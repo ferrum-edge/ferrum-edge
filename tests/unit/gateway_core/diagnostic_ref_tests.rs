@@ -17,19 +17,25 @@
 //!   `X-Gateway-Error` token, and only one a rejection site recorded; the
 //!   detail names the rejecting phase and plugin and every backend attempt,
 //!   with closed TLS labels, and stays bounded.
+//! * A replica-tagged store (issue #5846) mints `fd2_<replica>_<32 hex>`
+//!   references and resolves only its own. Another replica answers the plain
+//!   miss, plus the owner hint only for a caller authorized for its namespace;
+//!   `fd1_` references keep resolving on the untagged store that minted them.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ferrum_edge::diagnostic_ref::{
-    DIAGNOSTIC_REF_HEADER, DIAGNOSTIC_REF_LEN, DIAGNOSTIC_REF_PREFIX,
-    DIAGNOSTIC_REF_SCHEMA_VERSION, DiagnosticDetail, DiagnosticProtocol, DiagnosticRefLookup,
+    DIAGNOSTIC_REF_HEADER, DIAGNOSTIC_REF_LEN, DIAGNOSTIC_REF_OWNER_REPLICA_HEADER,
+    DIAGNOSTIC_REF_PREFIX, DIAGNOSTIC_REF_SCHEMA_VERSION, DIAGNOSTIC_REF_TAGGED_LEN,
+    DIAGNOSTIC_REF_TAGGED_PREFIX, DiagnosticDetail, DiagnosticProtocol, DiagnosticRefLookup,
     DiagnosticRefLookupAudit, DiagnosticRefLookupResult, DiagnosticRefMode, DiagnosticRefStore,
-    DiagnosticRefStoreConfig, DiagnosticRejection, DiagnosticRejectionSource, DiagnosticSlot,
-    DiagnosticTlsDetail, MAX_RECORDED_ATTEMPTS, MAX_TRACKED_LOOKUP_SUBJECTS, authorize_lookup,
-    backend_origin, duration_bucket, is_well_formed_ref, stamp_response_headers,
-    strip_response_header, tls_detail, tls_detail_from_rustls,
+    DiagnosticRefStoreConfig, DiagnosticRejection, DiagnosticRejectionSource, DiagnosticReplicaId,
+    DiagnosticSlot, DiagnosticTlsDetail, MAX_RECORDED_ATTEMPTS, MAX_TRACKED_LOOKUP_SUBJECTS,
+    REPLICA_ID_HEX_LEN, authorize_lookup, backend_origin, duration_bucket, insert_owner_hint,
+    is_well_formed_ref, reference_replica, stamp_response_headers, strip_response_header,
+    tls_detail, tls_detail_from_rustls,
 };
 use ferrum_edge::grpc::auth::AllowedNamespaces;
 use ferrum_edge::plugins::TransactionSummary;
@@ -83,6 +89,7 @@ fn label(outcome: &DiagnosticRefLookup) -> &'static str {
     match outcome {
         DiagnosticRefLookup::Found(_) => "found",
         DiagnosticRefLookup::NotFound => "not_found",
+        DiagnosticRefLookup::NotOwned(_) => "not_owned",
         DiagnosticRefLookup::MissingScope => "missing_scope",
         DiagnosticRefLookup::MissingNamespaceBinding => "missing_namespace_binding",
         DiagnosticRefLookup::RateLimited => "rate_limited",
@@ -1618,4 +1625,263 @@ fn routing_misses_and_admission_fences_record_their_rejection() {
         .find("if plugins.is_empty() && !diagnostic_detail_wanted {")
         .expect("no-consumer early return");
     assert!(record < early_return);
+}
+
+// ── cross-replica lookup (issue #5846) ─────────────────────────────────────
+
+const REPLICA_A: DiagnosticReplicaId = DiagnosticReplicaId::from_bytes([0x1a, 0x2b, 0x3c, 0x4d]);
+const REPLICA_B: DiagnosticReplicaId = DiagnosticReplicaId::from_bytes([0xf0, 0x0d, 0xca, 0xfe]);
+
+fn tagged_store(replica: DiagnosticReplicaId) -> DiagnosticRefStore {
+    default_store().with_replica(replica)
+}
+
+#[test]
+fn replica_tagged_references_embed_only_the_replica_id() {
+    let store = tagged_store(REPLICA_A);
+    assert_eq!(store.replica(), Some(REPLICA_A));
+    assert_eq!(REPLICA_A.to_hex(), "1a2b3c4d");
+    assert_eq!(REPLICA_A.to_hex().len(), REPLICA_ID_HEX_LEN);
+    let mut seen = HashSet::new();
+    for _ in 0..500 {
+        let reference = mint(&store, 502, "connection_failure");
+        assert_eq!(reference.len(), DIAGNOSTIC_REF_TAGGED_LEN, "{reference}");
+        let rest = reference
+            .strip_prefix(DIAGNOSTIC_REF_TAGGED_PREFIX)
+            .expect("tagged prefix");
+        let (replica, key) = rest.split_once('_').expect("replica separator");
+        assert_eq!(replica, "1a2b3c4d");
+        assert_eq!(key.len(), 32, "128 bits of randomness");
+        assert!(!reference.contains(NAMESPACE));
+        assert!(!reference.contains("connection_failure"));
+        assert!(is_well_formed_ref(&reference));
+        assert_eq!(reference_replica(&reference), Some(REPLICA_A));
+        assert!(seen.insert(key.to_string()), "keys must never repeat");
+    }
+}
+
+#[test]
+fn untagged_store_keeps_the_fd1_format_and_names_no_replica() {
+    let store = default_store();
+    assert_eq!(store.replica(), None);
+    let reference = mint(&store, 502, "connection_failure");
+    assert!(reference.starts_with(DIAGNOSTIC_REF_PREFIX));
+    assert_eq!(reference.len(), DIAGNOSTIC_REF_LEN);
+    assert_eq!(reference_replica(&reference), None);
+    assert_eq!(store.foreign_owner(&reference), None);
+    let view = store.lookup_at(Instant::now(), &reference).unwrap();
+    assert_eq!(view.replica_id, None);
+    let body = serde_json::to_value(&view).unwrap();
+    assert!(body.get("replica_id").is_none(), "fd1 body is unchanged");
+}
+
+#[test]
+fn malformed_tagged_references_never_resolve_or_name_an_owner() {
+    let owner = tagged_store(REPLICA_A);
+    let other = tagged_store(REPLICA_B);
+    let good = mint(&owner, 503, "overload");
+    let now = Instant::now();
+    assert!(owner.lookup_at(now, &good).is_some());
+
+    let key = &good[good.len() - 32..];
+    let upper_replica = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}1A2B3C4D_{key}");
+    let key_upper = key.to_uppercase();
+    let upper_key = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}1a2b3c4d_{key_upper}");
+    let other_separator = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}1a2b3c4d-{key}");
+    let no_separator = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}1a2b3c4d{key}0");
+    let short_replica = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}1a2b3c_{key}00");
+    let v1_prefix = format!("{DIAGNOSTIC_REF_PREFIX}1a2b3c4d_{key}");
+    let non_hex_replica = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}1a2b3c4g_{key}");
+    let short = good[..good.len() - 1].to_string();
+    let long = format!("{good}0");
+    let malformed = [
+        upper_replica.as_str(),
+        upper_key.as_str(),
+        other_separator.as_str(),
+        no_separator.as_str(),
+        short_replica.as_str(),
+        v1_prefix.as_str(),
+        non_hex_replica.as_str(),
+        short.as_str(),
+        long.as_str(),
+        "fd2_",
+    ];
+    for bad in malformed {
+        assert!(!is_well_formed_ref(bad), "{bad:?}");
+        assert_eq!(reference_replica(bad), None, "{bad:?}");
+        assert!(owner.lookup_at(now, bad).is_none(), "{bad:?}");
+        assert_eq!(other.foreign_owner(bad), None, "{bad:?}");
+    }
+}
+
+#[test]
+fn owned_tagged_lookup_resolves_with_its_replica_id() {
+    let store = tagged_store(REPLICA_A);
+    let reference = mint(&store, 502, "connection_failure");
+    let reader = namespaces(&[NAMESPACE]);
+    let now = Instant::now();
+    match authorize_lookup(Some(&store), OPERATOR, true, &reader, &reference, now) {
+        DiagnosticRefLookup::Found(view) => {
+            assert_eq!(view.reference, reference);
+            assert_eq!(view.replica_id.as_deref(), Some("1a2b3c4d"));
+            let body = serde_json::to_value(&*view).unwrap();
+            assert_eq!(body["replica_id"], "1a2b3c4d");
+            assert_eq!(body["schema_version"], DIAGNOSTIC_REF_SCHEMA_VERSION);
+        }
+        other => panic!("owned lookup must resolve, got {other:?}"),
+    }
+    assert_eq!(store.foreign_owner(&reference), None, "own reference");
+    assert_eq!(store.lookups_total(DiagnosticRefLookupResult::Found), 1);
+}
+
+#[test]
+fn non_owned_lookup_is_a_miss_with_the_owner_hint_only_when_authorized() {
+    let owner = tagged_store(REPLICA_A);
+    let peer = tagged_store(REPLICA_B);
+    let reference = mint(&owner, 502, "connection_failure");
+    let now = Instant::now();
+    let reader = namespaces(&[NAMESPACE]);
+
+    // The other replica never resolves it, even for the right caller...
+    assert!(peer.lookup_at(now, &reference).is_none());
+    // ...and names the owner only on the fully authorized path.
+    let hinted = authorize_lookup(Some(&peer), OPERATOR, true, &reader, &reference, now);
+    match &hinted {
+        DiagnosticRefLookup::NotOwned(replica) => assert_eq!(*replica, REPLICA_A),
+        other => panic!("expected the owner hint, got {other:?}"),
+    }
+    assert_eq!(
+        hinted.result(),
+        DiagnosticRefLookupResult::NotFound,
+        "a non-owned lookup is counted and audited as a miss"
+    );
+
+    let unbound = AllowedNamespaces::empty();
+    let refusals = [
+        authorize_lookup(Some(&peer), OPERATOR, false, &reader, &reference, now),
+        authorize_lookup(Some(&peer), OPERATOR, true, &unbound, &reference, now),
+    ];
+    let labels: Vec<&str> = refusals.iter().map(label).collect();
+    assert_eq!(labels, ["missing_scope", "missing_namespace_binding"]);
+
+    assert_eq!(peer.lookups_total(DiagnosticRefLookupResult::NotFound), 1);
+    assert_eq!(peer.lookups_total(DiagnosticRefLookupResult::Forbidden), 2);
+    assert_eq!(peer.lookups_total(DiagnosticRefLookupResult::Found), 0);
+}
+
+#[test]
+fn non_owned_lookup_never_hints_across_namespaces() {
+    let owner = tagged_store(REPLICA_A);
+    let peer = tagged_store(REPLICA_B);
+    let reference = mint(&owner, 502, "connection_failure");
+    let now = Instant::now();
+    let staging = namespaces(&["staging"]);
+
+    let cross = authorize_lookup(Some(&peer), OPERATOR, true, &staging, &reference, now);
+    let unknown = authorize_lookup(Some(&peer), OPERATOR, true, &staging, UNKNOWN_REF, now);
+    assert_eq!(label(&cross), "not_found", "no cross-namespace hint");
+    assert_eq!(label(&unknown), "not_found");
+
+    // A store in another namespace never hints for a caller bound only to the
+    // owner's namespace either: the answering store's namespace gates it.
+    let elsewhere = DiagnosticRefStore::new("staging", DiagnosticRefStoreConfig::default())
+        .with_replica(REPLICA_B);
+    let reader = namespaces(&[NAMESPACE]);
+    let other_ns = authorize_lookup(Some(&elsewhere), OPERATOR, true, &reader, &reference, now);
+    assert_eq!(label(&other_ns), "not_found");
+
+    // Feature off on the answering process: no store, no namespace, no hint.
+    let off = authorize_lookup(None, OPERATOR, true, &reader, &reference, now);
+    assert_eq!(label(&off), "not_found");
+}
+
+#[test]
+fn own_expired_or_unknown_tagged_reference_is_a_plain_miss() {
+    let store = store_with(10_000, Duration::from_secs(5), 10_000);
+    let store = store.with_replica(REPLICA_A);
+    let start = Instant::now();
+    let reference = store
+        .mint_at(start, DiagnosticProtocol::Http2, 504, "backend_timeout", None)
+        .unwrap();
+    let reader = namespaces(&[NAMESPACE]);
+    let later = start + Duration::from_secs(6);
+    let expired = authorize_lookup(Some(&store), OPERATOR, true, &reader, &reference, later);
+    assert_eq!(label(&expired), "not_found", "no hint at itself");
+
+    let unknown_own = format!("{DIAGNOSTIC_REF_TAGGED_PREFIX}1a2b3c4d_{}", "0".repeat(32));
+    let unknown = authorize_lookup(Some(&store), OPERATOR, true, &reader, &unknown_own, start);
+    assert_eq!(label(&unknown), "not_found");
+}
+
+#[test]
+fn reference_formats_resolve_only_on_a_store_that_mints_them() {
+    let untagged = default_store();
+    let tagged = tagged_store(REPLICA_A);
+    let v1 = mint(&untagged, 502, "connection_failure");
+    let v2 = mint(&tagged, 502, "connection_failure");
+    let now = Instant::now();
+    let reader = namespaces(&[NAMESPACE]);
+
+    // Old references still resolve on the replica that minted them.
+    assert!(untagged.lookup_at(now, &v1).is_some());
+    assert!(tagged.lookup_at(now, &v2).is_some());
+
+    // The same random key in the other format is a different reference.
+    let v1_as_v2 = format!(
+        "{DIAGNOSTIC_REF_TAGGED_PREFIX}1a2b3c4d_{}",
+        &v1[DIAGNOSTIC_REF_PREFIX.len()..]
+    );
+    let v2_as_v1 = format!("{DIAGNOSTIC_REF_PREFIX}{}", &v2[v2.len() - 32..]);
+    assert!(untagged.lookup_at(now, &v2_as_v1).is_none());
+    assert!(tagged.lookup_at(now, &v1_as_v2).is_none());
+
+    // A tagged replica asked for an untagged reference cannot name an owner.
+    let v1_on_tagged = authorize_lookup(Some(&tagged), OPERATOR, true, &reader, &v1, now);
+    assert_eq!(label(&v1_on_tagged), "not_found");
+
+    // An untagged replica in a mixed fleet still points at a tagged owner.
+    match authorize_lookup(Some(&untagged), OPERATOR, true, &reader, &v2, now) {
+        DiagnosticRefLookup::NotOwned(replica) => assert_eq!(replica, REPLICA_A),
+        other => panic!("expected the owner hint, got {other:?}"),
+    }
+}
+
+#[test]
+fn owner_hint_is_one_header_and_leaves_the_miss_body_alone() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    insert_owner_hint(&mut headers, REPLICA_A);
+    insert_owner_hint(&mut headers, REPLICA_A);
+    let values: Vec<&str> = headers
+        .get_all(DIAGNOSTIC_REF_OWNER_REPLICA_HEADER)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(values, ["1a2b3c4d"]);
+    assert_eq!(headers.len(), 2);
+}
+
+#[test]
+fn random_replica_ids_are_drawn_per_store() {
+    let mut ids = HashSet::new();
+    for _ in 0..64 {
+        ids.insert(DiagnosticReplicaId::random().expect("CSPRNG"));
+    }
+    assert!(ids.len() > 60, "replica ids come from the CSPRNG");
+}
+
+#[test]
+fn replica_info_metric_is_exported_only_when_tagged() {
+    let untagged = store_with(16, Duration::from_secs(900), 10);
+    let untagged = untagged.render_prometheus();
+    assert!(!untagged.contains("ferrum_diagnostic_ref_replica_info"));
+
+    let tagged = tagged_store(REPLICA_A).render_prometheus();
+    let expected = [
+        "# TYPE ferrum_diagnostic_ref_replica_info gauge",
+        "ferrum_diagnostic_ref_replica_info{replica_id=\"1a2b3c4d\"} 1",
+    ];
+    for line in expected {
+        assert!(tagged.lines().any(|l| l == line), "missing `{line}`");
+    }
 }

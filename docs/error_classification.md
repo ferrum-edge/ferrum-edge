@@ -450,7 +450,10 @@ X-Ferrum-Diagnostic-Ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
 ```
 
 The value is `fd1_` plus 128 bits from the process CSPRNG in lowercase hex. It
-embeds nothing: no cause, route, backend, tenant, time, or counter. With
+embeds nothing: no cause, route, backend, tenant, time, or counter. (With the
+opt-in `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` it also names the minting
+process's random replica id; see
+[Lookup across replicas](#lookup-across-replicas).) With
 `errors`, a response without an `X-Gateway-Error` token never carries a
 reference, and a request never carries two. Neither does an origin-authored
 representation a plugin replayed or relayed, even when it carries an
@@ -496,7 +499,8 @@ wrote, even while the feature is off. A client therefore never sees a reference
 the gateway did not mint, and cannot pre-seed one.
 
 **Resolve.** `GET /diagnostics/v1/refs/{ref}` on the admin listener of the
-same gateway process (see [admin_api.md](admin_api.md#diagnostic-references)).
+same gateway process (see [admin_api.md](admin_api.md#diagnostic-references);
+[Lookup across replicas](#lookup-across-replicas) covers finding that process).
 It requires an admin JWT with the `diagnostics:read` scope and an `ns` claim
 that names the gateway's namespace. An unknown, expired, evicted, or
 out-of-namespace reference answers `404` indistinguishably. The versioned body
@@ -565,11 +569,80 @@ gateway rejection. Every recording site is a single `Option` check when
 references are off.
 
 **Not covered yet.** A reference resolves only on the gateway process that
-minted it; there is no cross-replica or CP-side lookup. Attempts carry no
+minted it; another replica can name that process (below) but never fetches the
+detail for you, and the control plane does not proxy lookups. Attempts carry no
 per-attempt timing. A rejection that a plugin hook answers outside the shared
 rejection path (for example an `after_proxy` hook replacing a backend
 response) is not recorded as gateway-authored, so `all` mode does not
 reference it.
+
+### Lookup across replicas
+
+The detail lives only in the memory of the process that minted the reference,
+so behind a load balancer an operator must query that process's admin
+listener. `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` (issue #5846, default
+`false`) makes the reference say which process that is:
+
+```
+X-Ferrum-Diagnostic-Ref: fd2_1a2b3c4d_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+```
+
+`fd2_` is followed by the process's replica id (8 lowercase hex digits), `_`,
+and the same 128 CSPRNG bits. The replica id is 32 bits drawn from the process
+CSPRNG when the store is installed. It is derived from nothing: no host name,
+pod name, node, address, or namespace, and a restart draws a new one, just as
+a restart forgets every reference. It is logged once at startup
+(`replica_id` on the INFO line "Diagnostic references carry this process's
+replica id") and exported as
+`ferrum_diagnostic_ref_replica_info{replica_id="1a2b3c4d"} 1` on `/metrics`,
+so a Prometheus query joins it to the scrape target's pod and instance labels.
+The owning replica's lookup body carries it as `replica_id`.
+
+A lookup that reaches another replica:
+
+- answers the same `404` status and body as an unknown reference, is counted
+  as `not_found`, and is audited like any miss;
+- adds `X-Ferrum-Diagnostic-Owner-Replica: 1a2b3c4d` only when the caller
+  passed every check a `200` on that replica would need: the
+  `diagnostics:read` scope, an `ns` claim, and an `ns` claim that names the
+  answering replica's own namespace. A `403`, a `429`, a caller bound to other
+  namespaces, and a replica with references off never carry it. The owner is
+  read from the reference the caller supplied; the answering replica never
+  learns whether the owner exists, still holds the reference, or serves the
+  caller's namespace, so the hint cannot be used to probe another replica or
+  another namespace. The owner enforces its own namespace check when asked.
+
+An `fd1_` reference keeps resolving on the untagged replica that minted it, so
+a fleet can switch the flag replica by replica: an untagged replica still
+points at the owner of an `fd2_` reference, and a tagged replica answers an
+`fd1_` reference it did not mint with the plain `404`. A reference resolves
+only in the format its store mints, so re-spelling one format as the other
+never resolves.
+
+**What the tag reveals.** Untagged references are unlinkable. A tagged
+reference lets anyone who collects references (a client included) tell which
+responses one process served and roughly how many processes answered them,
+until the next restart. It reveals nothing else, which is why it is opt-in.
+
+**Rejected alternatives** (see
+[the ADR](plans/diagnostic_ref_cross_replica_adr.md)):
+
+- *Control-plane fan-out.* The CP↔DP ConfigSync channel is a stream the data
+  plane opens and the control plane only writes configuration to; the control
+  plane cannot call a data plane. Fan-out would need a new DP-side RPC that
+  carries diagnostic detail across the network, per-namespace authorization on
+  it, and time and concurrency bounds, and would still not cover `file` or
+  `database` fleets, which have no control plane.
+- *A shared store* (control plane, database, or Redis). Every referenced error
+  would cost a network write on the proxy path, the detail would leave the
+  process that owns it, and each store would need its own bounds and
+  retention.
+- *A hash of a host, pod, or node name.* A short unkeyed hash of a guessable
+  name can be reversed by a client. The DP `node_id` is itself a random
+  per-process id, but it exists only in `dp` mode, so reusing it would leave
+  `file` and `database` fleets without one.
+- *An operator-assigned id.* It needs per-replica configuration and silently
+  collides when two replicas share one.
 
 ## Adding a new error path
 

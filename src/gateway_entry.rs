@@ -827,6 +827,15 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         );
         return 1;
     }
+    // With `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` (issue #5846), name this
+    // process's random replica id once, so an operator can match the owner
+    // hint of a lookup answered by another replica to this process.
+    if let Some(replica) = crate::diagnostic_ref::active_replica() {
+        info!(
+            replica_id = %replica,
+            "Diagnostic references carry this process's replica id"
+        );
+    }
 
     // Apply the delayed-work admission budget before any listener can accept
     // traffic, so a fault-injection delay is never admitted against the

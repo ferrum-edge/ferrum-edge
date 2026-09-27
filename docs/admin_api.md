@@ -1714,6 +1714,27 @@ gateway process that served the response can resolve it. See
 [error_classification.md](error_classification.md#gateway-diagnostic-references)
 for the contract and bounds.
 
+**Across replicas.** With `FERRUM_DIAGNOSTIC_REF_REPLICA_TAG=true` (issue
+#5846), references take the form `fd2_<8 hex replica>_<32 hex>`, where the
+replica id is 32 random bits the process draws at startup; the owning
+process's `200` body adds `replica_id`. Asked for a reference another replica
+minted, a gateway answers the same `404` and body as any miss plus
+`X-Ferrum-Diagnostic-Owner-Replica: <replica id>`, only when the token carries
+`diagnostics:read` and an `ns` claim naming the answering gateway's namespace.
+Operator tooling then sends the lookup to the replica whose startup log or
+`ferrum_diagnostic_ref_replica_info{replica_id}` metric shows that id; the
+control plane does not proxy lookups. `fd1_` references keep resolving on the
+untagged gateway that minted them. See
+[error_classification.md](error_classification.md#lookup-across-replicas).
+
+```bash
+curl -i -H "Authorization: Bearer $DIAGNOSTICS_TOKEN" \
+  http://replica-b:9000/diagnostics/v1/refs/fd2_1a2b3c4d_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
+# HTTP/1.1 404 Not Found
+# x-ferrum-diagnostic-owner-replica: 1a2b3c4d
+# {"error":"Diagnostic reference not found"}
+```
+
 The token needs two claims beyond a normal admin JWT. The admin `role` never
 implies either:
 
@@ -1787,7 +1808,7 @@ not apply, so an `errors`-mode body without retries or a rejection keeps its
 | `200` | Resolved. `detail` is `null` (and `detail_available` is `false`) until the request's terminal transaction record exists — a streamed response records it when its body ends — and, in `errors` mode, for the overload and stale-configuration fences, which answer before a request context exists (`all` mode records their detail) |
 | `401` | Missing or invalid admin JWT |
 | `403` | The JWT lacks the `diagnostics:read` scope or carries no `ns` claim. Decided from the credential alone, before the reference is read. The attempt still counts against the rate limit |
-| `404` | Malformed, unknown, expired, or evicted reference; a reference outside the token's `ns` namespaces; or references are off. All identical, so references cannot be probed |
+| `404` | Malformed, unknown, expired, or evicted reference; a reference outside the token's `ns` namespaces; a replica-tagged reference another gateway process minted; or references are off. All identical, so references cannot be probed. Only the replica-tagged case adds `X-Ferrum-Diagnostic-Owner-Replica`, and only for a token whose `ns` claim names this gateway's namespace; the value is read from the reference itself |
 | `429` | More than `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) attempts in the current second across all callers, or more than half of it (at least 1) from one JWT `sub`. Every attempt counts against its subject's share, including one refused with `403`; only an attempt whose credential passes the scope and `ns` checks also consumes the global budget, and an attempt refused by either budget consumes neither. Carries `Retry-After: 1` |
 
 Every `200` and `404` emits one WARN-level
