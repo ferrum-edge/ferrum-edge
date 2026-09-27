@@ -629,8 +629,9 @@ fn layered_decode_inner(text: &str) -> (String, bool) {
     (current, converged)
 }
 
-/// Percent-decode (`%XX`) and translate `+` to space (form-encoding). Lossy on
-/// invalid UTF-8 sequences, which is fine for pattern detection.
+/// Percent-decode (`%XX` and `%uXXXX`) and translate `+` to space
+/// (form-encoding). Lossy on invalid UTF-8 sequences, which is fine for
+/// pattern detection.
 fn percent_decode_plus(text: &str) -> Cow<'_, str> {
     if !text.as_bytes().contains(&b'%') {
         if text.as_bytes().contains(&b'+') {
@@ -638,7 +639,11 @@ fn percent_decode_plus(text: &str) -> Cow<'_, str> {
         }
         return Cow::Borrowed(text);
     }
-    let decoded = percent_decode_str(text).decode_utf8_lossy();
+    let decoded = if has_percent_u_escape(text) {
+        Cow::Owned(percent_decode_with_u_escapes(text))
+    } else {
+        percent_decode_str(text).decode_utf8_lossy()
+    };
     if decoded.as_bytes().contains(&b'+') {
         Cow::Owned(decoded.replace('+', " "))
     } else {
@@ -646,8 +651,66 @@ fn percent_decode_plus(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// Decode JSON/JavaScript unicode escapes: `\uXXXX` (with surrogate pairs),
-/// `\u{XXXX}`, and `\xXX`. Unrecognized escapes keep their literal backslash.
+/// Whether `text` carries at least one well-formed `%uXXXX` escape.
+///
+/// `%uXXXX` is not RFC 3986 percent-encoding, but IIS / classic ASP decode it
+/// in the query string and form body, and JavaScript `unescape()` decodes it
+/// too, so `%u003cscript%u003e` reaches such an application as `<script>`.
+/// The standard `%XX` decoder leaves it untouched (`%u0` is not a valid
+/// octet), so without this the payload never reaches a rule.
+fn has_percent_u_escape(text: &str) -> bool {
+    text.as_bytes().windows(6).any(is_percent_u_escape)
+}
+
+fn is_percent_u_escape(bytes: &[u8]) -> bool {
+    matches!(bytes, [b'%', b'u' | b'U', a, b, c, d, ..]
+        if [a, b, c, d].iter().all(|digit| digit.is_ascii_hexdigit()))
+}
+
+/// Single-pass decode of `%XX` octets and `%uXXXX` code units, matching the
+/// one-pass behavior of the decoders that honor `%u`: a `%u0025` yields a
+/// literal `%` that is not decoded again within the same round (the layered
+/// decode's next round handles deliberate stacking). Octets are collected as
+/// bytes and read as lossy UTF-8, exactly like the `%XX`-only path; a lone
+/// surrogate code unit becomes `U+FFFD`.
+fn percent_decode_with_u_escapes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if is_percent_u_escape(&bytes[i..]) {
+                // Four validated hex digits always fit a `u16`.
+                let unit = hex_n(&bytes[i + 2..i + 6]).unwrap_or(0xFFFD);
+                let ch = char::from_u32(unit).unwrap_or(char::REPLACEMENT_CHARACTER);
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                i += 6;
+                continue;
+            }
+            if let Some(octet) = bytes.get(i + 1..i + 3).and_then(hex2) {
+                out.push(octet);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decode JSON/JavaScript string escapes: `\uXXXX` (with surrogate pairs),
+/// `\u{XXXX}`, `\xXX`, and the single-character escapes (`\n`, `\t`, `\r`,
+/// `\f`, `\b`, `\v`, `\/`, `\"`, `\'`, `\\`). Unrecognized escapes keep
+/// their literal backslash.
+///
+/// The single-character escapes are not cosmetic. A JSON or JavaScript parser
+/// resolves them before the application sees the value, so
+/// `{"q":"1 union\tselect"}` reaches a SQL sink as `union<TAB>select`,
+/// `\"1\"=\"1` as `"1"="1`, and `file:\/\/\/etc\/passwd` as
+/// `file:///etc/passwd` — while the raw bytes carry a backslash where every
+/// signature expects whitespace, a quote, or a slash.
 fn unicode_unescape(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     if !bytes.contains(&b'\\') {
@@ -711,6 +774,17 @@ fn decode_escape(after: &[u8]) -> Option<(u32, usize)> {
             }
         }
         b'x' | b'X' => Some((hex2(after.get(1..3)?)? as u32, 3)),
+        b'n' => Some((u32::from(b'\n'), 1)),
+        b't' => Some((u32::from(b'\t'), 1)),
+        b'r' => Some((u32::from(b'\r'), 1)),
+        b'f' => Some((0x0C, 1)),
+        b'b' => Some((0x08, 1)),
+        b'v' => Some((0x0B, 1)),
+        // `\\` must consume both backslashes so `\\u003c` reads as the
+        // literal text `\u003c`, exactly as a JSON parser reads it; the
+        // layered decode's next round still reduces a deliberate double
+        // escape.
+        escaped @ (b'/' | b'"' | b'\'' | b'\\') => Some((u32::from(*escaped), 1)),
         _ => None,
     }
 }
@@ -942,7 +1016,7 @@ mod tests {
     #[test]
     fn unicode_unescape_preserves_unknown_escapes_and_plain_text() {
         assert!(matches!(unicode_unescape("plain text"), Cow::Borrowed(_)));
-        assert_eq!(unicode_unescape(r"a\nb\qc"), r"a\nb\qc");
+        assert_eq!(unicode_unescape(r"a\qc\zd"), r"a\qc\zd");
     }
 
     #[test]

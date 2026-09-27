@@ -488,26 +488,56 @@ impl Waf {
             && !rule.suppresses_text(fp_filter_target)
     }
 
+    /// Scan each `name=value` cookie crumb as sent AND as decoded.
+    ///
+    /// Frameworks disagree about cookie values: the Servlet API and Go's
+    /// `net/http` hand the application the raw octets, while PHP (`urldecode`,
+    /// so `+` is a space), Express `cookie-parser` (`decodeURIComponent`), and
+    /// Rails unescape them first. A WAF that only scans the raw crumb misses
+    /// `pref=%3Cscript%3E`; one that only scans the decoded form misses a raw
+    /// payload a non-decoding backend reads verbatim. So the raw crumb is
+    /// always scanned and every distinct decoded view is scanned beside it,
+    /// through the same bounded canonical decode query components use.
+    /// Splitting on `;` happens first, so an encoded `%3B` cannot forge an
+    /// extra crumb. A crumb with nothing to decode costs no allocation.
     fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
+        if self.compiled.cookies.is_none()
+            && !self
+                .compiled
+                .text_cidr_rules
+                .iter()
+                .any(|&index| matches!(self.compiled.rules[index].target, RuleTarget::Cookies))
+        {
+            return;
+        }
         for cookie in header.split(';') {
             let cookie = cookie.trim();
-            if !cookie.is_empty() {
-                self.scan_text_set(
-                    outcome,
-                    self.compiled.cookies.as_ref(),
-                    cookie,
-                    subject,
-                    None,
-                );
-                self.scan_cidr_rules_matching(
-                    outcome,
-                    cookie,
-                    &self.compiled.text_cidr_rules,
-                    subject,
-                    |target| matches!(target, RuleTarget::Cookies),
-                );
+            if cookie.is_empty() {
+                continue;
+            }
+            self.scan_cookie_view(outcome, cookie, subject);
+            let views = normalize::canonical_query_component_views(cookie);
+            for view in views.iter().filter(|view| *view != cookie) {
+                self.scan_cookie_view(outcome, view, subject);
             }
         }
+    }
+
+    fn scan_cookie_view(&self, outcome: &mut ScanOutcome, cookie: &str, subject: ScanSubject<'_>) {
+        self.scan_text_set(
+            outcome,
+            self.compiled.cookies.as_ref(),
+            cookie,
+            subject,
+            None,
+        );
+        self.scan_cidr_rules_matching(
+            outcome,
+            cookie,
+            &self.compiled.text_cidr_rules,
+            subject,
+            |target| matches!(target, RuleTarget::Cookies),
+        );
     }
 
     fn scan_query_pair(
