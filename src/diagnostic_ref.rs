@@ -11,6 +11,12 @@
 //!   HTTP/3) also carries `X-Ferrum-Diagnostic-Ref: fd1_<32 lowercase hex>`.
 //!   The reference is 128 bits read from the process CSPRNG and embeds
 //!   nothing: no cause, route, backend, tenant, time, or counter.
+//! * With `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846), every gateway-authored
+//!   error response carries one as well: the `errors` set, plus the plugin
+//!   rejections (`401`/`403`/`429`, ...), gateway policy fences, and routing
+//!   `404`s that carry no `X-Gateway-Error`. A response is gateway-authored only
+//!   when a rejection site recorded it in the request's slot; a backend's own
+//!   `4xx`/`5xx` relayed to the client never carries a reference.
 //! * The detail behind a reference lives only in this process, in a bounded,
 //!   TTL-limited, sharded in-memory store ([`DiagnosticRefStore`]). It is
 //!   readable only through the authenticated admin lookup
@@ -24,13 +30,22 @@
 //!   `FERRUM_DIAGNOSTIC_REFS` says, before an enabled store writes its own, so
 //!   a client never sees a reference the gateway did not mint.
 //!
+//! The lookup detail also names the rejecting policy (phase and, when known,
+//! plugin) and every backend attempt the request made (at most
+//! [`MAX_RECORDED_ATTEMPTS`]), each with its dispatch outcome, closed
+//! `error_class`, and, for a TLS failure, the closed TLS alert or certificate
+//! verification reason. Everything in it is a compiled-in label or operator
+//! configuration.
+//!
 //! Hot-path cost: with the default `off`, one `OnceLock` load per HTTP-family
-//! request and one header-map removal per response head. When enabled, one
-//! `Arc` slot per request, and only on a response that carries
-//! `X-Gateway-Error`, one CSPRNG read and one short critical section on one of
-//! [`SHARD_COUNT`] shard mutexes. Detail is copied into the slot from the
-//! terminal transaction summary, and only for a summary that can carry
-//! `X-Gateway-Error` (5xx or a classified dispatch error).
+//! request and one header-map removal per response head; every recording site
+//! is an `Option` check on the request's absent slot. When enabled, one `Arc`
+//! slot per request, and only on a response that gets a reference, one CSPRNG
+//! read and one short critical section on one of [`SHARD_COUNT`] shard
+//! mutexes. Detail is copied into the slot from the terminal transaction
+//! summary, and only for a summary that can carry `X-Gateway-Error` (5xx or a
+//! classified dispatch error) or, in `all` mode, a recorded gateway rejection.
+//! Each backend attempt takes one uncontended per-request mutex.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
@@ -112,7 +127,35 @@ pub const SHARD_COUNT: usize = 16;
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-const MODE_PARSE_ERROR: &str = "FERRUM_DIAGNOSTIC_REFS must be `off` or `errors`";
+/// Most backend attempts one reference's detail lists. Later attempts are
+/// counted in `attempts_omitted` instead, so the detail stays bounded however
+/// many retries a route allows.
+pub const MAX_RECORDED_ATTEMPTS: usize = 8;
+
+/// Longest rejection phase or plugin name the detail records. A longer or
+/// non-label value is recorded as `other` (phase) or dropped (plugin).
+pub const MAX_REJECTION_LABEL_LEN: usize = 64;
+
+/// Rejection phase of a request that matched no route (`404`).
+pub const ROUTE_NOT_FOUND_PHASE: &str = "route_not_found";
+
+/// Rejection phase of an outbound route miss refused by the mesh
+/// `REGISTRY_ONLY` policy.
+pub const MESH_REGISTRY_ONLY_PHASE: &str = "mesh_registry_only";
+
+/// Plugin hook phases. A rejection recorded in one of them is a plugin
+/// rejection even when the rejecting plugin's name is not known.
+const PLUGIN_HOOK_PHASES: [&str; 7] = [
+    "on_request_received",
+    "authenticate",
+    "authorize",
+    "before_proxy",
+    "on_backend_path_resolved",
+    "on_final_request_body",
+    "after_proxy",
+];
+
+const MODE_PARSE_ERROR: &str = "FERRUM_DIAGNOSTIC_REFS must be `off`, `errors`, or `all`";
 
 /// `FERRUM_DIAGNOSTIC_REFS`: which gateway responses carry a reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,6 +165,9 @@ pub enum DiagnosticRefMode {
     Off,
     /// Responses carrying the gateway's own `X-Gateway-Error` token.
     Errors,
+    /// The `errors` set plus every other gateway-authored error response:
+    /// plugin rejections, gateway policy fences, and routing `404`s.
+    All,
 }
 
 impl DiagnosticRefMode {
@@ -131,6 +177,7 @@ impl DiagnosticRefMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Ok(Self::Off),
             "errors" => Ok(Self::Errors),
+            "all" => Ok(Self::All),
             _ => Err(MODE_PARSE_ERROR.to_string()),
         }
     }
@@ -139,11 +186,18 @@ impl DiagnosticRefMode {
         match self {
             Self::Off => "off",
             Self::Errors => "errors",
+            Self::All => "all",
         }
     }
 
     pub fn is_enabled(self) -> bool {
         !matches!(self, Self::Off)
+    }
+
+    /// Whether gateway-authored error responses without an `X-Gateway-Error`
+    /// token also carry a reference (`all`).
+    pub fn covers_gateway_rejections(self) -> bool {
+        matches!(self, Self::All)
     }
 }
 
@@ -227,6 +281,21 @@ pub struct DiagnosticDetail {
     pub backend_target: Option<String>,
     /// Coarse total-duration bucket (`lt_10ms` .. `ge_10s`, or `unknown`).
     pub duration_bucket: &'static str,
+    /// The gateway policy or plugin that rejected the request, when one did.
+    /// Absent for a backend dispatch outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<DiagnosticRejection>,
+    /// Every backend attempt the request made, in order, up to
+    /// [`MAX_RECORDED_ATTEMPTS`]. Absent when no backend was attempted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<DiagnosticAttempt>,
+    /// Attempts made beyond [`MAX_RECORDED_ATTEMPTS`]. Absent when zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub attempts_omitted: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl DiagnosticDetail {
@@ -248,7 +317,237 @@ impl DiagnosticDetail {
             proxy_id: summary.proxy_id.clone(),
             backend_target: summary.backend_target.as_deref().and_then(backend_origin),
             duration_bucket: duration_bucket(summary.latency_total_ms),
+            rejection: None,
+            attempts: Vec::new(),
+            attempts_omitted: 0,
         }
+    }
+
+    /// Detail of a gateway rejection answered before routing matched a proxy
+    /// (a routing `404`, an admission fence): nothing was dispatched and no
+    /// proxy or backend is known.
+    pub fn unrouted(latency_ms: f64) -> Self {
+        Self {
+            error_class: None,
+            body_error_class: None,
+            rejection_phase: None,
+            route_timeout_phase: None,
+            backend_dispatch: "not_dispatched",
+            proxy_id: None,
+            backend_target: None,
+            duration_bucket: duration_bucket(latency_ms),
+            rejection: None,
+            attempts: Vec::new(),
+            attempts_omitted: 0,
+        }
+    }
+}
+
+/// Who authored a gateway rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticRejectionSource {
+    /// A plugin hook rejected the request (authentication, authorization,
+    /// rate limiting, request validation, ...).
+    Plugin,
+    /// A gateway policy fence rejected the request (allowed methods,
+    /// connection limits, circuit breaker, admission fences, ...).
+    Gateway,
+    /// No route matched the request.
+    Routing,
+}
+
+/// The policy that rejected a request. `phase` is a compiled-in phase or
+/// policy label and `plugin` the rejecting plugin's type name; neither is
+/// request material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticRejection {
+    pub source: DiagnosticRejectionSource,
+    /// Rejection phase or policy (`authenticate`, `authorize`, `before_proxy`,
+    /// `allowed_methods`, `websocket_connection_limit`, `route_not_found`,
+    /// ...). A value that is not a short label is recorded as `other`.
+    pub phase: String,
+    /// Name of the rejecting plugin, when the phase that rejected knows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+}
+
+impl DiagnosticRejection {
+    /// A rejection in `phase`, by `plugin` when known. A plugin hook phase or
+    /// a known plugin makes it a plugin rejection; anything else is a gateway
+    /// policy rejection.
+    pub fn new(phase: &str, plugin: Option<&str>) -> Self {
+        let plugin = plugin.and_then(bounded_label);
+        let source = if plugin.is_some() || PLUGIN_HOOK_PHASES.contains(&phase) {
+            DiagnosticRejectionSource::Plugin
+        } else {
+            DiagnosticRejectionSource::Gateway
+        };
+        Self {
+            source,
+            phase: bounded_label(phase).unwrap_or_else(|| "other".to_string()),
+            plugin,
+        }
+    }
+
+    /// A routing rejection (`route_not_found`, `mesh_registry_only`).
+    pub fn routing(phase: &'static str) -> Self {
+        Self {
+            source: DiagnosticRejectionSource::Routing,
+            phase: phase.to_string(),
+            plugin: None,
+        }
+    }
+
+    /// A gateway admission fence that answered before a request context
+    /// existed.
+    pub fn gateway_fence(phase: &'static str) -> Self {
+        Self {
+            source: DiagnosticRejectionSource::Gateway,
+            phase: phase.to_string(),
+            plugin: None,
+        }
+    }
+}
+
+/// `value` when it is a short identifier-like label, never free text.
+fn bounded_label(value: &str) -> Option<String> {
+    let is_label = !value.is_empty()
+        && value.len() <= MAX_REJECTION_LABEL_LEN
+        && value.bytes().all(is_label_byte);
+    is_label.then(|| value.to_string())
+}
+
+fn is_label_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+}
+
+/// One backend attempt of a request, in dispatch order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DiagnosticAttempt {
+    /// 1-based attempt number (`1` is the first dispatch, `2` the first
+    /// retry).
+    pub attempt: u32,
+    /// How far this attempt reached the backend: `backend_response`,
+    /// `pre_wire_failure`, or `ambiguous_failure`.
+    pub backend_dispatch: &'static str,
+    /// The backend's HTTP status, when this attempt got a response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Granular `error_class` of a failed attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<&'static str>,
+    /// TLS failure detail of a `tls_error` attempt, when the typed TLS error
+    /// was available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<DiagnosticTlsDetail>,
+}
+
+/// Closed description of a backend TLS failure, taken from the typed rustls
+/// error. Certificate contents, names, and times are never recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DiagnosticTlsDetail {
+    /// `certificate_verification`, `alert_received`,
+    /// `no_certificates_presented`, `peer_incompatible`, `peer_misbehaved`,
+    /// `invalid_message`, `unexpected_message`, `decrypt_error`,
+    /// `no_application_protocol`, `invalid_crl`, or `other`.
+    pub failure: &'static str,
+    /// The certificate verification reason (`expired`, `unknown_issuer`,
+    /// `not_valid_for_name`, ...) or the received alert (`unknown_ca`,
+    /// `handshake_failure`, ...). Absent for other failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// Closed TLS detail of the first rustls error in `err`'s source chain.
+pub fn tls_detail(err: &(dyn std::error::Error + 'static)) -> Option<DiagnosticTlsDetail> {
+    crate::retry::rustls_error_from_chain(err).map(tls_detail_from_rustls)
+}
+
+/// Closed TLS detail of one rustls error.
+pub fn tls_detail_from_rustls(err: &rustls::Error) -> DiagnosticTlsDetail {
+    let (failure, reason) = match err {
+        rustls::Error::InvalidCertificate(cert) => (
+            "certificate_verification",
+            Some(certificate_error_label(cert)),
+        ),
+        rustls::Error::AlertReceived(alert) => ("alert_received", Some(alert_label(*alert))),
+        rustls::Error::NoCertificatesPresented => ("no_certificates_presented", None),
+        rustls::Error::PeerIncompatible(_) => ("peer_incompatible", None),
+        rustls::Error::PeerMisbehaved(_) => ("peer_misbehaved", None),
+        rustls::Error::InvalidMessage(_) => ("invalid_message", None),
+        rustls::Error::InappropriateMessage { .. }
+        | rustls::Error::InappropriateHandshakeMessage { .. } => ("unexpected_message", None),
+        rustls::Error::DecryptError => ("decrypt_error", None),
+        rustls::Error::NoApplicationProtocol => ("no_application_protocol", None),
+        rustls::Error::InvalidCertRevocationList(_) => ("invalid_crl", None),
+        _ => ("other", None),
+    };
+    DiagnosticTlsDetail { failure, reason }
+}
+
+fn certificate_error_label(err: &rustls::CertificateError) -> &'static str {
+    use rustls::CertificateError;
+    match err {
+        CertificateError::BadEncoding => "bad_encoding",
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => "expired",
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+            "not_valid_yet"
+        }
+        CertificateError::Revoked => "revoked",
+        CertificateError::UnhandledCriticalExtension => "unhandled_critical_extension",
+        CertificateError::UnknownIssuer => "unknown_issuer",
+        CertificateError::UnknownRevocationStatus => "unknown_revocation_status",
+        CertificateError::ExpiredRevocationList
+        | CertificateError::ExpiredRevocationListContext { .. } => "expired_revocation_list",
+        CertificateError::BadSignature => "bad_signature",
+        CertificateError::UnsupportedSignatureAlgorithmContext { .. }
+        | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => {
+            "unsupported_signature_algorithm"
+        }
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+            "not_valid_for_name"
+        }
+        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
+            "invalid_purpose"
+        }
+        CertificateError::InvalidOcspResponse => "invalid_ocsp_response",
+        CertificateError::ApplicationVerificationFailure => "application_verification_failure",
+        _ => "other",
+    }
+}
+
+fn alert_label(alert: rustls::AlertDescription) -> &'static str {
+    use rustls::AlertDescription;
+    match alert {
+        AlertDescription::CloseNotify => "close_notify",
+        AlertDescription::UnexpectedMessage => "unexpected_message",
+        AlertDescription::BadRecordMac => "bad_record_mac",
+        AlertDescription::RecordOverflow => "record_overflow",
+        AlertDescription::HandshakeFailure => "handshake_failure",
+        AlertDescription::BadCertificate => "bad_certificate",
+        AlertDescription::UnsupportedCertificate => "unsupported_certificate",
+        AlertDescription::CertificateRevoked => "certificate_revoked",
+        AlertDescription::CertificateExpired => "certificate_expired",
+        AlertDescription::CertificateUnknown => "certificate_unknown",
+        AlertDescription::IllegalParameter => "illegal_parameter",
+        AlertDescription::UnknownCA => "unknown_ca",
+        AlertDescription::AccessDenied => "access_denied",
+        AlertDescription::DecodeError => "decode_error",
+        AlertDescription::DecryptError => "decrypt_error",
+        AlertDescription::ProtocolVersion => "protocol_version",
+        AlertDescription::InsufficientSecurity => "insufficient_security",
+        AlertDescription::InternalError => "internal_error",
+        AlertDescription::InappropriateFallback => "inappropriate_fallback",
+        AlertDescription::UserCanceled => "user_canceled",
+        AlertDescription::MissingExtension => "missing_extension",
+        AlertDescription::UnsupportedExtension => "unsupported_extension",
+        AlertDescription::UnrecognisedName => "unrecognized_name",
+        AlertDescription::BadCertificateStatusResponse => "bad_certificate_status_response",
+        AlertDescription::UnknownPSKIdentity => "unknown_psk_identity",
+        AlertDescription::CertificateRequired => "certificate_required",
+        AlertDescription::NoApplicationProtocol => "no_application_protocol",
+        _ => "other",
     }
 }
 
@@ -340,6 +639,26 @@ pub(crate) fn backend_dispatch_label(state: crate::plugins::BackendDispatchState
 pub struct DiagnosticSlot {
     detail: OnceLock<DiagnosticDetail>,
     minted: OnceLock<String>,
+    /// The gateway rejection that authored this request's response, set by
+    /// the rejection site before the response head is written. In `all` mode
+    /// it is what makes a response without `X-Gateway-Error` gateway-authored.
+    rejection: OnceLock<DiagnosticRejection>,
+    /// Name of the plugin whose hook rejected the request, noted by the hook
+    /// dispatcher before the rejection is logged.
+    rejecting_plugin: OnceLock<String>,
+    attempt_log: Mutex<AttemptLog>,
+}
+
+/// Bounded per-request backend attempt log. The first attempt is stored
+/// inline, so a request that is not retried allocates nothing for it.
+#[derive(Debug, Default)]
+struct AttemptLog {
+    first: Option<DiagnosticAttempt>,
+    retries: Vec<DiagnosticAttempt>,
+    omitted: u32,
+    /// TLS detail noted by the dispatch that is about to report a
+    /// `tls_error` attempt; taken (and cleared) by the next attempt record.
+    pending_tls: Option<DiagnosticTlsDetail>,
 }
 
 impl DiagnosticSlot {
@@ -363,16 +682,118 @@ impl DiagnosticSlot {
     pub fn minted_ref(&self) -> Option<&str> {
         self.minted.get().map(String::as_str)
     }
+
+    /// Record the gateway rejection that authored this request's response.
+    /// The first record wins: a rejection is terminal, so a later record could
+    /// only come from a cleanup path describing the same response.
+    pub fn record_rejection(&self, rejection: DiagnosticRejection) {
+        let _ = self.rejection.set(rejection);
+    }
+
+    pub fn rejection(&self) -> Option<&DiagnosticRejection> {
+        self.rejection.get()
+    }
+
+    /// Note the plugin whose hook rejected the request. Dropped unless the
+    /// name is a short label.
+    pub fn note_rejecting_plugin(&self, plugin: &str) {
+        if let Some(plugin) = bounded_label(plugin) {
+            let _ = self.rejecting_plugin.set(plugin);
+        }
+    }
+
+    pub fn rejecting_plugin(&self) -> Option<&str> {
+        self.rejecting_plugin.get().map(String::as_str)
+    }
+
+    fn lock_attempts(&self) -> MutexGuard<'_, AttemptLog> {
+        // Every mutation is a single push or field write, so a recovered
+        // guard never exposes a torn log (same reasoning as `lock_shard`).
+        self.attempt_log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Note the TLS detail of a backend dispatch failure. The next
+    /// [`Self::record_attempt`] attaches it when that attempt is a
+    /// `tls_error`, and discards it otherwise.
+    pub fn note_tls_failure(&self, tls: DiagnosticTlsDetail) {
+        self.lock_attempts().pending_tls = Some(tls);
+    }
+
+    /// Record one completed backend attempt. `response_status` is kept only
+    /// for an attempt that got a backend response.
+    pub fn record_attempt(
+        &self,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+        response_status: Option<u16>,
+    ) {
+        let mut log = self.lock_attempts();
+        let pending_tls = log.pending_tls.take();
+        let recorded = usize::from(log.first.is_some()) + log.retries.len();
+        if recorded >= MAX_RECORDED_ATTEMPTS {
+            log.omitted = log.omitted.saturating_add(1);
+            return;
+        }
+        let backend_dispatch = match error_class {
+            None => "backend_response",
+            Some(_) if request_on_wire => "ambiguous_failure",
+            Some(_) => "pre_wire_failure",
+        };
+        let tls = if error_class == Some(crate::retry::ErrorClass::TlsError) {
+            pending_tls
+        } else {
+            None
+        };
+        let attempt = DiagnosticAttempt {
+            attempt: u32::try_from(recorded + 1).unwrap_or(u32::MAX),
+            backend_dispatch,
+            status: response_status.filter(|_| error_class.is_none()),
+            error_class: crate::retry::http_log_error_class(error_class),
+            tls,
+        };
+        if log.first.is_none() {
+            log.first = Some(attempt);
+        } else {
+            log.retries.push(attempt);
+        }
+    }
+
+    /// The recorded attempts, in order, and how many more were omitted.
+    pub fn attempts(&self) -> (Vec<DiagnosticAttempt>, u32) {
+        let log = self.lock_attempts();
+        let mut attempts = Vec::with_capacity(usize::from(log.first.is_some()) + log.retries.len());
+        attempts.extend(log.first);
+        attempts.extend_from_slice(&log.retries);
+        (attempts, log.omitted)
+    }
+
+    /// The recorded detail completed with the rejection and attempts this
+    /// slot holds, for the lookup view.
+    fn view_detail(&self) -> Option<DiagnosticDetail> {
+        let mut detail = self.detail()?.clone();
+        if detail.rejection.is_none() {
+            detail.rejection = self.rejection().cloned();
+        }
+        if detail.attempts.is_empty() {
+            let (attempts, omitted) = self.attempts();
+            detail.attempts = attempts;
+            detail.attempts_omitted = omitted;
+        }
+        Some(detail)
+    }
 }
 
 /// Copy the request's detail into its slot from the terminal summary.
 ///
 /// Only a summary that can accompany an `X-Gateway-Error` token (a 5xx or a
-/// classified dispatch error) is recorded, so the enabled feature does not
-/// copy strings for every successful request. The `error_class` is the one
-/// the transaction log reports, including a gateway output-policy refusal the
-/// request context selected after the summary was built, so the detail is
-/// identical whether it is recorded here synchronously or by the terminal log.
+/// classified dispatch error), or in `all` mode a recorded gateway rejection,
+/// is recorded, so the enabled feature does not copy strings for every
+/// successful request. The `error_class` is the one the transaction log
+/// reports, including a gateway output-policy refusal the request context
+/// selected after the summary was built, so the detail is identical whether it
+/// is recorded here synchronously or by the terminal log.
 pub(crate) fn record_request_detail(
     slot: &DiagnosticSlot,
     summary: &TransactionSummary,
@@ -382,7 +803,8 @@ pub(crate) fn record_request_detail(
         return;
     }
     let error_class = ctx.response_policy_error_class(summary.error_class);
-    if summary.response_status_code < 500 && error_class.is_none() {
+    let gateway_rejection = slot.rejection().is_some() && gateway_rejections_enabled();
+    if summary.response_status_code < 500 && error_class.is_none() && !gateway_rejection {
         return;
     }
     let mut detail = DiagnosticDetail::from_summary(
@@ -445,7 +867,7 @@ struct Entry {
     expires_at: Instant,
     protocol: DiagnosticProtocol,
     status: u16,
-    gateway_error: &'static str,
+    gateway_error: Option<&'static str>,
     slot: Option<Arc<DiagnosticSlot>>,
 }
 
@@ -541,7 +963,9 @@ pub struct DiagnosticRefView {
     pub expires_at: String,
     pub protocol: DiagnosticProtocol,
     pub status: u16,
-    pub gateway_error: &'static str,
+    /// The response's `X-Gateway-Error` token, or `null` for an `all`-mode
+    /// reference on a gateway rejection that carries none.
+    pub gateway_error: Option<&'static str>,
     /// `false` until the request's terminal transaction summary has been
     /// recorded (a streamed response records it when its body ends), and
     /// for gateway fences that answer before a request context exists.
@@ -555,6 +979,7 @@ pub struct DiagnosticRefView {
 #[derive(Debug)]
 pub struct DiagnosticRefStore {
     namespace: Arc<str>,
+    mode: DiagnosticRefMode,
     ttl: Duration,
     ttl_wall: chrono::Duration,
     per_shard_capacity: usize,
@@ -590,6 +1015,7 @@ impl DiagnosticRefStore {
             .clamp(MIN_LOOKUP_RATE_PER_SECOND, MAX_LOOKUP_RATE_PER_SECOND);
         Self {
             namespace: namespace.into(),
+            mode: DiagnosticRefMode::Errors,
             ttl,
             ttl_wall: chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::zero()),
             per_shard_capacity: (max_entries / SHARD_COUNT).max(1),
@@ -607,6 +1033,20 @@ impl DiagnosticRefStore {
             evicted_expired_total: AtomicU64::new(0),
             lookups_total: Default::default(),
         }
+    }
+
+    /// The same store minting for `mode`. [`Self::new`] mints for `errors`;
+    /// `off` is not a store mode and keeps `errors`.
+    pub fn with_mode(mut self, mode: DiagnosticRefMode) -> Self {
+        if mode.is_enabled() {
+            self.mode = mode;
+        }
+        self
+    }
+
+    /// Which responses this store mints references for (`errors` or `all`).
+    pub fn mode(&self) -> DiagnosticRefMode {
+        self.mode
     }
 
     /// Namespace every reference in this store belongs to.
@@ -663,6 +1103,19 @@ impl DiagnosticRefStore {
         protocol: DiagnosticProtocol,
         status: u16,
         gateway_error: &'static str,
+        slot: Option<&Arc<DiagnosticSlot>>,
+    ) -> Option<String> {
+        self.mint_entry_at(now, protocol, status, Some(gateway_error), slot)
+    }
+
+    /// Mint for a response carrying `gateway_error`, or for an `all`-mode
+    /// gateway rejection without a token (`None`).
+    fn mint_entry_at(
+        &self,
+        now: Instant,
+        protocol: DiagnosticProtocol,
+        status: u16,
+        gateway_error: Option<&'static str>,
         slot: Option<&Arc<DiagnosticSlot>>,
     ) -> Option<String> {
         if let Some(existing) = slot.and_then(|slot| slot.minted.get()) {
@@ -740,7 +1193,7 @@ impl DiagnosticRefStore {
     }
 
     fn view(&self, reference: &str, entry: &Entry) -> DiagnosticRefView {
-        let detail = entry.slot.as_ref().and_then(|slot| slot.detail().cloned());
+        let detail = entry.slot.as_ref().and_then(|slot| slot.view_detail());
         DiagnosticRefView {
             schema_version: DIAGNOSTIC_REF_SCHEMA_VERSION,
             reference: reference.to_string(),
@@ -925,9 +1378,21 @@ pub fn strip_response_header(headers: &mut http::HeaderMap) {
     headers.remove(&DIAGNOSTIC_REF_HEADER_NAME);
 }
 
+/// Whether a response head reports an error: an HTTP status of at least
+/// `400`, or a gRPC Trailers-Only head whose `grpc-status` is not `0`.
+pub fn is_error_response(status: u16, headers: &http::HeaderMap) -> bool {
+    status >= 400
+        || headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim() != "0")
+}
+
 /// Strip every client-bound copy of the reference header, then stamp a fresh
 /// reference when the response carries a gateway-authored `X-Gateway-Error`
-/// token from the closed vocabulary. Returns the stamped reference.
+/// token from the closed vocabulary or, in `all` mode, when the request's slot
+/// recorded a gateway rejection and the head reports an error. Returns the
+/// stamped reference.
 pub fn stamp_response_headers(
     store: &DiagnosticRefStore,
     slot: Option<&Arc<DiagnosticSlot>>,
@@ -939,8 +1404,15 @@ pub fn stamp_response_headers(
     let token = headers
         .get(crate::proxy::headers::X_GATEWAY_ERROR_HEADER)
         .and_then(|value| value.to_str().ok())
-        .and_then(crate::retry::intern_http_observability_error_class)?;
-    let reference = store.mint(protocol, status, token, slot)?;
+        .and_then(crate::retry::intern_http_observability_error_class);
+    let gateway_rejection = token.is_none()
+        && store.mode.covers_gateway_rejections()
+        && slot.is_some_and(|slot| slot.rejection().is_some())
+        && is_error_response(status, headers);
+    if token.is_none() && !gateway_rejection {
+        return None;
+    }
+    let reference = store.mint_entry_at(Instant::now(), protocol, status, token, slot)?;
     let value = http::HeaderValue::from_str(&reference).ok()?;
     headers.insert(&DIAGNOSTIC_REF_HEADER_NAME, value);
     Some(reference)
@@ -1074,7 +1546,7 @@ pub fn install(
     if !mode.is_enabled() {
         return Ok(());
     }
-    let store = DiagnosticRefStore::new(namespace, config);
+    let store = DiagnosticRefStore::new(namespace, config).with_mode(mode);
     ACTIVE_STORE
         .set(store)
         .map_err(|_| ALREADY_INSTALLED_ERROR.to_string())
@@ -1099,6 +1571,85 @@ pub fn install_from_env_config(env_config: &crate::config::EnvConfig) -> Result<
 /// The process store, or `None` when references are off.
 pub fn active_store() -> Option<&'static DiagnosticRefStore> {
     ACTIVE_STORE.get()
+}
+
+/// Whether the process store mints for gateway rejections (`all`).
+pub fn gateway_rejections_enabled() -> bool {
+    active_store().is_some_and(|store| store.mode.covers_gateway_rejections())
+}
+
+/// Note the plugin whose hook rejected the request. A no-op (one `Option`
+/// check) when references are off.
+pub(crate) fn note_rejecting_plugin(ctx: &crate::plugins::RequestContext, plugin: &str) {
+    if let Some(slot) = ctx.diagnostic_slot() {
+        slot.note_rejecting_plugin(plugin);
+    }
+}
+
+/// Note the source of a backend admission rejection. A plugin-named source
+/// is the rejecting plugin; a `__`-prefixed source is a gateway-internal
+/// admission ceiling, not a plugin.
+pub(crate) fn note_admission_rejection_source(ctx: &crate::plugins::RequestContext, source: &str) {
+    if !source.starts_with("__") {
+        note_rejecting_plugin(ctx, source);
+    }
+}
+
+/// Record the gateway or plugin rejection that authored the request's
+/// response, from the shared rejection-log funnel, before the response head
+/// is written. A no-op when references are off.
+pub(crate) fn record_rejection(ctx: &crate::plugins::RequestContext, phase: &str) {
+    if let Some(slot) = ctx.diagnostic_slot() {
+        let rejection = DiagnosticRejection::new(phase, slot.rejecting_plugin());
+        slot.record_rejection(rejection);
+    }
+}
+
+/// The slot a gateway rejection answered before routing matched a proxy (a
+/// routing `404`, an admission fence) is recorded in. Only `all` mode
+/// references such a response when it carries no `X-Gateway-Error`, so this is
+/// `None` in `errors` mode as well as when references are off, and the callers
+/// build nothing then.
+fn unrouted_rejection_slot(slot: Option<&Arc<DiagnosticSlot>>) -> Option<&Arc<DiagnosticSlot>> {
+    slot.filter(|_| gateway_rejections_enabled())
+}
+
+/// Record a routing rejection (`phase` is [`ROUTE_NOT_FOUND_PHASE`] or
+/// [`MESH_REGISTRY_ONLY_PHASE`]) for a request received at `started`, with its
+/// unrouted detail.
+pub(crate) fn record_route_miss(
+    slot: Option<&Arc<DiagnosticSlot>>,
+    phase: &'static str,
+    started: Instant,
+) {
+    if let Some(slot) = unrouted_rejection_slot(slot) {
+        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        slot.record_rejection(DiagnosticRejection::routing(phase));
+        slot.record_detail(DiagnosticDetail::unrouted(latency_ms));
+    }
+}
+
+/// Record a frontend admission fence that answered before a request context
+/// existed, with its unrouted detail. Fences answer without waiting, so the
+/// duration bucket is the shortest one.
+pub(crate) fn record_admission_fence(slot: Option<&Arc<DiagnosticSlot>>, phase: &'static str) {
+    if let Some(slot) = unrouted_rejection_slot(slot) {
+        slot.record_rejection(DiagnosticRejection::gateway_fence(phase));
+        slot.record_detail(DiagnosticDetail::unrouted(0.0));
+    }
+}
+
+/// Note the TLS detail of a backend dispatch failure for the attempt the
+/// dispatch is about to report. A no-op when references are off.
+pub(crate) fn note_backend_tls_failure(
+    slot: Option<&Arc<DiagnosticSlot>>,
+    err: &(dyn std::error::Error + 'static),
+) {
+    if let Some(slot) = slot
+        && let Some(tls) = tls_detail(err)
+    {
+        slot.note_tls_failure(tls);
+    }
 }
 
 /// `/metrics` families; empty when references are off.

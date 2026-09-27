@@ -13,6 +13,10 @@
 //! * Every lookup attempt, a refused one included, is charged against a
 //!   per-subject share; only an authorized credential's attempt also spends
 //!   the global budget. Refused and rate-limited audit events are throttled.
+//! * `all` mode (issue #5846) also references a gateway rejection without an
+//!   `X-Gateway-Error` token, and only one a rejection site recorded; the
+//!   detail names the rejecting phase and plugin and every backend attempt,
+//!   with closed TLS labels, and stays bounded.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -21,9 +25,10 @@ use ferrum_edge::diagnostic_ref::{
     DIAGNOSTIC_REF_HEADER, DIAGNOSTIC_REF_LEN, DIAGNOSTIC_REF_PREFIX,
     DIAGNOSTIC_REF_SCHEMA_VERSION, DiagnosticDetail, DiagnosticProtocol, DiagnosticRefLookup,
     DiagnosticRefLookupAudit, DiagnosticRefLookupResult, DiagnosticRefMode, DiagnosticRefStore,
-    DiagnosticRefStoreConfig, DiagnosticSlot, MAX_TRACKED_LOOKUP_SUBJECTS, authorize_lookup,
+    DiagnosticRefStoreConfig, DiagnosticRejection, DiagnosticRejectionSource, DiagnosticSlot,
+    DiagnosticTlsDetail, MAX_RECORDED_ATTEMPTS, MAX_TRACKED_LOOKUP_SUBJECTS, authorize_lookup,
     backend_origin, duration_bucket, is_well_formed_ref, stamp_response_headers,
-    strip_response_header,
+    strip_response_header, tls_detail, tls_detail_from_rustls,
 };
 use ferrum_edge::grpc::auth::AllowedNamespaces;
 use ferrum_edge::plugins::TransactionSummary;
@@ -133,16 +138,21 @@ fn summary(status: u16, class: Option<ErrorClass>) -> TransactionSummary {
 // ── configuration ──────────────────────────────────────────────────────────
 
 #[test]
-fn mode_parses_only_off_and_errors() {
+fn mode_parses_only_off_errors_and_all() {
     assert_eq!(DiagnosticRefMode::parse("off"), Ok(DiagnosticRefMode::Off));
     assert_eq!(
         DiagnosticRefMode::parse(" Errors "),
         Ok(DiagnosticRefMode::Errors)
     );
+    assert_eq!(DiagnosticRefMode::parse("ALL"), Ok(DiagnosticRefMode::All));
+    assert_eq!(DiagnosticRefMode::All.as_str(), "all");
     assert_eq!(DiagnosticRefMode::default(), DiagnosticRefMode::Off);
     assert!(!DiagnosticRefMode::Off.is_enabled());
     assert!(DiagnosticRefMode::Errors.is_enabled());
-    for rejected in ["", "on", "all", "true", "error", "errors,all"] {
+    assert!(DiagnosticRefMode::All.is_enabled());
+    assert!(!DiagnosticRefMode::Errors.covers_gateway_rejections());
+    assert!(DiagnosticRefMode::All.covers_gateway_rejections());
+    for rejected in ["", "on", "every", "true", "error", "errors,all"] {
         assert!(
             DiagnosticRefMode::parse(rejected).is_err(),
             "{rejected:?} must fail closed at startup"
@@ -249,7 +259,7 @@ fn lookup_returns_the_versioned_view_and_detail_arrives_later() {
     assert_eq!(pending.namespace, NAMESPACE);
     assert_eq!(pending.protocol, DiagnosticProtocol::Http3);
     assert_eq!(pending.status, 502);
-    assert_eq!(pending.gateway_error, "connection_failure");
+    assert_eq!(pending.gateway_error, Some("connection_failure"));
     assert!(!pending.detail_available);
     assert!(pending.detail.is_none());
 
@@ -402,7 +412,7 @@ fn stamp_replaces_a_forged_reference_on_a_gateway_error_response() {
     assert_ne!(stamped, forged);
     assert!(store.lookup_at(Instant::now(), &forged).is_none());
     let view = store.lookup_at(Instant::now(), &stamped).unwrap();
-    assert_eq!(view.gateway_error, "connection_failure");
+    assert_eq!(view.gateway_error, Some("connection_failure"));
     assert_eq!(view.status, 502);
     assert_eq!(view.protocol, DiagnosticProtocol::Http2);
 }
@@ -440,7 +450,7 @@ fn every_public_token_is_stamped() {
         let stamped = stamp(&store, DiagnosticProtocol::Http1, 503, &mut headers)
             .unwrap_or_else(|| panic!("{token} must carry a reference"));
         let view = store.lookup_at(Instant::now(), &stamped).unwrap();
-        assert_eq!(view.gateway_error, *token);
+        assert_eq!(view.gateway_error, Some(*token));
         let public = headers.get("x-gateway-error").unwrap();
         assert_eq!(
             public.to_str().unwrap(),
@@ -917,4 +927,474 @@ fn every_http3_response_head_is_stamped() {
         }
     }
     assert!(sites >= 17, "only {sites} HTTP/3 head writes");
+}
+
+// ── `all` mode, rejection detail, and attempts (issue #5846) ───────────────
+
+fn all_mode_store() -> DiagnosticRefStore {
+    default_store().with_mode(DiagnosticRefMode::All)
+}
+
+fn rejection_headers() -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    headers
+}
+
+fn plugin_rejected_slot(phase: &str, plugin: &str) -> std::sync::Arc<DiagnosticSlot> {
+    let slot = DiagnosticSlot::shared();
+    slot.note_rejecting_plugin(plugin);
+    slot.record_rejection(DiagnosticRejection::new(phase, slot.rejecting_plugin()));
+    slot
+}
+
+#[test]
+fn store_mode_defaults_to_errors_and_off_never_widens_it() {
+    assert_eq!(default_store().mode(), DiagnosticRefMode::Errors);
+    assert_eq!(all_mode_store().mode(), DiagnosticRefMode::All);
+    let off = default_store().with_mode(DiagnosticRefMode::Off);
+    assert_eq!(off.mode(), DiagnosticRefMode::Errors);
+}
+
+#[test]
+fn all_mode_stamps_a_recorded_rejection_without_a_gateway_error_token() {
+    let store = all_mode_store();
+    let slot = plugin_rejected_slot("authenticate", "key_auth");
+    let mut headers = rejection_headers();
+    headers.insert(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
+
+    let stamped = stamp_response_headers(
+        &store,
+        Some(&slot),
+        DiagnosticProtocol::Http2,
+        401,
+        &mut headers,
+    )
+    .expect("a recorded plugin rejection is referenced in `all` mode");
+
+    let values: Vec<_> = headers.get_all(DIAGNOSTIC_REF_HEADER).iter().collect();
+    assert_eq!(values.len(), 1, "exactly one reference reaches the client");
+    assert_eq!(values[0].to_str().unwrap(), stamped);
+    assert!(!headers.contains_key("x-gateway-error"));
+    let view = store.lookup_at(Instant::now(), &stamped).unwrap();
+    assert_eq!(view.gateway_error, None);
+    assert_eq!(view.status, 401);
+    assert_eq!(slot.minted_ref(), Some(stamped.as_str()));
+    let body = serde_json::to_value(&view).unwrap();
+    assert!(body["gateway_error"].is_null(), "{body}");
+}
+
+#[test]
+fn errors_mode_never_stamps_a_rejection_without_a_gateway_error_token() {
+    let store = default_store();
+    let slot = plugin_rejected_slot("authorize", "access_control");
+    let mut headers = rejection_headers();
+    headers.insert(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
+    let stamped = stamp_response_headers(
+        &store,
+        Some(&slot),
+        DiagnosticProtocol::Http1,
+        403,
+        &mut headers,
+    );
+    assert!(stamped.is_none(), "`errors` keeps its #5767 contract");
+    assert!(!headers.contains_key(DIAGNOSTIC_REF_HEADER));
+    assert_eq!(store.minted_total(), 0);
+
+    // A gateway-error response is still referenced exactly as before.
+    let mut gateway_error = gateway_error_headers("overload");
+    let stamped = stamp_response_headers(
+        &store,
+        Some(&slot),
+        DiagnosticProtocol::Http1,
+        503,
+        &mut gateway_error,
+    );
+    assert!(stamped.is_some());
+}
+
+#[test]
+fn all_mode_leaves_responses_without_a_recorded_rejection_unmarked() {
+    let store = all_mode_store();
+    // A backend's own error relayed to the client: nothing recorded a
+    // gateway rejection in the request's slot.
+    let relayed = DiagnosticSlot::shared();
+    for status in [400u16, 404, 429, 500, 503] {
+        let mut headers = rejection_headers();
+        headers.insert(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
+        let stamped = stamp_response_headers(
+            &store,
+            Some(&relayed),
+            DiagnosticProtocol::Http1,
+            status,
+            &mut headers,
+        );
+        assert!(stamped.is_none(), "{status}: backend-authored");
+        assert!(!headers.contains_key(DIAGNOSTIC_REF_HEADER), "{status}");
+    }
+    // No slot at all (a head written outside a request task).
+    let mut headers = rejection_headers();
+    assert!(stamp(&store, DiagnosticProtocol::Http3, 404, &mut headers).is_none());
+    // A recorded rejection whose response is a success (a plugin
+    // short-circuit answering 2xx) is not an error response.
+    let short_circuit = plugin_rejected_slot("before_proxy", "request_termination");
+    let mut headers = rejection_headers();
+    let stamped = stamp_response_headers(
+        &store,
+        Some(&short_circuit),
+        DiagnosticProtocol::Http1,
+        200,
+        &mut headers,
+    );
+    assert!(stamped.is_none());
+    assert_eq!(store.minted_total(), 0);
+}
+
+#[test]
+fn all_mode_stamps_grpc_trailers_only_rejections() {
+    let store = all_mode_store();
+    let slot = plugin_rejected_slot("authenticate", "jwt_auth");
+    let mut headers = rejection_headers();
+    headers.insert("grpc-status", "16".parse().unwrap());
+    let stamped = stamp_response_headers(
+        &store,
+        Some(&slot),
+        DiagnosticProtocol::Http2,
+        200,
+        &mut headers,
+    );
+    assert!(stamped.is_some(), "grpc-status 16 is an error response");
+
+    let ok = plugin_rejected_slot("before_proxy", "request_termination");
+    let mut headers = rejection_headers();
+    headers.insert("grpc-status", "0".parse().unwrap());
+    let stamped = stamp_response_headers(
+        &store,
+        Some(&ok),
+        DiagnosticProtocol::Http2,
+        200,
+        &mut headers,
+    );
+    assert!(stamped.is_none(), "grpc-status 0 is a success");
+}
+
+#[test]
+fn error_response_classification_is_status_or_grpc_status() {
+    use ferrum_edge::diagnostic_ref::is_error_response;
+    let empty = http::HeaderMap::new();
+    assert!(!is_error_response(200, &empty));
+    assert!(!is_error_response(304, &empty));
+    assert!(is_error_response(400, &empty));
+    assert!(is_error_response(599, &empty));
+    let mut grpc = http::HeaderMap::new();
+    grpc.insert("grpc-status", "7".parse().unwrap());
+    assert!(is_error_response(200, &grpc));
+    grpc.insert("grpc-status", " 0 ".parse().unwrap());
+    assert!(!is_error_response(200, &grpc));
+}
+
+#[test]
+fn rejection_detail_carries_only_bounded_labels() {
+    let plugin = DiagnosticRejection::new("authorize", Some("access_control"));
+    assert_eq!(plugin.source, DiagnosticRejectionSource::Plugin);
+    assert_eq!(plugin.phase, "authorize");
+    assert_eq!(plugin.plugin.as_deref(), Some("access_control"));
+
+    let hook_without_plugin = DiagnosticRejection::new("authenticate", None);
+    assert_eq!(
+        hook_without_plugin.source,
+        DiagnosticRejectionSource::Plugin
+    );
+    assert_eq!(hook_without_plugin.plugin, None);
+
+    let fence = DiagnosticRejection::new("websocket_connection_limit", None);
+    assert_eq!(fence.source, DiagnosticRejectionSource::Gateway);
+    let routing = DiagnosticRejection::routing("route_not_found");
+    assert_eq!(routing.source, DiagnosticRejectionSource::Routing);
+    assert_eq!(routing.phase, "route_not_found");
+
+    let long_plugin = "p".repeat(65);
+    let hostile = DiagnosticRejection::new(
+        "phase /orders?token=abc",
+        Some("Bearer eyJhbGciOiJIUzI1NiJ9"),
+    );
+    assert_eq!(hostile.phase, "other", "free text is never echoed");
+    assert_eq!(hostile.plugin, None, "free text is never echoed");
+    let too_long = DiagnosticRejection::new(&"x".repeat(65), Some(long_plugin.as_str()));
+    assert_eq!(too_long.phase, "other");
+    assert_eq!(too_long.plugin, None);
+
+    let rendered = serde_json::to_value(&plugin).unwrap();
+    assert_eq!(rendered["source"], "plugin");
+    let without_plugin = serde_json::to_value(&fence).unwrap();
+    let keys: HashSet<&str> = without_plugin
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, HashSet::from(["source", "phase"]));
+
+    let slot = DiagnosticSlot::shared();
+    slot.note_rejecting_plugin("bad name with spaces");
+    assert_eq!(slot.rejecting_plugin(), None);
+}
+
+#[test]
+fn errors_mode_detail_shape_is_unchanged_without_rejection_or_attempts() {
+    let detail = DiagnosticDetail::from_summary(
+        &summary(502, Some(ErrorClass::ConnectionRefused)),
+        "pre_wire_failure",
+        None,
+    );
+    let body = serde_json::to_value(&detail).unwrap();
+    let keys: HashSet<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected = HashSet::from([
+        "error_class",
+        "body_error_class",
+        "rejection_phase",
+        "route_timeout_phase",
+        "backend_dispatch",
+        "proxy_id",
+        "backend_target",
+        "duration_bucket",
+    ]);
+    assert_eq!(keys, expected);
+}
+
+#[test]
+fn attempts_are_ordered_bounded_and_carry_tls_detail() {
+    let store = default_store();
+    let slot = DiagnosticSlot::shared();
+    let protocol = DiagnosticProtocol::Http1;
+    let reference = store
+        .mint(protocol, 502, "connection_failure", Some(&slot))
+        .unwrap();
+    let expired = DiagnosticTlsDetail {
+        failure: "certificate_verification",
+        reason: Some("expired"),
+    };
+
+    // A TLS failure keeps its noted detail; a status is never recorded for a
+    // failed attempt.
+    slot.note_tls_failure(expired);
+    slot.record_attempt(Some(ErrorClass::TlsError), false, Some(502));
+    // A noted detail is discarded when the attempt is not a TLS failure.
+    slot.note_tls_failure(expired);
+    slot.record_attempt(Some(ErrorClass::ConnectionRefused), false, None);
+    // A backend response keeps its status.
+    slot.record_attempt(None, true, Some(503));
+    // A post-wire failure is ambiguous.
+    slot.record_attempt(Some(ErrorClass::ReadWriteTimeout), true, None);
+
+    let (attempts, omitted) = slot.attempts();
+    assert_eq!(omitted, 0);
+    assert_eq!(attempts.len(), 4);
+    let numbers: Vec<u32> = attempts.iter().map(|attempt| attempt.attempt).collect();
+    assert_eq!(numbers, [1, 2, 3, 4]);
+    assert_eq!(attempts[0].backend_dispatch, "pre_wire_failure");
+    assert_eq!(attempts[0].error_class, Some("tls_error"));
+    assert_eq!(attempts[0].status, None);
+    assert_eq!(attempts[0].tls, Some(expired));
+    assert_eq!(attempts[1].error_class, Some("connection_refused"));
+    assert_eq!(attempts[1].tls, None);
+    assert_eq!(attempts[2].backend_dispatch, "backend_response");
+    assert_eq!(attempts[2].status, Some(503));
+    assert_eq!(attempts[2].error_class, None);
+    assert_eq!(attempts[3].backend_dispatch, "ambiguous_failure");
+
+    // The lookup only shows attempts once the detail is recorded.
+    let pending = store.lookup_at(Instant::now(), &reference).unwrap();
+    assert!(pending.detail.is_none());
+    let refused = summary(502, Some(ErrorClass::ConnectionRefused));
+    slot.record_detail(DiagnosticDetail::from_summary(&refused, "ambiguous_failure", None));
+
+    // Later attempts are counted, never retained.
+    for _ in 0..(MAX_RECORDED_ATTEMPTS + 3) {
+        slot.record_attempt(Some(ErrorClass::ConnectionRefused), false, None);
+    }
+    let view = store.lookup_at(Instant::now(), &reference).unwrap();
+    let detail = view.detail.expect("detail recorded");
+    assert_eq!(detail.attempts.len(), MAX_RECORDED_ATTEMPTS);
+    // 4 + MAX + 3 attempts recorded, MAX retained.
+    let omitted = 7u32;
+    assert_eq!(detail.attempts_omitted, omitted);
+    let body = serde_json::to_value(&detail).unwrap();
+    assert_eq!(
+        body["attempts"][0]["tls"]["failure"],
+        "certificate_verification"
+    );
+    assert_eq!(body["attempts"][0]["tls"]["reason"], "expired");
+    assert!(body["attempts"][1].get("tls").is_none(), "{body}");
+    assert!(body["attempts"][1].get("status").is_none(), "{body}");
+    assert_eq!(body["attempts_omitted"], omitted);
+}
+
+#[test]
+fn tls_detail_maps_rustls_errors_to_closed_labels() {
+    use rustls::{AlertDescription, CertificateError, Error};
+    let cases = [
+        (
+            Error::InvalidCertificate(CertificateError::Expired),
+            "certificate_verification",
+            Some("expired"),
+        ),
+        (
+            Error::InvalidCertificate(CertificateError::UnknownIssuer),
+            "certificate_verification",
+            Some("unknown_issuer"),
+        ),
+        (
+            Error::InvalidCertificate(CertificateError::NotValidForName),
+            "certificate_verification",
+            Some("not_valid_for_name"),
+        ),
+        (
+            Error::InvalidCertificate(CertificateError::Revoked),
+            "certificate_verification",
+            Some("revoked"),
+        ),
+        (
+            Error::AlertReceived(AlertDescription::UnknownCA),
+            "alert_received",
+            Some("unknown_ca"),
+        ),
+        (
+            Error::AlertReceived(AlertDescription::HandshakeFailure),
+            "alert_received",
+            Some("handshake_failure"),
+        ),
+        (
+            Error::AlertReceived(AlertDescription::CertificateRequired),
+            "alert_received",
+            Some("certificate_required"),
+        ),
+        (
+            Error::NoCertificatesPresented,
+            "no_certificates_presented",
+            None,
+        ),
+        (Error::DecryptError, "decrypt_error", None),
+        (
+            Error::NoApplicationProtocol,
+            "no_application_protocol",
+            None,
+        ),
+        (Error::General("secret-host.internal".into()), "other", None),
+    ];
+    for (error, failure, reason) in cases {
+        let detail = tls_detail_from_rustls(&error);
+        assert_eq!(detail.failure, failure, "{error:?}");
+        assert_eq!(detail.reason, reason, "{error:?}");
+        let rendered = serde_json::to_string(&detail).unwrap();
+        assert!(!rendered.contains("secret-host"), "{rendered}");
+    }
+
+    // The typed error is found through an `io::Error` wrapper, as rustls
+    // failures reach the dispatch paths.
+    let wrapped = std::io::Error::other(Error::InvalidCertificate(CertificateError::BadSignature));
+    let detail = tls_detail(&wrapped).expect("rustls error in the chain");
+    assert_eq!(detail.reason, Some("bad_signature"));
+    let plain = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+    assert_eq!(tls_detail(&plain), None);
+}
+
+#[test]
+fn request_context_records_attempts_into_its_slot_only() {
+    use ferrum_edge::_test_support::{
+        record_backend_attempt_for_test, set_diagnostic_slot_for_test,
+    };
+    use ferrum_edge::plugins::RequestContext;
+
+    // Without a slot (references off) recording is a no-op.
+    let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    record_backend_attempt_for_test(&ctx, None, true, Some(200));
+
+    let slot = DiagnosticSlot::shared();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    set_diagnostic_slot_for_test(&mut ctx, std::sync::Arc::clone(&slot));
+    record_backend_attempt_for_test(&ctx, Some(ErrorClass::ConnectionRefused), false, None);
+    // A context clone shares the request's slot.
+    let clone = ctx.clone();
+    record_backend_attempt_for_test(&clone, None, true, Some(200));
+    let (attempts, _) = slot.attempts();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].status, Some(200));
+}
+
+#[tokio::test]
+async fn rejection_log_funnel_records_the_rejecting_phase_and_plugin() {
+    use ferrum_edge::_test_support::set_diagnostic_slot_for_test;
+    use ferrum_edge::plugins::RequestContext;
+
+    let slot = DiagnosticSlot::shared();
+    let mut ctx = RequestContext::new("203.0.113.7".into(), "GET".into(), "/secret".into());
+    set_diagnostic_slot_for_test(&mut ctx, std::sync::Arc::clone(&slot));
+    slot.note_rejecting_plugin("rate_limiting");
+    ferrum_edge::proxy::log_rejected_request(&[], &ctx, 429, Instant::now(), "before_proxy", 0)
+        .await;
+    let rejection = slot.rejection().expect("funnel recorded the rejection");
+    assert_eq!(rejection.source, DiagnosticRejectionSource::Plugin);
+    assert_eq!(rejection.phase, "before_proxy");
+    assert_eq!(rejection.plugin.as_deref(), Some("rate_limiting"));
+
+    let fence_slot = DiagnosticSlot::shared();
+    let mut fence_ctx = RequestContext::new("203.0.113.7".into(), "GET".into(), "/".into());
+    set_diagnostic_slot_for_test(&mut fence_ctx, std::sync::Arc::clone(&fence_slot));
+    ferrum_edge::proxy::log_rejected_request(
+        &[],
+        &fence_ctx,
+        405,
+        Instant::now(),
+        "allowed_methods",
+        0,
+    )
+    .await;
+    let rejection = fence_slot.rejection().expect("gateway fence recorded");
+    assert_eq!(rejection.source, DiagnosticRejectionSource::Gateway);
+    assert_eq!(rejection.phase, "allowed_methods");
+    assert_eq!(rejection.plugin, None);
+}
+
+/// Every routing `404` and admission fence records its rejection before the
+/// response head is written, on HTTP/1.1, HTTP/2, and HTTP/3, and every plugin
+/// or gateway rejection passes through the shared rejection-log funnel.
+#[test]
+fn routing_misses_and_admission_fences_record_their_rejection() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let proxy = "src/proxy/mod.rs";
+    let h3 = "src/http3/server.rs";
+    let route_miss = "diagnostic_ref::ROUTE_NOT_FOUND_PHASE,";
+    let registry_miss = "diagnostic_ref::MESH_REGISTRY_ONLY_PHASE,";
+    let fence = "diagnostic_ref::record_admission_fence(";
+    let funnel = "diagnostic_ref::record_rejection(ctx, rejection_phase);";
+    let expectations = [
+        (proxy, route_miss, 1),
+        (proxy, registry_miss, 1),
+        (proxy, fence, 4),
+        (proxy, funnel, 1),
+        (h3, route_miss, 1),
+    ];
+    for (file, needle, expected) in expectations {
+        let source = std::fs::read_to_string(root.join(file)).expect("read source");
+        let found = source.matches(needle).count();
+        assert_eq!(found, expected, "{file}: `{needle}`");
+    }
+    // The funnel records before its no-consumer early return.
+    let path = root.join(proxy);
+    let source = std::fs::read_to_string(&path).expect("read source");
+    let start = source
+        .find("async fn log_rejected_request_with_path_and_backend_state(")
+        .expect("rejection-log funnel");
+    let body = &source[start..];
+    let record = body.find(funnel).expect("funnel records the rejection");
+    let early_return = body
+        .find("if plugins.is_empty() && !diagnostic_detail_wanted {")
+        .expect("no-consumer early return");
+    assert!(record < early_return);
 }

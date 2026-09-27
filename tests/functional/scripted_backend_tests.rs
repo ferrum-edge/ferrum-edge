@@ -2813,3 +2813,271 @@ async fn diagnostic_refs_replace_backend_forged_references() {
     );
     drop(backends);
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Gateway diagnostic references: `all` mode, rejection and attempt detail
+// (#5846).
+// ────────────────────────────────────────────────────────────────────────────
+
+const DIAGNOSTIC_API_KEY: &str = "diagnostic-ref-invalid-api-key-value";
+
+/// File-mode config for the `all`-mode tests: a `key_auth` route whose
+/// backend is never reached, a route to a backend that answers its own `404`,
+/// and a retrying route to a refused port.
+fn diagnostic_all_mode_yaml(refused_port: u16, backend_404_port: u16) -> String {
+    to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "diag-secure",
+                "listen_path": "/secure",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused_port,
+                "strip_listen_path": true,
+                "plugins": [{"plugin_config_id": "diag-key-auth"}],
+            },
+            {
+                "id": "diag-backend-404",
+                "listen_path": "/backend-404",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": backend_404_port,
+                "strip_listen_path": true,
+                "response_body_mode": "buffer",
+            },
+            {
+                "id": "diag-retry",
+                "listen_path": "/retry",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": refused_port,
+                "strip_listen_path": true,
+                "backend_connect_timeout_ms": 2000,
+                "retry": {
+                    "max_retries": 2,
+                    "retry_on_connect_failure": true,
+                    "retryable_methods": ["GET"],
+                    "backoff": {"fixed": {"delay_ms": 10}},
+                },
+            },
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "diag-key-auth",
+            "plugin_name": "key_auth",
+            "scope": "proxy",
+            "proxy_id": "diag-secure",
+            "enabled": true,
+            "config": {"key_location": "header:X-Api-Key"},
+        }],
+    }))
+}
+
+/// A backend that answers its own `404` to every request.
+fn spawn_backend_404(listener: tokio::net::TcpListener) -> ScriptedHttp1Backend {
+    ScriptedHttp1Backend::builder(listener)
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 404,
+            reason: "Not Found".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "2".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"no".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend")
+}
+
+/// The single reference on a gateway rejection that carries no
+/// `X-Gateway-Error` token.
+fn rejection_reference(headers: &http::HeaderMap) -> String {
+    assert!(
+        !headers.contains_key("x-gateway-error"),
+        "a plugin or routing rejection carries no X-Gateway-Error: {headers:?}"
+    );
+    let references: Vec<&str> = headers
+        .get_all("x-ferrum-diagnostic-ref")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(references.len(), 1, "exactly one reference: {headers:?}");
+    assert!(references[0].starts_with("fd1_"), "{references:?}");
+    references[0].to_string()
+}
+
+// With `FERRUM_DIAGNOSTIC_REFS=all`, a plugin rejection (`key_auth` 401) and a
+// routing miss (404) carry a reference that resolves to the rejecting phase
+// and plugin; a backend's own 404 carries none; and a retried connection
+// failure resolves to one entry per backend attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_all_mode_marks_plugin_and_routing_rejections() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_404_port = reservation.port;
+    let backend = spawn_backend_404(reservation.into_listener());
+    let gateway = TestGateway::builder()
+        .mode_file(diagnostic_all_mode_yaml(refused.port, backend_404_port))
+        .log_level("warn")
+        .jwt_secret(DIAGNOSTIC_JWT_SECRET)
+        .jwt_issuer(DIAGNOSTIC_JWT_ISSUER)
+        .env("FERRUM_DIAGNOSTIC_REFS", "all")
+        .env("FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND", "1000")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let admin = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("admin client");
+    let reader = diagnostic_token(json!({"scope": "diagnostics:read", "ns": ["ferrum"]}));
+
+    // Plugin rejection: `key_auth` refuses an unknown key with 401.
+    let rejected = client
+        .get(gateway.proxy_url("/secure/orders"))
+        .header("X-Api-Key", DIAGNOSTIC_API_KEY)
+        .send()
+        .await
+        .expect("key_auth response");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let plugin_ref = rejection_reference(rejected.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{plugin_ref}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 401, "{body}");
+    assert!(body["gateway_error"].is_null(), "{body}");
+    assert_eq!(body["detail_available"], true, "{body}");
+    let detail = &body["detail"];
+    assert_eq!(detail["backend_dispatch"], "not_dispatched", "{body}");
+    assert_eq!(detail["proxy_id"], "diag-secure", "{body}");
+    assert_eq!(detail["rejection"]["source"], "plugin", "{body}");
+    assert_eq!(detail["rejection"]["phase"], "authenticate", "{body}");
+    assert_eq!(detail["rejection"]["plugin"], "key_auth", "{body}");
+    assert!(detail.get("attempts").is_none(), "{body}");
+    let rendered = body.to_string();
+    for leaked in [DIAGNOSTIC_API_KEY, "/orders", "X-Api-Key"] {
+        assert!(!rendered.contains(leaked), "leaked {leaked}: {rendered}");
+    }
+
+    // Routing miss: no proxy matches.
+    let miss = client
+        .get(gateway.proxy_url("/no-such-route"))
+        .send()
+        .await
+        .expect("route miss response");
+    assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    let route_ref = rejection_reference(miss.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{route_ref}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["status"], 404, "{body}");
+    assert!(body["gateway_error"].is_null(), "{body}");
+    let detail = &body["detail"];
+    assert_eq!(detail["backend_dispatch"], "not_dispatched", "{body}");
+    assert!(detail["proxy_id"].is_null(), "{body}");
+    assert_eq!(detail["rejection"]["source"], "routing", "{body}");
+    assert_eq!(detail["rejection"]["phase"], "route_not_found", "{body}");
+    assert!(!body.to_string().contains("no-such-route"), "{body}");
+
+    // A backend's own 404 is relayed, not authored: no reference.
+    let relayed = client
+        .get(gateway.proxy_url("/backend-404/thing"))
+        .send()
+        .await
+        .expect("backend 404 response");
+    assert_eq!(relayed.status(), StatusCode::NOT_FOUND);
+    assert!(
+        !relayed.headers().contains_key("x-ferrum-diagnostic-ref"),
+        "a backend-authored error never carries a reference: {:?}",
+        relayed.headers()
+    );
+
+    // Retried connection failure: one attempt entry per dispatch.
+    let retried = client
+        .get(gateway.proxy_url("/retry"))
+        .send()
+        .await
+        .expect("retry response");
+    let retry_ref = gateway_error_reference(retried.status(), retried.headers());
+    let lookup_url = gateway.admin_url(&format!("/diagnostics/v1/refs/{retry_ref}"));
+    let body = resolve_detail(&admin, &lookup_url, &reader).await;
+    assert_eq!(body["gateway_error"], "connection_failure", "{body}");
+    let attempts = body["detail"]["attempts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("per-attempt detail: {body}"));
+    // The first dispatch plus two retries.
+    assert_eq!(attempts.len(), 3, "{body}");
+    for (index, attempt) in attempts.iter().enumerate() {
+        assert_eq!(attempt["attempt"], index + 1, "{body}");
+        assert_eq!(attempt["backend_dispatch"], "pre_wire_failure", "{body}");
+        assert!(attempt["error_class"].is_string(), "{body}");
+        assert!(attempt.get("status").is_none(), "{body}");
+    }
+    drop(backend);
+}
+
+// `errors` keeps its #5767 contract: a plugin rejection and a routing miss
+// carry no `X-Gateway-Error`, so they carry no reference either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn diagnostic_refs_errors_mode_leaves_plugin_and_routing_rejections_unmarked() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_404_port = reservation.port;
+    let backend = spawn_backend_404(reservation.into_listener());
+    let gateway = TestGateway::builder()
+        .mode_file(diagnostic_all_mode_yaml(refused.port, backend_404_port))
+        .log_level("warn")
+        .env("FERRUM_DIAGNOSTIC_REFS", "errors")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+
+    let rejected = client
+        .get(gateway.proxy_url("/secure/orders"))
+        .header("X-Api-Key", DIAGNOSTIC_API_KEY)
+        .send()
+        .await
+        .expect("key_auth response");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let miss = client
+        .get(gateway.proxy_url("/no-such-route"))
+        .send()
+        .await
+        .expect("route miss response");
+    assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    for (label, headers) in [
+        ("plugin 401", rejected.headers()),
+        ("route 404", miss.headers()),
+    ] {
+        assert!(
+            !headers.contains_key("x-ferrum-diagnostic-ref"),
+            "{label}: `errors` must not reference a response without X-Gateway-Error: \
+             {headers:?}"
+        );
+    }
+
+    // The gateway-authored connection failure is still referenced.
+    let retried = client
+        .get(gateway.proxy_url("/retry"))
+        .send()
+        .await
+        .expect("retry response");
+    let _ = gateway_error_reference(retried.status(), retried.headers());
+    drop(backend);
+}

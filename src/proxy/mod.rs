@@ -4430,6 +4430,7 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.name());
                 return reject;
             }
         }
@@ -4496,6 +4497,7 @@ pub(crate) async fn apply_client_request_contract_validation(
         match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.name());
                 return reject;
             }
         }
@@ -23234,9 +23236,16 @@ async fn log_rejected_request_with_path_and_backend_state(
     request_path_override: Option<&str>,
     include_backend_target: bool,
 ) {
+    // Gateway diagnostic references (issue #5846): every plugin and gateway
+    // rejection passes through here before its response head is written, so
+    // this is where the rejecting phase (and plugin, when its dispatcher noted
+    // one) is recorded. In `all` mode that record is what gives a rejection
+    // without `X-Gateway-Error` its reference.
+    crate::diagnostic_ref::record_rejection(ctx, rejection_phase);
     // With no plugin there is no log consumer, unless a gateway diagnostic
-    // reference (issue #5767) will resolve to this rejection's detail.
-    let diagnostic_detail_wanted = ctx.diagnostic_slot().is_some() && status_code >= 500;
+    // reference (issues #5767, #5846) will resolve to this rejection's detail.
+    let diagnostic_detail_wanted = ctx.diagnostic_slot().is_some()
+        && (status_code >= 500 || crate::diagnostic_ref::gateway_rejections_enabled());
     if plugins.is_empty() && !diagnostic_detail_wanted {
         return;
     }
@@ -29778,6 +29787,7 @@ async fn handle_backend_admission_rejection(
     apply_grpc_reject_metadata(ctx, &reject);
     let grpc_web_response =
         build_grpc_web_reject_response(plugins, ctx, grpc_web_error_content_type, &reject).await;
+    crate::diagnostic_ref::note_admission_rejection_source(ctx, &rejection.plugin_name);
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -30368,6 +30378,7 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
                 }
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.name());
                 return reject;
             }
         }
@@ -30949,6 +30960,10 @@ pub async fn run_authentication_phase_with_envelope(
             // even when no gateway Consumer record exists.
             let mut last_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
             let mut server_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
+            // Which plugin produced each retained rejection, for the gateway
+            // diagnostic reference detail (issue #5846).
+            let mut last_reject_plugin: Option<&str> = None;
+            let mut server_reject_plugin: Option<&str> = None;
             for auth_plugin in auth_plugins {
                 if !auth_plugin.authentication_applies(ctx) {
                     continue;
@@ -30982,9 +30997,11 @@ pub async fn run_authentication_phase_with_envelope(
                             if reject.0 >= 500 {
                                 if server_reject.is_none() {
                                     server_reject = Some(reject);
+                                    server_reject_plugin = Some(auth_plugin.name());
                                 }
                             } else {
                                 last_reject = Some(reject);
+                                last_reject_plugin = Some(auth_plugin.name());
                             }
                         }
                     }
@@ -31010,6 +31027,9 @@ pub async fn run_authentication_phase_with_envelope(
                 None
             } else {
                 let used_missing_reject = server_reject.is_none() && last_reject.is_none();
+                if let Some(plugin) = server_reject_plugin.or(last_reject_plugin) {
+                    crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin);
+                }
                 let mut reject = server_reject
                     .or(last_reject)
                     .unwrap_or_else(|| missing_authentication_reject(auth_plugins, ctx));
@@ -31042,6 +31062,7 @@ pub async fn run_authentication_phase_with_envelope(
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
+                            crate::diagnostic_ref::note_rejecting_plugin(ctx, auth_plugin.name());
                             let mut reject = (reject.status_code, reject.body, reject.headers);
                             attach_auth_rejection_set_cookie(ctx, &mut reject.2);
                             return Some(adapt_auth_reject_for_openai_envelope(
@@ -31223,6 +31244,10 @@ async fn admit_proxy_request_on_frontend_port(
             );
         }
         record_request(&state, 400);
+        crate::diagnostic_ref::record_admission_fence(
+            connection_metadata.diagnostic_slot.as_ref(),
+            "h1_framing_unverified",
+        );
         let mut response = build_response(StatusCode::BAD_REQUEST, error_body);
         response.headers_mut().insert(
             hyper::header::CONNECTION,
@@ -31249,6 +31274,10 @@ async fn admit_proxy_request_on_frontend_port(
     if crate::dp_config_freshness::new_traffic_blocked() {
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 503);
+        crate::diagnostic_ref::record_admission_fence(
+            connection_metadata.diagnostic_slot.as_ref(),
+            "config_stale",
+        );
         if is_grpc {
             return Ok(grpc_proxy::build_grpc_error_response(
                 grpc_proxy::grpc_status::UNAVAILABLE,
@@ -31285,6 +31314,10 @@ async fn admit_proxy_request_on_frontend_port(
         session.record_fenced();
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 401);
+        crate::diagnostic_ref::record_admission_fence(
+            connection_metadata.diagnostic_slot.as_ref(),
+            "client_trust_withdrawn",
+        );
         if is_grpc {
             return Ok(grpc_proxy::build_grpc_error_response(
                 grpc_proxy::grpc_status::UNAUTHENTICATED,
@@ -31329,6 +31362,10 @@ async fn admit_proxy_request_on_frontend_port(
     {
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 503);
+        crate::diagnostic_ref::record_admission_fence(
+            connection_metadata.diagnostic_slot.as_ref(),
+            "overload",
+        );
         if is_grpc {
             return Ok(grpc_proxy::build_grpc_error_response(
                 grpc_proxy::grpc_status::UNAVAILABLE,
@@ -32346,6 +32383,11 @@ async fn handle_proxy_request_inner(
                             "Mesh REGISTRY_ONLY: rejecting outbound route miss for unadmitted destination"
                         );
                         state.request_count.fetch_add(1, Ordering::Relaxed);
+                        crate::diagnostic_ref::record_route_miss(
+                            ctx.diagnostic_slot(),
+                            crate::diagnostic_ref::MESH_REGISTRY_ONLY_PHASE,
+                            start_time,
+                        );
                         let status =
                             StatusCode::from_u16(reject_status).unwrap_or(StatusCode::BAD_GATEWAY);
                         let body: &[u8] = if request_host.as_deref().is_none_or(|h| h.is_empty()) {
@@ -32365,6 +32407,11 @@ async fn handle_proxy_request_inner(
                     }
                     debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
                     state.request_count.fetch_add(1, Ordering::Relaxed);
+                    crate::diagnostic_ref::record_route_miss(
+                        ctx.diagnostic_slot(),
+                        crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
+                        start_time,
+                    );
                     let response = build_pre_plugin_reject_response(
                         StatusCode::NOT_FOUND,
                         br#"{"error":"Not Found"}"#,
@@ -32667,6 +32714,7 @@ async fn handle_proxy_request_inner(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
+                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.name());
                     let plugin_reject = plugin_result_into_reject_parts(reject)
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
@@ -33089,6 +33137,7 @@ async fn handle_proxy_request_inner(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
+                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.name());
                     let plugin_reject = plugin_result_into_reject_parts(reject)
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
@@ -36266,6 +36315,18 @@ async fn handle_proxy_request_inner(
                     }
                 }
 
+                // Diagnostic reference detail (issue #5846): this attempt is
+                // settled and a retry replaces it.
+                if dispatch_error == Some(retry::ErrorClass::TlsError)
+                    && let Err(error) = &grpc_result
+                {
+                    crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
+                }
+                ctx.record_backend_attempt(
+                    dispatch_error,
+                    dispatch_error.is_none_or(retry::request_reached_wire),
+                    None,
+                );
                 // The failed attempt's route budget ends here: backoff is bounded
                 // by the RPC's total deadline alone.
                 ctx.end_grpc_route_attempt();
@@ -36714,6 +36775,16 @@ async fn handle_proxy_request_inner(
         ctx.record_backend_dispatch_outcome(
             dispatch_error,
             dispatch_error.is_none_or(retry::request_reached_wire),
+        );
+        if dispatch_error == Some(retry::ErrorClass::TlsError)
+            && let Err(error) = &grpc_result
+        {
+            crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
+        }
+        ctx.record_backend_attempt(
+            dispatch_error,
+            dispatch_error.is_none_or(retry::request_reached_wire),
+            None,
         );
         match grpc_result {
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
@@ -39268,6 +39339,13 @@ async fn handle_proxy_request_inner(
                 }
             }
 
+            // Diagnostic reference detail (issue #5846): this attempt is settled
+            // and a retry replaces it.
+            ctx.record_backend_attempt(
+                result.error_class,
+                !result.connection_error,
+                Some(result.status_code),
+            );
             // A gRPC-flavored request's route attempt budget ends with the
             // failed attempt, so backoff is bounded by its total deadline alone.
             ctx.end_grpc_route_attempt();
@@ -39946,6 +40024,11 @@ async fn handle_proxy_request_inner(
     )
     .is_some();
     ctx.record_backend_dispatch_outcome(backend_resp.error_class, !backend_resp.connection_error);
+    ctx.record_backend_attempt(
+        backend_resp.error_class,
+        !backend_resp.connection_error,
+        Some(backend_resp.status_code),
+    );
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
@@ -43735,6 +43818,9 @@ pub(crate) async fn proxy_to_backend_retry(
                 };
             }
             let error_class = retry::classify_reqwest_error(&e);
+            if error_class == retry::ErrorClass::TlsError {
+                crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
+            }
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }
@@ -46366,6 +46452,10 @@ async fn proxy_to_backend(
                             backend_admission_started_at,
                             &e,
                         );
+                        crate::diagnostic_ref::note_backend_tls_failure(
+                            request_ctx.diagnostic_slot(),
+                            &e,
+                        );
                         return backend_dispatch_response(
                             http2_pool_sender_error_response(state, proxy, &e, resolved_ip.clone()),
                             None,
@@ -47893,6 +47983,9 @@ async fn proxy_to_backend(
                 );
             }
             let error_class = retry::classify_reqwest_error(&e);
+            if error_class == retry::ErrorClass::TlsError {
+                crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
+            }
             if error_class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }

@@ -3732,6 +3732,21 @@ impl RequestContext {
         self.backend_dispatch_state
     }
 
+    /// Record one completed backend attempt in the request's diagnostic
+    /// reference detail (issue #5846): once for each attempt the retry loop
+    /// replaces with another, and once for the attempt whose outcome the
+    /// client sees. A no-op when `FERRUM_DIAGNOSTIC_REFS` is off.
+    pub(crate) fn record_backend_attempt(
+        &self,
+        error_class: Option<crate::retry::ErrorClass>,
+        request_on_wire: bool,
+        response_status: Option<u16>,
+    ) {
+        if let Some(slot) = self.diagnostic_slot.as_ref() {
+            slot.record_attempt(error_class, request_on_wire, response_status);
+        }
+    }
+
     /// Phase of the matched route rule's total request deadline that produced
     /// this request's gateway-authored `504`, when one did.
     pub(crate) fn route_request_timeout_phase(&self) -> Option<&'static str> {

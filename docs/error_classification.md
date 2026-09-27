@@ -450,9 +450,29 @@ X-Ferrum-Diagnostic-Ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
 ```
 
 The value is `fd1_` plus 128 bits from the process CSPRNG in lowercase hex. It
-embeds nothing: no cause, route, backend, tenant, time, or counter. A response
-without an `X-Gateway-Error` token never carries a reference, and a request
-never carries two.
+embeds nothing: no cause, route, backend, tenant, time, or counter. With
+`errors`, a response without an `X-Gateway-Error` token never carries a
+reference, and a request never carries two.
+
+**`all` mode.** `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846) references every
+gateway-authored error response, not only those with an `X-Gateway-Error`
+token:
+
+- plugin rejections (for example a `key_auth` `401`, an `access_control`
+  `403`, a `rate_limiting` `429`, a request-validation `400`), in every plugin
+  phase;
+- gateway policy fences (allowed methods, WebSocket connection limits,
+  backend connection limits, and the HTTP/1.1 and HTTP/2 frontend admission
+  fences: unverifiable HTTP/1 framing, withdrawn client-certificate trust,
+  overload, stale configuration);
+- routing `404`s (no route matched) and mesh `REGISTRY_ONLY` route misses.
+
+gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
+as error responses. A response is gateway-authored only when its rejection site
+recorded it in the request's diagnostic slot before the head was written: a
+backend's own `4xx`/`5xx` relayed to the client never carries a reference, and
+neither does a plugin short-circuit that answers `2xx`/`3xx`. The lookup of such
+a reference has a `null` `gateway_error`.
 
 **Ownership.** The header is gateway-owned whatever the setting. A backend or
 serverless-function copy, in the headers or the trailers, is stripped at every
@@ -477,12 +497,33 @@ phase, the route-deadline phase, how far the request reached a backend
 headers, paths, query strings, credentials, client addresses, or raw error
 text.
 
+The detail also carries, when present (issue #5846):
+
+- `rejection`: the gateway policy or plugin that rejected the request —
+  `source` (`plugin`, `gateway`, or `routing`), the rejection `phase`
+  (`authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+  `route_not_found`, ...), and the rejecting `plugin` name when the phase knows
+  it. Each is a compiled-in label or a plugin type name of at most 64
+  characters; anything else is reported as `other` or dropped. Never plugin
+  configuration, credentials, or the rejection body.
+- `attempts`: every backend attempt, in dispatch order — one per attempt a
+  retry replaced plus the attempt the client saw. Each names its `attempt`
+  number, `backend_dispatch`, the backend `status` when it got a response, the
+  granular `error_class` when it failed, and, for a `tls_error` whose typed
+  TLS error was available (HTTP/1.1 and HTTP/2 reqwest dispatch, direct HTTP/2
+  pool, gRPC, and native HTTP/3 streaming dispatch), a closed `tls` object: the
+  `failure` kind (`certificate_verification`, `alert_received`,
+  `no_certificates_presented`, ...) and its `reason` (`expired`,
+  `unknown_issuer`, `not_valid_for_name`, the received alert such as
+  `unknown_ca`, ...). Certificate contents, names, and times are never
+  recorded. At most 8 attempts are listed; `attempts_omitted` counts the rest.
+
 **Bounds.** References live only in process memory, in 16 independently locked
 shards, for `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900). At most
 `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000) are retained; a full shard
-evicts its oldest reference. Each retained reference costs roughly 0.5–1 KB,
-so the default holds about 5–10 MB and the 1000000 maximum up to about
-0.5–1 GB. A restart forgets every reference. Lookup attempts are admitted at
+evicts its oldest reference. Each retained reference costs roughly 0.5–1 KB
+(up to about 1.5 KB with a full attempt list and a rejection record), so the
+default holds about 5–10 MB and the 1000000 maximum up to about 0.5–1.5 GB. A restart forgets every reference. Lookup attempts are admitted at
 `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) per second, with
 one JWT `sub` limited to half of that (at least 1). Every attempt counts
 against its `sub`'s share, including one refused with `403`; only an attempt
@@ -497,16 +538,19 @@ budget. Each
 
 **Cost.** Off: one `OnceLock` load per HTTP-family request and one header
 removal per response head. On: one small
-shared slot per request; on a response that carries `X-Gateway-Error`, one
-CSPRNG read and one short shard-lock critical section. Detail is copied from
-the terminal transaction summary only for a 5xx or a classified dispatch error.
+shared slot per request; on a response that gets a reference, one CSPRNG read
+and one short shard-lock critical section; one uncontended per-request mutex
+per backend attempt. Detail is copied from the terminal transaction summary
+only for a 5xx, a classified dispatch error, or, in `all` mode, a recorded
+gateway rejection. Every recording site is a single `Option` check when
+references are off.
 
-**Not covered yet.** Gateway-authored responses without an `X-Gateway-Error`
-token (plugin `401`/`403`/`429` rejections, routing `404`s) carry no reference;
-there is no `all` mode. The detail records the final attempt's outcome, not a
-per-attempt history (TLS alert detail per retry, per-attempt timing). A
-reference resolves only on the gateway process that minted it; there is no
-cross-replica or CP-side lookup.
+**Not covered yet.** A reference resolves only on the gateway process that
+minted it; there is no cross-replica or CP-side lookup. Attempts carry no
+per-attempt timing. A rejection that a plugin hook answers outside the shared
+rejection path (for example an `after_proxy` hook replacing a backend
+response) is not recorded as gateway-authored, so `all` mode does not
+reference it.
 
 ## Adding a new error path
 

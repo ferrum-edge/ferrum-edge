@@ -3209,6 +3209,11 @@ async fn handle_h3_request(
             (rm.proxy, rm.matched_prefix_len)
         }
         None => {
+            crate::diagnostic_ref::record_route_miss(
+                ctx.diagnostic_slot(),
+                crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
+                start_time,
+            );
             record_h3_flavor_aware_reject(&state, http_flavor, 404);
             send_h3_error_flavor_aware(
                 &mut stream,
@@ -3553,6 +3558,7 @@ async fn handle_h3_request(
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.name());
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
                     run_h3_reject_response_committed_hooks(
@@ -4032,6 +4038,7 @@ async fn handle_h3_request(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
+                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.name());
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
                         run_h3_reject_response_committed_hooks(
@@ -7193,6 +7200,13 @@ async fn handle_h3_request(
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
                 let h3_error_class = classify_h3_error(&e);
                 ctx.record_backend_dispatch_outcome(Some(h3_error_class), e.request_on_wire());
+                if h3_error_class == crate::retry::ErrorClass::TlsError {
+                    crate::diagnostic_ref::note_backend_tls_failure(
+                        ctx.diagnostic_slot(),
+                        e.as_error().as_ref(),
+                    );
+                }
+                ctx.record_backend_attempt(Some(h3_error_class), e.request_on_wire(), None);
                 crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
                 let is_client_request_body_disconnect =
                     is_h3_client_request_body_disconnect(&err_msg);
@@ -9229,6 +9243,13 @@ async fn handle_h3_request(
                     }
                 }
 
+                // Diagnostic reference detail (issue #5846): this attempt is
+                // settled and a retry replaces it.
+                ctx.record_backend_attempt(
+                    result.error_class,
+                    result.request_on_wire,
+                    Some(result.status),
+                );
                 // Backoff spends the route's total budget too; its expiry here
                 // is the health-neutral route timeout (#5646).
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -9556,6 +9577,7 @@ async fn handle_h3_request(
             sticky_dispatch_refused = true;
         }
         ctx.record_backend_dispatch_outcome(h3_error_class, h3_request_on_wire);
+        ctx.record_backend_attempt(h3_error_class, h3_request_on_wire, Some(response_status));
         // Record outcome against the final target (may differ from initial after retries).
         // `connection_error` shares the same typed body-on-wire signal as the
         // retry decision and CB above so passive-health / least-latency LB
@@ -10487,6 +10509,7 @@ async fn run_h3_backend_admission_or_send_reject(
                 )
             };
             record_request(state, log_status_code);
+            crate::diagnostic_ref::note_admission_rejection_source(ctx, &rejection.plugin_name);
             log_rejected_request(
                 plugins,
                 ctx,

@@ -3081,8 +3081,9 @@ pub struct EnvConfig {
     /// liveness (`/live`) stays healthy and no healthy listener is closed.
     pub gateway_listener_failure_fails_readiness: bool,
     /// Which gateway-authored responses carry an opaque
-    /// `X-Ferrum-Diagnostic-Ref` (`FERRUM_DIAGNOSTIC_REFS`, issue #5767).
-    /// Default: `off` (no store is allocated).
+    /// `X-Ferrum-Diagnostic-Ref` (`FERRUM_DIAGNOSTIC_REFS`, issues #5767 and
+    /// #5846): `off`, `errors`, or `all`. Default: `off` (no store is
+    /// allocated).
     pub diagnostic_refs: crate::diagnostic_ref::DiagnosticRefMode,
     /// Lifetime of a diagnostic reference in the in-memory store. Default: 900.
     pub diagnostic_ref_ttl_seconds: u64,
