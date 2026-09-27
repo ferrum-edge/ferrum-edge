@@ -131,6 +131,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half-close regardless of activity, so it can cut a backend that is still
   streaming its response. Only a peer close or an idle expiry still ends the
   stream with `END_STREAM`.
+- With `FERRUM_DIAGNOSTIC_REFS=errors`, a response a plugin replayed or
+  relayed as origin content no longer gets an `X-Ferrum-Diagnostic-Ref`, even
+  when it carries an `X-Gateway-Error` token (#5860). For example, a
+  `response_caching` hit of a backend `502` stored because
+  `cacheable_status_codes` lists `502` is left unmarked, in `all` mode too.
+  The gateway's own error responses are referenced as before, on HTTP/1.1,
+  HTTP/2, gRPC, and HTTP/3.
 - A Gateway API listener port whose HTTP/3 (QUIC) task died now gets HTTP/3
   back in the same reconcile pass (#5840). Before, the rebind could run before
   the dead endpoint released its UDP socket. It then failed with
@@ -178,6 +185,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already reported its failures, so nothing retried it. The task now retries
   that bind the same way, with its own 2-second budget. A listener shut down
   while it waits stops at once, so removing or replacing it is never delayed.
+- A UDP/DTLS stream listener whose own bind gave up after that 2-second budget
+  is retried as soon as the QUIC half on its port closes, even when the QUIC
+  socket closed just before the listener reported the failure (#5855). The
+  stream listener manager could judge that close before the failure was
+  recorded, so the port waited for the 30-second retry. The listener task now
+  checks for such a close after it records its failure and asks for a new
+  reconcile itself, which restarts the listener even if its task has not
+  finished exiting yet.
 
 ### Security
 

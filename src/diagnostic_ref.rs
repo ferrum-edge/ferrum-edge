@@ -8,7 +8,9 @@
 //!
 //! * With `FERRUM_DIAGNOSTIC_REFS=errors`, every HTTP-family response that
 //!   carries the gateway's own `X-Gateway-Error` token (HTTP/1.1, HTTP/2, and
-//!   HTTP/3) also carries `X-Ferrum-Diagnostic-Ref: fd1_<32 lowercase hex>`.
+//!   HTTP/3) also carries `X-Ferrum-Diagnostic-Ref: fd1_<32 lowercase hex>`,
+//!   unless a plugin replayed or relayed it as origin content (a cache hit of
+//!   a stored `5xx`, say).
 //!   The reference is 128 bits read from the process CSPRNG and embeds
 //!   nothing: no cause, route, backend, tenant, time, or counter.
 //! * With `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846), every gateway-authored
@@ -731,7 +733,9 @@ pub struct DiagnosticSlot {
     rejecting_plugin: OnceLock<Cow<'static, str>>,
     /// Set when the rejecting plugin answers with an origin-authored
     /// representation instead of a rejection of its own
-    /// ([`crate::plugins::Plugin::rejects_with_origin_response`]).
+    /// ([`crate::plugins::Plugin::rejects_with_origin_response`]), or when the
+    /// rejection funnel sees the request marked as serving one
+    /// (`RequestContext::serves_origin_representation`).
     origin_response: AtomicBool,
     attempt_log: Mutex<AttemptLog>,
 }
@@ -800,7 +804,8 @@ impl DiagnosticSlot {
 
     /// Note that the rejecting plugin's short-circuit is an origin-authored
     /// representation (a cache hit, a federated provider response), so no
-    /// gateway rejection is recorded for it.
+    /// gateway rejection is recorded for it and, in any mode, the response is
+    /// never stamped.
     pub fn note_origin_response(&self) {
         self.origin_response.store(true, Ordering::Relaxed);
     }
@@ -1494,8 +1499,10 @@ pub fn is_error_response(status: u16, headers: &http::HeaderMap) -> bool {
 /// Strip every client-bound copy of the reference header, then stamp a fresh
 /// reference when the response carries a gateway-authored `X-Gateway-Error`
 /// token from the closed vocabulary or, in `all` mode, when the request's slot
-/// recorded a gateway rejection and the head reports an error. Returns the
-/// stamped reference.
+/// recorded a gateway rejection and the head reports an error. In every mode an
+/// origin-authored representation a plugin replayed or relayed (the slot's
+/// [`DiagnosticSlot::serves_origin_response`]) is never stamped, whatever
+/// token it carries. Returns the stamped reference.
 pub fn stamp_response_headers(
     store: &DiagnosticRefStore,
     slot: Option<&Arc<DiagnosticSlot>>,
@@ -1504,6 +1511,9 @@ pub fn stamp_response_headers(
     headers: &mut http::HeaderMap,
 ) -> Option<String> {
     strip_response_header(headers);
+    if slot.is_some_and(|slot| slot.serves_origin_response()) {
+        return None;
+    }
     let token = headers
         .get(crate::proxy::headers::X_GATEWAY_ERROR_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -1721,15 +1731,20 @@ pub(crate) fn record_admission_rejection(
 /// mode that never references them for their own sake. An origin-authored
 /// representation a plugin replayed or relayed (a cache hit, an idempotent
 /// replay, a serverless terminate reply, a federated provider response) is
-/// never recorded, whatever its status: the gateway did not author it.
+/// never recorded, whatever its status: the gateway did not author it. It
+/// marks the slot instead, so [`stamp_response_headers`] leaves it unmarked in
+/// `errors` mode too, even when it carries a replayed `X-Gateway-Error` token.
 pub(crate) fn record_rejection(ctx: &crate::plugins::RequestContext, phase: &str, status: u16) {
     let Some(slot) = ctx.diagnostic_slot() else {
         return;
     };
-    if status < 500 && !gateway_rejections_enabled() {
+    if ctx.serves_origin_representation() {
+        // Carry the request's marker into the slot, so the final stamp leaves
+        // the replay unmarked even when it carries an `X-Gateway-Error` token.
+        slot.note_origin_response();
         return;
     }
-    if ctx.serves_origin_representation() || slot.serves_origin_response() {
+    if slot.serves_origin_response() || (status < 500 && !gateway_rejections_enabled()) {
         return;
     }
     let rejection = DiagnosticRejection::new(phase, slot.rejecting_plugin(), status);

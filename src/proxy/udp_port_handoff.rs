@@ -61,7 +61,11 @@
 //! ([`UdpPortHold::bind`]) with its own budget, started by its own first
 //! collision, instead of reporting a failure nothing would retry before the
 //! 30-second tick (issue #5851). The wait runs in the listener task, never in
-//! a reconcile pass.
+//! a reconcile pass. A release slower than that budget can still land between
+//! the task's last bind attempt and its failure report, and the supervisor
+//! then judges it against the older failures, so the task's release mark is
+//! taken before it is spawned and, once its failure is published, the task
+//! wakes the supervisor itself if its port was released since (issue #5855).
 //!
 //! Not on any hot path: the ledger is touched only when a datagram listener
 //! binds or closes its socket and when a bind has already failed.

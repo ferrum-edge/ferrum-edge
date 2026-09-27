@@ -452,7 +452,11 @@ X-Ferrum-Diagnostic-Ref: fd1_3f9c2a7e5b1d4c8a9e0f6b2d7c4a1e5f
 The value is `fd1_` plus 128 bits from the process CSPRNG in lowercase hex. It
 embeds nothing: no cause, route, backend, tenant, time, or counter. With
 `errors`, a response without an `X-Gateway-Error` token never carries a
-reference, and a request never carries two.
+reference, and a request never carries two. Neither does an origin-authored
+representation a plugin replayed or relayed, even when it carries an
+`X-Gateway-Error` token (issue #5860): a `response_caching` hit of a backend
+`502` stored because `cacheable_status_codes` lists `502` carries no reference,
+in either mode, while the gateway's own `502` still does.
 
 **`all` mode.** `FERRUM_DIAGNOSTIC_REFS=all` (issue #5846) references every
 gateway-authored error response, not only those with an `X-Gateway-Error`
@@ -468,8 +472,12 @@ token:
 - routing `404`s (no route matched) and mesh `REGISTRY_ONLY` route misses.
 
 gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
-as error responses. A response is gateway-authored only when its rejection site
-recorded it in the request's diagnostic slot before the head was written, and
+as error responses. A gRPC-Web rejection whose `grpc-status` is carried only in
+the body's trailer frame (an HTTP `200` head without `grpc-status`) is not
+recognized as an error when the head is stamped, so it carries no reference:
+such a rejection can be under-marked, but it never gets a false reference. A
+response is gateway-authored only when its rejection site recorded it in the
+request's diagnostic slot before the head was written, and
 only on a head whose status is the one that rejection recorded (a rejection a
 later phase replaced marks nothing). A backend's own `4xx`/`5xx` never carries a
 reference: not when it is relayed to the client, and not when a plugin replays

@@ -1705,7 +1705,11 @@ other gateway-authored error response carries one too — plugin rejections
 `null` `gateway_error` and a `detail.rejection` naming the rejecting phase and
 plugin. A backend's own error response never carries a reference, whether
 relayed to the client or replayed by a plugin (a cache hit, an idempotent
-replay, a serverless terminate reply, a federated provider response). Only the
+replay, a serverless terminate reply, a federated provider response); in either
+mode a plugin's replay is left unmarked even when it carries an
+`X-Gateway-Error` token (a cached `502`, say). A gRPC-Web rejection whose
+`grpc-status` is carried only in the body's trailer frame is not marked in
+`all` mode: it can be under-marked, never falsely referenced. Only the
 gateway process that served the response can resolve it. See
 [error_classification.md](error_classification.md#gateway-diagnostic-references)
 for the contract and bounds.

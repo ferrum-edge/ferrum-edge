@@ -553,7 +553,10 @@ closes during startup, before the retry loop begins, is not missed (#5851). A
 stream listener's pass only checks that the port is free and its listener task
 binds the socket afterwards, so the task's own bind retries the same collision
 with a 2-second budget of its own; a listener shut down while it waits stops at
-once, so its manager's next reconcile never waits on it. TCP/TLS raw-stream
+once, so its manager's next reconcile never waits on it. If that budget runs
+out and the QUIC socket closes just before the task reports the failure, the
+task itself asks for a new reconcile, so the port is still retried at once
+rather than on the next tick (#5855). TCP/TLS raw-stream
 collisions still refuse the whole HTTP-family listener; plaintext HTTP
 listeners remain unaffected by UDP/DTLS same-port claims.
 
