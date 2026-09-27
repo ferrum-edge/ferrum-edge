@@ -469,10 +469,15 @@ token:
 
 gRPC Trailers-Only rejections (HTTP `200` with a non-zero `grpc-status`) count
 as error responses. A response is gateway-authored only when its rejection site
-recorded it in the request's diagnostic slot before the head was written: a
-backend's own `4xx`/`5xx` relayed to the client never carries a reference, and
-neither does a plugin short-circuit that answers `2xx`/`3xx`. The lookup of such
-a reference has a `null` `gateway_error`.
+recorded it in the request's diagnostic slot before the head was written, and
+only on a head whose status is the one that rejection recorded (a rejection a
+later phase replaced marks nothing). A backend's own `4xx`/`5xx` never carries a
+reference: not when it is relayed to the client, and not when a plugin replays
+or relays it as its short-circuit (a `response_caching` or `ai_semantic_cache`
+hit, a `request_deduplication` idempotent replay, a `serverless_function`
+terminate reply, an `ai_federation` provider response or provider-failure
+envelope). Neither does a plugin short-circuit that answers `2xx`/`3xx`. The
+lookup of such a reference has a `null` `gateway_error`.
 
 **Ownership.** The header is gateway-owned whatever the setting. A backend or
 serverless-function copy, in the headers or the trailers, is stripped at every
@@ -502,12 +507,18 @@ The detail also carries, when present (issue #5846):
 - `rejection`: the gateway policy or plugin that rejected the request —
   `source` (`plugin`, `gateway`, or `routing`), the rejection `phase`
   (`authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
-  `route_not_found`, ...), and the rejecting `plugin` name when the phase knows
-  it. Each is a compiled-in label or a plugin type name of at most 64
-  characters; anything else is reported as `other` or dropped. Never plugin
-  configuration, credentials, or the rejection body.
+  `backend_admission`, `route_not_found`, ...), and the rejecting `plugin` name
+  when the phase knows it. The phase is always one of the gateway's compiled-in labels (any other is
+  reported as `other`); the plugin is a built-in plugin name or a custom plugin
+  type name of at most 64 label characters (anything else is dropped). Never
+  plugin configuration, credentials, or the rejection body. In `errors` mode a
+  rejection is recorded only for a `5xx`, so a `4xx` rejection costs no
+  diagnostic bookkeeping there.
 - `attempts`: every backend attempt, in dispatch order — one per attempt a
-  retry replaced plus the attempt the client saw. Each names its `attempt`
+  retry replaced plus the attempt the client saw. A retry loop that ends
+  without sending another attempt (its backoff reached the route or gRPC
+  deadline, the next target's circuit breaker was open, or the rotated target
+  was refused) adds no entry for it. Each names its `attempt`
   number, `backend_dispatch`, the backend `status` when it got a response, the
   granular `error_class` when it failed, and, for a `tls_error` whose typed
   TLS error was available (HTTP/1.1 and HTTP/2 reqwest dispatch, direct HTTP/2

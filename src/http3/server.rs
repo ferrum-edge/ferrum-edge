@@ -3213,6 +3213,11 @@ async fn handle_h3_request(
                 ctx.diagnostic_slot(),
                 crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
                 start_time,
+                h3_error_head_status(
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    StatusCode::NOT_FOUND,
+                ),
             );
             record_h3_flavor_aware_reject(&state, http_flavor, 404);
             send_h3_error_flavor_aware(
@@ -3558,7 +3563,7 @@ async fn handle_h3_request(
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.name());
+                crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
                     run_h3_reject_response_committed_hooks(
@@ -4038,7 +4043,7 @@ async fn handle_h3_request(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
-                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.name());
+                    crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
                         run_h3_reject_response_committed_hooks(
@@ -9017,6 +9022,12 @@ async fn handle_h3_request(
         // candidate for outcome/logging attribution, but nothing served this
         // response, so it must not become a sticky-affinity binding.
         let mut sticky_dispatch_refused = false;
+        // Diagnostic reference detail (issue #5846): set once the retry loop
+        // has recorded the attempt behind `result`, and cleared by every retry
+        // dispatch, so a loop that ends without dispatching again (a backoff
+        // deadline, a refused rotated target) records no attempt that was
+        // never sent.
+        let mut last_attempt_recorded = false;
         let (
             mut response_status,
             response_body,
@@ -9250,6 +9261,7 @@ async fn handle_h3_request(
                     result.request_on_wire,
                     Some(result.status),
                 );
+                last_attempt_recorded = true;
                 // Backoff spends the route's total budget too; its expiry here
                 // is the health-neutral route timeout (#5646).
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -9500,6 +9512,7 @@ async fn handle_h3_request(
                     Ok(result) => result,
                     Err(expiry) => h3_route_deadline_buffered_result(&mut ctx, expiry),
                 };
+                last_attempt_recorded = false;
             }
 
             (
@@ -9577,7 +9590,9 @@ async fn handle_h3_request(
             sticky_dispatch_refused = true;
         }
         ctx.record_backend_dispatch_outcome(h3_error_class, h3_request_on_wire);
-        ctx.record_backend_attempt(h3_error_class, h3_request_on_wire, Some(response_status));
+        if !last_attempt_recorded {
+            ctx.record_backend_attempt(h3_error_class, h3_request_on_wire, Some(response_status));
+        }
         // Record outcome against the final target (may differ from initial after retries).
         // `connection_error` shares the same typed body-on-wire signal as the
         // retry decision and CB above so passive-health / least-latency LB
@@ -10509,7 +10524,11 @@ async fn run_h3_backend_admission_or_send_reject(
                 )
             };
             record_request(state, log_status_code);
-            crate::diagnostic_ref::note_admission_rejection_source(ctx, &rejection.plugin_name);
+            crate::diagnostic_ref::record_admission_rejection(
+                ctx,
+                &rejection.plugin_name,
+                log_status_code,
+            );
             log_rejected_request(
                 plugins,
                 ctx,
@@ -19087,6 +19106,20 @@ fn record_request(state: &ProxyState, status: u16) {
             .fetch_add(1, Ordering::Relaxed);
     }
     crate::runtime_metrics::global_ref().record_http_status(status);
+}
+
+/// HTTP status of the head [`send_h3_error_flavor_aware`] writes: a gRPC or
+/// gRPC-Web error answers `200` carrying its `grpc-status`.
+fn h3_error_head_status(
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    http_status: StatusCode,
+) -> u16 {
+    if grpc_web_response_content_type.is_some() || matches!(flavor, HttpFlavor::Grpc) {
+        StatusCode::OK.as_u16()
+    } else {
+        http_status.as_u16()
+    }
 }
 
 /// Record the HTTP status actually emitted by a flavor-aware H3 rejection.

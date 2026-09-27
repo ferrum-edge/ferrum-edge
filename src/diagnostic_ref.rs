@@ -15,8 +15,10 @@
 //!   error response carries one as well: the `errors` set, plus the plugin
 //!   rejections (`401`/`403`/`429`, ...), gateway policy fences, and routing
 //!   `404`s that carry no `X-Gateway-Error`. A response is gateway-authored only
-//!   when a rejection site recorded it in the request's slot; a backend's own
-//!   `4xx`/`5xx` relayed to the client never carries a reference.
+//!   when a rejection site recorded it in the request's slot for the status the
+//!   head carries; a backend's own `4xx`/`5xx`, relayed to the client or
+//!   replayed by a plugin (a cache hit, an idempotent replay, a serverless
+//!   terminate reply, a federated provider response), never carries one.
 //! * The detail behind a reference lives only in this process, in a bounded,
 //!   TTL-limited, sharded in-memory store ([`DiagnosticRefStore`]). It is
 //!   readable only through the authenticated admin lookup
@@ -45,14 +47,18 @@
 //! mutexes. Detail is copied into the slot from the terminal transaction
 //! summary, and only for a summary that can carry `X-Gateway-Error` (5xx or a
 //! classified dispatch error) or, in `all` mode, a recorded gateway rejection.
-//! Each backend attempt takes one uncontended per-request mutex.
+//! A rejection is recorded only in `all` mode or for a `5xx`, its phase is a
+//! compiled-in label, and a built-in plugin's name is borrowed, so an `errors`
+//! mode `4xx` rejection does no bookkeeping. Each backend attempt takes one
+//! uncontended per-request mutex.
 
+use std::borrow::Cow;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::hash::BuildHasher;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -132,9 +138,16 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 /// many retries a route allows.
 pub const MAX_RECORDED_ATTEMPTS: usize = 8;
 
-/// Longest rejection phase or plugin name the detail records. A longer or
-/// non-label value is recorded as `other` (phase) or dropped (plugin).
+/// Longest plugin name the detail records. A longer or non-label value is
+/// dropped.
 pub const MAX_REJECTION_LABEL_LEN: usize = 64;
+
+/// Rejection phase recorded for a phase outside the compiled-in phase set.
+pub const OTHER_REJECTION_PHASE: &str = "other";
+
+/// Rejection phase of a backend admission refusal (a backend-admission plugin
+/// or a gateway-internal admission ceiling).
+pub const BACKEND_ADMISSION_PHASE: &str = "backend_admission";
 
 /// Rejection phase of a request that matched no route (`404`).
 pub const ROUTE_NOT_FOUND_PHASE: &str = "route_not_found";
@@ -145,14 +158,59 @@ pub const MESH_REGISTRY_ONLY_PHASE: &str = "mesh_registry_only";
 
 /// Plugin hook phases. A rejection recorded in one of them is a plugin
 /// rejection even when the rejecting plugin's name is not known.
-const PLUGIN_HOOK_PHASES: [&str; 7] = [
+const PLUGIN_HOOK_PHASES: [&str; 9] = [
     "on_request_received",
     "authenticate",
     "authorize",
+    "normalize_buffered_request_body",
+    "validate_client_request_contract",
     "before_proxy",
     "on_backend_path_resolved",
     "on_final_request_body",
     "after_proxy",
+];
+
+/// Every gateway policy phase the detail can name besides
+/// [`PLUGIN_HOOK_PHASES`]. The recorded phase is always one of these
+/// compiled-in labels, or [`OTHER_REJECTION_PHASE`], never the caller's string.
+const GATEWAY_REJECTION_PHASES: &[&str] = &[
+    ROUTE_NOT_FOUND_PHASE,
+    MESH_REGISTRY_ONLY_PHASE,
+    BACKEND_ADMISSION_PHASE,
+    "h1_framing_unverified",
+    "config_stale",
+    "client_trust_withdrawn",
+    "overload",
+    "allowed_methods",
+    "max_forwards",
+    "backend_max_connections",
+    "circuit_breaker",
+    "circuit_breaker_open",
+    "finalized_request_egress",
+    "websocket_connection_limit",
+    "websocket_per_ip_connection_limit",
+    "websocket_credential_expired",
+    "websocket_max_lifetime",
+    "grpc_deadline_preflight",
+    "grpc_deadline_upload_before_authenticate",
+    "grpc_deadline_upload_before_authorize",
+    "grpc_deadline_upload_before_before_proxy",
+    "grpc_deadline_upload_before_dispatch",
+    "grpc_deadline_upload_before_cross_protocol_dispatch",
+    "grpc_deadline_terminal_request_body",
+    "grpc_deadline_buffered_grpc_upload",
+    "grpc_deadline_buffered_h3_bridge_upload",
+    "mesh_inbound_peer_auth_initial_route_mismatch",
+    "mesh_inbound_peer_auth_transport_mismatch",
+    "mesh_inbound_peer_auth_retry_target_mismatch",
+    "hbone_upgrade_missing",
+    "hbone_request_buffered",
+    "hbone_circuit_breaker_open",
+    "hbone_udp_no_destination",
+    "hbone_udp_egress_session_cap",
+    "hbone_dns",
+    "hbone_connect",
+    "hbone_connect_timeout",
 ];
 
 const MODE_PARSE_ERROR: &str = "FERRUM_DIAGNOSTIC_REFS must be `off`, `errors`, or `all`";
@@ -365,19 +423,26 @@ pub struct DiagnosticRejection {
     pub source: DiagnosticRejectionSource,
     /// Rejection phase or policy (`authenticate`, `authorize`, `before_proxy`,
     /// `allowed_methods`, `websocket_connection_limit`, `route_not_found`,
-    /// ...). A value that is not a short label is recorded as `other`.
-    pub phase: String,
-    /// Name of the rejecting plugin, when the phase that rejected knows it.
+    /// ...). A phase outside the compiled-in set is recorded as `other`.
+    pub phase: &'static str,
+    /// Name of the rejecting plugin, when the phase that rejected knows it. A
+    /// built-in plugin's name is borrowed, never copied.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub plugin: Option<String>,
+    pub plugin: Option<Cow<'static, str>>,
+    /// HTTP status of the response head this rejection authored. A reference
+    /// is stamped only on a head with this status, so a rejection a later
+    /// phase replaced never marks the response that replaced it. The lookup
+    /// view reports the stamped status on its own.
+    #[serde(skip)]
+    pub status: u16,
 }
 
 impl DiagnosticRejection {
-    /// A rejection in `phase`, by `plugin` when known. A plugin hook phase or
-    /// a known plugin makes it a plugin rejection; anything else is a gateway
-    /// policy rejection.
-    pub fn new(phase: &str, plugin: Option<&str>) -> Self {
-        let plugin = plugin.and_then(bounded_label);
+    /// A rejection in `phase` answered with `status`, by `plugin` when known.
+    /// A plugin hook phase or a known plugin makes it a plugin rejection;
+    /// anything else is a gateway policy rejection.
+    pub fn new(phase: &str, plugin: Option<&str>, status: u16) -> Self {
+        let plugin = plugin.and_then(plugin_label);
         let source = if plugin.is_some() || PLUGIN_HOOK_PHASES.contains(&phase) {
             DiagnosticRejectionSource::Plugin
         } else {
@@ -385,37 +450,55 @@ impl DiagnosticRejection {
         };
         Self {
             source,
-            phase: bounded_label(phase).unwrap_or_else(|| "other".to_string()),
+            phase: rejection_phase_label(phase),
             plugin,
+            status,
         }
     }
 
     /// A routing rejection (`route_not_found`, `mesh_registry_only`).
-    pub fn routing(phase: &'static str) -> Self {
+    pub fn routing(phase: &'static str, status: u16) -> Self {
         Self {
             source: DiagnosticRejectionSource::Routing,
-            phase: phase.to_string(),
+            phase: rejection_phase_label(phase),
             plugin: None,
+            status,
         }
     }
 
     /// A gateway admission fence that answered before a request context
     /// existed.
-    pub fn gateway_fence(phase: &'static str) -> Self {
+    pub fn gateway_fence(phase: &'static str, status: u16) -> Self {
         Self {
             source: DiagnosticRejectionSource::Gateway,
-            phase: phase.to_string(),
+            phase: rejection_phase_label(phase),
             plugin: None,
+            status,
         }
     }
 }
 
-/// `value` when it is a short identifier-like label, never free text.
-fn bounded_label(value: &str) -> Option<String> {
-    let is_label = !value.is_empty()
-        && value.len() <= MAX_REJECTION_LABEL_LEN
-        && value.bytes().all(is_label_byte);
-    is_label.then(|| value.to_string())
+/// The compiled-in label equal to `phase`, or [`OTHER_REJECTION_PHASE`].
+fn rejection_phase_label(phase: &str) -> &'static str {
+    PLUGIN_HOOK_PHASES
+        .iter()
+        .chain(GATEWAY_REJECTION_PHASES)
+        .find(|label| **label == phase)
+        .copied()
+        .unwrap_or(OTHER_REJECTION_PHASE)
+}
+
+/// A plugin name as a label: a built-in plugin's own static name, or a copy of
+/// a custom plugin's name when it is a short identifier-like label. Free text
+/// is never recorded.
+fn plugin_label(plugin: &str) -> Option<Cow<'static, str>> {
+    if let Some(registration) = crate::plugins::builtin_plugin_registration(plugin) {
+        return Some(Cow::Borrowed(registration.name));
+    }
+    let is_label = !plugin.is_empty()
+        && plugin.len() <= MAX_REJECTION_LABEL_LEN
+        && plugin.bytes().all(is_label_byte);
+    is_label.then(|| Cow::Owned(plugin.to_string()))
 }
 
 fn is_label_byte(byte: u8) -> bool {
@@ -645,7 +728,11 @@ pub struct DiagnosticSlot {
     rejection: OnceLock<DiagnosticRejection>,
     /// Name of the plugin whose hook rejected the request, noted by the hook
     /// dispatcher before the rejection is logged.
-    rejecting_plugin: OnceLock<String>,
+    rejecting_plugin: OnceLock<Cow<'static, str>>,
+    /// Set when the rejecting plugin answers with an origin-authored
+    /// representation instead of a rejection of its own
+    /// ([`crate::plugins::Plugin::rejects_with_origin_response`]).
+    origin_response: AtomicBool,
     attempt_log: Mutex<AttemptLog>,
 }
 
@@ -694,16 +781,32 @@ impl DiagnosticSlot {
         self.rejection.get()
     }
 
+    /// Whether the recorded rejection authored a response head with `status`.
+    pub fn authored_status(&self, status: u16) -> bool {
+        matches!(self.rejection(), Some(rejection) if rejection.status == status)
+    }
+
     /// Note the plugin whose hook rejected the request. Dropped unless the
-    /// name is a short label.
+    /// name is a built-in plugin or a short label.
     pub fn note_rejecting_plugin(&self, plugin: &str) {
-        if let Some(plugin) = bounded_label(plugin) {
+        if let Some(plugin) = plugin_label(plugin) {
             let _ = self.rejecting_plugin.set(plugin);
         }
     }
 
     pub fn rejecting_plugin(&self) -> Option<&str> {
-        self.rejecting_plugin.get().map(String::as_str)
+        self.rejecting_plugin.get().map(|plugin| &**plugin)
+    }
+
+    /// Note that the rejecting plugin's short-circuit is an origin-authored
+    /// representation (a cache hit, a federated provider response), so no
+    /// gateway rejection is recorded for it.
+    pub fn note_origin_response(&self) {
+        self.origin_response.store(true, Ordering::Relaxed);
+    }
+
+    pub fn serves_origin_response(&self) -> bool {
+        self.origin_response.load(Ordering::Relaxed)
     }
 
     fn lock_attempts(&self) -> MutexGuard<'_, AttemptLog> {
@@ -1407,7 +1510,7 @@ pub fn stamp_response_headers(
         .and_then(crate::retry::intern_http_observability_error_class);
     let gateway_rejection = token.is_none()
         && store.mode.covers_gateway_rejections()
-        && slot.is_some_and(|slot| slot.rejection().is_some())
+        && slot.is_some_and(|slot| slot.authored_status(status))
         && is_error_response(status, headers);
     if token.is_none() && !gateway_rejection {
         return None;
@@ -1578,31 +1681,59 @@ pub fn gateway_rejections_enabled() -> bool {
     active_store().is_some_and(|store| store.mode.covers_gateway_rejections())
 }
 
-/// Note the plugin whose hook rejected the request. A no-op (one `Option`
+/// Note the plugin whose hook rejected the request, and whether its
+/// short-circuit is an origin-authored representation. A no-op (one `Option`
 /// check) when references are off.
-pub(crate) fn note_rejecting_plugin(ctx: &crate::plugins::RequestContext, plugin: &str) {
+pub(crate) fn note_rejecting_plugin(
+    ctx: &crate::plugins::RequestContext,
+    plugin: &dyn crate::plugins::Plugin,
+) {
     if let Some(slot) = ctx.diagnostic_slot() {
-        slot.note_rejecting_plugin(plugin);
+        slot.note_rejecting_plugin(plugin.name());
+        if plugin.rejects_with_origin_response() {
+            slot.note_origin_response();
+        }
     }
 }
 
-/// Note the source of a backend admission rejection. A plugin-named source
-/// is the rejecting plugin; a `__`-prefixed source is a gateway-internal
-/// admission ceiling, not a plugin.
-pub(crate) fn note_admission_rejection_source(ctx: &crate::plugins::RequestContext, source: &str) {
-    if !source.starts_with("__") {
-        note_rejecting_plugin(ctx, source);
+/// Record a backend admission rejection answered with `status`. A
+/// plugin-named source is the rejecting plugin; a `__`-prefixed source is a
+/// gateway-internal admission ceiling, not a plugin.
+pub(crate) fn record_admission_rejection(
+    ctx: &crate::plugins::RequestContext,
+    source: &str,
+    status: u16,
+) {
+    if let Some(slot) = ctx.diagnostic_slot()
+        && !source.starts_with("__")
+    {
+        slot.note_rejecting_plugin(source);
     }
+    record_rejection(ctx, BACKEND_ADMISSION_PHASE, status);
 }
 
 /// Record the gateway or plugin rejection that authored the request's
-/// response, from the shared rejection-log funnel, before the response head
-/// is written. A no-op when references are off.
-pub(crate) fn record_rejection(ctx: &crate::plugins::RequestContext, phase: &str) {
-    if let Some(slot) = ctx.diagnostic_slot() {
-        let rejection = DiagnosticRejection::new(phase, slot.rejecting_plugin());
-        slot.record_rejection(rejection);
+/// `status` response head, from the shared rejection-log funnel, before the
+/// head is written. A no-op when references are off.
+///
+/// In `errors` mode only a `5xx` is recorded, so the common `4xx` rejections
+/// (authentication, authorization, rate limiting) do no bookkeeping in the
+/// mode that never references them for their own sake. An origin-authored
+/// representation a plugin replayed or relayed (a cache hit, an idempotent
+/// replay, a serverless terminate reply, a federated provider response) is
+/// never recorded, whatever its status: the gateway did not author it.
+pub(crate) fn record_rejection(ctx: &crate::plugins::RequestContext, phase: &str, status: u16) {
+    let Some(slot) = ctx.diagnostic_slot() else {
+        return;
+    };
+    if status < 500 && !gateway_rejections_enabled() {
+        return;
     }
+    if ctx.serves_origin_representation() || slot.serves_origin_response() {
+        return;
+    }
+    let rejection = DiagnosticRejection::new(phase, slot.rejecting_plugin(), status);
+    slot.record_rejection(rejection);
 }
 
 /// The slot a gateway rejection answered before routing matched a proxy (a
@@ -1615,26 +1746,31 @@ fn unrouted_rejection_slot(slot: Option<&Arc<DiagnosticSlot>>) -> Option<&Arc<Di
 }
 
 /// Record a routing rejection (`phase` is [`ROUTE_NOT_FOUND_PHASE`] or
-/// [`MESH_REGISTRY_ONLY_PHASE`]) for a request received at `started`, with its
-/// unrouted detail.
+/// [`MESH_REGISTRY_ONLY_PHASE`]) answered with `status` for a request received
+/// at `started`, with its unrouted detail.
 pub(crate) fn record_route_miss(
     slot: Option<&Arc<DiagnosticSlot>>,
     phase: &'static str,
     started: Instant,
+    status: u16,
 ) {
     if let Some(slot) = unrouted_rejection_slot(slot) {
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-        slot.record_rejection(DiagnosticRejection::routing(phase));
+        slot.record_rejection(DiagnosticRejection::routing(phase, status));
         slot.record_detail(DiagnosticDetail::unrouted(latency_ms));
     }
 }
 
-/// Record a frontend admission fence that answered before a request context
-/// existed, with its unrouted detail. Fences answer without waiting, so the
-/// duration bucket is the shortest one.
-pub(crate) fn record_admission_fence(slot: Option<&Arc<DiagnosticSlot>>, phase: &'static str) {
+/// Record a frontend admission fence answered with `status` before a request
+/// context existed, with its unrouted detail. Fences answer without waiting,
+/// so the duration bucket is the shortest one.
+pub(crate) fn record_admission_fence(
+    slot: Option<&Arc<DiagnosticSlot>>,
+    phase: &'static str,
+    status: u16,
+) {
     if let Some(slot) = unrouted_rejection_slot(slot) {
-        slot.record_rejection(DiagnosticRejection::gateway_fence(phase));
+        slot.record_rejection(DiagnosticRejection::gateway_fence(phase, status));
         slot.record_detail(DiagnosticDetail::unrouted(0.0));
     }
 }

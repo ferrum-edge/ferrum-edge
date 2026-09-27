@@ -1703,7 +1703,9 @@ HTTP/1.1, HTTP/2, and HTTP/3 proxy responses that carry the gateway's own
 other gateway-authored error response carries one too — plugin rejections
 (`401`, `403`, `429`, ...), gateway policy fences, and routing `404`s — with a
 `null` `gateway_error` and a `detail.rejection` naming the rejecting phase and
-plugin. A backend's own error response never carries a reference. Only the
+plugin. A backend's own error response never carries a reference, whether
+relayed to the client or replayed by a plugin (a cache hit, an idempotent
+replay, a serverless terminate reply, a federated provider response). Only the
 gateway process that served the response can resolve it. See
 [error_classification.md](error_classification.md#gateway-diagnostic-references)
 for the contract and bounds.

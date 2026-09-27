@@ -2489,8 +2489,11 @@ paths:
         (for example `401`, `403`, `429`), gateway policy fences, and routing
         `404`s, including gRPC Trailers-Only rejections. Such a reference has
         a `null` `gateway_error`, and its detail names the rejecting phase and,
-        when known, plugin. A backend's own error response relayed to the
-        client never carries a reference. The
+        when known, plugin. A backend's own error response never carries a
+        reference, whether relayed to the client or replayed by a plugin (a
+        cache hit, an idempotent replay, a serverless terminate reply, a
+        federated provider response), and a reference is stamped only on a
+        head whose status is the one its rejection recorded. The
         reference embeds nothing; the detail is retained only in the memory of
         the gateway process that served the response, for
         `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900) and at most
@@ -37671,8 +37674,8 @@ components:
             Rejection phase or policy, for example `on_request_received`,
             `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
             `websocket_connection_limit`, `overload`, `route_not_found`, or
-            `mesh_registry_only`. A value that is not a short label is
-            reported as `other`.
+            `mesh_registry_only`. Always one of the gateway's compiled-in
+            phase labels; any other phase is reported as `other`.
         plugin:
           type: string
           maxLength: 64

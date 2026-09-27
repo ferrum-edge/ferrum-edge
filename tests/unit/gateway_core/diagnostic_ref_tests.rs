@@ -18,6 +18,7 @@
 //!   detail names the rejecting phase and plugin and every backend attempt,
 //!   with closed TLS labels, and stays bounded.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -941,10 +942,14 @@ fn rejection_headers() -> http::HeaderMap {
     headers
 }
 
-fn plugin_rejected_slot(phase: &str, plugin: &str) -> std::sync::Arc<DiagnosticSlot> {
+fn plugin_rejected_slot(phase: &str, plugin: &str, status: u16) -> std::sync::Arc<DiagnosticSlot> {
     let slot = DiagnosticSlot::shared();
     slot.note_rejecting_plugin(plugin);
-    slot.record_rejection(DiagnosticRejection::new(phase, slot.rejecting_plugin()));
+    slot.record_rejection(DiagnosticRejection::new(
+        phase,
+        slot.rejecting_plugin(),
+        status,
+    ));
     slot
 }
 
@@ -959,7 +964,7 @@ fn store_mode_defaults_to_errors_and_off_never_widens_it() {
 #[test]
 fn all_mode_stamps_a_recorded_rejection_without_a_gateway_error_token() {
     let store = all_mode_store();
-    let slot = plugin_rejected_slot("authenticate", "key_auth");
+    let slot = plugin_rejected_slot("authenticate", "key_auth", 401);
     let mut headers = rejection_headers();
     headers.insert(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
 
@@ -987,7 +992,7 @@ fn all_mode_stamps_a_recorded_rejection_without_a_gateway_error_token() {
 #[test]
 fn errors_mode_never_stamps_a_rejection_without_a_gateway_error_token() {
     let store = default_store();
-    let slot = plugin_rejected_slot("authorize", "access_control");
+    let slot = plugin_rejected_slot("authorize", "access_control", 403);
     let mut headers = rejection_headers();
     headers.insert(DIAGNOSTIC_REF_HEADER, UNKNOWN_REF.parse().unwrap());
     let stamped = stamp_response_headers(
@@ -1037,7 +1042,7 @@ fn all_mode_leaves_responses_without_a_recorded_rejection_unmarked() {
     assert!(stamp(&store, DiagnosticProtocol::Http3, 404, &mut headers).is_none());
     // A recorded rejection whose response is a success (a plugin
     // short-circuit answering 2xx) is not an error response.
-    let short_circuit = plugin_rejected_slot("before_proxy", "request_termination");
+    let short_circuit = plugin_rejected_slot("before_proxy", "request_termination", 200);
     let mut headers = rejection_headers();
     let stamped = stamp_response_headers(
         &store,
@@ -1053,7 +1058,7 @@ fn all_mode_leaves_responses_without_a_recorded_rejection_unmarked() {
 #[test]
 fn all_mode_stamps_grpc_trailers_only_rejections() {
     let store = all_mode_store();
-    let slot = plugin_rejected_slot("authenticate", "jwt_auth");
+    let slot = plugin_rejected_slot("authenticate", "jwt_auth", 200);
     let mut headers = rejection_headers();
     headers.insert("grpc-status", "16".parse().unwrap());
     let stamped = stamp_response_headers(
@@ -1065,7 +1070,7 @@ fn all_mode_stamps_grpc_trailers_only_rejections() {
     );
     assert!(stamped.is_some(), "grpc-status 16 is an error response");
 
-    let ok = plugin_rejected_slot("before_proxy", "request_termination");
+    let ok = plugin_rejected_slot("before_proxy", "request_termination", 200);
     let mut headers = rejection_headers();
     headers.insert("grpc-status", "0".parse().unwrap());
     let stamped = stamp_response_headers(
@@ -1095,35 +1100,51 @@ fn error_response_classification_is_status_or_grpc_status() {
 
 #[test]
 fn rejection_detail_carries_only_bounded_labels() {
-    let plugin = DiagnosticRejection::new("authorize", Some("access_control"));
+    let plugin = DiagnosticRejection::new("authorize", Some("access_control"), 403);
     assert_eq!(plugin.source, DiagnosticRejectionSource::Plugin);
     assert_eq!(plugin.phase, "authorize");
     assert_eq!(plugin.plugin.as_deref(), Some("access_control"));
+    assert_eq!(plugin.status, 403);
+    // A built-in plugin's name is its own static label, never a copy.
+    let borrowed = matches!(plugin.plugin, Some(Cow::Borrowed(_)));
+    assert!(borrowed, "{:?}", plugin.plugin);
+    // A custom plugin's short label is kept.
+    let custom = DiagnosticRejection::new("before_proxy", Some("acme_custom-gate"), 429);
+    assert_eq!(custom.plugin.as_deref(), Some("acme_custom-gate"));
 
-    let hook_without_plugin = DiagnosticRejection::new("authenticate", None);
+    let hook_without_plugin = DiagnosticRejection::new("authenticate", None, 401);
     assert_eq!(
         hook_without_plugin.source,
         DiagnosticRejectionSource::Plugin
     );
     assert_eq!(hook_without_plugin.plugin, None);
 
-    let fence = DiagnosticRejection::new("websocket_connection_limit", None);
+    let fence = DiagnosticRejection::new("websocket_connection_limit", None, 429);
     assert_eq!(fence.source, DiagnosticRejectionSource::Gateway);
-    let routing = DiagnosticRejection::routing("route_not_found");
+    let routing = DiagnosticRejection::routing("route_not_found", 404);
     assert_eq!(routing.source, DiagnosticRejectionSource::Routing);
     assert_eq!(routing.phase, "route_not_found");
+    let admission = DiagnosticRejection::gateway_fence("overload", 503);
+    assert_eq!(admission.phase, "overload");
 
+    // The phase is a closed set: a well-formed label the gateway does not
+    // ship is `other`, exactly like free text.
+    let unlisted = DiagnosticRejection::new("made_up_phase", None, 400);
+    assert_eq!(unlisted.phase, "other");
+    assert_eq!(unlisted.source, DiagnosticRejectionSource::Gateway);
     let long_plugin = "p".repeat(65);
     let hostile = DiagnosticRejection::new(
         "phase /orders?token=abc",
         Some("Bearer eyJhbGciOiJIUzI1NiJ9"),
+        401,
     );
     assert_eq!(hostile.phase, "other", "free text is never echoed");
     assert_eq!(hostile.plugin, None, "free text is never echoed");
-    let too_long = DiagnosticRejection::new(&"x".repeat(65), Some(long_plugin.as_str()));
+    let too_long = DiagnosticRejection::new(&"x".repeat(65), Some(long_plugin.as_str()), 400);
     assert_eq!(too_long.phase, "other");
     assert_eq!(too_long.plugin, None);
 
+    // The status is kept for the stamp, never rendered in the detail.
     let rendered = serde_json::to_value(&plugin).unwrap();
     assert_eq!(rendered["source"], "plugin");
     let without_plugin = serde_json::to_value(&fence).unwrap();
@@ -1212,7 +1233,11 @@ fn attempts_are_ordered_bounded_and_carry_tls_detail() {
     let pending = store.lookup_at(Instant::now(), &reference).unwrap();
     assert!(pending.detail.is_none());
     let refused = summary(502, Some(ErrorClass::ConnectionRefused));
-    slot.record_detail(DiagnosticDetail::from_summary(&refused, "ambiguous_failure", None));
+    slot.record_detail(DiagnosticDetail::from_summary(
+        &refused,
+        "ambiguous_failure",
+        None,
+    ));
 
     // Later attempts are counted, never retained.
     for _ in 0..(MAX_RECORDED_ATTEMPTS + 3) {
@@ -1327,38 +1352,130 @@ fn request_context_records_attempts_into_its_slot_only() {
     assert_eq!(attempts[1].status, Some(200));
 }
 
+/// A request context carrying `slot`, as the HTTP frontends build one when
+/// references are enabled.
+fn context_with_slot(
+    slot: &std::sync::Arc<DiagnosticSlot>,
+) -> ferrum_edge::plugins::RequestContext {
+    use ferrum_edge::_test_support::set_diagnostic_slot_for_test;
+
+    let mut ctx =
+        ferrum_edge::plugins::RequestContext::new("203.0.113.7".into(), "GET".into(), "/".into());
+    set_diagnostic_slot_for_test(&mut ctx, std::sync::Arc::clone(slot));
+    ctx
+}
+
+async fn log_rejection(ctx: &ferrum_edge::plugins::RequestContext, status: u16, phase: &str) {
+    ferrum_edge::proxy::log_rejected_request(&[], ctx, status, Instant::now(), phase, 0).await;
+}
+
+// No store is installed in this process, so the funnel sees `errors`-mode
+// gating: only a `5xx` rejection is recorded. `all` mode is exercised end to
+// end by the functional tests.
 #[tokio::test]
 async fn rejection_log_funnel_records_the_rejecting_phase_and_plugin() {
-    use ferrum_edge::_test_support::set_diagnostic_slot_for_test;
-    use ferrum_edge::plugins::RequestContext;
-
     let slot = DiagnosticSlot::shared();
-    let mut ctx = RequestContext::new("203.0.113.7".into(), "GET".into(), "/secret".into());
-    set_diagnostic_slot_for_test(&mut ctx, std::sync::Arc::clone(&slot));
+    let ctx = context_with_slot(&slot);
     slot.note_rejecting_plugin("rate_limiting");
-    ferrum_edge::proxy::log_rejected_request(&[], &ctx, 429, Instant::now(), "before_proxy", 0)
-        .await;
+    log_rejection(&ctx, 503, "before_proxy").await;
     let rejection = slot.rejection().expect("funnel recorded the rejection");
     assert_eq!(rejection.source, DiagnosticRejectionSource::Plugin);
     assert_eq!(rejection.phase, "before_proxy");
     assert_eq!(rejection.plugin.as_deref(), Some("rate_limiting"));
+    assert_eq!(rejection.status, 503);
+    assert!(slot.authored_status(503));
+    assert!(!slot.authored_status(200));
 
     let fence_slot = DiagnosticSlot::shared();
-    let mut fence_ctx = RequestContext::new("203.0.113.7".into(), "GET".into(), "/".into());
-    set_diagnostic_slot_for_test(&mut fence_ctx, std::sync::Arc::clone(&fence_slot));
-    ferrum_edge::proxy::log_rejected_request(
-        &[],
-        &fence_ctx,
-        405,
-        Instant::now(),
-        "allowed_methods",
-        0,
-    )
-    .await;
+    let fence_ctx = context_with_slot(&fence_slot);
+    log_rejection(&fence_ctx, 503, "circuit_breaker_open").await;
     let rejection = fence_slot.rejection().expect("gateway fence recorded");
     assert_eq!(rejection.source, DiagnosticRejectionSource::Gateway);
-    assert_eq!(rejection.phase, "allowed_methods");
+    assert_eq!(rejection.phase, "circuit_breaker_open");
     assert_eq!(rejection.plugin, None);
+
+    // The recorded phase is a compiled-in label, whatever the caller passed.
+    let unlisted_slot = DiagnosticSlot::shared();
+    let unlisted_ctx = context_with_slot(&unlisted_slot);
+    log_rejection(&unlisted_ctx, 500, "operator-configured-policy-name").await;
+    let rejection = unlisted_slot.rejection().expect("rejection recorded");
+    assert_eq!(rejection.phase, "other");
+}
+
+// Outside `all` mode a `4xx` rejection can never carry a reference (it has no
+// `X-Gateway-Error`), so the funnel does no rejection bookkeeping for it.
+#[tokio::test]
+async fn rejection_log_funnel_skips_client_error_bookkeeping_outside_all_mode() {
+    let slot = DiagnosticSlot::shared();
+    let ctx = context_with_slot(&slot);
+    slot.note_rejecting_plugin("key_auth");
+    log_rejection(&ctx, 401, "authenticate").await;
+    assert!(slot.rejection().is_none());
+    assert!(!slot.authored_status(401));
+}
+
+// A plugin that answered with an origin-authored representation (a cache
+// hit, a replay, a serverless terminate reply, a provider response) authored
+// no gateway rejection, whatever the status.
+#[tokio::test]
+async fn origin_representations_are_never_recorded_as_rejections() {
+    use ferrum_edge::_test_support::set_serverless_terminate_response_for_test;
+
+    // Marked by the rejecting plugin itself (`rejects_with_origin_response`).
+    let slot = DiagnosticSlot::shared();
+    let ctx = context_with_slot(&slot);
+    slot.note_rejecting_plugin("response_caching");
+    slot.note_origin_response();
+    log_rejection(&ctx, 503, "before_proxy").await;
+    assert!(slot.rejection().is_none(), "a cached backend 503");
+    assert!(!slot.authored_status(503));
+
+    // Marked on the request by a plugin whose short-circuit is origin content
+    // on this path only.
+    let slot = DiagnosticSlot::shared();
+    let mut ctx = context_with_slot(&slot);
+    set_serverless_terminate_response_for_test(&mut ctx, true);
+    log_rejection(&ctx, 502, "before_proxy").await;
+    assert!(slot.rejection().is_none(), "a serverless function's 502");
+}
+
+#[tokio::test]
+async fn origin_response_plugins_declare_it() {
+    let caching = ferrum_edge::plugins::create_plugin("response_caching", &serde_json::json!({}))
+        .expect("valid response_caching config")
+        .expect("built-in plugin");
+    assert!(caching.rejects_with_origin_response());
+}
+
+#[test]
+fn all_mode_stamps_only_the_status_the_rejection_authored() {
+    let store = all_mode_store();
+    // A plugin rejected with 401, but the head that reached the client
+    // carries another status: the rejection did not author it.
+    let slot = plugin_rejected_slot("authenticate", "key_auth", 401);
+    for status in [404u16, 500, 502] {
+        let mut headers = rejection_headers();
+        let stamped = stamp_response_headers(
+            &store,
+            Some(&slot),
+            DiagnosticProtocol::Http1,
+            status,
+            &mut headers,
+        );
+        assert!(stamped.is_none(), "{status}");
+        assert!(!headers.contains_key(DIAGNOSTIC_REF_HEADER), "{status}");
+    }
+    assert_eq!(store.minted_total(), 0);
+
+    let mut headers = rejection_headers();
+    let stamped = stamp_response_headers(
+        &store,
+        Some(&slot),
+        DiagnosticProtocol::Http1,
+        401,
+        &mut headers,
+    );
+    assert!(stamped.is_some());
 }
 
 /// Every routing `404` and admission fence records its rejection before the
@@ -1366,32 +1483,61 @@ async fn rejection_log_funnel_records_the_rejecting_phase_and_plugin() {
 /// or gateway rejection passes through the shared rejection-log funnel.
 #[test]
 fn routing_misses_and_admission_fences_record_their_rejection() {
+    // How many lines after counting a fence's status its diagnostic rejection
+    // must be recorded.
+    const FENCE_WINDOW: usize = 6;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let proxy = "src/proxy/mod.rs";
-    let h3 = "src/http3/server.rs";
+    let read = |file: &str| std::fs::read_to_string(root.join(file)).expect("read source");
+    let proxy = read("src/proxy/mod.rs");
+    let h3 = read("src/http3/server.rs");
+
+    // Every error status the frontend admission wrapper counts is a fence,
+    // and each records its diagnostic rejection right after counting it.
+    let start = proxy
+        .find("async fn admit_proxy_request_on_frontend_port(")
+        .expect("admission wrapper");
+    let wrapper = &proxy[start..];
+    let len = wrapper.find("\n}\n").expect("admission wrapper end");
+    let lines: Vec<&str> = wrapper[..len].lines().collect();
+    let mut fences = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim().strip_prefix("record_request(&state, ") else {
+            continue;
+        };
+        let status: u16 = rest.trim_end_matches(");").parse().expect("status");
+        if status < 400 {
+            continue;
+        }
+        let window_end = (index + 1 + FENCE_WINDOW).min(lines.len());
+        let records_fence = lines[index + 1..window_end]
+            .iter()
+            .any(|next| next.contains("diagnostic_ref::record_admission_fence("));
+        assert!(
+            records_fence,
+            "admission fence `record_request(&state, {status})` records no diagnostic rejection"
+        );
+        fences += 1;
+    }
+    assert!(fences >= 4, "only {fences} admission fences found");
+
     let route_miss = "diagnostic_ref::ROUTE_NOT_FOUND_PHASE,";
     let registry_miss = "diagnostic_ref::MESH_REGISTRY_ONLY_PHASE,";
-    let fence = "diagnostic_ref::record_admission_fence(";
-    let funnel = "diagnostic_ref::record_rejection(ctx, rejection_phase);";
+    let funnel = "diagnostic_ref::record_rejection(ctx, rejection_phase, status_code);";
     let expectations = [
-        (proxy, route_miss, 1),
-        (proxy, registry_miss, 1),
-        (proxy, fence, 4),
-        (proxy, funnel, 1),
-        (h3, route_miss, 1),
+        ("src/proxy/mod.rs", &proxy, route_miss, 1),
+        ("src/proxy/mod.rs", &proxy, registry_miss, 1),
+        ("src/proxy/mod.rs", &proxy, funnel, 1),
+        ("src/http3/server.rs", &h3, route_miss, 1),
     ];
-    for (file, needle, expected) in expectations {
-        let source = std::fs::read_to_string(root.join(file)).expect("read source");
+    for (file, source, needle, expected) in expectations {
         let found = source.matches(needle).count();
         assert_eq!(found, expected, "{file}: `{needle}`");
     }
     // The funnel records before its no-consumer early return.
-    let path = root.join(proxy);
-    let source = std::fs::read_to_string(&path).expect("read source");
-    let start = source
+    let start = proxy
         .find("async fn log_rejected_request_with_path_and_backend_state(")
         .expect("rejection-log funnel");
-    let body = &source[start..];
+    let body = &proxy[start..];
     let record = body.find(funnel).expect("funnel records the rejection");
     let early_return = body
         .find("if plugins.is_empty() && !diagnostic_detail_wanted {")
