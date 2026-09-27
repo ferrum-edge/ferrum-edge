@@ -29,13 +29,13 @@
 //! socket, the DTLS server and its session drivers), so it is released when
 //! the last reference drops and the socket closes, not when the listener task
 //! returns. A bind that fails with `EADDRINUSE` on a port
-//! [`UdpPortHandoff::handoff_pending`] reports is retried within a short,
-//! bounded, pass-wide budget ([`UDP_PORT_HANDOFF_BUDGET`]). A port the ledger
-//! knows nothing about fails immediately, exactly as before, and a socket
-//! still held when the budget runs out is reported as the ordinary bind
-//! failure. Two sockets never share a port: nothing here sets `SO_REUSEADDR` /
-//! `SO_REUSEPORT`, it only decides whether one more exclusive bind attempt is
-//! worth making.
+//! [`UdpPortHandoff::note_bind_collision`] classifies as a handoff is retried
+//! within a short, bounded, pass-wide budget ([`UDP_PORT_HANDOFF_BUDGET`]). A
+//! port the ledger knows nothing about fails immediately, exactly as before,
+//! and a socket still held when the budget runs out is reported as the
+//! ordinary bind failure. Two sockets never share a port: nothing here sets
+//! `SO_REUSEADDR` / `SO_REUSEPORT`, it only decides whether one more exclusive
+//! bind attempt is worth making.
 //!
 //! As a fallback for a release slower than the budget, every release by one
 //! owner is appended to that owner's release log
@@ -45,7 +45,13 @@
 //! its port is actually released rather than on the next 30-second tick,
 //! while releases of unrelated ports cost nothing. Each manager subscribes
 //! only to the other owner's releases, so a listener that keeps failing can
-//! never wake its own manager into a reconcile loop.
+//! never wake its own manager into a reconcile loop. A reconcile the
+//! supervisor did not run publishes its failures only when it ends, after the
+//! supervisor may already have judged a release against the older failures,
+//! so such a pass marks the log when it starts
+//! ([`UdpPortHandoff::release_mark`]) and, when it publishes, wakes the
+//! supervisor itself if a port it failed was released since
+//! ([`UdpPortHandoff::released_since`]).
 //!
 //! Not on any hot path: the ledger is touched only when a datagram listener
 //! binds or closes its socket and when a bind has already failed.
@@ -60,9 +66,12 @@ use tokio::sync::watch;
 /// How long one reconcile pass may spend, in total, retrying `EADDRINUSE` on
 /// ports another in-process datagram listener is handing over. Shared by every
 /// such port in the pass and started by the first such collision, so unrelated
-/// listeners queued behind it are delayed by at most this much; a release
-/// slower than this falls back to the ordinary bind failure plus the release
-/// wakeup described in the module docs.
+/// listeners queued behind it are delayed by at most this much on its account;
+/// a release slower than this falls back to the ordinary bind failure plus the
+/// release wakeup described in the module docs. The Gateway listener manager
+/// also gives QUIC halves it retired in the same pass a separate budget of the
+/// same length, counted from the start of the pass, so one Gateway pass can
+/// wait up to about twice this in total.
 pub const UDP_PORT_HANDOFF_BUDGET: Duration = Duration::from_secs(2);
 
 /// First pause between bind attempts while a handoff is pending. Doubles up to
@@ -143,9 +152,9 @@ impl UdpPortHandoff {
     }
 
     /// A claim on `port` for one listener's socket. It counts toward
-    /// [`Self::handoff_pending`] only once [`UdpPortHold::arm`] is called right
-    /// after the bind succeeds, so a listener whose bind fails never marks the
-    /// port as recently released.
+    /// [`Self::note_bind_collision`] only once [`UdpPortHold::arm`] is called
+    /// right after the bind succeeds, so a listener whose bind fails never
+    /// marks the port as recently released.
     pub fn hold(self: &Arc<Self>, port: u16, owner: UdpPortOwner) -> UdpPortHold {
         UdpPortHold {
             inner: Arc::new(HoldInner {
@@ -157,14 +166,15 @@ impl UdpPortHandoff {
         }
     }
 
-    /// Whether a bind collision on `port` is plausibly an in-process handoff:
-    /// some managed datagram listener's socket holds the port now, or closed
-    /// within [`UDP_PORT_RECENT_RELEASE_WINDOW`].
+    /// Record that a bind on `port` just failed with `EADDRINUSE`, and return
+    /// whether that collision is plausibly an in-process handoff: some managed
+    /// datagram listener's socket holds the port now, or closed within
+    /// [`UDP_PORT_RECENT_RELEASE_WINDOW`].
     ///
-    /// Callers ask only after a bind failed with `EADDRINUSE`, so a `true`
-    /// answer is a collision about to be retried and is counted in
-    /// [`Self::handoff_retries`].
-    pub fn handoff_pending(&self, port: u16) -> bool {
+    /// Not a pure query: a `true` answer is a collision about to be retried
+    /// and increments [`Self::handoff_retries`], so call it once per failed
+    /// attempt and only after one.
+    pub fn note_bind_collision(&self, port: u16) -> bool {
         let pending = {
             let ports = self.ports.lock().unwrap_or_else(PoisonError::into_inner);
             ports.get(&port).is_some_and(|entry| {
@@ -180,7 +190,7 @@ impl UdpPortHandoff {
         pending
     }
 
-    /// How many bind collisions [`Self::handoff_pending`] has classified as
+    /// How many bind collisions [`Self::note_bind_collision`] has classified as
     /// in-process handoffs since the ledger was created. Diagnostic only.
     pub fn handoff_retries(&self) -> u64 {
         self.handoff_retries.load(Ordering::Relaxed)
@@ -193,6 +203,19 @@ impl UdpPortHandoff {
         let rx = self.release_channel(owner).subscribe();
         let seen = rx.borrow().seq;
         UdpPortReleases { rx, seen }
+    }
+
+    /// Where `owner`'s release log stands now. A reconcile pass takes one when
+    /// it starts and passes it to [`Self::released_since`] when it publishes
+    /// its bind failures (see the module docs).
+    pub fn release_mark(&self, owner: UdpPortOwner) -> UdpPortReleaseMark {
+        let seq = self.release_channel(owner).borrow().seq;
+        UdpPortReleaseMark { owner, seq }
+    }
+
+    /// The ports the mark's owner released after `mark` was taken.
+    pub fn released_since(&self, mark: UdpPortReleaseMark) -> ReleasedUdpPorts {
+        released_after(&self.release_channel(mark.owner).borrow(), mark.seq)
     }
 
     fn release_channel(&self, owner: UdpPortOwner) -> &watch::Sender<ReleaseLog> {
@@ -264,22 +287,34 @@ impl UdpPortReleases {
 
     fn take(&mut self) -> ReleasedUdpPorts {
         let log = self.rx.borrow_and_update();
-        let seen = self.seen;
-        // Sequence numbers only wrap after 2^64 releases, so plain comparison
-        // is enough for a process lifetime.
-        let gap = log
-            .recent
-            .front()
-            .is_some_and(|&(seq, _)| seq > seen.wrapping_add(1));
-        let ports = log
-            .recent
-            .iter()
-            .filter(|&&(seq, _)| seq > seen)
-            .map(|&(_, port)| port)
-            .collect();
+        let released = released_after(&log, self.seen);
         self.seen = log.seq;
-        ReleasedUdpPorts { ports, gap }
+        released
     }
+}
+
+/// A point in one owner's release log; see [`UdpPortHandoff::release_mark`].
+#[derive(Debug, Clone, Copy)]
+pub struct UdpPortReleaseMark {
+    owner: UdpPortOwner,
+    seq: u64,
+}
+
+/// The releases in `log` after sequence number `seen`.
+fn released_after(log: &ReleaseLog, seen: u64) -> ReleasedUdpPorts {
+    // Sequence numbers only wrap after 2^64 releases, so plain comparison is
+    // enough for a process lifetime.
+    let gap = log
+        .recent
+        .front()
+        .is_some_and(|&(seq, _)| seq > seen.wrapping_add(1));
+    let ports = log
+        .recent
+        .iter()
+        .filter(|&&(seq, _)| seq > seen)
+        .map(|&(_, port)| port)
+        .collect();
+    ReleasedUdpPorts { ports, gap }
 }
 
 /// Ports one owner released since a subscriber last looked.

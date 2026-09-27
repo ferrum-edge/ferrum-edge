@@ -1443,6 +1443,75 @@ async fn only_a_release_of_a_failed_udp_port_triggers_a_reconcile() {
     manager.shutdown_all().await;
 }
 
+/// Issue #5843: the supervisor judges a Gateway QUIC release against the bind
+/// failures published at that moment. A reconcile the supervisor did not run (a
+/// config update) publishes its failures only when it ends, so a release that
+/// lands after its probe collided but before that publication is judged against
+/// the older failures and skipped. The pass must wake the supervisor itself
+/// when it publishes a failure on a port released since it started, or the
+/// port waits for the 30-second tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_during_a_config_reconcile_still_wakes_the_supervisor() {
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind UDP");
+    let port = occupied.local_addr().expect("addr").port();
+    let config_arc = Arc::new(ArcSwap::from_pointee(empty_config()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &empty_config());
+    let manager = Arc::new(manager);
+    manager.start_supervisor();
+    // The first pass launches the supervisor, which from then on judges QUIC
+    // releases against this pass's (empty) failures.
+    assert!(manager.reconcile().await.is_empty());
+
+    config_arc.store(Arc::new(GatewayConfig {
+        proxies: vec![create_stream_proxy("udp-late-release", BackendScheme::Udp, port)],
+        ..empty_config()
+    }));
+    let ledger = Arc::clone(manager.udp_port_handoff());
+    let quic_hold = ledger.hold(port, UdpPortOwner::GatewayQuic);
+    quic_hold.arm();
+
+    // Gate: once the probe has collided and is retrying inside the pass,
+    // publish the QUIC release while the socket itself stays open. A hold the
+    // supervisor does not follow keeps the collision classified as a handoff,
+    // so the probe retries until the budget runs out and the pass publishes
+    // its failure about two seconds after the supervisor judged the release.
+    let releaser_ledger = Arc::clone(&ledger);
+    let releaser = std::thread::spawn(move || {
+        let collided = wait_for_handoff_retry(&releaser_ledger);
+        let keep_pending = releaser_ledger.hold(port, UdpPortOwner::StreamDatagram);
+        keep_pending.arm();
+        drop(quic_hold);
+        (collided, keep_pending)
+    });
+    let failures = manager.reconcile().await;
+    let (collided, keep_pending) = releaser.join().expect("releaser thread");
+    assert!(
+        collided,
+        "the UDP bind must have collided with the held socket and retried"
+    );
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].1, port);
+
+    // The socket closes only after the pass published its failure. Only the
+    // pass's own wakeup can retry the port before the 30-second tick.
+    drop(occupied);
+    manager
+        .wait_until_started(Duration::from_secs(10))
+        .await
+        .expect("the supervisor must retry a port released during the pass");
+    assert!(
+        manager
+            .stream_bind_failures()
+            .iter()
+            .all(|failure| failure.listen_port != port),
+        "{:?}",
+        manager.stream_bind_failures()
+    );
+
+    drop(keep_pending);
+    manager.shutdown_all().await;
+}
+
 /// A UDP port no in-process listener holds or recently released is not a
 /// handoff: the collision is reported on the first attempt, as before.
 #[tokio::test]

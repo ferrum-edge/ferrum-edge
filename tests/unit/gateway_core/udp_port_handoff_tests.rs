@@ -15,12 +15,12 @@ fn an_unarmed_hold_never_marks_its_port_as_handed_over() {
     let ledger = UdpPortHandoff::new();
     let mut releases = ledger.subscribe_releases(UdpPortOwner::GatewayQuic);
     let hold = ledger.hold(4433, UdpPortOwner::GatewayQuic);
-    assert!(!ledger.handoff_pending(4433));
+    assert!(!ledger.note_bind_collision(4433));
 
     // A listener whose bind failed never armed its hold: dropping it must not
     // make the port look recently released or wake the other manager.
     drop(hold);
-    assert!(!ledger.handoff_pending(4433));
+    assert!(!ledger.note_bind_collision(4433));
     assert!(releases.try_recv().is_none());
     assert_eq!(ledger.handoff_retries(), 0, "no collision was a handoff");
 }
@@ -30,15 +30,15 @@ fn an_armed_hold_marks_its_port_until_released_and_for_the_recent_window_after()
     let ledger = UdpPortHandoff::new();
     let hold = ledger.hold(4433, UdpPortOwner::StreamDatagram);
     hold.arm();
-    assert!(ledger.handoff_pending(4433));
-    assert!(!ledger.handoff_pending(4434), "other ports are unaffected");
+    assert!(ledger.note_bind_collision(4433));
+    assert!(!ledger.note_bind_collision(4434), "other ports are unaffected");
 
     // The acquiring side can fail its bind just before the release and ask
     // the ledger just after it, so the port stays eligible for the bounded
     // retry right after the release.
     drop(hold);
-    assert!(ledger.handoff_pending(4433));
-    assert!(!ledger.handoff_pending(4434));
+    assert!(ledger.note_bind_collision(4433));
+    assert!(!ledger.note_bind_collision(4434));
     assert_eq!(
         ledger.handoff_retries(),
         2,
@@ -142,9 +142,9 @@ fn a_port_held_by_both_owners_stays_marked_until_both_release() {
     quic_hold.arm();
     stream_hold.arm();
     drop(quic_hold);
-    assert!(ledger.handoff_pending(8443));
+    assert!(ledger.note_bind_collision(8443));
     drop(stream_hold);
-    assert!(ledger.handoff_pending(8443), "recently released");
+    assert!(ledger.note_bind_collision(8443), "recently released");
 }
 
 #[tokio::test(start_paused = true)]

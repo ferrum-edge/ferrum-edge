@@ -50,13 +50,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the socket actually closes, which can be after the listener task has ended:
   QUIC connections and UDP/DTLS sessions keep the socket open until they
   finish. A bind on a port that a Ferrum listener's socket holds, or closed in
-  the last second, retries that error for up to 2 seconds per reconcile pass.
-  If the port is still held after that, the failure is reported as before. It
-  is then retried when the other side's socket on that same port closes,
-  rather than 30 seconds later. A port owned by anything outside Ferrum still
-  fails on the first attempt, unless a Ferrum listener held that port number
-  within the last second. No socket options change; two sockets never share
-  the port.
+  the last second, retries that error. Each reconcile pass has a 2-second
+  budget for these retries, shared by its ports and started at its first such
+  collision, so a stream listener pass spends at most 2 seconds on them. A
+  Gateway pass also keeps the separate 2-second budget for QUIC halves it
+  retired itself (#5840), so one Gateway pass can spend up to about 4 seconds
+  in total. If the port is still held after that, the failure is reported as
+  before. It is then retried when the other side's socket on that same port
+  closes, rather than 30 seconds later, including when the socket closes while
+  a reconcile started by a config change is still running. A port owned by
+  anything outside Ferrum still fails on the first attempt, unless a Ferrum
+  listener held that port number within the last second. No socket options
+  change; two sockets never share the port.
 
 ### Performance
 

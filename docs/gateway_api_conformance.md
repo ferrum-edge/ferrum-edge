@@ -535,13 +535,19 @@ when the listener task ends: Quinn keeps a QUIC socket open until its endpoint
 driver and every connection have dropped it, and UDP/DTLS session tasks keep
 their listener's socket open until they observe the shutdown. A bind that
 fails with `Address already in use` on a port the ledger shows held, or closed
-within the last second, is retried for up to 2 seconds per reconcile pass
-instead of waiting for the 30-second retry tick. A port no Ferrum listener
+within the last second, is retried instead of waiting for the 30-second retry
+tick. Each reconcile pass has a 2-second budget for these retries, shared by
+all of its ports and started by its first such collision, so a stream listener
+pass spends at most 2 seconds on them. A Gateway pass also keeps a separate 2-second
+budget, counted from the start of the pass, for QUIC halves it retired itself
+and that the ledger has no entry for; the two budgets are independent, so one
+Gateway pass can wait up to about 4 seconds in total. A port no Ferrum listener
 holds fails on the first attempt as before, unless a Ferrum listener held that
-port number within the last second. A socket still held after the 2 seconds
-is reported as the ordinary bind failure. That failure is retried when the
-other side's socket on the same port closes, not only on the next tick;
-releases of other ports do not trigger a reconcile. TCP/TLS raw-stream
+port number within the last second. A socket still held when the budget runs
+out is reported as the ordinary bind failure. That failure is retried when the
+other side's socket on the same port closes, not only on the next tick, even
+when the socket closes while a reconcile started by a config change is still
+running; releases of other ports do not trigger a reconcile. TCP/TLS raw-stream
 collisions still refuse the whole HTTP-family listener; plaintext HTTP
 listeners remain unaffected by UDP/DTLS same-port claims.
 

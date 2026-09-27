@@ -1396,17 +1396,23 @@ impl GatewayListenerManager {
     /// socket is open, and also covers a QUIC socket this manager released in
     /// an earlier pass.
     ///
-    /// In both cases only `EADDRINUSE` is retried, within `budget`: a retired
-    /// port's wait is counted from the start of the pass, a handoff's from the
-    /// pass's first handoff collision, and each is shared by every port of its
-    /// kind ([`UDP_PORT_HANDOFF_BUDGET`]). Handoff eligibility is evaluated
-    /// after each failed attempt rather than once up front, because the other
-    /// manager may arm or release its hold while this pass runs. A port nothing
-    /// in-process holds fails on the first attempt as before; a socket still
-    /// held at the deadline (for example by connections the old endpoint is
-    /// still driving) is reported as the bind failure and retried by a later
-    /// reconcile, which the stream listener releasing that port wakes early
-    /// (see [`Self::run`]).
+    /// In both cases only `EADDRINUSE` is retried, within `budget`. The ledger
+    /// is consulted first: a collision it classifies as a handoff — including
+    /// a retired port whose own QUIC socket is still open or just closed —
+    /// waits on the handoff budget, counted from the pass's first such
+    /// collision. Only a retired port the ledger has no entry for falls back to
+    /// the retirement budget, counted from the start of the pass, so a
+    /// retirement earlier in the pass cannot use up the wait of a port whose
+    /// socket the ledger still shows open. Each budget
+    /// ([`UDP_PORT_HANDOFF_BUDGET`]) is shared by every port that draws on it,
+    /// and the two are independent, so one pass can wait up to about twice
+    /// that in total. Eligibility is evaluated after each failed attempt rather
+    /// than once up front, because the other manager may arm or release its
+    /// hold while this pass runs. A port nothing in-process holds fails on the
+    /// first attempt as before; a socket still held at the deadline (for
+    /// example by connections the old endpoint is still driving) is reported as
+    /// the bind failure and retried by a later reconcile, which the stream
+    /// listener releasing that port wakes early (see [`Self::run`]).
     async fn ensure_quic_in_pass(
         &self,
         port: u16,
@@ -1424,10 +1430,10 @@ impl GatewayListenerManager {
             if !failure.addr_in_use || stale {
                 return Some(failure.report());
             }
-            let deadline = if quic_retired {
-                budget.retired
-            } else if self.udp_ports.handoff_pending(port) {
+            let deadline = if self.udp_ports.note_bind_collision(port) {
                 budget.handoff_deadline()
+            } else if quic_retired {
+                budget.retired
             } else {
                 return Some(failure.report());
             };
@@ -1786,13 +1792,18 @@ const CLASS_FLIP_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from
 
 /// How long one reconcile pass may retry QUIC binds that collide with a UDP
 /// socket about to be released ([`GatewayListenerManager::ensure_quic_in_pass`]).
+/// The two deadlines are independent, so a pass that draws on both can wait
+/// up to about twice [`UDP_PORT_HANDOFF_BUDGET`] in total.
 struct QuicRebindBudget {
-    /// For ports whose QUIC task this pass retired: counted from the start of
-    /// the pass, because the retirement itself is part of it.
+    /// For ports whose QUIC task this pass retired and that the UDP ledger has
+    /// no entry for: counted from the start of the pass, because the
+    /// retirement itself is part of it.
     retired: tokio::time::Instant,
-    /// For in-process handoffs (issue #5843): started by the pass's first such
-    /// collision, as in the stream listener manager, so work earlier in the
-    /// pass (TCP binds, retirements of other ports) does not consume it.
+    /// For collisions the UDP ledger classifies as in-process handoffs (issue
+    /// #5843), a retired port's own still-open socket included: started by
+    /// the pass's first such collision, as in the stream listener manager, so
+    /// work earlier in the pass (TCP binds, retirements of other ports) does
+    /// not consume it.
     handoff: Option<tokio::time::Instant>,
 }
 
