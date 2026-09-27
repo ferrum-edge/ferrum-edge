@@ -425,7 +425,7 @@ fn parse_ref(reference: &str) -> Option<[u8; DIAGNOSTIC_REF_RANDOM_BYTES]> {
     }
     let hex = reference.strip_prefix(DIAGNOSTIC_REF_PREFIX)?.as_bytes();
     let mut key = [0u8; DIAGNOSTIC_REF_RANDOM_BYTES];
-    for (index, pair) in hex.chunks_exact(2).enumerate() {
+    for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         let high = hex_value(pair[0])?;
         let low = hex_value(pair[1])?;
         *key.get_mut(index)? = (high << 4) | low;
