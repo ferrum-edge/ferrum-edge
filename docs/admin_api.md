@@ -1748,7 +1748,7 @@ curl -H "Authorization: Bearer $DIAGNOSTICS_TOKEN" \
 | `401` | Missing or invalid admin JWT |
 | `403` | The JWT lacks the `diagnostics:read` scope or carries no `ns` claim. Decided from the credential alone, before the reference is read. The attempt still counts against the rate limit |
 | `404` | Malformed, unknown, expired, or evicted reference; a reference outside the token's `ns` namespaces; or references are off. All identical, so references cannot be probed |
-| `429` | More than `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) attempts in the current second across all callers, or more than half of it (at least 1) from one JWT `sub`. Every attempt counts, including one refused with `403`, and a subject over its share does not consume the global budget. Carries `Retry-After: 1` |
+| `429` | More than `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) attempts in the current second across all callers, or more than half of it (at least 1) from one JWT `sub`. Every attempt counts against its subject's share, including one refused with `403`; only an attempt whose credential passes the scope and `ns` checks also consumes the global budget, and an attempt refused by either budget consumes neither. Carries `Retry-After: 1` |
 
 Every `200` and `404` emits one WARN-level
 `audit.event = "diagnostic_ref_lookup"` event with the JWT subject, the

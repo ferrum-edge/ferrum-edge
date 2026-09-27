@@ -69,7 +69,6 @@ use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::plugins;
 use crate::proxy::ProxyState;
 use crate::tls::managed::ManagedTlsMaterialKind;
-use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use crate::util::body_limit::{BodyCollectError, collect_body_with_limits};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -2672,24 +2671,23 @@ fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bo
         .is_some()
 }
 
-/// Throttles the `diagnostic_ref_lookup` audit event for refused credentials
-/// (`403`) to one per window; the metric still counts every attempt.
-static DIAGNOSTIC_REF_FORBIDDEN_AUDIT: AtomicLogRateLimiter = AtomicLogRateLimiter::new();
-
-/// Throttles the `diagnostic_ref_lookup` audit event for rate-limited
-/// attempts (`429`) to one per window; the metric still counts every attempt.
-static DIAGNOSTIC_REF_RATE_LIMITED_AUDIT: AtomicLogRateLimiter = AtomicLogRateLimiter::new();
+/// Throttles the `diagnostic_ref_lookup` audit event for refused (`403`) and
+/// rate-limited (`429`) attempts; the metric still counts every attempt.
+static DIAGNOSTIC_REF_LOOKUP_AUDIT: crate::diagnostic_ref::DiagnosticRefLookupAudit =
+    crate::diagnostic_ref::DiagnosticRefLookupAudit::new();
 
 /// `GET /diagnostics/v1/refs/{ref}`: resolve a gateway diagnostic reference
 /// (issue #5767).
 ///
-/// Every attempt is charged against the lookup rate limit first, per JWT `sub`
-/// and globally (`429` + `Retry-After`), including one then refused for its
-/// credential. Requires the `diagnostics:read` JWT scope and an `ns` claim
-/// (`403` otherwise; both depend only on the credential, never on the
-/// reference). A malformed, unknown, expired, or evicted reference, one minted
-/// for a namespace the token does not name, and every reference while the
-/// feature is off all answer the same `404`, so references cannot be probed.
+/// Every attempt is charged against its JWT `sub`'s share of the lookup rate
+/// limit first (`429` + `Retry-After`), including one then refused for its
+/// credential; only an attempt whose credential passes the scope and `ns`
+/// checks is also charged against the global budget. Requires the
+/// `diagnostics:read` JWT scope and an `ns` claim (`403` otherwise; both
+/// depend only on the credential, never on the reference). A malformed,
+/// unknown, expired, or evicted reference, one minted for a namespace the
+/// token does not name, and every reference while the feature is off all
+/// answer the same `404`, so references cannot be probed.
 /// Every `200`/`404` emits one `audit.event = "diagnostic_ref_lookup"` event at
 /// WARN, visible at the default log level; `403` and `429` events are
 /// throttled to one per second each, carrying how many were suppressed.
@@ -2701,7 +2699,7 @@ fn diagnostic_ref_lookup_response(
     diagnostics_read_granted: bool,
     reference: &str,
 ) -> Response<Full<Bytes>> {
-    use crate::diagnostic_ref::{DiagnosticRefLookup, DiagnosticRefLookupResult};
+    use crate::diagnostic_ref::DiagnosticRefLookup;
 
     let outcome = crate::diagnostic_ref::authorize_lookup(
         crate::diagnostic_ref::active_store(),
@@ -2720,14 +2718,7 @@ fn diagnostic_ref_lookup_response(
     };
     let result = outcome.result();
     let now_ms = crate::socket_opts::monotonic_now_ms();
-    let audit = match result {
-        DiagnosticRefLookupResult::Forbidden => DIAGNOSTIC_REF_FORBIDDEN_AUDIT.on_event(now_ms),
-        DiagnosticRefLookupResult::RateLimited => {
-            DIAGNOSTIC_REF_RATE_LIMITED_AUDIT.on_event(now_ms)
-        }
-        DiagnosticRefLookupResult::Found | DiagnosticRefLookupResult::NotFound => Some(0),
-    };
-    if let Some(suppressed) = audit {
+    if let Some(suppressed) = DIAGNOSTIC_REF_LOOKUP_AUDIT.admit(result, now_ms) {
         warn!(
             audit.event = "diagnostic_ref_lookup",
             actor = %auth.sub,
@@ -3607,12 +3598,11 @@ async fn handle_admin_request_inner(
 
     // Authenticate. The `diagnostics:read` scope is read from the same verified
     // claims, so the diagnostic reference lookup never re-verifies the token.
-    let diagnostics_read: bool;
-    let auth = match state.jwt_manager.verify_request(auth_header.as_deref()) {
+    let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
         Ok(token_data) => match AuditActor::from_claims(&token_data.claims) {
             Ok(actor) => {
-                diagnostics_read = token_data.claims.grants_scope(DIAGNOSTICS_READ_SCOPE);
-                actor
+                let diagnostics_read = token_data.claims.grants_scope(DIAGNOSTICS_READ_SCOPE);
+                (actor, diagnostics_read)
             }
             Err(message) => {
                 return Ok(json_response(
@@ -3744,7 +3734,11 @@ async fn handle_admin_request_inner(
         if let (Method::GET, ["diagnostics", "v1", "refs", reference]) =
             (method.clone(), diagnostic_segments.as_slice())
         {
-            return Ok(diagnostic_ref_lookup_response(&auth, diagnostics_read, reference));
+            return Ok(diagnostic_ref_lookup_response(
+                &auth,
+                diagnostics_read,
+                reference,
+            ));
         }
     }
 

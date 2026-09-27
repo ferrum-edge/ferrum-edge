@@ -11,7 +11,8 @@
 //!   reference is indistinguishable from an unknown one (the store is not even
 //!   read).
 //! * Every lookup attempt, a refused one included, is charged against a
-//!   per-subject share and the global budget.
+//!   per-subject share; only an authorized credential's attempt also spends
+//!   the global budget. Refused and rate-limited audit events are throttled.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -19,9 +20,10 @@ use std::time::{Duration, Instant};
 use ferrum_edge::diagnostic_ref::{
     DIAGNOSTIC_REF_HEADER, DIAGNOSTIC_REF_LEN, DIAGNOSTIC_REF_PREFIX,
     DIAGNOSTIC_REF_SCHEMA_VERSION, DiagnosticDetail, DiagnosticProtocol, DiagnosticRefLookup,
-    DiagnosticRefLookupResult, DiagnosticRefMode, DiagnosticRefStore, DiagnosticRefStoreConfig,
-    DiagnosticSlot, MAX_TRACKED_LOOKUP_SUBJECTS, authorize_lookup, backend_origin, duration_bucket,
-    is_well_formed_ref, stamp_response_headers, strip_response_header,
+    DiagnosticRefLookupAudit, DiagnosticRefLookupResult, DiagnosticRefMode, DiagnosticRefStore,
+    DiagnosticRefStoreConfig, DiagnosticSlot, MAX_TRACKED_LOOKUP_SUBJECTS, authorize_lookup,
+    backend_origin, duration_bucket, is_well_formed_ref, stamp_response_headers,
+    strip_response_header,
 };
 use ferrum_edge::grpc::auth::AllowedNamespaces;
 use ferrum_edge::plugins::TransactionSummary;
@@ -602,7 +604,7 @@ fn one_subject_cannot_exhaust_the_global_lookup_budget() {
     let store = store_with(10_000, Duration::from_secs(900), 4);
     assert_eq!(store.per_subject_lookup_rate_per_second(), 2);
     let now = Instant::now() + Duration::from_secs(1);
-    let admitted = |subject: &str| store.try_acquire_subject_lookup_at(now, subject);
+    let admitted = |subject: &str| store.try_acquire_subject_lookup_at(now, subject, true);
 
     assert!(admitted("reader-a"));
     assert!(admitted("reader-a"));
@@ -613,7 +615,63 @@ fn one_subject_cannot_exhaust_the_global_lookup_budget() {
     assert!(!admitted("reader-c"), "the global budget is spent");
 
     let later = now + Duration::from_secs(1);
-    assert!(store.try_acquire_subject_lookup_at(later, "reader-a"));
+    assert!(store.try_acquire_subject_lookup_at(later, "reader-a", true));
+}
+
+#[test]
+fn unauthorized_subjects_cannot_exhaust_the_global_lookup_budget() {
+    // A budget of 2 per second leaves each subject a share of 1: before the
+    // fix, the first refused attempt of each unauthorized credential spent
+    // one global slot, locking the operator out for the rest of the window.
+    let store = store_with(10_000, Duration::from_secs(900), 2);
+    let reference = mint(&store, 502, "connection_failure");
+    let now = Instant::now() + Duration::from_secs(1);
+    let bound = namespaces(&[NAMESPACE]);
+    let unbound = AllowedNamespaces::empty();
+    let no_scope = || authorize_lookup(Some(&store), "no-scope", false, &bound, &reference, now);
+    let no_ns = || authorize_lookup(Some(&store), "no-ns", true, &unbound, &reference, now);
+
+    assert_eq!(label(&no_scope()), "missing_scope");
+    assert_eq!(label(&no_ns()), "missing_namespace_binding");
+    for _ in 0..20 {
+        assert_eq!(label(&no_scope()), "rate_limited", "share spent");
+        assert_eq!(label(&no_ns()), "rate_limited", "share spent");
+    }
+    let operator = authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, now);
+    assert_eq!(label(&operator), "found", "the global budget is untouched");
+}
+
+#[test]
+fn authorized_subject_over_its_share_is_rate_limited() {
+    let store = store_with(10_000, Duration::from_secs(900), 4);
+    assert_eq!(store.per_subject_lookup_rate_per_second(), 2);
+    let reference = mint(&store, 502, "connection_failure");
+    let now = Instant::now() + Duration::from_secs(1);
+    let bound = namespaces(&[NAMESPACE]);
+    let lookup = || authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, now);
+
+    assert_eq!(label(&lookup()), "found");
+    assert_eq!(label(&lookup()), "found");
+    assert_eq!(label(&lookup()), "rate_limited");
+}
+
+#[test]
+fn a_global_refusal_does_not_spend_the_subject_share() {
+    let store = store_with(10_000, Duration::from_secs(900), 2);
+    assert_eq!(store.per_subject_lookup_rate_per_second(), 1);
+    let now = Instant::now() + Duration::from_secs(1);
+
+    assert!(store.try_acquire_subject_lookup_at(now, "reader-a", true));
+    assert!(store.try_acquire_subject_lookup_at(now, "reader-b", true));
+    assert!(
+        !store.try_acquire_subject_lookup_at(now, "reader-c", true),
+        "the global budget is spent"
+    );
+    assert!(
+        store.try_acquire_subject_lookup_at(now, "reader-c", false),
+        "the globally refused attempt left reader-c's share intact"
+    );
+    assert!(!store.try_acquire_subject_lookup_at(now, "reader-c", false));
 }
 
 #[test]
@@ -622,17 +680,17 @@ fn subject_table_is_bounded_and_fails_closed_when_full() {
     let now = Instant::now() + Duration::from_secs(1);
     for index in 0..MAX_TRACKED_LOOKUP_SUBJECTS {
         let subject = format!("reader-{index}");
-        assert!(store.try_acquire_subject_lookup_at(now, &subject));
+        assert!(store.try_acquire_subject_lookup_at(now, &subject, true));
     }
-    let overflow = store.try_acquire_subject_lookup_at(now, "one-too-many");
+    let overflow = store.try_acquire_subject_lookup_at(now, "one-too-many", true);
     assert!(!overflow, "a full table never evicts a live subject");
     assert!(
-        store.try_acquire_subject_lookup_at(now, "reader-0"),
+        store.try_acquire_subject_lookup_at(now, "reader-0", true),
         "a tracked subject keeps its share"
     );
     let later = now + Duration::from_secs(1);
     assert!(
-        store.try_acquire_subject_lookup_at(later, "one-too-many"),
+        store.try_acquire_subject_lookup_at(later, "one-too-many", true),
         "earlier windows are purged to admit a new subject"
     );
 }
@@ -657,6 +715,34 @@ fn out_of_namespace_lookup_never_reads_the_store() {
     let own = authorize_lookup(Some(&store), OPERATOR, true, &bound, &reference, later);
     assert_eq!(label(&own), "not_found");
     assert_eq!(store.evicted_expired_total(), 1);
+}
+
+#[test]
+fn refused_and_rate_limited_audit_events_are_throttled() {
+    let audit = DiagnosticRefLookupAudit::new();
+    let start_ms = 10_000;
+    for result in [
+        DiagnosticRefLookupResult::Forbidden,
+        DiagnosticRefLookupResult::RateLimited,
+    ] {
+        let emitted = (0..100)
+            .filter(|offset| audit.admit(result, start_ms + offset).is_some())
+            .count();
+        assert_eq!(emitted, 1, "{result:?}: one event per window");
+        assert_eq!(
+            audit.admit(result, start_ms + 1_000),
+            Some(99),
+            "{result:?}: the next window reports every suppressed event"
+        );
+    }
+    for result in [
+        DiagnosticRefLookupResult::Found,
+        DiagnosticRefLookupResult::NotFound,
+    ] {
+        for _ in 0..10 {
+            assert_eq!(audit.admit(result, start_ms), Some(0), "{result:?}");
+        }
+    }
 }
 
 // ── detail content ─────────────────────────────────────────────────────────

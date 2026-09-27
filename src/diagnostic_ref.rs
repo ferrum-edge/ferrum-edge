@@ -46,9 +46,17 @@ use serde::Serialize;
 
 use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use crate::plugins::TransactionSummary;
+use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 
 /// Wire name of the gateway-owned diagnostic reference response header.
 pub const DIAGNOSTIC_REF_HEADER: &str = "x-ferrum-diagnostic-ref";
+
+/// [`DIAGNOSTIC_REF_HEADER`] as a pre-built `HeaderName`, so stripping and
+/// stamping never re-parse the field name. A `static` rather than a `const`:
+/// the custom name holds a `Bytes`, and a `const` would be an
+/// interior-mutable constant copied at every use.
+static DIAGNOSTIC_REF_HEADER_NAME: http::HeaderName =
+    http::HeaderName::from_static(DIAGNOSTIC_REF_HEADER);
 
 /// Version prefix of every reference. A future format changes the prefix.
 pub const DIAGNOSTIC_REF_PREFIX: &str = "fd1_";
@@ -752,17 +760,23 @@ impl DiagnosticRefStore {
         now.saturating_duration_since(self.epoch).as_secs() & 0xFFFF_FFFF
     }
 
-    /// Admit one admin lookup attempt by `subject` (the JWT `sub`): first
-    /// against that subject's share of the window, then against the global
-    /// budget. A subject over its share is refused without charging the
-    /// global budget, so no single credential can exhaust it for the others.
-    pub fn try_acquire_subject_lookup_at(&self, now: Instant, subject: &str) -> bool {
-        self.try_acquire_subject_window(now, subject) && self.try_acquire_lookup_at(now)
-    }
-
-    fn try_acquire_subject_window(&self, now: Instant, subject: &str) -> bool {
+    /// Admit one admin lookup attempt by `subject` (the JWT `sub`) against
+    /// that subject's share of the window and, when `charge_global` is set,
+    /// the global budget as well.
+    ///
+    /// Both are decided and committed under the subject-table lock: a subject
+    /// over its share never charges the global budget, and an attempt the
+    /// global budget refuses never spends the subject's share. Callers pass
+    /// `charge_global = false` for an attempt already refused for its
+    /// credential, so credentials that may not read references can only ever
+    /// exhaust their own shares, never the budget authorized operators use.
+    pub fn try_acquire_subject_lookup_at(
+        &self,
+        now: Instant,
+        subject: &str,
+        charge_global: bool,
+    ) -> bool {
         let window = self.lookup_window(now);
-        let limit = self.per_subject_lookup_rate_per_second;
         let key = self.subject_hasher.hash_one(subject);
         // Same poison reasoning as `lock_shard`: every mutation is a single
         // map operation, so a recovered guard never exposes a torn entry.
@@ -770,24 +784,27 @@ impl DiagnosticRefStore {
             .subject_windows
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = windows.get_mut(&key) {
-            if entry.window != window {
-                *entry = SubjectWindow { window, count: 1 };
-                return true;
+        let used = match windows.get(&key) {
+            Some(entry) if entry.window == window => entry.count,
+            Some(_) => 0,
+            None => {
+                if windows.len() >= MAX_TRACKED_LOOKUP_SUBJECTS {
+                    windows.retain(|_, entry| entry.window == window);
+                    if windows.len() >= MAX_TRACKED_LOOKUP_SUBJECTS {
+                        return false;
+                    }
+                }
+                0
             }
-            if entry.count >= limit {
-                return false;
-            }
-            entry.count += 1;
-            return true;
+        };
+        if used >= self.per_subject_lookup_rate_per_second {
+            return false;
         }
-        if windows.len() >= MAX_TRACKED_LOOKUP_SUBJECTS {
-            windows.retain(|_, entry| entry.window == window);
-            if windows.len() >= MAX_TRACKED_LOOKUP_SUBJECTS {
-                return false;
-            }
+        if charge_global && !self.try_acquire_lookup_at(now) {
+            return false;
         }
-        windows.insert(key, SubjectWindow { window, count: 1 });
+        let count = used + 1;
+        windows.insert(key, SubjectWindow { window, count });
         true
     }
 
@@ -905,7 +922,7 @@ impl DiagnosticRefStore {
 /// `http::HeaderMap` normalizes field names to lowercase, so the one `remove`
 /// drops every spelling and every repeated value.
 pub fn strip_response_header(headers: &mut http::HeaderMap) {
-    headers.remove(DIAGNOSTIC_REF_HEADER);
+    headers.remove(&DIAGNOSTIC_REF_HEADER_NAME);
 }
 
 /// Strip every client-bound copy of the reference header, then stamp a fresh
@@ -925,9 +942,7 @@ pub fn stamp_response_headers(
         .and_then(crate::retry::intern_http_observability_error_class)?;
     let reference = store.mint(protocol, status, token, slot)?;
     let value = http::HeaderValue::from_str(&reference).ok()?;
-    // `DIAGNOSTIC_REF_HEADER` is a compile-time lowercase field-name literal,
-    // the documented invariant `IntoHeaderName` for `&'static str` requires.
-    headers.insert(DIAGNOSTIC_REF_HEADER, value);
+    headers.insert(&DIAGNOSTIC_REF_HEADER_NAME, value);
     Some(reference)
 }
 
@@ -959,14 +974,48 @@ impl DiagnosticRefLookup {
     }
 }
 
+/// Throttle for the `diagnostic_ref_lookup` audit event.
+///
+/// `found` / `not_found` lookups are always audited. Refused (`forbidden`) and
+/// rate-limited attempts are throttled to one event per window per result,
+/// each carrying how many were suppressed since the previous one, so a caller
+/// hammering the endpoint cannot flood the audit log. The lookup metric still
+/// counts every attempt.
+#[derive(Debug, Default)]
+pub struct DiagnosticRefLookupAudit {
+    forbidden: AtomicLogRateLimiter,
+    rate_limited: AtomicLogRateLimiter,
+}
+
+impl DiagnosticRefLookupAudit {
+    pub const fn new() -> Self {
+        Self {
+            forbidden: AtomicLogRateLimiter::new(),
+            rate_limited: AtomicLogRateLimiter::new(),
+        }
+    }
+
+    /// Whether the audit event for `result` at `now_ms` (monotonic millis) is
+    /// emitted: `Some(suppressed_since_last)` to emit, `None` to suppress.
+    pub fn admit(&self, result: DiagnosticRefLookupResult, now_ms: u64) -> Option<u64> {
+        match result {
+            DiagnosticRefLookupResult::Found | DiagnosticRefLookupResult::NotFound => Some(0),
+            DiagnosticRefLookupResult::Forbidden => self.forbidden.on_event(now_ms),
+            DiagnosticRefLookupResult::RateLimited => self.rate_limited.on_event(now_ms),
+        }
+    }
+}
+
 /// Authorize and resolve one admin lookup by the JWT subject `subject`.
 ///
 /// Order is fixed and independent of the reference:
 ///
-/// 1. With the store enabled, every attempt is charged against the rate limit
-///    first (the subject's share, then the global budget), including one that
-///    is then refused for its credential, so a credential lacking the scope
-///    cannot probe without limit.
+/// 1. With the store enabled, every attempt is charged against the subject's
+///    share of the rate limit first, including one that is then refused for
+///    its credential, so a credential lacking the scope cannot probe without
+///    limit. Only an attempt whose credential carries the scope and an `ns`
+///    binding is also charged against the global budget, so credentials that
+///    may not read references can never exhaust it for authorized operators.
 /// 2. The scope and namespace binding (they depend only on the credential).
 /// 3. The store's own namespace against the token's `ns` claim. Every
 ///    reference in the store belongs to that one namespace, so a caller
@@ -981,8 +1030,9 @@ pub fn authorize_lookup(
     reference: &str,
     now: Instant,
 ) -> DiagnosticRefLookup {
+    let authorized = scope_granted && allowed_namespaces.is_present();
     let admitted = match store {
-        Some(store) => store.try_acquire_subject_lookup_at(now, subject),
+        Some(store) => store.try_acquire_subject_lookup_at(now, subject, authorized),
         None => true,
     };
     let outcome = if !admitted {

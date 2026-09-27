@@ -22,10 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched proxy, the backend origin, and a duration bucket. It never carries
   bodies, headers, paths, credentials, or raw error text. A reference outside
   the token's namespaces answers `404` like an unknown one. Every lookup
-  attempt, including one refused with `403`, is rate-limited
-  (`FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND`, default 10, with one JWT
-  `sub` limited to half of it) and audit-logged (refused and rate-limited
-  events throttled to one per second). References live only in process
+  attempt, including one refused with `403`, is charged to its JWT `sub`'s
+  share (half of `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND`, default 10);
+  only an attempt whose credential passes the scope and `ns` checks also
+  spends the global budget, so refused credentials cannot lock out operators.
+  Every attempt is audit-logged (refused and rate-limited events throttled to
+  one per second). References live only in process
   memory (roughly 0.5–1 KB each), bounded by
   `FERRUM_DIAGNOSTIC_REF_TTL_SECONDS` (default 900) and
   `FERRUM_DIAGNOSTIC_REF_MAX_ENTRIES` (default 10000, oldest evicted first),

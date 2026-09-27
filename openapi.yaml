@@ -2502,12 +2502,14 @@ paths:
         and every reference while the feature is off all answer the same
         `404`.
 
-        **Rate limit and audit.** Every attempt is charged against the lookup
-        budget before the credential checks, including one then refused with
-        `403`. The budget is `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND`
-        (default 10) per second across all callers, and one JWT `sub` may use
-        at most half of it (at least 1); `429` with `Retry-After: 1` above
-        either. Every `200` and `404` emits one WARN-level
+        **Rate limit and audit.** Every attempt is charged against its JWT
+        `sub`'s share of the lookup budget before the credential checks,
+        including one then refused with `403`; one `sub` may use at most half
+        of `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10, at
+        least 1) per second. Only an attempt whose credential carries the
+        `diagnostics:read` scope and an `ns` claim is also charged against the
+        global per-second budget, so refused credentials cannot exhaust it;
+        `429` with `Retry-After: 1` above either. Every `200` and `404` emits one WARN-level
         `audit.event = "diagnostic_ref_lookup"` event naming the JWT subject,
         the reference (or `malformed`), and the result; `403` and `429` events
         are throttled to one per second each and carry

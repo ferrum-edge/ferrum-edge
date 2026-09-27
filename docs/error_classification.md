@@ -484,8 +484,11 @@ evicts its oldest reference. Each retained reference costs roughly 0.5–1 KB,
 so the default holds about 5–10 MB and the 1000000 maximum up to about
 0.5–1 GB. A restart forgets every reference. Lookup attempts are admitted at
 `FERRUM_DIAGNOSTIC_REF_LOOKUP_RATE_PER_SECOND` (default 10) per second, with
-one JWT `sub` limited to half of that (at least 1); every attempt counts,
-including one refused with `403`, and `429` answers above either budget. Each
+one JWT `sub` limited to half of that (at least 1). Every attempt counts
+against its `sub`'s share, including one refused with `403`; only an attempt
+whose credential passes the scope and `ns` checks also spends the global
+budget, so refused credentials cannot exhaust it. `429` answers above either
+budget. Each
 `200`/`404` emits one WARN-level `audit.event = "diagnostic_ref_lookup"` event;
 `403` and `429` events are throttled to one per second each. `/metrics` exports
 `ferrum_diagnostic_refs_minted_total`, `ferrum_diagnostic_refs_entries`,
