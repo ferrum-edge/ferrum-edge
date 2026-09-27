@@ -1801,7 +1801,13 @@ fn own_expired_or_unknown_tagged_reference_is_a_plain_miss() {
     let store = store.with_replica(REPLICA_A);
     let start = Instant::now();
     let reference = store
-        .mint_at(start, DiagnosticProtocol::Http2, 504, "backend_timeout", None)
+        .mint_at(
+            start,
+            DiagnosticProtocol::Http2,
+            504,
+            "backend_timeout",
+            None,
+        )
         .unwrap();
     let reader = namespaces(&[NAMESPACE]);
     let later = start + Duration::from_secs(6);
