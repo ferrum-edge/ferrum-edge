@@ -253,7 +253,7 @@ c13307092a033ae9696893c83f27f75f3dbe5da50d17a2c58cd8e98ebfbf1917  vendor/hyper-1
 83088a98a30c13466380c028687c2fe03738a757b76453a4a54784c4a50e4819  vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/mod.rs
 fadc71622096fe674bf1ae4cf0390fa42fe444c4b696e04d77c79b3445f7b210  vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/ping.rs
 10a9deb6729f4cdca57222234783447c823b6d73669147d0a7d1297caf7f6683  vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/server.rs
-e131747174bac57e16aa1689491c7573b23bd39d3b30e4010f1f43b4c0f4b98d  vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/upgrade.rs
+fe02b1b00b786814296917802faec92e4cbc4e6141460bb198121efec50a4876  vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/upgrade.rs
 075880551f7ad6daf9a863d6707d116ff22c37bd18bcfa2d272d185c1853a9c3  vendor/hyper-1.9.0-ferrum-patched/src/proto/mod.rs
 82283d912a3a6e505880b32b4fe4591d7c2c71a6341a244558530c8920a0be47  vendor/hyper-1.9.0-ferrum-patched/src/rt/bounds.rs
 5408048435f24ab8f3db80e4e7e747efcd5c42d6e5833c2230be183bbfc56603  vendor/hyper-1.9.0-ferrum-patched/src/rt/io.rs

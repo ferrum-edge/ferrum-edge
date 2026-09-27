@@ -394,6 +394,18 @@ mod ferrum_connect_error_reset_tests {
             .expect("flush the upgraded stream");
     }
 
+    /// Reads the next non-empty DATA chunk. h2 surfaces the empty DATA frame
+    /// that carries `END_STREAM` as an empty chunk before `None`; an error
+    /// (`RST_STREAM`) or real data is returned as is.
+    async fn next_data(body: &mut h2::RecvStream) -> Option<Result<Bytes, h2::Error>> {
+        loop {
+            match body.data().await {
+                Some(Ok(data)) if data.is_empty() => continue,
+                other => return other,
+            }
+        }
+    }
+
     #[test]
     fn reset_ignores_non_h2_upgrades() {
         let (io, _peer) = tokio::io::duplex(64);
@@ -452,7 +464,7 @@ mod ferrum_connect_error_reset_tests {
         drop(upgraded);
 
         assert!(
-            client_body.data().await.is_none(),
+            next_data(&mut client_body).await.is_none(),
             "a plain drop still sends END_STREAM"
         );
         assert!(client_body.is_end_stream());
@@ -468,7 +480,7 @@ mod ferrum_connect_error_reset_tests {
 
         assert!(!upgraded.reset_with_connect_error());
         assert!(
-            client_body.data().await.is_none(),
+            next_data(&mut client_body).await.is_none(),
             "the completed shutdown already sent END_STREAM"
         );
     }
