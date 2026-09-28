@@ -1388,7 +1388,8 @@ mod tests {
     }
 
     fn reference_has_decodable_marker(text: &str) -> bool {
-        text.bytes().any(|byte| matches!(byte, b'%' | b'+' | b'\\' | b'&'))
+        text.bytes()
+            .any(|byte| matches!(byte, b'%' | b'+' | b'\\' | b'&'))
     }
 
     #[test]
@@ -1399,9 +1400,7 @@ mod tests {
             "%u003cscript%U003E".to_string(),
             "&lt;script&gt; &#60; &#x3e;".to_string(),
             format!("JS {slash}u003c and {slash}x3E"),
-            format!(
-                "overlong %u12345 and truncated %zz %u12 and {slash}u{{1234567}} {slash}x"
-            ),
+            format!("overlong %u12345 and truncated %zz %u12 and {slash}u{{1234567}} {slash}x"),
             "ends with %3c".to_string(),
             "日本%3c😀&lt;".to_string(),
             "plain text without markers".to_string(),
