@@ -1619,24 +1619,21 @@ fn reverse_translate(
 
     // GAP-2K: Recover full `MeshDestinationRule` semantics from ECDS resources
     // carrying the Ferrum-specific DR carrier type_url. Ferrum CP emits one
-    // reserved carrier per admitted DR; legacy operator-authored non-reserved
-    // carriers keep their historic ROUTING compatibility (a non-reserved name
-    // is still accepted, and cross-namespace ones are skipped rather than
-    // rejected), but they are no longer best-effort on CONTENT: any resource
-    // declaring the DR type_url has already passed
+    // reserved carrier per admitted DR, and only the reserved
+    // `ferrum-destination-rule-carrier/{namespace}/{name}` shape is accepted:
+    // every resource declaring the DR type_url has already passed
     // `validate_ecds_destination_rule_carrier` at the ACK boundary, so a
-    // malformed payload or an invalid `export_to` NACKed the response and never
-    // reaches here. The lenient arms below are retained as defense in depth.
-    // Resources with other inner type_urls are silently skipped — they belong
-    // to unrelated extension configs.
+    // non-reserved name, a malformed payload, or an invalid `export_to` NACKed
+    // the response and never reaches here. Resources with other inner
+    // type_urls are silently skipped — they belong to unrelated extension
+    // configs.
     let mut destination_rules = Vec::new();
     let mut dr_carrier_seen = false;
     for resource in accumulator.resources(ECDS_TYPE_URL) {
-        let reserved_dr_name = reserved_destination_rule_carrier_name(&resource.name)?;
         let typed_extension = match decode_ecds_typed_extension(resource) {
             Ok(value) => value,
             Err(e) => {
-                if reserved_dr_name.is_some() {
+                if reserved_destination_rule_carrier_name(&resource.name)?.is_some() {
                     return Err(e);
                 }
                 warn!(
@@ -1653,62 +1650,32 @@ fn reverse_translate(
                 continue;
             }
         };
-        let Some(inner) = destination_rule_carrier_inner(resource, &typed_extension)? else {
+        let Some(carrier) = destination_rule_carrier(resource, &typed_extension)? else {
             continue;
         };
         dr_carrier_seen = true;
-        match crate::util::deserialization::from_json_slice::<MeshDestinationRule>(&inner.value) {
-            Ok(mut dr) => {
-                // Restore the invariant `export_visibility_admits` documents:
-                // every source canonicalizes entries before the evaluator
-                // runs. `validate_ecds_destination_rule_carrier` accepts a
-                // TRIMMED copy at ACK time, so without this a third-party CP
-                // sending `[" beta "]` would be ACKed and then match nothing.
-                crate::modes::mesh::config::normalize_mesh_export_to(&mut dr.export_to);
-                if let Some((namespace, name)) = reserved_dr_name {
-                    validate_reserved_destination_rule_carrier_name(
-                        &resource.name,
-                        namespace,
-                        name,
-                        &dr,
-                    )?;
-                } else if dr.namespace != config.namespace {
-                    debug!(
-                        name = %sanitize_startup_scalar(dr.name.to_string()),
-                        namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
-                        workload_namespace = %sanitize_startup_scalar(config.namespace.as_str()),
-                        "Skipping xDS ECDS DR-carrier outside workload namespace"
-                    );
-                    continue;
-                }
-                debug!(
-                    name = %sanitize_startup_scalar(dr.name.to_string()),
-                    namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
-                    "Recovered MeshDestinationRule from xDS ECDS carrier"
-                );
-                destination_rules.push(dr);
-            }
-            Err(e) => {
-                if reserved_dr_name.is_some() {
-                    return Err(format!(
-                        "xDS reserved DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
-                        typed_extension.name
-                    ));
-                }
-                warn!(
-                    resource_name = %crate::startup::sanitize_startup_cause(
-                        format!("{:?}", bounded_xds_log_value(&typed_extension.name).to_string()),
-                        &[]
-                    ),
-                    inner_type_url = %crate::startup::sanitize_startup_cause(
-                        format!("{:?}", inner.type_url.to_string()),
-                        &[]
-                    ),
-                    error = %crate::startup::sanitize_startup_cause(&e, &[]),
-                    "xDS ECDS DR-carrier payload failed JSON decode; DR will be missing from slice"
-                );
-            }
-        }
+        let mut dr = crate::util::deserialization::from_json_slice::<MeshDestinationRule>(
+            &carrier.inner.value,
+        )
+        .map_err(|e| {
+            format!(
+                "xDS reserved DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
+                typed_extension.name
+            )
+        })?;
+        // Restore the invariant `export_visibility_admits` documents: every
+        // source canonicalizes entries before the evaluator runs.
+        // `validate_ecds_destination_rule_carrier` accepts a TRIMMED copy at ACK
+        // time, so without this a CP sending `[" beta "]` would be ACKed and
+        // then match nothing.
+        crate::modes::mesh::config::normalize_mesh_export_to(&mut dr.export_to);
+        validate_reserved_destination_rule_carrier_name(carrier.namespace, carrier.name, &dr)?;
+        debug!(
+            name = %sanitize_startup_scalar(dr.name.to_string()),
+            namespace = %sanitize_startup_scalar(dr.namespace.to_string()),
+            "Recovered MeshDestinationRule from xDS ECDS carrier"
+        );
+        destination_rules.push(dr);
     }
     if !dr_carrier_seen && !accumulator.resources(CDS_TYPE_URL).is_empty() {
         // Per-DR diagnostic replaces the historical one-shot startup warning.
@@ -2386,47 +2353,36 @@ fn validate_recognized_mesh_slice_carrier(
     }
 }
 
-/// ACK-time validation for EVERY recognized DestinationRule ECDS carrier —
-/// reserved (Ferrum CP) and legacy/non-reserved (operator- or third-party-CP
-/// authored) alike.
+/// ACK-time validation for EVERY recognized DestinationRule ECDS carrier.
 ///
-/// "Recognized" is decided by the INNER `type_url` only, so a genuinely
-/// unrelated extension config keeps riding the ECDS stream untouched and an
-/// unknown resource name is never reinterpreted as a DestinationRule. But a
-/// resource that DOES declare Ferrum's DestinationRule type_url is a
-/// DestinationRule by its producer's own declaration, so a malformed payload or
-/// an unsupported `export_to` list is a structural error at the ACK boundary,
-/// not a best-effort skip: it NACKs, `handle_ads_response` rolls the
-/// accumulator back, and last-known-good stays active. Skipping instead would
-/// let a malformed same-namespace legacy carrier be ACKed and normalized, and
-/// only later become inert — i.e. traffic served with the operator's policy
-/// silently missing (fail-open).
+/// "Recognized" is decided by the INNER `type_url`, so a genuinely unrelated
+/// extension config keeps riding the ECDS stream untouched and an unknown
+/// resource name is never reinterpreted as a DestinationRule. A resource that
+/// DOES declare Ferrum's DestinationRule type_url must use the reserved
+/// `ferrum-destination-rule-carrier/{namespace}/{name}` name, and a
+/// non-reserved name, a malformed payload, or an unsupported `export_to` list
+/// is a structural error at the ACK boundary, not a best-effort skip: it NACKs,
+/// `handle_ads_response` rolls the accumulator back, and last-known-good stays
+/// active. Skipping instead would ACK a response whose policy then silently
+/// vanishes — traffic served with the operator's policy missing (fail-open).
 ///
 /// Diagnostics are fixed-shape and never echo the carrier-supplied `export_to`
 /// value.
 fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Result<(), String> {
-    let reserved = reserved_destination_rule_carrier_name(&resource.name)?;
     let typed_extension = decode_ecds_typed_extension(resource)?;
-    let Some(inner) = destination_rule_carrier_inner(resource, &typed_extension)? else {
+    let Some(carrier) = destination_rule_carrier(resource, &typed_extension)? else {
         return Ok(());
     };
-    let dr = crate::util::deserialization::from_json_slice::<MeshDestinationRule>(&inner.value)
-        .map_err(|e| {
-            if reserved.is_some() {
-                format!(
-                    "xDS reserved DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
-                    typed_extension.name
-                )
-            } else {
-                format!(
-                    "xDS DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
-                    typed_extension.name
-                )
-            }
-        })?;
-    if let Some((namespace, name)) = reserved {
-        validate_reserved_destination_rule_carrier_name(&resource.name, namespace, name, &dr)?;
-    }
+    let dr = crate::util::deserialization::from_json_slice::<MeshDestinationRule>(
+        &carrier.inner.value,
+    )
+    .map_err(|e| {
+        format!(
+            "xDS reserved DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
+            typed_extension.name
+        )
+    })?;
+    validate_reserved_destination_rule_carrier_name(carrier.namespace, carrier.name, &dr)?;
 
     // `export_to` is the security boundary that bounds which subscribers may
     // receive this policy. Validate it while the carrier is still an ECDS
@@ -2473,7 +2429,6 @@ fn reserved_destination_rule_carrier_name(name: &str) -> Result<Option<(&str, &s
 }
 
 fn validate_reserved_destination_rule_carrier_name(
-    _resource_name: &str,
     expected_namespace: &str,
     expected_name: &str,
     dr: &MeshDestinationRule,
@@ -2488,14 +2443,25 @@ fn validate_reserved_destination_rule_carrier_name(
     )
 }
 
-fn destination_rule_carrier_inner<'a>(
-    resource: &AccumulatedResource,
+/// A recognized DestinationRule ECDS carrier: the `(namespace, name)` its
+/// reserved resource name declares, plus the inner DR payload.
+struct DestinationRuleCarrier<'a> {
+    namespace: &'a str,
+    name: &'a str,
+    inner: &'a proto::Any,
+}
+
+/// Classify an ECDS resource as a DestinationRule carrier. `Ok(None)` is an
+/// unrelated extension config (non-DR inner type_url under a non-reserved
+/// name). A reserved name without a DR payload, and a DR payload under a
+/// non-reserved name, are both structural errors.
+fn destination_rule_carrier<'a>(
+    resource: &'a AccumulatedResource,
     typed_extension: &'a proto::TypedExtensionConfig,
-) -> Result<Option<&'a proto::Any>, String> {
-    let resource_name_is_reserved =
-        reserved_destination_rule_carrier_name(&resource.name)?.is_some();
+) -> Result<Option<DestinationRuleCarrier<'a>>, String> {
+    let reserved = reserved_destination_rule_carrier_name(&resource.name)?;
     let Some(inner) = typed_extension.typed_config.as_ref() else {
-        if resource_name_is_reserved {
+        if reserved.is_some() {
             return Err(format!(
                 "xDS ECDS resource {:?} uses reserved Ferrum DestinationRule carrier name without \
                  typed_config",
@@ -2505,7 +2471,7 @@ fn destination_rule_carrier_inner<'a>(
         return Ok(None);
     };
     if inner.type_url != FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
-        if resource_name_is_reserved {
+        if reserved.is_some() {
             return Err(format!(
                 "xDS ECDS resource {:?} uses reserved Ferrum DestinationRule carrier name \
                  with non-DR type_url <redacted scalar>",
@@ -2514,7 +2480,17 @@ fn destination_rule_carrier_inner<'a>(
         }
         return Ok(None);
     }
-    Ok(Some(inner))
+    let Some((namespace, name)) = reserved else {
+        return Err(format!(
+            "xDS ECDS resource <redacted scalar> carries the Ferrum DestinationRule type_url but \
+             must be named `{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}{{namespace}}/{{name}}`"
+        ));
+    };
+    Ok(Some(DestinationRuleCarrier {
+        namespace,
+        name,
+        inner,
+    }))
 }
 
 fn mesh_slice_carrier_inner<'a>(
@@ -5054,6 +5030,15 @@ mod tests {
         )
     }
 
+    /// A DR carrier under the reserved
+    /// `ferrum-destination-rule-carrier/default/<name>` resource name.
+    fn default_dr_carrier_resource(name: &str, dr_json: &str) -> proto::Any {
+        dr_carrier_resource(
+            &format!("{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}default/{name}"),
+            dr_json,
+        )
+    }
+
     fn typed_extension_resource(
         name: &str,
         inner_type_url: &str,
@@ -5133,7 +5118,7 @@ mod tests {
         accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[dr_carrier_resource("api-dr", dr_json)],
+                &[default_dr_carrier_resource("api-dr", dr_json)],
                 "v1",
             )
             .expect("ECDS apply");
@@ -5189,14 +5174,13 @@ mod tests {
         assert!(slice.destination_rules.is_empty());
     }
 
-    /// A legacy (non-reserved-name) DR carrier whose payload does not decode is
-    /// a STRUCTURAL error at the ACK boundary, exactly like the reserved
-    /// carrier's. Skipping it would ACK a response that silently drops the
+    /// A DR carrier whose payload does not decode is a STRUCTURAL error at the
+    /// ACK boundary. Skipping it would ACK a response that silently drops the
     /// operator's policy — traffic then flows with no DestinationRule at all
     /// (fail-open). The rejection must leave the previously accepted ECDS state
     /// in place.
     #[test]
-    fn legacy_ecds_dr_carrier_invalid_json_is_rejected_and_retains_last_good() {
+    fn ecds_dr_carrier_invalid_json_is_rejected_and_retains_last_good() {
         let good_dr_json = r#"{
             "name": "api-dr",
             "namespace": "default",
@@ -5206,7 +5190,7 @@ mod tests {
         accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[dr_carrier_resource("api-dr", good_dr_json)],
+                &[default_dr_carrier_resource("api-dr", good_dr_json)],
                 "v1",
             )
             .expect("ECDS apply");
@@ -5214,7 +5198,7 @@ mod tests {
         let err = accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[dr_carrier_resource("api-dr", "{not valid json}")],
+                &[default_dr_carrier_resource("api-dr", "{not valid json}")],
                 "v2",
             )
             .expect_err("a recognized DR carrier with a bad payload is rejected");
@@ -5239,11 +5223,11 @@ mod tests {
         );
     }
 
-    /// The legacy carrier gets the reserved carrier's `exportTo` validation
-    /// too: a same-namespace legacy carrier with an unsupported visibility list
-    /// must NACK rather than be ACKed, normalized, and later found inert.
+    /// A carrier with an unsupported visibility list must NACK rather than be
+    /// ACKed, normalized, and later found inert, and the rejection leaves the
+    /// last accepted DR live.
     #[test]
-    fn legacy_ecds_dr_carrier_invalid_export_to_is_rejected_fail_closed() {
+    fn ecds_dr_carrier_invalid_export_to_retains_last_good() {
         let good_dr_json = r#"{
             "name": "api-dr",
             "namespace": "default",
@@ -5259,7 +5243,7 @@ mod tests {
         accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[dr_carrier_resource("api-dr", good_dr_json)],
+                &[default_dr_carrier_resource("api-dr", good_dr_json)],
                 "v1",
             )
             .expect("ECDS apply");
@@ -5267,10 +5251,10 @@ mod tests {
         let err = accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[dr_carrier_resource("api-dr", hostile_dr_json)],
+                &[default_dr_carrier_resource("api-dr", hostile_dr_json)],
                 "v2",
             )
-            .expect_err("invalid export_to must reject the legacy carrier too");
+            .expect_err("invalid export_to must reject the carrier");
         assert!(
             err.contains("xDS DestinationRule carrier.exportTo[0]"),
             "{err}"
@@ -5292,10 +5276,8 @@ mod tests {
         assert!(slice.destination_rules[0].export_to.is_empty());
     }
 
-    /// Carrier ROUTING compatibility is unchanged by the stricter content
-    /// validation: recognition is by inner `type_url` only, so an unrelated
-    /// extension config with an unknown name is neither validated as a
-    /// DestinationRule nor rejected.
+    /// Recognition is by inner `type_url`, so an unrelated extension config with
+    /// an unknown name is neither validated as a DestinationRule nor rejected.
     #[test]
     fn unrelated_ecds_resource_is_not_validated_as_a_destination_rule() {
         let mut accumulator = primed_accumulator();
@@ -5318,27 +5300,30 @@ mod tests {
         assert!(slice.destination_rules.is_empty());
     }
 
+    /// Only the reserved `ferrum-destination-rule-carrier/{namespace}/{name}`
+    /// shape is a DestinationRule carrier. A resource declaring the DR inner
+    /// `type_url` under any other name NACKs instead of being recovered or
+    /// silently skipped.
     #[test]
-    fn ecds_dr_carrier_cross_namespace_is_skipped() {
+    fn non_reserved_ecds_dr_carrier_name_is_rejected() {
         let dr_json = r#"{
             "name": "api-dr",
-            "namespace": "other",
+            "namespace": "default",
             "host": "api.default.svc.cluster.local"
         }"#;
         let mut accumulator = primed_accumulator();
-        accumulator
+        let err = accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
                 &[dr_carrier_resource("api-dr", dr_json)],
                 "v1",
             )
-            .expect("ECDS apply");
-
-        let slice = accumulator
-            .try_build_mesh_slice(&test_config())
-            .expect("reverse translate")
-            .expect("all required types present");
-        assert!(slice.destination_rules.is_empty());
+            .expect_err("a DR carrier under a non-reserved name must be rejected");
+        assert!(err.contains("must be named"), "{err}");
+        assert!(
+            accumulator.resources(ECDS_TYPE_URL).is_empty(),
+            "the rejected response must not replace the accepted ECDS state"
+        );
     }
 
     #[test]
@@ -5434,7 +5419,7 @@ mod tests {
         // where multiple ECDS resources coexist on one response. (A malformed
         // DR-TYPED payload in the same response is a different case: it is a
         // structural error and rejects the whole response — see
-        // `legacy_ecds_dr_carrier_invalid_json_is_rejected_and_retains_last_good`.)
+        // `ecds_dr_carrier_invalid_json_is_rejected_and_retains_last_good`.)
         let valid_dr_json = r#"{
             "name": "valid-dr",
             "namespace": "default",
@@ -5459,7 +5444,10 @@ mod tests {
         accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[dr_carrier_resource("valid-dr", valid_dr_json), other_any],
+                &[
+                    default_dr_carrier_resource("valid-dr", valid_dr_json),
+                    other_any,
+                ],
                 "v1",
             )
             .expect("ECDS apply");
@@ -5777,7 +5765,7 @@ mod tests {
         accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
-                &[dr_carrier_resource("api-dr", dr_json)],
+                &[default_dr_carrier_resource("api-dr", dr_json)],
                 "v1",
             )
             .expect("ECDS apply");

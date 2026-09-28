@@ -1086,7 +1086,7 @@ This is the same mechanism as the [DestinationRule carrier](#ecds-destinationrul
 
 **Behavior and fail-closed.** The CP always emits these alongside CDS/EDS (no env var gate), and the DP waits for the initial ECDS response before building a slice so startup cannot briefly apply the name-only, unprotected view. On the DP, a mesh-slice carrier must have both the reserved ECDS resource name and the matching inner `type_url`: a recognized pair overwrites the corresponding slice field; an unrecognized inner type (the DR carrier, or an operator's own extension config) is skipped; a reserved inner type under any other resource name is `warn!`-logged and skipped so operator-defined ECDS configs cannot impersonate security/policy carriers. A recognized carrier whose JSON fails to parse is FAIL-CLOSED: `MeshSliceCarrier::decode` returns `Err`, `recover_slice_carriers` propagates it, and the DP NACKs the entire ECDS response and retains the previous accepted slice — it does NOT skip the malformed carrier and continue with a partially populated slice. CDS/EDS service-port discovery still runs; the DP **prefers** the full `services`/`service_entries` recovered from carriers and falls back to the name-only CDS/EDS reconstruction only when no slice carrier is present at all (e.g. an internal Ferrum-shaped test CP with no carrier support). Empty `Vec`/`None` field groups emit no carrier, so "absent" and "empty" are indistinguishable on the DP — matching native, where an empty list and an absent list are equivalent. Effective workload labels are the exception: the CP emits `WorkloadLabelsCarrier` even when the label map is empty, because empty labels are meaningful selector context and must override any local DP labels during xDS recovery. **Ambiguous shared-SPIFFE labels are a counter-exception:** when several workloads share one SPIFFE id with **divergent** label sets and the slice request carried no explicit labels, the CP can only compute the label **intersection** (which loses information), while selector-scoped policies (authz / PeerAuthentication / RequestAuthentication / Telemetry) ride in as a **candidate-any superset** (kept if they match *any* candidate). The CP flags this by emitting `WorkloadLabelsAmbiguousCarrier`. (The common replica/endpoints case — many records for one SPIFFE with **identical** labels — is *not* flagged: the intersection equals each set and is authoritative, so the DP keeps trusting the carrier instead of preferring possibly-stale local labels.) On recovery the DP treats a flagged intersection as **non-authoritative** and prefers its own `FERRUM_MESH_WORKLOAD_LABELS` so it re-filters the superset against its real identity. Without this, a non-empty intersection (e.g. two pods sharing `app=shared` where only one has `role=api`) would replace the DP's real labels and silently drop every candidate-only selector policy — a fail-open for selector mTLS/JWT/authz whenever the intersection is non-empty. If the DP has no local labels either, it keeps the (informational) intersection. The marker is cleared on the recovered slice once the DP has resolved its authoritative labels. Operator-defined `MeshExtensionConfig` entries whose names start with `ferrum-mesh-carrier/` or whose inner `type_url` is one of the mesh-slice carrier markers are skipped by the Ferrum CP for the same reason.
 
-**Visibility is re-enforced at the fold, not assumed.** A carrier is raw producer input that never passed this DP's slice admission, so the two `exportTo`-bearing client-side policy carriers are gated on recovery: a `VirtualServiceCorsPoliciesCarrier` entry not exported to the DP's workload namespace is dropped (bounded `warn!` with a count only — never the carrier-supplied host, name, or `exportTo` value), exactly as the legacy `DestinationRule` carrier is gated to the workload namespace. Visibility LISTS themselves are validated at the ACK boundary on both carrier families — every recognized DestinationRule carrier (reserved AND legacy) and every `VirtualServiceCorsPoliciesCarrier` entry runs the shared `validate_mesh_export_to` before the response is ACKed, so an unsupported or self-conflicting list NACKs and the accumulator rolls back to the last accepted state instead of being ACKed and discovered inert later. Those rejection diagnostics name the carrier field and the offending INDEX, are capped at eight per rejected carrier, and never echo the carrier-supplied value. Both are then re-checked once more at materialization. `exportTo` entries on the DR, ServiceEntry, and VirtualService-CORS carriers are also canonicalized (trimmed) at decode: the shared visibility evaluator deliberately never reinterprets padded input, and ACK-time validation checks a trimmed copy, so an un-normalized `[" beta "]` would otherwise be accepted and then match nothing.
+**Visibility is re-enforced at the fold, not assumed.** A carrier is raw producer input that never passed this DP's slice admission, so the two `exportTo`-bearing client-side policy carriers are gated on recovery: a `VirtualServiceCorsPoliciesCarrier` entry not exported to the DP's workload namespace is dropped (bounded `warn!` with a count only — never the carrier-supplied host, name, or `exportTo` value), exactly as a `DestinationRule` carrier's `exportTo` is enforced at materialization. Visibility LISTS themselves are validated at the ACK boundary on both carrier families — every reserved DestinationRule carrier and every `VirtualServiceCorsPoliciesCarrier` entry runs the shared `validate_mesh_export_to` before the response is ACKed, so an unsupported or self-conflicting list NACKs and the accumulator rolls back to the last accepted state instead of being ACKed and discovered inert later. Those rejection diagnostics name the carrier field and the offending INDEX, are capped at eight per rejected carrier, and never echo the carrier-supplied value. Both are then re-checked once more at materialization. `exportTo` entries on the DR, ServiceEntry, and VirtualService-CORS carriers are also canonicalized (trimmed) at decode: the shared visibility evaluator deliberately never reinterprets padded input, and ACK-time validation checks a trimmed copy, so an un-normalized `[" beta "]` would otherwise be accepted and then match nothing.
 
 **Interop boundary.** A stock Envoy or third-party Istio control plane does not emit these inner type URLs or Ferrum-shaped resource names, so it cannot drive a protected Ferrum mesh over xDS. The carrier format is a Ferrum-to-Ferrum wire convention layered on the standard ECDS transport; it is **not** an interoperable third-party xDS extension. For full DR/policy parity, run a Ferrum CP (either protocol works) or use `FERRUM_MESH_CONFIG_PROTOCOL=native`.
 
@@ -1118,7 +1118,7 @@ ECDS resource (Any)
   }
 ```
 
-The inner `value` is the normalized DR model as UTF-8 JSON bytes — there is no protobuf wire encoding of the DR itself, just `serde_json` over the `MeshDestinationRule` shape consumed by the DP at `src/modes/mesh/config_consumer/xds_client.rs` (see `dr_carrier_resource()` and the recovery loop). Normalization includes host canonicalization and trimming accepted `export_to` entries before slice comparison and carrier serialization. The DP iterates ECDS resources, decodes each `TypedExtensionConfig`, and applies one of three behaviors per inner payload:
+The inner `value` is the normalized DR model as UTF-8 JSON bytes — there is no protobuf wire encoding of the DR itself, just `serde_json` over the `MeshDestinationRule` shape consumed by the DP at `src/modes/mesh/config_consumer/xds_client.rs` (see `dr_carrier_resource()` and the recovery loop). Normalization includes host canonicalization and trimming accepted `export_to` entries before slice comparison and carrier serialization. The DP iterates ECDS resources, decodes each `TypedExtensionConfig`, and applies one of these behaviors per inner payload:
 
 - The resource name uses the reserved
   `ferrum-destination-rule-carrier/<namespace>/<name>` shape, the inner
@@ -1131,16 +1131,13 @@ The inner `value` is the normalized DR model as UTF-8 JSON bytes — there is no
   accumulator and NACKs the response. Remaining semantic validation runs at
   materialization and rejects the candidate slice. In both cases the
   previously applied proxy generation remains live.
-- A legacy, non-reserved operator extension using the DR inner type keeps its
-  historic ROUTING compatibility — the resource name is not constrained, and a
-  carrier declaring another namespace is skipped rather than rejected — but it
-  is **not** best-effort on CONTENT. Recognition is by inner `type_url` alone,
-  and anything that declares Ferrum's DestinationRule type is a DestinationRule
-  by its producer's own declaration, so malformed JSON and an unsupported
-  `export_to` NACK the ECDS response exactly as they do for the reserved shape.
-  Accepting them would ACK a response whose policy then silently vanishes at
-  materialization — traffic served with the operator's DestinationRule missing.
-  Ferrum CP never emits the legacy shape.
+- A resource that declares the DR inner type under any name other than the
+  reserved `ferrum-destination-rule-carrier/<namespace>/<name>` shape is
+  rejected and NACKs the response: only the reserved carrier is a
+  DestinationRule. Ferrum CP emits only that shape, and it skips (with a
+  warning) any operator `mesh.extension_configs` entry that declares the DR
+  inner type, exactly as it skips entries impersonating the mesh-slice
+  carriers.
 
 **Worked example.** Given this original DestinationRule:
 
@@ -1204,9 +1201,8 @@ The DP recovers this back into a `MeshDestinationRule` with `traffic_policy.load
 
 **Emission and the per-slice diagnostic.** Ferrum CP always emits one reserved
 carrier for every DestinationRule already admitted to that node's slice; there
-is no feature flag. The DP always subscribes to ECDS. A legacy or third-party
-Ferrum-shaped CP that emits only CDS/EDS remains routable in the documented
-degraded mode, but full DestinationRule semantics are unavailable. When the DP
+is no feature flag. The DP always subscribes to ECDS. A Ferrum-shaped CP that
+emits only CDS/EDS remains routable in the documented degraded mode, but full DestinationRule semantics are unavailable. When the DP
 receives CDS clusters with zero DR-carrier ECDS resources, it emits a one-line
 `debug!` per slice apply listing the fields that cannot be round-tripped from
 CDS/EDS alone (`connectTimeout`, `loadBalancer`, `outlierDetection`, `subsets`,
