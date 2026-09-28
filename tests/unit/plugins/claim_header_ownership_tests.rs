@@ -418,6 +418,8 @@ fn claim_headers_refuse_the_whole_consumer_assertion_namespace() {
         "X-Consumer-Role",
         "x-consumer-groups",
         "x-consumer-username",
+        "X_Consumer_Role",
+        "x_consumer-groups",
     ] {
         let config = json!({"claim_headers": {"role": header}});
         let error = parse_claim_headers(

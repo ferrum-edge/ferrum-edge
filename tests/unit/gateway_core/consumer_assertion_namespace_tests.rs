@@ -37,10 +37,18 @@ fn authenticated_ctx(identity: &str) -> RequestContext {
     ctx
 }
 
+/// Names in the namespace by an independent oracle: ASCII case folded and `_`
+/// read as `-`, matching the shared predicate's contract.
+fn in_namespace(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .replace('_', "-")
+        .starts_with("x-consumer-")
+}
+
 fn consumer_namespace_keys(headers: &HashMap<String, String>) -> Vec<String> {
     headers
         .keys()
-        .filter(|name| name.to_ascii_lowercase().starts_with("x-consumer-"))
+        .filter(|name| in_namespace(name))
         .cloned()
         .collect()
 }
@@ -55,6 +63,14 @@ fn gateway_assertion_predicate_covers_whole_consumer_namespace_case_insensitivel
         "X-Consumer-Role",
         "X-CONSUMER-GROUPS",
         "x-consumer-",
+        // `_` and `-` are equivalent: CGI-style backends fold both onto
+        // `HTTP_X_CONSUMER_*`.
+        "x_consumer_role",
+        "X_Consumer_Role",
+        "x_consumer-groups",
+        "x-consumer_groups",
+        "X_CONSUMER_USERNAME",
+        "x_consumer_",
     ] {
         assert!(is_consumer_assertion_header(name), "{name}");
         assert!(is_gateway_assertion_header(name), "{name}");
@@ -67,6 +83,10 @@ fn gateway_assertion_predicate_covers_whole_consumer_namespace_case_insensitivel
         "x-geo-country",
         "consumer-role",
         "x-forwarded-consumer-role",
+        "x_consumer",
+        "x__consumer-role",
+        "x-consumer.role",
+        "x_geo_country",
     ] {
         assert!(!is_consumer_assertion_header(name), "{name}");
     }
@@ -84,6 +104,8 @@ fn ingress_materialization_drops_every_client_consumer_assertion() {
     raw.append("x-consumer-groups", "ops".parse().unwrap());
     raw.insert("X-Consumer-Username", "forged".parse().unwrap());
     raw.insert("x-consumer-custom-id", "forged-id".parse().unwrap());
+    raw.insert("x_consumer_role", "admin".parse().unwrap());
+    raw.insert("X_Consumer-Groups", "admins".parse().unwrap());
     raw.insert("x-consumers-note", "ordinary".parse().unwrap());
     raw.insert("x-request-id", "req-1".parse().unwrap());
     ctx.set_raw_headers(raw);
@@ -143,6 +165,8 @@ fn raw_grpc_merge_base_drops_client_consumer_namespace_without_a_principal() {
     let mut headers = HeaderMap::new();
     headers.insert("x-consumer-role", "admin".parse().unwrap());
     headers.insert("x-consumer-username", "forged".parse().unwrap());
+    headers.insert("x_consumer_role", "admin".parse().unwrap());
+    headers.insert("x-consumer_groups", "admins".parse().unwrap());
     headers.insert("x-app", "kept".parse().unwrap());
     let mut proxy_headers = HashMap::new();
     proxy_headers.insert("x-app".to_string(), "kept".to_string());
@@ -150,9 +174,7 @@ fn raw_grpc_merge_base_drops_client_consumer_namespace_without_a_principal() {
     merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
 
     assert!(
-        headers
-            .keys()
-            .all(|name| !name.as_str().starts_with("x-consumer-")),
+        headers.keys().all(|name| !in_namespace(name.as_str())),
         "{headers:?}"
     );
     assert_eq!(
@@ -170,6 +192,8 @@ fn post_plugin_refresh_scrubs_plugin_authored_consumer_namespace() {
     headers.insert("X-Consumer-Role".to_string(), "admin".to_string());
     headers.insert("x-consumer-groups".to_string(), "admins".to_string());
     headers.insert("X-Consumer-Username".to_string(), "forged".to_string());
+    headers.insert("X_Consumer_Role".to_string(), "admin".to_string());
+    headers.insert("x_consumer_username".to_string(), "forged".to_string());
     headers.insert("x-request-id".to_string(), "req-1".to_string());
 
     refresh_backend_gateway_assertion_headers(&ctx, &mut headers);
@@ -194,6 +218,7 @@ fn post_plugin_refresh_scrubs_consumer_namespace_without_a_principal() {
     let ctx = ctx();
     let mut headers = HashMap::new();
     headers.insert("x-consumer-role".to_string(), "admin".to_string());
+    headers.insert("x_consumer_groups".to_string(), "admins".to_string());
     headers.insert("x-request-id".to_string(), "req-1".to_string());
 
     refresh_backend_gateway_assertion_headers(&ctx, &mut headers);

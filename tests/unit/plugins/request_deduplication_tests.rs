@@ -692,6 +692,31 @@ fn test_new_rejects_invalid_header_name() {
     assert!(result.err().unwrap().contains("header_name"));
 }
 
+/// The idempotency key is read from the client request, and the gateway strips
+/// the whole `x-consumer-*` namespace (either spelling) at ingress, so such a
+/// name could never be supplied: with `enforce_required` every request would
+/// be rejected. It is refused at load instead.
+#[test]
+fn test_new_rejects_consumer_assertion_namespace_header_name() {
+    for header_name in [
+        "x-consumer-idempotency-key",
+        "X-Consumer-Request-Id",
+        "X_Consumer_Key",
+        "x_consumer-key",
+    ] {
+        let config = json!({ "header_name": header_name });
+        let Err(error) = RequestDeduplication::new(&config, PluginHttpClient::default()) else {
+            panic!("{header_name}: an x-consumer-* idempotency header must be refused");
+        };
+        assert!(
+            error.contains("`header_name`") && error.contains("`x-consumer-*`"),
+            "{header_name}: {error}"
+        );
+    }
+    // A name that only resembles the namespace stays allowed.
+    make_plugin(json!({ "header_name": "x-consumers-key" }));
+}
+
 #[test]
 fn test_new_rejects_invalid_numeric_and_bool_types() {
     for config in [

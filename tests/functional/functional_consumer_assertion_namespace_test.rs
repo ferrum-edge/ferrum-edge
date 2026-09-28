@@ -2,10 +2,12 @@
 //! (ferrum-alloy#25 item 4).
 //!
 //! A client that sends `X-Consumer-Role: admin` / `X-Consumer-Groups: admins`
-//! (or a forged `X-Consumer-Username`) must not reach any backend, while the
-//! gateway-authored `x-consumer-username` / `x-consumer-custom-id` of the
-//! authenticated consumer must. Each test authenticates through `key_auth` and
-//! asserts on what a scripted backend actually received:
+//! (or a forged `X-Consumer-Username`, or an underscore spelling such as
+//! `X_Consumer_Role` that CGI-style backends fold onto the same variable) must
+//! not reach any backend, while the gateway-authored `x-consumer-username` /
+//! `x-consumer-custom-id` of the authenticated consumer must. Each test
+//! authenticates through `key_auth` and asserts on what a scripted backend
+//! actually received:
 //!
 //! - HTTP/1.1, HTTP/2 (h2c), and HTTP/3 frontends to an HTTP/1.1 backend. The
 //!   HTTP/3 leg rides the H3-to-HTTP/1.1 cross-protocol bridge.
@@ -55,6 +57,9 @@ fn hostile_client_headers() -> Vec<(&'static str, String)> {
         ("X-Consumer-Role", "admin".to_string()),
         ("X-Consumer-Groups", "admins".to_string()),
         ("X-Consumer-Username", FORGED_USERNAME.to_string()),
+        ("X_Consumer_Role", "admin".to_string()),
+        ("x_consumer-groups", "admins".to_string()),
+        ("x-consumer_username", FORGED_USERNAME.to_string()),
         (APPLICATION_HEADER, "keep-me".to_string()),
     ]
 }
@@ -90,11 +95,13 @@ fn key_auth_config(proxies: Vec<Value>, proxy_ids: &[&str]) -> String {
 }
 
 /// Assert one backend-received header list honours the namespace contract.
+/// `_` is folded to `-` so an underscore spelling that survived would show up
+/// as an unexpected name.
 fn assert_backend_consumer_namespace(label: &str, headers: &[(String, String)]) {
     let consumer_headers: Vec<(String, &str)> = headers
         .iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
-        .filter(|(name, _)| name.starts_with("x-consumer-"))
+        .filter(|(name, _)| name.replace('_', "-").starts_with("x-consumer-"))
         .collect();
     let mut names: Vec<&str> = consumer_headers
         .iter()
@@ -425,8 +432,11 @@ async fn spawn_h3_grpc_gateway(backend_port: u16) -> (GatewayHarness, u16) {
                 key_path.to_string_lossy().into_owned(),
             )
             .env("FERRUM_TLS_NO_VERIFY", "true")
-            // gRPC always uses the cross-protocol bridge (never the native-H3
-            // pool), so the capability registry is irrelevant.
+            // Warmup off makes the subprocess run its one-shot startup
+            // capability probe immediately. That probe only handshakes (TLS +
+            // H2, plus a UDP H3 attempt) and opens no stream, so it does not
+            // consume the backend's one `AcceptRpc` step; gRPC itself always
+            // rides the cross-protocol bridge, never the native-H3 pool.
             .env("FERRUM_POOL_WARMUP_ENABLED", "false")
             .spawn()
             .await;

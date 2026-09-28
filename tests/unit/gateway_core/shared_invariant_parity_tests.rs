@@ -2701,7 +2701,7 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
     (
         "raw native-gRPC / direct-H2 / mesh replay merge base",
         "src/proxy/headers.rs",
-        ".find(|name| is_consumer_assertion_header(name.as_str()))",
+        ".filter(|name| is_consumer_assertion_header(name.as_str()))",
     ),
     (
         "H1/H2/H3 request trailers",
@@ -2767,6 +2767,21 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         "mesh_route_dispatch request_transform admission",
         "src/plugins/mesh_route_dispatch.rs",
         "crate::proxy::headers::is_consumer_assertion_header(&rule.key)",
+    ),
+    (
+        "Gateway API RequestHeaderModifier translation (per-route refusal)",
+        "src/config_sources/k8s/gateway_api.rs",
+        "!response_side && crate::proxy::headers::is_consumer_assertion_header(name)",
+    ),
+    (
+        "request_deduplication header_name admission",
+        "src/plugins/request_deduplication.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(&name)",
+    ),
+    (
+        "mcp_gateway session header admission",
+        "src/plugins/mcp_gateway.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(value)",
     ),
 ];
 

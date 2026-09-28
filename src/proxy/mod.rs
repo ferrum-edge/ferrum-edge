@@ -16988,6 +16988,10 @@ fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, Str
 /// `x-consumer-role` is dropped here exactly like a forged
 /// `x-consumer-username`; only the authenticated `x-consumer-username` /
 /// `x-consumer-custom-id` are written back.
+///
+/// `pub` (rather than `pub(crate)`) only so the external
+/// `tests/unit/gateway_core` target can exercise it; not a supported API.
+#[doc(hidden)]
 pub fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,

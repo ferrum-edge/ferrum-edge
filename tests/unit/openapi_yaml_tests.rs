@@ -7826,6 +7826,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "X-XSRF-Token"}),
         json!({"header_name": "X-Consumer-Request-Id"}),
         json!({"header_name": " x-consumer-trace "}),
+        json!({"header_name": "X_Consumer_Trace"}),
+        json!({"header_name": "x_consumer-trace"}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
         assert!(

@@ -20401,8 +20401,8 @@ components:
                 pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Vv][Ii][Aa]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$"
             - not:
                 type: string
-                pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-"
-          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names and every name in the gateway-owned x-consumer-* consumer assertion namespace, are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
+                pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]"
+          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names and every name in the gateway-owned x-consumer-* consumer assertion namespace (with `_` equivalent to `-`, so x_consumer_role is included), are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
         echo_downstream:
           type: [boolean, "null"]
           default: true
@@ -22277,7 +22277,7 @@ components:
                   type: string
                   pattern: '^\s*[!#$%&''*+.^_`|~0-9A-Za-z-]+\s*$'
                   not:
-                    pattern: '^\s*([Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]|[Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-[Cc][Uu][Ss][Tt][Oo][Mm]-[Ii][Dd]|[Hh][Oo][Ss][Tt]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])\s*$'
+                    pattern: '^\s*([Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]\S*|[Hh][Oo][Ss][Tt]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])\s*$'
                 description: >-
                   Claim path to upstream header mappings. Destination headers are
                   gateway-owned and always sanitized: every configured destination is
@@ -35080,6 +35080,9 @@ components:
               minLength: 1
               pattern: '^[!#$%&*+\-.^_`|~0-9A-Za-z]+$'
               default: mcp-session-id
+              not:
+                type: string
+                pattern: '^[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]'
               description: >-
                 Must be a valid HTTP header name; rejected at config validation
                 otherwise. This name is stamped onto the client response, so
@@ -35087,13 +35090,22 @@ components:
                 (`connection`, `content-length`, `keep-alive`,
                 `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
                 `transfer-encoding`, `upgrade`, case-insensitive) are also
-                rejected.
+                rejected. Names in the gateway-owned `x-consumer-*` request
+                namespace (case-insensitive, `_` equivalent to `-`) are
+                rejected because the gateway strips them from client requests.
             upstream_session_header:
               type: [string, "null"]
               minLength: 1
               pattern: '^[!#$%&*+\-.^_`|~0-9A-Za-z]+$'
               default: mcp-session-id
-              description: Must be a valid HTTP header name; rejected at config validation otherwise.
+              not:
+                type: string
+                pattern: '^[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]'
+              description: >-
+                Must be a valid HTTP header name; rejected at config validation
+                otherwise. Names in the gateway-owned `x-consumer-*` request
+                namespace (case-insensitive, `_` equivalent to `-`) are
+                rejected because the gateway scrubs them before dispatch.
             initialize_upstreams:
               type: [string, "null"]
               enum: [lazy, startup, passthrough, null]
@@ -37070,7 +37082,10 @@ components:
           minLength: 1
           pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: "Idempotency-Key"
-          description: Request header name containing the deduplication key. Must be a valid RFC 9110 HTTP field-name token.
+          not:
+            type: string
+            pattern: "^[Xx][-_][Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr][-_]"
+          description: Request header name containing the deduplication key. Must be a valid RFC 9110 HTTP field-name token. Names in the gateway-owned x-consumer-* request namespace (case-insensitive, `_` equivalent to `-`) are rejected at config load, because the gateway strips them from every client request and no request could carry the key.
         ttl_seconds:
           type: integer
           minimum: 1

@@ -2428,6 +2428,9 @@ fn admission_refuses_every_consumer_assertion_namespace_destination() {
         "X-CONSUMER-GROUPS",
         "x-consumer-username",
         "x-consumer-custom-id",
+        // `_` is equivalent to `-` in the namespace prefix.
+        "X_Consumer_Role",
+        "x_consumer-groups",
     ] {
         for operation in ["add", "update", "rename"] {
             let rule = if operation == "rename" {
@@ -2463,7 +2466,12 @@ fn admission_refuses_every_consumer_assertion_namespace_destination() {
         }
     }
     // Names that only resemble the prefix are ordinary headers.
-    for destination in ["x-consumer", "x-consumers-role", "x-consumerrole"] {
+    for destination in [
+        "x-consumer",
+        "x-consumers-role",
+        "x-consumerrole",
+        "x_consumer",
+    ] {
         let config = json!({"rules": [
             {"target": "header", "operation": "add", "key": destination, "value": "v"}
         ]});

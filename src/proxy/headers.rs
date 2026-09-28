@@ -104,7 +104,7 @@ define_header_name_set! {
 }
 
 /// Returns `true` for the gateway-owned consumer assertion namespace
-/// (`x-consumer-*`, ASCII case-insensitive).
+/// (`x-consumer-*`, ASCII case-insensitive, `_` equivalent to `-`).
 ///
 /// This is the single source of truth for the namespace. Every name under the
 /// prefix is gateway-owned: a client-supplied `X-Consumer-Role` or
@@ -116,15 +116,31 @@ define_header_name_set! {
 /// re-adds names beneath it afterwards (today `x-consumer-username` and
 /// `x-consumer-custom-id`, from the authenticated principal).
 ///
-/// Allocation-free: one bounded 11-byte case-insensitive prefix compare, so it
-/// is safe to call per header on the hot path with lowercase or mixed-case
-/// names.
+/// `_` and `-` are equivalent in the prefix: `X_Consumer_Role` and
+/// `x_consumer-groups` are in the namespace too. `_` is a legal token byte, and
+/// CGI-style backends (Rack, WSGI, PHP-FPM) fold both spellings to the same
+/// `HTTP_X_CONSUMER_*` variable, so an underscore spelling would otherwise
+/// reach the backend as the gateway's assertion.
+///
+/// Allocation-free: one bounded 11-byte compare that folds ASCII case and
+/// normalises `_` to `-`, so it is safe to call per header on the hot path
+/// with lowercase or mixed-case names.
 #[inline]
 pub fn is_consumer_assertion_header(name: &str) -> bool {
     const PREFIX: &[u8] = b"x-consumer-";
-    name.as_bytes()
-        .get(..PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+    let Some(head) = name.as_bytes().get(..PREFIX.len()) else {
+        return false;
+    };
+    for (&byte, &expected) in head.iter().zip(PREFIX) {
+        let folded = match byte {
+            b'_' => b'-',
+            other => other.to_ascii_lowercase(),
+        };
+        if folded != expected {
+            return false;
+        }
+    }
+    true
 }
 
 /// Returns `true` for every backend-visible gateway assertion: the
@@ -595,20 +611,20 @@ pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) 
 /// and `HeaderMap` names are already lowercase, so any client-supplied casing
 /// or duplication is dropped.
 ///
-/// Allocation-free: the common no-assertion request does one prefix compare per
-/// distinct name. A matching custom `HeaderName` clone only bumps a refcount.
+/// Linear in the number of distinct names: matching names are collected in one
+/// pass and then removed. The common no-assertion request does one prefix
+/// compare per distinct name and allocates nothing (collecting an empty
+/// iterator does not allocate).
 fn strip_reserved_gateway_assertion_headers(headers: &mut http::HeaderMap) {
-    while let Some(name) = first_consumer_assertion_header_name(headers) {
+    let forged: Vec<http::HeaderName> = headers
+        .keys()
+        .filter(|name| is_consumer_assertion_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in forged {
         headers.remove(name);
     }
     headers.remove("x-geo-country");
-}
-
-fn first_consumer_assertion_header_name(headers: &http::HeaderMap) -> Option<http::HeaderName> {
-    headers
-        .keys()
-        .find(|name| is_consumer_assertion_header(name.as_str()))
-        .cloned()
 }
 
 /// Whether the materialized single-value view still represents the exact raw

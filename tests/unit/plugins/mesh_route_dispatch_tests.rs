@@ -1419,7 +1419,13 @@ fn mesh_route_dispatch_rejects_protocol_managed_response_transform_destinations(
 /// offending rule.
 #[test]
 fn mesh_route_dispatch_rejects_consumer_assertion_request_transform_destinations() {
-    for key in ["x-consumer-foo", "X-Consumer-Role", "x-consumer-username"] {
+    for key in [
+        "x-consumer-foo",
+        "X-Consumer-Role",
+        "x-consumer-username",
+        "X_Consumer_Role",
+        "x_consumer-groups",
+    ] {
         for operation in ["add", "update"] {
             let config = json!({
                 "rules": [{

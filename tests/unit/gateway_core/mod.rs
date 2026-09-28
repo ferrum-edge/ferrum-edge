@@ -89,6 +89,7 @@ mod http3_websocket_tests;
 mod https_to_plaintext_tests;
 mod injector_sidecar_image_tests;
 mod json_dup_keys_tests;
+mod k8s_consumer_assertion_route_filter_tests;
 mod k8s_controller_metrics_tests;
 mod k8s_controller_rbac_parity_tests;
 mod k8s_gateway_status_ssa_cas_tests;
