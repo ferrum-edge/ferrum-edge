@@ -231,7 +231,11 @@ shares.
   ephemeral host ports, and do not blanket-retry unrelated container-start
   errors — a fixture that genuinely cannot start must still fail in CI.
   `tests/unit/gateway_core/shared_invariant_parity_tests.rs` asserts this
-  structurally over both fixture modules.
+  structurally over both fixture modules. Every container `start()` in both
+  suites goes through `tests/service_integration/common/container_retry.rs`
+  (`start_within_deadline`, also `#[path]`-included by the secrets fixtures),
+  which retries only transient image-pull/registry errors within one bounded
+  deadline; the same parity file asserts that too.
 - **A fixture must prove its PUBLISHED mapping before a test asserts through
   it** (issue #5488). A `WaitFor` log match and a `docker exec` seed both
   observe the container from the inside; neither shows that the host port

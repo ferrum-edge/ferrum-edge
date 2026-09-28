@@ -731,7 +731,9 @@ SHARED_FEATURE_JOB_PATTERNS = (
 # as well: the Vault/LocalStack fixtures include it through `#[path]` rather than
 # reimplementing host-port allocation (issue #5488). It is the one file outside
 # `tests/secrets_functional/` that changes what this job runs, so it is listed
-# here explicitly — the rest of that suite is not an input.
+# here explicitly — the rest of that suite is not an input. The shared
+# container-start retry (`tests/service_integration/common/container_retry.rs`)
+# is included the same way.
 SECRETS_BACKENDS_PATTERNS = [
     re.compile(pattern)
     for pattern in (
@@ -740,6 +742,7 @@ SECRETS_BACKENDS_PATTERNS = [
         r"^src/tls/source/mod\.rs$",
         r"^tests/secrets_functional/",
         r"^tests/service_integration/common/host_ports\.rs$",
+        r"^tests/service_integration/common/container_retry\.rs$",
         r"^src/(?:main|gateway_entry)\.rs$",
         r"^src/config/env_config\.rs$",
         r"^\.config/nextest\.toml$",
@@ -1654,6 +1657,13 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/service_integration/common/host_ports.rs"],
+            rust_only | {"run_service_integration": True, "run_secrets_backends": True},
+        ),
+        # Shared container-start retry: compiled into the secrets fixtures too
+        # (follow-up to #5881), so it schedules both container suites.
+        (
+            "pull_request",
+            ["tests/service_integration/common/container_retry.rs"],
             rust_only | {"run_service_integration": True, "run_secrets_backends": True},
         ),
         (

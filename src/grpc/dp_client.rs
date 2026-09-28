@@ -44,14 +44,15 @@ use super::configsync_lifecycle::{
     DeltaRejectionKind, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
     MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
     advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
-    check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
+    check_config_sync_build_identity, check_peer_version_compatibility, config_sync_build_identity,
+    connection_error_outcome, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, evaluate_delta_authority,
     evaluate_snapshot_clock_skew, full_snapshot_stream_disposition,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
     reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
-    silence_watchdog_armed, snapshot_failure_stream_disposition,
-    snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
+    snapshot_failure_stream_disposition, snapshot_requires_older_payload_exception,
+    stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
@@ -1261,6 +1262,13 @@ pub async fn start_dp_client_with_stream_timings(
                 update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::ResyncAfterAcceptedConfig
             }
+            Ok(DpStreamEnd::BuildMismatch) => {
+                // The CP runs a different build. It is not an authoritative
+                // source for this DP: fail over with accumulating backoff and
+                // keep serving last-known-good config.
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
+                ConfigSyncAttemptOutcome::BuildMismatch
+            }
             Ok(DpStreamEnd::TransportFailure { received_config }) => {
                 update_state_disconnected(&connection_state, cp_url, is_primary, received_config);
                 if received_config && is_fallback {
@@ -1272,7 +1280,23 @@ pub async fn start_dp_client_with_stream_timings(
                 connection_error_outcome(received_config)
             }
             Err(e) => {
-                if let Some(status) = subscribe_admission_refusal(&e) {
+                if let Some(status) = subscribe_build_mismatch(&e) {
+                    // The CP answered and refused this DP's build. Retrying
+                    // cannot succeed until CP and DP run the same build, so
+                    // back off on the normal failure schedule instead of
+                    // hot-looping.
+                    error!(
+                        cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                        dp_build = config_sync_build_identity(),
+                        "CP [{}/{}] refused ConfigSync Subscribe: {}. Backing off; \
+                         last-known-good configuration keeps serving",
+                        backoff.current_cp_index + 1,
+                        cp_count,
+                        sanitize_startup_cause(status.message(), &[])
+                    );
+                    update_state_disconnected(&connection_state, cp_url, is_primary, false);
+                    ConfigSyncAttemptOutcome::BuildMismatch
+                } else if let Some(status) = subscribe_admission_refusal(&e) {
                     // The CP answered. A `RESOURCE_EXHAUSTED` Subscribe status
                     // is a capacity/tenancy refusal by the CP gRPC stream
                     // admission controller. Only exact known messages may name
@@ -1326,6 +1350,7 @@ pub async fn start_dp_client_with_stream_timings(
         if matches!(
             attempt_outcome,
             ConfigSyncAttemptOutcome::ConnectionError
+                | ConfigSyncAttemptOutcome::BuildMismatch
                 | ConfigSyncAttemptOutcome::AdmissionRefused
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 | ConfigSyncAttemptOutcome::StaleSnapshotFenced
@@ -1402,6 +1427,7 @@ pub async fn start_dp_client_with_stream_timings(
         if matches!(
             attempt_outcome,
             ConfigSyncAttemptOutcome::ConnectionError
+                | ConfigSyncAttemptOutcome::BuildMismatch
                 | ConfigSyncAttemptOutcome::AdmissionRefused
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 | ConfigSyncAttemptOutcome::StaleSnapshotFenced
@@ -1445,6 +1471,9 @@ enum DpStreamEnd {
     /// Transport/RPC failure after Subscribe succeeded. `received_config`
     /// distinguishes backoff reset (issue #2968) from accumulating failure.
     TransportFailure { received_config: bool },
+    /// A CP frame carried a ConfigSync build identity other than this DP's.
+    /// Nothing from the frame is applied; the outer loop backs off.
+    BuildMismatch,
 }
 
 async fn wait_for_readiness_then_primary_retry(
@@ -1543,6 +1572,17 @@ pub fn subscribe_admission_refusal(error: &anyhow::Error) -> Option<&tonic::Stat
             && status.message().starts_with("CP gRPC ")
             && status.message().contains("(FERRUM_XDS_MAX_")
             && status.message().ends_with(')')
+    })
+}
+
+/// Recognise the CP's ConfigSync build-mismatch refusal inside a Subscribe
+/// error: `FAILED_PRECONDITION` whose message starts with
+/// [`super::configsync_lifecycle::CONFIG_SYNC_BUILD_MISMATCH_PREFIX`]. Other
+/// `FAILED_PRECONDITION` refusals stay ordinary connection errors.
+pub fn subscribe_build_mismatch(error: &anyhow::Error) -> Option<&tonic::Status> {
+    let prefix = super::configsync_lifecycle::CONFIG_SYNC_BUILD_MISMATCH_PREFIX;
+    error.downcast_ref::<tonic::Status>().filter(|status| {
+        status.code() == tonic::Code::FailedPrecondition && status.message().starts_with(prefix)
     })
 }
 
@@ -2106,6 +2146,7 @@ pub async fn connect_and_subscribe(
         | DpStreamEnd::InvalidDeltaFreshness
         | DpStreamEnd::InvalidSubscriptionBase
         | DpStreamEnd::ResyncAfterAcceptedConfig
+        | DpStreamEnd::BuildMismatch
         | DpStreamEnd::TransportFailure { .. } => Ok(()),
     }
 }
@@ -2163,6 +2204,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
         | DpStreamEnd::InvalidDeltaFreshness
         | DpStreamEnd::InvalidSubscriptionBase
         | DpStreamEnd::ResyncAfterAcceptedConfig
+        | DpStreamEnd::BuildMismatch
         | DpStreamEnd::TransportFailure { .. } => Ok(()),
     }
 }
@@ -2275,12 +2317,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 .clone()
                 .unwrap_or_default(),
         ),
-        // Advertise the heartbeat capability. The CP only emits keepalive frames
-        // to advertising subscribers, and only confirms the capability back on
-        // the initial update — so this DP arms its silence watchdog against a CP
-        // that actually committed to heartbeats, never against one that predates
-        // them.
-        supports_heartbeat: true,
+        config_sync_build: config_sync_build_identity().to_string(),
     });
 
     let mut stream = client.subscribe(request).await?.into_inner();
@@ -2290,16 +2327,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     let mut subscription = SubscriptionApplyState::new();
     let skip_startup_readiness_work = startup_ready.is_none();
     let mut received_config = false;
-    // Application silence is only a liveness signal once the CP has confirmed it
-    // will send heartbeats. Against a CP that predates the capability the stream
-    // is legitimately silent while idle, and arming the watchdog would force a
-    // reconnect the CP was never asked to prevent. Transport keepalive (HTTP/2
-    // PING + TCP) still covers those streams. Set true and never cleared: only
-    // the initial update carries the confirmation.
-    let mut heartbeats_negotiated = false;
-    // Silence before the *first* message is anomalous at any peer version, so
-    // the watchdog stays armed until one arrives (see `silence_watchdog_armed`).
-    let mut received_any_message = false;
+    // The CP sends a heartbeat on every Subscribe stream, so application
+    // silence beyond the liveness bound always means the stream is dead —
+    // including silence before the first message on a blackholed reconnect
+    // (issue #2967).
     let mut last_stream_activity = Instant::now();
     let primary_retry_fut = wait_for_readiness_then_primary_retry(
         startup_ready.clone(),
@@ -2329,7 +2360,6 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         let silence_remaining = timings
             .max_silence
             .saturating_sub(last_stream_activity.elapsed());
-        let silence_armed = silence_watchdog_armed(heartbeats_negotiated, received_any_message);
 
         // Poll lifecycle signals (shutdown / TLS reload / primary retry) before
         // the message arm so a sustained stream cannot starve them, but keep the
@@ -2365,7 +2395,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     }
                 }
             }
-            _ = tokio::time::sleep(silence_remaining), if silence_armed => {
+            _ = tokio::time::sleep(silence_remaining) => {
                 error!(
                     received_config,
                     "ConfigSync stream silent for {}s (no message/heartbeat); reconnecting",
@@ -2376,29 +2406,31 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         };
 
         last_stream_activity = Instant::now();
-        received_any_message = true;
 
-        // Every envelope, including a heartbeat, must come from a compatible
-        // peer. Otherwise an incompatible or malformed-version CP could keep a
-        // stream alive indefinitely while bypassing the config-update gate.
-        if let Err(err) = check_cp_version_compatibility(&update.ferrum_version) {
-            error!("{}", sanitize_startup_cause(err, &[]));
-            return Ok(DpStreamEnd::TransportFailure { received_config });
+        // Every envelope, including a heartbeat, must come from this exact
+        // build. Otherwise a different-build CP could keep a stream alive
+        // indefinitely while bypassing the config-update gate.
+        if let Err(mismatch) = check_config_sync_build_identity(&update.config_sync_build) {
+            error!(
+                cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
+                "{} Terminating the stream and backing off",
+                sanitize_startup_cause(mismatch.message("DP", "CP"), &[])
+            );
+            return Ok(DpStreamEnd::BuildMismatch);
         }
 
         if update.heartbeat {
             // Heartbeats are valid only after this subscription accepted its
-            // authoritative base and the initial FULL_SNAPSHOT negotiated the
-            // capability. A heartbeat cannot bootstrap either state: accepting
-            // it would let a buggy/adversarial CP keep an unready DP connected
-            // forever without ever supplying usable configuration.
-            if !heartbeat_frame_admissible(subscription.base_applied, heartbeats_negotiated) {
+            // authoritative FULL_SNAPSHOT base. A heartbeat cannot bootstrap
+            // that state: accepting it would let a buggy/adversarial CP keep an
+            // unready DP connected forever without ever supplying usable
+            // configuration.
+            if !heartbeat_frame_admissible(subscription.base_applied) {
                 warn!(
                     base_applied = subscription.base_applied,
-                    heartbeats_negotiated,
                     cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
-                    "Refusing ConfigSync heartbeat before an accepted, negotiated \
-                     FULL_SNAPSHOT base; terminating stream"
+                    "Refusing ConfigSync heartbeat before an accepted FULL_SNAPSHOT base; \
+                     terminating stream"
                 );
                 return Ok(refuse_unusable_snapshot(subscription.base_applied));
             }
@@ -2407,25 +2439,6 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 "Received ConfigSync heartbeat"
             );
             continue;
-        }
-
-        // The CP confirms heartbeat support only on a real FULL_SNAPSHOT.
-        // Rejecting a confirmation on DELTA prevents a partial update from
-        // changing lifecycle policy before establishing an authoritative base.
-        if update.heartbeat_negotiated && update.update_type != 0 {
-            warn!(
-                update_type = %sanitize_startup_cause(format!("\"{}\"", update.update_type), &[]),
-                cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
-                "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
-            );
-            return Ok(refuse_unusable_snapshot(subscription.base_applied));
-        }
-        if update.heartbeat_negotiated && !heartbeats_negotiated {
-            heartbeats_negotiated = true;
-            debug!(
-                max_silence_secs = timings.max_silence.as_secs(),
-                "CP confirmed ConfigSync heartbeat support; arming stream silence watchdog"
-            );
         }
 
         info!(
@@ -2852,23 +2865,6 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
                                 }
                             };
-                        // Rolling-upgrade compatibility: a same-major.minor CP
-                        // that predates namespace-qualified removals sends bare
-                        // resource IDs, which decode without a namespace. Adopt
-                        // this subscription's already-authorized namespace — the
-                        // only one this DP may act on — so the legacy semantics
-                        // are reproduced without widening reach. Keys that stay
-                        // unqualified (empty namespace) are dropped by the
-                        // namespace filter immediately below.
-                        let unqualified = result.qualify_unqualified_removals(namespace);
-                        if unqualified > 0 {
-                            debug!(
-                                unqualified,
-                                namespace,
-                                "CP delta carried legacy unqualified removal keys; scoping them to \
-                                 this subscription's authorized namespace"
-                            );
-                        }
                         // Defense in depth: filter cross-namespace
                         // additions/modifications before applying. See
                         // `filter_incremental_to_namespace`.
@@ -3320,12 +3316,12 @@ pub fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace
         + (pre.7 - result.removed_upstream_ids.len())
 }
 
-/// Check whether the CP's reported version is compatible with this DP.
+/// MeshSubscribe version floor for a CP-originated mesh config envelope.
 ///
-/// Uses SemVer parsing. Major and minor must match; patch and prerelease/build
-/// differences are allowed. Empty and malformed versions are rejected
-/// (issue #2395). See [`check_peer_version_compatibility`] for the prerelease
-/// policy.
+/// Empty, malformed, and different-major.minor versions are rejected
+/// (issue #2395); see [`check_peer_version_compatibility`]. The ConfigSync
+/// stream does not use this check: it requires the exact build identity
+/// ([`check_config_sync_build_identity`]).
 pub fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
     check_peer_version_compatibility(FERRUM_VERSION, cp_version)
         .map_err(|err| err.message("DP", "CP", FERRUM_VERSION))

@@ -336,7 +336,7 @@ fn delta_resource_and_qualified_removal_lists_require_objects() {
         "added_or_modified_consumers": [], "removed_consumer_ids": [],
         "added_or_modified_plugin_configs": [], "removed_plugin_config_ids": [],
         "added_or_modified_upstreams": [], "removed_upstream_ids": [],
-        "poll_timestamp": "2026-09-16T00:00:00Z"
+        "sequence_cursor": 0, "poll_timestamp": "2026-09-16T00:00:00Z"
     });
     let key = json!({"namespace": "ferrum", "id": "removed"});
     assert_lists::<IncrementalResult>(
@@ -349,9 +349,10 @@ fn delta_resource_and_qualified_removal_lists_require_objects() {
                 json!({"plugin_name": "cors", "scope": "global"}),
             ),
             ("added_or_modified_upstreams", json!({"targets": []})),
-            ("removed_proxy_keys", key.clone()),
-            ("removed_plugin_config_keys", key.clone()),
-            ("removed_upstream_keys", key.clone()),
+            ("removed_proxy_ids", key.clone()),
+            ("removed_consumer_ids", key.clone()),
+            ("removed_plugin_config_ids", key.clone()),
+            ("removed_upstream_ids", key),
         ],
     );
 
@@ -375,21 +376,6 @@ fn delta_resource_and_qualified_removal_lists_require_objects() {
         Err(error) => error.to_string(),
     };
     assert!(error.contains("expected a JSON object"), "{error}");
-
-    // The legacy removal arrays deliberately also admit bare strings. Guard
-    // only their object variant, keeping both documented wire forms usable.
-    for field in [
-        "removed_proxy_ids",
-        "removed_consumer_ids",
-        "removed_plugin_config_ids",
-        "removed_upstream_ids",
-    ] {
-        let mut delta = base.clone();
-        delta[field] = json!(["bare-id", key]);
-        assert!(serde_json::from_value::<IncrementalResult>(delta.clone()).is_ok());
-        delta[field] = json!([["ferrum", "removed"]]);
-        assert!(serde_json::from_value::<IncrementalResult>(delta).is_err());
-    }
 }
 
 #[test]

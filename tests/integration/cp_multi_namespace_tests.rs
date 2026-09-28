@@ -22,6 +22,7 @@ use tonic::transport::Server;
 
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
+use ferrum_edge::grpc::configsync_lifecycle::config_sync_build_identity;
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
 use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
@@ -192,7 +193,7 @@ async fn start_cp_with_scope(
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let cfg_arc = Arc::new(ArcSwap::new(Arc::new(config)));
     let registry = Arc::new(DpNodeRegistry::new());
-    let (server, _tx) = CpGrpcServer::builder(cfg_arc, TEST_JWT_SECRET.to_string())
+    let server = CpGrpcServer::builder(cfg_arc, TEST_JWT_SECRET.to_string())
         .channel_capacity(64)
         .registry(registry)
         .expected_issuer(TEST_ISSUER.to_string())
@@ -301,11 +302,12 @@ async fn start_xds_with_scope(
     require_ns_claim: bool,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let cfg_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (_cp, update_tx) = CpGrpcServer::builder(cfg_arc.clone(), TEST_JWT_SECRET.to_string())
+    let cp = CpGrpcServer::builder(cfg_arc.clone(), TEST_JWT_SECRET.to_string())
         .channel_capacity(64)
         .scope(scope.clone())
         .require_ns_claim(require_ns_claim)
         .build();
+    let update_tx = cp.broadcasts().sender_for("tenant-a");
     let server = XdsAdsServer::new(
         cfg_arc,
         update_tx,
@@ -359,9 +361,9 @@ async fn back_compat_single_scope_accepts_matching_namespace() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-a".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let mut stream = client
         .subscribe(request)
@@ -399,9 +401,9 @@ async fn back_compat_single_scope_rejects_mismatched_namespace() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-b".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "staging".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let err = client
         .subscribe(request)
@@ -444,9 +446,9 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
     let prod_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-prod".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let mut prod_stream = prod_client.subscribe(prod_req).await.unwrap().into_inner();
     let prod_first = timeout(Duration::from_secs(5), prod_stream.message())
@@ -470,9 +472,9 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
     let staging_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-staging".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "staging".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let mut staging_stream = staging_client
         .subscribe(staging_req)
@@ -498,9 +500,9 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
     let dev_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-dev".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "dev".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let err = dev_client.subscribe(dev_req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
@@ -533,9 +535,9 @@ async fn multi_ns_all_scope_filters_initial_snapshot_per_subscriber() {
         let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
             node_id: node_id.to_string(),
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            config_sync_build: config_sync_build_identity().to_string(),
             namespace: ns.to_string(),
             real_ip_header: Some(String::new()),
-            supports_heartbeat: true,
         });
         let mut stream = client.subscribe(req).await.unwrap().into_inner();
         let first = timeout(Duration::from_secs(5), stream.message())
@@ -574,9 +576,9 @@ async fn multi_ns_set_scope_rejects_token_without_ns_by_default() {
     let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-no-claim".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let err = client.subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -599,9 +601,9 @@ async fn multi_ns_rejects_malformed_ns_claim_before_snapshot() {
     let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-bad-claim".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let err = client.subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -628,9 +630,9 @@ async fn multi_ns_trust_bundles_are_not_sent_to_tenant_side_channel() {
     let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-prod".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let mut stream = client.subscribe(req).await.unwrap().into_inner();
     let first = timeout(Duration::from_secs(5), stream.message())
@@ -776,9 +778,9 @@ async fn require_claim_rejects_token_without_ns() {
     let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-no-claim".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let err = client.subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -806,9 +808,9 @@ async fn require_claim_accepts_matching_string_claim() {
     let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-claim-prod".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let mut stream = client
         .subscribe(req)
@@ -846,9 +848,9 @@ async fn array_claim_authorises_multiple_namespaces() {
     let req_prod = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-multi".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     assert!(
         client_prod.subscribe(req_prod).await.is_ok(),
@@ -860,9 +862,9 @@ async fn array_claim_authorises_multiple_namespaces() {
     let req_dev = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-multi".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "dev".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let err = client_dev.subscribe(req_dev).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -893,9 +895,9 @@ async fn claim_overrides_cp_scope_when_more_restrictive() {
     let req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-restricted".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let err = client.subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -925,6 +927,7 @@ async fn get_full_config_filters_to_dp_namespace() {
     let req = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
         node_id: "dp-prod".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
     });

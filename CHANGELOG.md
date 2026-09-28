@@ -267,6 +267,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CP and DP must run the same build; CP/DP backward-compatibility shims are
+  removed.** ConfigSync heartbeats are always on: the CP sends them on every
+  `Subscribe` stream and the DP always arms its silence watchdog.
+  `SubscribeRequest.supports_heartbeat` and `ConfigUpdate.heartbeat_negotiated`
+  are removed (their field numbers are `reserved`). DELTA bodies carry every
+  removal key only as a namespace-qualified `{namespace, id}` object: the
+  bare-ID arrays and the additive `removed_*_keys` arrays are gone, a bare-ID
+  removal is rejected, and `sequence_cursor` is required. `CpGrpcServer` and
+  `MeshGrpcServer` are built only through `builder()`, and
+  `CpGrpcServerBuilder::build()` returns only the server (per-namespace
+  senders come from `broadcasts()`). Same-build CP/DP behavior is unchanged.
+- **ConfigSync enforces the same build.** The major.minor version gate is
+  replaced by a build identity, `<crate version>+configsync.r<revision>`,
+  carried on new fields: `SubscribeRequest.config_sync_build` (6),
+  `FullConfigRequest.config_sync_build` (5), `FullConfigResponse.config_sync_build`
+  (5), and `ConfigUpdate.config_sync_build` (9). The CP refuses any other DP
+  build with `FAILED_PRECONDITION`, the DP refuses any CP frame from another
+  build, and a refused DP backs off on the normal failure schedule while it
+  keeps serving last-known-good config. Upgrade CP and DP together.
 - The vendored hyper patch that resets an upgraded HTTP/2 `CONNECT` stream
   with `CONNECT_ERROR` (#5781) is filed upstream as hyperium/hyper#4209 and
   hyperium/hyper#4210; the fork is dropped once a hyper release containing

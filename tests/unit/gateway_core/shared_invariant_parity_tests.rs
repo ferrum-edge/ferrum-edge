@@ -1170,6 +1170,47 @@ fn docker_fixtures_pin_host_ports_outside_the_ephemeral_range() {
 }
 
 // ---------------------------------------------------------------------------
+// Docker-backed fixtures retry transient image pulls through one helper
+//
+// Siblings: the service-integration fixtures (Consul, OpenLDAP, Redpanda,
+// Hydra, MySQL, ClickHouse, SQL TLS) and the secret-backend fixtures (Vault
+// dev server, LocalStack). A transient Docker Hub fault (a truncated layer,
+// main CI run 36370971003) hard-fails CI unless the start is retried, so every
+// container `start()` must go through the shared, bounded
+// `common/container_retry.rs::start_within_deadline` rather than a private
+// loop or no retry at all.
+// ---------------------------------------------------------------------------
+
+/// Every source that starts a testcontainers image.
+const CONTAINER_START_SOURCES: [&str; 6] = [
+    "tests/service_integration/common/containers.rs",
+    "tests/service_integration/common/hydra.rs",
+    "tests/service_integration/clickhouse.rs",
+    "tests/service_integration/db_tls.rs",
+    "tests/service_integration/mysql.rs",
+    "tests/secrets_functional/common/containers.rs",
+];
+
+#[test]
+fn docker_fixtures_start_through_the_shared_image_pull_retry() {
+    for relative in CONTAINER_START_SOURCES {
+        let text = source(relative);
+        let starts = text.matches(".start()").count();
+        let retried = text.matches("start_within_deadline(").count();
+        assert!(
+            starts > 0 && retried == starts,
+            "{relative}: every container start must go through the shared \
+             `start_within_deadline` image-pull retry ({starts} starts, {retried} retried)"
+        );
+    }
+    let secrets_common = source("tests/secrets_functional/common/mod.rs");
+    assert!(
+        secrets_common.contains("\"../../service_integration/common/container_retry.rs\""),
+        "the secrets fixtures must include the shared container_retry module, not a copy"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Object-valued admin admission fields reject positional sequences
 // ---------------------------------------------------------------------------
 //
@@ -1593,13 +1634,14 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/cni/rpc.rs:WireRequest.valid_attachments",
     "src/cni/spec.rs:CniNetConfig.ferrum",
     "src/cni/spec.rs:CniNetConfig.valid_attachments",
-    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_consumers",
-    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_plugin_configs",
-    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_proxies",
-    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_upstreams",
-    "src/config/db_backend.rs:IncrementalResultDe.removed_plugin_config_keys",
-    "src/config/db_backend.rs:IncrementalResultDe.removed_proxy_keys",
-    "src/config/db_backend.rs:IncrementalResultDe.removed_upstream_keys",
+    "src/config/db_backend.rs:IncrementalResult.added_or_modified_consumers",
+    "src/config/db_backend.rs:IncrementalResult.added_or_modified_plugin_configs",
+    "src/config/db_backend.rs:IncrementalResult.added_or_modified_proxies",
+    "src/config/db_backend.rs:IncrementalResult.added_or_modified_upstreams",
+    "src/config/db_backend.rs:IncrementalResult.removed_consumer_ids",
+    "src/config/db_backend.rs:IncrementalResult.removed_plugin_config_ids",
+    "src/config/db_backend.rs:IncrementalResult.removed_proxy_ids",
+    "src/config/db_backend.rs:IncrementalResult.removed_upstream_ids",
     "src/config/plugin_trigger.rs:PluginTriggerNode.all",
     "src/config/plugin_trigger.rs:PluginTriggerNode.any",
     "src/config/types.rs:GatewayConfig.consumers",

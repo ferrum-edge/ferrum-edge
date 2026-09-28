@@ -10,6 +10,7 @@ use crate::common::GatewayChildGuard;
 use crate::scaffolding::harness::wait_for_spawned_gateway;
 use crate::scaffolding::port_registry::TestSocket;
 
+use ferrum_edge::grpc::configsync_lifecycle::config_sync_build_identity;
 use ferrum_edge::grpc::proto::ConfigUpdate;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -3643,6 +3644,7 @@ async fn functional_cli_dp_initial_snapshot_rejection_withholds_document_values(
             config_json: serde_json::to_string(&config).unwrap(),
             version: config.loaded_at.to_rfc3339(),
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            config_sync_build: config_sync_build_identity().to_string(),
             ..Default::default()
         },
     };
