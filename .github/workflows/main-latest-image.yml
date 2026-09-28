@@ -21,7 +21,9 @@ name: Main Latest Image
 #   * credential isolation: the only jobs that check out or execute repository
 #     code (`contract`, `smoke`) hold no secret and no registry token. Jobs
 #     that hold registry credentials never check out the repository; `build`
-#     hands BuildKit the public Git URL of the commit instead;
+#     hands BuildKit the public Git URL of the commit instead. Syft, which
+#     parses the built image, gets no credential and scans Docker Hub
+#     anonymously;
 #   * pushes only `latest` and the `main-<sha>` tag, never a version tag and
 #     never an `-ebpf` / `-ebpf-tools` variant;
 #   * smoke-runs each platform image, then attests (SPDX SBOMs, SLSA
@@ -89,16 +91,38 @@ jobs:
           echo "sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
 
           # GitHub reports `ahead` or `identical` exactly when base is an
-          # ancestor of, or equal to, head, and 404 when either commit is
-          # unknown to the repository (for example after main was rewritten).
+          # ancestor of, or equal to, head. A compare 404 counts as "not an
+          # ancestor" only when it is corroborated: GitHub says the histories
+          # share no common ancestor, or the commits API does not know one of
+          # the two commits either (for example after main was rewritten). An
+          # uncorroborated 404, like any other answer, stops the run.
           is_ancestor() {
             local base="$1"
             local head="$2"
             local status
             local compare_err
+            local commit_err
+            local commit
+            local corroborated
             compare_err="$(mktemp)"
+            commit_err="$(mktemp)"
             status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}?per_page=1" --jq '.status' 2>"$compare_err" || true)"
             if grep -q 'HTTP 404' "$compare_err"; then
+              corroborated=false
+              if grep -qi 'no common ancestor' "$compare_err"; then
+                corroborated=true
+              fi
+              for commit in "$base" "$head"; do
+                if ! gh api "repos/${GITHUB_REPOSITORY}/commits/${commit}" --jq '.sha' >/dev/null 2>"$commit_err" &&
+                  grep -Eq 'HTTP 404|No commit found for SHA' "$commit_err"; then
+                  corroborated=true
+                fi
+              done
+              if [ "$corroborated" != true ]; then
+                echo "::error::compare ${base}...${head} returned 404, but both commits exist and GitHub reported no missing common ancestor; refusing to treat ${base} as off main's history" >&2
+                cat "$compare_err" >&2
+                exit 1
+              fi
               status="missing"
             fi
             case "$status" in
@@ -180,11 +204,39 @@ jobs:
             --certificate-github-workflow-trigger workflow_run
           )
 
+          # Docker Hub is read anonymously, so its per-IP rate limit applies. A
+          # throttled (429), failed (5xx), or dropped request is retried with
+          # exponential backoff, at most three attempts; any other failure returns
+          # to the caller at once, and exhausted retries stop the run. Only the
+          # successful attempt's output reaches the caller.
+          transient_registry_error='toomanyrequests|too many requests|internal server error|bad gateway|service unavailable|timeout|connection reset|connection refused|no such host|temporary failure|\beof\b|deadline exceeded'
+          registry_read() {
+            local err_file="$1"
+            shift
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@" >"${err_file}.out" 2>"$err_file"; then
+                cat "${err_file}.out"
+                return 0
+              fi
+              if ! grep -Eqi "$transient_registry_error" "$err_file"; then
+                return 1
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::transient registry error (attempt ${attempt} of 3); retrying" >&2
+                sleep $((10 * 2 ** (attempt - 1)))
+              fi
+            done
+            echo "::error::registry read still failing after 3 attempts" >&2
+            cat "$err_file" >&2
+            exit 1
+          }
+
           # Prints the manifest digest of a tag, or nothing when it does not exist.
           existing_digest() {
             local tag_ref="$1"
             local manifest
-            if ! manifest="$(docker buildx imagetools inspect "$tag_ref" --format '{{json .Manifest}}' 2>"$work/inspect.err")"; then
+            if ! manifest="$(registry_read "$work/inspect.err" docker buildx imagetools inspect "$tag_ref" --format '{{json .Manifest}}')"; then
               if grep -qi 'not found' "$work/inspect.err"; then
                 return 0
               fi
@@ -200,7 +252,7 @@ jobs:
           signed() {
             local image_ref="$1"
             local digest="${image_ref##*@}"
-            cosign verify "${verify_common_args[@]}" "$image_ref" > "$work/signature.json" &&
+            registry_read "$work/verify.err" cosign verify "${verify_common_args[@]}" "$image_ref" > "$work/signature.json" &&
               jq -e --arg digest "$digest" \
                 'length > 0 and all(.[]; .critical.image["docker-manifest-digest"] == $digest)' \
                 "$work/signature.json" >/dev/null
@@ -349,13 +401,47 @@ jobs:
         working-directory: ${{ runner.temp }}/digest
         run: |
           set -euo pipefail
+          # Docker Hub is read anonymously, so its per-IP rate limit applies. A
+          # throttled (429), failed (5xx), or dropped request is retried with
+          # exponential backoff, at most three attempts; any other failure returns
+          # to the caller at once, and exhausted retries stop the run. Only the
+          # successful attempt's output reaches the caller.
+          transient_registry_error='toomanyrequests|too many requests|internal server error|bad gateway|service unavailable|timeout|connection reset|connection refused|no such host|temporary failure|\beof\b|deadline exceeded'
+          registry_read() {
+            local err_file="$1"
+            shift
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@" >"${err_file}.out" 2>"$err_file"; then
+                cat "${err_file}.out"
+                return 0
+              fi
+              if ! grep -Eqi "$transient_registry_error" "$err_file"; then
+                return 1
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::transient registry error (attempt ${attempt} of 3); retrying" >&2
+                sleep $((10 * 2 ** (attempt - 1)))
+              fi
+            done
+            echo "::error::registry read still failing after 3 attempts" >&2
+            cat "$err_file" >&2
+            exit 1
+          }
+
           digests=(*)
           if [ "${#digests[@]}" -ne 1 ] || [[ ! "${digests[0]}" =~ ^[0-9a-f]{64}$ ]]; then
             echo "::error::expected exactly one platform digest" >&2
             exit 1
           fi
           DIGEST="sha256:${digests[0]}"
-          version_json="$(docker run --rm --network none "ferrumedge/ferrum-edge@${DIGEST}" version --json)"
+          pull_err="$RUNNER_TEMP/smoke-pull.err"
+          if ! registry_read "$pull_err" docker pull "ferrumedge/ferrum-edge@${DIGEST}"; then
+            echo "::error::could not pull ferrumedge/ferrum-edge@${DIGEST}" >&2
+            cat "$pull_err" >&2
+            exit 1
+          fi
+          version_json="$(docker run --rm --network none --pull never "ferrumedge/ferrum-edge@${DIGEST}" version --json)"
           jq -e '.version | type == "string" and length > 0' <<<"$version_json" >/dev/null
           echo "Smoke passed for ${DIGEST}: ${version_json}"
 
@@ -511,15 +597,16 @@ jobs:
             exit 1
           fi
 
+      # Syft parses the image the repository built, so it gets no credential:
+      # the step references no secret or token, and the container gets no
+      # registry auth and only its own new output directory. Docker Hub serves the
+      # public image anonymously. The `images` step proved that both registries
+      # hold identical platform descriptors, so the GHCR attestations reuse
+      # the Docker Hub SBOMs.
       - name: Generate SPDX SBOMs and manifest provenance
         if: needs.resolve.outputs.build == 'true'
         env:
-          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_USERNAME: ${{ github.actor }}
           DOCKER_REF: ${{ steps.images.outputs.docker_ref }}
-          GHCR_REF: ${{ steps.images.outputs.ghcr_ref }}
           SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
           CI_RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
@@ -535,33 +622,59 @@ jobs:
               and .relationshipType == "DESCRIBES")] | length > 0))
           JQ
 
-          generate_sboms() {
-            local registry="$1"
-            local image_ref="$2"
-            local registry_username="$3"
-            local registry_password="$4"
-            local platform arch output
-
-            for platform in linux/amd64 linux/arm64; do
-              arch="${platform#linux/}"
-              output="$work/${registry}-${arch}.spdx.json"
-              # anchore/syft:v1.49.0, pinned to the same image as release.yml.
-              docker run --rm \
-                -e SYFT_CHECK_FOR_APP_UPDATE=false \
-                -e SYFT_REGISTRY_AUTH_USERNAME="$registry_username" \
-                -e SYFT_REGISTRY_AUTH_PASSWORD="$registry_password" \
-                -v "$work:/out" \
-                anchore/syft@sha256:9a9f85314017f1ea798fb012edfa7fe9259923910f82c8d4bc983ab5c765e60b \
-                scan "registry:${image_ref}" \
-                --platform "$platform" \
-                -o "spdx-json=/out/${registry}-${arch}.spdx.json"
-
-              jq -e -f "$work/require_sbom.jq" "$output" >/dev/null
+          # Docker Hub is read anonymously, so its per-IP rate limit applies. A
+          # throttled (429), failed (5xx), or dropped request is retried with
+          # exponential backoff, at most three attempts; any other failure returns
+          # to the caller at once, and exhausted retries stop the run. Only the
+          # successful attempt's output reaches the caller.
+          transient_registry_error='toomanyrequests|too many requests|internal server error|bad gateway|service unavailable|timeout|connection reset|connection refused|no such host|temporary failure|\beof\b|deadline exceeded'
+          registry_read() {
+            local err_file="$1"
+            shift
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@" >"${err_file}.out" 2>"$err_file"; then
+                cat "${err_file}.out"
+                return 0
+              fi
+              if ! grep -Eqi "$transient_registry_error" "$err_file"; then
+                return 1
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::transient registry error (attempt ${attempt} of 3); retrying" >&2
+                sleep $((10 * 2 ** (attempt - 1)))
+              fi
             done
+            echo "::error::registry read still failing after 3 attempts" >&2
+            cat "$err_file" >&2
+            exit 1
           }
 
-          generate_sboms docker "$DOCKER_REF" "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
-          generate_sboms ghcr "$GHCR_REF" "$GHCR_USERNAME" "$GHCR_TOKEN"
+          sbom_dir="$RUNNER_TEMP/syft-output"
+          mkdir "$sbom_dir"
+          for platform in linux/amd64 linux/arm64; do
+            arch="${platform#linux/}"
+            output="$sbom_dir/${arch}.spdx.json"
+            # anchore/syft:v1.49.0, pinned to the same image as release.yml.
+            if ! registry_read "$work/syft.err" docker run --rm \
+              -e SYFT_CHECK_FOR_APP_UPDATE=false \
+              -v "$sbom_dir:/out" \
+              anchore/syft@sha256:9a9f85314017f1ea798fb012edfa7fe9259923910f82c8d4bc983ab5c765e60b \
+              scan "registry:${DOCKER_REF}" \
+              --platform "$platform" \
+              -o "spdx-json=/out/${arch}.spdx.json"; then
+              echo "::error::Syft could not scan ${DOCKER_REF} for ${platform}" >&2
+              cat "$work/syft.err" >&2
+              exit 1
+            fi
+            if [ -L "$output" ] || [ ! -f "$output" ]; then
+              echo "::error::Syft did not write a regular SBOM file for ${platform}" >&2
+              exit 1
+            fi
+            jq -e -f "$work/require_sbom.jq" "$output" >/dev/null
+            cp "$output" "$work/docker-${arch}.spdx.json"
+            cp "$output" "$work/ghcr-${arch}.spdx.json"
+          done
 
           cat > "$work/create_provenance.jq" <<'JQ'
           {
@@ -798,16 +911,38 @@ jobs:
           }
 
           # GitHub reports `ahead` or `identical` exactly when base is an
-          # ancestor of, or equal to, head, and 404 when either commit is
-          # unknown to the repository (for example after main was rewritten).
+          # ancestor of, or equal to, head. A compare 404 counts as "not an
+          # ancestor" only when it is corroborated: GitHub says the histories
+          # share no common ancestor, or the commits API does not know one of
+          # the two commits either (for example after main was rewritten). An
+          # uncorroborated 404, like any other answer, stops the run.
           is_ancestor() {
             local base="$1"
             local head="$2"
             local status
             local compare_err
+            local commit_err
+            local commit
+            local corroborated
             compare_err="$(mktemp)"
+            commit_err="$(mktemp)"
             status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}?per_page=1" --jq '.status' 2>"$compare_err" || true)"
             if grep -q 'HTTP 404' "$compare_err"; then
+              corroborated=false
+              if grep -qi 'no common ancestor' "$compare_err"; then
+                corroborated=true
+              fi
+              for commit in "$base" "$head"; do
+                if ! gh api "repos/${GITHUB_REPOSITORY}/commits/${commit}" --jq '.sha' >/dev/null 2>"$commit_err" &&
+                  grep -Eq 'HTTP 404|No commit found for SHA' "$commit_err"; then
+                  corroborated=true
+                fi
+              done
+              if [ "$corroborated" != true ]; then
+                echo "::error::compare ${base}...${head} returned 404, but both commits exist and GitHub reported no missing common ancestor; refusing to treat ${base} as off main's history" >&2
+                cat "$compare_err" >&2
+                exit 1
+              fi
               status="missing"
             fi
             case "$status" in

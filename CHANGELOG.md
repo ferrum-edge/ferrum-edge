@@ -274,9 +274,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/`.
 
 - **The Docker `latest` tag tracks `main` again** (owner decision 2026-09-28,
-  reversing the 2026-09-19 retirement). The new `main-latest-image.yml`
-  workflow runs after each successful `push` run of CI on `main`, builds that
-  exact commit from the root `Dockerfile` for `linux/amd64` and `linux/arm64`,
+  reversing the 2026-09-19 retirement). The new `main-latest-image.yml` workflow
+  runs after each successful `push` run of CI on `main`, builds that exact
+  commit from the root `Dockerfile` for `linux/amd64` and `linux/arm64`,
   smoke-runs each platform image, pushes a `main-<sha>` tag to Docker Hub and
   GHCR, attests and signs it (Cosign, SLSA provenance, SPDX SBOMs), and then
   moves `latest` to that verified digest. Runs are serialized and only the
@@ -285,13 +285,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the signed image. `latest` moves only forward: the commit must still be on
   main's history, and the commit `latest` currently names must be its ancestor
   whenever it is on main's history, both re-checked immediately before each
-  registry's move, so a late run never moves `latest` backwards. Jobs that
-  hold registry credentials never check out or run repository code: the
-  contract check and the image smoke run in credential-free jobs, and the build
-  fetches the commit inside BuildKit. A run that fails before signing can leave
-  an unsigned `main-<sha>` until a re-run replaces it, so verify signatures.
-  `latest` is a development channel, not a release: pin `vX.Y.Z` or a digest
-  in production. Version tags, the `-ebpf` variants, and GitHub Releases are
+  registry's move, so a late run never moves `latest` backwards. Jobs that hold
+  registry credentials never check out or run repository code: the contract
+  check and the image smoke run in credential-free jobs, the build fetches the
+  commit inside BuildKit, and Syft scans the public Docker Hub image with no
+  registry credential (the GHCR attestations reuse those SBOMs). A compare-API
+  `404` counts as "off main" only when GitHub corroborates it, and anonymous
+  Docker Hub reads retry throttled or failed requests a bounded number of times;
+  both otherwise fail the run. A run that fails before signing can leave an
+  unsigned `main-<sha>` until a re-run replaces it, so verify signatures.
+  `latest` is a development channel, not a release: pin `vX.Y.Z` or a digest in
+  production. Version tags, the `-ebpf` variants, and GitHub Releases are
   unchanged, and `FERRUM_INJECTOR_SIDECAR_IMAGE` still refuses `latest`.
   `verify_main_latest_image_workflow.py` pins the publisher contract in the
   required `Tests` check, and both files are CODEOWNERS-protected.

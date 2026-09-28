@@ -11,7 +11,9 @@ commit whose push CI succeeded. This verifier pins the fail-closed shape of
   and `latest` moves only while that still holds and only forward: when the
   commit `latest` names now is on main's history, it must be an ancestor of
   this one. Both checks run again, through pinned helpers that are actually
-  invoked, immediately before each registry's move;
+  invoked, immediately before each registry's move. A compare 404 counts as
+  "not on main's history" only when GitHub reports no common ancestor or the
+  commits API does not know one of the commits; otherwise the run fails;
 * every run that can publish shares one workflow-level concurrency group with
   cancel-in-progress disabled, so publishers and moves of `latest` never
   overlap;
@@ -21,7 +23,12 @@ commit whose push CI succeeded. This verifier pins the fail-closed shape of
 * credential isolation: only the credential-free `contract` and `smoke` jobs
   check out or execute repository code, `contract` runs Python only as
   `python3 -I`, and no job holding a secret or a registry token checks out the
-  repository, runs a repository script, or runs the built image;
+  repository, runs a repository script, or runs the built image. Syft, which
+  parses the built image, runs with no credential: it scans the public Docker
+  Hub image anonymously, and the GHCR attestations reuse those SBOMs;
+* anonymous Docker Hub reads in `resolve`, the Syft scan, and `smoke` retry
+  throttled, failed, or dropped requests with exponential backoff, at most
+  three attempts in all;
 * every job holds exactly its least-privilege permissions, the downstream jobs
   require every needed job to have succeeded, and only the release registry
   secrets are referenced;
@@ -143,18 +150,43 @@ LATEST_FORWARD = 'if is_ancestor "$revision" "$SOURCE_SHA"; then'
 LATEST_ORPHAN = 'if ! is_ancestor "$revision" "$main_head"; then'
 DIGEST_COMPARE = 'if [ "$actual" != "${expected_ref#*@}" ]; then'
 # GitHub's compare reports `ahead` or `identical` exactly when base is an
-# ancestor of, or equal to, head, and 404 when a commit is unknown to the
-# repository. Any other answer must stop the run.
+# ancestor of, or equal to, head. A compare 404 means "not an ancestor" only
+# when it is corroborated: no common ancestor, or the commits API does not know
+# one of the two commits. An uncorroborated 404, like any other answer, must
+# stop the run, so a spurious 404 can never move `latest` backwards.
+UNCORROBORATED_404 = 'if [ "$corroborated" != true ]; then'
 IS_ANCESTOR = (
     "          is_ancestor() {\n"
     '            local base="$1"\n'
     '            local head="$2"\n'
     "            local status\n"
     "            local compare_err\n"
+    "            local commit_err\n"
+    "            local commit\n"
+    "            local corroborated\n"
     '            compare_err="$(mktemp)"\n'
+    '            commit_err="$(mktemp)"\n'
     '            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}'
     "?per_page=1\" --jq '.status' 2>\"$compare_err\" || true)\"\n"
     "            if grep -q 'HTTP 404' \"$compare_err\"; then\n"
+    "              corroborated=false\n"
+    "              if grep -qi 'no common ancestor' \"$compare_err\"; then\n"
+    "                corroborated=true\n"
+    "              fi\n"
+    '              for commit in "$base" "$head"; do\n'
+    '                if ! gh api "repos/${GITHUB_REPOSITORY}/commits/${commit}" '
+    "--jq '.sha' >/dev/null 2>\"$commit_err\" &&\n"
+    "                  grep -Eq 'HTTP 404|No commit found for SHA' \"$commit_err\"; then\n"
+    "                  corroborated=true\n"
+    "                fi\n"
+    "              done\n"
+    f"              {UNCORROBORATED_404}\n"
+    '                echo "::error::compare ${base}...${head} returned 404, but both commits '
+    "exist and GitHub reported no missing common ancestor; refusing to treat ${base} as "
+    'off main\'s history" >&2\n'
+    '                cat "$compare_err" >&2\n'
+    "                exit 1\n"
+    "              fi\n"
     '              status="missing"\n'
     "            fi\n"
     '            case "$status" in\n'
@@ -183,7 +215,42 @@ VERIFY_IDENTITY = (
     "          )\n"
 )
 REUSE_SIGNED_CHECK = (
-    'cosign verify "${verify_common_args[@]}" "$image_ref" > "$work/signature.json" &&'
+    'registry_read "$work/verify.err" cosign verify "${verify_common_args[@]}" '
+    '"$image_ref" > "$work/signature.json" &&'
+)
+REUSE_INSPECT = (
+    'manifest="$(registry_read "$work/inspect.err" docker buildx imagetools inspect '
+    '"$tag_ref" --format \'{{json .Manifest}}\')"'
+)
+# Docker Hub is read anonymously, so `resolve`, the Syft scan, and `smoke` retry
+# a throttled, failed, or dropped registry read with exponential backoff, at
+# most three attempts in all, and stop the run once the retries are exhausted.
+REGISTRY_READ = (
+    "          transient_registry_error='toomanyrequests|too many requests|"
+    "internal server error|bad gateway|service unavailable|timeout|connection reset|"
+    "connection refused|no such host|temporary failure|\\beof\\b|deadline exceeded'\n"
+    "          registry_read() {\n"
+    '            local err_file="$1"\n'
+    "            shift\n"
+    "            local attempt\n"
+    "            for attempt in 1 2 3; do\n"
+    '              if "$@" >"${err_file}.out" 2>"$err_file"; then\n'
+    '                cat "${err_file}.out"\n'
+    "                return 0\n"
+    "              fi\n"
+    '              if ! grep -Eqi "$transient_registry_error" "$err_file"; then\n'
+    "                return 1\n"
+    "              fi\n"
+    '              if [ "$attempt" -lt 3 ]; then\n'
+    '                echo "::warning::transient registry error (attempt ${attempt} of 3); '
+    'retrying" >&2\n'
+    '                sleep $((10 * 2 ** (attempt - 1)))\n'
+    "              fi\n"
+    "            done\n"
+    '            echo "::error::registry read still failing after 3 attempts" >&2\n'
+    '            cat "$err_file" >&2\n'
+    "            exit 1\n"
+    "          }\n"
 )
 REUSE_SIGNED_CALLS = (
     'signed "ferrumedge/ferrum-edge@${docker_digest}"',
@@ -214,8 +281,11 @@ VERIFY_OUTPUT_LINES = (
     'echo "docker_ref=${DOCKER_REF}" >> "$GITHUB_OUTPUT"',
     'echo "ghcr_ref=${GHCR_REF}" >> "$GITHUB_OUTPUT"',
 )
+SMOKE_PULL = (
+    'if ! registry_read "$pull_err" docker pull "ferrumedge/ferrum-edge@${DIGEST}"; then'
+)
 SMOKE_RUN = (
-    'version_json="$(docker run --rm --network none '
+    'version_json="$(docker run --rm --network none --pull never '
     '"ferrumedge/ferrum-edge@${DIGEST}" version --json)"'
 )
 SMOKE_CHECK = (
@@ -280,6 +350,30 @@ ALLOWED_SECRETS = frozenset({"DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN", "GITHUB_TO
 SYFT_IMAGE = (
     "anchore/syft@sha256:"
     "9a9f85314017f1ea798fb012edfa7fe9259923910f82c8d4bc983ab5c765e60b"
+)
+# Syft parses the image the repository built, so its step references no secret
+# or token and its container gets no registry auth: it scans the public Docker
+# Hub image anonymously (through the bounded retry) into its own new output
+# directory, and the GHCR attestations reuse those SBOMs (the `images` step
+# proved both registries hold identical platform descriptors). This is the whole
+# Syft command, joined.
+SYFT_RUN = (
+    'if ! registry_read "$work/syft.err" docker run --rm -e SYFT_CHECK_FOR_APP_UPDATE=false '
+    '-v "$sbom_dir:/out" '
+    + SYFT_IMAGE
+    + ' scan "registry:${DOCKER_REF}" --platform "$platform" '
+    '-o "spdx-json=/out/${arch}.spdx.json"; then'
+)
+SYFT_OUTPUT_DIR = ('sbom_dir="$RUNNER_TEMP/syft-output"', 'mkdir "$sbom_dir"')
+SYFT_CREDENTIAL_MARKERS = (
+    "SYFT_REGISTRY",
+    "DOCKERHUB",
+    "TOKEN",
+    "PASSWORD",
+    "github.token",
+    "--env-file",
+    "docker.sock",
+    "$work:",
 )
 BUILD_PARITY_LINES = (
     "          target: runtime\n",
@@ -402,6 +496,14 @@ IMAGE_RUN_MESSAGE = (
     "built image"
 )
 PYTHON_ISOLATION_MESSAGE = "every Python invocation must be `python3 -I`"
+SYFT_MESSAGE = (
+    "jobs.attest must run Syft once, anonymously: its step references no secret or "
+    "token, and it runs exactly the pinned credential-free scan of the Docker Hub image"
+)
+REGISTRY_RETRY_MESSAGE = (
+    "must read Docker Hub anonymously through the pinned bounded-retry registry_read "
+    "helper"
+)
 
 
 def active_text(text: str) -> str:
@@ -678,6 +780,8 @@ def validate_resolve(block: str, active: str) -> list[str]:
     step = existing[0]
     if VERIFY_IDENTITY not in step:
         failures.append(RESOLVE_IDENTITY_MESSAGE)
+    if REGISTRY_READ not in step or REUSE_INSPECT not in step:
+        failures.append(f"jobs.resolve {REGISTRY_RETRY_MESSAGE}")
     skip = step.find('echo "build=false"')
     calls = [step.find(call) for call in REUSE_SIGNED_CALLS]
     if (
@@ -732,6 +836,34 @@ def validate_smoke(block: str) -> list[str]:
     ]
     if len(downloads) != 1 or len(smoke) != 1 or downloads[0] > smoke[0]:
         return [SMOKE_MESSAGE]
+    step = steps[smoke[0]]
+    pull = step.find(SMOKE_PULL)
+    if (
+        REGISTRY_READ not in step
+        or not 0 <= pull < step.find(SMOKE_RUN)
+        or not branch_contains(step, SMOKE_PULL, "exit 1")
+    ):
+        return [f"jobs.smoke {REGISTRY_RETRY_MESSAGE}"]
+    return []
+
+
+def validate_syft(steps: list[str]) -> list[str]:
+    """Syft runs once, with no credential in its step or its container."""
+
+    syft_steps_raw = [step for step in steps if SYFT_IMAGE in step]
+    if len(syft_steps_raw) != 1:
+        return [SYFT_MESSAGE]
+    step = active_text(syft_steps_raw[0])
+    script = re.sub(r"\\\n\s*", " ", step)
+    runs = [" ".join(line.split()) for line in script.splitlines() if "docker run" in line]
+    if (
+        runs != [SYFT_RUN]
+        or SECRET_REFERENCE.search(step) is not None
+        or any(marker in step for marker in SYFT_CREDENTIAL_MARKERS)
+        or any(line not in step for line in SYFT_OUTPUT_DIR)
+        or REGISTRY_READ not in syft_steps_raw[0]
+    ):
+        return [SYFT_MESSAGE]
     return []
 
 
@@ -740,6 +872,7 @@ def validate_attest(block: str) -> list[str]:
     if ATTEST_OUTPUTS not in block:
         failures.append(ATTEST_OUTPUTS_MESSAGE)
     steps = step_blocks(block)
+    failures.extend(validate_syft(steps))
 
     sign_steps = [
         (index, step) for index, step in enumerate(steps) if "sign_and_attest() {" in step
@@ -1016,6 +1149,20 @@ def replace_in_job(job: str, old: str, new: str) -> Callable[[str], str | None]:
     return mutate
 
 
+def chain(*mutations: Callable[[str], str | None]) -> Callable[[str], str | None]:
+    """Apply several mutations in order; None when any of them no longer applies."""
+
+    def mutate(text: str) -> str | None:
+        for mutation in mutations:
+            mutated = mutation(text)
+            if mutated is None:
+                return None
+            text = mutated
+        return text
+
+    return mutate
+
+
 def cut(start_marker: str, end_marker: str) -> Callable[[str], str | None]:
     """Delete from `start_marker` up to, not including, the next `end_marker`."""
 
@@ -1057,6 +1204,13 @@ def self_test() -> int:
     contract_step = "      - name: Verify the publisher contract of the running workflow\n"
     ghcr_latest = '            -t "ghcr.io/${GITHUB_REPOSITORY}:latest" \\\n'
     identity_tail = 'main-latest-image.yml@refs/heads/main"'
+    syft_env = (
+        "          DOCKER_REF: ${{ steps.images.outputs.docker_ref }}\n"
+        "          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}\n"
+    )
+    syft_token_env = "          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}\n"
+    syft_update_check = "              -e SYFT_CHECK_FOR_APP_UPDATE=false \\\n"
+    syft_token_arg = '              -e SYFT_REGISTRY_AUTH_PASSWORD="$DOCKERHUB_PASSWORD" \\\n'
     other_identity = 'main-latest-image.yml@refs/heads/feature"'
     # Each mutation maps to (mutation, a fragment its rejection must contain).
     # None accepts any rejection.
@@ -1182,6 +1336,14 @@ def self_test() -> int:
                 'it names the newer \\`${revision}\\`." >> "$GITHUB_STEP_SUMMARY"\n',
             ),
             PROMOTE_BACKWARDS_MESSAGE,
+        ),
+        "uncorroborated compare 404 moves latest": (
+            replace_in_job("promote", UNCORROBORATED_404, "if false; then"),
+            "jobs.promote must use the pinned is_ancestor helper",
+        ),
+        "resolve accepts an uncorroborated compare 404": (
+            replace_in_job("resolve", UNCORROBORATED_404, "if false; then"),
+            "jobs.resolve must use the pinned is_ancestor helper",
         ),
         "orphaned latest blocks forever": (
             replace_in_job(
@@ -1387,6 +1549,31 @@ def self_test() -> int:
                 "    permissions:\n      contents: read\n      packages: write\n",
             ),
             CREDENTIAL_FREE_MESSAGE,
+        ),
+        "smoke pull without retry": (
+            replace_in_job(
+                "smoke", 'if ! registry_read "$pull_err" docker pull', "if ! docker pull"
+            ),
+            f"jobs.smoke {REGISTRY_RETRY_MESSAGE}",
+        ),
+        "unbounded registry retry": (
+            replace_in_job("resolve", "for attempt in 1 2 3; do", "while true; do"),
+            f"jobs.resolve {REGISTRY_RETRY_MESSAGE}",
+        ),
+        "Syft receives the Docker Hub token": (
+            chain(
+                replace_in_job("attest", syft_env, syft_token_env + syft_env),
+                replace_in_job("attest", syft_update_check, syft_update_check + syft_token_arg),
+            ),
+            SYFT_MESSAGE,
+        ),
+        "Syft step holds the Docker Hub token": (
+            replace_in_job("attest", syft_env, syft_token_env + syft_env),
+            SYFT_MESSAGE,
+        ),
+        "Syft writes into the attestation work directory": (
+            replace_in_job("attest", '-v "$sbom_dir:/out"', '-v "$work:/out"'),
+            SYFT_MESSAGE,
         ),
         "no image smoke": (
             cut("      - name: Smoke the pushed platform image\n", "\n  manifest:\n"),

@@ -3315,7 +3315,11 @@ is not on main's history at all (the compare API reports it diverged from
 main's head, or does not know the commit, for example after a history rewrite)
 do not block the move; the last case also emits a warning annotation. So a
 rewrite of `main` never blocks `latest` forever, and `latest` never moves to a
-commit older than the one it names while that commit is on `main`. Both checks
+commit older than the one it names while that commit is on `main`. A compare
+`404` counts as "not on main's history" only when it is corroborated: GitHub
+reports no common ancestor, or the commits API does not know one of the two
+commits either. An uncorroborated `404` fails the run and leaves `latest`
+unchanged, so a spurious `404` can never move `latest` backwards. Both checks
 run again immediately before each registry's move, in the same step. Because
 publishers never overlap, no other run can move `latest` between a check and
 the move it guards.
@@ -3345,6 +3349,15 @@ platform image, by digest, on its native runner before `manifest` creates
 `main-<sha>`, so an image that cannot start never reaches `main-<sha>` or
 `latest`. It pulls the image anonymously from Docker Hub.
 
+**Anonymous Docker Hub reads.** `resolve` (the `main-<sha>` inspect and the
+`cosign verify` of an existing image), the Syft scan in `attest`, and `smoke`
+(the pull) read Docker Hub anonymously, so the per-IP rate limit applies. Each
+read is attempted at most three times with exponential backoff, and is retried
+only when it was throttled (`429`), failed with a `5xx`, or was dropped on the
+network. Any other failure is handled at once, and exhausted retries fail the
+run, so a throttled read never publishes anything; `latest` waits for the next
+run.
+
 **Tags.** A run pushes at most two tags per registry: `main-<40-character-sha>`
 and `latest`. It never creates or moves `vX.Y.Z`, `X.Y.Z`, `X.Y`, or `-ebpf*`
 tags.
@@ -3352,10 +3365,14 @@ tags.
 **Signing and SBOMs.** `main-<sha>` is pushed first. The `attest` job then
 applies the release attestation contract to that digest: both registries must
 hold the same `linux/amd64` + `linux/arm64` descriptors, the digest-pinned Syft
-image produces two SPDX inventories per registry, SLSA provenance v1 names the
+image produces one SPDX inventory per platform, SLSA provenance v1 names the
 source commit and the CI run that validated it, and Cosign attests and then
-signs keylessly. The verify step checks the signature, provenance, and SBOM
-attestations under the pinned identity
+signs keylessly. Syft parses the image that the repository built, so it runs
+with no credential: its step references no secret or token, it scans the public
+Docker Hub image anonymously, and it writes only to its own new output
+directory. Because both registries hold identical platform descriptors, the GHCR
+attestations reuse the Docker Hub SBOMs. The verify step checks the signature,
+provenance, and SBOM attestations under the pinned identity
 (`https://github.com/ferrum-edge/ferrum-edge/.github/workflows/main-latest-image.yml@refs/heads/main`),
 issuer, repository, ref, and `workflow_run` trigger, and exports the
 `repo@sha256:` references it verified. `promote` creates `latest` only from
@@ -3388,7 +3405,7 @@ a job:
 | `build` | No checkout; BuildKit fetches the commit and runs the `Dockerfile` inside its own containers | `contents: read` + `packages: write`, Docker Hub token |
 | `smoke` | Runs the built image | `contents: read` only; no secret, no login |
 | `manifest`, `promote` | No | `contents: read` + `packages: write`, Docker Hub token |
-| `attest` | No (runs only the digest-pinned Syft image) | `id-token: write` + `packages: write`, Docker Hub token |
+| `attest` | No (runs only the digest-pinned Syft image, which gets no credential) | `id-token: write` + `packages: write`, Docker Hub token (never passed to Syft) |
 
 `python3 -I` keeps the checkout's `.github/scripts/` off `sys.path` and ignores
 `PYTHON*` variables, so a planted module next to the verifier cannot run in its
@@ -3399,23 +3416,25 @@ secrets and `GITHUB_TOKEN` as `release.yml`, with no deployment environment
 (release uses none). Every action is pinned to the same full commit SHA as in
 `release.yml`, and event data reaches shell only through `env:`.
 
-**Contract.** `.github/scripts/verify_main_latest_image_workflow.py` pins all
-of the above: trigger, gate conditions, the ancestry helper and every history
-check, the reuse rule, the single concurrency group, per-job permissions and
-`needs`, downstream conditions that require every needed job to have succeeded,
-the credential isolation (no checkout, interpreter, git, repository script, or
+**Contract.** `.github/scripts/verify_main_latest_image_workflow.py` pins all of
+the above: trigger, gate conditions, the ancestry helper and every history check
+and the corroborated-`404` rule, the reuse rule, the bounded retry of anonymous
+Docker Hub reads, the single concurrency group, per-job permissions and `needs`,
+downstream conditions that require every needed job to have succeeded, the
+credential isolation (no checkout, interpreter, git, repository script, or
 built-image run in a credentialed job; no credential in `contract` or `smoke`;
-`python3 -I` everywhere), allowed secrets (matched case-insensitively), action
-pins matching release.yml, build parity and the Git build context, the smoke
-run, the attest-then-sign order, the verify step's identity and issuer, the
-exact tag set per job, the invoked gate sequence in `promote`, `latest` created
-only from the verified references, and the absence of version or eBPF tags. Its
-`--self-test` mutates the checked-in workflow and requires each regression to
-be rejected, most of them for their own specific reason. `verify_required_ci.py`
-runs both modes, so the required `Tests` check and `Trusted Policy Candidate`
-enforce it; the publisher's credential-free `contract` job also re-runs it from
-the running workflow's commit before anything is built or signed. The workflow
-and its verifier are CODEOWNERS-protected like `release.yml`.
+`python3 -I` everywhere; a credential-free, anonymous Syft scan), allowed
+secrets (matched case-insensitively), action pins matching release.yml, build
+parity and the Git build context, the smoke run, the attest-then-sign order, the
+verify step's identity and issuer, the exact tag set per job, the invoked gate
+sequence in `promote`, `latest` created only from the verified references, and
+the absence of version or eBPF tags. Its `--self-test` mutates the checked-in
+workflow and requires each regression to be rejected, most of them for their own
+specific reason. `verify_required_ci.py` runs both modes, so the required
+`Tests` check and `Trusted Policy Candidate` enforce it; the publisher's
+credential-free `contract` job also re-runs it from the running workflow's
+commit before anything is built or signed. The workflow and its verifier are
+CODEOWNERS-protected like `release.yml`.
 
 To verify a `latest` image, resolve it to a digest and verify that digest (not
 the tag). The signing identity is the workflow on `refs/heads/main`:
