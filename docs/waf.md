@@ -82,12 +82,13 @@ rules into enforcement. There are three ways:
    score (see [Anomaly scoring](#anomaly-scoring)).
 
 Action precedence for a built-in rule, lowest first: `default_rule_action`,
-`category_modes`, `rule_overrides.<id>.action`, `rule_modes`. The two per-rule
-controls behave the same way: an `enforce` from `rule_modes`, or from
-`rule_overrides.<id>.action` when `rule_modes` does not name the rule,
-force-compiles the rule even above `paranoia_level` and promotes a
-[detection-band](#detection-paranoia-level) rule to a normal enforcing rule.
-The bulk controls (`default_rule_action`, `category_modes`) do neither.
+`category_modes`, `rule_overrides.<id>.action`, `rule_modes`.
+`rule_overrides.<id>.action` sets the action of a rule that is already enforced
+by level; only `rule_modes: enforce` promotes a rule above `paranoia_level`
+(including a [detection-band](#detection-paranoia-level) rule). An override's
+`enforce` leaves a band rule monitor-only and a rule above both levels
+compiled out, and the bulk controls (`default_rule_action`, `category_modes`)
+promote neither.
 
 Because the loud/broad rules are gated behind `paranoia_level >= 2` (see
 below), the recommended starting posture for active blocking is:
@@ -171,14 +172,13 @@ runs the higher level in **detection-only** mode first, like CRS's
 Rules with `paranoia_level < paranoia_min <= detection_paranoia_level` are
 compiled and scanned but:
 
-- are always `monitor`, whatever `default_rule_action` or `category_modes`
-  say. An explicit per-rule `enforce` promotes one to a normal enforcing rule
-  (no longer detection-only, so the rest of this list stops applying to it):
-  `rule_modes: {"<id>": "enforce"}`, or `rule_overrides: {"<id>": {"action":
-  "enforce"}}` when `rule_modes` does not name the rule. This is the same
-  force-compile both per-rule controls apply to a rule above
-  `detection_paranoia_level`, so raising the detection level never changes
-  what a per-rule `enforce` blocks;
+- are always `monitor`, whatever `default_rule_action`, `category_modes`, or
+  `rule_overrides.<id>.action` say. Only an explicit `rule_modes: {"<id>":
+  "enforce"}` promotes one to a normal enforcing rule (no longer
+  detection-only, so the rest of this list stops applying to it), exactly as
+  it force-compiles a rule above `detection_paranoia_level`. An override's
+  `enforce` never promotes, so raising the detection level never changes what
+  blocks;
 - contribute **zero** to anomaly scoring;
 - never make a body policy "enforcing", so they cannot trigger
   `on_body_too_large: fail_closed`, `on_scan_timeout: fail_closed`, a
@@ -564,11 +564,12 @@ same terms as text:
 
 Per-rule `action: "enforce"` only blocks when global `mode` is also
 `enforce`; with `mode: "monitor"` the match is logged but allowed. It sits
-below `rule_modes` in precedence and otherwise behaves exactly like a
-`rule_modes` `enforce` entry: it compiles the rule even when its `paranoia_min`
-is above `paranoia_level` (including a `paranoia_min` raised in the same
-override), and it promotes a
-[detection-band](#detection-paranoia-level) rule to a normal enforcing rule.
+below `rule_modes` in precedence. `rule_overrides.<id>.action` sets the action
+of a rule that is already enforced by level; only `rule_modes: enforce`
+promotes a rule above `paranoia_level` (including a
+[detection-band](#detection-paranoia-level) rule). An override that raises
+`paranoia_min` above `paranoia_level` together with `action: enforce` keeps
+the rule dormant until `paranoia_level` reaches it.
 
 ### Field exclusions
 
@@ -1220,7 +1221,7 @@ fire, then switch to `enforce`.
 | `default_rule_action` | enum | _(unset)_ | bulk action for built-ins that inherit it; encoding heuristics stay monitor until `rule_modes`; `rule_modes` overrides win |
 | `category_modes` | map | `{}` | per-category action for built-in rules; above `default_rule_action`, below `rule_overrides.action` / `rule_modes`; unknown categories rejected |
 | `paranoia_level` | int 1–4 | `1` | activate rules with `paranoia_min <= level` |
-| `detection_paranoia_level` | int 1–4 | `paranoia_level` | also compile rules up to this level as detection-only (never block or score; reported in `waf.detection_rule_hits`); a per-rule `enforce` (`rule_modes` or `rule_overrides.action`) promotes one |
+| `detection_paranoia_level` | int 1–4 | `paranoia_level` | also compile rules up to this level as detection-only (never block or score; reported in `waf.detection_rule_hits`); only `rule_modes: enforce` promotes one |
 | `request_inspection` | bool | `true` | scan request metadata |
 | `request_body_inspection` | bool | `true` | scan request bodies |
 | `response_inspection` | bool | `false` | scan response headers |
@@ -1228,7 +1229,7 @@ fire, then switch to `enforce`.
 | `include_default_rules` | bool | `true` | load the built-in pack |
 | `disabled_default_rules` | string[] | `[]` | built-in ids to drop |
 | `rule_modes` | map | `{}` | per-rule action by id |
-| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action/exclude (see [Field exclusions](#field-exclusions)); `action: enforce` behaves like a `rule_modes` `enforce` entry unless `rule_modes` names the rule |
+| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action/exclude (see [Field exclusions](#field-exclusions)); `action` applies to rules already enforced by level and never promotes above `paranoia_level` |
 | `custom_rules` | object[] | `[]` | additional rules |
 | `scoring` | object | _(off)_ | anomaly scoring (see above) |
 | `global_exemptions` | object | _(none)_ | request short-circuits |

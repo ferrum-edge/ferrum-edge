@@ -109,7 +109,11 @@ async fn grpc_unlisted_content_type_is_refused_unless_listed() {
         .spawn()
         .expect("spawn backend");
 
+    // In-process with warmup off skips the startup capability probe, whose h2c
+    // connection would otherwise run the one-shot backend script and break
+    // the stream-count and matcher assertions below.
     let harness = GatewayHarness::builder()
+        .mode_in_process()
         .file_config(file_config(backend_port))
         .log_level("warn")
         .pool_warmup_enabled(false)

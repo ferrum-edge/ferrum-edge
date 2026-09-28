@@ -28222,8 +28222,8 @@ components:
             (inspect_tcp or inspect_udp), on_body_too_large: block (when a
             body inspection hook can run), and on_unlisted_content_type: block
             (when some HTTP request body can be unlisted; see that property)
-            each satisfy admission without per-rule action: enforce. monitor with zero enforcing
-            rules remains valid. Every optional property of this schema also
+            each satisfy admission without per-rule action: enforce. monitor
+            with zero enforcing rules remains valid. Every optional property of this schema also
             accepts an explicit null, which the runtime treats exactly as an
             omitted key and replaces with the documented default.
         default_rule_action:
@@ -28255,10 +28255,10 @@ components:
             scanned as detection-only: always monitor whatever
             default_rule_action or category_modes say, zero anomaly-score
             contribution, never an enforcing body policy, and never an
-            admission enforcement path. An explicit per-rule enforce, from
-            rule_modes or rule_overrides.<id>.action (rule_modes wins when both
-            name the rule), promotes a band rule to a normal enforcing rule,
-            exactly as it force-compiles a rule above this level. A band body
+            admission enforcement path. Only an explicit rule_modes enforce
+            entry promotes a band rule to a normal enforcing rule, exactly as
+            it force-compiles a rule above this level;
+            rule_overrides.<id>.action: enforce does not. A band body
             rule still turns on inspection of its body direction, so the
             configuration-level on_body_too_large: block and
             on_unlisted_content_type: block dispositions then apply to that
@@ -28442,10 +28442,11 @@ components:
             scope via conditions, raise/lower paranoia_min, change severity, or
             set action without forking the rule pack. Unknown rule ids and
             unsupported fields are rejected. action sits below rule_modes and
-            above category_modes; when rule_modes does not name the rule, an
-            action of enforce behaves exactly like a rule_modes enforce entry:
-            it force-compiles the rule even above paranoia_level and promotes a
-            detection-band rule to a normal enforcing rule.
+            above category_modes. rule_overrides.<id>.action sets the action of
+            a rule that is already enforced by level; only rule_modes: enforce
+            promotes a rule above paranoia_level (including a detection-band
+            rule), so an override's enforce leaves a band rule monitor-only and
+            a rule above detection_paranoia_level compiled out.
           additionalProperties:
             type: object
             additionalProperties: false

@@ -585,9 +585,9 @@ impl IpCidr {
 /// Rules with `paranoia_min <= blocking` compile normally. Rules in the band
 /// `blocking < paranoia_min <= detection` compile as detection-only (see
 /// [`CompiledRule::detection_only`]). Anything above `detection` is compiled
-/// out, except that an explicit per-rule `enforce` (`rule_modes`, or
-/// `rule_overrides.action` when `rule_modes` does not name the rule) still
-/// force-compiles a rule as a normal enforcing rule.
+/// out, except that an explicit `rule_modes: enforce` still force-compiles a
+/// rule as a normal enforcing rule. `rule_overrides.action: enforce` promotes
+/// neither a band rule nor a rule above `detection`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ParanoiaLevels {
     pub(super) blocking: u8,
@@ -662,20 +662,13 @@ pub(super) fn compile_rules(
         if let Some(exclusions) = &exclusions {
             validate_field_exclusions(&rule, exclusions).map_err(with_rule_context)?;
         }
-        // An explicit per-rule `enforce` force-compiles a rule even when its
-        // `paranoia_min` exceeds the active paranoia level, and promotes a
-        // detection-band rule to a normal enforcing rule. The per-rule action
-        // is `rule_modes`, else `rule_overrides.action`: the same precedence
-        // the action resolution below applies, so the two per-rule controls
-        // agree and a `rule_modes` Monitor/Disabled entry still wins over an
-        // override's `enforce`. A Monitor or Disabled per-rule action never
-        // resurrects a paranoia-filtered rule. Between the blocking and
-        // detection levels a rule is otherwise kept as detection-only.
-        let per_rule_action = rule_modes
-            .get(&rule.id)
-            .copied()
-            .or_else(|| rule_overrides.get(&rule.id).and_then(|ov| ov.action));
-        let force_enforced = per_rule_action == Some(RuleAction::Enforce);
+        // An explicit `rule_modes: enforce` entry force-compiles a rule even
+        // when its `paranoia_min` exceeds the active paranoia level; a Monitor
+        // or Disabled entry never resurrects a paranoia-filtered rule. Between
+        // the blocking and detection levels a rule is kept as detection-only.
+        // `rule_overrides.action` never promotes: it only sets the action of a
+        // rule that is already enforced by level.
+        let force_enforced = rule_modes.get(&rule.id) == Some(&RuleAction::Enforce);
         let detection_only = rule.paranoia_min > paranoia.blocking && !force_enforced;
         if detection_only && rule.paranoia_min > paranoia.detection {
             continue;

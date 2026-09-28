@@ -188,11 +188,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scanned and reported in `waf.detection_rule_hits` / `waf.detection_paranoia`
   but never block, never score, never make a body policy enforcing, and never
   satisfy `mode: enforce` admission; a request whose only hits are in the band
-  keeps `waf.action=clean`. Only an explicit per-rule `enforce` (`rule_modes`
-  or `rule_overrides.<id>.action`) promotes a band rule. This lets operators measure a higher paranoia level on live
-  traffic before enabling it. A band body rule still turns on inspection of
-  its body direction, so `on_body_too_large: block` and
-  `on_unlisted_content_type: block` then apply to that direction.
+  keeps `waf.action=clean`. Only an explicit `rule_modes: enforce` promotes a
+  band rule; `rule_overrides.<id>.action` sets the action of a rule that is
+  already enforced by level and promotes nothing above `paranoia_level`. This
+  lets operators measure a higher paranoia level on live traffic before
+  enabling it. A band body rule still turns on inspection of its body
+  direction, so `on_body_too_large: block` and `on_unlisted_content_type:
+  block` then apply to that direction.
 - **WAF category modes** (#5847). `category_modes` sets the action of every
   built-in rule in a category (`{"xss": "enforce", "ldap_injection":
   "disabled"}`). Precedence, lowest
@@ -249,23 +251,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **WAF `rule_overrides.<id>.action: enforce` now matches `rule_modes`**
-  (#5865). When `rule_modes` does not name the rule, an override's `enforce`
-  promotes a detection-band rule to a normal enforcing rule (it used to stay
-  monitor-only without any warning) and compiles a rule whose `paranoia_min`
-  is above `paranoia_level` (it used to be compiled out), exactly as
-  `rule_modes: enforce` does. `rule_modes` still wins when both name a rule.
-  Raising `detection_paranoia_level` therefore never changes what a per-rule
-  `enforce` blocks. Configurations that relied on an override's `enforce`
-  being ignored now block on that rule, and an enforce-mode configuration whose
-  only enforcing rule is such an override is now admitted.
 - **WAF admission: `on_unlisted_content_type: block` needs a body method**
   (#5865). With `body_methods: []` no HTTP request body is governed, so `block`
   can never fire; under `mode: enforce` it no longer counts as an enforcement
   path, and a configuration with no other path is rejected at construction.
   `on_body_too_large: block` still counts, because WebSocket client messages
-  ignore `body_methods`. `on_unlisted_content_type` and the detection band are
-  unreleased (added after v0.9.8), so neither change has a deprecation path.
+  ignore `body_methods`. `on_unlisted_content_type` is unreleased (added after
+  v0.9.8), so this change has no deprecation path.
 - WAF scanning is faster on the request path with identical results. Rule
   sets run an `is_match` prefilter before collecting matches, so a clean
   header, query, cookie, or path value (the common case) skips the overlapping

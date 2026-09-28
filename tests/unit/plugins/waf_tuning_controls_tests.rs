@@ -175,7 +175,10 @@ async fn explicit_rule_modes_enforce_still_promotes_a_band_rule_to_blocking() {
 }
 
 #[tokio::test]
-async fn rule_overrides_action_enforce_promotes_a_band_rule_like_rule_modes() {
+async fn rule_overrides_action_enforce_does_not_promote_a_band_rule() {
+    // `rule_overrides.<id>.action` sets the action of a rule already enforced
+    // by level; a band rule it names stays monitor-only, so raising
+    // `detection_paranoia_level` never changes what blocks.
     let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
@@ -185,32 +188,30 @@ async fn rule_overrides_action_enforce_promotes_a_band_rule_like_rule_modes() {
     }))
     .unwrap();
     let (result, request) = query(&plugin, LEVEL_TWO_ONLY_QUERY).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
-    assert!(listed(&request, "waf.rule_hits", "FE-RFI-001"));
-    assert_eq!(meta(&request, "waf.detection_rule_hits"), None);
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(listed(&request, "waf.detection_rule_hits", "FE-RFI-001"));
+    assert_eq!(meta(&request, "waf.rule_hits"), None);
 
-    // `rule_modes` sits above `rule_overrides.action`: its `monitor` wins, and
-    // the rule stays in the band.
-    let overruled = waf(json!({
+    // Only `rule_modes: enforce` promotes it, with or without the override.
+    let promoted = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "paranoia_level": 1,
         "detection_paranoia_level": 2,
         "rule_overrides": { "FE-RFI-001": { "action": "enforce" } },
-        "rule_modes": { "FE-RFI-001": "monitor" }
+        "rule_modes": { "FE-RFI-001": "enforce" }
     }))
     .unwrap();
-    let (result, request) = query(&overruled, LEVEL_TWO_ONLY_QUERY).await;
-    assert!(matches!(result, PluginResult::Continue));
-    assert!(listed(&request, "waf.detection_rule_hits", "FE-RFI-001"));
-    assert_eq!(meta(&request, "waf.rule_hits"), None);
+    let (result, request) = query(&promoted, LEVEL_TWO_ONLY_QUERY).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-RFI-001"));
+    assert_eq!(meta(&request, "waf.detection_rule_hits"), None);
 }
 
 #[tokio::test]
-async fn rule_overrides_action_enforce_force_compiles_above_paranoia_like_rule_modes() {
-    // With no band the level-2 rule would be compiled out, but an explicit
-    // per-rule `enforce` compiles it from either control, so raising
-    // `detection_paranoia_level` never changes what it blocks.
+async fn rule_overrides_action_enforce_does_not_force_compile_above_paranoia() {
+    // With no band the level-2 rule is compiled out at level 1, and an
+    // override's `enforce` does not bring it back (v0.9.8 behavior).
     let overridden = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
@@ -219,9 +220,11 @@ async fn rule_overrides_action_enforce_force_compiles_above_paranoia_like_rule_m
     }))
     .unwrap();
     let (result, request) = query(&overridden, LEVEL_TWO_ONLY_QUERY).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
-    assert!(listed(&request, "waf.rule_hits", "FE-RFI-001"));
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&request, "waf.rule_hits"), None);
+    assert_eq!(meta(&request, "waf.detection_rule_hits"), None);
 
+    // `rule_modes: enforce` does force-compile it.
     let moded = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
@@ -233,14 +236,28 @@ async fn rule_overrides_action_enforce_force_compiles_above_paranoia_like_rule_m
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert!(listed(&request, "waf.rule_hits", "FE-RFI-001"));
 
-    // Including a `paranoia_min` raised in the same override.
-    let plugin = waf(json!({
+    // The staging pattern: an override that raises `paranoia_min` above the
+    // active level keeps the rule dormant until `paranoia_level` reaches it.
+    let staged_override = json!({ "FE-XSS-001": { "paranoia_min": 4, "action": "enforce" } });
+    let staged = waf(json!({
         "mode": "enforce",
+        "default_rule_action": "enforce",
         "paranoia_level": 1,
-        "rule_overrides": { "FE-XSS-001": { "paranoia_min": 3, "action": "enforce" } }
+        "rule_overrides": staged_override.clone()
     }))
     .unwrap();
-    let (result, request) = query(&plugin, LEVEL_ONE_QUERY).await;
+    let (_, request) = query(&staged, LEVEL_ONE_QUERY).await;
+    assert!(!listed(&request, "waf.rule_hits", "FE-XSS-001"));
+    assert!(!listed(&request, "waf.detection_rule_hits", "FE-XSS-001"));
+
+    let raised = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 4,
+        "rule_overrides": staged_override
+    }))
+    .unwrap();
+    let (result, request) = query(&raised, LEVEL_ONE_QUERY).await;
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
 }
