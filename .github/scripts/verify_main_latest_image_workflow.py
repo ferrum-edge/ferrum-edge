@@ -130,7 +130,8 @@ REMOTE_USES = re.compile(r"^\s*(?:-\s+)?uses:\s*(?P<ref>[^\s#]+)", re.MULTILINE)
 PINNED_REF = re.compile(r"^(?P<name>[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@(?P<sha>[0-9a-f]{40})$")
 RUN_KEY = re.compile(r"^(?P<indent>\s*)(?:-\s+)?run:\s*(?P<value>.*)$")
 TAG_ARGUMENT = re.compile(r"(?:^|\s)(?:-t|--tag)(?:\s+|=)(?P<tag>\S+)")
-SECRET_REFERENCE = re.compile(r"\bsecrets\b(?P<field>\.[A-Za-z0-9_]+)?")
+# `cloud-secrets` is a Cargo feature, not the `secrets` context.
+SECRET_REFERENCE = re.compile(r"(?<![\w-])secrets\b(?P<field>\.[A-Za-z0-9_]+)?")
 
 
 def active_text(text: str) -> str:
