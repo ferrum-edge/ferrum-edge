@@ -21,7 +21,7 @@ const GLOBAL_EXEMPTION_KEYS: &[&str] = &[
 #[derive(Debug, Default)]
 pub struct CompiledExemptions {
     path_set: Option<RegexSet>,
-    methods: HashSet<String>,
+    methods: Vec<String>,
     consumers: HashSet<String>,
     ips: Vec<IpCidr>,
     header_present: HashMap<String, Option<String>>,
@@ -63,7 +63,7 @@ impl CompiledExemptions {
             .unwrap_or_default()
             .into_iter()
             .map(|method| method.to_ascii_uppercase())
-            .collect();
+            .collect::<Vec<_>>();
         let consumers = optional_string_vec(object, "consumers")?
             .unwrap_or_default()
             .into_iter()

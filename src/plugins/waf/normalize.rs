@@ -749,10 +749,10 @@ struct LayeredDecode<'a> {
 /// final allowed round (e.g. triple percent-encoding with a 3-round cap) has
 /// converged and must not be reported as a residual.
 ///
-/// Every decoder here only ever shortens its input when it decodes something,
-/// so a stage returns `Cow::Owned` exactly when it changed the text and a round
-/// that returns `Cow::Borrowed` is a fixed point. The equality check below is
-/// kept as a belt-and-braces guard; for a genuinely changed round it fails on
+/// These decoders never lengthen their input when they decode something, so a
+/// stage returns `Cow::Owned` exactly when it changed the text and a round that
+/// returns `Cow::Borrowed` is a fixed point. The equality check below is kept as
+/// a belt-and-braces guard; for a genuinely changed round it usually fails on
 /// the length comparison before touching the bytes.
 fn layered_decode_inner(text: &str, escapes: StringEscapes) -> LayeredDecode<'_> {
     let mut current = Cow::Borrowed(text);
@@ -1246,7 +1246,8 @@ mod tests {
 
     #[test]
     fn unicode_unescape_decodes_json_payload() {
-        assert_eq!(unicode_unescape(r"<script>"), "<script>");
+        let encoded = format!("{}u003cscript{}u003e", '\\', '\\');
+        assert_eq!(unicode_unescape(&encoded), "<script>");
         assert_eq!(unicode_unescape(r"${jndi"), "${jndi");
     }
 
@@ -1258,7 +1259,8 @@ mod tests {
 
     #[test]
     fn unicode_unescape_handles_surrogate_pairs_and_braces() {
-        assert_eq!(unicode_unescape(r"😀"), "\u{1F600}");
+        let surrogate_pair = format!("{}uD83D{}uDE00", '\\', '\\');
+        assert_eq!(unicode_unescape(&surrogate_pair), "😀");
         assert_eq!(unicode_unescape(r"\u{3c}script"), "<script");
         assert_eq!(unicode_unescape(r"\x3cscript"), "<script");
     }
@@ -1354,6 +1356,98 @@ mod tests {
         assert!(has_decodable_marker("&lt;script&gt;"));
         assert!(has_decodable_marker(r"\u003cscript\u003e"));
         assert!(has_decodable_marker("a+b"));
+    }
+
+    fn reference_decode_runs(
+        text: &str,
+        marker: u8,
+        decode: impl Fn(&[u8]) -> Option<(EntityVal, usize)>,
+    ) -> String {
+        let bytes = text.as_bytes();
+        let mut output = String::with_capacity(text.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == marker
+                && let Some((value, consumed)) = decode(&bytes[index + 1..])
+            {
+                match value {
+                    EntityVal::Cp(cp) => push_cp(&mut output, cp),
+                    EntityVal::Str(decoded) => output.push_str(decoded),
+                }
+                index += consumed + 1;
+            } else {
+                let ch = text[index..]
+                    .chars()
+                    .next()
+                    .expect("index is within the UTF-8 input");
+                output.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+        output
+    }
+
+    fn reference_has_decodable_marker(text: &str) -> bool {
+        text.bytes().any(|byte| matches!(byte, b'%' | b'+' | b'\\' | b'&'))
+    }
+
+    #[test]
+    fn run_decoders_and_prefilters_match_reference_implementations() {
+        let slash = '\\';
+        let cases = vec![
+            "mixed %3c%3E and plus+ signs".to_string(),
+            "%u003cscript%U003E".to_string(),
+            "&lt;script&gt; &#60; &#x3e;".to_string(),
+            format!("JS {slash}u003c and {slash}x3E"),
+            format!(
+                "overlong %u12345 and truncated %zz %u12 and {slash}u{{1234567}} {slash}x"
+            ),
+            "ends with %3c".to_string(),
+            "日本%3c😀&lt;".to_string(),
+            "plain text without markers".to_string(),
+        ];
+
+        for text in &cases {
+            let expected_marker = reference_has_decodable_marker(text);
+            assert_eq!(has_decodable_marker(text), expected_marker, "{text:?}");
+
+            let expected_js = reference_decode_runs(text, b'\\', |after| {
+                StringEscapes::All
+                    .decode(after)
+                    .map(|(cp, consumed)| (EntityVal::Cp(cp), consumed))
+            });
+            assert_eq!(
+                string_unescape(text, StringEscapes::All),
+                expected_js,
+                "{text:?}"
+            );
+
+            let expected_html = reference_decode_runs(text, b'&', decode_entity);
+            assert_eq!(html_entity_decode(text), expected_html, "{text:?}");
+        }
+
+        let patterns = [r"(?i)<script", r"union\s+select", r"%[0-9a-f]{2}"];
+        let regex_set = regex::RegexSet::new(patterns).expect("valid test patterns");
+        let regexes: Vec<_> = patterns
+            .iter()
+            .map(|pattern| regex::Regex::new(pattern).expect("valid test pattern"))
+            .collect();
+        let regex_cases = cases.iter().map(String::as_str).chain([
+            "<SCRIPT>alert(1)",
+            "1 union\tselect",
+            "literal %3c",
+            "日本語の文章",
+            "",
+        ]);
+        for text in regex_cases {
+            let reference = regexes.iter().any(|regex| regex.is_match(text));
+            assert_eq!(regex_set.is_match(text), reference, "{text:?}");
+            assert_eq!(
+                regex_set.matches(text).iter().next().is_some(),
+                reference,
+                "{text:?}"
+            );
+        }
     }
 
     fn residual(text: &str) -> bool {

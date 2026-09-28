@@ -556,12 +556,12 @@ impl Waf {
     /// always scanned and every distinct decoded view is scanned beside it.
     /// Cookie views are percent decodes (`%XX`, `%uXXXX`, `+` as a space and,
     /// Express-style, as `+`, and the bounded layered percent decode), plus
-    /// the code-point escapes (`\uXXXX`, `\xXX`) of an Express `j:` JSON
-    /// cookie. JSON single-character escapes and HTML entities are not cookie
-    /// encodings, and resolving them would turn a `j:` cookie's `\n` into a
-    /// control character. Splitting on `;` happens first, so an encoded `%3B`
-    /// cannot forge an extra crumb. A crumb with nothing to decode costs no
-    /// allocation.
+    /// the code-point escapes (`\uXXXX`, `\xXX`) and quote/slash/backslash
+    /// escapes (`\"`, `\'`, `\/`, `\\`) of an Express `j:` JSON cookie.
+    /// Control escapes and HTML entities are not cookie encodings, and
+    /// resolving a `j:` cookie's `\n` would introduce a control character.
+    /// Splitting on `;` happens first, so an encoded `%3B` cannot forge an
+    /// extra crumb. A crumb with nothing to decode costs no allocation.
     fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
         if !self.compiled.cookie_rules_active {
             return;
