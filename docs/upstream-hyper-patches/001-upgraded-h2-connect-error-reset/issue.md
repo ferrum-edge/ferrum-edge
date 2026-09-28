@@ -1,8 +1,6 @@
 # Upgraded HTTP/2 CONNECT streams cannot be reset, so a failed tunnel looks like a clean close
 
-<!-- DRAFT, not filed. Filing in hyperium/hyper needs the Ferrum Edge owner's
-     approval. Once filed, record the issue number in the patch README, the
-     dependency-policy inventory row, and docs/vendored-patch-lifecycle.json. -->
+<!-- Filed as hyperium/hyper#4209 on 2026-09-28; kept as the record of what was filed (the issue itself is authoritative for later edits). -->
 
 ## Summary
 

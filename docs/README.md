@@ -197,7 +197,7 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
 ### hyper
 
 - 001 — [reset an upgraded HTTP/2 CONNECT stream with `CONNECT_ERROR`](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md)
-  ([issue draft](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/issue.md),
+  ([issue text](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/issue.md),
   [PR text](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/pr-description.md),
   [patch](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/hyper-upgraded-h2-connect-error-reset.patch))
 

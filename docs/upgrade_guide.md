@@ -47,6 +47,24 @@ instead of `END_STREAM`. Only a peer close or an idle expiry still ends with
 half-close cap while the backend was still streaming, or by policy as a
 complete stream now sees a stream error.
 
+**What a revoked HBONE tunnel looks like (intentional, kept).** When the
+admission fence revokes a live tunnel mid-stream, the HBONE client or waypoint
+on the other end sees a stream error, `RST_STREAM(CONNECT_ERROR)`, not a
+complete response. v0.9.8 ended the same tunnel with a clean `END_STREAM`,
+which presented a policy cut as a finished stream; the reset is deliberate and
+stays. On the gateway, a revocation counts in
+`ferrum_mesh_hbone_tunnel_revocations_total{proxy_id,reason}` (for example
+`reason="peer_revoked"` or `"authorization_denied"`), logs
+`HBONE tunnel closed: admission revoked` at `info` (`HBONE UDP tunnel closed:
+admission revoked` for the datagram relay), and records
+`hbone.udp.termination_reason=revoked` on a datagram relay's transaction line. It never counts as a relay failure. A
+backend or socket failure instead counts in
+`ferrum_mesh_hbone_relay_failures_total{proxy_id,direction,error_class}` with
+the `HBONE tunnel relay failed` warning for the byte-stream relay, and records
+`tunnel_read_error`, `tunnel_write_error`, `tunnel_write_stalled`,
+`app_send_error`, or `app_recv_error` as the datagram relay's termination
+reason.
+
 **Dependencies**
 
 - **Vendored hyper:** hyper 1.9.0 is now a path-sourced fork
