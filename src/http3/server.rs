@@ -7045,10 +7045,13 @@ async fn handle_h3_request(
         );
 
         let client_ip_owned = ctx.client_ip.clone();
+        // The single attempt's `otel_tracing` CLIENT span (issue #5867): the
+        // backend request carries the attempt's own `traceparent`.
+        let attempt_span = ctx.begin_backend_attempt_span(&backend_url, &proxy_headers);
         let h3_headers = build_h3_backend_headers(
             &proxy,
             upstream_target.as_deref(),
-            &proxy_headers,
+            attempt_span.headers(&proxy_headers),
             &client_ip_owned,
             socket_ip,
             &state,
@@ -7123,12 +7126,13 @@ async fn handle_h3_request(
                 }
             };
             tokio::pin!(attempt);
-            crate::proxy::await_route_request_deadline(
+            crate::proxy::await_backend_attempt_route_deadline(
                 route.total(),
                 crate::proxy::RouteAttemptBudget::from_start(
                     route.attempt_timeout(),
                     &mut route_attempt_deadline,
                 ),
+                attempt_span.trace(),
                 attempt,
             )
             .await
@@ -7146,6 +7150,12 @@ async fn handle_h3_request(
             Err(e) => {
                 let err_msg = e.to_string();
                 if err_msg.contains("exceeds maximum size") {
+                    // The attempt ends with the oversized upload (issue #5867).
+                    ctx.record_backend_attempt(
+                        Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+                        e.request_on_wire(),
+                        None,
+                    );
                     record_request(&state, 413);
                     // Do NOT propagate a send error: the outcome record below
                     // releases the CB probe slot and the admission outcome, so
@@ -7341,6 +7351,8 @@ async fn handle_h3_request(
 
         let backend_admission_response_elapsed = backend_admission_start.elapsed();
         let response_status = h3_resp.status;
+        // The attempt ends at the response head (issue #5867).
+        ctx.record_backend_attempt(None, true, Some(response_status));
         let mut response_headers = h3_resp.headers;
         // Capture transport semantics before response hooks can mutate context.
         let response_omits_body = crate::http3::client::cancel_bodyless_h3_response(
@@ -11284,10 +11296,15 @@ async fn proxy_to_backend_h3_refined_response(
     // Effective response ceiling for this request: the global knob narrowed by
     // any active route ceiling (`GHSA-xrfj-852f-645j`).
     let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
+    // The first attempt's `otel_tracing` CLIENT span (issue #5867): the
+    // backend request carries the attempt's own `traceparent`. A buffered
+    // result hands the attempt to the caller's retry loop or final record,
+    // which ends it; a streamed one is ended here, at its response head.
+    let attempt_span = ctx.begin_backend_attempt_span(backend_url, headers);
     let h3_headers = build_h3_backend_headers(
         proxy,
         upstream_target,
-        headers,
+        attempt_span.headers(headers),
         client_ip,
         xff_append_ip,
         state,
@@ -11332,12 +11349,13 @@ async fn proxy_to_backend_h3_refined_response(
             }
         };
         tokio::pin!(attempt);
-        crate::proxy::await_route_request_deadline(
+        crate::proxy::await_backend_attempt_route_deadline(
             route.total(),
             crate::proxy::RouteAttemptBudget::from_start(
                 route.attempt_timeout(),
                 &mut route_attempt_deadline,
             ),
+            attempt_span.trace(),
             attempt,
         )
         .await
@@ -11376,6 +11394,14 @@ async fn proxy_to_backend_h3_refined_response(
                     request_on_wire,
                 }));
             }
+            // No retry loop follows: this failure ends the attempt.
+            if h3_error_class == crate::retry::ErrorClass::TlsError {
+                crate::diagnostic_ref::note_backend_tls_failure(
+                    ctx.diagnostic_slot(),
+                    error.as_error().as_ref(),
+                );
+            }
+            ctx.record_backend_attempt(Some(h3_error_class), request_on_wire, None);
             // Do NOT propagate a send error here: returning `Err` would skip the
             // caller's backend outcome record when the client disconnects during
             // the reject write. Report the disconnect in the result so the
@@ -11440,6 +11466,8 @@ async fn proxy_to_backend_h3_refined_response(
             response_status,
             &response_headers,
         ) {
+            // The streamed attempt ends at its response head.
+            ctx.record_backend_attempt(None, true, Some(response_status));
             let result = stream_h3_open_response_to_client(
                 state,
                 proxy,
@@ -13337,6 +13365,13 @@ async fn record_failed_h3_grpc_dispatch(
         outcome_connection_error,
         error_sent,
     } = failure;
+    // Every caller is a failure before the response head, which ends the
+    // native gRPC attempt (issue #5867).
+    ctx.record_backend_attempt(
+        Some(h3_error_class),
+        crate::retry::request_reached_wire(h3_error_class),
+        None,
+    );
     crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
         state,
         proxy,
@@ -13656,10 +13691,15 @@ async fn dispatch_grpc_native_h3(
     // Stream the gRPC request body to the native H3 backend. gRPC frames are
     // forwarded unchanged; the ceiling is the gRPC-specific recv limit so H3
     // matches the H1/H2 gRPC path.
+    // The single attempt's `otel_tracing` CLIENT span (issue #5867): the
+    // backend request carries the attempt's own `traceparent`. It ends at the
+    // response head, or at the pre-head failure
+    // (`record_failed_h3_grpc_dispatch`).
+    let attempt_span = ctx.begin_backend_attempt_span(backend_url, proxy_headers);
     let mut h3_headers = build_h3_backend_headers(
         proxy,
         upstream_target,
-        proxy_headers,
+        attempt_span.headers(proxy_headers),
         client_ip,
         xff_append_ip,
         state,
@@ -13822,7 +13862,14 @@ async fn dispatch_grpc_native_h3(
                 .await
         }
     };
-    let opened = match crate::plugins::await_deadline_first(dispatch_deadline_at, open_fut).await {
+    // Opened in the attempt's scope, which hands the attempt to the backend.
+    // Pinned in this block, so the open future ends with the open.
+    let open_result = {
+        tokio::pin!(open_fut);
+        crate::plugins::await_deadline_first(dispatch_deadline_at, attempt_span.scope(open_fut))
+            .await
+    };
+    let opened = match open_result {
         Ok(result) => Ok(result),
         // Authorization is checked FIRST: when the composed bound fired
         // because the admitted credential elapsed, the terminal is the
@@ -14048,6 +14095,9 @@ async fn dispatch_grpc_native_h3(
     // Backend produced response headers.
     let backend_admission_response_elapsed = backend_admission_start.elapsed();
     let response_status = h3_resp.status;
+    // The attempt ends at the response head; like the H1/H2 gRPC dispatch, it
+    // reports no HTTP status (issue #5867).
+    ctx.record_backend_attempt(None, true, None);
     let mut response_headers = h3_resp.headers;
     stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
 
@@ -16009,10 +16059,13 @@ async fn proxy_to_backend_h3_streaming(
     // any active route ceiling (`GHSA-xrfj-852f-645j`). Hoisted so the streaming
     // chunk loop below compares against a plain local.
     let effective_max_response_body_size_bytes = ctx.effective_max_response_body_size_bytes();
+    // The single attempt's `otel_tracing` CLIENT span (issue #5867): the
+    // backend request carries the attempt's own `traceparent`.
+    let attempt_span = ctx.begin_backend_attempt_span(backend_url, headers);
     let h3_headers = build_h3_backend_headers(
         proxy,
         upstream_target,
-        headers,
+        attempt_span.headers(headers),
         client_ip,
         xff_append_ip,
         state,
@@ -16057,12 +16110,13 @@ async fn proxy_to_backend_h3_streaming(
             }
         };
         tokio::pin!(attempt);
-        crate::proxy::await_route_request_deadline(
+        crate::proxy::await_backend_attempt_route_deadline(
             route.total(),
             crate::proxy::RouteAttemptBudget::from_start(
                 route.attempt_timeout(),
                 &mut route_attempt_deadline,
             ),
+            attempt_span.trace(),
             attempt,
         )
         .await
@@ -16090,6 +16144,13 @@ async fn proxy_to_backend_h3_streaming(
             // that case.
             let request_on_wire = e.request_on_wire();
             let h3_error_class = classify_h3_error(&e);
+            if h3_error_class == crate::retry::ErrorClass::TlsError {
+                crate::diagnostic_ref::note_backend_tls_failure(
+                    ctx.diagnostic_slot(),
+                    e.as_error().as_ref(),
+                );
+            }
+            ctx.record_backend_attempt(Some(h3_error_class), request_on_wire, None);
             crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
             if crate::proxy::is_h3_transport_error_class(h3_error_class) {
                 state
@@ -16126,6 +16187,8 @@ async fn proxy_to_backend_h3_streaming(
 
     let backend_admission_elapsed = backend_admission_start.elapsed();
     let response_status = h3_resp.status;
+    // The attempt ends at the response head (issue #5867).
+    ctx.record_backend_attempt(None, true, Some(response_status));
     let mut response_headers = h3_resp.headers;
 
     // Strip hop-by-hop response headers per RFC 9110 §7.6.1 — see

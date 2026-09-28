@@ -1,9 +1,11 @@
 //! Per-attempt CLIENT spans for `otel_tracing` (issue #5864).
 //!
 //! `otel_tracing` installs a [`BackendAttemptTrace`] on a sampled request's
-//! context in `before_proxy` when it has an exporter. Every backend attempt the
-//! retry loops dispatch (the H1/H2 loop, the native gRPC loop, and the native
-//! HTTP/3 frontend loop, retries included) then:
+//! context in `before_proxy` when it has an exporter. Every backend attempt an
+//! instrumented dispatch site sends (the H1/H2 loop, the native gRPC loop, the
+//! native HTTP/3 frontend's buffered, streamed-body, and header-refined
+//! dispatches, the HTTP/3-to-gRPC bridges, and the WebSocket upgrades, retries
+//! included; issues #5864 and #5867) then:
 //!
 //! 1. begins at its dispatch site ([`BackendAttemptTrace::begin`]), which mints
 //!    the attempt's span id and returns a copy of the backend header map whose
@@ -251,18 +253,49 @@ impl BackendAttemptTrace {
         backend_url: &str,
         headers: &HashMap<String, String>,
     ) -> BackendAttemptSpan {
-        let span_id = OtelTracing::generate_span_id();
-        let (server_address, server_port) = parse_backend_host_port(backend_url);
         let mut attempt_headers = headers.clone();
         attempt_headers.retain(|name, _| !name.eq_ignore_ascii_case(TRACEPARENT_HEADER));
-        attempt_headers.insert(
-            TRACEPARENT_HEADER.to_string(),
-            build_traceparent(
-                SUPPORTED_TRACEPARENT_VERSION,
-                &self.trace_id,
-                &span_id,
-                "01",
-            ),
+        let traceparent = self.start_attempt(backend_url);
+        attempt_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent);
+        BackendAttemptSpan(Some(Box::new(BegunAttempt {
+            trace: Arc::clone(self),
+            headers: AttemptHeaders::Map(attempt_headers),
+        })))
+    }
+
+    /// [`Self::begin`] for a dispatch whose backend headers are an ordered
+    /// header list (the WebSocket upgrades, issue #5867): the attempt carries
+    /// `headers` with every `traceparent` entry replaced by this attempt's.
+    pub(crate) fn begin_with_header_list(
+        self: &Arc<Self>,
+        backend_url: &str,
+        headers: &[(String, String)],
+    ) -> BackendAttemptSpan {
+        let mut attempt_headers = Vec::with_capacity(headers.len() + 1);
+        attempt_headers.extend(
+            headers
+                .iter()
+                .filter(|(name, _)| !name.eq_ignore_ascii_case(TRACEPARENT_HEADER))
+                .cloned(),
+        );
+        let traceparent = self.start_attempt(backend_url);
+        attempt_headers.push((TRACEPARENT_HEADER.to_string(), traceparent));
+        BackendAttemptSpan(Some(Box::new(BegunAttempt {
+            trace: Arc::clone(self),
+            headers: AttemptHeaders::List(attempt_headers),
+        })))
+    }
+
+    /// Put a new attempt to `backend_url` in flight and return the
+    /// `traceparent` naming its span.
+    fn start_attempt(&self, backend_url: &str) -> String {
+        let span_id = OtelTracing::generate_span_id();
+        let (server_address, server_port) = parse_backend_host_port(backend_url);
+        let traceparent = build_traceparent(
+            SUPPORTED_TRACEPARENT_VERSION,
+            &self.trace_id,
+            &span_id,
+            "01",
         );
         self.lock().in_flight = Some(InFlightAttempt {
             span_id,
@@ -274,10 +307,7 @@ impl BackendAttemptTrace {
             handed_off: false,
             handed_off_on_poll: true,
         });
-        BackendAttemptSpan(Some(Box::new(BegunAttempt {
-            trace: Arc::clone(self),
-            headers: attempt_headers,
-        })))
+        traceparent
     }
 
     /// End the attempt in flight with its outcome and export its span. Called
@@ -414,7 +444,14 @@ fn attempt_outcome_label(
 
 struct BegunAttempt {
     trace: Arc<BackendAttemptTrace>,
-    headers: HashMap<String, String>,
+    headers: AttemptHeaders,
+}
+
+/// The backend headers a begun attempt dispatches, in the shape its dispatch
+/// site passes them.
+enum AttemptHeaders {
+    Map(HashMap<String, String>),
+    List(Vec<(String, String)>),
 }
 
 /// One begun backend attempt: the header map it carries and the scope it is
@@ -431,7 +468,28 @@ impl BackendAttemptSpan {
         &'a self,
         base: &'a HashMap<String, String>,
     ) -> &'a HashMap<String, String> {
-        self.0.as_ref().map_or(base, |begun| &begun.headers)
+        match self.0.as_deref() {
+            Some(BegunAttempt {
+                headers: AttemptHeaders::Map(headers),
+                ..
+            }) => headers,
+            _ => base,
+        }
+    }
+
+    /// [`Self::headers`] for an attempt begun with
+    /// `RequestContext::begin_backend_attempt_span_for_header_list`.
+    pub(crate) fn header_list<'a>(
+        &'a self,
+        base: &'a [(String, String)],
+    ) -> &'a [(String, String)] {
+        match self.0.as_deref() {
+            Some(BegunAttempt {
+                headers: AttemptHeaders::List(headers),
+                ..
+            }) => headers,
+            _ => base,
+        }
     }
 
     /// The dispatch admits and prepares the request before it hands it to the
@@ -515,6 +573,13 @@ pub(crate) fn poll_backend_attempt<F: Future>(
     }
 }
 
+/// The clock reading a pool times one connection-setup phase from, taken
+/// only while a traced backend attempt is being polled: `None`, with no clock
+/// read, otherwise. Only the attempt span consumes these timings.
+pub(crate) fn backend_attempt_clock() -> Option<Instant> {
+    ACTIVE_BACKEND_ATTEMPT.try_with(|_| Instant::now()).ok()
+}
+
 fn with_active_attempt(update: impl FnOnce(&mut InFlightAttempt)) {
     let _ = ACTIVE_BACKEND_ATTEMPT.try_with(|trace| trace.update_in_flight(update));
 }
@@ -557,6 +622,38 @@ pub(crate) fn note_backend_tcp_connect(elapsed: Duration) {
 /// The TLS handshake for the active attempt's new connection took `elapsed`.
 pub(crate) fn note_backend_tls_handshake(elapsed: Duration) {
     with_active_attempt(|attempt| attempt.connection.tls_handshake = Some(elapsed));
+}
+
+/// [`note_backend_connection_established`] timed from `started`, a
+/// [`backend_attempt_clock`] reading; a no-op without one.
+pub(crate) fn note_backend_connection_established_since(started: Option<Instant>) {
+    if let Some(started) = started {
+        note_backend_connection_established(started.elapsed());
+    }
+}
+
+/// [`note_backend_dns_resolution`] timed from `started`, a
+/// [`backend_attempt_clock`] reading; a no-op without one.
+pub(crate) fn note_backend_dns_resolution_since(started: Option<Instant>) {
+    if let Some(started) = started {
+        note_backend_dns_resolution(started.elapsed());
+    }
+}
+
+/// [`note_backend_tcp_connect`] timed from `started`, a
+/// [`backend_attempt_clock`] reading; a no-op without one.
+pub(crate) fn note_backend_tcp_connect_since(started: Option<Instant>) {
+    if let Some(started) = started {
+        note_backend_tcp_connect(started.elapsed());
+    }
+}
+
+/// [`note_backend_tls_handshake`] timed from `started`, a
+/// [`backend_attempt_clock`] reading; a no-op without one.
+pub(crate) fn note_backend_tls_handshake_since(started: Option<Instant>) {
+    if let Some(started) = started {
+        note_backend_tls_handshake(started.elapsed());
+    }
 }
 
 fn duration_millis(duration: Duration) -> f64 {

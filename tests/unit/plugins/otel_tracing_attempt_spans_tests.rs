@@ -4,7 +4,9 @@
 //! attempt begins at its dispatch site (`run_backend_attempt_for_test` also
 //! polls it in the attempt scope the connection pools report into) and ends at
 //! `record_backend_attempt`. Live retry coverage is in
-//! `tests/functional/functional_otel_attempt_spans_test.rs`.
+//! `tests/functional/functional_otel_attempt_spans_test.rs`, and for the
+//! HTTP/3 and WebSocket paths (issue #5867) in
+//! `tests/functional/functional_otel_attempt_spans_protocols_test.rs`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -12,7 +14,8 @@ use std::time::Duration;
 use ferrum_edge::_test_support::{
     BackendAttemptForTest, note_backend_attempt_handed_off_for_test,
     note_backend_connection_reused_for_test, note_backend_connection_setup_for_test,
-    record_backend_attempt_for_test, run_backend_attempt_for_test,
+    note_backend_connection_setup_timed_for_test, record_backend_attempt_for_test,
+    run_backend_attempt_for_test, run_backend_attempt_with_header_list_for_test,
 };
 use ferrum_edge::plugins::{
     Plugin, PluginResult, RequestContext, TransactionSummary, otel_tracing::OtelTracing,
@@ -583,4 +586,123 @@ async fn propagation_only_and_absent_tracing_dispatch_unchanged_headers() {
     .await;
     record_backend_attempt_for_test(&ctx, None, true, Some(200));
     assert_eq!(dispatched, headers);
+}
+
+fn header(name: &str, value: &str) -> (String, String) {
+    (name.to_string(), value.to_string())
+}
+
+#[tokio::test]
+async fn a_header_list_attempt_replaces_every_traceparent_entry_with_its_own_span() {
+    let server = collector().await;
+    let plugin = otel(Some(&endpoint(&server)), json!({}));
+    let (ctx, headers) = traced_request(&plugin).await;
+    let trace_id = ctx.metadata["trace_id"].clone();
+    let server_span_id = ctx.metadata["span_id"].clone();
+
+    // A WebSocket upgrade forwards an ordered header list: repeated names keep
+    // their order, and any `traceparent` spelling is the gateway's to replace.
+    let upgrade = [
+        header("x-app", "first"),
+        header("Traceparent", &headers["traceparent"]),
+        header("x-app", "second"),
+        header("traceparent", "00-stale"),
+    ];
+    let (dispatched, ()) = run_backend_attempt_with_header_list_for_test(
+        &ctx,
+        "http://backend.internal:8080/ws",
+        &upgrade,
+        async {},
+    )
+    .await;
+    record_backend_attempt_for_test(&ctx, None, true, Some(101));
+
+    let clients = client_spans(&exported_spans(&server, 1).await);
+    let attempt = &clients[0];
+    let span_id = attempt["spanId"].as_str().expect("span id");
+    assert_eq!(
+        dispatched,
+        [
+            header("x-app", "first"),
+            header("x-app", "second"),
+            header("traceparent", &format!("00-{trace_id}-{span_id}-01")),
+        ],
+        "the upgrade carries exactly one traceparent, naming its attempt"
+    );
+    assert_eq!(attempt["parentSpanId"], server_span_id.as_str());
+    assert_eq!(int_attr(attempt, "gateway.backend.attempt"), Some(1));
+    assert_eq!(int_attr(attempt, "http.response.status_code"), Some(101));
+    assert_eq!(string_attr(attempt, "error.type"), None);
+    assert_eq!(int_attr(attempt, "server.port"), Some(8080));
+}
+
+#[tokio::test]
+async fn a_header_list_attempt_without_an_exporting_trace_keeps_its_headers() {
+    let upgrade = [header("x-app", "kept"), header("traceparent", "00-server")];
+
+    // Without `otel_tracing` the list is dispatched as it is.
+    let ctx = RequestContext::new("10.0.0.1".into(), "GET".into(), "/ws".into());
+    let (dispatched, ()) =
+        run_backend_attempt_with_header_list_for_test(&ctx, BACKEND_URL, &upgrade, async {}).await;
+    assert_eq!(dispatched, upgrade);
+
+    // Propagation-only mode records no attempt spans either.
+    let plugin = otel(None, json!({}));
+    let (ctx, _) = traced_request(&plugin).await;
+    let (dispatched, ()) =
+        run_backend_attempt_with_header_list_for_test(&ctx, BACKEND_URL, &upgrade, async {}).await;
+    record_backend_attempt_for_test(&ctx, None, true, Some(101));
+    assert_eq!(dispatched, upgrade);
+}
+
+#[tokio::test]
+async fn connection_setup_timing_reads_the_clock_only_for_a_traced_attempt() {
+    let server = collector().await;
+    let plugin = otel(Some(&endpoint(&server)), json!({}));
+    let (ctx, headers) = traced_request(&plugin).await;
+
+    // Outside every attempt's poll the pools read no clock and report nothing.
+    assert!(!note_backend_connection_setup_timed_for_test());
+
+    let (_, armed) = run_backend_attempt_for_test(&ctx, BACKEND_URL, &headers, async {
+        note_backend_connection_setup_timed_for_test()
+    })
+    .await;
+    assert!(armed, "a traced attempt arms the connection-setup clock");
+    record_backend_attempt_for_test(&ctx, None, true, Some(200));
+
+    let clients = client_spans(&exported_spans(&server, 1).await);
+    let setup = &clients[0];
+    assert_eq!(
+        bool_attr(setup, "gateway.backend.connection.reused"),
+        Some(false)
+    );
+    for key in [
+        "gateway.backend.connection.setup_ms",
+        "gateway.backend.connection.dns_ms",
+        "gateway.backend.connection.tcp_connect_ms",
+        "gateway.backend.connection.tls_handshake_ms",
+    ] {
+        let value = double_attr(setup, key).unwrap_or_else(|| panic!("{key} missing"));
+        assert!(value >= 0.0, "{key}={value}");
+    }
+
+    // An unsampled request and a request without tracing leave it unarmed.
+    let unsampled = otel(
+        Some(&endpoint(&server)),
+        json!({ "root_sampling": "always_off" }),
+    );
+    let (ctx, headers) = traced_request(&unsampled).await;
+    let (_, armed) = run_backend_attempt_for_test(&ctx, BACKEND_URL, &headers, async {
+        note_backend_connection_setup_timed_for_test()
+    })
+    .await;
+    assert!(!armed, "an unsampled attempt reads no clock");
+
+    let ctx = RequestContext::new("10.0.0.1".into(), "GET".into(), "/".into());
+    let (_, armed) = run_backend_attempt_for_test(&ctx, BACKEND_URL, &headers, async {
+        note_backend_connection_setup_timed_for_test()
+    })
+    .await;
+    assert!(!armed, "a request without tracing reads no clock");
 }

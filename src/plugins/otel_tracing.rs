@@ -65,6 +65,11 @@ pub(crate) use attempt_spans::{
     note_backend_connection_setup_started, note_backend_dns_resolution, note_backend_tcp_connect,
     note_backend_tls_handshake, poll_backend_attempt,
 };
+pub(crate) use attempt_spans::{
+    backend_attempt_clock, note_backend_connection_established_since,
+    note_backend_dns_resolution_since, note_backend_tcp_connect_since,
+    note_backend_tls_handshake_since,
+};
 
 const TRACEPARENT_HEADER: &str = "traceparent";
 const TRACESTATE_HEADER: &str = "tracestate";

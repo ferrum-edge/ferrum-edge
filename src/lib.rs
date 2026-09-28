@@ -1056,6 +1056,35 @@ pub mod _test_support {
         (dispatched, output)
     }
 
+    /// [`run_backend_attempt_for_test`] for a dispatch whose backend headers
+    /// are an ordered header list, as the WebSocket upgrades begin theirs
+    /// (issue #5867).
+    pub async fn run_backend_attempt_with_header_list_for_test<F: std::future::Future>(
+        ctx: &crate::plugins::RequestContext,
+        backend_url: &str,
+        headers: &[(String, String)],
+        attempt: F,
+    ) -> (Vec<(String, String)>, F::Output) {
+        let span = ctx.begin_backend_attempt_span_for_header_list(backend_url, headers);
+        let dispatched = span.header_list(headers).to_vec();
+        let attempt = std::pin::pin!(attempt);
+        let output = span.scope(attempt).await;
+        (dispatched, output)
+    }
+
+    /// Time a connection setup as the connection pools do (issue #5867): read
+    /// the attempt clock, which only a traced attempt being polled arms, then
+    /// report every setup phase from it. Returns whether the clock was read.
+    pub fn note_backend_connection_setup_timed_for_test() -> bool {
+        let started = crate::plugins::otel_tracing::backend_attempt_clock();
+        crate::plugins::otel_tracing::note_backend_connection_setup_started();
+        crate::plugins::otel_tracing::note_backend_dns_resolution_since(started);
+        crate::plugins::otel_tracing::note_backend_tcp_connect_since(started);
+        crate::plugins::otel_tracing::note_backend_tls_handshake_since(started);
+        crate::plugins::otel_tracing::note_backend_connection_established_since(started);
+        started.is_some()
+    }
+
     /// A begun backend attempt's `otel_tracing` CLIENT span (issue #5864),
     /// held as a dispatch site holds it, so a test can drop it (and the
     /// request) before the attempt ends.

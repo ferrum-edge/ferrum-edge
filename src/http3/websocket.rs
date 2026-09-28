@@ -1004,52 +1004,67 @@ pub(crate) async fn handle_h3_websocket(
                     .map(|pq| std::borrow::Cow::Owned(pq.as_str().to_string()))
                     .unwrap_or(std::borrow::Cow::Borrowed("/"))
             });
-        let ws_dial_result: Result<
-            crate::proxy::WsBackendHandshake,
-            Box<dyn std::error::Error + Send + Sync>,
-        > = match (
-            &ws_mesh_egress,
-            current_target.as_deref(),
-            ws_path_and_query.as_deref(),
-        ) {
-            (Some(egress), Some(target), Some(path_and_query)) => {
-                crate::proxy::connect_mesh_websocket_backend(
-                    &state,
+        // The attempt's `otel_tracing` CLIENT span (issue #5867): the upgrade
+        // request carries the attempt's own `traceparent`, and the handshake is
+        // polled in the attempt's scope. It ends with the handshake below.
+        let ws_attempt_span =
+            ctx.begin_backend_attempt_span_for_header_list(&current_backend_url, &client_headers);
+        let ws_attempt_headers = ws_attempt_span.header_list(&client_headers);
+        let ws_dial = async {
+            match (
+                &ws_mesh_egress,
+                current_target.as_deref(),
+                ws_path_and_query.as_deref(),
+            ) {
+                (Some(egress), Some(target), Some(path_and_query)) => {
+                    crate::proxy::connect_mesh_websocket_backend(
+                        &state,
+                        ws_dial_proxy,
+                        target,
+                        egress,
+                        ws_client_host.as_deref(),
+                        path_and_query,
+                        ws_attempt_headers,
+                        ws_size_limits.max_frame_bytes,
+                        ws_size_limits.max_message_bytes,
+                        state.websocket_write_buffer_size,
+                        ws_idle_tracker.clone(),
+                        ctx.peer_spiffe_id.as_ref(),
+                    )
+                    .await
+                    .map(|handshake| crate::proxy::WsBackendHandshake::Mesh(Box::new(handshake)))
+                }
+                (Some(_), Some(_), None) => {
+                    Err(crate::retry::WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into())
+                }
+                _ => crate::proxy::connect_websocket_backend(
+                    &current_backend_url,
                     ws_dial_proxy,
-                    target,
-                    egress,
-                    ws_client_host.as_deref(),
-                    path_and_query,
-                    &client_headers,
+                    &state.env_config,
+                    ws_attempt_headers,
+                    &state.connection_pool,
                     ws_size_limits.max_frame_bytes,
                     ws_size_limits.max_message_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
-                    ctx.peer_spiffe_id.as_ref(),
+                    Some(&state.dns_cache),
                 )
                 .await
-                .map(|handshake| crate::proxy::WsBackendHandshake::Mesh(Box::new(handshake)))
+                .map(|handshake| crate::proxy::WsBackendHandshake::Direct(Box::new(handshake))),
             }
-            (Some(_), Some(_), None) => {
-                Err(crate::retry::WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into())
-            }
-            _ => crate::proxy::connect_websocket_backend(
-                &current_backend_url,
-                ws_dial_proxy,
-                &state.env_config,
-                &client_headers,
-                &state.connection_pool,
-                ws_size_limits.max_frame_bytes,
-                ws_size_limits.max_message_bytes,
-                state.websocket_write_buffer_size,
-                ws_idle_tracker.clone(),
-                Some(&state.dns_cache),
-            )
-            .await
-            .map(|handshake| crate::proxy::WsBackendHandshake::Direct(Box::new(handshake))),
+        };
+        // Pinned in this block, so the dial future and its borrow of `ctx` end
+        // with the dial.
+        let ws_dial_result: Result<
+            crate::proxy::WsBackendHandshake,
+            Box<dyn std::error::Error + Send + Sync>,
+        > = {
+            tokio::pin!(ws_dial);
+            ws_attempt_span.scope(ws_dial).await
         };
         match ws_dial_result {
             Ok(handshake) => {
+                ctx.record_backend_attempt(None, true, handshake.backend_upgrade_status());
                 backend_conn_guard = conn_slot;
                 break handshake;
             }
@@ -1073,6 +1088,8 @@ pub(crate) async fn handle_h3_websocket(
                 // failure), matching the H1/H2 path.
                 let ws_egress_denied =
                     matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
+                // Every failed handshake ends its attempt, retried or not.
+                ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
                     let route_retry_ceiling =
                         crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);
