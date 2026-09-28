@@ -2,6 +2,10 @@
 //! 36370971003: a Docker Hub pull of `postgres:17` failed with
 //! `bytes remaining on stream` and hard-failed the job).
 //!
+//! The helper lives in `common/container_retry.rs` and is compiled into both
+//! container suites (the secrets fixtures include it through `#[path]`), so
+//! these tests cover the Vault/LocalStack starts as well.
+//!
 //! These tests do not start Docker. They pin which start errors count as
 //! transient image-pull/registry faults, and that the retry stays bounded, so
 //! a wait-condition failure or a real setup error still fails on its first
@@ -11,7 +15,7 @@ use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use crate::common::containers::{
+use crate::common::container_retry::{
     CONTAINER_START_ATTEMPTS, ContainerStartRetry, is_transient_image_pull_error, start_with_retry,
 };
 use crate::common::host_ports::retry_on_host_port_collision;
@@ -52,6 +56,57 @@ fn classifies_transient_transfer_and_registry_faults() {
         assert!(
             is_transient_image_pull_error(error),
             "must be retried as transient: {error}"
+        );
+    }
+}
+
+#[test]
+fn default_policy_is_the_bounded_shared_policy() {
+    // Both container suites start through this policy; pin it so neither can
+    // drift to an unbounded or wider retry.
+    let policy = ContainerStartRetry::DEFAULT;
+    assert_eq!(policy.attempts, CONTAINER_START_ATTEMPTS);
+    assert_eq!(policy.attempts, 3);
+    assert_eq!(policy.backoff, Duration::from_secs(2));
+    assert_eq!(policy.budget, Duration::from_secs(300));
+    let worst_case_backoff: Duration = (1..policy.attempts)
+        .map(|attempt| policy.backoff * attempt)
+        .sum();
+    assert!(
+        worst_case_backoff < policy.budget,
+        "backoff alone must not consume the start deadline"
+    );
+}
+
+#[test]
+fn classifies_secrets_fixture_pull_faults_as_transient() {
+    for error in [
+        "failed to pull the image 'hashicorp/vault:1.15', error: Docker stream error: \
+         bytes remaining on stream",
+        "failed to pull the image 'localstack/localstack:3', error: Docker responded with \
+         status code 500: received unexpected HTTP status: 502 Bad Gateway",
+        "failed to pull the image 'localstack/localstack:3', error: toomanyrequests: \
+         You have reached your unauthenticated pull rate limit",
+    ] {
+        assert!(
+            is_transient_image_pull_error(error),
+            "must be retried as transient: {error}"
+        );
+    }
+}
+
+#[test]
+fn does_not_retry_secrets_fixture_wait_condition_failures() {
+    // Vault waits for `Vault server started!` and LocalStack for `Ready.` on
+    // stdout; a missing line is a broken fixture, not a transfer fault.
+    for error in [
+        "failed to wait for container log: log stream ended before \
+         `Vault server started!` was observed",
+        "container startup timeout",
+    ] {
+        assert!(
+            !is_transient_image_pull_error(error),
+            "wait-condition failure must not be retried: {error}"
         );
     }
 }
