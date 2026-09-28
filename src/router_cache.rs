@@ -759,7 +759,7 @@ impl HostRouteTable {
     /// - a single-port SERVICE-default group (`is_ingress == false`) → a
     ///   request with no port signal keeps `current` (bare-Host clients); a
     ///   PRESENT signal must name the sole port — the orig-dst its container
-    ///   port, else the authority its service port — or
+    ///   port, else the authority its service port or its container port — or
     ///   [`MeshInboundPortSelectError::PortNotMaterialized`];
     /// - a single-listener INGRESS group (`is_ingress == true`) → a present port
     ///   signal MUST equal the declared listener port (else
@@ -816,17 +816,20 @@ impl HostRouteTable {
             // signal (a bare-Host client) keeps the representative. A PRESENT
             // signal must name this port with the same priority as a multi-port
             // group — the captured orig-dst its container port, else the
-            // authority its service port — and a mismatch fails closed rather
-            // than being absorbed onto the only port. Not an ingress group, so no
-            // authz listener port to stamp.
+            // authority either its service port (`Host: svc:80`) or its
+            // container port (a headless / direct-pod `pod-0.svc:9080` dial;
+            // a single-port peer's authority is forwarded unchanged). Both are
+            // the sole port's own numbers, so accepting either absorbs no other
+            // port; any other explicit port fails closed. Not an ingress group,
+            // so no authz listener port to stamp.
             let sibling = group.ports.first();
             let signal_matches = match (orig_dst_port, authority_port) {
                 (Some(container_port), _) => {
                     sibling.is_some_and(|sibling| sibling.orig_dst_match_port == container_port)
                 }
-                (None, Some(service_port)) => {
-                    sibling.is_some_and(|sibling| sibling.authority_port == service_port)
-                }
+                (None, Some(port)) => sibling.is_some_and(|sibling| {
+                    sibling.authority_port == port || sibling.orig_dst_match_port == port
+                }),
                 (None, None) => true,
             };
             if !signal_matches {
@@ -5829,8 +5832,9 @@ mod tests {
 
     /// Single-declared-port local services keep serving bare-Host clients (no
     /// port signal), but a PRESENT port signal must name the sole port: the
-    /// orig-dst its container port, else the authority its service port. A
-    /// mismatched explicit port fails closed instead of being absorbed.
+    /// orig-dst its container port, else the authority its service port or its
+    /// container port. A mismatched explicit port fails closed instead of being
+    /// absorbed.
     #[test]
     fn mesh_inbound_single_port_group_requires_a_present_signal_to_match() {
         let mut p =
@@ -5846,12 +5850,14 @@ mod tests {
         let table = cache.route_table_for_tests();
 
         // No signal, a matching orig-dst (container port 8081), or a matching
-        // authority (service port 8080) keeps the route. A present orig-dst
-        // outranks the authority, as for a multi-port group.
+        // authority (service port 8080, or container port 8081) keeps the
+        // route. A present orig-dst outranks the authority, as for a
+        // multi-port group.
         for (orig_dst, authority) in [
             (None, None),
             (Some(8081u16), None),
             (None, Some(8080u16)),
+            (None, Some(8081u16)),
             (Some(8081u16), Some(9999u16)),
         ] {
             let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
@@ -6143,42 +6149,50 @@ mod tests {
     }
 
     /// Counterpart to the ingress fail-closed check: a SINGLE-port SERVICE-default
-    /// inbound group (`is_ingress == false`) keeps the back-compat passthrough —
-    /// it accepts any explicit port and a bare-Host dial onto the sole sibling, so
-    /// the round-2 ingress tightening does NOT regress single-port services.
+    /// inbound group (`is_ingress == false`) serves a bare-Host dial and a Host
+    /// port naming EITHER the service port (`Host: reviews:80`) OR the container
+    /// port (a headless `pod-0.reviews:9080` dial), and refuses any other port.
     #[test]
-    fn mesh_inbound_single_service_port_keeps_backcompat_passthrough() {
-        let mut p =
-            minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
-        p.hosts = vec!["reviews".to_string()];
-        p.backend_port = 8080;
-        let config = GatewayConfig {
-            proxies: vec![p],
-            // The service declares exactly one HTTP port.
-            mesh: mesh_block(&[("default", "reviews", &[80])]),
-            ..GatewayConfig::default()
-        };
-        let cache = RouterCache::new(&config, 100);
-        let table = cache.route_table_for_tests();
+    fn mesh_inbound_single_service_port_accepts_service_or_container_host_port() {
+        for container_port in [8080u16, 9080] {
+            let mut p =
+                minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
+            p.hosts = vec!["reviews".to_string()];
+            p.backend_port = container_port;
+            let config = GatewayConfig {
+                proxies: vec![p],
+                // The service declares exactly one HTTP port.
+                mesh: mesh_block(&[("default", "reviews", &[80])]),
+                ..GatewayConfig::default()
+            };
+            let cache = RouterCache::new(&config, 100);
+            let table = cache.route_table_for_tests();
 
-        // No signal → keep (back-compat), and NO ingress authz port (service
-        // default authorizes on the backend port).
-        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
-        let (kept, authz_port) = table
-            .select_mesh_inbound_port_route(rm, None, None)
-            .expect("single service port keeps the route unconditionally");
-        assert_eq!(kept.proxy.backend_port, 8080);
-        assert_eq!(authz_port, None);
+            // No signal, the service port, or the container port in the Host
+            // keeps the route, with NO ingress authz port (service default
+            // authorizes on the backend port).
+            for authority in [None, Some(80u16), Some(container_port)] {
+                let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+                let (kept, authz_port) = table
+                    .select_mesh_inbound_port_route(rm, None, authority)
+                    .expect("the sole port's own numbers keep the route");
+                assert_eq!(kept.proxy.backend_port, container_port);
+                assert_eq!(authz_port, None);
+            }
 
-        // An explicit (even unrelated) authority/orig-dst port is still accepted
-        // for a single-port service — unchanged from round-1.
-        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
-        assert!(
-            table
-                .select_mesh_inbound_port_route(rm, Some(12345), None)
-                .is_ok(),
-            "a single-port service must keep accepting any explicit port (back-compat)"
-        );
+            // Any other explicit port is refused rather than absorbed, and a
+            // captured orig-dst must be the container port.
+            for (orig_dst, authority) in [(None, Some(12345u16)), (Some(12345u16), None)] {
+                let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+                assert!(
+                    matches!(
+                        table.select_mesh_inbound_port_route(rm, orig_dst, authority),
+                        Err(MeshInboundPortSelectError::PortNotMaterialized)
+                    ),
+                    "container={container_port} orig_dst={orig_dst:?} authority={authority:?}"
+                );
+            }
+        }
     }
 
     /// A partially materialized multi-port group (one sibling skipped) still

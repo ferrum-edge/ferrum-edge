@@ -6625,10 +6625,10 @@ pub fn validate_mesh_config(
 }
 
 /// Refuse operator ECDS extension configs that declare the DestinationRule
-/// carrier type. DestinationRules reach data planes only through the reserved
-/// carriers the xDS translator emits from `destination_rules`; a data plane
-/// NACKs that type under any other name, which would wedge every later ECDS
-/// update on last-known-good.
+/// carrier type or a mesh-slice carrier type. Those reach data planes only
+/// through the reserved carriers the xDS translator emits from the slice's own
+/// fields; a data plane NACKs either type under any other name, which would
+/// wedge every later ECDS update on last-known-good.
 fn validate_mesh_extension_configs(
     extension_configs: &[crate::modes::mesh::slice::MeshExtensionConfig],
     errors: &mut Vec<String>,
@@ -6638,6 +6638,14 @@ fn validate_mesh_extension_configs(
             errors.push(format!(
                 "MeshConfig.extension_configs {:?}: type_url {:?} is reserved for Ferrum \
                  DestinationRule carriers; declare the rule in destination_rules instead",
+                extension.name, extension.type_url
+            ));
+        } else if crate::xds::carrier::carrier_resource_name_for_type_url(&extension.type_url)
+            .is_some()
+        {
+            errors.push(format!(
+                "MeshConfig.extension_configs {:?}: type_url {:?} is reserved for Ferrum \
+                 mesh-slice carriers; declare that state in its mesh config field instead",
                 extension.name, extension.type_url
             ));
         }

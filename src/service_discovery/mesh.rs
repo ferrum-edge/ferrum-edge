@@ -422,9 +422,9 @@ impl MeshServiceDiscoverer {
         let base_fqdn =
             crate::modes::mesh::cross_cluster_service_base_fqdn(service, &self.cluster_domain);
         // Judge by the selected HTTP-family port's alias; fall back to the base
-        // FQDN alone when the selected port is absent, not HTTP-family, or an
-        // ambiguous HTTP/raw-TCP number (the bridge itself then stays
-        // fail-closed regardless, so the base-only judgment is safe).
+        // FQDN alone when the selected port is absent, not HTTP-family, or on
+        // an ambiguous alias (the bridge itself then stays fail-closed
+        // regardless, so the base-only judgment is safe).
         let dial_sni = selected_service_port
             .and_then(|selected| selected.service_port)
             .and_then(|port| {

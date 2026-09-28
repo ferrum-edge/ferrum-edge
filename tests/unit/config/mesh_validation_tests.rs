@@ -15,6 +15,7 @@ use ferrum_edge::modes::mesh::config::{
     WorkloadSelector, validate_mesh_config,
 };
 use ferrum_edge::modes::mesh::slice::MeshExtensionConfig;
+use ferrum_edge::xds::carrier::FERRUM_ECDS_SERVICES_TYPE_URL;
 use ferrum_edge::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -3987,5 +3988,29 @@ fn extension_config_declaring_destination_rule_carrier_type_is_rejected() {
     assert!(
         !errors.iter().any(|error| error.contains("operator-ext")),
         "an ordinary operator extension stays admissible, got {errors:?}"
+    );
+}
+
+#[test]
+fn extension_config_declaring_mesh_slice_carrier_type_is_rejected() {
+    // Mesh-slice carriers ride only the translator's reserved ECDS names; an
+    // operator entry declaring one of their types would be NACKed by every DP.
+    let mesh = MeshConfig {
+        extension_configs: vec![MeshExtensionConfig {
+            name: "operator-services".to_string(),
+            namespace: "default".to_string(),
+            type_url: FERRUM_ECDS_SERVICES_TYPE_URL.to_string(),
+            value: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("\"operator-services\"")
+                && error.contains("reserved for Ferrum mesh-slice carriers")
+        }),
+        "the error must name the offending entry, got {errors:?}"
     );
 }

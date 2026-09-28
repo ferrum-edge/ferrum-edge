@@ -7332,6 +7332,12 @@ struct RequestConnectionMetadata {
 static H1_FRAMING_OBSERVER_FAILED_WARN: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
     crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
 
+/// Rate-limits the warning for a mesh inbound request refused because its port
+/// signal names no mesh-routable port of the local service (or a multi-port
+/// service got no signal), so the 502 is diagnosable without debug logging.
+static MESH_INBOUND_PORT_REJECT_WARN: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
+    crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
+
 /// RFC 9112 §6.1 requires closing after any HTTP/1 CL+TE response, even
 /// when Hyper drained the body according to Transfer-Encoding. A peer honoring
 /// Content-Length could place the next request boundary elsewhere, so no
@@ -32619,6 +32625,17 @@ async fn handle_proxy_request_inner(
                         client_ip = %ctx.client_ip,
                         "Mesh inbound port selection failed; rejecting inbound request"
                     );
+                    let now_ms = crate::socket_opts::monotonic_now_ms();
+                    if let Some(suppressed) = MESH_INBOUND_PORT_REJECT_WARN.on_event(now_ms) {
+                        warn!(
+                            proxy_id = %representative_id.id,
+                            orig_dst_port = ?ctx.orig_dst.map(|addr| addr.port()),
+                            authority_port = ?authority_port,
+                            reason = ?reason,
+                            suppressed,
+                            "Rejected mesh inbound request: its port signal (or its absence) matches no mesh-routable port of the local service"
+                        );
+                    }
                     state.request_count.fetch_add(1, Ordering::Relaxed);
                     let body: &[u8] = match reason {
                         crate::router_cache::MeshInboundPortSelectError::PortSignalUnavailable => {

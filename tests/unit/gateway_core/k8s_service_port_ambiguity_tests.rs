@@ -1,6 +1,7 @@
-//! A Service that declares one port number for both an HTTP-family port and a
-//! raw-TCP port is refused on its own: both ports would route cross-cluster on
-//! the same `p<port>` east-west SNI alias. Sibling Services still translate.
+//! A Service that declares one port number on the same L4 transport more than
+//! once (HTTP plus raw TCP, or a Diameter-style `3868/TCP` plus `3868/SCTP`)
+//! still translates in full. Only the east-west materializers skip that port
+//! for cross-cluster routing; the translator never drops the Service.
 
 use std::collections::HashMap;
 
@@ -52,11 +53,28 @@ fn translated_service_names(objects: &[K8sObject]) -> (Vec<String>, Vec<String>)
     (names, errors)
 }
 
+fn translated_port_numbers(objects: &[K8sObject], service_name: &str) -> Vec<u16> {
+    let (translation, skipped) =
+        translate_k8s_objects_collecting_skips(objects, options()).expect("translation");
+    assert!(
+        skipped.is_empty(),
+        "nothing may be skipped, got {}",
+        skipped.len()
+    );
+    let mesh = translation.config.mesh.expect("mesh config");
+    let service = mesh
+        .services
+        .iter()
+        .find(|svc| svc.name == service_name)
+        .unwrap_or_else(|| panic!("Service {service_name} must translate"));
+    service.ports.iter().map(|port| port.port).collect()
+}
+
 #[test]
-fn http_and_raw_tcp_ports_sharing_a_number_refuse_only_that_service() {
+fn http_and_raw_tcp_ports_sharing_a_number_still_translate() {
     let objects = vec![
         service(
-            "ambiguous",
+            "shared",
             json!([
                 {"name": "http", "port": 7070, "protocol": "TCP", "appProtocol": "http"},
                 {"name": "raw", "port": 7070, "protocol": "TCP", "appProtocol": "tcp"}
@@ -68,15 +86,31 @@ fn http_and_raw_tcp_ports_sharing_a_number_refuse_only_that_service() {
         ),
     ];
 
+    assert_eq!(
+        translated_port_numbers(&objects, "shared"),
+        vec![7070, 7070]
+    );
+    assert_eq!(translated_port_numbers(&objects, "reviews"), vec![9080]);
+}
+
+#[test]
+fn tcp_and_sctp_ports_sharing_a_number_translate() {
+    // Diameter: Kubernetes allows one number on two L4 protocols.
+    let objects = vec![service(
+        "diameter",
+        json!([
+            {"name": "tcp-diameter", "port": 3868, "protocol": "TCP"},
+            {"name": "sctp-diameter", "port": 3868, "protocol": "SCTP"}
+        ]),
+    )];
+
     let (names, errors) = translated_service_names(&objects);
 
-    assert!(names.iter().any(|name| name == "reviews"), "{names:?}");
-    assert!(!names.iter().any(|name| name == "ambiguous"), "{names:?}");
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.starts_with("ambiguous:") && error.contains("port \"7070\"")),
-        "the refusal must name the Service and the ambiguous port, got {errors:?}"
+    assert!(names.iter().any(|name| name == "diameter"), "{names:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        translated_port_numbers(&objects, "diameter"),
+        vec![3868, 3868]
     );
 }
 

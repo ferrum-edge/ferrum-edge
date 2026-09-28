@@ -88,6 +88,7 @@ use crate::modes::startup_security;
 use crate::proxy::{self, GatewayTrustCommit, ProxyState};
 use crate::startup::{sanitize_startup_cause, sanitize_startup_scalar, wait_for_start_signals};
 use crate::tls::{self, TlsPolicy};
+use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:15001";
@@ -4486,6 +4487,19 @@ fn warn_east_west_gateway_base_fqdn_only(
     services: &[crate::modes::mesh::config::MeshService],
     cluster_domain: &str,
 ) {
+    let key = format!("{}/{}", gateway.namespace, gateway.name);
+    let warned =
+        EAST_WEST_BASE_FQDN_ONLY_WARNED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    // Check the dedup set first so an entry already warned about (or a full
+    // set) skips the per-service alias scan on every later reconcile.
+    {
+        let warned = warned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if warned.contains(&key) || warned.len() >= EAST_WEST_BASE_FQDN_ONLY_WARN_MAX_KEYS {
+            return;
+        }
+    }
     let claims: Vec<String> = gateway
         .sni_hosts
         .iter()
@@ -4510,12 +4524,10 @@ fn warn_east_west_gateway_base_fqdn_only(
         return;
     };
     let first = {
-        let mut warned = EAST_WEST_BASE_FQDN_ONLY_WARNED
-            .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+        let mut warned = warned
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        warned.len() < EAST_WEST_BASE_FQDN_ONLY_WARN_MAX_KEYS
-            && warned.insert(format!("{}/{}", gateway.namespace, gateway.name))
+        warned.len() < EAST_WEST_BASE_FQDN_ONLY_WARN_MAX_KEYS && warned.insert(key)
     };
     if first {
         warn!(
@@ -4640,14 +4652,7 @@ fn build_east_west_service_proxies_and_upstreams(
             // Every port carries its own `.p<port>` id so the per-port proxies
             // never collide (codex #2040 Finding B).
             let Some(id_suffix) = cross_cluster_service_sni_label(service, service_port) else {
-                warn!(
-                    service = %sanitize_startup_scalar(service.name.to_string()),
-                    namespace = %sanitize_startup_scalar(service.namespace.to_string()),
-                    service_port = %sanitize_startup_scalar(service_port.port),
-                    "Refusing east-west routing for a service port number declared by both an \
-                     HTTP-family port and a raw-TCP port; the shared p<port> SNI alias would be \
-                     ambiguous"
-                );
+                warn_east_west_ambiguous_alias(service, service_port, "destination");
                 continue;
             };
             // Build upstream targets for THIS service port.
@@ -4877,67 +4882,96 @@ pub(crate) fn cross_cluster_service_base_fqdn(
     )
 }
 
-/// Whether a service declares service port NUMBER `port` for both an
-/// HTTP-family port and a raw-TCP port (effective protocol, `protocol_overrides`
-/// applied).
+/// Whether a service port's DECLARED L4 transport is UDP-family.
 ///
-/// Both transport classes route cross-cluster on the same `p<port>` east-west
-/// alias ([`cross_cluster_service_sni_label`]), so such a pair is ambiguous: a
-/// peer dialing `p<port>` could not say which of the two ports it means.
-/// Kubernetes cannot express the pair (both are `protocol: TCP` on one number),
-/// so the K8s translator refuses such a Service outright; the east-west
-/// materializers refuse the ambiguous number for every other source. A UDP port
-/// never conflicts — it takes its own `p<port>-udp` alias.
-pub(crate) fn service_port_number_is_http_tcp_ambiguous(
+/// The east-west alias keys on the declared `ServicePort.protocol`, never on
+/// `protocol_overrides`: an override reclassifies the application protocol a
+/// port carries, not the transport it is declared on. It is also keyed by port
+/// NUMBER, so applying it here would let one override move a UDP entry onto
+/// the `p<port>` alias of the TCP entry sharing its number.
+fn service_port_declares_udp(service_port: &crate::modes::mesh::config::ServicePort) -> bool {
+    is_udp_mesh_protocol(service_port.protocol)
+}
+
+/// Whether more than one of the service's declared ports maps to the same
+/// east-west alias as `service_port` — the same number on the same declared L4
+/// transport (see [`service_port_declares_udp`]).
+///
+/// Such a number is ambiguous: a peer dialing that alias could not say which
+/// of the entries (and their targetPorts) it means, so neither side routes it
+/// cross-cluster. Examples: an HTTP-family and a raw-TCP port on one number in
+/// a native or file config, duplicate native entries, or a Kubernetes Service
+/// declaring `3868/TCP` plus `3868/SCTP` (SCTP has no mesh transport model; the
+/// translator carries it as `Unknown`, which is not UDP). In-cluster routing is
+/// unaffected. A UDP port never collides with a TCP port — it takes its own
+/// `p<port>-udp` alias.
+fn service_port_east_west_alias_is_ambiguous(
     ports: &[crate::modes::mesh::config::ServicePort],
-    protocol_overrides: &HashMap<u16, AppProtocol>,
-    port: u16,
+    service_port: &crate::modes::mesh::config::ServicePort,
 ) -> bool {
-    let mut http = false;
-    let mut raw_tcp = false;
-    for candidate in ports.iter().filter(|candidate| candidate.port == port) {
-        let protocol = protocol_overrides
-            .get(&port)
-            .copied()
-            .unwrap_or(candidate.protocol);
-        if is_http_family_mesh_protocol(protocol) {
-            http = true;
-        } else if !is_udp_mesh_protocol(protocol) {
-            raw_tcp = true;
-        }
-    }
-    http && raw_tcp
+    let udp = service_port_declares_udp(service_port);
+    ports
+        .iter()
+        .filter(|candidate| {
+            candidate.port == service_port.port && service_port_declares_udp(candidate) == udp
+        })
+        .nth(1)
+        .is_some()
+}
+
+/// Window for the ambiguous east-west alias advisory: materialization reruns on
+/// every reconcile, so repeat the warning at most once a minute.
+const EAST_WEST_AMBIGUOUS_ALIAS_WARN_WINDOW_MS: u64 = 60_000;
+
+static EAST_WEST_AMBIGUOUS_ALIAS_WARN: AtomicLogRateLimiter =
+    AtomicLogRateLimiter::with_window_ms(EAST_WEST_AMBIGUOUS_ALIAS_WARN_WINDOW_MS);
+
+/// Rate-limited warning that `service_port` is not routed cross-cluster
+/// because its east-west alias is ambiguous
+/// ([`service_port_east_west_alias_is_ambiguous`]). `side` names the
+/// materializer (`destination` or `client`) that skipped it.
+fn warn_east_west_ambiguous_alias(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    side: &'static str,
+) {
+    let now_ms = crate::socket_opts::monotonic_now_ms();
+    let Some(suppressed) = EAST_WEST_AMBIGUOUS_ALIAS_WARN.on_event(now_ms) else {
+        return;
+    };
+    warn!(
+        service = %sanitize_startup_scalar(service.name.to_string()),
+        namespace = %sanitize_startup_scalar(service.namespace.to_string()),
+        service_port = %sanitize_startup_scalar(service_port.port),
+        side,
+        suppressed,
+        "Not routing a service port cross-cluster: the service declares more than one port \
+         with this number and L4 transport, so its east-west SNI alias would be ambiguous"
+    );
 }
 
 /// DNS label (and internal id suffix) for a service port's east-west alias.
 ///
-/// The label depends ONLY on the port's own number and transport — never on the
-/// service's other ports — so two clusters that declare different port sets
-/// for one service still agree on every shared port: `p<port>` for an
-/// HTTP-family or raw-TCP port, `p<port>-udp` for a UDP-family port. Returns
-/// `None` for a port whose number the service declares for both an HTTP-family
-/// and a raw-TCP port ([`service_port_number_is_http_tcp_ambiguous`]); such a
-/// port is not routed cross-cluster at all.
+/// The label depends ONLY on the port's own number and declared L4 transport —
+/// never on the service's other ports — so two clusters that declare different
+/// port sets for one service still agree on every shared port: `p<port>` for a
+/// TCP-carried (HTTP-family or raw-TCP) port, `p<port>-udp` for a UDP-family
+/// port. Returns `None` when more than one declared port maps to that alias
+/// ([`service_port_east_west_alias_is_ambiguous`]); such a port is not routed
+/// cross-cluster at all.
 fn cross_cluster_service_sni_label(
     service: &crate::modes::mesh::config::MeshService,
     service_port: &crate::modes::mesh::config::ServicePort,
 ) -> Option<String> {
-    let effective_protocol = service
-        .protocol_overrides
-        .get(&service_port.port)
-        .copied()
-        .unwrap_or(service_port.protocol);
-    if is_udp_mesh_protocol(effective_protocol) {
-        return Some(format!("p{}-udp", service_port.port));
-    }
-    if service_port_number_is_http_tcp_ambiguous(
-        &service.ports,
-        &service.protocol_overrides,
-        service_port.port,
-    ) {
+    if service_port_east_west_alias_is_ambiguous(&service.ports, service_port) {
         return None;
     }
-    Some(format!("p{}", service_port.port))
+    let suffix = if service_port_declares_udp(service_port) {
+        "-udp"
+    } else {
+        ""
+    };
+    Some(format!("p{}{suffix}", service_port.port))
 }
 
 /// The cross-cluster east-west SNI a `(service, service_port)` routes on
@@ -4954,8 +4988,8 @@ fn cross_cluster_service_sni_label(
 /// cluster and the destination cluster agree per numeric port regardless of
 /// which ports EITHER cluster happens to declare. A port the destination does
 /// not declare has no passthrough proxy, so the dial fails instead of reaching a
-/// sibling port. Returns `None` for an ambiguous HTTP/raw-TCP port number, which
-/// neither side routes.
+/// sibling port. Returns `None` for a port whose alias more than one declared
+/// port maps to, which neither side routes.
 ///
 /// The NUMERIC service port is authoritative in the alias — a port NAME is never
 /// used. SNI carries no port, so a per-port DNS-safe alias is the port channel.
@@ -8939,9 +8973,10 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
     // service's per-port aliases) OR the exact per-port alias being dialed (codex
     // #2040 Finding C). Both SNIs derive from `cross_cluster_service_{base_fqdn,
     // sni}` so client + gateway cannot drift.
-    // An ambiguous HTTP/raw-TCP port number has no alias; the destination
-    // refuses it too, so there is nothing to dial.
+    // A port sharing its number and L4 transport with another declared port
+    // has no alias; the destination refuses it too, so there is nothing to dial.
     let Some(dial_sni) = cross_cluster_service_sni(service, service_port, cluster_domain) else {
+        warn_east_west_ambiguous_alias(service, service_port, "client");
         return;
     };
     let base_fqdn = cross_cluster_service_base_fqdn(service, cluster_domain);
@@ -9178,9 +9213,10 @@ fn append_cross_cluster_sidecar_l4_targets(
         return;
     }
 
-    // An ambiguous HTTP/raw-TCP port number has no alias; the destination
-    // refuses it too, so there is nothing to dial.
+    // A port sharing its number and L4 transport with another declared port
+    // has no alias; the destination refuses it too, so there is nothing to dial.
     let Some(dial_sni) = cross_cluster_service_sni(service, service_port, cluster_domain) else {
+        warn_east_west_ambiguous_alias(service, service_port, "client");
         return;
     };
     let base_fqdn = cross_cluster_service_base_fqdn(service, cluster_domain);
@@ -9490,9 +9526,10 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
     // claims EITHER the base service FQDN OR the exact per-port alias being dialed
     // (codex #2040 Finding C). Both derive from `cross_cluster_service_{base_fqdn,
     // sni}` so client + gateway cannot drift.
-    // An ambiguous HTTP/raw-TCP port number has no alias; the destination
-    // refuses it too, so there is nothing to dial.
+    // A port sharing its number and L4 transport with another declared port
+    // has no alias; the destination refuses it too, so there is nothing to dial.
     let Some(dial_sni) = cross_cluster_service_sni(service, service_port, cluster_domain) else {
+        warn_east_west_ambiguous_alias(service, service_port, "client");
         return;
     };
     let base_fqdn = cross_cluster_service_base_fqdn(service, cluster_domain);

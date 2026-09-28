@@ -327,11 +327,12 @@ outright with no deprecation period:
   service port, including a single-port service's only port, routes on its
   `p<port>.<service>.<namespace>.svc.<cluster-domain>` alias. The alias depends
   only on the port's number and transport: HTTP-family and raw-TCP ports use
-  `p<port>`, and UDP ports always use `p<port>-udp`. A service that declares
-  an HTTP-family port and a raw-TCP port on the same number is refused: the
-  Kubernetes translator rejects the Service, and other sources skip that port
-  number for cross-cluster routing. This changes the cross-cluster wire
-  format.
+  `p<port>`, and UDP ports (by declared protocol, never `protocol_overrides`)
+  always use `p<port>-udp`. When more than one declared port maps to one alias
+  (for example HTTP plus raw TCP, or Kubernetes `3868/TCP` plus `3868/SCTP`),
+  every source still translates the service, and both ends skip only that
+  alias for cross-cluster routing with a rate-limited warning. This changes
+  the cross-cluster wire format.
   - A destination `EastWestGateway` `sni_hosts` entry takes over a port only
     when it names that port's alias (or a covering wildcard). An entry that
     names only a local service's base FQDN now logs a one-time warning.
@@ -350,9 +351,10 @@ outright with no deprecation period:
   warning.
 - **Mismatched explicit ports on single-port inbound routes.** A Sidecar
   inbound route for a single-port service still serves a request with no port
-  signal, but a request whose captured original destination or explicit
-  `Host`/`:authority` port names a different port now fails closed with 502,
-  as it already did for multi-port services.
+  signal, and a `Host`/`:authority` port naming its service port or its
+  container port. Any other explicit port, or a captured original destination
+  other than the container port, now fails closed with 502, as it already did
+  for multi-port services. These rejections log a rate-limited warning.
 - **Shared-secret remote discovery.** Cross-cluster endpoint discovery polls a
   `RemoteCluster` only with its own `discovery_credential_ref` credential from
   `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS`; a cluster without one is no
