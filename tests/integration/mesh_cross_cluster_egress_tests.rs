@@ -32,6 +32,8 @@ use super::mesh_test_support::{
 };
 
 const SVC_B_FQDN: &str = "svc-b.default.svc.cluster.local";
+/// The per-port east-west SNI alias `svc-b`'s sole HTTP port 8080 dials.
+const SVC_B_8080_SNI: &str = "p8080.svc-b.default.svc.cluster.local";
 const REMOTE_TRUST_DOMAIN: &str = "cluster-b.local";
 const REMOTE_NETWORK: &str = "net-b";
 const GATEWAY_HOST: &str = "10.9.9.9";
@@ -201,11 +203,11 @@ fn cross_cluster_target_is_materialized_for_remote_workload_with_matching_gatewa
         "mesh.mtls_port must be the east-west gateway port"
     );
 
-    // SNI override = the destination service FQDN.
+    // SNI override = the destination service port's per-port alias.
     assert_eq!(
         xc.tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
-        Some(SVC_B_FQDN),
-        "mesh.eastwest_sni must be the destination service FQDN"
+        Some(SVC_B_8080_SNI),
+        "mesh.eastwest_sni must be the destination service port's alias"
     );
 
     // NO pinned pod identity (trust-domain-only verification).
@@ -311,7 +313,7 @@ fn catch_all_gateway_fronts_remote_workload_with_no_network() {
     assert_eq!(cross[0].host, GATEWAY_HOST);
     assert_eq!(
         cross[0].tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
-        Some(SVC_B_FQDN)
+        Some(SVC_B_8080_SNI)
     );
 }
 
@@ -348,7 +350,7 @@ fn sidecar_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
     let runtime = sidecar_client_runtime();
 
     // The TCP port deliberately shares :7070 with the service's sole HTTP port.
-    // HTTP keeps the base FQDN; L4 must still use p7070 and a distinct id.
+    // HTTP takes the `p7070-http` alias; L4 keeps p7070 and a distinct id.
     let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
     local.ports = vec![WorkloadPort {
         port: 7070,
@@ -433,8 +435,7 @@ fn sidecar_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
 }
 
 /// Multi-port east-west (issue #2010 phase 3): a multi-port HTTP service now
-/// yields a cross-cluster target for EVERY HTTP-family port. The FIRST declared
-/// port routes on the base service FQDN; each additional port routes on the
+/// yields a cross-cluster target for EVERY HTTP-family port, each routed on its
 /// deterministic `p<port>.<fqdn>` SNI alias.
 #[test]
 fn cross_cluster_target_for_each_http_service_port() {
@@ -646,20 +647,18 @@ fn cross_cluster_sni_alias_keys_on_explicit_port_not_declaration_order() {
     );
 }
 
-/// codex #2040 Finding A (cross-cluster base-port skew fail-closed). Two clusters
+/// codex #2040 Finding A (cross-cluster port-set skew fail-closed). Two clusters
 /// can declare DIFFERENT HTTP port sets for the same service. The dialed SNI for
-/// a given numeric port must depend ONLY on whether the DIALING service is
-/// single- or multi-port — never route a multi-port service's port onto the bare
-/// base FQDN — so a client and a destination that disagree on port sets can never
-/// silently cross-wire through a shared base-FQDN channel; a mismatch fails
-/// closed (the missing per-port/base proxy) instead.
+/// a given numeric port must depend ONLY on that numeric port — never on the
+/// port SET — so a client and a destination that disagree on port sets agree on
+/// every shared port and a missing port fails closed (the absent per-port proxy)
+/// instead of cross-wiring through a shared base-FQDN channel.
 ///
 /// Here the SAME service `svc-b` and SAME numeric port 9090 are materialized
-/// under two client shapes: single-port `{9090}` dials the BARE base FQDN, while
-/// multi-port `{8080,9090}` dials `p9090`. The two SNIs DIFFER — there is no
-/// shared base-FQDN mapping for :9090 that a skewed peer could misroute onto.
+/// under two client shapes: single-port `{9090}` and multi-port `{8080,9090}`.
+/// Both dial `p9090`; neither dials the base FQDN.
 #[test]
-fn cross_cluster_multiport_port_never_shares_base_fqdn_channel_with_single_port() {
+fn cross_cluster_dial_sni_depends_only_on_numeric_port_not_port_set() {
     let runtime = sidecar_client_runtime();
 
     // Extract the cross-cluster dial SNI a client materializes for :9090 given a
@@ -725,26 +724,17 @@ fn cross_cluster_multiport_port_never_shares_base_fqdn_channel_with_single_port(
             })
     };
 
-    // Single-port client: :9090 is the sole port ⇒ bare base FQDN.
+    // Single-port client: :9090 ⇒ explicit p9090 alias, NOT the base FQDN.
     assert_eq!(
         dial_sni_for_9090(vec![9090]).as_deref(),
-        Some(SVC_B_FQDN),
-        "a single-port service dials the bare base FQDN for its sole port"
+        Some("p9090.svc-b.default.svc.cluster.local"),
+        "a single-port service dials the explicit p<port> alias for its sole port"
     );
-    // Multi-port client: :9090 ⇒ explicit p9090 alias, NOT the base FQDN.
+    // Multi-port client: :9090 ⇒ the same explicit p9090 alias.
     assert_eq!(
         dial_sni_for_9090(vec![8080, 9090]).as_deref(),
         Some("p9090.svc-b.default.svc.cluster.local"),
         "a multi-port service dials the explicit p<port> alias for :9090, never the base FQDN"
-    );
-    // The two SNIs differ ⇒ no shared base-FQDN channel for :9090 that a skewed
-    // peer (different port set) could silently cross-wire onto — mismatches fail
-    // closed on the absent proxy instead.
-    assert_ne!(
-        dial_sni_for_9090(vec![9090]),
-        dial_sni_for_9090(vec![8080, 9090]),
-        "port :9090 must not resolve to the SAME SNI under single-port vs multi-port shapes \
-         (that shared channel is exactly the codex #2040 Finding A cross-cluster misroute)"
     );
 }
 
@@ -1752,11 +1742,11 @@ fn ambient_cross_cluster_per_pod_hbone_target_has_correct_tags() {
         "mesh.hbone_port must be the east-west gateway port"
     );
 
-    // Outer-TLS SNI override = the destination service FQDN.
+    // Outer-TLS SNI override = the destination service port's alias.
     assert_eq!(
         xc.tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
-        Some(SVC_B_FQDN),
-        "mesh.eastwest_sni must be the destination service FQDN"
+        Some(SVC_B_8080_SNI),
+        "mesh.eastwest_sni must be the destination service port's alias"
     );
 
     // Cross-cluster + remote markers; trust domain = remote (B); NO pinned id.
@@ -1861,8 +1851,8 @@ fn ambient_cross_cluster_target_drives_runtime_dispatch_helpers() {
     // Required cross-cluster verification inputs are present + usable.
     assert_eq!(
         hbone_pool::target_hbone_eastwest_sni(xc),
-        Some(SVC_B_FQDN),
-        "the outer-TLS SNI override is the destination service FQDN"
+        Some(SVC_B_8080_SNI),
+        "the outer-TLS SNI override is the destination service port's alias"
     );
     assert!(
         hbone_pool::target_hbone_cross_cluster_trust_domain(xc).is_some(),
@@ -1950,7 +1940,7 @@ fn ambient_cross_cluster_two_pods_same_gateway_yield_two_per_pod_targets() {
         );
         assert_eq!(
             t.tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
-            Some(SVC_B_FQDN)
+            Some(SVC_B_8080_SNI)
         );
     }
 }

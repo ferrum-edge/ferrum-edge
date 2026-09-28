@@ -97,7 +97,8 @@ fn east_west_gateway_materializes_sni_passthrough_proxy_from_remote_gateway_conf
 fn east_west_gateway_materializes_local_service_proxies_for_sni_routing() {
     // Workloads + services in the mesh slice produce per-service
     // passthrough proxies so inbound cross-cluster traffic SNI-routes
-    // to the right local workload. The SNI host is the service FQDN.
+    // to the right local workload. The SNI host is the port's
+    // `p<port>.<fqdn>` alias, exactly as for a multi-port service.
     let workload = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
@@ -110,18 +111,27 @@ fn east_west_gateway_materializes_local_service_proxies_for_sni_routing() {
     let prepared =
         prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("east-west prepared");
 
-    // One proxy per service, materialised with the FQDN SNI host.
+    // One proxy per service port, materialised with the per-port alias SNI.
     let service_proxy = prepared
         .proxies
         .iter()
         .find(|p| {
             p.hosts
                 .iter()
-                .any(|h| h.contains("reviews.default.svc.cluster.local"))
+                .any(|h| h == "p8080.reviews.default.svc.cluster.local")
         })
         .expect("east-west service proxy materialised");
     assert!(service_proxy.passthrough);
     assert_eq!(service_proxy.listen_port, Some(15443));
+    assert_eq!(service_proxy.id, "__mesh-ew-svc-default-reviews.p8080");
+    // No auto proxy routes on the bare base FQDN, even for a single-port
+    // service.
+    assert!(!prepared.proxies.iter().any(|proxy| {
+        proxy
+            .hosts
+            .iter()
+            .any(|host| host == "reviews.default.svc.cluster.local")
+    }));
 
     // One upstream per service with the workload addresses as targets.
     let upstream = prepared
@@ -137,9 +147,8 @@ fn east_west_gateway_materializes_local_service_proxies_for_sni_routing() {
 }
 
 /// Multi-port east-west (issue #2010 phase 3): a service with two HTTP ports
-/// materializes ONE SNI-passthrough proxy PER port — the first on the base
-/// service FQDN, the second on the deterministic `p<port>.<fqdn>` alias — each
-/// backed by that port's container port. This is the gateway (destination) side
+/// materializes ONE SNI-passthrough proxy PER port, each on its deterministic
+/// `p<port>.<fqdn>` alias and backed by that port's container port. This is the gateway (destination) side
 /// of the per-port SNI scheme the client materializers dial.
 #[test]
 fn east_west_gateway_materializes_per_port_proxies_for_multiport_service() {
@@ -345,13 +354,8 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
     )
     .expect("prepared");
 
-    assert!(prepared.proxies.iter().any(|proxy| {
-        proxy
-            .hosts
-            .iter()
-            .any(|host| host == "mixed.default.svc.cluster.local")
-    }));
     for alias in [
+        "p8080-http.mixed.default.svc.cluster.local",
         "p8080-tcp.mixed.default.svc.cluster.local",
         "p8080-udp.mixed.default.svc.cluster.local",
     ] {
@@ -366,7 +370,7 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
         prepared
             .upstreams
             .iter()
-            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed")
+            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080-http")
     );
     assert!(
         prepared
@@ -387,9 +391,8 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
 /// clobber each other in the materializer's id-keyed upsert map. The per-port id
 /// separator is `.` (a character a DNS-1035/1123 k8s service name cannot
 /// contain), so `foo`'s :8080 alias id is `__mesh-ew-svc-default-foo.p8080`
-/// while `foo-p8080`'s bare id is `__mesh-ew-svc-default-foo-p8080` (no dot) —
-/// distinct. The pre-`.` scheme (`-p8080`) produced the SAME id for both and one
-/// overwrote the other.
+/// while `foo-p8080`'s :8080 alias id is `__mesh-ew-svc-default-foo-p8080.p8080`
+/// — distinct. A `-p8080` marker would have produced the SAME id for both.
 #[test]
 fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     let foo_wl = workload_for("foo", DEFAULT_NAMESPACE, [("app", "foo")], ["10.0.0.1"]);
@@ -409,8 +412,8 @@ fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
         },
     ];
 
-    // A distinct service literally named `foo-p8080` — the id-space collision the
-    // `-p<port>` marker was vulnerable to. Single-port ⇒ port-less bare id.
+    // A distinct service literally named `foo-p8080` — the id-space collision a
+    // `-p<port>` marker would be vulnerable to.
     let collide_wl = workload_for(
         "foo-p8080",
         DEFAULT_NAMESPACE,
@@ -436,23 +439,17 @@ fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     assert!(has_upstream("__mesh-ew-upstream-default-foo.p8080"));
     assert!(has_upstream("__mesh-ew-upstream-default-foo.p9090"));
 
-    // `foo-p8080`'s bare (port-less) id uses the `-p8080` name literally — a
-    // DIFFERENT string from foo's `.p8080` alias, so neither was overwritten.
+    // `foo-p8080`'s alias id carries the `-p8080` name literally — a DIFFERENT
+    // string from foo's `.p8080` alias, so neither was overwritten.
     assert!(
-        has_proxy("__mesh-ew-svc-default-foo-p8080"),
-        "the distinct `foo-p8080` service's bare proxy must survive (not clobbered), got {:?}",
+        has_proxy("__mesh-ew-svc-default-foo-p8080.p8080"),
+        "the distinct `foo-p8080` service's proxy must survive (not clobbered), got {:?}",
         prepared.proxies.iter().map(|p| &p.id).collect::<Vec<_>>()
     );
-    assert!(has_upstream("__mesh-ew-upstream-default-foo-p8080"));
-
-    // The dotted alias id and the literal-name bare id are provably distinct.
-    assert_ne!(
-        "__mesh-ew-svc-default-foo.p8080", "__mesh-ew-svc-default-foo-p8080",
-        "the `.p<port>` alias id and the `-p<port>` literal-name id must never coincide"
-    );
+    assert!(has_upstream("__mesh-ew-upstream-default-foo-p8080.p8080"));
 
     // Both services keep their own backend: foo's alias backends 8080/9090,
-    // foo-p8080's bare upstream backends its 8080 workload port — no cross-wiring.
+    // foo-p8080's upstream backends its 8080 workload port — no cross-wiring.
     let foo_8080 = prepared
         .upstreams
         .iter()
@@ -462,7 +459,7 @@ fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     let collide_up = prepared
         .upstreams
         .iter()
-        .find(|u| u.id == "__mesh-ew-upstream-default-foo-p8080")
+        .find(|u| u.id == "__mesh-ew-upstream-default-foo-p8080.p8080")
         .expect("foo-p8080 upstream");
     assert!(collide_up.targets.iter().all(|t| t.host == "10.0.0.2"));
 }
@@ -517,12 +514,12 @@ fn east_west_gateway_skips_remote_gateway_from_other_namespace() {
 
 #[test]
 fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
-    // An explicit EastWestGateway that owns a local service's FQDN SNI host
+    // An explicit EastWestGateway that owns a local service port's SNI alias
     // must win over the automatic local-service proxy: materializing both
     // would emit two passthrough proxies claiming the same SNI on the shared
     // listen port, which `validate_stream_proxies` rejects as overlapping —
     // silently dropping the operator's explicit route. The auto proxy for the
-    // overlapping FQDN is suppressed so exactly one (the explicit) survives.
+    // overlapping alias is suppressed so exactly one (the explicit) survives.
     let workload = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
@@ -537,7 +534,7 @@ fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
         remote_clusters: Vec::new(),
         east_west_gateways: vec![east_west_gateway(
             "explicit-reviews",
-            vec!["reviews.default.svc.cluster.local"],
+            vec!["p8080.reviews.default.svc.cluster.local"],
         )],
     });
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
@@ -551,10 +548,10 @@ fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
             .any(|p| p.id.starts_with("__mesh-east-west-")
                 && p.hosts
                     .iter()
-                    .any(|h| h == "reviews.default.svc.cluster.local")),
+                    .any(|h| h == "p8080.reviews.default.svc.cluster.local")),
         "explicit east-west gateway proxy must own the reviews SNI"
     );
-    // ...and the auto local-service proxy for the same FQDN is suppressed, so
+    // ...and the auto local-service proxy for the same alias is suppressed, so
     // only one proxy claims that SNI on the shared listen port.
     let claimants = prepared
         .proxies
@@ -563,7 +560,7 @@ fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
             p.listen_port == Some(15443)
                 && p.hosts
                     .iter()
-                    .any(|h| h == "reviews.default.svc.cluster.local")
+                    .any(|h| h == "p8080.reviews.default.svc.cluster.local")
         })
         .count();
     assert_eq!(
@@ -667,9 +664,10 @@ fn east_west_overwritten_duplicate_gateway_does_not_suppress_auto_proxy() {
     // Two EastWestGateway entries in the same namespace that reuse the same
     // `name` collapse onto one generated proxy id (last wins). The override
     // set must reflect only the surviving gateway's SNI hosts: an overwritten
-    // entry that claimed `reviews.default.svc.cluster.local` must NOT suppress
-    // the auto local-service proxy for `reviews`, or that service silently
-    // disappears from east-west routing. The surviving entry claims `ratings`.
+    // entry that claimed `p8080.reviews.default.svc.cluster.local` must NOT
+    // suppress the auto local-service proxy for `reviews`, or that service
+    // silently disappears from east-west routing. The surviving entry claims
+    // `ratings`.
     let reviews_wl = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
@@ -686,8 +684,8 @@ fn east_west_overwritten_duplicate_gateway_does_not_suppress_auto_proxy() {
         federation_endpoint: None,
         remote_clusters: Vec::new(),
         east_west_gateways: vec![
-            east_west_gateway("dup", vec!["reviews.default.svc.cluster.local"]),
-            east_west_gateway("dup", vec!["ratings.default.svc.cluster.local"]),
+            east_west_gateway("dup", vec!["p8080.reviews.default.svc.cluster.local"]),
+            east_west_gateway("dup", vec!["p8080.ratings.default.svc.cluster.local"]),
         ],
     });
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
@@ -703,7 +701,7 @@ fn east_west_overwritten_duplicate_gateway_does_not_suppress_auto_proxy() {
             .any(|p| p.id.starts_with("__mesh-ew-svc-")
                 && p.hosts
                     .iter()
-                    .any(|h| h == "reviews.default.svc.cluster.local")),
+                    .any(|h| h == "p8080.reviews.default.svc.cluster.local")),
         "auto local-service proxy for reviews must survive when only an overwritten duplicate-name gateway claimed it, got {:?}",
         prepared
             .proxies

@@ -8,7 +8,7 @@
 #     (topology=sidecar) whose inbound iptables init container REDIRECTs the app
 #     port to :15006 — the REAL captured path the functional test collapses;
 #   - an EAST-WEST GATEWAY (topology=east_west_gateway, SNI passthrough on
-#     :15443) that forwards the destination service FQDN's SNI to the local
+#     :15443) that forwards the destination service port's SNI alias to the local
 #     svc pod's app port (where the sidecar's iptables redirect takes over);
 #   - a CLIENT sidecar (topology=sidecar) whose file-config MultiClusterConfig
 #     points at the PEER cluster's east-west gateway, plus a curl container that
@@ -69,7 +69,8 @@ metadata:
 ---
 # ── Destination service ─────────────────────────────────────────────────────
 # A plain ClusterIP Service used purely for its FQDN (svc.<ns>.svc.cluster.local)
-# — that FQDN is the ClientHello SNI the east-west passthrough routes on. The
+# — its per-port alias p8080.<FQDN> is the ClientHello SNI the east-west
+# passthrough routes on. The
 # Service selects the destination sidecar pod (the app container behind it).
 apiVersion: v1
 kind: Service

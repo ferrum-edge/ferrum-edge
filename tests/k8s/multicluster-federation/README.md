@@ -26,7 +26,7 @@ driven in BOTH directions:
   reason this fixture exists;
 - an **east-west gateway** (`FERRUM_MESH_TOPOLOGY=east_west_gateway`, SNI
   passthrough on `:15443`, exposed as a NodePort) that forwards the destination
-  service FQDN's SNI to the local `svc` pod's app port;
+  service port's SNI alias to the local `svc` pod's app port;
 - a **client** sidecar whose file-config `MultiClusterConfig` points at the PEER
   cluster's east-west gateway NodePort, plus a `curl` container that drives the
   captured request directly at the outbound capture listener `:15001` (mirroring
@@ -37,8 +37,8 @@ driven in BOTH directions:
   peer `svc`'s `deny-peer-rogue` MeshPolicy → 403), not a client-side TLS failure.
 
 The A→B path: cluster A's client captures a plaintext request → cross-cluster
-target dialing B's east-west NodePort with `svc.ferrum.svc.cluster.local` as the
-ClientHello SNI and trust-domain-only mTLS → B's SNI passthrough → B's `svc` pod
+target dialing B's east-west NodePort with `p8080.svc.ferrum.svc.cluster.local` as
+the ClientHello SNI and trust-domain-only mTLS → B's SNI passthrough → B's `svc` pod
 app port `8080` → B's pod inbound iptables REDIRECT `8080`→`:15006` → B's `svc`
 sidecar STRICT inbound (verifies cluster A's client SVID via the FEDERATED
 bundle) → B's local app → `200 svc-b`. B→A mirrors it.

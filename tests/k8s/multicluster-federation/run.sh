@@ -13,7 +13,7 @@ set -euo pipefail
 #
 # Topology (symmetric in both clusters A=cluster-a.test and B=cluster-b.test):
 #   client(sidecar) --capture :15001--> cross-cluster target (dial PEER east-west
-#     gateway NodePort, SNI = peer svc FQDN, trust-domain-only mTLS) -->
+#     gateway NodePort, SNI = p8080.<peer svc FQDN>, trust-domain-only mTLS) -->
 #   PEER east-west gateway (:15443 SNI passthrough) --> PEER svc pod app port
 #     8080 --> PEER svc pod inbound iptables REDIRECT 8080->:15006 -->
 #   PEER svc sidecar STRICT inbound (verifies client SVID via FEDERATED bundle)
@@ -620,7 +620,7 @@ YAML
 
 # East-west gateway: the svc workload carries the REAL svc pod IP + app port so
 # the SNI passthrough forwards opaque TLS to the pod (where inbound iptables
-# redirects 8080 -> :15006). Auto-materialized SNI host = svc FQDN. Needs the
+# redirects 8080 -> :15006). Auto-materialized SNI host = p8080.<svc FQDN>. Needs the
 # discovered svc pod IP.
 render_ew_config() {
   local context="$1" local_td="$2" svc_pod_ip="$3"

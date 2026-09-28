@@ -1676,6 +1676,23 @@ fn multi_cluster_rejects_base_fqdn_and_wildcard_alias_owner() {
 }
 
 #[test]
+fn multi_cluster_rejects_base_fqdn_and_transport_discriminated_alias() {
+    for alias in [
+        "p8080-http.reviews.default.svc.cluster.local",
+        "p8080-tcp.reviews.default.svc.cluster.local",
+        "p8080-udp.reviews.default.svc.cluster.local",
+    ] {
+        let mesh = mesh_with_same_scope_east_west_snis("reviews.default.svc.cluster.local", alias);
+
+        let errors = mesh.validate();
+        assert!(
+            errors.iter().any(|err| err.contains("sni_hosts overlap")),
+            "base FQDN and derived alias {alias} must be rejected, got: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn multi_cluster_keeps_non_service_prefixed_hosts_distinct() {
     let mesh = mesh_with_same_scope_east_west_snis("example.com", "p9090.example.com");
 

@@ -4564,23 +4564,16 @@ fn build_east_west_service_proxies_and_upstreams(
     let now = chrono::Utc::now();
 
     for service in &mesh_slice.services {
-        // MULTI-PORT east-west (issue #2010 phase 3): materialize ONE
-        // SNI-passthrough proxy per cross-cluster service port. A SINGLE-HTTP-port
-        // service materializes exactly one proxy on the bare base service FQDN
-        // with the port-less legacy id, byte-identical to the pre-multi-port
-        // behavior. A MULTI-HTTP-port service materializes a proxy per port on an
-        // explicit `p<port>.<fqdn>` SNI alias — the lowest port INCLUDED — so
-        // client + destination agree per EXPLICIT numeric port and cannot
-        // cross-wire under cross-cluster port skew (codex #2040 Finding A);
-        // `cross_cluster_service_sni` is the shared source of that SNI. L4 ports
-        // are inherently per-port and use `p<port>.<fqdn>` (or the
-        // protocol-suffixed form when TCP and UDP share a number).
+        // Materialize ONE SNI-passthrough proxy per cross-cluster service port,
+        // on an explicit per-port `p<port>.<fqdn>` SNI alias for EVERY port —
+        // single-port services included — so client + destination agree per
+        // EXPLICIT numeric port and cannot cross-wire under cross-cluster port
+        // skew (codex #2040 Finding A); `cross_cluster_service_sni` is the shared
+        // source of that SNI. A port whose number is shared with another
+        // transport class takes a protocol-suffixed alias.
         for service_port in &service.ports {
-            // `None` (⇒ port-less legacy id) ONLY for a single-port service's sole
-            // port (`cross_cluster_service_base_port` returns `None` for a
-            // multi-port service); every port of a multi-port service carries its
-            // own `.p<port>` id so the per-port proxies never collide (codex #2040
-            // Finding B).
+            // Every port carries its own `.p<port>` id so the per-port proxies
+            // never collide (codex #2040 Finding B).
             let id_suffix = cross_cluster_service_sni_label(service, service_port);
             // Build upstream targets for THIS service port.
             let targets = build_east_west_service_targets(
@@ -4639,11 +4632,8 @@ fn build_east_west_service_proxies_and_upstreams(
                 continue;
             }
 
-            let upstream_id = mesh_east_west_service_upstream_id(
-                &service.namespace,
-                &service.name,
-                id_suffix.as_deref(),
-            );
+            let upstream_id =
+                mesh_east_west_service_upstream_id(&service.namespace, &service.name, &id_suffix);
 
             let upstream = Upstream {
                 labels: Default::default(),
@@ -4681,11 +4671,8 @@ fn build_east_west_service_proxies_and_upstreams(
             };
             upstreams.push(upstream);
 
-            let proxy_id = mesh_east_west_service_proxy_id(
-                &service.namespace,
-                &service.name,
-                id_suffix.as_deref(),
-            );
+            let proxy_id =
+                mesh_east_west_service_proxy_id(&service.namespace, &service.name, &id_suffix);
             let proxy = east_west_service_proxy(
                 &proxy_id,
                 &sni_hostname,
@@ -4795,13 +4782,12 @@ fn matched_remote_service_workloads<'a>(
     matched
 }
 
-/// The base cross-cluster east-west SNI for a service — the destination service
-/// FQDN `<name>.<namespace>.svc.<cluster-domain>`. A SINGLE-HTTP-port service's
-/// sole port routes on this; a MULTI-HTTP-port service routes NO port on it
-/// (every port takes a `p<port>.<fqdn>` alias). It is also the host a client
-/// uses to SELECT an `EastWestGateway` (whose `sni_hosts` claiming the base
-/// FQDN auto-extends to the per-port aliases; see
-/// [`east_west_acceptable_snis`]). See [`cross_cluster_service_sni`].
+/// The base cross-cluster east-west FQDN for a service — the destination service
+/// FQDN `<name>.<namespace>.svc.<cluster-domain>`. No port routes on it (every
+/// port takes a `p<port>.<fqdn>` alias); it is the host a client uses to SELECT
+/// an `EastWestGateway` (whose `sni_hosts` claiming the base FQDN auto-extends
+/// to the per-port aliases; see [`east_west_acceptable_snis`]). See
+/// [`cross_cluster_service_sni`].
 pub(crate) fn cross_cluster_service_base_fqdn(
     service: &crate::modes::mesh::config::MeshService,
     cluster_domain: &str,
@@ -4813,43 +4799,20 @@ pub(crate) fn cross_cluster_service_base_fqdn(
     )
 }
 
-/// The service port that owns the port-LESS internal east-west id for a
-/// SINGLE-HTTP-port service — its sole HTTP-family port. Returns `None` for a
-/// service with no HTTP-family port (no cross-cluster east-west target is
-/// materialized for it) OR for a MULTI-HTTP-port service (every port of which
-/// takes an explicit per-port id/SNI — no port owns a bare base). This drives
-/// only the internal id/SNI base-vs-alias decision; it is NOT a routing
-/// authority. It is intentionally `None` for multi-port so no port is silently
-/// mapped onto the bare base FQDN across clusters (codex #2040 Finding A).
-pub(crate) fn cross_cluster_service_base_port(
-    service: &crate::modes::mesh::config::MeshService,
-) -> Option<u16> {
-    let http_ports = service_http_family_ports(service);
-    match http_ports.as_slice() {
-        [only] => Some(only.port),
-        _ => None,
-    }
-}
-
 /// DNS label (and internal id suffix) for a service port's east-west alias.
-/// `None` is the HTTP-only bare-base compatibility case. L4 normally uses
-/// `p<port>`; when TCP-family and UDP share the same numeric service port, the
-/// transport discriminator is required because their targetPorts may differ.
+/// Every port normally uses `p<port>`. An HTTP-family port whose number is also
+/// declared by a raw-TCP/UDP port uses `p<port>-http`; when TCP-family and UDP
+/// share the same numeric service port, they use `p<port>-tcp` / `p<port>-udp`.
+/// The discriminators are required because the ports' targetPorts may differ.
 fn cross_cluster_service_sni_label(
     service: &crate::modes::mesh::config::MeshService,
     service_port: &crate::modes::mesh::config::ServicePort,
-) -> Option<String> {
+) -> String {
     let effective_protocol = service
         .protocol_overrides
         .get(&service_port.port)
         .copied()
         .unwrap_or(service_port.protocol);
-    if is_http_family_mesh_protocol(effective_protocol)
-        && cross_cluster_service_base_port(service) == Some(service_port.port)
-    {
-        return None;
-    }
-
     let l4_same_number = service
         .ports
         .iter()
@@ -4864,43 +4827,45 @@ fn cross_cluster_service_sni_label(
                 )
         })
         .count();
-    if l4_same_number > 1 {
+    if is_http_family_mesh_protocol(effective_protocol) {
+        if l4_same_number > 0 {
+            format!("p{}-http", service_port.port)
+        } else {
+            format!("p{}", service_port.port)
+        }
+    } else if l4_same_number > 1 {
         let transport = if is_udp_mesh_protocol(effective_protocol) {
             "udp"
         } else {
             "tcp"
         };
-        Some(format!("p{}-{transport}", service_port.port))
+        format!("p{}-{transport}", service_port.port)
     } else {
-        Some(format!("p{}", service_port.port))
+        format!("p{}", service_port.port)
     }
 }
 
 /// The cross-cluster east-west SNI a `(service, service_port)` routes on
-/// (multi-port scheme, issue #2010 phase 3; codex #2040 Finding A).
+/// (issue #2010 phase 3; codex #2040 Finding A).
 ///
-/// - A **single-HTTP-port** service routes its sole port on the bare base
-///   service FQDN ([`cross_cluster_service_base_fqdn`], e.g.
-///   `reviews.default.svc.cluster.local`) — backward-compatible and unambiguous
-///   (only one port is possible, so there is nothing to disambiguate).
-/// - A **multi-HTTP-port** service routes EVERY port — including the numerically
-///   lowest — on an explicit per-port alias `p<service_port>.<base_fqdn>` (e.g.
-///   `p8080.reviews...`, `p9090.reviews...`). The bare base FQDN routes to NO
-///   port for a multi-port service.
-/// - A **raw-TCP or UDP** port routes on `p<service_port>.<base_fqdn>`; when
-///   TCP and UDP share the number, `-tcp` / `-udp` disambiguates their aliases.
-///   L4 capture never consumes the HTTP-only bare-base compatibility case.
+/// EVERY port — of a single-port or multi-port service alike — routes on an
+/// explicit per-port alias `p<service_port>.<base_fqdn>` (e.g.
+/// `p8080.reviews.default.svc.cluster.local`). The base FQDN
+/// ([`cross_cluster_service_base_fqdn`]) routes to NO port. When ports of
+/// different transport classes share one number, the alias label carries a
+/// discriminator: `p<port>-http` for the HTTP-family port and `p<port>-tcp` /
+/// `p<port>-udp` when raw TCP and UDP share it (see
+/// [`cross_cluster_service_sni_label`]).
 ///
-/// Aliasing every port of a multi-port service (rather than routing the lowest
-/// port on the bare base) is what makes the scheme fail CLOSED under
-/// cross-cluster port skew: because the port channel is the EXPLICIT numeric
-/// port in the alias, a client cluster and the destination cluster agree per
-/// numeric port regardless of which HTTP ports EITHER cluster happens to declare.
-/// The previous "lowest port owns the base FQDN" rule could silently misroute
-/// when the two clusters had different port sets (a client that only knows :9090
-/// would treat it as the base while the destination materialized the base for
-/// :8080). There is no bare-base-to-port mapping to mis-hit here, so the skew
-/// cannot cross-wire.
+/// Aliasing every port (rather than routing some port on the bare base) is what
+/// makes the scheme fail CLOSED under cross-cluster port skew: because the port
+/// channel is the EXPLICIT numeric port in the alias, a client cluster and the
+/// destination cluster agree per numeric port regardless of which ports EITHER
+/// cluster happens to declare. Routing any port on the base FQDN could silently
+/// misroute when the two clusters had different port sets (a client that only
+/// knows :9090 would treat it as the base while the destination materialized the
+/// base for :8080). There is no base-to-port mapping to mis-hit here, so the
+/// skew cannot cross-wire.
 ///
 /// The NUMERIC service port is authoritative in the alias — a port NAME is never
 /// used. SNI carries no port, so a per-port DNS-safe alias is the port channel.
@@ -4913,10 +4878,8 @@ pub(crate) fn cross_cluster_service_sni(
     cluster_domain: &str,
 ) -> String {
     let base = cross_cluster_service_base_fqdn(service, cluster_domain);
-    // Bare base FQDN ONLY for a single-HTTP-port service (its sole port). Every
-    // port of a multi-port service — lowest included — gets an explicit alias.
-    cross_cluster_service_sni_label(service, service_port)
-        .map_or(base.clone(), |label| format!("{label}.{base}"))
+    let label = cross_cluster_service_sni_label(service, service_port);
+    format!("{label}.{base}")
 }
 
 /// Build upstream targets from workloads that belong to the given service, for
@@ -5129,14 +5092,10 @@ fn sanitize_mesh_id_component(component: &str) -> String {
     component.replace(['/', '.'], "-")
 }
 
-/// East-west per-service proxy id. `sni_label` is `None` for a SINGLE-HTTP-port
-/// service — which keeps the historic port-LESS `__mesh-ew-svc-<ns>-<name>` id so
-/// that service is byte-identical to the pre-multi-port shape — and `Some(port)`
-/// for EVERY port of a MULTI-port service (multi-port east-west, issue #2010
-/// phase 3; L4 labels may additionally carry a `-tcp` / `-udp` discriminator
-/// when both transports share one number. No bare base id is emitted for a multi-port service, matching the
-/// SNI scheme where every port of a multi-port service takes an explicit
-/// `p<port>.<fqdn>` alias).
+/// East-west per-service proxy id. `sni_label` is the port's alias label from
+/// [`cross_cluster_service_sni_label`] (`p<port>`, or a `-http` / `-tcp` /
+/// `-udp` discriminated form when transports share one number), matching the
+/// SNI scheme where every port takes an explicit `p<port>.<fqdn>` alias.
 ///
 /// The port marker is joined with `.` — a character DNS-1035/1123 labels forbid,
 /// so it CANNOT appear in a Kubernetes namespace or service name (codex #2040
@@ -5148,29 +5107,18 @@ fn sanitize_mesh_id_component(component: &str) -> String {
 /// sanitized (`/`,`.` → `-`) BEFORE the `.p<port>` marker is appended so a
 /// malformed component can never forge the structural separator, while the
 /// intentional marker dot is preserved (never collapsed).
-fn mesh_east_west_service_proxy_id(namespace: &str, name: &str, sni_label: Option<&str>) -> String {
+fn mesh_east_west_service_proxy_id(namespace: &str, name: &str, sni_label: &str) -> String {
     let namespace = sanitize_mesh_id_component(namespace);
     let name = sanitize_mesh_id_component(name);
-    match sni_label {
-        None => format!("__mesh-ew-svc-{namespace}-{name}"),
-        Some(label) => format!("__mesh-ew-svc-{namespace}-{name}.{label}"),
-    }
+    format!("__mesh-ew-svc-{namespace}-{name}.{sni_label}")
 }
 
 /// East-west per-service upstream id; `sni_label` semantics and the
-/// collision-free `.p<port>` marker mirror [`mesh_east_west_service_proxy_id`]
-/// (single-port ⇒ port-less legacy id; multi-port ⇒ explicit per-port id).
-fn mesh_east_west_service_upstream_id(
-    namespace: &str,
-    name: &str,
-    sni_label: Option<&str>,
-) -> String {
+/// collision-free `.p<port>` marker mirror [`mesh_east_west_service_proxy_id`].
+fn mesh_east_west_service_upstream_id(namespace: &str, name: &str, sni_label: &str) -> String {
     let namespace = sanitize_mesh_id_component(namespace);
     let name = sanitize_mesh_id_component(name);
-    match sni_label {
-        None => format!("__mesh-ew-upstream-{namespace}-{name}"),
-        Some(label) => format!("__mesh-ew-upstream-{namespace}-{name}.{label}"),
-    }
+    format!("__mesh-ew-upstream-{namespace}-{name}.{sni_label}")
 }
 
 // ── Sidecar inbound route materialization ─────────────────────────────────
@@ -8764,8 +8712,8 @@ fn build_outbound_mesh_targets(
 ///   is trust-domain-only against the remote trust domain);
 /// - `mesh.trust_domain` = the group's trust domain;
 /// - `mesh.mtls_port` = `gateway.port` (the DIAL port, e.g. `:15443`);
-/// - `mesh.eastwest_sni` = the destination service FQDN (the SNI the remote
-///   gateway's passthrough routes on);
+/// - `mesh.eastwest_sni` = the destination service port's alias FQDN (the SNI
+///   the remote gateway's passthrough routes on);
 /// - `mesh.cross_cluster = "true"`;
 /// - `mesh.remote = "true"` (strict local-first LB provenance);
 /// - **identity = the gateway DIAL ENDPOINT** (codex r2 [R2-4]): `host =
@@ -8859,9 +8807,8 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
     // MULTI-PORT (issue #2010 phase 3): every HTTP-family `service_port` gets a
     // cross-cluster target. The destination gateway auto-materializes one
     // passthrough proxy per service port (`build_east_west_service_proxies_and_
-    // upstreams`), keyed by the port's SNI: a single-HTTP-port service's sole
-    // port on the bare base service FQDN, every port of a multi-port service on
-    // its `p<port>.<fqdn>` alias (`cross_cluster_service_sni`). The client
+    // upstreams`), keyed by the port's `p<port>.<fqdn>` SNI alias
+    // (`cross_cluster_service_sni`). The client
     // SELECTS the gateway by the base FQDN or the exact dialed alias
     // (`east_west_acceptable_snis`) but DIALS the per-port SNI, so a gateway
     // owning the base FQDN auto-owns its port aliases with no extra operator
@@ -8901,8 +8848,7 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
     // that claims EITHER the base service FQDN (whose ownership auto-extends to the
     // service's per-port aliases) OR the exact per-port alias being dialed (codex
     // #2040 Finding C). Both SNIs derive from `cross_cluster_service_{base_fqdn,
-    // sni}` so client + gateway cannot drift. `dial_sni == base_fqdn` for a
-    // single-port service, so the accept set collapses to the base FQDN there.
+    // sni}` so client + gateway cannot drift.
     let base_fqdn = cross_cluster_service_base_fqdn(service, cluster_domain);
     let dial_sni = cross_cluster_service_sni(service, service_port, cluster_domain);
     let acceptable_snis = east_west_acceptable_snis(&base_fqdn, &dial_sni);
@@ -9330,7 +9276,7 @@ fn cross_cluster_hbone_synthetic_host(
 /// - `mesh.hbone = "true"` (Ambient transport);
 /// - `mesh.hbone_dial_host` = `gateway.host` (the network dial host);
 /// - `mesh.hbone_port` = `gateway.port` (the DIAL port, e.g. `:15443`);
-/// - `mesh.eastwest_sni` = the destination service FQDN (outer-TLS SNI override);
+/// - `mesh.eastwest_sni` = the destination service port's alias FQDN (outer-TLS SNI override);
 /// - `mesh.trust_domain` = the remote TD (trust-domain-only verification);
 /// - `mesh.cross_cluster = "true"`; `mesh.remote = "true"`;
 /// - NO `mesh.spiffe_id` (the gateway LB-picks the destination, so no pod pin).
@@ -9543,10 +9489,8 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
                 crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
                 gateway.port.to_string(),
             );
-            // Outer-TLS SNI override = the bare destination service FQDN for a
-            // single-HTTP-port service, or the `p<port>.<fqdn>` alias for every
-            // port of a multi-port service (multi-port east-west, issue #2010
-            // phase 3).
+            // Outer-TLS SNI override = the destination service port's
+            // `p<port>.<fqdn>` alias (issue #2010 phase 3).
             tags.insert(
                 crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
                 dial_sni.clone(),
@@ -9672,9 +9616,9 @@ fn east_west_workload_is_reachable(
 }
 
 /// The SNIs a client will ACCEPT an east-west gateway for: the base service FQDN
-/// plus the per-port alias actually being dialed (`dial_sni`), deduplicated.
-/// `dial_sni == base_fqdn` for a single-port service, so the result collapses to
-/// a single entry there. A gateway that claims the base FQDN automatically owns
+/// plus the per-port alias actually being dialed (`dial_sni`), deduplicated
+/// (a caller with no resolvable port passes the base FQDN as `dial_sni`). A
+/// gateway that claims the base FQDN automatically owns
 /// the service's per-port aliases (its passthrough materializes them); a gateway
 /// that lists ONLY the per-port alias is also acceptable for that port (codex
 /// #2040 Finding C). Returned as a small stack `Vec<&str>` borrowing the two
@@ -26117,7 +26061,10 @@ mod tests {
             Some(MeshTrafficDirection::Outbound)
         );
         assert_eq!(mesh_route_direction("operator-proxy"), None);
-        assert_eq!(mesh_route_direction("__mesh-ew-svc-default-reviews"), None);
+        assert_eq!(
+            mesh_route_direction("__mesh-ew-svc-default-reviews.p9080"),
+            None
+        );
     }
 
     /// `mesh_outbound_service_groups` is the single source of truth for
@@ -32282,23 +32229,25 @@ mod tests {
                 let proxy = prepared
                     .proxies
                     .iter()
-                    .find(|p| p.id == "__mesh-ew-svc-default-reviews")
+                    .find(|p| p.id == "__mesh-ew-svc-default-reviews.p9080")
                     .expect("east-west service proxy");
 
                 assert_eq!(proxy.listen_port, Some(15443));
                 assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
                 assert!(proxy.passthrough);
-                assert_eq!(proxy.hosts, vec!["reviews.default.svc.cluster.local"]);
+                // A single-port service routes on the same explicit per-port
+                // alias as every port of a multi-port service.
+                assert_eq!(proxy.hosts, vec!["p9080.reviews.default.svc.cluster.local"]);
                 assert_eq!(
                     proxy.upstream_id.as_deref(),
-                    Some("__mesh-ew-upstream-default-reviews")
+                    Some("__mesh-ew-upstream-default-reviews.p9080")
                 );
 
                 // Verify upstream was materialized.
                 let upstream = prepared
                     .upstreams
                     .iter()
-                    .find(|u| u.id == "__mesh-ew-upstream-default-reviews")
+                    .find(|u| u.id == "__mesh-ew-upstream-default-reviews.p9080")
                     .expect("east-west service upstream");
 
                 assert_eq!(upstream.targets.len(), 1);
@@ -32335,7 +32284,7 @@ mod tests {
 
                 let config = GatewayConfig {
                     mesh: Some(Box::new(MeshConfig {
-                        // Explicit gateway claiming the reviews service FQDN
+                        // Explicit gateway claiming the reviews :9080 SNI alias
                         // (mixed-case, to exercise the case-insensitive match).
                         multi_cluster: Some(MultiClusterConfig {
                             east_west_gateways: vec![EastWestGateway {
@@ -32343,7 +32292,9 @@ mod tests {
                                 namespace: "default".to_string(),
                                 host: "gw.remote.example".to_string(),
                                 port: 443,
-                                sni_hosts: vec!["Reviews.Default.SVC.Cluster.Local".to_string()],
+                                sni_hosts: vec![
+                                    "P9080.Reviews.Default.SVC.Cluster.Local".to_string(),
+                                ],
                                 trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
                                 network: Some("network-a".to_string()),
                             }],
@@ -32387,14 +32338,17 @@ mod tests {
                     .iter()
                     .find(|p| p.id == "__mesh-east-west-default-explicit-reviews")
                     .expect("explicit east-west proxy");
-                assert_eq!(explicit.hosts, vec!["reviews.default.svc.cluster.local"]);
+                assert_eq!(
+                    explicit.hosts,
+                    vec!["p9080.reviews.default.svc.cluster.local"]
+                );
 
                 // The auto-materialized local-service proxy is suppressed.
                 assert!(
                     prepared
                         .proxies
                         .iter()
-                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews.p9080"),
                     "auto service proxy must yield to the explicit SNI override"
                 );
                 // No two proxies share the canonical SNI on the listen port.
@@ -32405,7 +32359,7 @@ mod tests {
                         p.listen_port == Some(15443)
                             && p.hosts
                                 .iter()
-                                .any(|h| h == "reviews.default.svc.cluster.local")
+                                .any(|h| h == "p9080.reviews.default.svc.cluster.local")
                     })
                     .count();
                 assert_eq!(claimants, 1, "exactly one proxy may claim the SNI");
@@ -32488,7 +32442,7 @@ mod tests {
                     prepared
                         .proxies
                         .iter()
-                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews.p9080"),
                     "auto service proxy must yield to the explicit wildcard SNI override"
                 );
             },
@@ -32548,7 +32502,7 @@ mod tests {
                     !prepared
                         .proxies
                         .iter()
-                        .any(|p| p.id == "__mesh-ew-svc-default-pending"),
+                        .any(|p| p.id == "__mesh-ew-svc-default-pending.p8080"),
                     "service with no reachable targets should not produce a proxy"
                 );
             },
@@ -32640,30 +32594,30 @@ mod tests {
                 let reviews_proxy = prepared
                     .proxies
                     .iter()
-                    .find(|p| p.id == "__mesh-ew-svc-default-reviews")
+                    .find(|p| p.id == "__mesh-ew-svc-default-reviews.p9080")
                     .expect("reviews proxy");
                 assert_eq!(reviews_proxy.listen_port, Some(15443));
                 assert_eq!(
                     reviews_proxy.hosts,
-                    vec!["reviews.default.svc.cluster.local"]
+                    vec!["p9080.reviews.default.svc.cluster.local"]
                 );
 
                 let ratings_proxy = prepared
                     .proxies
                     .iter()
-                    .find(|p| p.id == "__mesh-ew-svc-default-ratings")
+                    .find(|p| p.id == "__mesh-ew-svc-default-ratings.p3000")
                     .expect("ratings proxy");
                 assert_eq!(ratings_proxy.listen_port, Some(15443));
                 assert_eq!(
                     ratings_proxy.hosts,
-                    vec!["ratings.default.svc.cluster.local"]
+                    vec!["p3000.ratings.default.svc.cluster.local"]
                 );
 
                 // Ratings upstream should have 2 targets (two addresses).
                 let ratings_upstream = prepared
                     .upstreams
                     .iter()
-                    .find(|u| u.id == "__mesh-ew-upstream-default-ratings")
+                    .find(|u| u.id == "__mesh-ew-upstream-default-ratings.p3000")
                     .expect("ratings upstream");
                 assert_eq!(ratings_upstream.targets.len(), 2);
                 assert_eq!(ratings_upstream.targets[0].host, "10.0.0.6");
@@ -33758,7 +33712,7 @@ mod tests {
                 let upstream = prepared
                     .upstreams
                     .iter()
-                    .find(|u| u.id == "__mesh-ew-upstream-default-reviews")
+                    .find(|u| u.id == "__mesh-ew-upstream-default-reviews.p9080")
                     .expect("reviews upstream");
                 let hosts: Vec<&str> = upstream
                     .targets

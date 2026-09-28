@@ -8351,7 +8351,9 @@ fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
 }
 
 /// Return the base service FQDN claimed by a generated exact alias
-/// (`p<port>.<base>`) or by a wildcard alias owner (`*.<base>`).
+/// (`p<port>.<base>`, or the transport-discriminated `p<port>-http` /
+/// `p<port>-tcp` / `p<port>-udp` form) or by a wildcard alias owner
+/// (`*.<base>`).
 ///
 /// The suffix must have Ferrum's `<service>.<namespace>.svc.<cluster-domain>`
 /// shape. This keeps unrelated explicit hosts such as `p9090.example.com`
@@ -8366,6 +8368,10 @@ fn east_west_alias_claim_base(host: &str) -> Option<String> {
     }
 
     let port = alias_label.strip_prefix('p')?;
+    let port = ["-http", "-tcp", "-udp"]
+        .iter()
+        .find_map(|suffix| port.strip_suffix(suffix))
+        .unwrap_or(port);
     // `cross_cluster_service_sni` renders a non-zero u16 without leading
     // zeroes. Recognize only that canonical generated namespace so an ordinary
     // hostname such as `p65536.example` is not reinterpreted as an alias.

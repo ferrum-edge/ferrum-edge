@@ -6117,6 +6117,11 @@ fn mint_cross_cluster_svid_under(
     }
 }
 
+/// The east-west SNI alias a client dials for `svc-c`'s `service_port`.
+fn svc_c_east_west_sni(service_port: u16) -> String {
+    format!("p{service_port}.svc-c.ferrum.svc.cluster.local")
+}
+
 /// Poll the complete destination path until the east-west listener accepts an
 /// SNI-routed mTLS connection and the destination presents its expected SVID.
 /// A bare TCP connect only proves that the passthrough listener has bound; this
@@ -6554,25 +6559,32 @@ fn cross_cluster_dest_slice(
 }
 
 /// East-west gateway (B) slice: topology EastWestGateway, trust domain B. SNI
-/// passthrough — its per-service inbound for `svc-c` forwards SNI=`svc-c` FQDN →
-/// C's sidecar inbound listener at `127.0.0.1:c_inbound_port`.
+/// passthrough — its per-service inbound for `svc-c` forwards
+/// SNI=`p<service_port>.<svc-c FQDN>` → C's sidecar inbound listener at
+/// `127.0.0.1:c_inbound_port`.
 ///
 /// TEST-REALISM MODELING (Codex round-1 finding #7 — NOT a client/datapath bug):
 /// the CLIENT (gateway A) datapath is correct — it dials the east-west gateway
-/// with the destination service FQDN as the ClientHello SNI, exactly as a real
-/// cross-cluster sidecar would. In a real injected-sidecar destination, the
+/// with the destination service port's alias as the ClientHello SNI, exactly as
+/// a real cross-cluster sidecar would. In a real injected-sidecar destination, the
 /// gateway forwards the opaque TLS to the destination workload's APP port, and
 /// the destination pod's INBOUND iptables capture REDIRECTS that app-port traffic
 /// to the sidecar's `:15006` mTLS listener (the same model same-cluster east-west
 /// INBOUND uses — `build_east_west_service_targets` forwards to the workload
 /// app/target port, NOT `:15006`). The functional test cannot run iptables, so it
-/// COLLAPSES that destination-side redirect by modeling the service port (and the
-/// east-west "workload" address) as C's sidecar inbound mTLS listener directly
-/// (`c_inbound_port`) — so the passthrough lands straight on the listener that
-/// terminates the client mTLS. This is a test-harness limitation, not a client
+/// COLLAPSES that destination-side redirect by modeling the service port's
+/// `targetPort` (and the east-west "workload" address) as C's sidecar inbound
+/// mTLS listener directly (`c_inbound_port`) — so the passthrough lands straight
+/// on the listener that terminates the client mTLS. The service port itself
+/// stays the client's `service_port`, because the SNI alias names it. This is a test-harness limitation, not a client
 /// bug; the live two-cluster k8s fixture (Stage 2) exercises the realistic
 /// app-port→`:15006` iptables path. See `docs/mesh.md` (cross-cluster east-west).
-fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: u16) -> MeshSlice {
+fn cross_cluster_east_west_slice(
+    node_id: &str,
+    c_spiffe: &str,
+    service_port: u16,
+    c_inbound_port: u16,
+) -> MeshSlice {
     let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
     MeshSlice {
         node_id: node_id.to_string(),
@@ -6608,10 +6620,10 @@ fn cross_cluster_east_west_slice(node_id: &str, c_spiffe: &str, c_inbound_port: 
             name: "svc-c".to_string(),
             namespace: "ferrum".to_string(),
             ports: vec![ServicePort {
-                port: c_inbound_port,
+                port: service_port,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
-                target_port: None,
+                target_port: Some(ServiceTargetPort::Number(c_inbound_port)),
             }],
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
@@ -6792,6 +6804,7 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
         let cp_b = start_static_mesh_cp(cross_cluster_east_west_slice(
             &node_b,
             c_spiffe,
+            backend_port,
             c_inbound_port,
         ))
         .await;
@@ -6893,7 +6906,7 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
         }
         if let Err(error) = wait_for_cross_cluster_destination_ready(
             b_east_west_port,
-            "svc-c.ferrum.svc.cluster.local",
+            &svc_c_east_west_sni(backend_port),
             c_spiffe,
             b_spiffe,
             &b_svid,
@@ -7239,6 +7252,7 @@ async fn try_start_sidecar_cross_cluster_fixture(
     let cp_b = start_static_mesh_cp(cross_cluster_east_west_slice(
         &node_b,
         c_spiffe,
+        backend_port,
         c_inbound_port,
     ))
     .await;
@@ -7332,7 +7346,7 @@ async fn try_start_sidecar_cross_cluster_fixture(
     }
     if wait_for_cross_cluster_destination_ready(
         b_east_west_port,
-        "svc-c.ferrum.svc.cluster.local",
+        &svc_c_east_west_sni(backend_port),
         c_spiffe,
         b_spiffe,
         &b_svid,
@@ -7729,16 +7743,18 @@ fn cross_cluster_ambient_dest_slice(
 ///
 /// TEST-REALISM MODELING (same as the Sidecar east-west slice — NOT a datapath
 /// bug): a real cross-cluster Ambient client dials the east-west gateway with the
-/// destination service FQDN as the outer-TLS SNI; the gateway forwards the opaque
-/// TLS to the destination workload's HBONE listener. The functional test cannot
-/// run a flat dest network / iptables, so it models the east-west "workload" as
-/// C's HBONE listener directly (`127.0.0.1:c_hbone_port`). The inner CONNECT
+/// destination service port's alias as the outer-TLS SNI; the gateway forwards the
+/// opaque TLS to the destination workload's HBONE listener. The functional test
+/// cannot run a flat dest network / iptables, so it models the east-west
+/// "workload" (and the service port's `targetPort`) as C's HBONE listener
+/// directly (`127.0.0.1:c_hbone_port`). The inner CONNECT
 /// authority is C's advertised non-loopback app address, which C can dial
 /// without crossing the loopback-namespace boundary. The live two-cluster
 /// fixture exercises the realistic pod-IP path.
 fn cross_cluster_ambient_east_west_slice(
     node_id: &str,
     c_spiffe: &str,
+    service_port: u16,
     c_hbone_port: u16,
 ) -> MeshSlice {
     let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
@@ -7773,10 +7789,10 @@ fn cross_cluster_ambient_east_west_slice(
             name: "svc-c".to_string(),
             namespace: "ferrum".to_string(),
             ports: vec![ServicePort {
-                port: c_hbone_port,
+                port: service_port,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
-                target_port: None,
+                target_port: Some(ServiceTargetPort::Number(c_hbone_port)),
             }],
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
@@ -7960,6 +7976,7 @@ async fn drive_ambient_cross_cluster_egress(
         let cp_b = start_static_mesh_cp(cross_cluster_ambient_east_west_slice(
             &node_b,
             c_spiffe,
+            backend_port,
             c_hbone_port,
         ))
         .await;
@@ -8068,7 +8085,7 @@ async fn drive_ambient_cross_cluster_egress(
         }
         if let Err(error) = wait_for_cross_cluster_destination_ready(
             b_east_west_port,
-            "svc-c.ferrum.svc.cluster.local",
+            &svc_c_east_west_sni(backend_port),
             c_spiffe,
             b_spiffe,
             &b_svid,
@@ -8408,6 +8425,7 @@ async fn try_start_ambient_cross_cluster_fixture(
     let cp_b = start_static_mesh_cp(cross_cluster_ambient_east_west_slice(
         &node_b,
         c_spiffe,
+        backend_port,
         c_hbone_port,
     ))
     .await;
@@ -8508,7 +8526,7 @@ async fn try_start_ambient_cross_cluster_fixture(
     }
     if wait_for_cross_cluster_destination_ready(
         b_east_west_port,
-        "svc-c.ferrum.svc.cluster.local",
+        &svc_c_east_west_sni(backend_port),
         c_spiffe,
         b_spiffe,
         &b_svid,
