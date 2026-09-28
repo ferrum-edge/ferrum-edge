@@ -117,9 +117,10 @@ Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86
 ### Docker
 
 Choose a completed published version, not a source tag or chart `appVersion`
-that is still in release preparation. The container tag `latest` tracks the most
-recent `main` commit that passed CI (with an immutable `main-<sha>` tag beside
-it): a moving development channel for evaluation, not a release. Omitting a tag
+that is still in release preparation. The container tag `latest` moves forward
+to the newest `main` commit that passed CI and was signed (each such commit
+also gets a `main-<sha>` tag): a moving development channel for evaluation, not
+a release. Omitting a tag
 also selects `latest`, so for production always specify a published version or
 image digest.
 

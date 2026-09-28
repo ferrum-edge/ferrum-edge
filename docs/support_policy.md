@@ -8,8 +8,8 @@ deprecations are announced, and how security fixes reach released versions.
 > exact-commit validation. Tag existence does not establish successful artifact
 > publication; verify the version's workflow and
 > [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases).
-> The `latest` container tag follows each `main` commit that passes CI; it is a
-> development channel, not a release. The historical `latest` GitHub prerelease
+> The `latest` container tag follows `main` (the newest commit that passed CI
+> and was signed); it is a development channel, not a release. The historical `latest` GitHub prerelease
 > is not refreshed.
 > The "After 1.0" commitments below remain **proposed**; pre-1.0 tags do not
 > activate them.

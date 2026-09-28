@@ -152,24 +152,54 @@ def validate_chart_mode_messages(results_dir: Path) -> None:
     print("chart mode messages ok")
 
 
+# `latest` and `main-<sha>` are the moving development channel published from
+# `main` by main-latest-image.yml (owner decision 2026-09-28). Documentation may
+# name them, but a surface that deploys an image must pin a published release:
+# chart values, templates, examples, and schemas, and any Kubernetes/Helm usage
+# shown in the docs (an `image:` field, a `tag:` value, or `--set image.tag=`).
+DEVELOPMENT_TAG = r"(?:latest|main-[0-9a-f]{7,40})(?![\w.-])"
+REGISTRY_IMAGE = r"(?:(?:docker\.io/)?ferrumedge/ferrum-edge|ghcr\.io/ferrum-edge/ferrum-edge)"
+
+
 def validate_published_image_tags(root: Path) -> None:
-    stale_registry_image = re.compile(
-        r"(?:docker\.io/)?ferrumedge/ferrum-edge:latest(?:\s|[\"'`]|$)"
+    development_image = re.compile(rf"{REGISTRY_IMAGE}:{DEVELOPMENT_TAG}")
+    development_tag_value = re.compile(
+        rf"(?m)^\s*(?:-\s+)?tag:\s*[\"']?{DEVELOPMENT_TAG}[\"']?\s*(?:#.*)?$"
     )
-    stale_chart_tag = re.compile(r"(?m)^\s*tag:\s*latest\s*(?:#.*)?$")
-    scanned = [*sorted((root / "docs").glob("*.md"))]
-    scanned.extend(
+    development_image_field = re.compile(
+        rf"(?m)^\s*(?:-\s+)?image:\s*[\"']?{REGISTRY_IMAGE}:{DEVELOPMENT_TAG}"
+    )
+    development_set_tag = re.compile(rf"image\.tag={DEVELOPMENT_TAG}")
+
+    chart_manifests = [
         path
         for path in sorted((root / "charts").rglob("*"))
-        if path.is_file() and path.suffix in {".md", ".yaml", ".yml", ".json"}
-    )
-    for path in scanned:
+        if path.is_file() and path.suffix in {".yaml", ".yml", ".json"}
+    ]
+    for path in chart_manifests:
         text = path.read_text(encoding="utf-8")
-        if stale_registry_image.search(text) or stale_chart_tag.search(text):
+        if development_image.search(text) or development_tag_value.search(text):
             fail(
-                "Retired registry image tag",
-                f"{path.relative_to(root)} references latest; use a published version "
-                "or chart appVersion fallback",
+                "Development image tag in a chart",
+                f"{path.relative_to(root)} deploys latest or main-<sha>; charts must "
+                "default to a published version or the chart appVersion",
+            )
+
+    docs = [*sorted((root / "docs").glob("*.md"))]
+    docs.extend(
+        path for path in sorted((root / "charts").rglob("*.md")) if path.is_file()
+    )
+    for path in docs:
+        text = path.read_text(encoding="utf-8")
+        if (
+            development_tag_value.search(text)
+            or development_image_field.search(text)
+            or development_set_tag.search(text)
+        ):
+            fail(
+                "Development image tag in a deployment example",
+                f"{path.relative_to(root)} deploys latest or main-<sha> in a Kubernetes "
+                "or Helm example; pin a published version or digest",
             )
     print("published image tags ok")
 
