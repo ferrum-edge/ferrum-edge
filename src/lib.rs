@@ -1039,6 +1039,86 @@ pub mod _test_support {
         ctx.record_backend_attempt(error_class, request_on_wire, response_status);
     }
 
+    /// Begin a backend attempt's `otel_tracing` CLIENT span (issue #5864) as
+    /// the retry loops' dispatch sites do, drive `attempt` in the attempt's
+    /// scope as they poll the dispatch, and return the header map the attempt
+    /// dispatched with the attempt's output.
+    pub async fn run_backend_attempt_for_test<F: std::future::Future>(
+        ctx: &crate::plugins::RequestContext,
+        backend_url: &str,
+        headers: &HashMap<String, String>,
+        attempt: F,
+    ) -> (HashMap<String, String>, F::Output) {
+        let span = ctx.begin_backend_attempt_span(backend_url, headers);
+        let dispatched = span.headers(headers).clone();
+        let attempt = std::pin::pin!(attempt);
+        let output = span.scope(attempt).await;
+        (dispatched, output)
+    }
+
+    /// A begun backend attempt's `otel_tracing` CLIENT span (issue #5864),
+    /// held as a dispatch site holds it, so a test can drop it (and the
+    /// request) before the attempt ends.
+    pub struct BackendAttemptForTest(crate::plugins::otel_tracing::BackendAttemptSpan);
+
+    impl BackendAttemptForTest {
+        /// Begin the next backend attempt, as its dispatch site does.
+        pub fn begin(
+            ctx: &crate::plugins::RequestContext,
+            backend_url: &str,
+            headers: &HashMap<String, String>,
+        ) -> Self {
+            Self(ctx.begin_backend_attempt_span(backend_url, headers))
+        }
+
+        /// The dispatch reports its own handoff to the backend, as
+        /// `proxy_to_backend` does: polling the attempt no longer hands it
+        /// over, [`note_backend_attempt_handed_off_for_test`] does.
+        pub fn handoff_reported_by_dispatch(&self) {
+            self.0.handoff_reported_by_dispatch();
+        }
+
+        /// The header map this attempt dispatches.
+        pub fn headers(&self, headers: &HashMap<String, String>) -> HashMap<String, String> {
+            self.0.headers(headers).clone()
+        }
+
+        /// Drive `attempt` in this attempt's scope.
+        pub async fn run<F: std::future::Future>(&self, attempt: F) -> F::Output {
+            let attempt = std::pin::pin!(attempt);
+            self.0.scope(attempt).await
+        }
+    }
+
+    /// Report, as `proxy_to_backend` does at its handoff, that the backend
+    /// attempt being polled was handed to the backend.
+    pub fn note_backend_attempt_handed_off_for_test() {
+        crate::plugins::otel_tracing::note_backend_attempt_handed_off();
+    }
+
+    /// Report, as the connection pools do, that the backend attempt being
+    /// polled rides a pooled connection it did not open.
+    pub fn note_backend_connection_reused_for_test() {
+        crate::plugins::otel_tracing::note_backend_connection_reused();
+    }
+
+    /// Report, as the connection pools do, a connection the backend attempt
+    /// being polled established, with the setup phases the pool timed.
+    pub fn note_backend_connection_setup_for_test(
+        setup: Duration,
+        dns: Duration,
+        tcp_connect: Duration,
+        tls_handshake: Option<Duration>,
+    ) {
+        crate::plugins::otel_tracing::note_backend_connection_setup_started();
+        crate::plugins::otel_tracing::note_backend_dns_resolution(dns);
+        crate::plugins::otel_tracing::note_backend_tcp_connect(tcp_connect);
+        if let Some(tls_handshake) = tls_handshake {
+            crate::plugins::otel_tracing::note_backend_tls_handshake(tls_handshake);
+        }
+        crate::plugins::otel_tracing::note_backend_connection_established(setup);
+    }
+
     /// Model the transport-owned empty-body proof for direct plugin lifecycle
     /// tests that do not enter through an HTTP proxy body-drain path.
     pub fn set_replay_request_body_empty_proven_for_test(

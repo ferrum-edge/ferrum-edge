@@ -9073,6 +9073,8 @@ async fn handle_h3_request(
             let mut result = match refined_buffered_response {
                 Some(result) => result,
                 None => {
+                    // The attempt's `otel_tracing` CLIENT span (issue #5864).
+                    let attempt_span = ctx.begin_backend_attempt_span(&current_url, &proxy_headers);
                     // Pinned in place so the wrapper does not copy the attempt
                     // into this frame a second time.
                     let dispatched = {
@@ -9081,7 +9083,7 @@ async fn handle_h3_request(
                             attempt_dispatch_proxy.as_ref(),
                             &current_url,
                             &method,
-                            &proxy_headers,
+                            attempt_span.headers(&proxy_headers),
                             &body_data,
                             &ctx.client_ip,
                             socket_ip,
@@ -9091,12 +9093,13 @@ async fn handle_h3_request(
                             effective_max_response_body_size_bytes,
                         );
                         tokio::pin!(attempt);
-                        crate::proxy::await_route_request_deadline(
+                        crate::proxy::await_backend_attempt_route_deadline(
                             route.total(),
                             crate::proxy::RouteAttemptBudget::from_start(
                                 route.attempt_timeout(),
                                 &mut route_attempt_deadline,
                             ),
+                            attempt_span.trace(),
                             attempt,
                         )
                         .await
@@ -9428,6 +9431,10 @@ async fn handle_h3_request(
                     route.attempt_timeout(),
                     &mut route_attempt_deadline,
                 );
+                // This retry's own `otel_tracing` CLIENT span and `traceparent`
+                // (issue #5864).
+                let attempt_span = ctx.begin_backend_attempt_span(&current_url, &proxy_headers);
+                let attempt_headers = attempt_span.headers(&proxy_headers);
                 let attempt_result = if let Some(target) = current_target
                     .as_deref()
                     .filter(|target| crate::proxy::target_requires_http_mesh_egress(target))
@@ -9440,7 +9447,7 @@ async fn handle_h3_request(
                         attempt_dispatch_proxy.as_ref(),
                         &current_url,
                         &method,
-                        &proxy_headers,
+                        attempt_headers,
                         Bytes::copy_from_slice(body_data.as_slice()),
                         target,
                         &plugins,
@@ -9449,9 +9456,10 @@ async fn handle_h3_request(
                         socket_ip,
                         ctx.request_is_secure,
                     );
-                    crate::proxy::await_route_request_deadline(
+                    crate::proxy::await_backend_attempt_route_deadline(
                         route.total(),
                         attempt_budget,
+                        attempt_span.trace(),
                         attempt,
                     )
                     .await
@@ -9462,7 +9470,7 @@ async fn handle_h3_request(
                         attempt_dispatch_proxy.as_ref(),
                         &current_url,
                         &method,
-                        &proxy_headers,
+                        attempt_headers,
                         &body_data,
                         &ctx.client_ip,
                         socket_ip,
@@ -9472,9 +9480,10 @@ async fn handle_h3_request(
                         effective_max_response_body_size_bytes,
                     );
                     tokio::pin!(attempt);
-                    crate::proxy::await_route_request_deadline(
+                    crate::proxy::await_backend_attempt_route_deadline(
                         route.total(),
                         attempt_budget,
+                        attempt_span.trace(),
                         attempt,
                     )
                     .await
@@ -9488,7 +9497,7 @@ async fn handle_h3_request(
                         selected_base_proxy.as_ref(),
                         &current_url,
                         &method,
-                        &proxy_headers,
+                        attempt_headers,
                         current_target.as_deref(),
                         Some(body_data.as_slice()),
                         false,
@@ -9500,9 +9509,10 @@ async fn handle_h3_request(
                         hyper::Version::HTTP_3,
                     );
                     tokio::pin!(attempt);
-                    crate::proxy::await_route_request_deadline(
+                    crate::proxy::await_backend_attempt_route_deadline(
                         route.total(),
                         attempt_budget,
+                        attempt_span.trace(),
                         attempt,
                     )
                     .await
@@ -9540,6 +9550,8 @@ async fn handle_h3_request(
             // No retry configured — single attempt, under the matched route
             // rule's deadlines (#5646).
             let mut route_attempt_deadline = None;
+            // The attempt's `otel_tracing` CLIENT span (issue #5864).
+            let attempt_span = ctx.begin_backend_attempt_span(&backend_url, &proxy_headers);
             // Pinned in place so the wrapper does not copy the attempt into
             // this frame a second time.
             let dispatched = {
@@ -9548,7 +9560,7 @@ async fn handle_h3_request(
                     &proxy,
                     &backend_url,
                     &method,
-                    &proxy_headers,
+                    attempt_span.headers(&proxy_headers),
                     &body_data,
                     &ctx.client_ip,
                     socket_ip,
@@ -9558,12 +9570,13 @@ async fn handle_h3_request(
                     effective_max_response_body_size_bytes,
                 );
                 tokio::pin!(attempt);
-                crate::proxy::await_route_request_deadline(
+                crate::proxy::await_backend_attempt_route_deadline(
                     route.total(),
                     crate::proxy::RouteAttemptBudget::from_start(
                         route.attempt_timeout(),
                         &mut route_attempt_deadline,
                     ),
+                    attempt_span.trace(),
                     attempt,
                 )
                 .await
