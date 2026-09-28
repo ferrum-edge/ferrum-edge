@@ -2373,15 +2373,14 @@ fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Res
     let Some(carrier) = destination_rule_carrier(resource, &typed_extension)? else {
         return Ok(());
     };
-    let dr = crate::util::deserialization::from_json_slice::<MeshDestinationRule>(
-        &carrier.inner.value,
-    )
-    .map_err(|e| {
-        format!(
-            "xDS reserved DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
-            typed_extension.name
-        )
-    })?;
+    let dr =
+        crate::util::deserialization::from_json_slice::<MeshDestinationRule>(&carrier.inner.value)
+            .map_err(|e| {
+                format!(
+                    "xDS reserved DestinationRule ECDS carrier {:?} failed JSON decode: {e}",
+                    typed_extension.name
+                )
+            })?;
     validate_reserved_destination_rule_carrier_name(carrier.namespace, carrier.name, &dr)?;
 
     // `export_to` is the security boundary that bounds which subscribers may
