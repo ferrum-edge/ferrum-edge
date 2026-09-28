@@ -11,8 +11,9 @@
 //! `Err`, and callers print a skip notice and return rather than fail — except
 //! in CI, where a container that fails to start is a hard failure (see
 //! [`fail_in_ci_else_skip`]). Host ports are pinned outside the kernel
-//! ephemeral range and start is retried only on bind collisions (see
-//! [`super::host_ports`]).
+//! ephemeral range and start is retried with a fresh port only on bind
+//! collisions (see [`super::host_ports`]); transient image-pull/registry
+//! errors are retried inside [`start_within_deadline`].
 
 #![allow(dead_code)] // helpers are used selectively per backend module
 
@@ -23,7 +24,7 @@ use testcontainers::core::{ExecCommand, IntoContainerPort};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-use super::host_ports::{allocate_host_port, retry_on_host_port_collision};
+use super::host_ports::{allocate_host_port, is_host_port_collision, retry_on_host_port_collision};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -39,11 +40,21 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // each fixture already carries stay as they are; these bound the phases that
 // had no deadline at all.
 
-/// Wall-clock bound on one container `start()` (image pull + create + start).
-/// A cold runner pulling a multi-hundred-megabyte image is slow, but it is not
+/// Wall-clock bound on one container `start()` phase (image pull + create +
+/// start), including every transient-pull retry and backoff inside it. A cold
+/// runner pulling a multi-hundred-megabyte image is slow, but it is not
 /// unbounded — 5 minutes is well past the observed worst case (~1 min) and far
 /// short of the 60-minute job budget.
 pub const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Attempts [`start_within_deadline`] makes when a start fails with a
+/// transient image-pull/registry error (see [`is_transient_image_pull_error`]).
+/// Any other failure is returned after the first attempt.
+pub const CONTAINER_START_ATTEMPTS: u32 = 3;
+
+/// Backoff unit between those attempts: the wait after attempt `n` is `n`
+/// units, and it is only taken while the phase deadline still has room.
+pub const CONTAINER_START_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Per-request bound for fixture HTTP calls to a loopback service. Generous
 /// for a container on the same host; the point is that no single request can
@@ -92,23 +103,156 @@ pub async fn with_phase_deadline<F: Future>(
     }
 }
 
-/// [`with_phase_deadline`] specialised to a container `start()`: bounds the
-/// image pull and start, and flattens the timeout into the future's own
-/// `Result` error type.
-pub async fn start_within_deadline<F, T, E>(service: &str, future: F) -> Result<T, BoxError>
+/// Retry policy for one container `start()` phase. [`start_within_deadline`]
+/// uses [`ContainerStartRetry::DEFAULT`]; tests inject short bounds.
+#[derive(Clone, Copy, Debug)]
+pub struct ContainerStartRetry {
+    /// Total attempts, including the first.
+    pub attempts: u32,
+    /// Wall-clock bound on the whole phase, across attempts and backoff.
+    pub budget: Duration,
+    /// Backoff unit; the wait after attempt `n` is `n` units.
+    pub backoff: Duration,
+}
+
+impl ContainerStartRetry {
+    pub const DEFAULT: Self = Self {
+        attempts: CONTAINER_START_ATTEMPTS,
+        budget: CONTAINER_START_TIMEOUT,
+        backoff: CONTAINER_START_BACKOFF,
+    };
+}
+
+/// Error text that marks a start failure as a deterministic answer rather than
+/// a transfer fault: a wrong image reference or credentials, and
+/// testcontainers' own wait-condition failures. Checked before
+/// [`TRANSIENT_START_MARKERS`], so e.g. `container startup timeout` is never
+/// retried as a "timeout".
+const NON_TRANSIENT_START_MARKERS: &[&str] = &[
+    "manifest unknown",
+    "not found",
+    "denied",
+    "unauthorized",
+    "invalid reference format",
+    "container startup timeout",
+    "container is not ready",
+    "container is unhealthy",
+    "container exited with unexpected code",
+    "failed to wait for container log",
+    "healthcheck is not configured",
+];
+
+/// Error text of a transient image-pull or registry fault: testcontainers'
+/// `failed to pull the image` wrapper, a truncated or reset transfer, a
+/// network timeout, registry rate limiting, or a registry 5xx.
+const TRANSIENT_START_MARKERS: &[&str] = &[
+    "failed to pull",
+    "bytes remaining on stream",
+    "connection reset",
+    "unexpected eof",
+    "timeout",
+    "timed out",
+    "context deadline exceeded",
+    "tls handshake",
+    "toomanyrequests",
+    "too many requests",
+    "unexpected http status: 5",
+    "500 internal server error",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+];
+
+/// True when a container-start error is a transient image-pull or registry
+/// failure worth another attempt (e.g. Docker Hub cutting a `postgres:17` layer
+/// short with `bytes remaining on stream`, main CI run 36370971003).
+///
+/// Deliberately conservative. Host-port bind collisions are excluded so they
+/// reach [`retry_on_host_port_collision`] and get a fresh port; wait-condition
+/// failures and deterministic registry answers (unknown manifest, denied pull)
+/// are excluded so a broken fixture still fails on its first attempt.
+pub fn is_transient_image_pull_error(error: &str) -> bool {
+    if is_host_port_collision(error) {
+        return false;
+    }
+    let lower = error.to_ascii_lowercase();
+    if NON_TRANSIENT_START_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    TRANSIENT_START_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Bound one container `start()` (image pull + create + start) by
+/// [`CONTAINER_START_TIMEOUT`], retrying transient image-pull/registry errors
+/// up to [`CONTAINER_START_ATTEMPTS`] times inside that same deadline.
+///
+/// `start` builds and starts a fresh request on every call (a
+/// `ContainerRequest` is consumed by `start()` and is not `Clone`). Every
+/// other error, including a host-port collision, is returned after the attempt
+/// that produced it with its text intact, so callers keep their existing error
+/// handling and [`retry_on_host_port_collision`] still sees collisions.
+pub async fn start_within_deadline<F, Fut, T, E>(service: &str, start: F) -> Result<T, BoxError>
 where
-    F: Future<Output = Result<T, E>>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    match with_phase_deadline(
-        &format!("{service} image pull/start"),
-        CONTAINER_START_TIMEOUT,
-        future,
-    )
-    .await?
-    {
-        Ok(value) => Ok(value),
-        Err(error) => Err(format!("{service} image pull/start failed: {error}").into()),
+    start_with_retry(service, ContainerStartRetry::DEFAULT, start).await
+}
+
+/// [`start_within_deadline`] with an explicit [`ContainerStartRetry`] policy.
+pub async fn start_with_retry<F, Fut, T, E>(
+    service: &str,
+    policy: ContainerStartRetry,
+    mut start: F,
+) -> Result<T, BoxError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let attempts = policy.attempts.max(1);
+    let started = Instant::now();
+    let deadline = started + policy.budget;
+    let mut attempt = 1;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let error = match tokio::time::timeout(remaining, start()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => {
+                return Err(format!(
+                    "{service} image pull/start exceeded its {:.0}s deadline \
+                     (elapsed {:.1}s, attempt {attempt}/{attempts})",
+                    policy.budget.as_secs_f64(),
+                    started.elapsed().as_secs_f64()
+                )
+                .into());
+            }
+        };
+        let backoff = policy.backoff.saturating_mul(attempt);
+        let has_budget = deadline.saturating_duration_since(Instant::now()) > backoff;
+        if attempt >= attempts || !has_budget || !is_transient_image_pull_error(&error) {
+            let message = if attempt == 1 {
+                format!("{service} image pull/start failed: {error}")
+            } else {
+                format!("{service} image pull/start failed after {attempt} attempts: {error}")
+            };
+            return Err(message.into());
+        }
+        eprintln!(
+            "{service} image pull/start attempt {attempt}/{attempts} failed with a transient \
+             image-pull/registry error after {:.1}s; retrying in {:.0}s: {error}",
+            started.elapsed().as_secs_f64(),
+            backoff.as_secs_f64()
+        );
+        tokio::time::sleep(backoff).await;
+        attempt += 1;
     }
 }
 
@@ -149,14 +293,13 @@ pub struct ConsulContainer {
 pub async fn start_consul_dev_container() -> Result<ConsulContainer, BoxError> {
     let (container, port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
-        let container = start_within_deadline(
-            "Consul",
+        let container = start_within_deadline("Consul", || {
             GenericImage::new("hashicorp/consul", "1.19")
                 .with_exposed_port(8500.tcp())
                 .with_mapped_port(host_port, 8500.tcp())
                 .with_cmd(["agent", "-dev", "-client", "0.0.0.0"])
-                .start(),
-        )
+                .start()
+        })
         .await?;
         Ok((container, host_port))
     })
@@ -237,8 +380,7 @@ pub struct OpenLdapContainer {
 pub async fn start_openldap_container() -> Result<OpenLdapContainer, BoxError> {
     let (container, port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
-        let container = start_within_deadline(
-            "OpenLDAP",
+        let container = start_within_deadline("OpenLDAP", || {
             GenericImage::new("osixia/openldap", "1.5.0")
                 .with_exposed_port(LDAP_CONTAINER_PORT.tcp())
                 .with_mapped_port(host_port, LDAP_CONTAINER_PORT.tcp())
@@ -249,8 +391,8 @@ pub async fn start_openldap_container() -> Result<OpenLdapContainer, BoxError> {
                 .with_env_var("LDAP_ORGANISATION", "Ferrum Test")
                 .with_env_var("LDAP_DOMAIN", "example.org")
                 .with_env_var("LDAP_ADMIN_PASSWORD", LDAP_ADMIN_PASSWORD)
-                .start(),
-        )
+                .start()
+        })
         .await?;
         Ok((container, host_port))
     })
@@ -409,30 +551,32 @@ pub async fn start_redpanda_container() -> Result<RedpandaContainer, BoxError> {
         let host_port = allocate_host_port()?;
         let advertise = format!("internal://127.0.0.1:9092,external://127.0.0.1:{host_port}");
 
-        let image = GenericImage::new("redpandadata/redpanda", "v24.2.4")
-            .with_exposed_port(9093.tcp())
-            .with_mapped_port(host_port, 9093.tcp())
-            .with_cmd([
-                "redpanda".to_string(),
-                "start".to_string(),
-                "--overprovisioned".to_string(),
-                "--smp".to_string(),
-                "1".to_string(),
-                "--memory".to_string(),
-                "512M".to_string(),
-                "--reserve-memory".to_string(),
-                "0M".to_string(),
-                "--node-id".to_string(),
-                "0".to_string(),
-                "--check=false".to_string(),
-                "--kafka-addr".to_string(),
-                "internal://0.0.0.0:9092,external://0.0.0.0:9093".to_string(),
-                "--advertise-kafka-addr".to_string(),
-                advertise,
-                "--set".to_string(),
-                "redpanda.auto_create_topics_enabled=false".to_string(),
-            ]);
-        let container = start_within_deadline("Redpanda", image.start()).await?;
+        let image = || {
+            GenericImage::new("redpandadata/redpanda", "v24.2.4")
+                .with_exposed_port(9093.tcp())
+                .with_mapped_port(host_port, 9093.tcp())
+                .with_cmd([
+                    "redpanda".to_string(),
+                    "start".to_string(),
+                    "--overprovisioned".to_string(),
+                    "--smp".to_string(),
+                    "1".to_string(),
+                    "--memory".to_string(),
+                    "512M".to_string(),
+                    "--reserve-memory".to_string(),
+                    "0M".to_string(),
+                    "--node-id".to_string(),
+                    "0".to_string(),
+                    "--check=false".to_string(),
+                    "--kafka-addr".to_string(),
+                    "internal://0.0.0.0:9092,external://0.0.0.0:9093".to_string(),
+                    "--advertise-kafka-addr".to_string(),
+                    advertise.clone(),
+                    "--set".to_string(),
+                    "redpanda.auto_create_topics_enabled=false".to_string(),
+                ])
+        };
+        let container = start_within_deadline("Redpanda", || image().start()).await?;
         Ok((container, host_port))
     })
     .await?;
@@ -507,21 +651,24 @@ pub async fn start_redpanda_tls_container() -> Result<RedpandaTlsContainer, BoxE
             },
             "rpk": {"kafka_api": {"brokers": ["127.0.0.1:9092"]}}
         });
-        let image = GenericImage::new("redpandadata/redpanda", "v24.2.4")
-            .with_entrypoint("/bin/sh")
-            .with_exposed_port(9093.tcp())
-            .with_exposed_port(9094.tcp())
-            .with_exposed_port(9095.tcp())
-            .with_mapped_port(ports[0], 9093.tcp())
-            .with_mapped_port(ports[1], 9094.tcp())
-            .with_mapped_port(ports[2], 9095.tcp())
-            .with_copy_to("/tmp/kafka-tls.yaml", serde_json::to_vec(&config)?)
-            .with_copy_to("/tmp/broker.pem", cert.pem().into_bytes())
-            .with_copy_to("/tmp/broker.key", key.serialize_pem().into_bytes())
-            // Docker copies files as root. rpk atomically rewrites/chowns its
-            // config, so first create a copy owned by the image's redpanda user.
-            .with_cmd(["-ec", "cp /tmp/kafka-tls.yaml /tmp/kafka-run.yaml\nexec rpk redpanda start --config /tmp/kafka-run.yaml --overprovisioned --smp 1 --memory 512M --reserve-memory 0M --check=false"]);
-        let container = start_within_deadline("Redpanda TLS", image.start()).await?;
+        let config = serde_json::to_vec(&config)?;
+        let image = || {
+            GenericImage::new("redpandadata/redpanda", "v24.2.4")
+                .with_entrypoint("/bin/sh")
+                .with_exposed_port(9093.tcp())
+                .with_exposed_port(9094.tcp())
+                .with_exposed_port(9095.tcp())
+                .with_mapped_port(ports[0], 9093.tcp())
+                .with_mapped_port(ports[1], 9094.tcp())
+                .with_mapped_port(ports[2], 9095.tcp())
+                .with_copy_to("/tmp/kafka-tls.yaml", config.clone())
+                .with_copy_to("/tmp/broker.pem", cert.pem().into_bytes())
+                .with_copy_to("/tmp/broker.key", key.serialize_pem().into_bytes())
+                // Docker copies files as root. rpk atomically rewrites/chowns its
+                // config, so first create a copy owned by the image's redpanda user.
+                .with_cmd(["-ec", "cp /tmp/kafka-tls.yaml /tmp/kafka-run.yaml\nexec rpk redpanda start --config /tmp/kafka-run.yaml --overprovisioned --smp 1 --memory 512M --reserve-memory 0M --check=false"])
+        };
+        let container = start_within_deadline("Redpanda TLS", || image().start()).await?;
         Ok((container, ports))
     }).await?;
     let broker = RedpandaContainer {
