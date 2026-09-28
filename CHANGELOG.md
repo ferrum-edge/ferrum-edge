@@ -318,9 +318,9 @@ outright with no deprecation period:
   service port, including a single-port service's only port, routes on its
   `p<port>.<service>.<namespace>.svc.<cluster-domain>` alias, and an HTTP port
   that shares its number with a raw-TCP or UDP port uses `p<port>-http`. This
-  changes the cross-cluster wire format: upgrade client and destination
-  clusters together, and move any `EastWestGateway.sni_hosts` entry that took
-  over a single-port service's base FQDN to its alias.
+  changes the cross-cluster wire format. A destination `EastWestGateway`
+  `sni_hosts` entry takes over a port only when it names that port's alias (or
+  a covering wildcard).
 - **Non-reserved xDS DestinationRule ECDS carriers.** A resource carrying the
   DestinationRule carrier type under any name other than
   `ferrum-destination-rule-carrier/<namespace>/<name>` now NACKs, and the
