@@ -494,6 +494,7 @@ async fn like_tautology_requires_an_injection_shaped_right_operand() {
         "user=x'%20or%20'a'%20like%20'%25",
         "user=x'%20or%20'a'%20like%20'a'--%20",
         "user=x'%20or%20'a'%20like%20'a'%23",
+        "user=x'%20or%20'a'%20like%20'a'%20or%20'x",
     ] {
         assert_detected(&plugin, "FE-SQLI-009", Surface::Query(query)).await;
     }
@@ -501,6 +502,12 @@ async fn like_tautology_requires_an_injection_shaped_right_operand() {
         &plugin,
         "FE-SQLI-009-B",
         Surface::Body(JSON, br#"{"user":"admin' or 'a' like 'a"}"#),
+    )
+    .await;
+    assert_detected(
+        &plugin,
+        "FE-SQLI-009-B",
+        Surface::Body(JSON, br#"{"user":"x' or 'a' like 'a' or 'x"}"#),
     )
     .await;
 
@@ -1433,11 +1440,13 @@ async fn recommended_posture_enforces_new_level_one_signatures() {
 
     for surface in [
         Surface::Query("id=1%20AND%20SLEEP(5)"),
+        Surface::Query("user=x'%20or%20'a'%20like%20'a'%20or%20'x"),
         Surface::Query("host=$(whoami)"),
         Surface::Cookie("id=1 UNION SELECT password FROM users"),
         Surface::Header("user-agent", "() { :; }; /bin/id"),
         Surface::Path("/.git/config"),
         Surface::Body(JSON, br#"{"@type":"com.sun.rowset.JdbcRowSetImpl"}"#),
+        Surface::Body(JSON, br#"{"user":"x' or 'a' like 'a' or 'x"}"#),
     ] {
         let (result, request) = scan(&plugin, &surface).await;
         assert!(
