@@ -737,15 +737,15 @@
       "owner_github": null,
       "reason": "hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends a clean END_STREAM, so an HBONE relay that ended on a socket error was indistinguishable on the wire from a normal close; Upgraded::reset_with_connect_error() sends RST_STREAM(CONNECT_ERROR) instead (RFC 9113 section 8.5, #5781).",
       "upstream": {
-        "filing": "deliberate_fork_unfiled",
+        "filing": "filed",
         "github_repo": "hyperium/hyper",
-        "pr_number": null,
-        "issue_number": null,
+        "pr_number": 4210,
+        "issue_number": 4209,
         "fork_ref": null
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "A hyper release can reset an upgraded HTTP/2 stream with a chosen error code.",
+        "trigger": "A hyper release containing hyperium/hyper#4210 (or an equivalent API that resets an upgraded HTTP/2 stream with a chosen error code) is adopted.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
