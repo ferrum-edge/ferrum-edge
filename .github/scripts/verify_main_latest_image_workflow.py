@@ -374,7 +374,7 @@ SYFT_CREDENTIAL_MARKERS = (
     "--env-file",
     "docker.sock",
     "$work:",
-    ".docker",
+    "/.docker",
     "config.json",
     "DOCKER_CONFIG",
 )
