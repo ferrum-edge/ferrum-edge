@@ -181,7 +181,9 @@ fn consumer_namespace_request_header_modifier_refuses_only_its_own_route() {
         "the valid route's header modifier must still be emitted: {plugins:?}"
     );
     assert!(
-        rendered.iter().all(|config| !config.contains("x-consumer-role")),
+        rendered
+            .iter()
+            .all(|config| !config.contains("x-consumer-role")),
         "no emitted plugin may carry the refused destination: {plugins:?}"
     );
 
