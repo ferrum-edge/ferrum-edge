@@ -21,8 +21,8 @@
 //! ```
 
 use super::functional_otel_attempt_spans_test::{
-    client_spans, in_trace, int_attr, otel_plugin, start_collector, string_attr,
-    traceparent_ids, wait_for_spans,
+    client_spans, in_trace, int_attr, otel_plugin, start_collector, string_attr, traceparent_ids,
+    wait_for_spans,
 };
 use crate::scaffolding::backends::{
     H3Step, H3TlsConfig, ScriptedH3Backend, ScriptedTlsBackend, TcpStep, TlsConfig,
@@ -30,7 +30,9 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::{BIND_DROP_SPAWN_ATTEMPTS, reserve_colocated_tcp_udp, reserve_port};
+use crate::scaffolding::ports::{
+    BIND_DROP_SPAWN_ATTEMPTS, reserve_colocated_tcp_udp, reserve_port,
+};
 use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -547,10 +549,7 @@ async fn websocket_upgrade_exports_one_client_span_for_its_backend_attempt() {
     .await;
     let trace = in_trace(&spans, &trace_id);
     let servers = server_spans(&trace);
-    assert!(
-        !servers.is_empty(),
-        "the handshake SERVER span: {trace:#?}"
-    );
+    assert!(!servers.is_empty(), "the handshake SERVER span: {trace:#?}");
     let server_span_ids: Vec<&str> = servers
         .iter()
         .filter_map(|span| span["spanId"].as_str())
