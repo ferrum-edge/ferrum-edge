@@ -426,8 +426,7 @@ fn claim_headers_refuse_the_whole_consumer_assertion_namespace() {
             "test_auth",
             PREFIX,
         )
-        .err()
-        .expect("an x-consumer-* claim destination must fail admission");
+        .expect_err("an x-consumer-* claim destination must fail admission");
         assert!(
             error.contains("claim_headers[0].header"),
             "{header}: {error}"
