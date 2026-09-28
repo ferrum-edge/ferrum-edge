@@ -1,20 +1,27 @@
 name: Main Latest Image
 
 # Owner decision 2026-09-28: the Docker `latest` tag tracks the newest `main`
-# commit whose complete push CI succeeded. It is a moving development channel,
-# not a release; version tags are published only by release.yml.
+# commit whose complete push CI succeeded and whose image this workflow then
+# built. It is a moving development channel, not a release; version tags are
+# published only by release.yml.
 #
 # Fail-closed contract, pinned by .github/scripts/verify_main_latest_image_workflow.py
 # (run by the required Tests gate through verify_required_ci.py):
 #   * runs only after a successful `push` run of ci.yml on `main` in this
 #     repository, and builds exactly that run's head SHA;
-#   * publishes `main-<sha>` for every such commit that is still on main's
-#     history, and reuses an already signed `main-<sha>` instead of rebuilding
-#     it, so a re-run never re-pushes a different digest;
+#   * runs are serialized: one runs, the newest waits, and any older waiting
+#     run is replaced, so intermediate commits may be skipped. Each commit that
+#     is built gets `main-<sha>`; a re-run reuses an already signed `main-<sha>`
+#     instead of rebuilding it, so it never re-pushes a different digest;
 #   * moves `latest` only while the commit is still on main's history and only
-#     forward: the commit `latest` currently names (its
-#     `org.opencontainers.image.revision` label) must be an ancestor of this
-#     commit. Both facts are re-checked immediately before each registry's move;
+#     forward: when the commit `latest` names (its
+#     `org.opencontainers.image.revision` label) is on main's history, it must
+#     be an ancestor of this commit. Both facts are re-checked immediately
+#     before each registry's move;
+#   * credential isolation: the only jobs that check out or execute repository
+#     code (`contract`, `smoke`) hold no secret and no registry token. Jobs
+#     that hold registry credentials never check out the repository; `build`
+#     hands BuildKit the public Git URL of the commit instead;
 #   * pushes only `latest` and the `main-<sha>` tag, never a version tag and
 #     never an `-ebpf` / `-ebpf-tools` variant;
 #   * smoke-runs each platform image, then attests (SPDX SBOMs, SLSA
@@ -40,15 +47,20 @@ on:
 permissions:
   contents: read
 
-# One publisher per triggering CI workflow, event, conclusion, and commit, so a
-# re-run of the same commit waits for the first and then reuses its image, and
-# no other completion can displace it. Different commits build in parallel;
-# only `promote` is serialized repository-wide (see its job concurrency).
+# One group for every run that can publish (a successful `push` run of ci.yml
+# in this repository), so publishers never overlap and every move of `latest`
+# is serialized. With cancel-in-progress disabled, GitHub keeps the running
+# publisher and only the newest waiting one; an older waiting run is cancelled
+# before it starts. Runs for other events or conclusions land in other groups
+# and skip at `resolve`, so they cannot displace a waiting publisher.
 concurrency:
-  group: main-latest-image-${{ github.event.workflow_run.path }}-${{ github.event.workflow_run.event }}-${{ github.event.workflow_run.conclusion }}-${{ github.event.workflow_run.head_sha }}
+  group: main-latest-image-${{ github.repository }}-${{ github.event.workflow_run.path }}-${{ github.event.workflow_run.event }}-${{ github.event.workflow_run.conclusion }}
   cancel-in-progress: false
 
 jobs:
+  # No checkout and no repository code: this job only reads GitHub and the
+  # registries. It holds a GHCR read token because the GHCR package does not
+  # serve anonymous reads; Docker Hub is read anonymously.
   resolve:
     name: Resolve main commit
     if: github.repository == 'ferrum-edge/ferrum-edge' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.path == '.github/workflows/ci.yml' && github.event.workflow_run.head_repository.full_name == github.repository
@@ -77,17 +89,24 @@ jobs:
           echo "sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
 
           # GitHub reports `ahead` or `identical` exactly when base is an
-          # ancestor of, or equal to, head.
+          # ancestor of, or equal to, head, and 404 when either commit is
+          # unknown to the repository (for example after main was rewritten).
           is_ancestor() {
             local base="$1"
             local head="$2"
             local status
-            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}?per_page=1" --jq '.status' || true)"
+            local compare_err
+            compare_err="$(mktemp)"
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}?per_page=1" --jq '.status' 2>"$compare_err" || true)"
+            if grep -q 'HTTP 404' "$compare_err"; then
+              status="missing"
+            fi
             case "$status" in
               ahead | identical) return 0 ;;
-              behind | diverged) return 1 ;;
+              behind | diverged | missing) return 1 ;;
               *)
                 echo "::error::could not compare ${base} with ${head}" >&2
+                cat "$compare_err" >&2
                 exit 1
                 ;;
             esac
@@ -121,21 +140,6 @@ jobs:
             echo "CI run: ${CI_RUN_URL}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        if: steps.head.outputs.publish == 'true'
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      # Runs before any registry login, so no credential is on disk while
-      # repository code executes in this job.
-      - name: Verify the publisher contract of the running workflow
-        if: steps.head.outputs.publish == 'true'
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/verify_main_latest_image_workflow.py --self-test
-          python3 .github/scripts/verify_main_latest_image_workflow.py
-
       - name: Set up Docker Buildx
         if: steps.head.outputs.publish == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -152,17 +156,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        if: steps.head.outputs.publish == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       # `main-<sha>` is built once. When both registries already hold it and
       # its signature verifies under this workflow's identity, the build,
       # manifest, and signing jobs are skipped and the existing digest is
-      # re-verified and promoted. An unsigned leftover is rebuilt.
+      # re-verified and promoted. An unsigned leftover is rebuilt. This step
+      # must stay last in the job: `build=false` is its final output.
       - name: Reuse an already signed main-sha image
         id: existing
         if: steps.head.outputs.publish == 'true'
@@ -219,9 +217,37 @@ jobs:
             echo "build=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # Checks out and runs repository code on the host, so it holds no secret, no
+  # registry login, and no write token. `python3 -I` keeps the checkout's
+  # `.github/scripts/` off sys.path and ignores PYTHON* variables.
+  contract:
+    name: Verify publisher contract
+    needs: resolve
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify the publisher contract of the running workflow
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_main_latest_image_workflow.py --self-test
+          python3 -I .github/scripts/verify_main_latest_image_workflow.py
+
+  # Holds registry credentials, so it never checks out the repository.
+  # BuildKit fetches the public repository at the CI-validated commit itself,
+  # and the repository's build steps run only inside BuildKit. The empty
+  # `github-token` keeps the job token out of the build, so no Dockerfile can
+  # mount it as a GIT_AUTH_TOKEN secret.
   build:
     name: Build latest image (${{ matrix.platform }})
-    needs: resolve
+    needs: [resolve, contract]
     if: needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
@@ -239,22 +265,6 @@ jobs:
             platform: linux/arm64
             arch_dir: arm64
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          ref: ${{ needs.resolve.outputs.sha }}
-          persist-credentials: false
-
-      - name: Confirm the checkout is the CI-validated commit
-        env:
-          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
-        run: |
-          set -euo pipefail
-          checked_out="$(git rev-parse HEAD)"
-          if [ "$checked_out" != "$SOURCE_SHA" ]; then
-            echo "::error::checkout ${checked_out} is not the CI-validated ${SOURCE_SHA}" >&2
-            exit 1
-          fi
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
@@ -275,8 +285,8 @@ jobs:
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
-          context: .
-          file: Dockerfile
+          context: https://github.com/ferrum-edge/ferrum-edge.git#${{ needs.resolve.outputs.sha }}
+          github-token: ""
           target: runtime
           platforms: ${{ matrix.platform }}
           build-args: |
@@ -285,21 +295,6 @@ jobs:
             org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
           outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
           provenance: false
-
-      # Runs the pushed platform image on its native runner before its digest
-      # can reach a manifest, so an image that cannot start never moves `latest`.
-      - name: Smoke the pushed platform image
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::build produced no immutable digest" >&2
-            exit 1
-          fi
-          version_json="$(docker run --rm --network none "ferrumedge/ferrum-edge@${DIGEST}" version --json)"
-          jq -e '.version | type == "string" and length > 0' <<<"$version_json" >/dev/null
-          echo "Smoke passed for ${DIGEST}: ${version_json}"
 
       - name: Export digest
         env:
@@ -321,9 +316,52 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Runs each pushed platform image by digest on its native runner before the
+  # digest can reach a manifest, so an image that cannot start never moves
+  # `latest`. Running the image executes repository code, so this job holds no
+  # secret and no registry login: Docker Hub serves the image anonymously.
+  smoke:
+    name: Smoke latest image (${{ matrix.platform }})
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.build == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux/amd64
+            arch_dir: amd64
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch_dir: arm64
+    steps:
+      - name: Download digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: main-latest-digest-${{ matrix.arch_dir }}
+          path: ${{ runner.temp }}/digest
+
+      - name: Smoke the pushed platform image
+        working-directory: ${{ runner.temp }}/digest
+        run: |
+          set -euo pipefail
+          digests=(*)
+          if [ "${#digests[@]}" -ne 1 ] || [[ ! "${digests[0]}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::expected exactly one platform digest" >&2
+            exit 1
+          fi
+          DIGEST="sha256:${digests[0]}"
+          version_json="$(docker run --rm --network none "ferrumedge/ferrum-edge@${DIGEST}" version --json)"
+          jq -e '.version | type == "string" and length > 0' <<<"$version_json" >/dev/null
+          echo "Smoke passed for ${DIGEST}: ${version_json}"
+
   manifest:
     name: Publish main-sha manifest
-    needs: [resolve, build]
+    needs: [resolve, build, smoke]
     if: needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -388,11 +426,12 @@ jobs:
 
   # `manifest` is skipped when `resolve` reuses a signed `main-<sha>`; the
   # explicit result checks replace the implicit success() that a skipped
-  # dependency would otherwise fail.
+  # dependency would otherwise fail, and require every needed job that must
+  # run to have succeeded.
   attest:
     name: Sign and attest main image
-    needs: [resolve, manifest]
-    if: ${{ !cancelled() && needs.resolve.outputs.publish == 'true' && (needs.manifest.result == 'success' || (needs.manifest.result == 'skipped' && needs.resolve.outputs.build == 'false')) }}
+    needs: [resolve, contract, manifest]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.contract.result == 'success' && needs.resolve.outputs.publish == 'true' && (needs.manifest.result == 'success' || (needs.manifest.result == 'skipped' && needs.resolve.outputs.build == 'false')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -706,21 +745,17 @@ jobs:
           echo "docker_ref=${DOCKER_REF}" >> "$GITHUB_OUTPUT"
           echo "ghcr_ref=${GHCR_REF}" >> "$GITHUB_OUTPUT"
 
+  # No other publisher runs while this job does: the workflow-level concurrency
+  # group serializes every run that can move `latest`.
   promote:
     name: Move latest to the verified digest
-    needs: [resolve, attest]
-    if: ${{ !cancelled() && needs.resolve.outputs.publish == 'true' && needs.attest.result == 'success' }}
+    needs: [resolve, contract, attest]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.contract.result == 'success' && needs.attest.result == 'success' && needs.resolve.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
-    # Serializes every move of `latest`. A newer pending promotion replaces an
-    # older pending one, which is harmless: the older one could only lose the
-    # ancestry check against it.
-    concurrency:
-      group: main-latest-image-promote
-      cancel-in-progress: false
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -763,17 +798,24 @@ jobs:
           }
 
           # GitHub reports `ahead` or `identical` exactly when base is an
-          # ancestor of, or equal to, head.
+          # ancestor of, or equal to, head, and 404 when either commit is
+          # unknown to the repository (for example after main was rewritten).
           is_ancestor() {
             local base="$1"
             local head="$2"
             local status
-            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}?per_page=1" --jq '.status' || true)"
+            local compare_err
+            compare_err="$(mktemp)"
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}?per_page=1" --jq '.status' 2>"$compare_err" || true)"
+            if grep -q 'HTTP 404' "$compare_err"; then
+              status="missing"
+            fi
             case "$status" in
               ahead | identical) return 0 ;;
-              behind | diverged) return 1 ;;
+              behind | diverged | missing) return 1 ;;
               *)
                 echo "::error::could not compare ${base} with ${head}" >&2
+                cat "$compare_err" >&2
                 exit 1
                 ;;
             esac
@@ -794,13 +836,16 @@ jobs:
             fi
           }
 
-          # `latest` only moves forward: the commit it names now must be an
-          # ancestor of (or equal to) this one. A missing tag, or an image
-          # without a readable revision label, does not block the move.
+          # `latest` only moves forward: when the commit it names now is on
+          # main's history, it must be an ancestor of (or equal to) this one.
+          # A missing tag, an image without a readable revision label, or a
+          # revision that is not on main's history (main was rewritten) cannot
+          # be newer, so it does not block the move.
           require_latest_not_newer() {
             local repository="$1"
             local inspect_err
             local revision
+            local main_head
             inspect_err="$(mktemp)"
             if ! revision="$(
               docker buildx imagetools inspect "${repository}:latest" \
@@ -822,11 +867,21 @@ jobs:
               echo "::notice::${repository}:latest carries no readable revision label"
               return 0
             fi
-            if ! is_ancestor "$revision" "$SOURCE_SHA"; then
-              echo "::notice::${repository}:latest names ${revision}, which is not an ancestor of ${SOURCE_SHA}; leaving latest unchanged"
-              echo "\`latest\` unchanged in ${repository}: it names \`${revision}\`." >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+            if is_ancestor "$revision" "$SOURCE_SHA"; then
+              return 0
             fi
+            main_head="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+            if [[ ! "$main_head" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::could not resolve the current head of main" >&2
+              exit 1
+            fi
+            if ! is_ancestor "$revision" "$main_head"; then
+              echo "::warning::${repository}:latest names ${revision}, which is not on main's history; treating latest as absent"
+              return 0
+            fi
+            echo "::notice::${repository}:latest names ${revision}, which is newer than ${SOURCE_SHA}; leaving latest unchanged"
+            echo "\`latest\` unchanged in ${repository}: it names the newer \`${revision}\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           }
 
           # `latest` must name exactly the verified digest. A mismatch stops the

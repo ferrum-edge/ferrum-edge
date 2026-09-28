@@ -28,7 +28,8 @@ A merge to `main` additionally packages the tested Linux amd64 binaries into an
 image artifact. CI itself does not publish to Docker Hub, GHCR, or GitHub
 Releases. After a `main` push CI run succeeds, the separate **Main Latest
 Image** workflow publishes a signed `main-<sha>` image for that commit and moves
-the `latest` container tag forward to it; see
+the `latest` container tag forward to it. Its runs are serialized and only the
+newest waiting commit is built, so intermediate commits may get no image; see
 [Main latest image](#main-latest-image).
 
 Production publishing starts from **Start Production Release**
@@ -55,7 +56,7 @@ adding, removing, or materially changing a workflow.
 | `fips-build.yml` | FIPS Build Policy | PRs, `merge_group`, push to `main`, manual | Required FIPS feature-graph audit plus compile/clippy/handshake gate. Warm PR target <=30 minutes (p95 <=45); see [CI runtime caching](#ci-runtime-caching-production-images-and-fips). |
 | `release-dispatch.yml` | Start Production Release | Manual version input | Validate the selected main SHA and create its version tag. |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
-| `main-latest-image.yml` | Main Latest Image | `workflow_run` of CI on `main` (successful `push` runs only) | Builds the CI-validated `main` commit, pushes and signs `main-<sha>`, then moves `latest` forward to it while that commit is on main's history and newer than the commit `latest` names. Never touches version tags. See [Main latest image](#main-latest-image). |
+| `main-latest-image.yml` | Main Latest Image | `workflow_run` of CI on `main` (successful `push` runs only) | Serialized: builds the newest waiting CI-validated `main` commit (intermediate commits may be skipped), pushes and signs `main-<sha>`, then moves `latest` forward to it while that commit is on main's history and newer than the commit `latest` names. Never touches version tags. See [Main latest image](#main-latest-image). |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
@@ -3029,13 +3030,15 @@ docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 The `latest` container tag follows `main` (owner decision 2026-09-28, reversing
 the 2026-09-19 retirement): it moves forward to the newest `main` commit whose
 push CI passed and whose image was then built, signed, and verified, and never
-moves backwards. It trails `main` by at least one image build. It is a moving
-development channel, not a release: it may carry unreleased and breaking
-changes, and is not a supported upgrade or security-update channel. Every such
-commit also gets a `main-<40-character-sha>` tag, built once and reused on
-re-runs. Versioned releases never move `latest`, and the `latest` publisher
-never touches version tags. An image reference without a tag implicitly selects
-`latest`.
+moves backwards. It trails `main` by at least one image build, and it may skip
+intermediate commits: publisher runs are serialized and only the newest waiting
+commit is built. It is a moving development channel, not a release: it may
+carry unreleased and breaking changes, and is not a supported upgrade or
+security-update channel. Each commit that is built also gets a
+`main-<40-character-sha>` tag, built once and reused on re-runs; a skipped
+commit gets none. Versioned releases never move `latest`, and the `latest`
+publisher never touches version tags. An image reference without a tag
+implicitly selects `latest`.
 
 For production, pin a completed published version (`vX.Y.Z` or `X.Y.Z`) or an
 image digest. The `X.Y` alias is published by the version-tag workflow and moves
@@ -3277,55 +3280,70 @@ integration testing. Pin `vX.Y.Z` or a digest for production;
 runs on `main`. Its first job proceeds only when the triggering run concluded
 `success`, was a `push` event on `main` from `.github/workflows/ci.yml`, and
 belongs to this repository. A pull request, merge group, manual CI run, fork,
-failed or cancelled run publishes nothing. The build checks out exactly
-`github.event.workflow_run.head_sha` and fails if the checkout differs.
+failed or cancelled run publishes nothing. The build fetches exactly
+`github.event.workflow_run.head_sha`.
 
-**`main-<sha>` for every commit.** `resolve` publishes only when the
-CI-validated SHA is an ancestor of (or equal to) both the commit that supplied
-the running workflow definition and the current head of `main`, read from the
-GitHub compare API. A commit that was removed from `main` publishes nothing;
-every other successful `main` commit gets its `main-<sha>` tag, even when
-`main` has already moved on. Runs are grouped per triggering workflow path,
-event, conclusion, and commit with `cancel-in-progress: false`, so different
-commits build in parallel and a re-run of the same commit waits for the first
-run instead of displacing it.
+**One publisher at a time; intermediate commits may be skipped.** Every run
+that can publish shares one workflow-level concurrency group, keyed on the
+repository and the triggering workflow path (plus the event and conclusion, so
+a failed or pull-request CI completion lands in a different group and cannot
+displace a waiting publisher), with `cancel-in-progress: false`. GitHub then
+keeps one running publisher and only the newest waiting one: when a newer
+commit's CI succeeds while an older commit is still waiting, the older run is
+cancelled before it starts. So `main-<sha>` exists for every commit that gets
+built, not for every commit, and `latest` may skip intermediate commits. This
+bounds the cost to one from-source build pair at a time, however fast `main`
+moves. `resolve` publishes only when the CI-validated SHA is an ancestor of (or
+equal to) both the commit that supplied the running workflow definition and the
+current head of `main`, read from the GitHub compare API; a commit that was
+removed from `main` publishes nothing.
+
+A waiting run is replaced by whichever qualifying run is queued after it, not
+necessarily by a newer commit. Re-running an old commit's CI, or re-running the
+publisher, queues a run that replaces a waiting newer one. The old run cannot
+move `latest` backwards (see below), so `latest` then lags until the next green
+merge to `main`.
 
 **`latest` only moves forward.** `promote` moves `latest` only when (a) the
 commit is still an ancestor of, or equal to, the current head of `main`, and
 (b) the commit that `latest` currently names, read from the
-`org.opencontainers.image.revision` label that the build sets, is an ancestor
-of, or equal to, this commit. A missing `latest`, or one without a readable
-revision label (such as the image left over from the 2026-09-19 retirement),
-does not block the move. Both checks run again immediately before each
-registry's move, in the same step. Every `promote` job shares one
-repository-wide concurrency group with `cancel-in-progress: false`. A newer
-pending promotion replaces an older pending one, which could only have lost
-check (b) anyway, so the replaced run ends `cancelled` after its `main-<sha>`
-was already published. A run that finishes late therefore leaves `latest` alone
-and cannot move it backwards. If `main` were ever rewound past the commit
-`latest` names, check (b) would keep refusing until an operator re-points
-`latest`.
+`org.opencontainers.image.revision` label that the build sets, is not newer:
+it must be an ancestor of, or equal to, this commit whenever it is itself on
+main's history. A missing `latest`, one without a readable revision label (such
+as the image left over from the 2026-09-19 retirement), and one whose revision
+is not on main's history at all (the compare API reports it diverged from
+main's head, or does not know the commit, for example after a history rewrite)
+do not block the move; the last case also emits a warning annotation. So a
+rewrite of `main` never blocks `latest` forever, and `latest` never moves to a
+commit older than the one it names while that commit is on `main`. Both checks
+run again immediately before each registry's move, in the same step. Because
+publishers never overlap, no other run can move `latest` between a check and
+the move it guards.
 
 **Re-runs.** When both registries already hold `main-<sha>` and its signature
-verifies under this workflow's identity, `resolve` skips `build`, `manifest`,
-and signing; `attest` re-verifies the existing digest and `promote` re-applies
-the ancestry checks. Re-running CI or the publisher therefore never pushes a
-different digest under an existing, signed `main-<sha>`.
+verifies under this workflow's identity, `resolve` skips `build`, `smoke`,
+`manifest`, and signing; `attest` re-verifies the existing digest and `promote`
+re-applies the ancestry checks. Re-running CI or the publisher therefore never
+pushes a different digest under an existing, signed `main-<sha>`.
 
 **Build.** Each run builds the root `Dockerfile` `runtime` target with
 `FEATURES=cloud-secrets` on native `linux/amd64` (`ubuntu-latest`) and
 `linux/arm64` (`ubuntu-24.04-arm`) runners, pushes each platform by digest, and
-assembles one multi-arch manifest. This is the same distroless runtime base,
-environment, entrypoint and labels as the release default image, built the way
+assembles one multi-arch manifest. BuildKit fetches the source itself from
+`https://github.com/ferrum-edge/ferrum-edge.git#<sha>`, so the credentialed
+build job never checks out the repository, and `github-token: ""` keeps the job
+token out of the build. This is the same distroless runtime base, environment,
+entrypoint and labels as the release default image, built the way
 `release.yml` builds its `-ebpf` families. The release default image instead
 packages the release binaries (x86_64 from the pinned GNU sysroot, ARM64 from
 the isolated Cross build); only `release.yml` may produce those, because the
 trusted Cross policy forbids a second Cross producer. The `-ebpf` and
 `-ebpf-tools` variants are not published from `main`; use a release for those.
 
-**Smoke.** Each platform image runs `ferrum-edge version --json` by digest on
-its native runner right after it is pushed, before its digest can reach a
-manifest, so an image that cannot start never reaches `main-<sha>` or `latest`.
+**Smoke.** The `smoke` job runs `ferrum-edge version --json` from each pushed
+platform image, by digest, on its native runner before `manifest` creates
+`main-<sha>`, so an image that cannot start never reaches `main-<sha>` or
+`latest`. It pulls the image anonymously from Docker Hub.
 
 **Tags.** A run pushes at most two tags per registry: `main-<40-character-sha>`
 and `latest`. It never creates or moves `vX.Y.Z`, `X.Y.Z`, `X.Y`, or `-ebpf*`
@@ -3345,35 +3363,59 @@ those references, moves Docker Hub first and GHCR second, and checks each
 registry's `latest` digest right after its move. A mismatch fails the run before
 the next registry moves.
 
+The identity pins the workflow **path and ref**
+(`main-latest-image.yml@refs/heads/main`), not the workflow file's commit:
+verification does not pass `--certificate-github-workflow-sha`. A signature
+made by any past revision of this workflow on `main` therefore verifies. That is
+deliberate, because a re-run reuses a `main-<sha>` that an earlier revision
+signed, and it is sound because every revision of the workflow on `main`
+passed the contract below. To bind a signature to one workflow revision, add
+`--certificate-github-workflow-sha <workflow commit>` to `cosign verify`.
+
 **Unsigned `main-<sha>` after a failure.** `main-<sha>` is pushed before it is
 signed, so a run that fails between `manifest` and signing leaves an unsigned
 `main-<sha>` tag behind. `latest` never points at it, and a re-run rebuilds and
 replaces it, but until then the tag exists unsigned. Consumers must verify the
 signature (below) rather than trust a `main-<sha>` tag.
 
-**Permissions and credentials.** The workflow default is `contents: read`.
-`resolve` holds `contents: read` + `packages: read` (to inspect and verify an
-existing GHCR `main-<sha>`); `build`, `manifest`, and `promote` hold
-`contents: read` + `packages: write`; only `attest` holds `id-token: write`
-(with `packages: write`). It uses the same `DOCKERHUB_USERNAME` /
-`DOCKERHUB_TOKEN` repository secrets and `GITHUB_TOKEN` as `release.yml`, with no
-deployment environment (release uses none). Every action is pinned to the same
-full commit SHA as in `release.yml`, and event data reaches shell only through
-`env:`.
+**Credential isolation.** Repository code and registry credentials never share
+a job:
+
+| Job | Checks out or runs repository code | Credentials |
+| --- | --- | --- |
+| `resolve` | No (GitHub API and registry reads only) | `contents: read` + `packages: read`; GHCR read login; Docker Hub read anonymously |
+| `contract` | Checks out the running workflow's commit and runs the verifier with `python3 -I` | `contents: read` only; no secret, no login |
+| `build` | No checkout; BuildKit fetches the commit and runs the `Dockerfile` inside its own containers | `contents: read` + `packages: write`, Docker Hub token |
+| `smoke` | Runs the built image | `contents: read` only; no secret, no login |
+| `manifest`, `promote` | No | `contents: read` + `packages: write`, Docker Hub token |
+| `attest` | No (runs only the digest-pinned Syft image) | `id-token: write` + `packages: write`, Docker Hub token |
+
+`python3 -I` keeps the checkout's `.github/scripts/` off `sys.path` and ignores
+`PYTHON*` variables, so a planted module next to the verifier cannot run in its
+place. Code running in `contract` could write `$GITHUB_ENV` or `$GITHUB_PATH`,
+or leave a process behind, but only within that credential-free job. The
+workflow uses the same `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repository
+secrets and `GITHUB_TOKEN` as `release.yml`, with no deployment environment
+(release uses none). Every action is pinned to the same full commit SHA as in
+`release.yml`, and event data reaches shell only through `env:`.
 
 **Contract.** `.github/scripts/verify_main_latest_image_workflow.py` pins all
 of the above: trigger, gate conditions, the ancestry helper and every history
-check, the reuse rule, both concurrency groups, per-job permissions, allowed
-secrets (matched case-insensitively), action pins matching release.yml, build
-parity, the smoke run, the attest-then-sign order, the verify step's identity
-and issuer, the exact tag set per job, the invoked gate sequence in `promote`,
-`latest` created only from the verified references, and the absence of version
-or eBPF tags. Its `--self-test` mutates the checked-in workflow and requires
-each regression to be rejected, the signing and gate mutations for their own
-specific reason. `verify_required_ci.py` runs both modes, so the required
-`Tests` check and `Trusted Policy Candidate` enforce it; the publisher also
-re-runs it from the running workflow's commit, before any registry login.
-The workflow and its verifier are CODEOWNERS-protected like `release.yml`.
+check, the reuse rule, the single concurrency group, per-job permissions and
+`needs`, downstream conditions that require every needed job to have succeeded,
+the credential isolation (no checkout, interpreter, git, repository script, or
+built-image run in a credentialed job; no credential in `contract` or `smoke`;
+`python3 -I` everywhere), allowed secrets (matched case-insensitively), action
+pins matching release.yml, build parity and the Git build context, the smoke
+run, the attest-then-sign order, the verify step's identity and issuer, the
+exact tag set per job, the invoked gate sequence in `promote`, `latest` created
+only from the verified references, and the absence of version or eBPF tags. Its
+`--self-test` mutates the checked-in workflow and requires each regression to
+be rejected, most of them for their own specific reason. `verify_required_ci.py`
+runs both modes, so the required `Tests` check and `Trusted Policy Candidate`
+enforce it; the publisher's credential-free `contract` job also re-runs it from
+the running workflow's commit before anything is built or signed. The workflow
+and its verifier are CODEOWNERS-protected like `release.yml`.
 
 To verify a `latest` image, resolve it to a digest and verify that digest (not
 the tag). The signing identity is the workflow on `refs/heads/main`:

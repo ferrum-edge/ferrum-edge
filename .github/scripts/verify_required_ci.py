@@ -40,6 +40,9 @@ from pr_ci_plan import (
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
 )
+from validate_migrate_k8s_contract import (
+    run_self_test as published_image_tags_self_test,
+)
 from verify_coverage_workflow import (
     main as coverage_workflow_main,
 )
@@ -2228,6 +2231,7 @@ def main() -> int:
         planner_errors.append("main latest image publisher self-test failed")
     if main_latest_image_workflow_main([]) != 0:
         planner_errors.append("main latest image publisher contract failed")
+    planner_errors.extend(published_image_tags_self_test())
     if ci_runtime_cache_main(["--self-test"]) != 0:
         planner_errors.append("CI runtime cache contract self-test failed")
     if ci_runtime_cache_main([]) != 0:

@@ -22,14 +22,17 @@ keylessly signed with Cosign and attested with SLSA provenance and SPDX SBOMs.
 | `vX.Y.Z`, `X.Y.Z` | No | `release.yml` on a version tag | Production (or pin the digest) |
 | `X.Y` | Within the release series | `release.yml` on a version tag | Tracking patch releases of one series |
 | `vX.Y.Z-ebpf`, `vX.Y.Z-ebpf-tools` (and `X.Y.Z` / `X.Y` forms) | As above | `release.yml` on a version tag | Mesh node-agent / NodeWaypoint / Ambient UDP capture |
-| `latest` | Forward only, to the newest `main` commit whose CI passed and whose image was signed | `main-latest-image.yml` | Evaluation and development only |
-| `main-<40-character-sha>` | No: built once per `main` commit whose CI passed; re-runs reuse the signed image | `main-latest-image.yml` | Reproducing a specific `main` build |
+| `latest` | Forward only, to the newest `main` commit whose CI passed and whose image was built and signed; may skip intermediate commits | `main-latest-image.yml` | Evaluation and development only |
+| `main-<40-character-sha>` | No: built once for each `main` commit that the publisher builds (not every commit); re-runs reuse the signed image | `main-latest-image.yml` | Reproducing a specific `main` build |
 
 `latest` is a moving development channel, not a release: it moves forward to
 the newest `main` commit whose push CI succeeded and whose image was then built,
 signed, and verified, never backwards, and trails `main` by at least one image
-build. It can carry unreleased or breaking changes and is not a security-update
-channel. A run that fails before signing can leave an unsigned `main-<sha>` tag
+build. Publisher runs are serialized and only the newest waiting commit is
+built, so `latest` may skip intermediate commits, and `main-<sha>` exists only
+for commits that were built. It can carry unreleased or breaking changes and is
+not a security-update channel. A run that fails before signing can leave an
+unsigned `main-<sha>` tag
 until a re-run replaces it, so verify the signature of any `latest` or
 `main-<sha>` digest you pull. An image reference without a tag
 selects `latest`, so production deployments should always pin a published

@@ -279,16 +279,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact commit from the root `Dockerfile` for `linux/amd64` and `linux/arm64`,
   smoke-runs each platform image, pushes a `main-<sha>` tag to Docker Hub and
   GHCR, attests and signs it (Cosign, SLSA provenance, SPDX SBOMs), and then
-  moves `latest` to that verified digest. Every such commit that is still on
-  `main` gets its `main-<sha>`, built once: a re-run reuses the signed image.
-  `latest` moves only forward: the commit must still be on main's history, and
-  the commit `latest` currently names must be its ancestor, both re-checked
-  immediately before each registry's move, so a late run never moves `latest`
-  backwards. A run that fails before signing can leave an unsigned `main-<sha>`
-  until a re-run replaces it, so verify signatures. `latest` is a development
-  channel, not a release: pin `vX.Y.Z` or a digest in production. Version tags,
-  the `-ebpf` variants, and GitHub Releases are unchanged, and
-  `FERRUM_INJECTOR_SIDECAR_IMAGE` still refuses `latest`.
+  moves `latest` to that verified digest. Runs are serialized and only the
+  newest waiting commit is built, so `latest` may skip intermediate commits and
+  `main-<sha>` exists only for built commits, each built once: a re-run reuses
+  the signed image. `latest` moves only forward: the commit must still be on
+  main's history, and the commit `latest` currently names must be its ancestor
+  whenever it is on main's history, both re-checked immediately before each
+  registry's move, so a late run never moves `latest` backwards. Jobs that
+  hold registry credentials never check out or run repository code: the
+  contract check and the image smoke run in credential-free jobs, and the build
+  fetches the commit inside BuildKit. A run that fails before signing can leave
+  an unsigned `main-<sha>` until a re-run replaces it, so verify signatures.
+  `latest` is a development channel, not a release: pin `vX.Y.Z` or a digest
+  in production. Version tags, the `-ebpf` variants, and GitHub Releases are
+  unchanged, and `FERRUM_INJECTOR_SIDECAR_IMAGE` still refuses `latest`.
   `verify_main_latest_image_workflow.py` pins the publisher contract in the
   required `Tests` check, and both files are CODEOWNERS-protected.
 

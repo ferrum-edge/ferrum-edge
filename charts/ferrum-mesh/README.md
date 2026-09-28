@@ -23,8 +23,10 @@ When `image.tag` is empty the chart defaults to `Chart.appVersion`. That tag
 must exist in the container registry before install. Override with a published
 tag from `docker.io/ferrumedge/ferrum-edge` or `ghcr.io/ferrum-edge/ferrum-edge`
 (for example `--set image.tag=<published-tag>`). The registry's `latest` tag is
-a moving development build of the newest `main` commit that passed CI, not a
-release; the mesh injector refuses it for `FERRUM_INJECTOR_SIDECAR_IMAGE`.
+a moving development build of the newest built `main` commit that passed CI
+(intermediate commits may be skipped; only built commits get a `main-<sha>`
+tag), not a release; the mesh injector refuses it for
+`FERRUM_INJECTOR_SIDECAR_IMAGE`.
 
 ## Private registries
 

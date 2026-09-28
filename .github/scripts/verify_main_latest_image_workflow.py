@@ -8,23 +8,31 @@ commit whose push CI succeeded. This verifier pins the fail-closed shape of
 * it is triggered only by completed CI runs on `main`, and its first job
   proceeds only for a successful `push` run of ci.yml in this repository;
 * nothing is published unless the CI-validated commit is on main's history,
-  and `latest` moves only while that still holds and only forward: the commit
-  `latest` names now must be an ancestor of this one. Both checks run again,
-  through pinned helpers that are actually invoked, immediately before each
-  registry's move;
-* publishers are serialized per commit, every move of `latest` is serialized
-  repository-wide, and cancel-in-progress is disabled for both;
+  and `latest` moves only while that still holds and only forward: when the
+  commit `latest` names now is on main's history, it must be an ancestor of
+  this one. Both checks run again, through pinned helpers that are actually
+  invoked, immediately before each registry's move;
+* every run that can publish shares one workflow-level concurrency group with
+  cancel-in-progress disabled, so publishers and moves of `latest` never
+  overlap;
 * an already signed `main-<sha>` is reused rather than rebuilt, and only after
-  its signature verifies under the pinned signing identity;
-* every job holds exactly its least-privilege permissions, and only the
-  release registry secrets are referenced;
+  its signature verifies under the pinned signing identity, in a job that
+  never checks out the repository and reads Docker Hub anonymously;
+* credential isolation: only the credential-free `contract` and `smoke` jobs
+  check out or execute repository code, `contract` runs Python only as
+  `python3 -I`, and no job holding a secret or a registry token checks out the
+  repository, runs a repository script, or runs the built image;
+* every job holds exactly its least-privilege permissions, the downstream jobs
+  require every needed job to have succeeded, and only the release registry
+  secrets are referenced;
 * every remote action is pinned by full commit SHA to the same pin release.yml
   uses, and no workflow expression is interpolated into a shell body;
 * only the `main-<sha>` tags and `latest` are pushed, never a version tag or an
-  eBPF variant. Each platform image is smoke-run before its digest is
-  exported; the digest is attested and then signed, verified under the pinned
-  identity and issuer, and `latest` is created only from the digest reference
-  that the verify step exported, then checked to resolve to it.
+  eBPF variant. The build runs from the public Git URL of the CI-validated
+  commit, each platform image is smoke-run by digest before the manifest, and
+  the digest is attested and then signed, verified under the pinned identity
+  and issuer, and `latest` is created only from the digest reference that the
+  verify step exported, then checked to resolve to it.
 
 It reads files only; it does not contact a registry or execute the workflow.
 """
@@ -52,33 +60,37 @@ EXPECTED_ON = (
     "    branches:\n"
     "      - main\n"
 )
+# One group for every run that can publish; runs for other events or
+# conclusions land in other groups and cannot displace a waiting publisher.
 EXPECTED_CONCURRENCY = (
     "concurrency:\n"
-    "  group: main-latest-image-${{ github.event.workflow_run.path }}-"
-    "${{ github.event.workflow_run.event }}-${{ github.event.workflow_run.conclusion }}-"
-    "${{ github.event.workflow_run.head_sha }}\n"
+    "  group: main-latest-image-${{ github.repository }}-"
+    "${{ github.event.workflow_run.path }}-${{ github.event.workflow_run.event }}-"
+    "${{ github.event.workflow_run.conclusion }}\n"
     "  cancel-in-progress: false\n"
-)
-PROMOTE_CONCURRENCY = (
-    "    concurrency:\n"
-    "      group: main-latest-image-promote\n"
-    "      cancel-in-progress: false\n"
 )
 EXPECTED_TOP_PERMISSIONS = "permissions:\n  contents: read\n"
 EXPECTED_JOB_PERMISSIONS = {
     "resolve": {"contents": "read", "packages": "read"},
+    "contract": {"contents": "read"},
     "build": {"contents": "read", "packages": "write"},
+    "smoke": {"contents": "read"},
     "manifest": {"contents": "read", "packages": "write"},
     "attest": {"id-token": "write", "packages": "write"},
     "promote": {"contents": "read", "packages": "write"},
 }
 EXPECTED_NEEDS = {
     "resolve": None,
-    "build": "resolve",
-    "manifest": "[resolve, build]",
-    "attest": "[resolve, manifest]",
-    "promote": "[resolve, attest]",
+    "contract": "resolve",
+    "build": "[resolve, contract]",
+    "smoke": "[resolve, build]",
+    "manifest": "[resolve, build, smoke]",
+    "attest": "[resolve, contract, manifest]",
+    "promote": "[resolve, contract, attest]",
 }
+# The only jobs that may check out or execute repository code. They hold no
+# secret, no registry login, and no token beyond `contents: read`.
+CREDENTIAL_FREE_JOBS = frozenset({"contract", "smoke"})
 RESOLVE_CONDITIONS = (
     "github.repository == 'ferrum-edge/ferrum-edge'",
     "github.event.workflow_run.conclusion == 'success'",
@@ -89,18 +101,23 @@ RESOLVE_CONDITIONS = (
 )
 BUILD_GATE = "needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.build == 'true'"
 # `manifest` is skipped when `resolve` reuses a signed `main-<sha>`, so the two
-# downstream jobs replace the implicit success() with explicit result checks.
+# downstream jobs replace the implicit success() with explicit result checks
+# that name every needed job.
 EXPECTED_JOB_IFS = {
+    "contract": "needs.resolve.outputs.publish == 'true'",
     "build": BUILD_GATE,
+    "smoke": BUILD_GATE,
     "manifest": BUILD_GATE,
     "attest": (
-        "${{ !cancelled() && needs.resolve.outputs.publish == 'true' && "
+        "${{ !cancelled() && needs.resolve.result == 'success' && "
+        "needs.contract.result == 'success' && needs.resolve.outputs.publish == 'true' && "
         "(needs.manifest.result == 'success' || "
         "(needs.manifest.result == 'skipped' && needs.resolve.outputs.build == 'false')) }}"
     ),
     "promote": (
-        "${{ !cancelled() && needs.resolve.outputs.publish == 'true' && "
-        "needs.attest.result == 'success' }}"
+        "${{ !cancelled() && needs.resolve.result == 'success' && "
+        "needs.contract.result == 'success' && needs.attest.result == 'success' && "
+        "needs.resolve.outputs.publish == 'true' }}"
     ),
 }
 RESOLVE_OUTPUTS = (
@@ -121,22 +138,31 @@ PROMOTE_ENV = (
 HEAD_LOOKUP = 'gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main"'
 WORKFLOW_SHA_COMPARE = 'if ! is_ancestor "$SOURCE_SHA" "$GITHUB_SHA"; then'
 HEAD_COMPARE = 'if ! is_ancestor "$SOURCE_SHA" "$main_head"; then'
-LATEST_COMPARE = 'if ! is_ancestor "$revision" "$SOURCE_SHA"; then'
+LATEST_FORWARD = 'if is_ancestor "$revision" "$SOURCE_SHA"; then'
+# A revision that is not on main's history cannot be newer: warn and move.
+LATEST_ORPHAN = 'if ! is_ancestor "$revision" "$main_head"; then'
 DIGEST_COMPARE = 'if [ "$actual" != "${expected_ref#*@}" ]; then'
 # GitHub's compare reports `ahead` or `identical` exactly when base is an
-# ancestor of, or equal to, head. Any other answer must stop the run.
+# ancestor of, or equal to, head, and 404 when a commit is unknown to the
+# repository. Any other answer must stop the run.
 IS_ANCESTOR = (
     "          is_ancestor() {\n"
     '            local base="$1"\n'
     '            local head="$2"\n'
     "            local status\n"
+    "            local compare_err\n"
+    '            compare_err="$(mktemp)"\n'
     '            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${base}...${head}'
-    "?per_page=1\" --jq '.status' || true)\"\n"
+    "?per_page=1\" --jq '.status' 2>\"$compare_err\" || true)\"\n"
+    "            if grep -q 'HTTP 404' \"$compare_err\"; then\n"
+    '              status="missing"\n'
+    "            fi\n"
     '            case "$status" in\n'
     "              ahead | identical) return 0 ;;\n"
-    "              behind | diverged) return 1 ;;\n"
+    "              behind | diverged | missing) return 1 ;;\n"
     "              *)\n"
     '                echo "::error::could not compare ${base} with ${head}" >&2\n'
+    '                cat "$compare_err" >&2\n'
     "                exit 1\n"
     "                ;;\n"
     "            esac\n"
@@ -223,10 +249,24 @@ PROMOTE_SOURCES = {
     '"ferrumedge/ferrum-edge:latest"': '"$DOCKER_REF"',
     '"ghcr.io/${GITHUB_REPOSITORY}:latest"': '"$GHCR_REF"',
 }
+# Only `contract` checks out the repository: the running workflow's own commit.
 CHECKOUT_REFS = {
-    "resolve": "ref: ${{ github.sha }}",
-    "build": "ref: ${{ needs.resolve.outputs.sha }}",
+    "contract": "ref: ${{ github.sha }}",
 }
+# The whole `contract` script: both verifier modes, isolated from the checkout.
+CONTRACT_RUN = (
+    "          set -euo pipefail\n"
+    "          python3 -I .github/scripts/verify_main_latest_image_workflow.py --self-test\n"
+    "          python3 -I .github/scripts/verify_main_latest_image_workflow.py"
+)
+# BuildKit fetches the CI-validated commit from the public repository, so the
+# credentialed build never checks out the repository, and the empty token keeps
+# the job token out of the build (no GIT_AUTH_TOKEN secret to mount).
+BUILD_CONTEXT = (
+    "          context: https://github.com/ferrum-edge/ferrum-edge.git"
+    "#${{ needs.resolve.outputs.sha }}\n"
+)
+BUILD_GIT_TOKEN = '          github-token: ""\n'
 IMMUTABLE_TAGS = [
     '"ferrumedge/ferrum-edge:main-${SOURCE_SHA}"',
     '"ghcr.io/${GITHUB_REPOSITORY}:main-${SOURCE_SHA}"',
@@ -242,8 +282,6 @@ SYFT_IMAGE = (
     "9a9f85314017f1ea798fb012edfa7fe9259923910f82c8d4bc983ab5c765e60b"
 )
 BUILD_PARITY_LINES = (
-    "          context: .\n",
-    "          file: Dockerfile\n",
     "          target: runtime\n",
     "            FEATURES=cloud-secrets\n",
     "          provenance: false\n",
@@ -269,6 +307,13 @@ FORBIDDEN_ACTIVE_TEXT = (
     ("docker tag", "images are tagged only by imagetools create"),
 )
 PROMOTE_FORBIDDEN = ("unset ", "alias ", "set +e")
+# Commands that would run repository code on a credentialed host: an
+# interpreter, a build tool, git, or a repository-relative path.
+REPOSITORY_EXECUTION = re.compile(
+    r"(?<![\w./$-])(?:python[0-9.]*|bash|sh|source|make|cargo|npm|npx|node|pip[0-9]*|git)"
+    r"(?![\w.+-])|\.github/scripts|(?<![\w.}$-])\./"
+)
+PYTHON_INVOCATION = re.compile(r"(?<![\w./-])python[0-9.]*(?![\w.-])(?P<flag> -I )?")
 REMOTE_USES = re.compile(r"^\s*(?:-\s+)?uses:\s*(?P<ref>[^\s#]+)", re.MULTILINE)
 PINNED_REF = re.compile(r"^(?P<name>[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@(?P<sha>[0-9a-f]{40})$")
 RUN_KEY = re.compile(r"^(?P<indent>\s*)(?:-\s+)?run:\s*(?P<value>.*)$")
@@ -292,7 +337,10 @@ REUSE_MESSAGE = (
     "jobs.resolve may skip the build only after verifying a signed main-<sha> in both "
     "registries"
 )
-SMOKE_MESSAGE = "jobs.build must smoke-run each pushed platform image before exporting its digest"
+SMOKE_MESSAGE = (
+    "jobs.smoke must run each pushed platform image by its downloaded digest, "
+    "unconditionally, before jobs.manifest"
+)
 SIGN_MESSAGE = (
     "jobs.attest must attest provenance and SBOMs and then sign each registry's digest "
     "whenever it built one"
@@ -318,12 +366,42 @@ PROMOTE_ON_MAIN_MESSAGE = (
 PROMOTE_BACKWARDS_MESSAGE = (
     "jobs.promote must leave latest unchanged when it already names a newer commit"
 )
+PROMOTE_ORPHAN_MESSAGE = (
+    "jobs.promote must warn and move latest when the commit it names is not on "
+    "main's history, instead of blocking forever"
+)
 PROMOTE_DIGEST_MESSAGE = (
     "jobs.promote must fail when latest does not resolve to the verified digest"
 )
-PROMOTE_CONCURRENCY_MESSAGE = (
-    "jobs.promote must serialize every move of latest without cancelling a running move"
+RESOLVE_LAST_STEP_MESSAGE = (
+    "jobs.resolve must end with its `id: existing` step, so build=false is its final output"
 )
+RESOLVE_ANONYMOUS_MESSAGE = (
+    "jobs.resolve must read Docker Hub anonymously: no Docker Hub credential and "
+    "only the GHCR read login"
+)
+CONTRACT_MESSAGE = (
+    "jobs.contract must check out the running workflow's commit and run exactly both "
+    "verifier modes with `python3 -I`"
+)
+BUILD_CONTEXT_MESSAGE = (
+    "jobs.build must build from the public Git URL pinned to the CI-validated commit "
+    'with github-token: ""'
+)
+CHECKOUT_MESSAGE = "must not check out the repository: it holds registry credentials"
+CREDENTIAL_FREE_MESSAGE = (
+    "runs repository code, so it must hold no secret, registry login, or token "
+    "beyond contents: read"
+)
+REPOSITORY_EXECUTION_MESSAGE = (
+    "holds registry credentials, so its shell must not run an interpreter, git, "
+    "a build tool, or a repository script"
+)
+IMAGE_RUN_MESSAGE = (
+    "holds registry credentials, so it may run only the pinned Syft image, never the "
+    "built image"
+)
+PYTHON_ISOLATION_MESSAGE = "every Python invocation must be `python3 -I`"
 
 
 def active_text(text: str) -> str:
@@ -523,6 +601,33 @@ def release_action_pins(release_text: str) -> dict[str, set[str]]:
     return pins
 
 
+def credential_isolation_errors(job_name: str, block: str) -> list[str]:
+    """Repository code and registry credentials never share a job."""
+
+    job_active = active_text(block)
+    permissions = job_permissions(block) or {}
+    credentialed = (
+        any(scope != "contents" for scope in permissions)
+        or any(level != "read" for level in permissions.values())
+        or SECRET_REFERENCE.search(job_active) is not None
+        or "docker/login-action@" in job_active
+    )
+    if job_name in CREDENTIAL_FREE_JOBS:
+        if credentialed:
+            return [f"jobs.{job_name} {CREDENTIAL_FREE_MESSAGE}"]
+        return []
+
+    failures: list[str] = []
+    for body in run_bodies(block):
+        script = re.sub(r"\\\n\s*", " ", active_text(body))
+        if REPOSITORY_EXECUTION.search(script):
+            failures.append(f"jobs.{job_name} {REPOSITORY_EXECUTION_MESSAGE}")
+        for line in script.splitlines():
+            if "docker run" in line and SYFT_IMAGE not in line:
+                failures.append(f"jobs.{job_name} {IMAGE_RUN_MESSAGE}")
+    return failures
+
+
 def validate_resolve(block: str, active: str) -> list[str]:
     failures: list[str] = []
     if RESOLVE_OUTPUTS not in block:
@@ -552,14 +657,15 @@ def validate_resolve(block: str, active: str) -> list[str]:
         failures.append("publish=true must be emitted by exactly one guarded statement")
 
     steps = step_blocks(block)
-    contract = [
-        index
-        for index, step in enumerate(steps)
-        if "verify_main_latest_image_workflow.py --self-test" in step
-    ]
-    logins = [index for index, step in enumerate(steps) if "docker/login-action@" in step]
-    if len(contract) != 1 or (logins and min(logins) < contract[0]):
-        failures.append("jobs.resolve must verify the publisher contract before any registry login")
+    logins = [step for step in steps if "docker/login-action@" in step]
+    if (
+        "DOCKERHUB" in active_text(block)
+        or len(logins) != 1
+        or "registry: ghcr.io" not in logins[0]
+    ):
+        failures.append(RESOLVE_ANONYMOUS_MESSAGE)
+    if not steps or "\n        id: existing" not in steps[-1]:
+        failures.append(RESOLVE_LAST_STEP_MESSAGE)
 
     job_active = active_text(block)
     if "cosign sign" in job_active or "cosign attest" in job_active:
@@ -585,21 +691,48 @@ def validate_resolve(block: str, active: str) -> list[str]:
     return failures
 
 
+def validate_contract(block: str) -> list[str]:
+    steps = step_blocks(block)
+    if (
+        len(steps) != 2
+        or "actions/checkout@" not in steps[0]
+        or [body.rstrip() for body in run_bodies(block)] != [CONTRACT_RUN]
+    ):
+        return [CONTRACT_MESSAGE]
+    return []
+
+
 def validate_build(block: str) -> list[str]:
     failures: list[str] = []
     for line in BUILD_PARITY_LINES:
         if line not in block:
             failures.append(f"jobs.build must keep {line.strip()!r} (release build parity)")
+    if (
+        block.count(BUILD_CONTEXT) != 1
+        or block.count(BUILD_GIT_TOKEN) != 1
+        or len(re.findall(r"^\s+context:", block, re.MULTILINE)) != 1
+        or len(re.findall(r"^\s+github-token:", block, re.MULTILINE)) != 1
+    ):
+        failures.append(BUILD_CONTEXT_MESSAGE)
+    return failures
+
+
+def validate_smoke(block: str) -> list[str]:
     steps = step_blocks(block)
+    downloads = [
+        index
+        for index, step in enumerate(steps)
+        if "actions/download-artifact@" in step
+        and "name: main-latest-digest-${{ matrix.arch_dir }}" in step
+    ]
     smoke = [
         index
         for index, step in enumerate(steps)
         if SMOKE_RUN in step and SMOKE_CHECK in step and "\n        if:" not in step
     ]
-    uploads = [index for index, step in enumerate(steps) if "actions/upload-artifact@" in step]
-    if len(smoke) != 1 or len(uploads) != 1 or smoke[0] > uploads[0]:
-        failures.append(SMOKE_MESSAGE)
-    return failures
+    if len(downloads) != 1 or len(smoke) != 1 or downloads[0] > smoke[0]:
+        return [SMOKE_MESSAGE]
+    return []
 
 
 def validate_attest(block: str) -> list[str]:
@@ -652,8 +785,6 @@ def validate_attest(block: str) -> list[str]:
 
 def validate_promote(block: str) -> list[str]:
     failures: list[str] = []
-    if PROMOTE_CONCURRENCY not in block:
-        failures.append(PROMOTE_CONCURRENCY_MESSAGE)
     if any(line not in block for line in PROMOTE_ENV) or (
         block.count("DOCKER_REF:") != 1 or block.count("GHCR_REF:") != 1
     ):
@@ -701,12 +832,24 @@ def validate_promote(block: str) -> list[str]:
     if HEAD_LOOKUP not in on_main or not stale_branch_exits_cleanly(on_main, HEAD_COMPARE):
         failures.append(PROMOTE_ON_MAIN_MESSAGE)
     not_newer = function("require_latest_not_newer")
+    forward = not_newer.find(LATEST_FORWARD)
+    orphan = not_newer.find(LATEST_ORPHAN)
     if (
         "--format '{{json .Image}}'" not in not_newer
         or '"org.opencontainers.image.revision"' not in not_newer
-        or not stale_branch_exits_cleanly(not_newer, LATEST_COMPARE)
+        or not branch_contains(not_newer, LATEST_FORWARD, "return 0")
+        or not not_newer.rstrip().endswith("exit 0")
+        or not 0 <= forward < orphan
     ):
         failures.append(PROMOTE_BACKWARDS_MESSAGE)
+    if (
+        orphan < 0
+        or HEAD_LOOKUP not in not_newer[forward:orphan]
+        or not branch_contains(not_newer, LATEST_ORPHAN, "::warning::")
+        or not branch_contains(not_newer, LATEST_ORPHAN, "return 0")
+        or branch_contains(not_newer, LATEST_ORPHAN, "exit")
+    ):
+        failures.append(PROMOTE_ORPHAN_MESSAGE)
     if not branch_contains(function("require_latest"), DIGEST_COMPARE, "exit 1"):
         failures.append(PROMOTE_DIGEST_MESSAGE)
     verified_ref = function("require_verified_ref")
@@ -738,8 +881,11 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
             failures.append(f"workflow must not contain {needle!r}: {reason}")
     if active.count("cancelled()") != 2:
         failures.append("cancelled() may appear only in the pinned attest and promote conditions")
-    if len(re.findall(r"^\s*concurrency:", active, re.MULTILINE)) != 2:
-        failures.append("only the workflow and jobs.promote may declare concurrency")
+    if len(re.findall(r"^\s*concurrency:", active, re.MULTILINE)) != 1:
+        failures.append("only the workflow may declare concurrency")
+    for python in PYTHON_INVOCATION.finditer(active):
+        if python.group("flag") is None:
+            failures.append(PYTHON_ISOLATION_MESSAGE)
 
     jobs = job_blocks(text)
     if set(jobs) != set(EXPECTED_JOB_PERMISSIONS):
@@ -781,6 +927,7 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
                     "body; pass it through env instead"
                 )
 
+        failures.extend(credential_isolation_errors(job_name, block))
         for step in step_blocks(block):
             if "actions/checkout@" not in step:
                 continue
@@ -788,7 +935,7 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
                 failures.append(f"jobs.{job_name} checkout must not persist credentials")
             expected_ref = CHECKOUT_REFS.get(job_name)
             if expected_ref is None:
-                failures.append(f"jobs.{job_name} must not check out the repository")
+                failures.append(f"jobs.{job_name} {CHECKOUT_MESSAGE}")
             elif expected_ref not in step:
                 failures.append(f"jobs.{job_name} checkout must pin {expected_ref}")
 
@@ -817,7 +964,9 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
             failures.append(f"jobs.{job_name} must not use cosign; only jobs.attest signs")
 
     failures.extend(validate_resolve(jobs["resolve"], active))
+    failures.extend(validate_contract(jobs["contract"]))
     failures.extend(validate_build(jobs["build"]))
+    failures.extend(validate_smoke(jobs["smoke"]))
     failures.extend(validate_attest(jobs["attest"]))
     failures.extend(validate_promote(jobs["promote"]))
 
@@ -892,6 +1041,20 @@ def self_test() -> int:
         )
 
     build_push = "docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc"
+    checkout_step = (
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        "        with:\n"
+        "          ref: ${{ needs.resolve.outputs.sha }}\n"
+        "          persist-credentials: false\n\n"
+    )
+    dockerhub_login = (
+        "      - name: Log in to Docker Hub\n"
+        "        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4\n"
+        "        with:\n"
+        "          username: ${{ secrets.DOCKERHUB_USERNAME }}\n"
+        "          password: ${{ secrets.DOCKERHUB_TOKEN }}\n\n"
+    )
+    contract_step = "      - name: Verify the publisher contract of the running workflow\n"
     ghcr_latest = '            -t "ghcr.io/${GITHUB_REPOSITORY}:latest" \\\n'
     identity_tail = 'main-latest-image.yml@refs/heads/main"'
     other_identity = 'main-latest-image.yml@refs/heads/feature"'
@@ -945,18 +1108,29 @@ def self_test() -> int:
         ),
         "concurrency without the CI workflow path": (
             replace_once(
-                "main-latest-image-${{ github.event.workflow_run.path }}-",
-                "main-latest-image-",
+                "-${{ github.event.workflow_run.path }}-${{ github.event.workflow_run.event }}",
+                "-${{ github.event.workflow_run.event }}",
             ),
             "top-level concurrency: block differs",
         ),
-        "promote cancels a running move": (
+        "per-commit concurrency": (
+            replace_once(
+                "-${{ github.event.workflow_run.conclusion }}\n  cancel-in-progress",
+                "-${{ github.event.workflow_run.conclusion }}-"
+                "${{ github.event.workflow_run.head_sha }}\n  cancel-in-progress",
+            ),
+            "top-level concurrency: block differs",
+        ),
+        "second concurrency group": (
             replace_in_job(
                 "promote",
-                "      cancel-in-progress: false\n",
+                "    timeout-minutes: 10\n",
+                "    timeout-minutes: 10\n"
+                "    concurrency:\n"
+                "      group: main-latest-image-promote\n"
                 "      cancel-in-progress: true\n",
             ),
-            PROMOTE_CONCURRENCY_MESSAGE,
+            "only the workflow may declare concurrency",
         ),
         "running workflow need not contain the commit": (
             replace_in_job("resolve", WORKFLOW_SHA_COMPARE, "if false; then"),
@@ -981,14 +1155,49 @@ def self_test() -> int:
             PROMOTE_ON_MAIN_MESSAGE,
         ),
         "latest may move backwards": (
-            replace_in_job("promote", LATEST_COMPARE, "if false; then"),
+            replace_in_job("promote", LATEST_FORWARD, "if true; then"),
             PROMOTE_BACKWARDS_MESSAGE,
         ),
         "ancestry helper accepts a newer latest": (
             replace_in_job(
-                "promote", "behind | diverged) return 1 ;;", "behind | diverged) return 0 ;;"
+                "promote",
+                "behind | diverged | missing) return 1 ;;",
+                "behind | diverged | missing) return 0 ;;",
             ),
             "jobs.promote must use the pinned is_ancestor helper",
+        ),
+        "resolve history checks use a changed helper": (
+            replace_in_job(
+                "resolve",
+                "behind | diverged | missing) return 1 ;;",
+                "behind | diverged | missing) return 0 ;;",
+            ),
+            "jobs.resolve must use the pinned is_ancestor helper",
+        ),
+        "newer latest falls through to the move": (
+            replace_in_job(
+                "promote",
+                'it names the newer \\`${revision}\\`." >> "$GITHUB_STEP_SUMMARY"\n'
+                "            exit 0\n",
+                'it names the newer \\`${revision}\\`." >> "$GITHUB_STEP_SUMMARY"\n',
+            ),
+            PROMOTE_BACKWARDS_MESSAGE,
+        ),
+        "orphaned latest blocks forever": (
+            replace_in_job(
+                "promote",
+                'treating latest as absent"\n              return 0\n',
+                'treating latest as absent"\n              exit 0\n',
+            ),
+            PROMOTE_ORPHAN_MESSAGE,
+        ),
+        "promote omits the second on-main check": (
+            replace_in_job(
+                "promote",
+                '          require_on_main\n          require_latest_not_newer "ghcr.io/',
+                '          require_latest_not_newer "ghcr.io/',
+            ),
+            "jobs.promote must run 'require_on_main'",
         ),
         "ancestry gate defined but not called": (
             replace_in_job(
@@ -1064,11 +1273,123 @@ def self_test() -> int:
             ),
             "jobs.attest.if must be exactly",
         ),
-        "no image smoke": (
-            cut(
-                "      # Runs the pushed platform image on its native runner",
-                "      - name: Export digest\n",
+        "attest without resolve success": (
+            replace_in_job("attest", "needs.resolve.result == 'success' && ", ""),
+            "jobs.attest.if must be exactly",
+        ),
+        "promote without resolve success": (
+            replace_in_job("promote", "needs.resolve.result == 'success' && ", ""),
+            "jobs.promote.if must be exactly",
+        ),
+        "promote without contract success": (
+            replace_in_job("promote", "needs.contract.result == 'success' && ", ""),
+            "jobs.promote.if must be exactly",
+        ),
+        "reuse step no longer last in resolve": (
+            replace_in_job(
+                "resolve",
+                '            echo "build=true" >> "$GITHUB_OUTPUT"\n          fi\n',
+                '            echo "build=true" >> "$GITHUB_OUTPUT"\n          fi\n\n'
+                "      - name: Late step\n"
+                "        run: echo done\n",
             ),
+            RESOLVE_LAST_STEP_MESSAGE,
+        ),
+        "Docker Hub credential in resolve": (
+            replace_in_job(
+                "resolve",
+                "      # `main-<sha>` is built once.",
+                dockerhub_login + "      # `main-<sha>` is built once.",
+            ),
+            RESOLVE_ANONYMOUS_MESSAGE,
+        ),
+        "checkout in a credentialed job": (
+            replace_in_job(
+                "promote",
+                "    steps:\n      - name: Set up Docker Buildx\n",
+                "    steps:\n" + checkout_step + "      - name: Set up Docker Buildx\n",
+            ),
+            CHECKOUT_MESSAGE,
+        ),
+        "build checks out the repository": (
+            replace_in_job(
+                "build",
+                "    steps:\n      - name: Set up Docker Buildx\n",
+                "    steps:\n" + checkout_step + "      - name: Set up Docker Buildx\n",
+            ),
+            CHECKOUT_MESSAGE,
+        ),
+        "build from a moving branch": (
+            replace_in_job(
+                "build",
+                "ferrum-edge.git#${{ needs.resolve.outputs.sha }}",
+                "ferrum-edge.git#main",
+            ),
+            BUILD_CONTEXT_MESSAGE,
+        ),
+        "build receives the job token": (
+            replace_in_job("build", BUILD_GIT_TOKEN, ""),
+            BUILD_CONTEXT_MESSAGE,
+        ),
+        "repository script in a credentialed job": (
+            replace_in_job(
+                "manifest",
+                "          set -euo pipefail\n          docker buildx imagetools create",
+                "          set -euo pipefail\n"
+                "          bash .github/scripts/stage_iproute2_runtime.sh\n"
+                "          docker buildx imagetools create",
+            ),
+            REPOSITORY_EXECUTION_MESSAGE,
+        ),
+        "interpreter in a credentialed job": (
+            replace_in_job(
+                "promote",
+                "          set -euo pipefail\n\n          require_verified_ref() {",
+                "          set -euo pipefail\n"
+                "          python3 -I -c 'print(1)'\n\n"
+                "          require_verified_ref() {",
+            ),
+            REPOSITORY_EXECUTION_MESSAGE,
+        ),
+        "built image run in a credentialed job": (
+            replace_in_job(
+                "build",
+                '          mkdir -p "$RUNNER_TEMP/digests"\n',
+                '          docker run --rm "ferrumedge/ferrum-edge@${DIGEST}" version\n'
+                '          mkdir -p "$RUNNER_TEMP/digests"\n',
+            ),
+            IMAGE_RUN_MESSAGE,
+        ),
+        "python without isolation": (
+            replace_once(
+                "python3 -I .github/scripts/verify_main_latest_image_workflow.py --self-test",
+                "python3 .github/scripts/verify_main_latest_image_workflow.py --self-test",
+            ),
+            PYTHON_ISOLATION_MESSAGE,
+        ),
+        "contract skips its self-test": (
+            replace_in_job(
+                "contract",
+                "          python3 -I .github/scripts/verify_main_latest_image_workflow.py"
+                " --self-test\n",
+                "",
+            ),
+            CONTRACT_MESSAGE,
+        ),
+        "contract holds a registry credential": (
+            replace_in_job("contract", contract_step, dockerhub_login + contract_step),
+            CREDENTIAL_FREE_MESSAGE,
+        ),
+        "smoke holds a write token": (
+            replace_in_job(
+                "smoke",
+                "    permissions:\n      contents: read\n",
+                "    permissions:\n      contents: read\n      packages: write\n",
+            ),
+            CREDENTIAL_FREE_MESSAGE,
+        ),
+        "no image smoke": (
+            cut("      - name: Smoke the pushed platform image\n", "\n  manifest:\n"),
             SMOKE_MESSAGE,
         ),
         "unpinned action": (replace_once(build_push, "docker/build-push-action@v7"), None),
@@ -1103,10 +1424,10 @@ def self_test() -> int:
         ),
         "expression in shell": (
             replace_once(
-                "          set -euo pipefail\n          checked_out=",
+                '          set -euo pipefail\n          if [[ ! "$DIGEST"',
                 "          set -euo pipefail\n"
                 '          echo "${{ github.event.workflow_run.head_branch }}"\n'
-                "          checked_out=",
+                '          if [[ ! "$DIGEST"',
             ),
             None,
         ),
@@ -1138,7 +1459,10 @@ def self_test() -> int:
             "found SECRETS.RELEASE_TAG_TOKEN",
         ),
         "promote without attestation": (
-            replace_once("    needs: [resolve, attest]\n", "    needs: [resolve, manifest]\n"),
+            replace_once(
+                "    needs: [resolve, contract, attest]\n",
+                "    needs: [resolve, contract, manifest]\n",
+            ),
             None,
         ),
         "direct docker push": (
