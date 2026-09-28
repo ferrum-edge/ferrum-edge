@@ -9,9 +9,10 @@ version's release workflow before choosing an artifact.
 
 | Version | Status | Security updates |
 | ------- | ------ | ---------------- |
-| `main` | active build-out; breaking changes expected | fixes land on `main`; CI validates but does not publish production artifacts |
+| `main` | active build-out; breaking changes expected | fixes land on `main`; CI validates but does not publish production artifacts; the `latest` / `main-<sha>` development images follow it |
 | Published `v0.9.x` artifacts | pre-1.0 versioned releases, where publication completed | take a subsequently published version containing the fix; no minor-line backport window is committed yet |
-| Historical `latest` artifacts | no longer refreshed by main CI | do not use as a security-update channel |
+| `latest` container tag | moves to each `main` commit that passes CI | development channel only; do not use as a security-update channel |
+| Historical `latest` GitHub prerelease binaries | no longer refreshed | do not use |
 
 Production artifacts are published by the version-tag release workflow after
 exact-commit validation. Pin a published version or immutable image digest and

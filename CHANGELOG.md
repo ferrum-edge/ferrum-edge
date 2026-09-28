@@ -267,6 +267,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Docker `latest` tag tracks `main` again** (owner decision 2026-09-28,
+  reversing the 2026-09-19 retirement). The new `main-latest-image.yml`
+  workflow runs after each successful `push` run of CI on `main`, builds that
+  exact commit from the root `Dockerfile` for `linux/amd64` and `linux/arm64`,
+  pushes an immutable `main-<sha>` tag to Docker Hub and GHCR, signs and
+  attests it (Cosign, SLSA provenance, SPDX SBOMs), and then moves `latest` to
+  that digest only if the commit is still the head of `main`, so a late run
+  never moves `latest` backwards. `latest` is a development channel, not a
+  release: pin `vX.Y.Z` or a digest in production. Version tags, the `-ebpf`
+  variants, and GitHub Releases are unchanged, and `FERRUM_INJECTOR_SIDECAR_IMAGE`
+  still refuses `latest`. `verify_main_latest_image_workflow.py` pins the
+  publisher contract in the required `Tests` check.
+
 - **WAF admission: `on_unlisted_content_type: block` needs a body method**
   (#5865). With `body_methods: []` no HTTP request body is governed, so `block`
   can never fire; under `mode: enforce` it no longer counts as an enforcement

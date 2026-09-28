@@ -14,6 +14,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 - [Creating a New Release](#creating-a-new-release)
 - [Binaries and Downloads](#binaries-and-downloads)
 - [Image Signatures, SBOMs, and Provenance](#image-signatures-sboms-and-provenance)
+- [Main latest image](#main-latest-image)
 - [GitHub Actions Secrets](#github-actions-secrets)
 - [Root Merge Gate Attestation](#root-merge-gate-attestation)
 - [Customizing CI/CD](#customizing-cicd)
@@ -24,7 +25,10 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 
 CI validates pull requests, merge groups, and `main` with fast build profiles.
 A merge to `main` additionally packages the tested Linux amd64 binaries into an
-image artifact. It does not publish to Docker Hub, GHCR, or GitHub Releases.
+image artifact. CI itself does not publish to Docker Hub, GHCR, or GitHub
+Releases. After a `main` push CI run succeeds, the separate **Main Latest
+Image** workflow moves the `latest` container tag to that commit; see
+[Main latest image](#main-latest-image).
 
 Production publishing starts from **Start Production Release**
 (`release-dispatch.yml`). Run it on `main` with a version such as `v1.2.3`.
@@ -36,6 +40,7 @@ separate `release.yml` production build and publishing workflow.
 | CI (`ci.yml`) | PR, merge group, main push | Tests and fast verification builds; Linux CI image artifact on main |
 | Start Production Release (`release-dispatch.yml`) | Manual, version input | Exact-commit validation and immutable tag creation |
 | Release (`release.yml`) | `v*` tag push | Production binaries, multi-architecture images, signatures, SBOMs and GitHub Release |
+| Main Latest Image (`main-latest-image.yml`) | Successful CI push run on `main` | Signed `latest` and `main-<sha>` development images; no binaries, no GitHub Release |
 
 ## Workflow Inventory
 
@@ -49,6 +54,7 @@ adding, removing, or materially changing a workflow.
 | `fips-build.yml` | FIPS Build Policy | PRs, `merge_group`, push to `main`, manual | Required FIPS feature-graph audit plus compile/clippy/handshake gate. Warm PR target <=30 minutes (p95 <=45); see [CI runtime caching](#ci-runtime-caching-production-images-and-fips). |
 | `release-dispatch.yml` | Start Production Release | Manual version input | Validate the selected main SHA and create its version tag. |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
+| `main-latest-image.yml` | Main Latest Image | `workflow_run` of CI on `main` (successful `push` runs only) | Builds the CI-validated `main` commit, pushes and signs `main-<sha>`, then moves `latest` to it only if that commit is still the head of `main`. Never touches version tags. See [Main latest image](#main-latest-image). |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
@@ -2686,8 +2692,9 @@ Only ARM64, whose producer and consumer `needs` are both frozen, is joined
 after the fact: `linux-gnu-abi-release-gate` requires
 `verify-linux-gnu-abi-aarch64` and deletes the GitHub Release if it did not
 succeed. The former main-path `linux-gnu-abi-latest-gate` and moving prerelease
-publication are no longer part of CI; retained historical `latest` artifacts do
-not reflect subsequent main validation.
+publication are no longer part of CI. The `latest` GitHub prerelease and its
+binaries are not refreshed; only the `latest` container tag moves again, from
+`main-latest-image.yml` (see [Main latest image](#main-latest-image)).
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)
@@ -3018,12 +3025,20 @@ docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2.3
 docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 ```
 
-The `latest` container tag is retired: neither main CI nor versioned releases
-update it. Existing `latest` and `main-<sha>` tags remain historical artifacts,
-not supported channels for subsequent fixes. An image reference without a tag
-implicitly selects `latest`; specify a completed published full version or digest.
-The `X.Y` alias is published by the version-tag workflow and moves within that
-release series, so use `vX.Y.Z`, `X.Y.Z`, or a digest when reproducibility matters.
+The `latest` container tag tracks the most recent `main` commit that passed CI
+(owner decision 2026-09-28, reversing the 2026-09-19 retirement). It is a moving
+development channel, not a release: it changes on every qualifying merge, may
+carry unreleased and breaking changes, and is not a supported upgrade or
+security-update channel. Each such commit also gets an immutable
+`main-<40-character-sha>` tag. Versioned releases never move `latest`, and the
+`latest` publisher never touches version tags. An image reference without a tag
+implicitly selects `latest`.
+
+For production, pin a completed published version (`vX.Y.Z` or `X.Y.Z`) or an
+image digest. The `X.Y` alias is published by the version-tag workflow and moves
+within that release series, so use `vX.Y.Z`, `X.Y.Z`, or a digest when
+reproducibility matters. The mesh injector is unchanged:
+`FERRUM_INJECTOR_SIDECAR_IMAGE` still refuses a `latest` (or untagged) image.
 
 The `anonymous-pull-smoke` job runs in `release.yml` after the standard
 version manifest is published, with an empty Docker configuration. Docker Hub
@@ -3031,7 +3046,7 @@ must permit anonymous pulls and pass the version smoke; GHCR remains warn-only
 until the package is public. The same script supports manual verification:
 `bash scripts/smoke_anonymous_pull.sh docker.io/ferrumedge/ferrum-edge:v0.9.3`.
 
-The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in `release.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
+The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in `release.yml` and `main-latest-image.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
 
 ## Image Signatures, SBOMs, and Provenance
 
@@ -3245,6 +3260,94 @@ To inspect the authenticated predicates after verification, replace the final
 .[].payload | @base64d | fromjson | .predicate
 ```
 
+## Main latest image
+
+`.github/workflows/main-latest-image.yml` implements the owner decision of
+2026-09-28: the `latest` container tag in both registries
+(`ferrumedge/ferrum-edge:latest`, `ghcr.io/ferrum-edge/ferrum-edge:latest`)
+is overwritten for each `main` commit whose complete push CI succeeded. It is a
+development channel for evaluation and integration testing. Pin `vX.Y.Z` or a
+digest for production; `FERRUM_INJECTOR_SIDECAR_IMAGE` still refuses `latest`.
+
+**Trigger and gating.** The workflow runs on `workflow_run` for completed CI
+runs on `main`. Its first job proceeds only when the triggering run concluded
+`success`, was a `push` event on `main` from `.github/workflows/ci.yml`, and
+belongs to this repository. A pull request, merge group, manual CI run, fork,
+failed or cancelled run publishes nothing. The build checks out exactly
+`github.event.workflow_run.head_sha` and fails if the checkout differs.
+
+**No stale overwrite.** The CI-validated SHA must equal the current head of
+`main` (read from the GitHub API) and the commit that supplied the running
+workflow definition. If `main` has moved on, the run publishes nothing. The
+same head check runs again in the step that moves `latest`, immediately before
+the tag changes. Publishers share one concurrency group with
+`cancel-in-progress: false`, so a newer commit's run waits for an older run and
+then moves `latest` itself. An older run finishing late can therefore never move
+`latest` backwards.
+
+**Build.** Each run builds the root `Dockerfile` `runtime` target with
+`FEATURES=cloud-secrets` on native `linux/amd64` (`ubuntu-latest`) and
+`linux/arm64` (`ubuntu-24.04-arm`) runners, pushes each platform by digest, and
+assembles one multi-arch manifest. This is the same distroless runtime base,
+environment, entrypoint and labels as the release default image, built the way
+`release.yml` builds its `-ebpf` families. The release default image instead
+packages the release binaries (x86_64 from the pinned GNU sysroot, ARM64 from
+the isolated Cross build); only `release.yml` may produce those, because the
+trusted Cross policy forbids a second Cross producer. The `-ebpf` and
+`-ebpf-tools` variants are not published from `main`; use a release for those.
+
+**Tags.** A run pushes exactly two tags per registry: the immutable
+`main-<40-character-sha>` tag and `latest`. It never creates or moves `vX.Y.Z`,
+`X.Y.Z`, `X.Y`, or `-ebpf*` tags.
+
+**Signing and SBOMs.** `main-<sha>` is pushed first. The `attest` job then
+applies the release attestation contract to that digest: both registries must
+hold the same `linux/amd64` + `linux/arm64` descriptors, the digest-pinned Syft
+image produces two SPDX inventories per registry, SLSA provenance v1 names the
+source commit and the CI run that validated it, and Cosign signs keylessly,
+attests, and verifies the result. Only after verification does `promote` point
+`latest` at that exact digest, and it fails unless `latest` then resolves to it.
+
+**Permissions and credentials.** The workflow default is `contents: read`.
+`resolve` holds `contents: read`; `build`, `manifest`, and `promote` hold
+`contents: read` + `packages: write`; only `attest` holds `id-token: write`
+(with `packages: write`). It uses the same `DOCKERHUB_USERNAME` /
+`DOCKERHUB_TOKEN` repository secrets and `GITHUB_TOKEN` as `release.yml`, with no
+deployment environment (release uses none). Every action is pinned to the same
+full commit SHA as in `release.yml`, and event data reaches shell only through
+`env:`.
+
+**Contract.** `.github/scripts/verify_main_latest_image_workflow.py` pins all
+of the above: trigger, gate conditions, both head checks, concurrency,
+per-job permissions, allowed secrets, action pins matching release.yml, build
+parity, the exact tag set per job, and the absence of version or eBPF tags. Its
+`--self-test` mutates the checked-in workflow and requires each regression to
+be rejected. `verify_required_ci.py` runs both modes, so the required `Tests`
+check and `Trusted Policy Candidate` enforce it; the publisher also re-runs
+it at the published commit before building.
+
+To verify a `latest` image, resolve it to a digest and verify that digest (not
+the tag). The signing identity is the workflow on `refs/heads/main`:
+
+```bash
+IMAGE=ferrumedge/ferrum-edge
+# Alternative registry:
+# IMAGE=ghcr.io/ferrum-edge/ferrum-edge
+DIGEST="$(
+  docker buildx imagetools inspect "${IMAGE}:latest" --format '{{json .Manifest}}' |
+    jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))'
+)"
+cosign verify \
+  --certificate-identity "https://github.com/ferrum-edge/ferrum-edge/.github/workflows/main-latest-image.yml@refs/heads/main" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  "${IMAGE}@${DIGEST}"
+```
+
+The provenance and SBOM checks in [Consumer verification](#consumer-verification)
+apply unchanged with that identity. The verified provenance names the source
+commit; `docker buildx imagetools inspect "${IMAGE}:main-<sha>"` returns the same
+digest.
+
 ## GitHub Actions Secrets
 
 Configure secrets for Docker image publishing and releases.
@@ -3259,7 +3362,7 @@ Configure secrets for Docker image publishing and releases.
 
 #### Docker Registry
 
-Required for pushing Docker Hub images. The workflows unconditionally run the Docker Hub login step on version-tag Docker jobs, so missing secrets fail publishing:
+Required for pushing Docker Hub images. The workflows unconditionally run the Docker Hub login step on version-tag Docker jobs and on the `main-latest-image.yml` publishing jobs, so missing secrets fail publishing:
 
 - `DOCKERHUB_USERNAME` - Docker Hub username
 - `DOCKERHUB_TOKEN` - Docker Hub access token
@@ -3273,8 +3376,8 @@ Required for pushing Docker Hub images. The workflows unconditionally run the Do
 For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare
 job-level `permissions: { contents: write }` for release creation,
 `permissions: { contents: read, packages: write }` for Docker/GHCR publishing,
-and `permissions: { id-token: write, packages: write }` only for release image
-signing and attestation. Repository **Settings → Actions → General → Workflow
+and `permissions: { id-token: write, packages: write }` only for release and
+`main-latest-image.yml` image signing and attestation. Repository **Settings → Actions → General → Workflow
 permissions** must allow read/write access (including `packages: write`) for
 those per-job grants to take effect.
 

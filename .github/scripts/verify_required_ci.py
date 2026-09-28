@@ -46,6 +46,9 @@ from verify_coverage_workflow import (
 from verify_mesh_performance_baselines_workflow import (
     main as mesh_baselines_workflow_main,
 )
+from verify_main_latest_image_workflow import (
+    main as main_latest_image_workflow_main,
+)
 from verify_install_docs_contract import (
     run_self_test as install_docs_contract_self_test,
 )
@@ -2221,6 +2224,10 @@ def main() -> int:
         planner_errors.append("coverage workflow verifier self-test failed")
     if coverage_workflow_main([]) != 0:
         planner_errors.append("coverage workflow shard-plan contract failed")
+    if main_latest_image_workflow_main(["--self-test"]) != 0:
+        planner_errors.append("main latest image publisher self-test failed")
+    if main_latest_image_workflow_main([]) != 0:
+        planner_errors.append("main latest image publisher contract failed")
     if ci_runtime_cache_main(["--self-test"]) != 0:
         planner_errors.append("CI runtime cache contract self-test failed")
     if ci_runtime_cache_main([]) != 0:

@@ -4,11 +4,35 @@ This guide covers building and running Ferrum Edge using Docker and Docker Compo
 
 ## Table of Contents
 
+- [Published Images and Tags](#published-images-and-tags)
 - [Building the Docker Image](#building-the-docker-image)
 - [Running with Docker](#running-with-docker)
 - [Running with Docker Compose](#running-with-docker-compose)
 - [Configuration via Environment Variables](#configuration-via-environment-variables)
 - [Production Deployment Tips](#production-deployment-tips)
+
+## Published Images and Tags
+
+Images are published to Docker Hub (`ferrumedge/ferrum-edge`) and GHCR
+(`ghcr.io/ferrum-edge/ferrum-edge`) as `linux/amd64` + `linux/arm64` manifests,
+keylessly signed with Cosign and attested with SLSA provenance and SPDX SBOMs.
+
+| Tag | Moves? | Published by | Use for |
+| --- | --- | --- | --- |
+| `vX.Y.Z`, `X.Y.Z` | No | `release.yml` on a version tag | Production (or pin the digest) |
+| `X.Y` | Within the release series | `release.yml` on a version tag | Tracking patch releases of one series |
+| `vX.Y.Z-ebpf`, `vX.Y.Z-ebpf-tools` (and `X.Y.Z` / `X.Y` forms) | As above | `release.yml` on a version tag | Mesh node-agent / NodeWaypoint / Ambient UDP capture |
+| `latest` | Every `main` commit that passes CI | `main-latest-image.yml` | Evaluation and development only |
+| `main-<40-character-sha>` | No | `main-latest-image.yml` | Reproducing a specific `main` build |
+
+`latest` is a moving development channel, not a release: it follows the most
+recent `main` commit whose push CI succeeded, can carry unreleased or breaking
+changes, and is not a security-update channel. An image reference without a tag
+selects `latest`, so production deployments should always pin a published
+`vX.Y.Z` tag or an image digest. The `-ebpf` / `-ebpf-tools` variants are
+published only for releases. The mesh injector still refuses `latest` and
+untagged references in `FERRUM_INJECTOR_SIDECAR_IMAGE`. Build details and
+signature verification: [ci_cd.md → Main latest image](ci_cd.md#main-latest-image).
 
 ## Building the Docker Image
 
