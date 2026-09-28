@@ -198,6 +198,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WAF rule shapes: missed injection forms and prose false positives**
+  (#5865). `FE-SQLI-008` now matches `load_file` on a MySQL `X'2f65…'` hex
+  literal and after an inline comment (`load_file(/**/'/etc/passwd')`).
+  `FE-SQLI-010-B` (level 1) now matches three unquoted body forms: a later
+  `ORDER BY` / `GROUP BY` item (`ORDER BY 1,sleep(5)`), a number that opens
+  the value followed by an operator (`1-sleep(5)`), and a form pair whose whole
+  value is the call (`id=sleep(5)`). Code such as `x = sleep(5)` stays clean.
+  `FE-UPLOAD-001` now accepts any RFC 8187 charset and language tag in
+  `filename*=` (`UTF-8'en'shell.php`, `ISO-8859-1''shell.php`), including
+  percent-encoded names. `FE-SQLI-009` counts a `like` comparison only when
+  its right-hand string is a wildcard, left unterminated, or followed by an SQL
+  comment, so `'soda' or 'pop' like 'grandma'` is clean. `FE-CMD-004` no longer
+  fires on a prose line that starts `PowerShell …` or on `cat & dog` /
+  `cat &amp; dog` after a newline. `FE-DESER-005` names Spring's gadget
+  packages instead of all of `org.springframework.`, so Spring Session and
+  Spring Security JSON is clean.
 - An HBONE relay that ends on a socket error now resets its HTTP/2 CONNECT
   stream with `RST_STREAM(CONNECT_ERROR)` (RFC 9113 §8.5) instead of closing it
   with a clean `END_STREAM` (#5781). This covers the byte-stream relay (for
