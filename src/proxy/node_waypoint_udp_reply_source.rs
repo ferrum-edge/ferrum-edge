@@ -66,8 +66,8 @@
 //! proxy rewrite the pinned original-destination identity records. So the proxy
 //! publishes a DESIRED generation and the node-agent applies it, reusing the
 //! established proxy→node-agent channel: the pod registry directory that already
-//! carries `.ready` markers one way and `.udp-not-ready` acknowledgements the
-//! other.
+//! carries `.ready4` / `.ready6` markers one way and `.udp-not-ready`
+//! acknowledgements the other.
 //!
 //! # The channel is a generation, not a directory of claims
 //!

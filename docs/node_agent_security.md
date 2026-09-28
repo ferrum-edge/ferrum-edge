@@ -350,7 +350,8 @@ In NodeWaypoint topology, the ambient proxy mounts the same host bpffs and
 cgroup roots read-only and also runs with `hostPID: true`. It does not attach
 BPF programs or write cgroups; it needs those views to open pinned maps, find a
 live PID in each registry cgroup, and `setns()` into the matching pod network
-namespace before publishing `<podRegistryDir>/.ready/<pod_uid>`.
+namespace before publishing `<podRegistryDir>/.ready4/<pod_uid>` and
+`<podRegistryDir>/.ready6/<pod_uid>`.
 
 ### Mounts deliberately NOT requested
 

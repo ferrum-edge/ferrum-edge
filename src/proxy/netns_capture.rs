@@ -148,7 +148,7 @@ const MAX_COMPLETE_REGISTRY_ENTRY_BYTES: u64 = 16 * 1024;
 /// is the pod cgroup path and whose optional keyed lines carry the
 /// node-agent-derived workload SPIFFE identity (`spiffe_id=<id>`) and
 /// same-family source IP overrides (`ipv4=<addr>`, `ipv6=<addr>`). Dot-prefixed
-/// names are registry control entries (`.ready`, `.udp-ready`, publication
+/// names are registry control entries (`.ready4`, `.udp-ready`, publication
 /// tempfiles), not pods. Removing the file (on pod teardown) drops the pod from
 /// the set. This mirrors the existing "pinned path is the entire node-agent ↔
 /// mesh-proxy IPC surface" contract.
@@ -377,7 +377,7 @@ impl PodCaptureSource for DirectoryCaptureSource {
                 .into_string()
                 .map_err(|_| "Ambient capture registry entry name is not UTF-8")?;
             if pod_uid.starts_with('.') {
-                // Node-agent control entries (`.ready`, `.udp-ready`,
+                // Node-agent control entries (`.ready4`, `.udp-ready`,
                 // `.pod-registry-entry.tmp.*`) co-located in this directory are
                 // not pods: skip them rather than parsing or retracting.
                 continue;
@@ -515,22 +515,14 @@ fn ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf> {
     Some(dir.join(pod_uid))
 }
 
-fn ready_family_dir(legacy_ready_dir: &Path, family: CaptureFamily) -> PathBuf {
+/// The per-family readiness marker directory under the pod registry:
+/// `<registry>/.ready4` or `<registry>/.ready6`.
+fn ready_family_dir(registry_dir: &Path, family: CaptureFamily) -> PathBuf {
     let family_dir = match family {
         CaptureFamily::Ipv4 => ".ready4",
         CaptureFamily::Ipv6 => ".ready6",
     };
-    legacy_ready_dir
-        .parent()
-        .map(|parent| parent.join(family_dir))
-        .unwrap_or_else(|| legacy_ready_dir.join(family_dir))
-}
-
-fn ready_marker_dirs_for_family(dir: &Path, family: CaptureFamily) -> Vec<PathBuf> {
-    match family {
-        CaptureFamily::Ipv4 => vec![dir.to_path_buf(), ready_family_dir(dir, family)],
-        CaptureFamily::Ipv6 => vec![ready_family_dir(dir, family)],
-    }
+    registry_dir.join(family_dir)
 }
 
 fn write_marker_file(dir: &Path, pod_uid: &str, family: CaptureFamily) {
@@ -550,10 +542,8 @@ fn write_marker_file(dir: &Path, pod_uid: &str, family: CaptureFamily) {
 /// a failure to create the directory or write the file is logged and swallowed;
 /// the affected family remains visibly unready and captured connects continue to
 /// fail closed until a listener exists.
-fn write_ready_marker(dir: &Path, pod_uid: &str, family: CaptureFamily) {
-    for marker_dir in ready_marker_dirs_for_family(dir, family) {
-        write_marker_file(&marker_dir, pod_uid, family);
-    }
+fn write_ready_marker(registry_dir: &Path, pod_uid: &str, family: CaptureFamily) {
+    write_marker_file(&ready_family_dir(registry_dir, family), pod_uid, family);
 }
 
 fn remove_marker_file(dir: &Path, pod_uid: &str, family: CaptureFamily) {
@@ -567,16 +557,11 @@ fn remove_marker_file(dir: &Path, pod_uid: &str, family: CaptureFamily) {
     }
 }
 
-/// Remove listener-readiness markers for `pod_uid`. Missing files are success.
-fn remove_ready_marker(dir: &Path, pod_uid: &str, family: CaptureFamily) {
-    for marker_dir in ready_marker_dirs_for_family(dir, family) {
-        remove_marker_file(&marker_dir, pod_uid, family);
-    }
-}
-
-fn remove_all_ready_markers(dir: &Path, pod_uid: &str) {
+/// Remove every family's listener-readiness marker for `pod_uid`. Missing
+/// files are success.
+fn remove_all_ready_markers(registry_dir: &Path, pod_uid: &str) {
     for family in [CaptureFamily::Ipv4, CaptureFamily::Ipv6] {
-        remove_ready_marker(dir, pod_uid, family);
+        remove_marker_file(&ready_family_dir(registry_dir, family), pod_uid, family);
     }
 }
 
@@ -585,7 +570,7 @@ fn open_missing_family_listeners<B: NetnsBackend>(
     listener: &mut ActiveListener,
     target: &PodCaptureTarget,
     endpoints: [CaptureEndpoint; 2],
-    ready_dir: Option<&Path>,
+    registry_dir: Option<&Path>,
     netns: u64,
 ) {
     for endpoint in endpoints {
@@ -602,7 +587,7 @@ fn open_missing_family_listeners<B: NetnsBackend>(
                     family = endpoint.family.as_str(),
                     "Opened node-waypoint in-netns capture listener"
                 );
-                if let Some(dir) = ready_dir {
+                if let Some(dir) = registry_dir {
                     for uid in &listener.pod_uids {
                         write_ready_marker(dir, uid, endpoint.family);
                     }
@@ -636,12 +621,13 @@ pub struct NetnsCaptureManager<B: NetnsBackend> {
     poll_interval: Duration,
     /// netns inode → its open listener.
     active: HashMap<u64, ActiveListener>,
-    /// When set, per-pod readiness markers are written when that pod's listeners
-    /// open and removed when they close. Redirect hooks attach at enrollment and
-    /// fail closed until a listener exists; these markers expose family readiness
-    /// to the live gate and keep stale-listener cleanup observable. `None`
-    /// disables marker publishing (unit tests).
-    ready_dir: Option<PathBuf>,
+    /// Pod registry directory. When set, per-pod readiness markers are written
+    /// under its `.ready4` / `.ready6` children when that pod's listeners open
+    /// and removed when they close. Redirect hooks attach at enrollment and fail
+    /// closed until a listener exists; these markers expose family readiness to
+    /// the live gate and keep stale-listener cleanup observable. `None` disables
+    /// marker publishing (unit tests).
+    registry_dir: Option<PathBuf>,
     /// Last registry UID set logged, so startup/churn diagnostics show whether
     /// the ambient proxy can see the node-agent's hostPath registry without
     /// emitting the same line every poll.
@@ -664,18 +650,17 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             backend,
             poll_interval,
             active: HashMap::new(),
-            ready_dir: None,
+            registry_dir: None,
             last_registry_uids: HashSet::new(),
             unresolved_reasons: HashMap::new(),
         }
     }
 
-    /// Set the legacy readiness marker directory (`<registry>/.ready`). The
-    /// manager writes the historical IPv4 marker there, plus sibling `.ready4`
-    /// and `.ready6` directories for family-level evidence. `None` (the default)
-    /// disables marker publishing — used by unit tests.
-    pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
-        self.ready_dir = dir;
+    /// Set the pod registry directory the manager publishes per-family
+    /// readiness markers under (`<registry>/.ready4` and `<registry>/.ready6`).
+    /// `None` (the default) disables marker publishing — used by unit tests.
+    pub fn with_registry_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.registry_dir = dir;
         self
     }
 
@@ -797,7 +782,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
         for netns in gone {
             if let Some(listener) = self.active.remove(&netns) {
                 listener.close();
-                if let Some(dir) = &self.ready_dir {
+                if let Some(dir) = &self.registry_dir {
                     for uid in &listener.pod_uids {
                         remove_all_ready_markers(dir, uid);
                     }
@@ -847,7 +832,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                         "Node-waypoint capture: source pod IPs changed; updated in-netns listener overrides"
                     );
                 }
-                if let Some(dir) = &self.ready_dir {
+                if let Some(dir) = &self.registry_dir {
                     for uid in previous_pod_uids.difference(&listener.pod_uids) {
                         remove_all_ready_markers(dir, uid);
                     }
@@ -858,14 +843,14 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                     }
                 }
                 let endpoints = self.capture_endpoints;
-                let ready_dir = self.ready_dir.clone();
+                let registry_dir = self.registry_dir.clone();
                 if let Some(target) = desired_target {
                     open_missing_family_listeners(
                         &self.backend,
                         listener,
                         target,
                         endpoints,
-                        ready_dir.as_deref(),
+                        registry_dir.as_deref(),
                         netns,
                     );
                 }
@@ -889,7 +874,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                 &mut listener,
                 target,
                 self.capture_endpoints,
-                self.ready_dir.as_deref(),
+                self.registry_dir.as_deref(),
                 netns,
             );
             if listener.listeners.is_empty() {
@@ -907,10 +892,10 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
     }
 
     fn shutdown_all(&mut self) {
-        let ready_dir = self.ready_dir.clone();
+        let registry_dir = self.registry_dir.clone();
         for (_, listener) in self.active.drain() {
             listener.close();
-            if let Some(dir) = &ready_dir {
+            if let Some(dir) = &registry_dir {
                 for uid in &listener.pod_uids {
                     remove_all_ready_markers(dir, uid);
                 }
@@ -2009,11 +1994,11 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_writes_and_removes_readiness_markers() {
-        // With a ready dir configured, opening a pod's listener writes the
-        // legacy IPv4 marker plus address-family markers; closing it removes
-        // them.
+        // With a registry dir configured, opening a pod's listener writes the
+        // address-family markers; closing it removes them. No marker is
+        // written to the unsuffixed `.ready` directory.
         let registry = tempfile::tempdir().unwrap();
-        let ready_dir = registry.path().join(".ready");
+        let unsuffixed_ready_dir = registry.path().join(".ready");
         let ready4_dir = registry.path().join(".ready4");
         let ready6_dir = registry.path().join(".ready6");
         let targets = Arc::new(Mutex::new(vec![target("pod-a", "/cg/a")]));
@@ -2030,12 +2015,12 @@ mod tests {
             backend,
             Duration::from_secs(1),
         )
-        .with_ready_dir(Some(ready_dir.clone()));
+        .with_registry_dir(Some(registry.path().to_path_buf()));
 
         assert_eq!(mgr.reconcile_once(), 1);
         assert!(
-            ready_dir.join("pod-a").exists(),
-            "the legacy IPv4 readiness marker must be written when the IPv4 listener opens"
+            !unsuffixed_ready_dir.exists(),
+            "no marker directory other than `.ready4` / `.ready6` is written"
         );
         assert!(
             ready4_dir.join("pod-a").exists(),
@@ -2049,10 +2034,6 @@ mod tests {
         // Pod leaves the registry → listener closes → marker removed.
         targets.lock().unwrap().clear();
         assert_eq!(mgr.reconcile_once(), 0);
-        assert!(
-            !ready_dir.join("pod-a").exists(),
-            "the legacy readiness marker must be removed when the listener closes"
-        );
         assert!(
             !ready4_dir.join("pod-a").exists(),
             "the IPv4 readiness marker must be removed when the listener closes"
@@ -2093,7 +2074,7 @@ mod tests {
         }
 
         let registry = tempfile::tempdir().unwrap();
-        let ready_dir = registry.path().join(".ready");
+        let ready4_dir = registry.path().join(".ready4");
         let ready6_dir = registry.path().join(".ready6");
         let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
             pod_uid: "pod-a".to_string(),
@@ -2115,11 +2096,11 @@ mod tests {
             },
             Duration::from_secs(1),
         )
-        .with_ready_dir(Some(ready_dir.clone()));
+        .with_registry_dir(Some(registry.path().to_path_buf()));
 
         // First open succeeds → marker present.
         assert_eq!(mgr.reconcile_once(), 1);
-        assert!(ready_dir.join("pod-a").exists());
+        assert!(ready4_dir.join("pod-a").exists());
         assert!(
             ready6_dir.join("pod-a").exists(),
             "the IPv6 readiness marker is present after the v6 listener opens"
@@ -2137,7 +2118,7 @@ mod tests {
             "a pod IP update keeps the existing listener active"
         );
         assert!(
-            ready_dir.join("pod-a").exists(),
+            ready4_dir.join("pod-a").exists(),
             "the readiness marker stays while the listener still serves the pod"
         );
         assert_eq!(
@@ -2149,7 +2130,7 @@ mod tests {
 
     #[test]
     fn ready_marker_path_rejects_unsafe_pod_uids() {
-        let dir = Path::new("/run/ferrum/node-waypoint-pods/.ready");
+        let dir = Path::new("/run/ferrum/node-waypoint-pods/.ready4");
         for unsafe_uid in ["", ".", "..", "a/b", "a\\b", "../escape"] {
             assert!(
                 ready_marker_path(dir, unsafe_uid).is_none(),

@@ -1876,7 +1876,6 @@ async fn remote_discovery_loop(
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_remote_discovery_poll_failure(
                     &ctx.cluster_name,
                     ctx.trust_domain.as_str(),
-                    &url_for_logs,
                 );
                 expire_stale_endpoints_after_failure(&store, &ctx, task_generation, &url_for_logs);
                 (false, jittered_backoff(backoff_secs))

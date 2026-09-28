@@ -14848,21 +14848,20 @@ async fn arm_mesh_runtime_startup(
                 Some(MeshTrafficDirection::Outbound),
                 shutdown_tx.subscribe(),
             );
-            // Listener-readiness markers go in dot-subdirs of the registry dir:
-            // `.ready` remains the IPv4-compatible marker, while `.ready4` and
-            // `.ready6` expose family-level readiness. Redirect hooks are already
-            // attached by the node-agent and fail closed until a listener exists.
-            // `DirectoryCaptureSource` skips dotfiles, so these subdirs are
-            // invisible to the pod-discovery scan.
-            let ready_dir = std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
-                .join(".ready");
+            // Listener-readiness markers go in the `.ready4` / `.ready6`
+            // dot-subdirs of the registry dir, one per address family. Redirect
+            // hooks are already attached by the node-agent and fail closed until
+            // a listener exists. `DirectoryCaptureSource` skips dotfiles, so
+            // these subdirs are invisible to the pod-discovery scan.
+            let registry_dir =
+                std::path::PathBuf::from(&env_config.mesh_node_waypoint_pod_registry_dir);
             let manager = crate::proxy::netns_capture::NetnsCaptureManager::new(
                 capture_addr,
                 source,
                 backend,
                 std::time::Duration::from_secs(2),
             )
-            .with_ready_dir(Some(ready_dir));
+            .with_registry_dir(Some(registry_dir));
             let manager_shutdown = shutdown_tx.subscribe();
             info!(
                 registry_dir = %sanitize_startup_scalar(

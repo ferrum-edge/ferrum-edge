@@ -2416,15 +2416,7 @@ pub struct MeshTracingConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_env_tags: HashMap<String, String>,
     /// Provider-specific tracing backends (Zipkin / Datadog / Lightstep / OpenTelemetry).
-    ///
-    /// The legacy singular `provider` spelling deserializes into this vector
-    /// for back-compat, but new slices serialize only `providers`.
-    #[serde(
-        default,
-        alias = "provider",
-        deserialize_with = "deserialize_tracing_providers",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<TracingProvider>,
 }
 
@@ -2542,23 +2534,6 @@ impl fmt::Debug for TracingProvider {
                 .field("endpoint", endpoint)
                 .finish(),
         }
-    }
-}
-
-fn deserialize_tracing_providers<'de, D>(deserializer: D) -> Result<Vec<TracingProvider>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    if value.is_null() {
-        return Ok(Vec::new());
-    }
-    if value.is_array() {
-        crate::util::deserialization::from_json_value(value).map_err(serde::de::Error::custom)
-    } else {
-        crate::util::deserialization::from_json_value(value)
-            .map(|provider| vec![provider])
-            .map_err(serde::de::Error::custom)
     }
 }
 

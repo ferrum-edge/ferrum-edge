@@ -3957,8 +3957,8 @@ fn inbound_relay_registry_strict_parse_retracts_malformed_evidence_then_recovers
     let dir = tempfile::tempdir().expect("registry");
     write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
     write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
-    std::fs::create_dir_all(dir.path().join(".ready")).expect("ready control dir");
-    std::fs::write(dir.path().join(".ready").join("marker"), b"").expect("ready marker");
+    std::fs::create_dir_all(dir.path().join(".ready4")).expect("ready control dir");
+    std::fs::write(dir.path().join(".ready4").join("marker"), b"").expect("ready marker");
     std::fs::create_dir_all(dir.path().join(".udp-ready")).expect("udp-ready control dir");
     std::fs::write(dir.path().join(".udp-ready").join(LOCAL_POD_UID), b"")
         .expect("udp-ready marker");

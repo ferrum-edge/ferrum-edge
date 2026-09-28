@@ -5958,7 +5958,7 @@ fn test_validate_unique_listen_paths_allows_host_only_alongside_path_proxy_same_
 }
 
 #[test]
-fn mesh_tracing_config_deserializes_legacy_singular_provider_alias() {
+fn mesh_tracing_config_ignores_singular_provider_spelling() {
     let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
         "provider": {
             "kind": "zipkin",
@@ -5967,7 +5967,39 @@ fn mesh_tracing_config_deserializes_legacy_singular_provider_alias() {
             }
         }
     }))
-    .expect("legacy provider alias deserializes");
+    .expect("unknown field is ignored");
+
+    assert!(
+        config.providers.is_empty(),
+        "singular `provider` is not an alias for `providers`"
+    );
+}
+
+#[test]
+fn mesh_tracing_config_rejects_single_object_providers() {
+    let result = serde_json::from_value::<MeshTracingConfig>(serde_json::json!({
+        "providers": {
+            "kind": "zipkin",
+            "config": {
+                "url": "http://zipkin:9411/api/v2/spans"
+            }
+        }
+    }));
+
+    assert!(result.is_err(), "`providers` must be an array");
+}
+
+#[test]
+fn mesh_tracing_config_deserializes_providers_array() {
+    let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
+        "providers": [{
+            "kind": "zipkin",
+            "config": {
+                "url": "http://zipkin:9411/api/v2/spans"
+            }
+        }]
+    }))
+    .expect("providers array deserializes");
 
     assert_eq!(config.providers.len(), 1);
     match &config.providers[0] {

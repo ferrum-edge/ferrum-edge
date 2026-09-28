@@ -1828,11 +1828,7 @@ async fn mesh_poll_failure_counters_are_live_across_the_render_cache() {
         &trust_domain,
         format!("https://federation-{suffix}.example:8443"),
     );
-    prometheus_helpers::increment_mesh_remote_discovery_poll_failure(
-        &cluster,
-        &trust_domain,
-        format!("https://cp-{suffix}.example:9443"),
-    );
+    prometheus_helpers::increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
 
     // Second scrape inside the TTL: the cached body is reused, but the mesh
     // block must be re-rendered from live state.

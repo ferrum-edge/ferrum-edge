@@ -987,8 +987,7 @@ via `nodeAgent.trustedKubeletProbeSourceIps`.
 NodeWaypoint adds `::/0` to the capture include set so IPv6 destinations reach
 `connect6`; the legacy `ipv6_outbound_deny` flag remains clear in the normal
 dual-family path. Excluded v6 (CIDR/port excludes) still flows. The proxy writes
-`<registry_dir>/.ready/<pod_uid>` for the historical IPv4 readiness marker,
-`<registry_dir>/.ready4/<pod_uid>` for IPv4, and
+`<registry_dir>/.ready4/<pod_uid>` for IPv4 and
 `<registry_dir>/.ready6/<pod_uid>` for IPv6; these dotdirs are skipped by the
 pod-discovery scan.
 
@@ -1320,9 +1319,7 @@ The listener holds a sibling `<socket>.lock` advisory lock for its complete
 lifetime. A second live node-agent generation refuses to replace the active
 owner and continues with watcher reconciliation; after a crash, the kernel
 releases the lock and the next generation removes the stale socket before
-publishing. A short fail-closed connect probe also preserves a live socket from
-an older Ferrum version that predates the lock. Publication retains the
-socket's device/inode identity, and
+publishing. Publication retains the socket's device/inode identity, and
 shutdown unlinks the well-known path only when it still names that identity,
 so a draining old generation cannot remove an explicitly coordinated
 replacement.

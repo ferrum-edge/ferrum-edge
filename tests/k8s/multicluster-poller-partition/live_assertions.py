@@ -410,11 +410,12 @@ def assert_metric_admin_parity(
         and "ferrum_mesh_federation_poll_failures_total" in text
     ):
         raise SystemExit("federation endpoint label not redacted")
-    if (
-        'control_plane="redacted"' not in text
-        and "ferrum_mesh_remote_discovery_poll_failures_total" in text
+    if any(
+        line.startswith("ferrum_mesh_remote_discovery_poll_failures_total{")
+        and "control_plane=" in line
+        for line in text.splitlines()
     ):
-        raise SystemExit("control-plane label not redacted")
+        raise SystemExit("remote-discovery failure series carries a control-plane label")
     families = {
         "ferrum_mesh_federation_poll_failures_total": f'trust_domain="{trust_domain}"',
         "ferrum_mesh_federation_bundle_age_seconds": f'trust_domain="{trust_domain}"',
@@ -466,7 +467,7 @@ def self_test_metric_admin_parity() -> None:
             'ferrum_mesh_federation_poll_failures_total'
             f'{{trust_domain="{trust_domain}",endpoint="redacted"}} 1',
             'ferrum_mesh_remote_discovery_poll_failures_total'
-            f'{{cluster="{peer}",control_plane="redacted"}} 1',
+            f'{{cluster="{peer}",trust_domain="{trust_domain}"}} 1',
             'ferrum_mesh_remote_discovery_poll_successes_total'
             f'{{cluster="{peer}",trust_domain="{trust_domain}"}} 2',
         ]

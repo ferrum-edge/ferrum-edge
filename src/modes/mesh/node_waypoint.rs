@@ -1307,7 +1307,7 @@ const MAX_POD_REGISTRY_UID_BYTES: usize = 256;
 /// tokens fixtures use. Path separators, `..`, NULs, whitespace, control
 /// characters, and other punctuation are unsafe.
 ///
-/// Hidden dot-prefixed names (`.ready`, `.udp-ready`, `.pod-registry-entry.tmp.*`)
+/// Hidden dot-prefixed names (`.ready4`, `.udp-ready`, `.pod-registry-entry.tmp.*`)
 /// are **not** safe pod UIDs. Directory enumerators must skip those as registry
 /// control entries rather than treating them as pods or as snapshot errors.
 pub fn is_safe_pod_registry_uid(pod_uid: &str) -> bool {

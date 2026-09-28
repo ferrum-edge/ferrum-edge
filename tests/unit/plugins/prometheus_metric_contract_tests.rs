@@ -770,11 +770,7 @@ fn representative_exposition() -> String {
     let suffix = format!("{}-{}", std::process::id(), line!());
     let cluster = format!("remote-{suffix}");
     let trust_domain = format!("td-{suffix}.example");
-    prometheus_helpers::increment_mesh_remote_discovery_poll_failure(
-        &cluster,
-        &trust_domain,
-        format!("https://cp-{suffix}.example:9443"),
-    );
+    prometheus_helpers::increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
     prometheus_helpers::record_mesh_remote_discovery_poll_success(
         &cluster,
         &trust_domain,
