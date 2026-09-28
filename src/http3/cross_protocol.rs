@@ -14306,11 +14306,11 @@ mod tests {
         assert!(
             src.contains(
                 "proxy_grpc_request_from_bytes(\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20hyper_method.clone(),\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20initial_hmap,\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20initial_body,\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20hyper_method.clone(),\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20initial_hmap,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20initial_body,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
             ),
             "initial gRPC dispatch must move the prepared headers/body and use the \
              target-effective backend connection proxy"
