@@ -67,19 +67,21 @@ const PROTOTYPE_POLLUTION_CONSTRUCTOR: &str =
 /// directly in front of it: the start of the value, a quote, `(`, `,`, `;`,
 /// `=`, `|`, `&`, or an SQL keyword, optionally followed by the same
 /// whitespace-or-bounded-comment separator the level-1 signatures above use.
-/// A method call (`.sleep(`) never qualifies. A number that opens the value
-/// followed by an arithmetic, comparison, or bitwise operator
-/// (`1-sleep(5)`, `1*sleep(5)`, `1+sleep(5)`) is the numeric-context probe;
-/// it is anchored to the start of the value, where a query value holds only
-/// the injected expression. The remaining alternatives name database-specific
-/// functions that are not general-purpose code.
+/// A method call (`.sleep(`) never qualifies. A number followed by an
+/// arithmetic, comparison, or bitwise operator (`1-sleep(5)`, `1*sleep(5)`,
+/// `1+sleep(5)`) is the numeric-context probe; the number must open the
+/// value or directly follow a quote or `&`, where an injected expression
+/// starts, so `room 1-sleep(5)` stays clean while the body mirror still sees
+/// the probe inside a JSON string (`{"id":"1-sleep(5) and 1=1"}`). The
+/// remaining alternatives name database-specific functions that are not
+/// general-purpose code.
 ///
 /// That context is tight enough for a query value but not for a request body
 /// that carries source code: `foo();\n sleep(1);`, `x = sleep(5)`,
 /// `(sleep(1))`, and `benchmark(1000, fn)` are all ordinary code. The body
 /// mirror is therefore level 2, and level-1 body coverage comes from
 /// `SQLI_TIME_DELAY_SQL_CONTEXT`.
-const SQLI_TIME_DELAY: &str = r#"(?i)(?:(?:^|[(,;='"|&]|\b(?:and|or|xor|select|union|where|having|if|then|else|when)\b|^[\s(]*-?[0-9]{1,20}(?:\.[0-9]{1,20})?\s*[-+*/%^|&<>=]{1,2}\(*)(?:\s|/\*(?s:.){0,64}?\*/)*(?:sleep|pg_sleep)\s*\(\s*\d+(?:\.\d+)?\s*\)|\bbenchmark\s*\(\s*\d+\s*,|\bwaitfor(?:\s|/\*(?s:.){0,64}?\*/)+(?:delay|time)(?:\s|/\*(?s:.){0,64}?\*/)*['"]\d|\bdbms_(?:lock\.sleep|pipe\.receive_message)\s*\(|\brandomblob\s*\(\s*\d{6,})"#;
+const SQLI_TIME_DELAY: &str = r#"(?i)(?:(?:^|[(,;='"|&]|\b(?:and|or|xor|select|union|where|having|if|then|else|when)\b|(?:^|['"&])[\s(]*-?[0-9]{1,20}(?:\.[0-9]{1,20})?\s*[-+*/%^|&<>=]{1,2}\(*)(?:\s|/\*(?s:.){0,64}?\*/)*(?:sleep|pg_sleep)\s*\(\s*\d+(?:\.\d+)?\s*\)|\bbenchmark\s*\(\s*\d+\s*,|\bwaitfor(?:\s|/\*(?s:.){0,64}?\*/)+(?:delay|time)(?:\s|/\*(?s:.){0,64}?\*/)*['"]\d|\bdbms_(?:lock\.sleep|pipe\.receive_message)\s*\(|\brandomblob\s*\(\s*\d{6,})"#;
 
 /// Level-1 body time-delay signature, claimed by `FE-SQLI-010-B`. `sleep(n)`
 /// counts only where no general-purpose language puts it: after an SQL
@@ -110,7 +112,8 @@ const SQLI_TIME_DELAY: &str = r#"(?i)(?:(?:^|[(,;='"|&]|\b(?:and|or|xor|select|u
 /// (`"=2*sleep(1)"`), a statement (`foo(); sleep(1);`), and a method call
 /// (`time.sleep(1)`) stay clean; so does a JSON string whose whole value is
 /// `sleep(5)`, which only the level-2 `FE-SQLI-006-B` claims. A delay call
-/// followed by more SQL (`id=sleep(5) and 1=1`) is likewise left to level 2.
+/// followed by more SQL (`id=sleep(5) and 1=1`, `{"id":"1-sleep(5) and 1=1"}`)
+/// is likewise left to level 2.
 ///
 /// `BENCHMARK` needs an SQL function as its expression (`MD5(`, `SHA1(`, a
 /// subquery), so `benchmark(1000, fn)` stays clean. `pg_sleep`,
@@ -194,24 +197,30 @@ const HTML_ACTIVE_CONTENT_ELEMENT: &str =
 /// * a backtick or `$(` subshell running a common command;
 /// * a CR/LF command separator (`%0a`) followed by a Windows tool name in
 ///   all-lower or all-upper case (`whoami`, `IPCONFIG`). `cmd.exe` and
-///   PowerShell resolve commands in any case, so a mixed-case name
-///   (`Whoami`, `WhoAmI`, `PowerShell`) also counts when it ends the value,
-///   carries `.exe`, takes a flag (`PowerShell -nop`, `Certutil /urlcache`),
-///   or is followed by one of the shell operators listed below other than
-///   `#`; PowerShell also counts before `iex` / `invoke-`
-///   (`Powershell IEX(…)`). A capitalised `PowerShell is great` or
-///   `PowerShell - a primer` is the start of a prose line;
+///   PowerShell resolve commands in any case, so a mixed-case `Whoami`,
+///   `Ipconfig`, `Certutil`, or `Systeminfo` also counts when it ends the
+///   value, carries `.exe`, takes a flag (`Certutil /urlcache`), or is
+///   followed by one of the shell operators listed below other than `#`. A
+///   mixed-case `PowerShell` / `Pwsh` counts only with `.exe`, a flag
+///   (`PowerShell -nop`), or `iex` / `invoke-` (`Powershell IEX(…)`): a bare
+///   launch runs no attacker command, so a prose list ending in
+///   `PowerShell`, a table row `PowerShell | …`,
+///   `PowerShell is great`, and `PowerShell - a primer` stay clean. Being
+///   piped into (`x | PowerShell -c …`) is covered by the operator shapes
+///   below;
 /// * the same separator followed by a Unix tool name in the lower case a Unix
 ///   shell requires, or by a short command word (`cat`, `id`, `sh`, `nc`,
 ///   `bash`, `python`, `perl`) in lower case that then ends the value, takes
 ///   an argument shaped like a flag, path, variable, or quoted string, or is
 ///   followed by a shell operator. The operator must be one prose does not
-///   write after a word: `;`, `|`, `&`, `<`, `>`, a backtick, or a `#`
-///   directly against the word (`id#`, `cat|nc`); `&&`, `|`, `||`, `;`, a
-///   backtick, or a `#` comment after a space (`id #`, the form a POSIX shell
-///   treats as a comment); a spaced `&` that ends the value (`id &`); or a
-///   redirect onto a path, descriptor, or variable (`cat > /tmp/x`). A spaced
-///   `&` followed by more text (`cat & dog`, `cat &amp; dog`) is prose;
+///   write after a word: `;`, `|`, `&`, `<`, `>`, or a backtick directly
+///   against the word (`cat|nc`); `&&`, `|`, `||`, `;`, or a backtick after a
+///   space; a `#` comment, against the word or after a space, that ends the
+///   value or is followed by a non-digit (`id#`, `id #`, `id #x`, the form a
+///   POSIX shell treats as a comment); a spaced `&` that ends the value
+///   (`id &`); or a redirect onto a path, descriptor, or variable
+///   (`cat > /tmp/x`). A spaced `&` followed by more text (`cat & dog`,
+///   `cat &amp; dog`) and a numbered item (`cat #1`) are prose;
 /// * `;`, `|`, `&&`, or `||` followed by a reconnaissance tool that never
 ///   names a list item (`whoami`, `ifconfig`, `certutil`, `mkfifo`, …);
 /// * `&&` or `||` — which lists do not use — followed by a tool that can also
@@ -227,7 +236,7 @@ const HTML_ACTIVE_CONTENT_ELEMENT: &str =
 /// plus the `$IFS` field-separator trick used to smuggle spaces. A bare
 /// `x;uname` at the end of a value is indistinguishable from the list
 /// `fields=id;uname` and is deliberately not matched.
-const CMD_EXTENDED_EXECUTION: &str = r#"(?i)(?:(?:`|\$\()\s*(?:cat|tac|head|tail|ls|id|echo|printf|rm|ping|sleep|env|pwd|uname|whoami|curl|wget|nc|ncat|bash|sh|zsh|python[23]?|perl|ruby|php|base64|xxd|nslookup|dig|ifconfig)\b|[\r\n]\s*(?:(?-i:whoami|ipconfig|certutil|powershell|pwsh|systeminfo|WHOAMI|IPCONFIG|CERTUTIL|POWERSHELL|PWSH|SYSTEMINFO)\b|(?:whoami|ipconfig|certutil|powershell|pwsh|systeminfo)(?:\.exe\b|\s*$|[;|&<>`]|\s*(?:&&|\|\|?|;|`)|\s*&\s*$|\s*[<>]{1,2}\s*[/~.$&]|\s+[-/][a-z])|(?:powershell|pwsh)\s+(?:iex\b|invoke-)|(?-i:uname|ifconfig|nslookup|wget|curl|ncat)\b|(?-i:cat|id|sh|nc|bash|python[23]?|perl)(?:\s*$|[;|&<>`#]|\s*(?:&&|\|\|?|;|`|#)|\s*&\s*$|\s*[<>]{1,2}\s*[/~.$&]|\s+[-/.~$'"]))|(?:[;|]|&&)\s*(?:whoami|ifconfig|ipconfig|nslookup|certutil|bitsadmin|systeminfo|tasklist|mkfifo)\b|(?:&&|\|\|)\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh|id|ls|sleep|ping)\b|[;|]\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)(?:\s+[-/$'"]|\s*[<>`]|\s*&&|\s*\|\|)|[;|]\s*(?:busybox\s+(?:nc|wget|sh|ash|telnet)\b|socat\s+(?:tcp|udp|exec|-)|(?:ncat|netcat|nc)\s+\S+\s+\d{1,5}\b)|\$\{?IFS\}?)"#;
+const CMD_EXTENDED_EXECUTION: &str = r#"(?i)(?:(?:`|\$\()\s*(?:cat|tac|head|tail|ls|id|echo|printf|rm|ping|sleep|env|pwd|uname|whoami|curl|wget|nc|ncat|bash|sh|zsh|python[23]?|perl|ruby|php|base64|xxd|nslookup|dig|ifconfig)\b|[\r\n]\s*(?:(?-i:whoami|ipconfig|certutil|powershell|pwsh|systeminfo|WHOAMI|IPCONFIG|CERTUTIL|POWERSHELL|PWSH|SYSTEMINFO)\b|(?:whoami|ipconfig|certutil|systeminfo)(?:\.exe\b|\s*$|[;|&<>`]|\s*(?:&&|\|\|?|;|`)|\s*&\s*$|\s*[<>]{1,2}\s*[/~.$&]|\s+[-/][a-z])|(?:powershell|pwsh)(?:\.exe\b|\s+[-/][a-z]|\s+(?:iex\b|invoke-))|(?-i:uname|ifconfig|nslookup|wget|curl|ncat)\b|(?-i:cat|id|sh|nc|bash|python[23]?|perl)(?:\s*$|[;|&<>`]|\s*(?:&&|\|\|?|;|`)|\s*#(?:[^0-9]|$)|\s*&\s*$|\s*[<>]{1,2}\s*[/~.$&]|\s+[-/.~$'"]))|(?:[;|]|&&)\s*(?:whoami|ifconfig|ipconfig|nslookup|certutil|bitsadmin|systeminfo|tasklist|mkfifo)\b|(?:&&|\|\|)\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh|id|ls|sleep|ping)\b|[;|]\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)(?:\s+[-/$'"]|\s*[<>`]|\s*&&|\s*\|\|)|[;|]\s*(?:busybox\s+(?:nc|wget|sh|ash|telnet)\b|socat\s+(?:tcp|udp|exec|-)|(?:ncat|netcat|nc)\s+\S+\s+\d{1,5}\b)|\$\{?IFS\}?)"#;
 
 /// Explicit shell / interpreter invocation, claimed by `FE-CMD-005-Q`
 /// (level 1) and `FE-CMD-005-B` (level 2, because deployment and CI APIs
@@ -342,8 +351,10 @@ const YAML_GADGET_TAG: &str = r"(?i)(?:!!(?:python/(?:object(?:/apply|/new)?|nam
 /// `["org.springframework.context.support.FileSystemXmlApplicationContext",
 /// "http://…/spel.xml"]`. That string form counts only when the array is
 /// exactly `[class, string]` and the first element ends in a capitalised class
-/// name, so a list of package names (`["org.apache.commons","org.apache.http"]`)
-/// or of three class names stays clean. It leaves out the `java.*` and .NET
+/// name; the string may be double-quoted and hold a `'`, or single-quoted and
+/// hold a `"` (`"http://x/it's.xml"`, `'http://x/"a.xml'`). A list of
+/// package names (`["org.apache.commons","org.apache.http"]`) or of three
+/// class names stays clean. It leaves out the `java.*` and .NET
 /// namespaces: Jackson wraps JDK value types with a string as ordinary data
 /// (`["java.net.URL","https://…"]`), and Json.NET never writes this array form.
 ///
@@ -358,7 +369,7 @@ const YAML_GADGET_TAG: &str = r"(?i)(?:!!(?:python/(?:object(?:/apply|/new)?|nam
 /// collection wrappers those modules also emit (`["java.util.ArrayList",[…]]`)
 /// are outside both lists, and a `java.lang.*` wrapper such as
 /// `["java.lang.Long",1]` wraps a scalar, not an object.
-const JSON_POLYMORPHIC_GADGET: &str = r#"(?i)(?:["'](?:@type|\$type|@class|__type)["']\s*:\s*["'](?-i:[\[L]){0,3}(?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))|\[\s*["'](?:(?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))[\w.$]*["']\s*,\s*\{|(?:com\.sun\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.)(?:[\w.$]*\.)?(?-i:[A-Z])[\w$]*["']\s*,\s*["'][^"'\r\n]*["']\s*\]))"#;
+const JSON_POLYMORPHIC_GADGET: &str = r#"(?i)(?:["'](?:@type|\$type|@class|__type)["']\s*:\s*["'](?-i:[\[L]){0,3}(?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))|\[\s*["'](?:(?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))[\w.$]*["']\s*,\s*\{|(?:com\.sun\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.)(?:[\w.$]*\.)?(?-i:[A-Z])[\w$]*["']\s*,\s*(?:"[^"\r\n]*"|'[^'\r\n]*')\s*\]))"#;
 
 /// Cloud-metadata endpoints and dotted IPv4 private/loopback/link-local forms
 /// claimed by `FE-SSRF-001` / `FE-SSRF-001-Q`. Body and query share this

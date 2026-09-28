@@ -286,8 +286,9 @@ async fn time_delay_body_shapes_accept_comments_and_skip_compact_code() {
     .await;
 }
 
-/// A query value holds only the injected expression, so a number followed by
-/// an operator and a delay call at the start of the value is precise there.
+/// A number followed by an operator and a delay call counts where an injected
+/// expression starts: the start of the value, or directly after a quote or
+/// `&`. A number inside prose does not.
 #[tokio::test]
 async fn numeric_context_time_delay_opens_the_query_value() {
     let plugin = monitor_waf(1);
@@ -298,10 +299,17 @@ async fn numeric_context_time_delay_opens_the_query_value() {
         "id=1/sleep(5)",
         "id=1%5Esleep(5)",
         "id=-1-sleep(5)",
+        "id='1-sleep(5)",
+        "q=%221*sleep(5)%22",
     ] {
         assert_detected(&plugin, "FE-SQLI-006", Surface::Query(query)).await;
     }
-    for query in ["q=a-sleep(5)", "q=room%201-sleep(5)", "q=time.sleep(1)"] {
+    for query in [
+        "q=a-sleep(5)",
+        "q=room%201-sleep(5)",
+        "q=time.sleep(1)",
+        "q=it's%201-sleep(5)",
+    ] {
         assert_clean(&plugin, "FE-SQLI-006", Surface::Query(query)).await;
     }
 
@@ -311,6 +319,13 @@ async fn numeric_context_time_delay_opens_the_query_value() {
     for body in [b"1-sleep(5)".as_slice(), b"1*sleep(5)"] {
         assert_detected(&level_two, "FE-SQLI-006-B", Surface::Body(TEXT, body)).await;
     }
+
+    // Followed by more SQL inside a JSON string, the probe is not a whole
+    // value, so level-1 010-B leaves it and the level-2 006-B backstop claims
+    // it after the opening quote.
+    let body: &[u8] = br#"{"id":"1-sleep(5) and 1=1"}"#;
+    assert_clean(&plugin, "FE-SQLI-010-B", Surface::Body(JSON, body)).await;
+    assert_detected(&level_two, "FE-SQLI-006-B", Surface::Body(JSON, body)).await;
 }
 
 #[tokio::test]
@@ -770,10 +785,11 @@ async fn newline_command_ignores_capitalised_prose_and_spaced_ampersand() {
 }
 
 /// `cmd.exe` and PowerShell resolve commands in any case, so a mixed-case
-/// Windows tool after a CR/LF counts when it ends the value, carries `.exe`,
-/// is followed by a shell operator or a flag, or (PowerShell) runs `iex` /
-/// `invoke-`. A short command followed by a spaced `#` comment or a spaced
-/// `&` that ends the value is a command too. Prose lines stay clean.
+/// Windows tool after a CR/LF counts when it carries `.exe` or a flag, when
+/// (except PowerShell) it ends the value or is followed by a shell operator,
+/// or when PowerShell runs `iex` / `invoke-`. A short command followed by a
+/// spaced `#` comment or a spaced `&` that ends the value is a command too.
+/// Prose lines stay clean.
 #[tokio::test]
 async fn newline_command_catches_mixed_case_tools_spaced_comment_and_trailing_ampersand() {
     let plugin = monitor_waf(1);
@@ -803,6 +819,36 @@ async fn newline_command_catches_mixed_case_tools_spaced_comment_and_trailing_am
         "note=Skills:%0APowerShell.",
         "note=pets%0Acat%20%26%20dog",
         "note=pets%0Acat%20%26amp;%20dog",
+    ] {
+        assert_clean(&plugin, "FE-CMD-004", Surface::Query(query)).await;
+    }
+}
+
+/// A bare mixed-case `PowerShell` / `Pwsh` after a CR/LF runs no command, so
+/// it counts only with `.exe`, a flag, or `iex` / `invoke-`: a prose list
+/// ending in it and a table row stay clean, while a mixed-case `Whoami` still
+/// counts when it ends the value. A `#` counts as a shell comment only when it
+/// ends the value or a non-digit follows it, so a numbered item stays clean.
+#[tokio::test]
+async fn newline_powershell_needs_a_command_and_comment_needs_a_non_digit() {
+    let plugin = monitor_waf(1);
+    for query in [
+        "host=127.0.0.1%0APowerShell.exe",
+        "host=127.0.0.1%0APwsh%20-c%20id",
+        "host=127.0.0.1%0AWhoami",
+        "host=a|PowerShell%20-c%20id",
+        "host=127.0.0.1%0Aid%20%23x",
+        "host=127.0.0.1%0Aid%23x",
+        "host=127.0.0.1%0Aid%20%23",
+    ] {
+        assert_detected(&plugin, "FE-CMD-004", Surface::Query(query)).await;
+    }
+    for query in [
+        "note=Skills:%0APython%0APowerShell",
+        "note=Skills:%0APwsh",
+        "note=Shells:%0APowerShell%20|%20Windows%0ABash%20|%20Linux",
+        "note=Shelter%0Acat%20%231%20is%20Tom",
+        "note=Shelter%0Acat%232",
     ] {
         assert_clean(&plugin, "FE-CMD-004", Surface::Query(query)).await;
     }
@@ -1292,6 +1338,7 @@ async fn spring_session_json_is_not_a_polymorphic_gadget() {
 /// Jackson's `WRAPPER_ARRAY` also types a gadget built from one string
 /// (CVE-2017-17485: `["…FileSystemXmlApplicationContext","http://…"]`), and
 /// `org.springframework.web.context.support.` holds the web-context variants.
+/// The string may hold the other quote character (`"…it's…"`, `'…"a"…'`).
 /// A pair of package names, a longer class list, a Maven coordinate, a JDK
 /// value type, and Spring Security's own types stay clean.
 #[tokio::test]
@@ -1302,11 +1349,14 @@ async fn spring_gadget_array_with_a_string_argument_is_detected() {
         br#"{"a":["org.springframework.context.support.ClassPathXmlApplicationContext", "http://x/spel.xml"]}"#,
         br#"["org.springframework.web.context.support.XmlWebApplicationContext",{"configLocation":"http://x/spel.xml"}]"#,
         br#"["org.springframework.web.context.support.GroovyWebApplicationContext","http://x/a.groovy"]"#,
+        br#"["org.springframework.context.support.FileSystemXmlApplicationContext","http://x/it's/spel.xml"]"#,
+        br#"['org.springframework.context.support.ClassPathXmlApplicationContext','http://x/"a"/spel.xml']"#,
     ] {
         assert_detected(&plugin, "FE-DESER-005", Surface::Body(JSON, body)).await;
     }
     for body in [
-        br#"["org.springframework.security.core.authority.SimpleGrantedAuthority","ROLE_USER"]"#.as_slice(),
+        br#"["org.springframework.security.core.authority.SimpleGrantedAuthority","ROLE_USER"]"#
+            .as_slice(),
         br#"["org.springframework.session.MapSession","5f1c"]"#,
         br#"["org.springframework.web.servlet.DispatcherServlet","x"]"#,
         br#"{"packages":["org.apache.commons","org.apache.http"]}"#,
