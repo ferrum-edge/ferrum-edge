@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`otel_tracing` attempt spans on the HTTP/3, gRPC-bridge, and WebSocket
+  paths** (#5867). The per-attempt `CLIENT` spans from #5864 now also cover
+  HTTP/3 requests with a streamed body or a streamed response, the first
+  attempt of an HTTP/3 request whose response buffering is decided from the
+  backend's response headers (previously counted but not exported, so its
+  retry reported attempt `2` alone), native HTTP/3 gRPC, the HTTP/3-to-gRPC
+  bridge, and WebSocket upgrades over HTTP/1.1, HTTP/2 extended `CONNECT`, and
+  HTTP/3. Each attempt on these paths exports one span and hands the backend
+  that span as its `traceparent` parent. These attempts are also recorded in a
+  request's diagnostic-reference detail. The HTTP/3 frontend's bridge to an
+  HTTP/1.1 or HTTP/2 backend remains uninstrumented and keeps the gateway
+  span's `traceparent`. The direct HTTP/2 and gRPC pools now read the clock
+  for connection-setup timings only while a sampled attempt is being
+  dispatched.
 - **`otel_tracing` CLIENT span per backend attempt** (#5864). With an `endpoint`
   configured, every sampled request now also exports one `CLIENT` span per
   backend attempt, retries included, as a child of the gateway's `SERVER` span.

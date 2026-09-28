@@ -46,7 +46,7 @@ const CONNECTION_TIMINGS: [&str; 4] = [
     "gateway.backend.connection.tls_handshake_ms",
 ];
 
-async fn start_collector() -> wiremock::MockServer {
+pub(super) async fn start_collector() -> wiremock::MockServer {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/v1/traces"))
@@ -56,7 +56,7 @@ async fn start_collector() -> wiremock::MockServer {
     server
 }
 
-fn otel_plugin(collector: &wiremock::MockServer) -> Value {
+pub(super) fn otel_plugin(collector: &wiremock::MockServer) -> Value {
     json!({
         "id": "otel-attempt-spans",
         "plugin_name": "otel_tracing",
@@ -72,7 +72,7 @@ fn otel_plugin(collector: &wiremock::MockServer) -> Value {
 }
 
 /// Every span the collector has received, across export batches.
-async fn received_spans(collector: &wiremock::MockServer) -> Vec<Value> {
+pub(super) async fn received_spans(collector: &wiremock::MockServer) -> Vec<Value> {
     let requests = collector.received_requests().await.unwrap_or_default();
     let mut spans = Vec::new();
     for request in requests {
@@ -90,7 +90,7 @@ async fn received_spans(collector: &wiremock::MockServer) -> Vec<Value> {
 
 /// Poll the collector until `ready` accepts its spans, or time out with the
 /// spans it has.
-async fn wait_for_spans(
+pub(super) async fn wait_for_spans(
     collector: &wiremock::MockServer,
     ready: impl Fn(&[Value]) -> bool,
 ) -> Vec<Value> {
@@ -104,7 +104,7 @@ async fn wait_for_spans(
     }
 }
 
-fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
+pub(super) fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
     span["attributes"]
         .as_array()?
         .iter()
@@ -112,11 +112,11 @@ fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
         .map(|attribute| &attribute["value"])
 }
 
-fn string_attr<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
+pub(super) fn string_attr<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
     attr(span, key)?["stringValue"].as_str()
 }
 
-fn int_attr(span: &Value, key: &str) -> Option<i64> {
+pub(super) fn int_attr(span: &Value, key: &str) -> Option<i64> {
     attr(span, key)?["intValue"].as_str()?.parse().ok()
 }
 
@@ -128,7 +128,7 @@ fn double_attr(span: &Value, key: &str) -> Option<f64> {
     attr(span, key)?["doubleValue"].as_f64()
 }
 
-fn in_trace<'a>(spans: &'a [Value], trace_id: &str) -> Vec<&'a Value> {
+pub(super) fn in_trace<'a>(spans: &'a [Value], trace_id: &str) -> Vec<&'a Value> {
     spans
         .iter()
         .filter(|span| span["traceId"] == trace_id)
@@ -140,7 +140,7 @@ fn is_client(span: &&Value) -> bool {
 }
 
 /// The CLIENT spans among `spans`, ordered by attempt number.
-fn client_spans<'a>(spans: impl IntoIterator<Item = &'a Value>) -> Vec<&'a Value> {
+pub(super) fn client_spans<'a>(spans: impl IntoIterator<Item = &'a Value>) -> Vec<&'a Value> {
     let mut clients: Vec<&Value> = spans.into_iter().filter(is_client).collect();
     clients.sort_by_key(|span| int_attr(span, "gateway.backend.attempt"));
     clients
@@ -157,7 +157,7 @@ fn server_span<'a>(spans: &[&'a Value]) -> &'a Value {
 }
 
 /// `(trace_id, parent_span_id)` of a `traceparent` a backend received.
-fn traceparent_ids(traceparent: &str) -> (String, String) {
+pub(super) fn traceparent_ids(traceparent: &str) -> (String, String) {
     let fields: Vec<&str> = traceparent.split('-').collect();
     assert_eq!(fields.len(), 4, "malformed traceparent {traceparent:?}");
     assert_eq!(fields[3], "01", "the request is sampled");

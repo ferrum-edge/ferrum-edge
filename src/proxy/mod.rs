@@ -15447,10 +15447,16 @@ async fn handle_websocket_request_authenticated(
                 }
             });
 
+        // The attempt's `otel_tracing` CLIENT span (issue #5867): the upgrade
+        // request carries the attempt's own `traceparent`, and the handshake is
+        // polled in the attempt's scope. It ends with the handshake below.
+        let ws_attempt_span =
+            ctx.begin_backend_attempt_span_for_header_list(&current_backend_url, &client_headers);
+        let ws_attempt_headers = ws_attempt_span.header_list(&client_headers);
         // A Unix-tagged target is screened BEFORE mesh egress and before the
         // direct dial, so no WebSocket error path can reach the placeholder
         // loopback authority.
-        let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
+        let ws_dial = async {
             if let Some(unix_dispatch) = ws_unix_dispatch {
                 // Match ordinary Unix HTTP dispatch: preserve the authenticated
                 // client's Host only when the route explicitly opts in.
@@ -15495,7 +15501,7 @@ async fn handle_websocket_request_authenticated(
                                 &url_authority,
                                 host.as_ref(),
                                 ws_path_and_query.as_ref(),
-                                &client_headers,
+                                ws_attempt_headers,
                                 ws_size_limits.max_frame_bytes,
                                 ws_size_limits.max_message_bytes,
                                 state.websocket_write_buffer_size,
@@ -15527,7 +15533,7 @@ async fn handle_websocket_request_authenticated(
                         egress,
                         ws_client_host.as_deref(),
                         ws_path_and_query.as_ref(),
-                        &client_headers,
+                        ws_attempt_headers,
                         ws_size_limits.max_frame_bytes,
                         ws_size_limits.max_message_bytes,
                         state.websocket_write_buffer_size,
@@ -15548,7 +15554,7 @@ async fn handle_websocket_request_authenticated(
                         &current_backend_url,
                         ws_dial_proxy,
                         &env_config,
-                        &client_headers,
+                        ws_attempt_headers,
                         &state.connection_pool,
                         ws_size_limits.max_frame_bytes,
                         ws_size_limits.max_message_bytes,
@@ -15559,9 +15565,17 @@ async fn handle_websocket_request_authenticated(
                     .await
                     .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
                 }
-            };
+            }
+        };
+        // Pinned in this block, so the dial future and its borrow of `ctx` end
+        // with the dial.
+        let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> = {
+            tokio::pin!(ws_dial);
+            ws_attempt_span.scope(ws_dial).await
+        };
         match ws_dial_result {
             Ok(handshake) => {
+                ctx.record_backend_attempt(None, true, handshake.backend_upgrade_status());
                 backend_conn_guard = conn_slot;
                 break handshake;
             }
@@ -15599,6 +15613,8 @@ async fn handle_websocket_request_authenticated(
                 // DispatchPolicyRejected dispatch path.
                 let ws_egress_denied =
                     matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
+                // Every failed handshake ends its attempt, retried or not.
+                ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
 
                 // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
                 // handshake / port exhaustion). A backend that got the
@@ -17530,6 +17546,18 @@ pub(crate) enum WsBackendHandshake {
 }
 
 impl WsBackendHandshake {
+    /// The status the backend answered this attempt's upgrade with: `101` for
+    /// a direct or Unix-socket HTTP/1.1 upgrade. `None` for a mesh tunnel,
+    /// whose handshake status depends on its transport and is not retained.
+    pub(crate) fn backend_upgrade_status(&self) -> Option<u16> {
+        match self {
+            Self::Direct(_) => Some(101),
+            Self::Mesh(_) => None,
+            #[cfg(unix)]
+            Self::Unix(_) => Some(101),
+        }
+    }
+
     pub(crate) fn negotiated_subprotocol(&self) -> Option<&hyper::header::HeaderValue> {
         match self {
             Self::Direct(handshake) => handshake.negotiated_subprotocol.as_ref(),

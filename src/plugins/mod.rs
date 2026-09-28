@@ -3780,6 +3780,20 @@ impl RequestContext {
         }
     }
 
+    /// [`Self::begin_backend_attempt_span`] for a dispatch whose backend
+    /// headers are an ordered header list (the WebSocket upgrades, issue
+    /// #5867). The attempt must dispatch `span.header_list(headers)`.
+    pub(crate) fn begin_backend_attempt_span_for_header_list(
+        &self,
+        backend_url: &str,
+        headers: &[(String, String)],
+    ) -> crate::plugins::otel_tracing::BackendAttemptSpan {
+        match self.backend_attempt_trace.as_ref() {
+            Some(trace) => trace.begin_with_header_list(backend_url, headers),
+            None => crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE,
+        }
+    }
+
     /// Whether this request's short-circuit response is an origin-authored
     /// representation a plugin replayed or relayed rather than a rejection
     /// the gateway authored: a `response_caching` HIT/REVALIDATED, a

@@ -95,6 +95,7 @@ mod functional_node_agent_test;
 mod functional_opa_key_auth_redaction_test;
 mod functional_opa_protocol_coverage_test;
 mod functional_openapi_client_contract_test;
+mod functional_otel_attempt_spans_protocols_test;
 mod functional_otel_attempt_spans_test;
 mod functional_otel_ldap_test;
 mod functional_overload_test;
