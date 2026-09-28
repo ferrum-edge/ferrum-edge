@@ -11,6 +11,7 @@
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 fn ctx(method: &str, path: &str) -> RequestContext {
     RequestContext::new("203.0.113.10".into(), method.into(), path.into())
@@ -171,6 +172,293 @@ async fn explicit_rule_modes_enforce_still_promotes_a_band_rule_to_blocking() {
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert!(listed(&request, "waf.rule_hits", "FE-RFI-001"));
     assert_eq!(meta(&request, "waf.detection_rule_hits"), None);
+}
+
+#[tokio::test]
+async fn rule_overrides_action_enforce_does_not_promote_a_band_rule() {
+    // `rule_overrides.<id>.action` sets the action of a rule already enforced
+    // by level; a band rule it names stays monitor-only, so raising
+    // `detection_paranoia_level` never changes what blocks.
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "detection_paranoia_level": 2,
+        "rule_overrides": { "FE-RFI-001": { "action": "enforce" } }
+    }))
+    .unwrap();
+    let (result, request) = query(&plugin, LEVEL_TWO_ONLY_QUERY).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(listed(&request, "waf.detection_rule_hits", "FE-RFI-001"));
+    assert_eq!(meta(&request, "waf.rule_hits"), None);
+
+    // Only `rule_modes: enforce` promotes it, with or without the override.
+    let promoted = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "detection_paranoia_level": 2,
+        "rule_overrides": { "FE-RFI-001": { "action": "enforce" } },
+        "rule_modes": { "FE-RFI-001": "enforce" }
+    }))
+    .unwrap();
+    let (result, request) = query(&promoted, LEVEL_TWO_ONLY_QUERY).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-RFI-001"));
+    assert_eq!(meta(&request, "waf.detection_rule_hits"), None);
+}
+
+#[tokio::test]
+async fn rule_overrides_action_enforce_does_not_force_compile_above_paranoia() {
+    // With no band the level-2 rule is compiled out at level 1, and an
+    // override's `enforce` does not bring it back (v0.9.8 behavior).
+    let overridden = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "rule_overrides": { "FE-RFI-001": { "action": "enforce" } }
+    }))
+    .unwrap();
+    let (result, request) = query(&overridden, LEVEL_TWO_ONLY_QUERY).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&request, "waf.rule_hits"), None);
+    assert_eq!(meta(&request, "waf.detection_rule_hits"), None);
+
+    // `rule_modes: enforce` does force-compile it.
+    let moded = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "rule_modes": { "FE-RFI-001": "enforce" }
+    }))
+    .unwrap();
+    let (result, request) = query(&moded, LEVEL_TWO_ONLY_QUERY).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-RFI-001"));
+
+    // The staging pattern: an override that raises `paranoia_min` above the
+    // active level keeps the rule dormant until `paranoia_level` reaches it.
+    let staged_override = json!({ "FE-XSS-001": { "paranoia_min": 4, "action": "enforce" } });
+    let staged = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "rule_overrides": staged_override.clone()
+    }))
+    .unwrap();
+    let (_, request) = query(&staged, LEVEL_ONE_QUERY).await;
+    assert!(!listed(&request, "waf.rule_hits", "FE-XSS-001"));
+    assert!(!listed(&request, "waf.detection_rule_hits", "FE-XSS-001"));
+
+    let raised = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 4,
+        "rule_overrides": staged_override
+    }))
+    .unwrap();
+    let (result, request) = query(&raised, LEVEL_ONE_QUERY).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
+}
+
+#[tokio::test]
+async fn category_modes_enforce_does_not_promote_a_band_rule() {
+    // `FE-RFI-001` is the only `rfi` rule and sits in the band, so naming its
+    // category leaves nothing that can block and admission refuses it.
+    let error = waf(json!({
+        "mode": "enforce",
+        "paranoia_level": 1,
+        "detection_paranoia_level": 2,
+        "category_modes": { "rfi": "enforce" }
+    }))
+    .unwrap_err();
+    assert!(error.contains("no enabled enforcement path"), "{error}");
+
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "paranoia_level": 1,
+        "detection_paranoia_level": 2,
+        "category_modes": { "rfi": "enforce", "xss": "enforce" }
+    }))
+    .unwrap();
+    let (result, request) = query(&plugin, LEVEL_TWO_ONLY_QUERY).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(listed(&request, "waf.detection_rule_hits", "FE-RFI-001"));
+    assert_eq!(meta(&request, "waf.rule_hits"), None);
+
+    // The level-1 category it names in the same map still enforces.
+    let (result, request) = query(&plugin, LEVEL_ONE_QUERY).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
+}
+
+fn band_response_waf(extra: Value) -> Waf {
+    let mut config = json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "paranoia_level": 1,
+        "detection_paranoia_level": 2,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "scoring": { "enabled": true, "block_threshold": 1 },
+        "custom_rules": [
+            {
+                "id": "BAND-RESP-H",
+                "category": "custom",
+                "severity": "critical",
+                "target": "response_headers",
+                "match_kind": "contains",
+                "pattern": "band-header-marker",
+                "action": "enforce",
+                "paranoia_min": 2
+            },
+            {
+                "id": "BAND-RESP-B",
+                "category": "custom",
+                "severity": "critical",
+                "target": "response_body",
+                "match_kind": "contains",
+                "pattern": "band-body-marker",
+                "action": "enforce",
+                "paranoia_min": 2
+            },
+            {
+                "id": "QUERY-GATE",
+                "category": "custom",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "gate-marker",
+                "action": "enforce"
+            }
+        ]
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    waf(config).unwrap()
+}
+
+fn json_response_headers() -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), "application/json".to_string())])
+}
+
+#[tokio::test]
+async fn detection_band_covers_response_headers_without_blocking() {
+    // An `enforce` action and a critical severity against a threshold of 1:
+    // a band rule still neither blocks nor scores.
+    let plugin = band_response_waf(json!({}));
+    let mut request = ctx("GET", "/report");
+    let mut headers = HashMap::from([("x-debug".to_string(), "band-header-marker".to_string())]);
+
+    let result = plugin.after_proxy(&mut request, 200, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(listed(&request, "waf.detection_rule_hits", "BAND-RESP-H"));
+    assert_eq!(meta(&request, "waf.rule_hits"), None);
+    assert_eq!(meta(&request, "waf.score"), None);
+    assert_eq!(meta(&request, "waf.block_reason"), None);
+}
+
+#[tokio::test]
+async fn detection_band_covers_response_bodies_without_blocking() {
+    let plugin = band_response_waf(json!({}));
+    let mut request = ctx("GET", "/report");
+
+    let result = plugin
+        .finalize_client_visible_response_body(
+            &mut request,
+            200,
+            &json_response_headers(),
+            br#"{"note":"band-body-marker"}"#,
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(listed(&request, "waf.detection_rule_hits", "BAND-RESP-B"));
+    assert_eq!(meta(&request, "waf.rule_hits"), None);
+    assert_eq!(meta(&request, "waf.score"), None);
+    assert_eq!(meta(&request, "waf.block_reason"), None);
+}
+
+#[tokio::test]
+async fn a_band_only_response_body_never_fails_an_oversize_response_closed() {
+    // The default `on_body_too_large: fail_closed` needs an enforcing body
+    // policy; band rules are never one, so the oversize body is prefix-scanned.
+    let plugin = band_response_waf(json!({ "max_scan_bytes": 16 }));
+    let mut request = ctx("GET", "/report");
+
+    let result = plugin
+        .finalize_client_visible_response_body(
+            &mut request,
+            200,
+            &json_response_headers(),
+            br#"{"note":"band-body-marker and a long tail"}"#,
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&request, "waf.scan_truncated"), Some("true"));
+    assert_eq!(meta(&request, "waf.block_reason"), None);
+}
+
+#[tokio::test]
+async fn band_body_rules_enable_the_configuration_level_block_dispositions() {
+    // Deliberately fail-closed: a band body rule turns on inspection of its
+    // direction, and `block` then refuses there as with any other body rule.
+    let plugin = band_response_waf(json!({
+        "max_scan_bytes": 16,
+        "on_body_too_large": "block"
+    }));
+    let mut request = ctx("GET", "/report");
+    let result = plugin
+        .finalize_client_visible_response_body(
+            &mut request,
+            200,
+            &json_response_headers(),
+            br#"{"note":"a clean body with a long tail"}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(meta(&request, "waf.block_reason"), Some("body_too_large"));
+
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "paranoia_level": 1,
+        "detection_paranoia_level": 2,
+        "on_unlisted_content_type": "block",
+        "custom_rules": [
+            {
+                "id": "BAND-BODY",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "paranoia_min": 2
+            },
+            {
+                "id": "QUERY-GATE",
+                "category": "custom",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "gate-marker",
+                "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+    let mut request = ctx("POST", "/upload");
+    request
+        .headers
+        .insert("content-type".into(), "application/octet-stream".into());
+    assert!(plugin.should_buffer_request_body(&request));
+    let headers = request.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut request, &headers, b"clean bytes")
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(meta(&request, "waf.block_reason"), Some("content_type"));
 }
 
 #[tokio::test]
@@ -599,6 +887,102 @@ async fn materialized_query_names_are_compared_as_stored() {
     let result = plugin.authorize(&mut request).await;
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
+}
+
+#[tokio::test]
+async fn materialized_query_whole_url_rules_recheck_without_excluded_pairs() {
+    // The whole-URL re-check on the materialized path rebuilds the URL from
+    // the parsed map minus the excluded names.
+    let plugin = recommended_with_overrides(json!({
+        "FE-PATHTRAV-001": { "exclude": { "query_params": ["relpath"] } }
+    }));
+
+    let mut request = ctx("GET", "/search");
+    request
+        .query_params
+        .insert("relpath".into(), "../assets/logo.svg".into());
+    let result = plugin.authorize(&mut request).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+    assert!(!listed(&request, "waf.rule_hits", "FE-PATHTRAV-001"));
+
+    let mut request = ctx("GET", "/search");
+    request
+        .query_params
+        .insert("relpath".into(), "../assets".into());
+    request
+        .query_params
+        .insert("file".into(), "../../etc/shadow".into());
+    let result = plugin.authorize(&mut request).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-PATHTRAV-001"));
+}
+
+#[tokio::test]
+async fn encoding_specials_judge_the_url_without_excluded_parameters() {
+    // `FE-ENCODING-001` is a whole-URL special: with a query exclusion it
+    // judges the URL rebuilt without the excluded pairs.
+    let strict = recommended_with_overrides(json!({
+        "FE-ENCODING-001": { "action": "enforce" }
+    }));
+    let (result, request) = query(&strict, "code=SAVE50%2525").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "baseline: the double-encoded marker enforces"
+    );
+    assert!(listed(&request, "waf.rule_hits", "FE-ENCODING-001"));
+
+    let plugin = recommended_with_overrides(json!({
+        "FE-ENCODING-001": { "action": "enforce", "exclude": { "query_params": ["code"] } }
+    }));
+    let (result, request) = query(&plugin, "code=SAVE50%2525").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+    assert!(!listed(&request, "waf.rule_hits", "FE-ENCODING-001"));
+
+    // The same marker in any other parameter still counts.
+    let (result, request) = query(&plugin, "code=ok&next=SAVE50%2525").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-ENCODING-001"));
+}
+
+#[tokio::test]
+async fn a_method_override_exclusion_covers_the_override_special() {
+    // `FE-HEADER-002` fires on the override header's name and, through its
+    // special, on an override that differs from the request method. A header
+    // exclusion suppresses both, case-insensitively.
+    let strict = recommended_with_overrides(json!({}));
+    let (result, request) = with_header(&strict, "x-http-method-override", "DELETE").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "baseline: the method override enforces"
+    );
+    assert!(listed(&request, "waf.rule_hits", "FE-HEADER-002"));
+
+    let plugin = recommended_with_overrides(json!({
+        "FE-HEADER-002": { "exclude": { "headers": ["X-HTTP-Method-Override"] } }
+    }));
+    let (result, request) = with_header(&plugin, "x-http-method-override", "DELETE").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{:?}",
+        meta(&request, "waf.rule_hits")
+    );
+    assert!(!listed(&request, "waf.rule_hits", "FE-HEADER-002"));
+
+    // Excluding an unrelated header leaves the override inspected.
+    let unrelated = recommended_with_overrides(json!({
+        "FE-HEADER-002": { "exclude": { "headers": ["x-other"] } }
+    }));
+    let (result, request) = with_header(&unrelated, "x-http-method-override", "DELETE").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HEADER-002"));
 }
 
 #[tokio::test]

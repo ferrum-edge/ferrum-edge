@@ -154,6 +154,8 @@ mod functional_udp_proxy_test;
 #[cfg(unix)]
 mod functional_unix_backend_test;
 mod functional_url_query_limits_test;
+mod functional_waf_unlisted_content_type_grpc_test;
+mod functional_waf_unlisted_content_type_h3_test;
 mod functional_websocket_connection_limit_test;
 mod functional_websocket_frame_limit_test;
 mod functional_websocket_limits_test;

@@ -389,6 +389,133 @@ fn block_is_not_an_admission_enforcement_path_when_every_type_is_scanned() {
     }
 }
 
+#[tokio::test]
+async fn block_with_every_type_scanned_is_admitted_beside_an_enforcing_rule() {
+    // Accepted twin of the rejection above: `block` is still dead
+    // configuration, but an enforcing body rule is a reachable path of its
+    // own. Every type, a missing one included, is scanned rather than refused.
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "inspect_binary_body": true,
+        "inspect_multipart": true,
+        "on_unlisted_content_type": "block",
+        "rule_modes": { "FE-SQLI-001-B": "enforce" }
+    }))
+    .unwrap();
+    for ct in [Some("application/octet-stream"), Some("text/csv"), None] {
+        let (_, result, ctx) = post(&plugin, ct, br#"{"name":"widget"}"#).await;
+        assert!(matches!(result, PluginResult::Continue), "{ct:?}");
+        assert_eq!(meta(&ctx, "waf.body_uninspected"), None, "{ct:?}");
+
+        let (_, result, ctx) = post(&plugin, ct, SQLI_JSON).await;
+        assert!(is_reject(&result), "{ct:?}");
+        assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"), "{ct:?}");
+    }
+}
+
+#[tokio::test]
+async fn block_is_not_an_admission_enforcement_path_without_body_methods() {
+    // `body_methods: []` governs no HTTP request body, so `block` can never
+    // fire and the monitor-only default pack leaves nothing that can block.
+    let error = waf(json!({
+        "mode": "enforce",
+        "body_methods": [],
+        "on_unlisted_content_type": "block"
+    }))
+    .unwrap_err();
+    assert!(error.contains("no enabled enforcement path"), "{error}");
+    assert!(
+        error.contains("at least one `body_methods` entry"),
+        "{error}"
+    );
+
+    // Any listed method makes it reachable again.
+    waf(json!({
+        "mode": "enforce",
+        "body_methods": ["POST"],
+        "on_unlisted_content_type": "block"
+    }))
+    .unwrap();
+
+    // Accepted beside another enforcement path, where `block` stays inert.
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "body_methods": [],
+        "on_unlisted_content_type": "block"
+    }))
+    .unwrap();
+    let (buffers, result, ctx) = post(&plugin, Some("application/octet-stream"), SQLI_JSON).await;
+    assert!(!buffers);
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&ctx, "waf.body_uninspected"), None);
+}
+
+#[test]
+fn an_oversize_block_stays_an_admission_path_without_body_methods() {
+    // `body_methods` does not govern WebSocket messages, which still apply the
+    // strict size cap, so an empty list does not make it unreachable.
+    waf(json!({
+        "mode": "enforce",
+        "body_methods": [],
+        "on_body_too_large": "block"
+    }))
+    .unwrap();
+}
+
+#[tokio::test]
+async fn grpc_json_codecs_are_scanned_and_other_grpc_types_are_unlisted() {
+    let plugin = recommended("block");
+    for ct in ["application/grpc+json", "application/grpc-web+json"] {
+        let (_, result, ctx) = post(&plugin, Some(ct), br#"{"name":"widget"}"#).await;
+        assert!(matches!(result, PluginResult::Continue), "{ct}");
+        assert_eq!(meta(&ctx, "waf.body_uninspected"), None, "{ct}");
+
+        let (_, result, ctx) = post(&plugin, Some(ct), SQLI_JSON).await;
+        assert!(is_reject(&result), "{ct}");
+        assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"), "{ct}");
+    }
+    for ct in [
+        "application/grpc",
+        "application/grpc+proto",
+        "application/grpc-web",
+        "application/grpc-web+proto",
+        "application/grpc-web-text",
+        "application/protobuf",
+    ] {
+        let (buffers, result, ctx) = post(&plugin, Some(ct), b"\0\0\0\0\x02hi").await;
+        assert!(buffers, "{ct}");
+        assert!(is_reject(&result), "{ct}");
+        assert_eq!(
+            meta(&ctx, "waf.block_reason"),
+            Some("content_type"),
+            "{ct:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn block_while_enforcing_records_nothing_before_the_body_decision() {
+    // `block` in enforce mode always refuses, so the header-time observation
+    // never records; the exact decision over the finalized body does.
+    let plugin = recommended("block");
+    let mut declared = request("POST", "/api/items", Some("application/octet-stream"));
+    declared
+        .headers
+        .insert("content-length".into(), "15".into());
+    let result = plugin.authorize(&mut declared).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&declared, "waf.body_uninspected"), None);
+
+    let headers = declared.headers.clone();
+    let result = final_body(&plugin, &mut declared, &headers, b"fifteen bytes!!").await;
+    assert!(is_reject(&result));
+    assert_eq!(
+        meta(&declared, "waf.body_uninspected"),
+        Some("content_type")
+    );
+}
+
 #[test]
 fn block_is_an_admission_enforcement_path_only_with_body_inspection() {
     // The built-in pack is monitor-only; `block` alone makes enforce reachable.

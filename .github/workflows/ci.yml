@@ -1919,6 +1919,8 @@ jobs:
               functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
               functional_response_protocol_managed_headers_test
+              functional_waf_unlisted_content_type_grpc_test
+              functional_waf_unlisted_content_type_h3_test
               functional_websocket_limits_test
               functional_otel_attempt_spans_protocols_test
           # The service-backed shards run serially (`nextest_jobs: 1`) against

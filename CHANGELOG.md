@@ -205,10 +205,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but never block, never score, never make a body policy enforcing, and never
   satisfy `mode: enforce` admission; a request whose only hits are in the band
   keeps `waf.action=clean`. Only an explicit `rule_modes: enforce` promotes a
-  band rule. This lets operators measure a higher paranoia level on live
-  traffic before enabling it. A band body rule still turns on inspection of
-  its body direction, so `on_body_too_large: block` and
-  `on_unlisted_content_type: block` then apply to that direction.
+  band rule; `rule_overrides.<id>.action` sets the action of a rule that is
+  already enforced by level and promotes nothing above `paranoia_level`. This
+  lets operators measure a higher paranoia level on live traffic before
+  enabling it. A band body rule still turns on inspection of its body
+  direction, so `on_body_too_large: block` and `on_unlisted_content_type:
+  block` then apply to that direction.
 - **WAF category modes** (#5847). `category_modes` sets the action of every
   built-in rule in a category (`{"xss": "enforce", "ldap_injection":
   "disabled"}`). Precedence, lowest
@@ -265,6 +267,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **WAF admission: `on_unlisted_content_type: block` needs a body method**
+  (#5865). With `body_methods: []` no HTTP request body is governed, so `block`
+  can never fire; under `mode: enforce` it no longer counts as an enforcement
+  path, and a configuration with no other path is rejected at construction.
+  `on_body_too_large: block` still counts, because WebSocket client messages
+  ignore `body_methods`. `on_unlisted_content_type` is unreleased (added after
+  v0.9.8), so this change has no deprecation path.
 - WAF scanning is faster on the request path with identical results. Rule
   sets run an `is_match` prefilter before collecting matches, so a clean
   header, query, cookie, or path value (the common case) skips the overlapping

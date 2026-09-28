@@ -83,6 +83,12 @@ rules into enforcement. There are three ways:
 
 Action precedence for a built-in rule, lowest first: `default_rule_action`,
 `category_modes`, `rule_overrides.<id>.action`, `rule_modes`.
+`rule_overrides.<id>.action` sets the action of a rule that is already enforced
+by level; only `rule_modes: enforce` promotes a rule above `paranoia_level`
+(including a [detection-band](#detection-paranoia-level) rule). An override's
+`enforce` leaves a band rule monitor-only and a rule above both levels
+compiled out, and the bulk controls (`default_rule_action`, `category_modes`)
+promote neither.
 
 Because the loud/broad rules are gated behind `paranoia_level >= 2` (see
 below), the recommended starting posture for active blocking is:
@@ -134,8 +140,12 @@ when a body inspection hook can run: it rejects oversize governed HTTP bodies
 and WebSocket application messages under `mode: enforce` even if every rule
 stays monitor-only. `fail_closed` (the default), `scan_truncated`, and `skip`
 do not count, because they cannot reject unless some other enforcing body
-policy already exists. `on_unlisted_content_type: block` counts the same way
-when the request-body hook can run and some body can be unlisted (see
+policy already exists. An empty `body_methods` does not remove this path:
+client-to-backend WebSocket messages ignore `body_methods` and still apply the
+cap. `on_unlisted_content_type: block` counts the same way when the
+request-body hook can run and some HTTP request body can be unlisted, which
+needs at least one `body_methods` entry and not both `inspect_multipart` and
+`inspect_binary_body` (see
 [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type));
 its `fail_closed` does not.
 
@@ -163,9 +173,12 @@ Rules with `paranoia_level < paranoia_min <= detection_paranoia_level` are
 compiled and scanned but:
 
 - are always `monitor`, whatever `default_rule_action`, `category_modes`, or
-  `rule_overrides.action` say — only an explicit `rule_modes: {"<id>":
-  "enforce"}` promotes one, exactly as it force-compiles a rule above
-  `paranoia_level` today;
+  `rule_overrides.<id>.action` say. Only an explicit `rule_modes: {"<id>":
+  "enforce"}` promotes one to a normal enforcing rule (no longer
+  detection-only, so the rest of this list stops applying to it), exactly as
+  it force-compiles a rule above `detection_paranoia_level`. An override's
+  `enforce` never promotes, so raising the detection level never changes what
+  blocks;
 - contribute **zero** to anomaly scoring;
 - never make a body policy "enforcing", so they cannot trigger
   `on_body_too_large: fail_closed`, `on_scan_timeout: fail_closed`, a
@@ -181,17 +194,30 @@ compiled and scanned but:
 
 Detection-band body rules still cause request/response bodies (and WebSocket
 messages) to be buffered and scanned, so budget for that scan cost while the
-band is active. Because the band turns on inspection of that body direction,
-the dispositions that refuse **every** inspected body by configuration rather
-than by a rule verdict apply to it too: in `mode: enforce`,
-`on_body_too_large: block` rejects an oversize body or WebSocket message, and
-`on_unlisted_content_type: block` rejects a non-empty unlisted request body,
+band is active.
+
+A band body rule **turns on body inspection for its direction**, and the
+dispositions that refuse by configuration rather than by a rule verdict then
+apply to that direction. This is deliberate and fails closed: the WAF does not
+track which rules enabled a direction, and an operator who asked for `block`
+gets `block` on every body it inspects:
+
+- in `mode: enforce`, `on_body_too_large: block` rejects an oversize request
+  or response body, or an oversize WebSocket message;
+- in `mode: enforce`, `on_unlisted_content_type: block` rejects a non-empty
+  unlisted request body;
+- `on_scan_timeout: block`, which does not depend on `mode`, rejects an
+  over-budget body scan;
+
 exactly as they would with a monitor-only body rule. This only changes
 behavior when the band supplies the first body rule in a direction (for
-example a custom-only pack whose one body rule sits in the band); the
-`fail_closed` variants of both settings are unaffected, since band rules never
-make a body policy enforcing. `detection_paranoia_level` below
-`paranoia_level` is rejected.
+example a custom-only pack whose one body rule sits in the band, or a response
+band rule while `response_body_inspection` is on and no other response-body
+rule is active). The `fail_closed` variants of these settings are unaffected,
+since band rules never make a body policy enforcing; use them (the default for
+`on_body_too_large`) while you measure a band if configuration-level refusals
+are not wanted yet. `detection_paranoia_level` below `paranoia_level` is
+rejected.
 
 ## Decode / normalization
 
@@ -537,7 +563,13 @@ same terms as text:
 ```
 
 Per-rule `action: "enforce"` only blocks when global `mode` is also
-`enforce`; with `mode: "monitor"` the match is logged but allowed.
+`enforce`; with `mode: "monitor"` the match is logged but allowed. It sits
+below `rule_modes` in precedence. `rule_overrides.<id>.action` sets the action
+of a rule that is already enforced by level; only `rule_modes: enforce`
+promotes a rule above `paranoia_level` (including a
+[detection-band](#detection-paranoia-level) rule). An override that raises
+`paranoia_min` above `paranoia_level` together with `action: enforce` keeps
+the rule dormant until `paranoia_level` reaches it.
 
 ### Field exclusions
 
@@ -697,14 +729,24 @@ The decision is exact: when a value could refuse the request, the WAF asks the
 gateway to buffer that body and decides over the **finalized** backend-visible
 headers and the actual bytes, so an empty upload always passes and an HTTP/2
 or HTTP/3 body sent without `Content-Length` is still caught. Bodies that
-could not be refused keep the streaming path. It applies only to
-`body_methods`, to non-exempt requests, and when this instance's request-body
-hook runs at all (request and request-body inspection on, with an active
-request-body rule or `FE-ENCODING-001` / `FE-ENCODING-002` enabled); WebSocket
-messages carry no `Content-Type` and are always scanned.
+could not be refused keep the streaming path.
+
+Scope: the setting governs **HTTP request bodies only** — HTTP/1.1, HTTP/2,
+HTTP/3, native gRPC, and gRPC-Web requests — and among those only:
+
+- methods listed in `body_methods` (so `body_methods: []` turns it off, and
+  `block` then no longer satisfies `mode: enforce` admission);
+- requests no `global_exemptions` entry short-circuits;
+- instances whose request-body hook runs at all (request and request-body
+  inspection on, with an active request-body rule or `FE-ENCODING-001` /
+  `FE-ENCODING-002` enabled).
+
+Response bodies are never governed by it, and WebSocket messages carry no
+`Content-Type` and are always scanned.
 
 Because a refusing configuration reads the whole body before it rejects, a
-large or long-running upload receives its `403` only at end of stream (memory
+large or long-running upload receives the rejection (`reject_status_code`,
+default `403`) only at end of stream (memory
 stays bounded by `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`), and a client-streaming
 or bidirectional gRPC call may wait for its deadline instead. `on_body_too_large:
 skip` does not avoid this buffering for unlisted bodies: it only skips oversize
@@ -721,19 +763,30 @@ from the request's declared framing (`Content-Length` > 0 or
 shows which routes carry unlisted bodies, but undercounts such clients.
 
 Under `mode: enforce`, `block` is itself a reachable admission enforcement
-path when the request-body hook can run (as above) and at least one content
-type is left unscanned. With both `inspect_multipart` and
-`inspect_binary_body` on, every body is scanned, `block` can never fire, and it
-does not satisfy admission. `fail_closed` never satisfies admission.
+path when the request-body hook can run (as above), `body_methods` is not
+empty, and at least one content type is left unscanned. With both
+`inspect_multipart` and `inspect_binary_body` on, every body is scanned; with
+`body_methods: []`, no HTTP request body is governed. Either way `block` can
+never fire, and it does not satisfy admission (the configuration is still
+accepted when some other enforcement path exists). `fail_closed` never
+satisfies admission.
 
 Before switching to `block` or `fail_closed`, list every type your backends
 legitimately accept: add them to `body_content_types` (scanned as text), turn
 on `inspect_multipart` for uploads, or exempt upload-only routes with
-`global_exemptions`. gRPC (`application/grpc`, gRPC-Web, `application/protobuf`)
-and image bodies are unlisted by default, so a non-empty one is refused under
-`block`, and under `fail_closed` wherever an enforcing request-body policy
-applies (for example with `default_rule_action: enforce` or anomaly scoring),
-unless the type is listed or the route exempted.
+`global_exemptions`. gRPC (`application/grpc`, `application/grpc+proto`),
+gRPC-Web (`application/grpc-web`, `application/grpc-web+proto`,
+`application/grpc-web-text`), `application/protobuf`, and image bodies are
+unlisted by default, so a non-empty one is refused under `block`, and under
+`fail_closed` wherever an enforcing request-body policy applies (for example
+with `default_rule_action: enforce` or anomaly scoring), unless the type is
+listed or the route exempted. Every gRPC call has a non-empty body (each
+message carries a 5-byte frame header), and a refused native gRPC call receives
+the rejection mapped to a gRPC status (`PERMISSION_DENIED` for the default
+`403`). The JSON codecs are the exception: `application/grpc+json` and
+`application/grpc-web+json` map to the JSON family through their `+json`
+suffix, so they are **scanned** as JSON whenever `application/json` is in
+`body_content_types`, not refused as unlisted.
 Bodies on methods outside `body_methods` (for example a `GET` with a body)
 are not governed; add the method to `body_methods` if a backend reads such
 bodies.
@@ -1168,7 +1221,7 @@ fire, then switch to `enforce`.
 | `default_rule_action` | enum | _(unset)_ | bulk action for built-ins that inherit it; encoding heuristics stay monitor until `rule_modes`; `rule_modes` overrides win |
 | `category_modes` | map | `{}` | per-category action for built-in rules; above `default_rule_action`, below `rule_overrides.action` / `rule_modes`; unknown categories rejected |
 | `paranoia_level` | int 1–4 | `1` | activate rules with `paranoia_min <= level` |
-| `detection_paranoia_level` | int 1–4 | `paranoia_level` | also compile rules up to this level as detection-only (never block or score; reported in `waf.detection_rule_hits`) |
+| `detection_paranoia_level` | int 1–4 | `paranoia_level` | also compile rules up to this level as detection-only (never block or score; reported in `waf.detection_rule_hits`); only `rule_modes: enforce` promotes one |
 | `request_inspection` | bool | `true` | scan request metadata |
 | `request_body_inspection` | bool | `true` | scan request bodies |
 | `response_inspection` | bool | `false` | scan response headers |
@@ -1176,7 +1229,7 @@ fire, then switch to `enforce`.
 | `include_default_rules` | bool | `true` | load the built-in pack |
 | `disabled_default_rules` | string[] | `[]` | built-in ids to drop |
 | `rule_modes` | map | `{}` | per-rule action by id |
-| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action/exclude (see [Field exclusions](#field-exclusions)) |
+| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action/exclude (see [Field exclusions](#field-exclusions)); `action` applies to rules already enforced by level and never promotes above `paranoia_level` |
 | `custom_rules` | object[] | `[]` | additional rules |
 | `scoring` | object | _(off)_ | anomaly scoring (see above) |
 | `global_exemptions` | object | _(none)_ | request short-circuits |
@@ -1185,7 +1238,7 @@ fire, then switch to `enforce`.
 | `max_scan_bytes` | int | `1048576` | body scan cap |
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
 | `on_unlisted_content_type` | enum | `allow` | `allow` / `fail_closed` / `block`; request bodies whose `Content-Type` is outside the scan scope (see [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type)) |
-| `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose bodies are scanned |
+| `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose HTTP request bodies are scanned and governed by `on_unlisted_content_type`; WebSocket messages ignore it |
 | `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |
 | `inspect_binary_body` | bool | `false` | scan bodies with unknown/binary type |

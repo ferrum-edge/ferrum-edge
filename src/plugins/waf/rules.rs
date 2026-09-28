@@ -586,7 +586,8 @@ impl IpCidr {
 /// `blocking < paranoia_min <= detection` compile as detection-only (see
 /// [`CompiledRule::detection_only`]). Anything above `detection` is compiled
 /// out, except that an explicit `rule_modes: enforce` still force-compiles a
-/// rule as a normal enforcing rule.
+/// rule as a normal enforcing rule. `rule_overrides.action: enforce` promotes
+/// neither a band rule nor a rule above `detection`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ParanoiaLevels {
     pub(super) blocking: u8,
@@ -665,6 +666,8 @@ pub(super) fn compile_rules(
         // when its `paranoia_min` exceeds the active paranoia level; a Monitor
         // or Disabled entry never resurrects a paranoia-filtered rule. Between
         // the blocking and detection levels a rule is kept as detection-only.
+        // `rule_overrides.action` never promotes: it only sets the action of a
+        // rule that is already enforced by level.
         let force_enforced = rule_modes.get(&rule.id) == Some(&RuleAction::Enforce);
         let detection_only = rule.paranoia_min > paranoia.blocking && !force_enforced;
         if detection_only && rule.paranoia_min > paranoia.detection {

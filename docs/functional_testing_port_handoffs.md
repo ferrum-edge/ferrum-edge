@@ -44,6 +44,7 @@ range policy; the future refused stream reservation uses `reserve_future_tcp_por
 | `functional_stream_listener_failure_test.rs` | 1 future stream listener, initially bound without listening |
 | `functional_tcp_idle_timeout_env_test.rs` | 1 TCP stream frontend |
 | `functional_tls_lifecycle_test.rs` | 3 HTTPS, TCP and UDP frontends |
+| `functional_waf_unlisted_content_type_h3_test.rs` | 1 H3 frontend |
 | `scripted_backend_h3_tests.rs` | 1 H3 frontend |
 | `scripted_backend_streaming_latency_tests.rs` | 1 HTTPS frontend |
 
