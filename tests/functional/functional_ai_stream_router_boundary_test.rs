@@ -214,12 +214,7 @@ fn assert_provider_boundary(protocol: &str, attempt: &str, request: &CapturedReq
             "{ctx}: '{forbidden}' must never cross the provider boundary:\n{raw}"
         );
     }
-    for forbidden_header in [
-        "x-api-key:",
-        "x-client-token:",
-        "x-consumer-",
-        "cookie:",
-    ] {
+    for forbidden_header in ["x-api-key:", "x-client-token:", "x-consumer-", "cookie:"] {
         assert!(
             !lower.contains(forbidden_header),
             "{ctx}: '{forbidden_header}' must be stripped at the provider boundary:\n{raw}"

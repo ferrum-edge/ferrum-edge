@@ -1432,9 +1432,8 @@ fn mesh_route_dispatch_rejects_consumer_assertion_request_transform_destinations
                     }]
                 }]
             });
-            let error = MeshRouteDispatch::new(&config).expect_err(
-                "an x-consumer-* request_transform destination must fail admission",
-            );
+            let error = MeshRouteDispatch::new(&config)
+                .expect_err("an x-consumer-* request_transform destination must fail admission");
             assert!(
                 error.contains("rules[0].request_transform[0]"),
                 "{operation} {key} rejection must name the rule; got: {error}"

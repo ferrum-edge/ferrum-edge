@@ -2440,12 +2440,18 @@ fn admission_refuses_every_consumer_assertion_namespace_destination() {
             let error = RequestTransformer::new(&json!({"rules": [rule]}))
                 .err()
                 .expect("an x-consumer-* destination must fail admission");
-            assert!(error.contains("`rule[0]`"), "{operation} {destination}: {error}");
+            assert!(
+                error.contains("`rule[0]`"),
+                "{operation} {destination}: {error}"
+            );
             assert!(
                 error.contains(&destination.to_ascii_lowercase()),
                 "{operation} {destination}: {error}"
             );
-            assert!(error.contains("`x-consumer-*`"), "{operation} {destination}: {error}");
+            assert!(
+                error.contains("`x-consumer-*`"),
+                "{operation} {destination}: {error}"
+            );
         }
         // Removing, or renaming a value away from the namespace, stays legal.
         for rule in [

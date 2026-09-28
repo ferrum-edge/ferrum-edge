@@ -875,9 +875,8 @@ fn test_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
     // (asserted behaviourally in
     // `gateway_assertion_predicate_covers_whole_consumer_namespace_case_insensitively`).
     assert!(
-        source.contains(
-            "headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));"
-        ),
+        source
+            .contains("headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));"),
         "the shared scrub must reject case variants of every reserved assertion header"
     );
     assert!(
