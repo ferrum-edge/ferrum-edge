@@ -1157,6 +1157,8 @@ pub struct RequestContext {
 - `apply_route_overrides(proxy)` — returns an `Arc<Proxy>` with direct route overrides applied. This helper cannot re-resolve upstream TLS for `route_override_upstream_id`.
 - `apply_route_overrides_with_upstreams(proxy, upstreams)` — use this in custom dispatch paths that honor `route_override_upstream_id`; it re-resolves `resolved_tls` from the effective upstream snapshot and rebinds the precomputed H1 `pending_limit_scope` (clearing it on a direct-backend override).
 
+The `x-consumer-*` request-header namespace is gateway-owned. Client-supplied names beneath it never reach `ctx.headers`, and any `x-consumer-*` header a custom plugin writes into the outbound header map is scrubbed before dispatch; the gateway then writes only `X-Consumer-Username` / `X-Consumer-Custom-Id` from the values above. To pass additional consumer attributes to a backend, use a header name outside that namespace.
+
 ### Inter-Plugin Communication
 
 Use the `metadata` field to pass data between plugins. For example, a correlation ID plugin sets `metadata["request_id"]`, and a logging plugin reads it:

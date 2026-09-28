@@ -2678,3 +2678,144 @@ fn every_direct_h1_dispatch_awaits_through_the_sender_release() {
         "the direct HTTP/1.1 dispatch sites changed; list the new site above"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Gateway-owned `x-consumer-*` consumer assertion namespace
+// ---------------------------------------------------------------------------
+//
+// Every boundary that decides whether a request header is a consumer
+// assertion must route through the ONE shared namespace predicate
+// (`proxy::headers::is_consumer_assertion_header`, or its
+// `is_gateway_assertion_header` superset that adds `x-geo-country`). Before
+// ferrum-alloy#25 item 4 the WebSocket and trailer boundaries stripped the
+// whole namespace while ordinary request headers only stripped the two
+// identity names, so a client `X-Consumer-Role` reached HTTP/gRPC backends.
+
+/// `(boundary, source file, delegation to the shared predicate)`.
+const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
+    (
+        "ingress materialization (every HTTP-family path) and mesh authz",
+        "src/plugins/mod.rs",
+        "crate::proxy::headers::is_gateway_assertion_header(name)",
+    ),
+    (
+        "raw native-gRPC / direct-H2 / mesh replay merge base",
+        "src/proxy/headers.rs",
+        ".find(|name| is_consumer_assertion_header(name.as_str()))",
+    ),
+    (
+        "H1/H2/H3 request trailers",
+        "src/proxy/headers.rs",
+        "|| is_consumer_assertion_header(name)\n",
+    ),
+    (
+        "post-plugin refresh (H1/H2, H3, egress overlay, deferred passes)",
+        "src/proxy/mod.rs",
+        "headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));",
+    ),
+    (
+        "H1/H2 dispatch refresh gate",
+        "src/proxy/mod.rs",
+        ".any(|name| headers_mod::is_gateway_assertion_header(name));",
+    ),
+    (
+        "H1/H2 WebSocket handshake",
+        "src/proxy/mod.rs",
+        "    headers_mod::is_consumer_assertion_header(name)\n        || matches!(",
+    ),
+    (
+        "native H3 dispatch refresh gate",
+        "src/http3/server.rs",
+        ".any(|k| crate::proxy::headers::is_gateway_assertion_header(k));",
+    ),
+    (
+        "H3 WebSocket handshake",
+        "src/http3/websocket.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(&lower)",
+    ),
+    (
+        "H3-to-gRPC bridge trusted overlay",
+        "src/http3/cross_protocol.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(key)",
+    ),
+    (
+        "H3-to-gRPC bridge prebuilt base",
+        "src/http3/cross_protocol.rs",
+        "crate::proxy::headers::is_gateway_assertion_header(name.as_str())",
+    ),
+    (
+        "AI provider boundary (ai_stream_router, ai_federation)",
+        "src/plugins/ai_stream_router.rs",
+        "headers.retain(|name, _| !crate::proxy::headers::is_gateway_assertion_header(name));",
+    ),
+    (
+        "request_transformer admission",
+        "src/plugins/request_transformer.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(dest)",
+    ),
+    (
+        "claim_headers / outputClaimToHeaders admission",
+        "src/plugins/utils/claim_header_fanout.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(name)",
+    ),
+    (
+        "correlation_id admission",
+        "src/plugins/correlation_id.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(name)",
+    ),
+    (
+        "mesh_route_dispatch request_transform admission",
+        "src/plugins/mesh_route_dispatch.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(&rule.key)",
+    ),
+];
+
+/// Production text of a source file: everything before its trailing inline
+/// `mod tests`, so an inline test's literal cannot satisfy or trip a guard.
+fn without_inline_test_module(text: &str) -> &str {
+    text.split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .unwrap_or(text)
+}
+
+#[test]
+fn every_consumer_assertion_boundary_routes_through_the_shared_namespace_predicate() {
+    for &(boundary, file, delegation) in CONSUMER_ASSERTION_NAMESPACE_SITES {
+        let text = source(file);
+        assert!(
+            without_inline_test_module(&text).contains(delegation),
+            "{boundary} ({file}) must decide the x-consumer-* namespace with the shared \
+             predicate: `{delegation}`"
+        );
+    }
+}
+
+#[test]
+fn no_production_boundary_reserves_only_the_two_consumer_identity_names() {
+    // The shapes every pre-fix site used. Each reserves `x-consumer-username`
+    // / `x-consumer-custom-id` by exact name and therefore lets any other
+    // `x-consumer-*` name through.
+    let two_name_shapes = [
+        "eq_ignore_ascii_case(\"x-consumer-username\")",
+        "eq_ignore_ascii_case(\"x-consumer-custom-id\")",
+        "\"x-consumer-username\" | \"x-consumer-custom-id\"",
+        "remove(\"x-consumer-username\")",
+        "starts_with(\"x-consumer-\")",
+    ];
+    for (path, text) in production_sources() {
+        let production = without_inline_test_module(&text);
+        for shape in two_name_shapes {
+            assert!(
+                !production.contains(shape),
+                "{path} matches the consumer assertion namespace with `{shape}`; route it \
+                 through `proxy::headers::is_consumer_assertion_header` instead"
+            );
+        }
+    }
+    let headers = source("src/proxy/headers.rs");
+    assert_eq!(
+        headers.matches("b\"x-consumer-\"").count(),
+        1,
+        "the x-consumer-* prefix must be spelled in exactly one predicate"
+    );
+}

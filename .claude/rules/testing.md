@@ -133,8 +133,10 @@ The parity tables live in:
   HALF_OPEN probe release, discovery-target health pruning, RFC 9113
   protocol-NACK classification, CLI external-secret resolution, discovery
   dial-identity dedup, the `pool_shard_amount` minimum, SVID
-  generation-segment matching across all four pool families, and pinned
-  non-ephemeral host ports across every Docker-backed test fixture.
+  generation-segment matching across all four pool families, pinned
+  non-ephemeral host ports across every Docker-backed test fixture, and the
+  gateway-owned `x-consumer-*` request-header namespace across every ingress,
+  dispatch, trailer, WebSocket, AI-provider, and plugin-admission boundary.
 - `tests/unit/plugins/waf_body_charset_parity_tests.rs` — wide-charset
   (UTF-16/UTF-32) body decoding on both the request and response scan paths.
 

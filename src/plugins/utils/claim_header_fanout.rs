@@ -437,6 +437,12 @@ fn normalize_allowed_header(raw_header: &str, plugin: &str, field: &str) -> Resu
         .map_err(|e| format!("{plugin}: `{field}` header name is invalid: {e}"))?
         .as_str()
         .to_string();
+    if crate::proxy::headers::is_consumer_assertion_header(&header) {
+        return Err(format!(
+            "{plugin}: `{field}` cannot target {header:?}: the `x-consumer-*` namespace is \
+             gateway-owned consumer assertion metadata"
+        ));
+    }
     if is_reserved_header(&header) {
         return Err(format!(
             "{plugin}: `{field}` cannot target reserved header {header:?}"
@@ -445,20 +451,23 @@ fn normalize_allowed_header(raw_header: &str, plugin: &str, field: &str) -> Resu
     Ok(header)
 }
 
+/// Headers a claim mapping may never write. The whole gateway-owned
+/// `x-consumer-*` namespace is reserved
+/// ([`crate::proxy::headers::is_consumer_assertion_header`]), not only the
+/// two identity fields the gateway itself asserts.
 pub fn is_reserved_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "x-consumer-username"
-            | "x-consumer-custom-id"
-            | "host"
-            | "connection"
-            | "te"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "upgrade"
-            | "proxy-authorization"
-            | "authorization"
-    )
+    crate::proxy::headers::is_consumer_assertion_header(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "host"
+                | "connection"
+                | "te"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "proxy-authorization"
+                | "authorization"
+        )
 }
 
 /// Headers that a validated JWT claim must never be allowed to synthesize.

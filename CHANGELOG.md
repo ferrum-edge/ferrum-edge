@@ -267,6 +267,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The whole `x-consumer-*` request-header namespace is gateway-owned**
+  (breaking). Every client-supplied request header whose name starts with
+  `x-consumer-` (case-insensitive), not only `X-Consumer-Username` and
+  `X-Consumer-Custom-Id`, is now removed before plugins run and before
+  dispatch on HTTP/1.1, HTTP/2, HTTP/3, native and bridged gRPC, the
+  cross-protocol bridges, mesh/HBONE-forwarded HTTP, and third-party AI
+  provider calls; WebSocket handshakes and request trailers already did this.
+  A client `X-Consumer-Role` or `X-Consumer-Groups` no longer reaches a
+  backend. After the plugin phases the namespace is scrubbed again, so a
+  plugin cannot author a name beneath it, and only the gateway's authenticated
+  `X-Consumer-Username` / `X-Consumer-Custom-Id` are written back. Plugin
+  configuration that targets the namespace is rejected at config load, with an
+  error naming the rule: `request_transformer` header destinations,
+  `claim_headers` / `output_claim_headers` destinations,
+  `correlation_id.header_name`, and `mesh_route_dispatch` `request_transform`
+  destinations. `proxy::headers::is_consumer_assertion_header` is the single
+  predicate every boundary uses. There is no opt-out.
 - **WAF admission: `on_unlisted_content_type: block` needs a body method**
   (#5865). With `body_methods: []` no HTTP request body is governed, so `block`
   can never fire; under `mode: enforce` it no longer counts as an enforcement

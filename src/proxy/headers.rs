@@ -103,14 +103,40 @@ define_header_name_set! {
     ]
 }
 
-/// Returns `true` for the gateway-owned consumer assertion namespace.
+/// Returns `true` for the gateway-owned consumer assertion namespace
+/// (`x-consumer-*`, ASCII case-insensitive).
 ///
-/// Consumer plugins may attach additional attributes beneath this prefix, so
-/// backend boundaries must reject the whole namespace rather than only the two
-/// built-in identity fields.
+/// This is the single source of truth for the namespace. Every name under the
+/// prefix is gateway-owned: a client-supplied `X-Consumer-Role` or
+/// `X-Consumer-Groups` is as much a forged identity assertion to a backend as a
+/// client-supplied `X-Consumer-Username`, so ingress materialization, the raw
+/// gRPC / mesh merge base, the post-plugin assertion refresh, WebSocket
+/// handshakes, request trailers, third-party AI provider boundaries, and
+/// plugin config admission all reject the whole namespace. Only the gateway
+/// re-adds names beneath it afterwards (today `x-consumer-username` and
+/// `x-consumer-custom-id`, from the authenticated principal).
+///
+/// Allocation-free: one bounded 11-byte case-insensitive prefix compare, so it
+/// is safe to call per header on the hot path with lowercase or mixed-case
+/// names.
 #[inline]
-pub(crate) fn is_consumer_assertion_header(name: &str) -> bool {
-    name.starts_with("x-consumer-")
+pub fn is_consumer_assertion_header(name: &str) -> bool {
+    const PREFIX: &[u8] = b"x-consumer-";
+    name.as_bytes()
+        .get(..PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+}
+
+/// Returns `true` for every backend-visible gateway assertion: the
+/// [`is_consumer_assertion_header`] namespace plus the private GeoIP result
+/// (`x-geo-country`). ASCII case-insensitive and allocation-free.
+///
+/// Outbound maps that plugins may have mutated are scrubbed of these names and
+/// then receive only the gateway's authoritative values
+/// (`crate::proxy::refresh_backend_gateway_assertion_headers`).
+#[inline]
+pub fn is_gateway_assertion_header(name: &str) -> bool {
+    is_consumer_assertion_header(name) || name.eq_ignore_ascii_case("x-geo-country")
 }
 
 define_header_name_set! {
@@ -507,7 +533,7 @@ pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
     is_backend_request_strip_header(name)
         || is_proxy_owned_forwarding_header(name, true)
         || name.starts_with("grpc-")
-        || name.starts_with("x-consumer-")
+        || is_consumer_assertion_header(name)
         || name.starts_with("x-ferrum-")
         || name.starts_with("x-path-param-")
         // `via` and `early-data` are deliberately asymmetric with the header
@@ -561,15 +587,28 @@ pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) 
 
 /// Remove reserved gateway-asserted headers from a request `HeaderMap`.
 ///
-/// `x-consumer-username` / `x-consumer-custom-id` are injected by the gateway
-/// only after a principal is resolved and are documented as "never trusted
-/// from clients". `x-geo-country` is likewise emitted only after a successful
-/// GeoIP lookup. `HeaderMap::remove` clears every value for the case-insensitive
-/// name, so any client-supplied casing or duplication is dropped.
+/// The whole `x-consumer-*` namespace ([`is_consumer_assertion_header`]) is
+/// gateway-owned: `x-consumer-username` / `x-consumer-custom-id` are injected
+/// only after a principal is resolved, and no other name beneath the prefix is
+/// ever trusted from a client. `x-geo-country` is likewise emitted only after a
+/// successful GeoIP lookup. `HeaderMap::remove` clears every value for a name,
+/// and `HeaderMap` names are already lowercase, so any client-supplied casing
+/// or duplication is dropped.
+///
+/// Allocation-free: the common no-assertion request does one prefix compare per
+/// distinct name. A matching custom `HeaderName` clone only bumps a refcount.
 fn strip_reserved_gateway_assertion_headers(headers: &mut http::HeaderMap) {
-    headers.remove("x-consumer-username");
-    headers.remove("x-consumer-custom-id");
+    while let Some(name) = first_consumer_assertion_header_name(headers) {
+        headers.remove(name);
+    }
     headers.remove("x-geo-country");
+}
+
+fn first_consumer_assertion_header_name(headers: &http::HeaderMap) -> Option<http::HeaderName> {
+    headers
+        .keys()
+        .find(|name| is_consumer_assertion_header(name.as_str()))
+        .cloned()
 }
 
 /// Whether the materialized single-value view still represents the exact raw
@@ -622,8 +661,8 @@ fn raw_header_values_match_materialized(
 /// `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
 /// `content-length`, etc. straight back into the outbound map.
 ///
-/// Reserved gateway-asserted headers (`x-consumer-username`,
-/// `x-consumer-custom-id`, and `x-geo-country`) are stripped from the raw base
+/// Reserved gateway-asserted headers (the whole `x-consumer-*` namespace and
+/// `x-geo-country`) are stripped from the raw base
 /// map FIRST, before the merge. The native gRPC path uses the raw inbound
 /// `HeaderMap` as its merge base (unlike the reqwest / direct-H2 /
 /// WebSocket paths, which build the outbound map from the sanitised

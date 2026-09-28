@@ -6964,9 +6964,12 @@ fn build_h3_grpc_backend_headers(
     hmap
 }
 
-/// Extract the gateway-trusted plugin assertions (`x-consumer-username`,
-/// `x-consumer-custom-id`, and `x-geo-country`) from the materialised
-/// `proxy_headers` into a minimal map.
+/// Extract the gateway-trusted plugin assertions (the `x-consumer-*`
+/// namespace — in practice `x-consumer-username` / `x-consumer-custom-id` —
+/// and `x-geo-country`) from the materialised `proxy_headers` into a minimal
+/// map. `proxy_headers` has already been through
+/// [`crate::proxy::refresh_backend_gateway_assertion_headers`], so every name
+/// left in the namespace is gateway-authored.
 ///
 /// The H3 gRPC dispatch builds its backend header set up-front
 /// ([`build_h3_grpc_backend_headers`]). The shared gRPC core's
@@ -6994,8 +6997,7 @@ fn trusted_plugin_assertion_proxy_headers(
     // regardless. The reserved set mirrors
     // `proxy::headers::strip_reserved_gateway_assertion_headers`.
     for (key, value) in proxy_headers {
-        if key.eq_ignore_ascii_case("x-consumer-username")
-            || key.eq_ignore_ascii_case("x-consumer-custom-id")
+        if crate::proxy::headers::is_consumer_assertion_header(key)
             || key.eq_ignore_ascii_case("x-geo-country")
         {
             assertions.insert(key.to_ascii_lowercase(), value.clone());
@@ -7010,13 +7012,20 @@ fn trusted_plugin_assertion_proxy_headers(
 /// Folds every UTF-8 field line with the same separators plugin materialization
 /// uses, then overlays [`trusted_plugin_assertion_proxy_headers`]. Matching
 /// folded values keep the prebuilt raw lines (including repeated / `-bin`
-/// metadata); trusted assertions replace any client-forged reserved names.
+/// metadata); reserved names on the prebuilt base are dropped and only trusted
+/// assertions are layered back on.
 fn merge_proxy_headers_for_prebuilt_h3_grpc(
     prebuilt: &HeaderMap,
     proxy_headers: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut view = HashMap::with_capacity(prebuilt.keys_len());
     for name in prebuilt.keys() {
+        // Gateway assertions come ONLY from the trusted overlay below; a
+        // reserved name on the prebuilt base must not survive into the
+        // authoritative view when no trusted value replaces it.
+        if crate::proxy::headers::is_gateway_assertion_header(name.as_str()) {
+            continue;
+        }
         let separator = crate::plugins::repeated_request_header_separator(name.as_str());
         let mut folded = String::new();
         let mut saw_value = false;

@@ -310,8 +310,8 @@ request.
 A deferred hook that can inject routing headers runs after the selected
 target's single state-consuming enforcement, and that target is pinned across
 the external call. After each deferred pass, the gateway removes every case
-variant of the reserved `x-consumer-username` and `x-consumer-custom-id`
-headers, restores only authenticated gateway values, and reapplies configured
+variant of every header in the gateway-owned `x-consumer-*` namespace (and
+`x-geo-country`), restores only authenticated gateway values, and reapplies configured
 egress baggage-key filtering. Plugin-returned headers therefore cannot spoof
 backend identity, restore forbidden baggage, or steer this request to a
 different unauthorized target.
@@ -452,7 +452,7 @@ Plugins receive an immutable finalized body and pre-egress header snapshot. A
 `pre_proxy` `serverless_function` that injects backend request headers publishes
 them into a separate backend header overlay; the proxy merges that overlay into
 the outbound map afterwards and then re-strips reserved gateway assertions
-(`x-consumer-username`, `x-consumer-custom-id`, `x-geo-country`) and re-applies
+(the whole `x-consumer-*` namespace and `x-geo-country`) and re-applies
 the configured egress baggage filter, exactly as it does after a deferred
 `before_proxy` pass. The finalized body cannot change after policy acceptance;
 the overlay is the explicit, bounded exception for backend request headers.
@@ -894,8 +894,8 @@ before the trailer section reaches a backend:
 Removed from the trailer section: RFC 9110 §7.6.1 request-direction hop-by-hop
 and framing fields (`connection`, `expect`, `keep-alive`, `proxy-authorization`,
 `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
-`content-length`); reserved gateway assertions (`x-consumer-username`,
-`x-consumer-custom-id`, `x-geo-country`); Ferrum-owned names (`x-ferrum-*`,
+`content-length`); reserved gateway assertions (the whole `x-consumer-*`
+namespace and `x-geo-country`); Ferrum-owned names (`x-ferrum-*`,
 `x-path-param-*`); credentials (`authorization`, `cookie`, `x-api-key`);
 forwarding identity the gateway regenerates (`x-forwarded-*`, `forwarded`);
 initial-only gRPC call parameters (`grpc-*`); the gateway-owned `early-data`
@@ -907,8 +907,8 @@ Ordinary application metadata — request checksums, tenant tags, tracing
 annotations — is unaffected and still reaches the backend. Requests dispatched
 through reqwest drop the inbound trailer section entirely, as they always have.
 A backend that needs to identify the caller must keep reading the gateway's
-`X-Consumer-Username` / `X-Consumer-Custom-Id` **headers**; those names are
-never accepted from a client in either section.
+`X-Consumer-Username` / `X-Consumer-Custom-Id` **headers**; no `x-consumer-*`
+name is ever accepted from a client in either section.
 
 ## Stream Proxy Lifecycle (TCP/UDP)
 
@@ -1784,7 +1784,7 @@ keeps unauthenticated requests eligible for an immediate `401` without body
 collection while still making the bounded body available to OPA's `authorize`
 callback on HTTP/1.1, HTTP/2, and HTTP/3.
 
-After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
+After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. The whole `x-consumer-*` request-header namespace is gateway-owned: client-supplied names beneath it are dropped when headers are materialized, before any plugin runs, and plugin-authored names beneath it are scrubbed from the outbound map before these two are written back, on every protocol path. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
 
 ### Rate limiting runs after auth (priority 2900)
 

@@ -2417,6 +2417,58 @@ fn gateway_owned_request_destinations_fail_admission() {
 }
 
 // ---------------------------------------------------------------------------
+// The `x-consumer-*` namespace is gateway-owned consumer assertion metadata
+// ---------------------------------------------------------------------------
+
+#[test]
+fn admission_refuses_every_consumer_assertion_namespace_destination() {
+    for destination in [
+        "x-consumer-foo",
+        "X-Consumer-Role",
+        "X-CONSUMER-GROUPS",
+        "x-consumer-username",
+        "x-consumer-custom-id",
+    ] {
+        for operation in ["add", "update", "rename"] {
+            let rule = if operation == "rename" {
+                json!({"target": "header", "operation": operation,
+                    "key": "x-source", "new_key": destination})
+            } else {
+                json!({"target": "header", "operation": operation,
+                    "key": destination, "value": "admin"})
+            };
+            let error = RequestTransformer::new(&json!({"rules": [rule]}))
+                .err()
+                .expect("an x-consumer-* destination must fail admission");
+            assert!(error.contains("`rule[0]`"), "{operation} {destination}: {error}");
+            assert!(
+                error.contains(&destination.to_ascii_lowercase()),
+                "{operation} {destination}: {error}"
+            );
+            assert!(error.contains("`x-consumer-*`"), "{operation} {destination}: {error}");
+        }
+        // Removing, or renaming a value away from the namespace, stays legal.
+        for rule in [
+            json!({"target": "header", "operation": "remove", "key": destination}),
+            json!({"target": "header", "operation": "rename",
+                "key": destination, "new_key": "x-captured"}),
+        ] {
+            assert!(RequestTransformer::new(&json!({"rules": [rule]})).is_ok());
+        }
+    }
+    // Names that only resemble the prefix are ordinary headers.
+    for destination in ["x-consumer", "x-consumers-role", "x-consumerrole"] {
+        let config = json!({"rules": [
+            {"target": "header", "operation": "add", "key": destination, "value": "v"}
+        ]});
+        assert!(
+            RequestTransformer::new(&config).is_ok(),
+            "{destination} is outside the gateway-owned namespace"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Issue #5106 — a JSON-only body rule must not pin an ordinary non-JSON upload
 // to the buffered path. The config-time capability stays the upper bound; the
 // per-request predicate is the exact negation of what `transform_request_body`

@@ -20399,7 +20399,10 @@ components:
             - not:
                 type: string
                 pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Vv][Ii][Aa]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$"
-          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names, are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
+            - not:
+                type: string
+                pattern: "^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[Xx]-[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]-"
+          description: "Header name (surrounding Rust `str::trim` Unicode White_Space is trimmed and the name is lowercased internally). After trimming, the token must be a valid `http::HeaderName` of at most 65,535 ASCII bytes. Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names and every name in the gateway-owned x-consumer-* consumer assertion namespace, are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
         echo_downstream:
           type: [boolean, "null"]
           default: true
@@ -21735,6 +21738,8 @@ components:
                   before verified claim values are installed, so an absent, null,
                   empty, or wrong-type claim leaves the header absent instead of
                   forwarding client-supplied input.
+                  Destinations in the gateway-owned `x-consumer-*` consumer
+                  assertion namespace are rejected at config load.
               claim_headers_separator:
                 type: string
                 minLength: 1
@@ -21885,6 +21890,8 @@ components:
             claim values are installed, so an absent, null, empty, or wrong-type
             claim leaves the header absent instead of forwarding client-supplied
             input.
+            Destinations in the gateway-owned `x-consumer-*` consumer
+            assertion namespace are rejected at config load.
         claim_headers_separator:
           type: string
           default: ","
@@ -22278,6 +22285,8 @@ components:
                   claim values are installed, so an absent, null, empty, or wrong-type
                   claim leaves the header absent instead of forwarding client-supplied
                   input.
+                  Destinations in the gateway-owned `x-consumer-*` consumer
+                  assertion namespace are rejected at config load.
         allow_provider_fanout:
           type: boolean
           default: false
@@ -22482,6 +22491,8 @@ components:
                   verified claim values are installed, so an absent, null, empty, or
                   wrong-type claim leaves the header absent instead of forwarding
                   client-supplied input.
+                  Destinations in the gateway-owned `x-consumer-*` consumer
+                  assertion namespace are rejected at config load.
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -24470,8 +24481,10 @@ components:
                   disabled RTDS transformer is not eligible and does not
                   consume the list. `apply_route_overrides: true` lets an
                   auto-emitted empty-rules instance act as that eligible
-                  consumer. Validated at config load — CRLF in values and
-                  unknown operations are rejected.
+                  consumer. Validated at config load — CRLF in values,
+                  unknown operations, and `add`/`update` destinations in the
+                  gateway-owned `x-consumer-*` consumer assertion namespace are
+                  rejected.
                 items:
                   type: object
                   additionalProperties: false
@@ -27317,7 +27330,10 @@ components:
             connection, transfer-encoding, keep-alive, proxy-authorization,
             proxy-connection, te, trailer, upgrade, expect, x-forwarded-for,
             x-forwarded-proto, x-forwarded-host,
-            x-ferrum-original-content-encoding, and x-grpc-web-mode.
+            x-ferrum-original-content-encoding, and x-grpc-web-mode. They also
+            reject every name in the gateway-owned `x-consumer-*` consumer
+            assertion namespace (including x-consumer-username and
+            x-consumer-custom-id); the error names the rule.
             Removal and rename sources remain allowed. Use preserve_host_header
             for Host or trusted-proxy configuration for forwarding identity.
         value:

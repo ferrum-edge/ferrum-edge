@@ -412,6 +412,7 @@ async fn final_backend_header_policy_reasserts_provider_boundary() {
         "Bearer normal-backend-secret".to_string(),
     );
     headers.insert("x-consumer-username".to_string(), "alice".to_string());
+    headers.insert("X-Consumer-Role".to_string(), "admin".to_string());
     headers.insert("host".to_string(), "attacker.example".to_string());
 
     plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
@@ -420,6 +421,10 @@ async fn final_backend_header_policy_reasserts_provider_boundary() {
         Some("Bearer sk-test")
     );
     assert!(!headers.contains_key("x-consumer-username"));
+    assert!(
+        !headers.contains_key("X-Consumer-Role"),
+        "the whole x-consumer-* namespace is stripped at the provider boundary"
+    );
     assert_eq!(
         headers.get("host").map(String::as_str),
         Some("api.openai.com")

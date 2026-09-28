@@ -440,6 +440,19 @@ impl RequestTransformer {
                              for Host or trusted-proxy configuration for forwarding identity"
                         ));
                     }
+                    // The whole `x-consumer-*` namespace is gateway-owned
+                    // consumer assertion metadata. Removing or renaming away
+                    // from it stays legal (the client value is already gone).
+                    if let Some(dest) = destination
+                        && crate::proxy::headers::is_consumer_assertion_header(dest)
+                    {
+                        return Err(format!(
+                            "request_transformer: `rule[{idx}]`: header destination {dest:?} is \
+                             in the gateway-owned `x-consumer-*` consumer assertion namespace \
+                             and cannot be configured; only the gateway asserts consumer \
+                             identity to backends"
+                        ));
+                    }
                     header_rules.push(HeaderRule {
                         operation: hop,
                         key,

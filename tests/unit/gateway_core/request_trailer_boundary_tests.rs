@@ -4,7 +4,7 @@
 //! Client request trailers are read AFTER the initial header block has been
 //! stripped and sanitized, so a client that sends a TRAILERS frame can restate
 //! anything the gateway removed from the headers: reserved gateway assertions
-//! (`x-consumer-username`, `x-consumer-custom-id`, `x-geo-country`), Ferrum
+//! (the whole `x-consumer-*` namespace, `x-geo-country`), Ferrum
 //! internals (`x-ferrum-*`, `x-path-param-*`), credentials, forwarding
 //! identity, and hop-by-hop framing controls.
 //!
@@ -27,6 +27,9 @@ fn hostile_request_trailers() -> Vec<(&'static str, &'static str)> {
         // clients" and the whole point of this boundary.
         ("x-consumer-username", "admin"),
         ("x-consumer-custom-id", "1"),
+        // The whole `x-consumer-*` namespace is gateway-owned.
+        ("x-consumer-role", "admin"),
+        ("x-consumer-groups", "admins"),
         ("x-geo-country", "US"),
         // Ferrum-owned internals.
         ("x-ferrum-foo", "bar"),

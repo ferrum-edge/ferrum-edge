@@ -16975,17 +16975,20 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
+/// Drop every gateway assertion (the whole `x-consumer-*` namespace plus
+/// `x-geo-country`), in any case variant, from a plugin-mutable header map.
 fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
-    headers.retain(|name, _| {
-        !name.eq_ignore_ascii_case("x-consumer-username")
-            && !name.eq_ignore_ascii_case("x-consumer-custom-id")
-            && !name.eq_ignore_ascii_case("x-geo-country")
-    });
+    headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));
 }
 
 /// Remove plugin-controlled gateway assertion headers and restore only the
 /// authenticated principal and private GeoIP lookup result for dispatch.
-pub(crate) fn refresh_backend_gateway_assertion_headers(
+///
+/// Every `x-consumer-*` name is gateway-owned, so a plugin- or config-authored
+/// `x-consumer-role` is dropped here exactly like a forged
+/// `x-consumer-username`; only the authenticated `x-consumer-username` /
+/// `x-consumer-custom-id` are written back.
+pub fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
@@ -16996,11 +16999,9 @@ pub(crate) fn refresh_backend_gateway_assertion_headers(
     let geo_country = ctx.backend_geo_country().map(str::to_string);
     let source_has_reserved_assertion = principal_username.is_none()
         && geo_country.is_none()
-        && headers.keys().any(|name| {
-            name.eq_ignore_ascii_case("x-consumer-username")
-                || name.eq_ignore_ascii_case("x-consumer-custom-id")
-                || name.eq_ignore_ascii_case("x-geo-country")
-        });
+        && headers
+            .keys()
+            .any(|name| headers_mod::is_gateway_assertion_header(name));
     if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
         return;
     }
@@ -34136,11 +34137,9 @@ async fn handle_proxy_request_inner(
     // authenticated principal and private GeoIP result. The common
     // no-assertion path avoids materializing an owned header map.
     let effective_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
-    let source_has_reserved_assertion = effective_headers.keys().any(|name| {
-        name.eq_ignore_ascii_case("x-consumer-username")
-            || name.eq_ignore_ascii_case("x-consumer-custom-id")
-            || name.eq_ignore_ascii_case("x-geo-country")
-    });
+    let source_has_reserved_assertion = effective_headers
+        .keys()
+        .any(|name| headers_mod::is_gateway_assertion_header(name));
     if ctx.backend_consumer_username().is_some()
         || ctx.backend_geo_country().is_some()
         || source_has_reserved_assertion
