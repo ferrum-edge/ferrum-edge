@@ -1162,8 +1162,10 @@ async fn functional_ws_deflate_terminate_waf_inspects_plaintext() {
     assert_eq!(client.inflate(&echo), b"echo:harmless");
 
     // The token only exists after inflation, so a close proves the scanner
-    // saw plaintext.
-    let message = format!("prefix {WAF_TOKEN} suffix");
+    // saw plaintext. Repeating it makes the message compressible, so the
+    // compressor emits a Huffman-coded block instead of a stored block that
+    // would carry the token's bytes verbatim.
+    let message = format!("prefix {} suffix", WAF_TOKEN.repeat(8));
     let compressed = client.deflate(message.as_bytes());
     assert!(
         !compressed
