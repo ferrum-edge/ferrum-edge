@@ -374,6 +374,9 @@ SYFT_CREDENTIAL_MARKERS = (
     "--env-file",
     "docker.sock",
     "$work:",
+    ".docker",
+    "config.json",
+    "DOCKER_CONFIG",
 )
 BUILD_PARITY_LINES = (
     "          target: runtime\n",
