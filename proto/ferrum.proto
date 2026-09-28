@@ -30,13 +30,10 @@ message SubscribeRequest {
   // field and rejects a mismatch before streaming configuration so plugin
   // ownership admission uses one enforced cluster-wide value.
   optional string real_ip_header = 4;
-  // Additive ConfigSync capability advertisement: this DP understands
-  // `ConfigUpdate.heartbeat` keepalive frames and will arm an application
-  // silence watchdog once the CP confirms it will send them. Absent/false on
-  // peers that predate heartbeats, so a CP must never send heartbeats to a DP
-  // that did not advertise support — an unnegotiated empty heartbeat envelope
-  // would read as an unusable FULL_SNAPSHOT to such a DP.
-  bool supports_heartbeat = 5;
+  // Retired heartbeat capability advertisement. Heartbeats are always on, so
+  // CP and DP no longer negotiate them.
+  reserved 5;
+  reserved "supports_heartbeat";
 }
 
 message FullConfigRequest {
@@ -56,7 +53,7 @@ message FullConfigResponse {
   string ferrum_version = 3;
   // JSON-encoded modes::mesh::config::TrustBundleSet for gateway-to-mesh TLS,
   // or JSON null to clear previously delivered CP trust material. Kept
-  // out-of-band so config_json stays compatible with older DPs.
+  // out-of-band so config_json never carries trust authority material.
   string trust_bundles_json = 4;
 }
 
@@ -74,21 +71,17 @@ message ConfigUpdate {
   // JSON-encoded modes::mesh::config::TrustBundleSet for gateway-to-mesh TLS,
   // or JSON null to clear previously delivered CP trust material. Kept
   // out-of-band so DELTA updates can refresh trust without changing the
-  // incremental resource payload and FULL_SNAPSHOT config_json stays
-  // compatible with older DPs.
+  // incremental resource payload and FULL_SNAPSHOT config_json never carries
+  // trust authority material.
   string trust_bundles_json = 6;
   // Lightweight keepalive frame for ConfigSync Subscribe streams. Heartbeats
   // refresh DP stream liveness without forcing a config apply, so healthy
-  // idle clusters are not mistaken for silent partitions. Only ever sent to a
-  // subscriber that advertised `SubscribeRequest.supports_heartbeat`.
+  // idle clusters are not mistaken for silent partitions. The CP sends them on
+  // every Subscribe stream and the DP always arms its silence watchdog.
   bool heartbeat = 7;
-  // CP-side confirmation of the heartbeat capability, set on the initial
-  // FULL_SNAPSHOT of a Subscribe stream when the CP accepted the DP's
-  // `supports_heartbeat` advertisement and will emit heartbeat frames. A DP
-  // arms its application silence watchdog only after seeing this, so a new DP
-  // talking to a CP that predates heartbeats never reconnects on silence the
-  // CP was never asked to break. Absent/false on legacy CPs.
-  bool heartbeat_negotiated = 8;
+  // Retired heartbeat capability confirmation (heartbeats are always on).
+  reserved 8;
+  reserved "heartbeat_negotiated";
 }
 
 message MeshSubscribeRequest {

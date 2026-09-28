@@ -2350,7 +2350,7 @@ pub async fn run(
     }
     let stream_admission =
         crate::grpc::admission::CpGrpcAdmissionController::new(stream_admission_limits);
-    let (grpc_server, update_tx) = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
+    let grpc_server = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
         .channel_capacity(env_config.cp_broadcast_channel_capacity)
         .admission(stream_admission.clone())
         .registry(dp_registry.clone())
@@ -2398,7 +2398,9 @@ pub async fn run(
         Some(
             XdsAdsServer::with_sidecar_enforcement(
                 config_arc.clone(),
-                update_tx.clone(),
+                // ADS reads every namespace through `with_namespace_broadcasts`
+                // below; this constructor sender is the CP's own namespace.
+                broadcasts.sender_for(&env_config.namespace),
                 grpc_secret,
                 env_config.cp_dp_grpc_jwt_issuer.clone(),
                 env_config.namespace.clone(),

@@ -310,42 +310,6 @@ impl MeshGrpcServer {
     }
 
     #[allow(dead_code)]
-    pub fn new(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-    ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        Self::builder(config, jwt_secret).build()
-    }
-
-    #[allow(dead_code)]
-    pub fn with_channel_capacity(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-        channel_capacity: usize,
-    ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        Self::builder(config, jwt_secret)
-            .channel_capacity(channel_capacity)
-            .build()
-    }
-
-    #[allow(dead_code)]
-    pub fn with_channel_capacity_registry_issuer_and_namespace(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-        channel_capacity: usize,
-        registry: Arc<MeshNodeRegistry>,
-        expected_issuer: String,
-        namespace: String,
-    ) -> (Self, broadcast::Sender<MeshConfigBroadcast>) {
-        Self::builder(config, jwt_secret)
-            .channel_capacity(channel_capacity)
-            .registry(registry)
-            .expected_issuer(expected_issuer)
-            .namespace(namespace)
-            .build()
-    }
-
-    #[allow(dead_code)]
     pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
         self.cluster_domain = cluster_domain;
         self

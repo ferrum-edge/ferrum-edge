@@ -363,12 +363,11 @@ async fn spawn_cp(
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(initial_config)));
     let registry = Arc::new(DpNodeRegistry::new());
-    let (cp_server, update_tx) = CpGrpcServer::with_channel_capacity_and_registry(
-        config_arc.clone(),
-        GRPC_JWT_SECRET.to_string(),
-        broadcast_capacity,
-        registry.clone(),
-    );
+    let cp_server = CpGrpcServer::builder(config_arc.clone(), GRPC_JWT_SECRET.to_string())
+        .channel_capacity(broadcast_capacity)
+        .registry(registry.clone())
+        .build();
+    let update_tx = cp_server.broadcasts().sender_for("ferrum");
 
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -733,12 +732,13 @@ async fn test_primary_retry_reconnects_to_primary() {
     for attempt in 1..=5 {
         match tokio::net::TcpListener::bind_test(primary_addr).await {
             Ok(listener) => {
-                let (cp_server, _tx) = CpGrpcServer::with_channel_capacity_and_registry(
+                let cp_server = CpGrpcServer::builder(
                     Arc::new(ArcSwap::new(Arc::new(primary_config.clone()))),
                     GRPC_JWT_SECRET.to_string(),
-                    16,
-                    Arc::new(DpNodeRegistry::new()),
-                );
+                )
+                .channel_capacity(16)
+                .registry(Arc::new(DpNodeRegistry::new()))
+                .build();
                 let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
                 let h = tokio::spawn(async move {
                     let _ = Server::builder()

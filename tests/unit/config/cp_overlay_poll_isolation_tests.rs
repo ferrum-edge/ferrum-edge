@@ -537,19 +537,6 @@ fn json_ids(payload: &serde_json::Value, field: &str) -> Vec<String> {
     ids
 }
 
-fn json_strings(payload: &serde_json::Value, field: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let Some(items) = payload.get(field).and_then(|value| value.as_array()) else {
-        return values;
-    };
-    for item in items {
-        if let Some(value) = item.as_str() {
-            values.push(value.to_string());
-        }
-    }
-    values
-}
-
 /// Fold a mesh broadcast into the state a mesh node would hold, exactly as a
 /// subscriber does: `Full` replaces, `Delta` applies on top, arrival order only.
 fn apply_mesh_event(state: &mut BTreeSet<String>, event: &MeshConfigBroadcast) {
@@ -577,7 +564,7 @@ fn apply_dp_event(state: &mut BTreeSet<String>, update: &ConfigUpdate) {
     for id in json_ids(&payload, "added_or_modified_proxies") {
         state.insert(id);
     }
-    for id in json_strings(&payload, "removed_proxy_ids") {
+    for id in json_ids(&payload, "removed_proxy_ids") {
         state.remove(&id);
     }
 }

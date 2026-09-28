@@ -256,7 +256,7 @@ async fn start_configsync(
     verifier: Arc<CpDpVerifier>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
-    let (server, _tx) = CpGrpcServer::builder(cfg_arc, TENANT_A_SECRET.to_string())
+    let server = CpGrpcServer::builder(cfg_arc, TENANT_A_SECRET.to_string())
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
@@ -299,10 +299,11 @@ async fn start_mesh(verifier: Arc<CpDpVerifier>) -> (SocketAddr, tokio::task::Jo
 
 async fn start_xds(verifier: Arc<CpDpVerifier>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
-    let (_cp, update_tx) = CpGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
+    let cp = CpGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
         .channel_capacity(64)
         .scope(multi_tenant_scope())
         .build();
+    let update_tx = cp.broadcasts().sender_for(TENANT_A);
     let server = XdsAdsServer::new(
         cfg_arc,
         update_tx,
@@ -330,7 +331,7 @@ async fn start_all_stream_surfaces(
     max_lifetime: Duration,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
-    let (cp, update_tx) = CpGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
+    let cp = CpGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
@@ -339,6 +340,7 @@ async fn start_all_stream_surfaces(
         .scope(multi_tenant_scope())
         .real_ip_header(None)
         .build();
+    let update_tx = cp.broadcasts().sender_for(TENANT_A);
     let (mesh, _mesh_tx) = MeshGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
         .channel_capacity(64)
         .registry(Arc::new(MeshNodeRegistry::new()))
@@ -434,7 +436,6 @@ fn subscribe_request(node_id: &str, namespace: &str) -> ferrum_edge::grpc::proto
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: namespace.to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     }
 }
 
@@ -1988,10 +1989,11 @@ async fn mesh_subscribe_rejects_trust_bundle_token_with_kid_but_no_ns_claim() {
 #[tokio::test(flavor = "multi_thread")]
 async fn xds_all_scope_rejects_bound_credential_without_ns_claim() {
     let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
-    let (_cp, update_tx) = CpGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
+    let cp = CpGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
         .channel_capacity(64)
         .scope(CpScope::All)
         .build();
+    let update_tx = cp.broadcasts().sender_for(TENANT_A);
     let server = XdsAdsServer::new(
         cfg_arc,
         update_tx,
@@ -2055,7 +2057,7 @@ async fn xds_all_scope_rejects_bound_credential_without_ns_claim() {
 async fn single_scope_require_ns_claim_rejects_token_without_ns() {
     let verifier = single_tenant_bundle();
     let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
-    let (server, _tx) = CpGrpcServer::builder(cfg_arc, TENANT_A_SECRET.to_string())
+    let server = CpGrpcServer::builder(cfg_arc, TENANT_A_SECRET.to_string())
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
@@ -2097,7 +2099,7 @@ async fn single_scope_require_ns_claim_rejects_token_without_ns() {
 async fn single_scope_without_require_accepts_no_ns_but_applies_bound() {
     let verifier = single_tenant_bundle();
     let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
-    let (server, _tx) = CpGrpcServer::builder(cfg_arc, TENANT_A_SECRET.to_string())
+    let server = CpGrpcServer::builder(cfg_arc, TENANT_A_SECRET.to_string())
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())

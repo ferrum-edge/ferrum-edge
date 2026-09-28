@@ -43,8 +43,8 @@ pub const CONFIGSYNC_MAX_SILENCE_SECS: u64 = 150;
 /// into a production DP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigSyncStreamTimings {
-    /// Reconnect when a stream with *negotiated* heartbeats delivers no message
-    /// for this long. Unnegotiated streams never arm the watchdog at all.
+    /// Reconnect when a stream delivers no message (config or heartbeat) for
+    /// this long.
     pub max_silence: std::time::Duration,
 }
 
@@ -282,7 +282,7 @@ pub fn resolve_authority_trust_after_snapshot(
 /// Includes GatewayConfig content (excluding `loaded_at`) and the effective
 /// CP gateway-trust state from the side channel. Fails closed when either side
 /// is [`GatewayTrustEquivalenceState::Unknown`], when `incoming_trust` is
-/// `None` (empty/unchanged mixed-version channel), or when comparison inputs
+/// `None` (empty/unchanged side channel), or when comparison inputs
 /// are otherwise unavailable. Unknown vs Unknown is not equivalence.
 pub fn authoritative_snapshot_payload_matches(
     current_config: &GatewayConfig,
@@ -1008,33 +1008,11 @@ pub fn failure_backoff_sequence(cp_count: usize, attempts: usize) -> Vec<u64> {
     sleeps
 }
 
-/// Whether the application-silence watchdog may fire on this subscription.
-///
-/// Two independent reasons to arm it:
-/// - The CP confirmed heartbeat support (`ConfigUpdate.heartbeat_negotiated`),
-///   so continued silence means the keepalive it promised stopped arriving.
-/// - No message has arrived at all yet. Every CP — including one that predates
-///   heartbeats — sends its initial FULL_SNAPSHOT immediately on Subscribe, so a
-///   stream that is silent before its first message is anomalous at any version.
-///   Without this, a blackholed reconnect against an unnegotiated stream would
-///   hang forever on `message().await` (issue #2967).
-///
-/// It stays disarmed only in the case it must: a mixed-version stream from a CP
-/// that never negotiated heartbeats, after that CP has proven liveness with at
-/// least one message. Such a stream is legitimately silent while idle, and
-/// HTTP/2 PING + TCP keepalive still cover it.
-pub fn silence_watchdog_armed(heartbeats_negotiated: bool, received_any_message: bool) -> bool {
-    heartbeats_negotiated || !received_any_message
-}
-
 /// A heartbeat frame is admissible only after this subscription has accepted
-/// its authoritative FULL_SNAPSHOT base and that snapshot negotiated heartbeat
-/// support. Heartbeats are liveness-only and must never establish either state.
-pub fn heartbeat_frame_admissible(
-    subscription_base_applied: bool,
-    heartbeats_negotiated: bool,
-) -> bool {
-    subscription_base_applied && heartbeats_negotiated
+/// its authoritative FULL_SNAPSHOT base. Heartbeats are liveness-only and must
+/// never establish that state.
+pub fn heartbeat_frame_admissible(subscription_base_applied: bool) -> bool {
+    subscription_base_applied
 }
 
 /// True when a silence interval exceeds the ConfigSync liveness bound.

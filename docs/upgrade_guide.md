@@ -1447,13 +1447,15 @@ upgrade.
 
 ### Version Negotiation (Built-In Safety Net)
 
-Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version during gRPC handshake. Versions are parsed as **SemVer**. The **major and minor** components must match — patch-level differences (e.g., `0.9.0` vs `0.9.1`) are allowed. **Prerelease policy:** prerelease (`-rc.1`) and build metadata (`+git`) are ignored for compatibility; only major.minor are compared, so `0.9.0-rc.1` is compatible with `0.9.0` and `0.9.3`. Empty or malformed versions are rejected on both CP admission (`FailedPrecondition`) and DP ConfigUpdate processing. Every ConfigUpdate envelope — FULL_SNAPSHOT, DELTA, or negotiated heartbeat — must carry a valid compatible CP version.
+**CP and DP must run the same build.** The ConfigSync wire contract (the protobuf messages and the JSON config bodies they carry) is only guaranteed between identical builds; there is no mixed-version compatibility layer, including between patch versions.
+
+Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version during gRPC handshake as a safety net for gross mismatches. Versions are parsed as **SemVer** and the **major and minor** components must match. Patch-level differences (e.g., `0.9.0` vs `0.9.1`) pass this gate but are not a supported deployment. **Prerelease policy:** prerelease (`-rc.1`) and build metadata (`+git`) are ignored by the gate; only major.minor are compared. Empty or malformed versions are rejected on both CP admission (`FailedPrecondition`) and DP ConfigUpdate processing. Every ConfigUpdate envelope — FULL_SNAPSHOT, DELTA, or heartbeat — must carry a valid compatible CP version.
 
 | CP Version | DP Version | Result |
 |------------|------------|--------|
 | `0.9.0` | `0.9.0` | Allowed |
-| `0.9.0` | `0.9.3` | Allowed (patch difference) |
-| `0.9.0` | `0.9.0-rc.1` | Allowed (prerelease ignored for major.minor gate) |
+| `0.9.0` | `0.9.3` | Passes the gate (patch difference) — unsupported; run the same build |
+| `0.9.0` | `0.9.0-rc.1` | Passes the gate (prerelease ignored for major.minor gate) — unsupported; run the same build |
 | `0.9.0` | `1` / `garbage` / `` | **Rejected** — missing or malformed SemVer |
 | `0.9.0` | `0.10.0` | **Rejected** — DP Subscribe/GetFullConfig fails with `FAILED_PRECONDITION` |
 | `1.0.0` | `0.9.0` | **Rejected** — major version mismatch |
@@ -1472,42 +1474,12 @@ You can verify versions via the authenticated `GET /admin/metrics` endpoint on a
 Always upgrade in this order: **CP first, then DPs.** The CP owns the
 configuration database; during build-out that database is rebuilt with
 `GET /backup` / `POST /restore`, not in-place core schema migration. DPs are
-stateless proxies that receive config via gRPC. Version negotiation ensures that
-if you forget to upgrade a DP, it will refuse the incompatible config rather than
-silently applying a partial parse.
-
-### Mixed-Version Wire Compatibility (Patch-Level Rollouts)
-
-Because patch-level differences are allowed, a CP-first rollout necessarily runs
-mixed CP/DP patch versions for a while. Two ConfigSync surfaces are explicitly
-built to survive that window without config churn.
-
-**ConfigSync heartbeats are negotiated, never assumed.** A DP advertises
-`SubscribeRequest.supports_heartbeat`, and the CP confirms with
-`ConfigUpdate.heartbeat_negotiated` on the first message of the stream. Both are
-additive protobuf fields, so peers that predate them read `false` and safely
-ignore them.
-
-| CP | DP | Behavior |
-|----|----|----------|
-| New | New | CP sends heartbeat frames; DP arms the 150s application silence watchdog |
-| New | Legacy | DP never advertises support, so the CP sends **no** heartbeat frames — the legacy DP never sees an empty envelope and never churns |
-| Legacy | New | CP never confirms, so the DP does **not** arm the silence watchdog — no reconnect the legacy CP was never asked to prevent. HTTP/2 PING and TCP keepalive still cover the stream |
-
-**Delta removal keys stay wire-compatible in both directions.** Incremental
-DELTA bodies carry namespace-qualified removals (so a misrouted delta cannot
-delete a same-ID resource in another namespace) without breaking older peers:
-the historical `removed_proxy_ids` / `removed_plugin_config_ids` /
-`removed_upstream_ids` arrays keep their bare-ID string shape, and the
-namespace-qualified `(namespace, id)` objects travel in **additive**
-`removed_*_keys` arrays that older DPs ignore. Decoding accepts either shape. A
-delta from a CP that only sent bare IDs is scoped to the DP's own already
-authorized subscription namespace, and the DP's namespace filter still drops
-anything outside it — so the cross-namespace deletion guarantee holds on both
-new/new and mixed pairs.
-
-Neither surface requires operator configuration, and neither changes behavior
-for new/new fleets. Still complete the CP-first, then DP rollout promptly.
+stateless proxies that receive config via gRPC. CP and DP must run the same
+build, so upgrade the DPs promptly after the CP: a DP on a different build is not
+guaranteed to understand the CP's ConfigSync stream and may reconnect or refuse
+updates until it is upgraded. The version gate additionally makes a DP with a
+different major.minor refuse the incompatible config rather than silently
+applying a partial parse.
 
 ### Step-by-Step
 
@@ -1700,7 +1672,7 @@ FERRUM_MODE=file \
 | Database schema (build-out) | No — rebuild fresh DB + `POST /restore` | No — old binary + old DB only |
 | Database schema (post-freeze tagged releases) | Yes (versioned forward migrations) | No (old binary cannot read new schema) |
 | Config file format (build-out) | No — update the config shape and validate | No compatibility guarantee |
-| gRPC protocol (CP↔DP) | Same major.minor required (enforced at connect time) | Same major.minor required |
+| gRPC protocol (CP↔DP) | No — CP and DP must run the same build (major.minor mismatch rejected at connect time) | No — same build required |
 | Admin API | Generally stable | Check release notes |
 
 ### Downtime Expectations

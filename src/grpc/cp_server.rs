@@ -13,9 +13,9 @@
 //! match the configured expected issuer (`FERRUM_CP_DP_GRPC_JWT_ISSUER`,
 //! default `"ferrum-edge-cp-dp"`); this prevents a token minted with the same
 //! shared secret for a different audience (e.g. the admin API JWT secret if
-//! it was reused) from authenticating to the gRPC channel. The CP enforces
-//! `major.minor` version compatibility — a DP running a different minor
-//! version is rejected.
+//! it was reused) from authenticating to the gRPC channel. CP and DP must run
+//! the same build; as a safety net the CP rejects a DP whose `major.minor`
+//! version differs.
 //!
 //! Issuer rotation: changing `FERRUM_CP_DP_GRPC_JWT_ISSUER` is a breaking
 //! change. The CP rejects any token whose `iss` does not match its expected
@@ -441,9 +441,8 @@ pub struct CpGrpcServer {
     /// Expected `iss` claim on inbound DP tokens. Tokens whose `iss` does not
     /// exactly match this string are rejected with `unauthenticated`.
     expected_issuer: String,
-    /// Per-namespace broadcast channels. The legacy single `update_tx`
-    /// returned to construction callers is just the sender for the back-compat
-    /// `Single(...)` namespace.
+    /// Per-namespace broadcast channels. Callers reach a namespace's sender
+    /// through [`CpGrpcServer::broadcasts`].
     broadcasts: Arc<NamespaceBroadcasts>,
     registry: Arc<DpNodeRegistry>,
     /// Which namespaces this CP is authorised to serve. See [`CpScope`].
@@ -459,103 +458,9 @@ pub struct CpGrpcServer {
 }
 
 impl CpGrpcServer {
-    /// Create a new CP gRPC server with the default broadcast channel capacity (128)
-    /// plus the default expected issuer and namespace.
-    ///
-    /// Used by tests. Production code calls `builder()` so it can thread the
-    /// operator-configured capacity, issuer, namespace, scope, and claim
-    /// policy through from `EnvConfig`.
-    #[allow(dead_code)]
-    pub fn new(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
-        Self::builder(config, jwt_secret).build()
-    }
-
-    #[allow(dead_code)]
-    pub fn with_channel_capacity(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-        channel_capacity: usize,
-    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
-        Self::builder(config, jwt_secret)
-            .channel_capacity(channel_capacity)
-            .build()
-    }
-
-    #[allow(dead_code)]
-    pub fn with_channel_capacity_and_registry(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-        channel_capacity: usize,
-        registry: Arc<DpNodeRegistry>,
-    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
-        Self::builder(config, jwt_secret)
-            .channel_capacity(channel_capacity)
-            .registry(registry)
-            .build()
-    }
-
-    /// Constructor that threads through the operator-configured expected issuer
-    /// (`FERRUM_CP_DP_GRPC_JWT_ISSUER`) and uses the default namespace.
-    #[allow(dead_code)]
-    pub fn with_channel_capacity_registry_and_issuer(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-        channel_capacity: usize,
-        registry: Arc<DpNodeRegistry>,
-        expected_issuer: String,
-    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
-        Self::builder(config, jwt_secret)
-            .channel_capacity(channel_capacity)
-            .registry(registry)
-            .expected_issuer(expected_issuer)
-            .build()
-    }
-
-    /// Constructor that threads through the CP's configured namespace and uses
-    /// the default CP/DP JWT issuer.
-    #[allow(dead_code)]
-    pub fn with_channel_capacity_registry_and_namespace(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-        channel_capacity: usize,
-        registry: Arc<DpNodeRegistry>,
-        namespace: String,
-    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
-        Self::builder(config, jwt_secret)
-            .channel_capacity(channel_capacity)
-            .registry(registry)
-            .scope(CpScope::Single(namespace))
-            .build()
-    }
-
-    /// Production-grade constructor that threads through both the operator-
-    /// configured expected issuer (`FERRUM_CP_DP_GRPC_JWT_ISSUER`) and the
-    /// CP namespace (`FERRUM_NAMESPACE`). Kept for back-compat call sites;
-    /// new call sites should use [`Self::builder`] directly.
-    #[allow(dead_code)]
-    pub fn with_channel_capacity_registry_issuer_and_namespace(
-        config: Arc<ArcSwap<GatewayConfig>>,
-        jwt_secret: String,
-        channel_capacity: usize,
-        registry: Arc<DpNodeRegistry>,
-        expected_issuer: String,
-        namespace: String,
-    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
-        Self::builder(config, jwt_secret)
-            .channel_capacity(channel_capacity)
-            .registry(registry)
-            .expected_issuer(expected_issuer)
-            .scope(CpScope::Single(namespace))
-            .build()
-    }
-
-    /// Fluent builder. Production code in `control_plane.rs` uses this to
-    /// pass the full set of T2-A knobs (scope + require-claim) without
-    /// growing yet another constructor overload.
-    /// Fluent builder seeded with the legacy fleet-wide shared secret.
+    /// The only constructor: a fluent builder seeded with the fleet-wide
+    /// shared secret. Production code in `control_plane.rs` threads the full
+    /// set of operator knobs (capacity, issuer, scope, claim policy) through it.
     ///
     /// Production CP startup replaces the seeded verifier via
     /// [`CpGrpcServerBuilder::verifier_store`] so ConfigSync, MeshSubscribe,
@@ -1665,11 +1570,8 @@ impl CpGrpcServer {
 
     /// Broadcast a full config snapshot to all DPs in `namespace`.
     ///
-    /// Single-namespace deployments call the legacy
-    /// [`Self::broadcast_update`] / [`Self::broadcast_update_with_registry`]
-    /// helpers, which forward to this method via the back-compat shim. New
-    /// multi-namespace code paths in the CP polling loop call this directly
-    /// and partition the work by namespace.
+    /// The CP polling loop calls this directly and partitions the work by
+    /// namespace.
     pub fn broadcast_namespace_update(
         broadcasts: &NamespaceBroadcasts,
         namespace: &str,
@@ -1748,25 +1650,7 @@ impl CpGrpcServer {
         }
     }
 
-    /// Broadcast a full config snapshot to all connected DPs.
-    ///
-    /// Back-compat helper for single-namespace deployments. Multi-namespace
-    /// callers must use [`Self::broadcast_namespace_update`] so each DP only
-    /// receives its own namespace.
-    #[allow(dead_code)]
-    pub fn broadcast_update_with_registry(
-        tx: &broadcast::Sender<ConfigUpdate>,
-        config: &GatewayConfig,
-        registry: &DpNodeRegistry,
-    ) {
-        if Self::broadcast_update(tx, config) {
-            registry.touch_all();
-        }
-    }
-
-    /// Build a keepalive frame. Only ever emitted on a subscription whose DP
-    /// advertised `SubscribeRequest.supports_heartbeat`, so the frame always
-    /// restates the negotiated capability.
+    /// Build a keepalive frame for a ConfigSync Subscribe stream.
     fn build_configsync_heartbeat(version: String) -> ConfigUpdate {
         ConfigUpdate {
             update_type: 0,
@@ -1776,7 +1660,6 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json: String::new(),
             heartbeat: true,
-            heartbeat_negotiated: true,
         }
     }
 
@@ -1838,7 +1721,6 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
-            heartbeat_negotiated: false,
         };
         Self::send_bounded_update(tx, update, namespace)
     }
@@ -1955,7 +1837,6 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
-            heartbeat_negotiated: false,
         };
         Self::send_bounded_update(tx, update, namespace)
     }
@@ -2045,11 +1926,9 @@ impl CpGrpcServer {
         // per-namespace `gateway_trust_bundles` resource vector, whose records
         // carry raw authority material plus server-assigned metadata
         // (revision, actor, timestamps). Keeping them out of the regular
-        // GatewayConfig JSON preserves compatibility with older DPs whose
-        // `GatewayConfig` deserializer denies unknown fields, and makes the
-        // wire boundary fail closed at the single publication funnel rather
-        // than depending on `gateway_trust_bundles` keeping its `#[serde(skip)]`
-        // attribute.
+        // GatewayConfig JSON makes the wire boundary fail closed at the single
+        // publication funnel rather than depending on `gateway_trust_bundles`
+        // keeping its `#[serde(skip)]` attribute.
         snapshot.trust_bundles = None;
         snapshot.gateway_trust_bundles.clear();
         serde_json::to_string(&snapshot).map_err(|error| error.to_string())
@@ -2118,63 +1997,44 @@ impl CpGrpcServerBuilder {
         self
     }
 
-    /// Finish construction. Returns the server plus the broadcast sender
-    /// for the scope's *first* namespace — kept for back-compat with the
-    /// pre-T2-A construction signature, which returned a single sender.
-    /// Multi-namespace callers should immediately call [`CpGrpcServer::broadcasts`]
-    /// to gain access to the full per-namespace map.
-    pub fn build(self) -> (CpGrpcServer, broadcast::Sender<ConfigUpdate>) {
+    /// Finish construction. Per-namespace senders are reached through
+    /// [`CpGrpcServer::broadcasts`].
+    pub fn build(self) -> CpGrpcServer {
         let registry = self
             .registry
             .unwrap_or_else(|| Arc::new(DpNodeRegistry::new()));
         let broadcasts = Arc::new(NamespaceBroadcasts::new(self.channel_capacity));
 
-        // Pre-create the broadcast channel for the back-compat single-namespace
-        // case so the returned `update_tx` matches the pre-T2-A behavior (the
-        // sender exists even before the first subscriber connects). For multi-
-        // tenant `Set` / `All` scopes we still pre-create channels for every
-        // known namespace so the polling loop never silently drops the very
-        // first delta — `try_sender_for` skips broadcasting when no channel
-        // exists, which would race the polling loop's first tick against the
-        // first subscriber.
-        let primary_namespace = match &self.scope {
-            CpScope::Single(ns) => ns.clone(),
+        // Pre-create the broadcast channel for every explicit namespace so the
+        // polling loop never silently drops the very first delta —
+        // `try_sender_for` skips broadcasting when no channel exists, which
+        // would race the polling loop's first tick against the first
+        // subscriber. A cluster-wide `All` scope has no explicit namespaces;
+        // its channels are created as subscribers arrive.
+        match &self.scope {
+            CpScope::Single(ns) => {
+                let _ = broadcasts.sender_for(ns);
+            }
             CpScope::Set(set) => {
-                // Pre-create channels for every explicit namespace.
                 for ns in set {
                     let _ = broadcasts.sender_for(ns);
                 }
-                // Pick a stable name (sorted) for the back-compat return value.
-                let mut v: Vec<&String> = set.iter().collect();
-                v.sort();
-                v.first().map(|s| (*s).clone()).unwrap_or_default()
             }
-            CpScope::All => {
-                // Cluster-wide CP — no explicit namespaces to pre-create.
-                // The back-compat `tx` falls back to the default namespace so
-                // legacy callers that still reach for the returned sender
-                // don't get an empty channel. New callers (multi-namespace
-                // polling loop) should consult `broadcasts()` instead.
-                default_namespace()
-            }
-        };
-        let primary_tx = broadcasts.sender_for(&primary_namespace);
+            CpScope::All => {}
+        }
 
-        (
-            CpGrpcServer {
-                config: self.config,
-                admission: self.admission,
-                verifier: self.verifier,
-                max_stream_lifetime: self.max_stream_lifetime,
-                expected_issuer: self.expected_issuer,
-                broadcasts,
-                registry,
-                scope: self.scope,
-                require_ns_claim: self.require_ns_claim,
-                real_ip_header: self.real_ip_header,
-            },
-            primary_tx,
-        )
+        CpGrpcServer {
+            config: self.config,
+            admission: self.admission,
+            verifier: self.verifier,
+            max_stream_lifetime: self.max_stream_lifetime,
+            expected_issuer: self.expected_issuer,
+            broadcasts,
+            registry,
+            scope: self.scope,
+            require_ns_claim: self.require_ns_claim,
+            real_ip_header: self.real_ip_header,
+        }
     }
 }
 
@@ -2221,11 +2081,6 @@ impl ConfigSync for CpGrpcServer {
         let node_id = inner.node_id;
         let dp_version = inner.ferrum_version;
         let dp_namespace = inner.namespace;
-        // Heartbeat capability is negotiated, not assumed. A DP that predates
-        // `ConfigUpdate.heartbeat` would read an empty heartbeat envelope as an
-        // unusable FULL_SNAPSHOT and churn through reconnects, so only
-        // advertising subscribers ever receive keepalive frames.
-        let heartbeats_negotiated = inner.supports_heartbeat;
 
         // Reject DPs with incompatible versions before streaming any config.
         Self::check_version_compatibility(&dp_version)?;
@@ -2319,11 +2174,6 @@ impl ConfigSync for CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
-            // Confirm the capability on the first message of the stream so the
-            // DP arms its application silence watchdog only against a CP that
-            // actually committed to sending heartbeats. A CP that predates this
-            // field leaves it false and the DP never arms the watchdog.
-            heartbeat_negotiated: heartbeats_negotiated,
         };
 
         Self::check_message_size(&initial, &dp_namespace)?;
@@ -2405,7 +2255,6 @@ impl ConfigSync for CpGrpcServer {
                             ferrum_version: FERRUM_VERSION.to_string(),
                             trust_bundles_json,
                             heartbeat: false,
-                            heartbeat_negotiated: false,
                         }))
                     }
                     Err(e) => {
@@ -2429,25 +2278,15 @@ impl ConfigSync for CpGrpcServer {
         // Prepend initial config, interleave application heartbeats for
         // silent-partition detection, then wrap in TrackedStream so the DP is
         // automatically de-registered when the gRPC stream is dropped.
-        //
-        // The timer is built unconditionally to keep one concrete stream type;
-        // when the DP did not advertise heartbeat support every tick is dropped
-        // and no frame is ever written, so a legacy subscriber sees exactly the
-        // pre-heartbeat stream contents.
         let initial_stream = tokio_stream::once(Ok(initial));
         let heartbeat_config = self.config.clone();
         let heartbeat_stream = IntervalStream::new(interval_at(
             Instant::now() + CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
             CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
         ))
-        .filter_map(move |_| {
-            if !heartbeats_negotiated {
-                return None;
-            }
-            let current = heartbeat_config.load_full();
-            Some(Ok(Self::build_configsync_heartbeat(
-                current.loaded_at.to_rfc3339(),
-            )))
+        .map(move |_| {
+            let version = heartbeat_config.load_full().loaded_at.to_rfc3339();
+            Ok(Self::build_configsync_heartbeat(version))
         });
         // Guard every outgoing frame, including lag recovery and callers that
         // hold a raw broadcast sender. Initial admission was checked above so
@@ -2848,28 +2687,24 @@ mod tests {
 
     fn cp_with_namespace(namespace: &str) -> CpGrpcServer {
         let cfg = Arc::new(ArcSwap::new(Arc::new(GatewayConfig::default())));
-        let (server, _tx) = CpGrpcServer::with_channel_capacity_registry_and_namespace(
-            cfg,
-            "test-secret".to_string(),
-            128,
-            Arc::new(DpNodeRegistry::new()),
-            namespace.to_string(),
-        );
-        server
+        CpGrpcServer::builder(cfg, "test-secret".to_string())
+            .channel_capacity(128)
+            .registry(Arc::new(DpNodeRegistry::new()))
+            .scope(CpScope::Single(namespace.to_string()))
+            .build()
     }
 
     fn cp_with_scope(scope: CpScope, require_ns_claim: bool) -> CpGrpcServer {
         let cfg = Arc::new(ArcSwap::new(Arc::new(GatewayConfig::default())));
-        let (server, _tx) = CpGrpcServer::builder(cfg, "test-secret".to_string())
+        CpGrpcServer::builder(cfg, "test-secret".to_string())
             .channel_capacity(128)
             .registry(Arc::new(DpNodeRegistry::new()))
             .scope(scope)
             .require_ns_claim(require_ns_claim)
-            .build();
-        server
+            .build()
     }
 
-    // ── Back-compat: single-namespace behavior is byte-identical ────────────
+    // ── Single-namespace scope ──────────────────────────────────────────────
 
     #[test]
     fn single_scope_accepts_matching_namespace() {
