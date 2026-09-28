@@ -5548,9 +5548,8 @@ fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
         .nth(1)
         .expect("streaming upload/backend response race");
     assert!(
-        upload_race.contains(
-            "Some(termination) => PlainAttemptEnd::AuthorizationExpired(termination),"
-        ),
+        upload_race
+            .contains("Some(termination) => PlainAttemptEnd::AuthorizationExpired(termination),"),
         "the streaming upload must classify an authorization expiry as its own attempt end"
     );
     let upload = balanced_block_after(

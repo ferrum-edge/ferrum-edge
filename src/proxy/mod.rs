@@ -17647,10 +17647,10 @@ pub(crate) fn websocket_backend_dial_refusal(
         if let Some(ip) = literal_ip
             && let Some(reason) = env_config.backend_allow_ips.deny_reason(&ip)
         {
-            return Some(format!(
-                "backend egress policy denied literal-IP WebSocket backend {ip}: {reason}"
-            )
-            .into());
+            return Some(
+                format!("backend egress policy denied literal-IP WebSocket backend {ip}: {reason}")
+                    .into(),
+            );
         }
     }
 
