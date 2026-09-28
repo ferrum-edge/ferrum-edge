@@ -94,7 +94,6 @@ pub async fn with_phase_deadline<F: Future>(
     }
 }
 
-
 /// Decide how to handle an unavailable container.
 ///
 /// In CI (`CI` env var set, e.g. GitHub Actions) a container that fails to
