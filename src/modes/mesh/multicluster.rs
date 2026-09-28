@@ -1078,6 +1078,10 @@ pub struct RemoteDiscoveryManager {
     /// Per-cluster ordering watermarks survive poller restarts and URL,
     /// credential, or trust-source changes for the same declared cluster.
     revision_gates: HashMap<String, Arc<MeshRevisionGate>>,
+    /// Declared clusters already warned about a missing or unresolved
+    /// discovery credential, so every reconcile does not repeat the warning.
+    /// Cleared for a cluster once it starts or is no longer declared.
+    credential_warned: HashSet<String>,
 }
 
 impl RemoteDiscoveryManager {
@@ -1096,6 +1100,7 @@ impl RemoteDiscoveryManager {
             running: HashMap::new(),
             credentials: std::sync::Arc::new(std::collections::HashMap::new()),
             revision_gates: HashMap::new(),
+            credential_warned: HashSet::new(),
         }
     }
 
@@ -1123,6 +1128,7 @@ impl RemoteDiscoveryManager {
         let (Some(config), Some(multi_cluster)) = (self.config.clone(), multi_cluster) else {
             self.stop_all(true);
             self.revision_gates.clear();
+            self.credential_warned.clear();
             return;
         };
         // Ordering state belongs to the declared remote-cluster identity, not
@@ -1137,6 +1143,8 @@ impl RemoteDiscoveryManager {
             .collect();
         self.revision_gates
             .retain(|name, _| declared_names.contains(name.as_str()));
+        self.credential_warned
+            .retain(|name| declared_names.contains(name.as_str()));
         let targets = poll_targets_for_multi_cluster_with_posture(
             multi_cluster,
             &trust_bundle_domains,
@@ -1209,23 +1217,29 @@ impl RemoteDiscoveryManager {
         // authenticates ONLY with the credential this cluster references, so a
         // credential for one cluster cannot authenticate to another. A cluster
         // with no reference, or whose reference does not resolve, fails closed:
-        // skip it with a warning.
+        // skip it, warning once per declared cluster rather than per reconcile.
         let Some(reference) = target.credential_ref.as_ref() else {
-            warn!(
-                cluster = %crate::startup::sanitize_startup_scalar(&target.cluster_name),
-                "RemoteCluster sets no discovery_credential_ref; skipping discovery \
-                 (configure discovery_credential_ref + FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS)"
-            );
+            if self.credential_warned.insert(target.cluster_name.clone()) {
+                warn!(
+                    cluster = %crate::startup::sanitize_startup_scalar(&target.cluster_name),
+                    "RemoteCluster sets no discovery_credential_ref; skipping discovery \
+                     (configure discovery_credential_ref + \
+                     FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS)"
+                );
+            }
             return;
         };
         let Some(secret) = self.credentials.get(reference) else {
-            warn!(
-                cluster = %crate::startup::sanitize_startup_scalar(&target.cluster_name),
-                "RemoteCluster references an unknown discovery credential; \
-                 skipping discovery (configure FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS)"
-            );
+            if self.credential_warned.insert(target.cluster_name.clone()) {
+                warn!(
+                    cluster = %crate::startup::sanitize_startup_scalar(&target.cluster_name),
+                    "RemoteCluster references an unknown discovery credential; \
+                     skipping discovery (configure FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS)"
+                );
+            }
             return;
         };
+        self.credential_warned.remove(&target.cluster_name);
         config.jwt_secret = Some(secret.clone());
         let revision_gate = self
             .revision_gates

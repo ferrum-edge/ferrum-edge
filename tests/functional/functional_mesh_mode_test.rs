@@ -6576,9 +6576,10 @@ fn cross_cluster_dest_slice(
 /// `targetPort` (and the east-west "workload" address) as C's sidecar inbound
 /// mTLS listener directly (`c_inbound_port`) — so the passthrough lands straight
 /// on the listener that terminates the client mTLS. The service port itself
-/// stays the client's `service_port`, because the SNI alias names it. This is a test-harness limitation, not a client
-/// bug; the live two-cluster k8s fixture (Stage 2) exercises the realistic
-/// app-port→`:15006` iptables path. See `docs/mesh.md` (cross-cluster east-west).
+/// stays the client's `service_port`, because the SNI alias names it. This is a
+/// test-harness limitation, not a client bug; the live two-cluster k8s fixture
+/// (Stage 2) exercises the realistic app-port→`:15006` iptables path. See
+/// `docs/mesh.md` (cross-cluster east-west).
 fn cross_cluster_east_west_slice(
     node_id: &str,
     c_spiffe: &str,

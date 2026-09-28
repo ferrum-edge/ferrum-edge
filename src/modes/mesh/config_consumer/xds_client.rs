@@ -1906,12 +1906,12 @@ fn reverse_translate(
         // which the runtime denies — the carrier is what keeps xDS and native
         // materialization at parity.
         ext_authz_providers: recovered.ext_authz_providers,
-        // Gate the CORS carrier exactly like the legacy DR carrier above is
-        // gated to the workload namespace: an ECDS carrier is raw producer
-        // input that never passed this DP's slice admission, so the
-        // `exportTo` boundary has to be enforced here or a cross-wired CP
-        // could inject another tenant's CORS policy onto this workload's
-        // outbound routes.
+        // Gate the CORS carrier to the workload namespace's `exportTo`
+        // visibility: an ECDS carrier is raw producer input that never passed
+        // this DP's slice admission, so the boundary has to be enforced here or
+        // a cross-wired CP could inject another tenant's CORS policy onto this
+        // workload's outbound routes. (Reserved DR carriers are not filtered at
+        // recovery; their `exportTo` is enforced at materialization.)
         virtual_service_cors_policies: retain_visible_cors_policies(
             recovered.virtual_service_cors_policies,
             &config.namespace,
@@ -2182,10 +2182,10 @@ fn validate_waypoint_gateway_class_carrier(
 /// into a [`RecoveredSliceCarriers`].
 ///
 /// ECDS resources that are not Ferrum slice carriers (the DR carrier, or any
-/// operator-defined extension config) are skipped. A recognized slice carrier
-/// whose JSON fails to parse rejects the ECDS response so the client NACKs it
-/// and retains the previous protected slice instead of clearing security fields
-/// fail-open.
+/// operator-defined extension config) are skipped. A slice carrier type under a
+/// non-reserved name, or a recognized slice carrier whose JSON fails to parse,
+/// rejects the ECDS response so the client NACKs it and retains the previous
+/// protected slice instead of clearing security fields fail-open.
 fn recover_slice_carriers(
     accumulator: &ResourceAccumulator,
 ) -> Result<RecoveredSliceCarriers, String> {
@@ -2199,7 +2199,7 @@ fn recover_slice_carriers(
             // quiet here to avoid double-logging the same decode failure.
             Err(_) => continue,
         };
-        let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension, false)? else {
+        let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension)? else {
             continue;
         };
         match MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
@@ -2279,7 +2279,7 @@ fn join_bounded_carrier_errors(errors: Vec<String>) -> String {
 
 fn validate_ecds_mesh_slice_carrier(resource: &AccumulatedResource) -> Result<(), String> {
     let typed_extension = decode_ecds_typed_extension(resource)?;
-    let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension, true)? else {
+    let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension)? else {
         return Ok(());
     };
     match crate::xds::carrier::MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
@@ -2495,7 +2495,6 @@ fn destination_rule_carrier<'a>(
 fn mesh_slice_carrier_inner<'a>(
     resource: &AccumulatedResource,
     typed_extension: &'a proto::TypedExtensionConfig,
-    warn_on_non_reserved_name: bool,
 ) -> Result<Option<&'a proto::Any>, String> {
     use crate::xds::carrier::{
         FERRUM_CARRIER_RESOURCE_NAME_PREFIX, carrier_resource_name_for_type_url,
@@ -2539,26 +2538,14 @@ fn mesh_slice_carrier_inner<'a>(
         return Ok(None);
     };
     if resource.name != expected_name {
-        if resource_name_is_reserved {
-            return Err(format!(
-                "xDS ECDS resource <redacted scalar> uses carrier type_url {:?} \
-                 but must be named `{}`",
-                inner.type_url, expected_name
-            ));
-        }
-        if warn_on_non_reserved_name {
-            // Both schema fields are from the closed carrier-name lookup above.
-            warn!(
-                resource_name = %crate::startup::sanitize_startup_cause(
-                    format!("{:?}", bounded_xds_log_value(&resource.name).to_string()),
-                    &[]
-                ),
-                expected_name,
-                inner_type_url = %inner.type_url,
-                "xDS ECDS resource used reserved Ferrum mesh-slice carrier type_url with non-reserved name; skipping"
-            );
-        }
-        return Ok(None);
+        // A carrier type_url is reserved to its one carrier name, exactly like
+        // the DestinationRule carrier: any other name NACKs the response. Both
+        // echoed fields come from the closed carrier-name lookup above.
+        return Err(format!(
+            "xDS ECDS resource <redacted scalar> uses carrier type_url {:?} \
+             but must be named `{}`",
+            inner.type_url, expected_name
+        ));
     }
     Ok(Some(inner))
 }
@@ -2884,14 +2871,11 @@ mod tests {
     }
 
     #[test]
-    fn carrier_warning_keeps_closed_schema_names() {
-        use super::super::common::diagnostic_test_support::DiagnosticLogs;
+    fn non_reserved_carrier_name_nacks_with_closed_schema_names() {
         use crate::xds::carrier::{
             FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
         };
 
-        let logs = DiagnosticLogs::default();
-        let _guard = tracing::subscriber::set_default(logs.subscriber());
         let resource = AccumulatedResource {
             name: "'UNREGISTERED_CARRIER5591\"\\\n".to_string(),
             bytes: Vec::new(),
@@ -2903,17 +2887,13 @@ mod tests {
                 value: Vec::new(),
             }),
         };
-        assert!(
-            mesh_slice_carrier_inner(&resource, &extension, true)
-                .unwrap()
-                .is_none()
-        );
-        let output = logs.output();
+        let error = mesh_slice_carrier_inner(&resource, &extension)
+            .expect_err("a carrier type_url under a non-reserved name must NACK");
         let expected_name = carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL)
             .expect("known carrier schema");
-        assert!(output.contains(expected_name), "{output}");
-        assert!(output.contains(FERRUM_ECDS_PEER_AUTH_TYPE_URL), "{output}");
-        assert!(!output.contains("UNREGISTERED_CARRIER5591"), "{output}");
+        assert!(error.contains(expected_name), "{error}");
+        assert!(error.contains(FERRUM_ECDS_PEER_AUTH_TYPE_URL), "{error}");
+        assert!(!error.contains("UNREGISTERED_CARRIER5591"), "{error}");
     }
 
     fn test_config() -> XdsClientConfig {
@@ -6820,6 +6800,9 @@ mod tests {
         assert_eq!(recovered.destination_rules, native.destination_rules);
     }
 
+    /// A slice carrier type_url is reserved to its one carrier name, like the
+    /// DestinationRule carrier: an operator-named resource declaring it NACKs
+    /// instead of being skipped, and the accepted ECDS state is kept.
     #[test]
     fn xds_slice_carrier_requires_reserved_resource_name() {
         use crate::modes::mesh::config::{MeshPolicy, MeshRule, PolicyAction, PolicyScope};
@@ -6838,7 +6821,7 @@ mod tests {
         }];
         let payload = serde_json::to_vec(&malicious_policies).expect("policy json");
         let mut accumulator = primed_accumulator();
-        accumulator
+        let err = accumulator
             .apply_sotw_response(
                 ECDS_TYPE_URL,
                 &[typed_extension_resource(
@@ -6848,16 +6831,12 @@ mod tests {
                 )],
                 "v1",
             )
-            .expect("ECDS applies");
-
-        let recovered = accumulator
-            .try_build_mesh_slice(&test_config())
-            .expect("reverse translate succeeds")
-            .expect("all required types present");
-
+            .expect_err("operator ECDS resources must not impersonate internal slice carriers");
+        assert!(err.contains("must be named"), "{err}");
+        assert!(!err.contains("operator-mesh-policies"), "{err}");
         assert!(
-            recovered.mesh_policies.is_empty(),
-            "operator ECDS resources must not impersonate internal slice carriers"
+            accumulator.resources(ECDS_TYPE_URL).is_empty(),
+            "the rejected response must not replace the accepted ECDS state"
         );
     }
 

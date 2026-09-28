@@ -625,7 +625,6 @@ struct MeshMtlsHandshakeFailureKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MeshFederationPollFailureKey {
     trust_domain: Arc<str>,
-    endpoint: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -836,16 +835,14 @@ pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
         .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
 }
 
-pub fn increment_mesh_federation_poll_failure(
-    trust_domain: impl AsRef<str>,
-    _endpoint: impl AsRef<str>,
-) {
+/// Count one failed SPIFFE federation trust-bundle poll.
+///
+/// The series carries no endpoint label: federation URLs may carry credentials
+/// in userinfo, path, query, or fragment components, so no URL component is
+/// ever rendered.
+pub fn increment_mesh_federation_poll_failure(trust_domain: impl AsRef<str>) {
     let key = MeshFederationPollFailureKey {
         trust_domain: Arc::from(trust_domain.as_ref()),
-        // Federation URLs may carry credentials in userinfo, path, query, or
-        // fragment components. Keep even authenticated observability output
-        // free of those values by retaining only a fixed compatibility label.
-        endpoint: Arc::from("redacted"),
     };
     MESH_FEDERATION_POLL_FAILURES
         .entry(key)
@@ -1517,9 +1514,8 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         output.push_str("# TYPE ferrum_mesh_federation_poll_failures_total counter\n");
         for entry in MESH_FEDERATION_POLL_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\",endpoint=\"{}\"{}}} {}\n",
+                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().trust_domain),
-                escape_label_value(&entry.key().endpoint),
                 gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
@@ -3126,12 +3122,9 @@ mod tests {
     }
 
     #[test]
-    fn federation_failure_metric_never_renders_endpoint_secrets() {
+    fn federation_failure_series_has_no_endpoint_label() {
         let trust_domain = format!("security-{}-{}.example", std::process::id(), line!());
-        increment_mesh_federation_poll_failure(
-            &trust_domain,
-            "https://user:password@federation.example/secret/path?token=query-secret#fragment",
-        );
+        increment_mesh_federation_poll_failure(&trust_domain);
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
         let line = output
@@ -3142,10 +3135,7 @@ mod tests {
             })
             .expect("federation failure metric");
 
-        assert!(line.contains("endpoint=\"redacted\""), "{line}");
-        for secret in ["user", "password", "secret", "token", "fragment"] {
-            assert!(!line.contains(secret), "{secret} leaked in {line}");
-        }
+        assert!(!line.contains("endpoint="), "{line}");
     }
 
     #[test]

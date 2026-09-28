@@ -15,7 +15,7 @@ use crate::modes::mesh::config::{
 
 use super::{
     K8sAccumulator, K8sObject, K8sServiceKey, K8sTranslateError, K8sTranslationOptions,
-    RouteBackend, port_from_u64, string_field,
+    RouteBackend, invalid_resource, port_from_u64, string_field,
 };
 
 #[derive(Debug, Default)]
@@ -401,6 +401,26 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
             name,
             target_port,
         });
+    }
+    // HTTP-family and raw-TCP ports route cross-cluster on the same `p<port>`
+    // east-west SNI alias, so one number carrying both is ambiguous. Kubernetes
+    // already rejects the pair (both are `protocol: TCP`); refuse the Service
+    // rather than translate a port the east-west gateway could not route.
+    for service_port in &service_ports {
+        let port = service_port.port;
+        if crate::modes::mesh::service_port_number_is_http_tcp_ambiguous(
+            &service_ports,
+            &HashMap::new(),
+            port,
+        ) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "`Service.spec.ports` declares port \"{port}\" for both an HTTP-family port \
+                     and a raw-TCP port; both would route cross-cluster on one `p<port>` SNI alias"
+                ),
+            ));
+        }
     }
     // `spec.clusterIPs` carries the dual-stack VIP list; older objects may
     // only have the singular `spec.clusterIP`. Headless services declare the

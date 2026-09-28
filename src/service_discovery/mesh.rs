@@ -422,9 +422,9 @@ impl MeshServiceDiscoverer {
         let base_fqdn =
             crate::modes::mesh::cross_cluster_service_base_fqdn(service, &self.cluster_domain);
         // Judge by the selected HTTP-family port's alias; fall back to the base
-        // FQDN alone when the selected port is absent or not HTTP-family (the
-        // bridge itself then stays fail-closed regardless, so the base-only
-        // judgment is safe).
+        // FQDN alone when the selected port is absent, not HTTP-family, or an
+        // ambiguous HTTP/raw-TCP number (the bridge itself then stays
+        // fail-closed regardless, so the base-only judgment is safe).
         let dial_sni = selected_service_port
             .and_then(|selected| selected.service_port)
             .and_then(|port| {
@@ -432,15 +432,15 @@ impl MeshServiceDiscoverer {
                     .into_iter()
                     .find(|sp| sp.port == port)
             })
-            .map(|service_port| {
+            .and_then(|service_port| {
                 crate::modes::mesh::cross_cluster_service_sni(
                     service,
                     service_port,
                     &self.cluster_domain,
                 )
             });
-        let dial_sni = dial_sni.as_deref().unwrap_or(&base_fqdn);
-        let acceptable_snis = crate::modes::mesh::east_west_acceptable_snis(&base_fqdn, dial_sni);
+        let acceptable_snis =
+            crate::modes::mesh::east_west_acceptable_snis(&base_fqdn, dial_sni.as_deref());
         !crate::modes::mesh::east_west_gateway_governs_network(
             multi_cluster,
             workload.network.as_deref(),

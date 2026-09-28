@@ -5958,8 +5958,8 @@ fn test_validate_unique_listen_paths_allows_host_only_alongside_path_proxy_same_
 }
 
 #[test]
-fn mesh_tracing_config_ignores_singular_provider_spelling() {
-    let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
+fn mesh_tracing_config_rejects_singular_provider_spelling() {
+    let error = serde_json::from_value::<MeshTracingConfig>(serde_json::json!({
         "provider": {
             "kind": "zipkin",
             "config": {
@@ -5967,11 +5967,11 @@ fn mesh_tracing_config_ignores_singular_provider_spelling() {
             }
         }
     }))
-    .expect("unknown field is ignored");
+    .expect_err("the removed singular `provider` key must fail the load");
 
     assert!(
-        config.providers.is_empty(),
-        "singular `provider` is not an alias for `providers`"
+        error.to_string().contains("unknown field `provider`"),
+        "unexpected error: {error}"
     );
 }
 

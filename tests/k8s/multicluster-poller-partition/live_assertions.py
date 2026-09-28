@@ -405,11 +405,12 @@ def assert_metric_admin_parity(
     ) or metric_age_matches_admin_snapshot(endpoint_age, endpoint_after)
     if not trust_ok or not endpoint_ok:
         raise SystemExit("admin/metric cache-age parity exceeded 2s")
-    if (
-        'endpoint="redacted"' not in text
-        and "ferrum_mesh_federation_poll_failures_total" in text
+    if any(
+        line.startswith("ferrum_mesh_federation_poll_failures_total{")
+        and "endpoint=" in line
+        for line in text.splitlines()
     ):
-        raise SystemExit("federation endpoint label not redacted")
+        raise SystemExit("federation failure series carries an endpoint label")
     if any(
         line.startswith("ferrum_mesh_remote_discovery_poll_failures_total{")
         and "control_plane=" in line
@@ -465,7 +466,7 @@ def self_test_metric_admin_parity() -> None:
                 f'{{cluster="{peer}",trust_domain="{trust_domain}"}} 5'
             ),
             'ferrum_mesh_federation_poll_failures_total'
-            f'{{trust_domain="{trust_domain}",endpoint="redacted"}} 1',
+            f'{{trust_domain="{trust_domain}"}} 1',
             'ferrum_mesh_remote_discovery_poll_failures_total'
             f'{{cluster="{peer}",trust_domain="{trust_domain}"}} 1',
             'ferrum_mesh_remote_discovery_poll_successes_total'

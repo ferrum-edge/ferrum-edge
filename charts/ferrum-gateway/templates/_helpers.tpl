@@ -759,8 +759,8 @@ Validation: fail render on missing/unsafe configuration.
 {{- fail (printf "cp.namespaces=%q makes this a multi-namespace control plane, which refuses to start with only grpc.jwtSecret: that value is distributed to the data planes it would authorize, so any tenant holding it can re-sign the JWT `ns` claim and subscribe to another tenant (advisory GHSA-3f2j-wwqw-grmg). Set cp.trustBundlePath to a mounted JSON bundle of namespace-bound verification credentials (see docs/cp_namespace_tenancy.md), or serve one namespace per CP." (.Values.cp.namespaces | default "")) -}}
 {{- end -}}
 {{/* With a trust bundle the verification credentials live in the bundle, so the
-     shared secret is optional (it stays permitted for cross-cluster mesh remote
-     discovery, which still self-mints an audience-bound token). */}}
+     shared secret is optional. Cross-cluster mesh remote discovery never uses it:
+     each RemoteCluster mints its token from its own discovery_credential_ref. */}}
 {{- if $cpTrustBundle -}}
 {{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET" "optional" true) -}}
 {{- else -}}

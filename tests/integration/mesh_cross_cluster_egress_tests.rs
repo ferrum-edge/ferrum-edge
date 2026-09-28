@@ -17,7 +17,7 @@
 
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshService, MultiClusterConfig, ServicePort,
-    Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    ServiceTargetPort, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::{MeshTopology, prepare_gateway_config_for_mesh};
 use ferrum_edge::proxy::mesh_mtls_pool::{
@@ -28,7 +28,8 @@ use ferrum_edge::proxy::mesh_mtls_pool::{
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 
 use super::mesh_test_support::{
-    default_mesh_runtime, gateway_config_with_mesh, mesh_config_with, workload_for,
+    default_mesh_runtime, gateway_config_with_mesh, mesh_config_with, runtime_for_topology,
+    workload_for,
 };
 
 const SVC_B_FQDN: &str = "svc-b.default.svc.cluster.local";
@@ -349,8 +350,8 @@ fn sidecar_client_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
 fn sidecar_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
     let runtime = sidecar_client_runtime();
 
-    // The TCP port deliberately shares :7070 with the service's sole HTTP port.
-    // HTTP takes the `p7070-http` alias; L4 keeps p7070 and a distinct id.
+    // The service also declares an HTTP port on another number; the TCP port's
+    // alias is still just p7070 (it never depends on sibling ports).
     let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
     local.ports = vec![WorkloadPort {
         port: 7070,
@@ -372,9 +373,9 @@ fn sidecar_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
         namespace: "default".to_string(),
         ports: vec![
             ServicePort {
-                port: 7070,
+                port: 7071,
                 protocol: AppProtocol::Http,
-                name: Some("http-same-number".to_string()),
+                name: Some("http".to_string()),
                 target_port: None,
             },
             ServicePort {
@@ -648,29 +649,29 @@ fn cross_cluster_sni_alias_keys_on_explicit_port_not_declaration_order() {
 }
 
 /// codex #2040 Finding A (cross-cluster port-set skew fail-closed). Two clusters
-/// can declare DIFFERENT HTTP port sets for the same service. The dialed SNI for
-/// a given numeric port must depend ONLY on that numeric port — never on the
-/// port SET — so a client and a destination that disagree on port sets agree on
-/// every shared port and a missing port fails closed (the absent per-port proxy)
-/// instead of cross-wiring through a shared base-FQDN channel.
+/// can declare DIFFERENT port sets for the same service. The dialed SNI for a
+/// given numeric port must depend ONLY on that port's number and transport —
+/// never on the port SET — so a client and a destination that disagree on port
+/// sets agree on every shared port and a missing port fails closed (the absent
+/// per-port proxy) instead of cross-wiring onto a sibling port.
 ///
-/// Here the SAME service `svc-b` and SAME numeric port 9090 are materialized
-/// under two client shapes: single-port `{9090}` and multi-port `{8080,9090}`.
-/// Both dial `p9090`; neither dials the base FQDN.
+/// Here the SAME service `svc-b` and SAME HTTP port 9090 are materialized under
+/// three client shapes: `{9090}`, `{8080, 9090}`, and one that adds a raw-TCP
+/// :8080 and a UDP :9090 sibling. All dial `p9090`; none dials the base FQDN.
 #[test]
 fn cross_cluster_dial_sni_depends_only_on_numeric_port_not_port_set() {
     let runtime = sidecar_client_runtime();
 
-    // Extract the cross-cluster dial SNI a client materializes for :9090 given a
-    // service whose HTTP port set is `ports`.
-    let dial_sni_for_9090 = |ports: Vec<u16>| -> Option<String> {
+    // Extract the cross-cluster dial SNI a client materializes for HTTP :9090
+    // given a service whose port set is `ports`.
+    let dial_sni_for_9090 = |ports: Vec<(u16, AppProtocol)>| -> Option<String> {
         let mk_ports = || -> Vec<WorkloadPort> {
             ports
                 .iter()
-                .map(|&p| WorkloadPort {
-                    port: p,
-                    protocol: AppProtocol::Http,
-                    name: Some(format!("http-{p}")),
+                .map(|&(port, protocol)| WorkloadPort {
+                    port,
+                    protocol,
+                    name: Some(format!("port-{port}")),
                 })
                 .collect()
         };
@@ -679,15 +680,15 @@ fn cross_cluster_dial_sni_depends_only_on_numeric_port_not_port_set() {
         let mut remote = remote_workload(Some(REMOTE_NETWORK));
         remote.ports = mk_ports();
         let service = MeshService {
-            cluster_ips: Vec::new(),
+            cluster_ips: vec!["10.96.0.50".to_string()],
             name: "svc-b".to_string(),
             namespace: "default".to_string(),
             ports: ports
                 .iter()
-                .map(|&p| ServicePort {
-                    port: p,
-                    protocol: AppProtocol::Http,
-                    name: Some(format!("http-{p}")),
+                .map(|&(port, protocol)| ServicePort {
+                    port,
+                    protocol,
+                    name: Some(format!("port-{port}")),
                     target_port: None,
                 })
                 .collect(),
@@ -703,7 +704,7 @@ fn cross_cluster_dial_sni_depends_only_on_numeric_port_not_port_set() {
             uid: None,
         };
         let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
-        // Gateway claims the base FQDN AND both per-port aliases, so selection
+        // Gateway claims the base FQDN AND the per-port aliases, so selection
         // never gates this SNI-SHAPE assertion regardless of the port set under
         // test. (`sni_hosts` must be non-empty — validation rejects a cleared
         // list — so we enumerate rather than wildcard.)
@@ -724,17 +725,174 @@ fn cross_cluster_dial_sni_depends_only_on_numeric_port_not_port_set() {
             })
     };
 
+    let expected = Some("p9090.svc-b.default.svc.cluster.local");
     // Single-port client: :9090 ⇒ explicit p9090 alias, NOT the base FQDN.
     assert_eq!(
-        dial_sni_for_9090(vec![9090]).as_deref(),
-        Some("p9090.svc-b.default.svc.cluster.local"),
+        dial_sni_for_9090(vec![(9090, AppProtocol::Http)]).as_deref(),
+        expected,
         "a single-port service dials the explicit p<port> alias for its sole port"
     );
     // Multi-port client: :9090 ⇒ the same explicit p9090 alias.
     assert_eq!(
-        dial_sni_for_9090(vec![8080, 9090]).as_deref(),
-        Some("p9090.svc-b.default.svc.cluster.local"),
+        dial_sni_for_9090(vec![(8080, AppProtocol::Http), (9090, AppProtocol::Http)]).as_deref(),
+        expected,
         "a multi-port service dials the explicit p<port> alias for :9090, never the base FQDN"
+    );
+    // Mixed transports: a raw-TCP :8080 and a UDP :9090 sibling change nothing.
+    let mixed = vec![
+        (8080, AppProtocol::Tcp),
+        (9090, AppProtocol::Http),
+        (9090, AppProtocol::Udp),
+    ];
+    assert_eq!(
+        dial_sni_for_9090(mixed).as_deref(),
+        expected,
+        "sibling ports of other transports never change the HTTP :9090 alias"
+    );
+}
+
+/// Cross-cluster port-set skew end to end: the client cluster declares only
+/// HTTP :7070, while the destination cluster also declares a UDP :7070 (on a
+/// different targetPort) and a raw-TCP :8080. The client's dialed SNI must
+/// select the destination's HTTP :7070 passthrough — whose backend is that
+/// port's targetPort — never the UDP sibling on the same number or the TCP port.
+#[test]
+fn cross_cluster_port_set_skew_still_reaches_the_dialed_port() {
+    // ── Client cluster: svc-b declares only HTTP :7070. ──
+    let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    local.ports = vec![WorkloadPort {
+        port: 7070,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+    }];
+    let mut remote = remote_workload(Some(REMOTE_NETWORK));
+    remote.ports = local.ports.clone();
+    let mut client_service = svc_b_service(&local, &remote);
+    client_service.ports = vec![ServicePort {
+        port: 7070,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+        target_port: None,
+    }];
+    let mut client_mesh = mesh_config_with(vec![local, remote], vec![client_service], Vec::new());
+    client_mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+    let client_sni = materialize_all_upstream_targets(client_mesh, &sidecar_client_runtime())
+        .get("__mesh-out-upstream-default-svc-b-7070")
+        .and_then(|targets| {
+            targets
+                .iter()
+                .find(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+                .and_then(|t| t.tags.get(MESH_EASTWEST_SNI_TAG).cloned())
+        })
+        .expect("client cross-cluster target for HTTP :7070");
+    assert_eq!(client_sni, "p7070.svc-b.default.svc.cluster.local");
+
+    // ── Destination cluster: svc-b declares HTTP :7070, UDP :7070, TCP :8080. ──
+    let backend = workload_for("svc-b", "default", [("app", "svc-b")], ["10.1.0.7"]);
+    let mut destination_service = svc_b_service(&backend, &backend);
+    destination_service.cluster_ips = vec!["10.96.0.70".to_string()];
+    destination_service.workloads.truncate(1);
+    destination_service.ports = vec![
+        ServicePort {
+            port: 7070,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: Some(ServiceTargetPort::Number(17070)),
+        },
+        ServicePort {
+            port: 7070,
+            protocol: AppProtocol::Udp,
+            name: Some("udp".to_string()),
+            target_port: Some(ServiceTargetPort::Number(27070)),
+        },
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+            target_port: Some(ServiceTargetPort::Number(18080)),
+        },
+    ];
+    let mut east_west_runtime = runtime_for_topology(MeshTopology::EastWestGateway);
+    east_west_runtime.namespace = "default".to_string();
+    east_west_runtime.east_west_listen_port = GATEWAY_PORT;
+    let destination = prepare_gateway_config_for_mesh(
+        gateway_config_with_mesh(
+            Vec::new(),
+            Vec::new(),
+            mesh_config_with(vec![backend], vec![destination_service], Vec::new()),
+        ),
+        &east_west_runtime,
+    )
+    .expect("destination east-west prepared");
+
+    let backend_ports_for = |sni: &str| -> Vec<u16> {
+        let proxy = destination
+            .proxies
+            .iter()
+            .find(|proxy| proxy.hosts.iter().any(|host| host == sni))
+            .unwrap_or_else(|| panic!("destination passthrough for {sni}"));
+        destination
+            .upstreams
+            .iter()
+            .find(|upstream| Some(&upstream.id) == proxy.upstream_id.as_ref())
+            .map(|upstream| upstream.targets.iter().map(|t| t.port).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        backend_ports_for(&client_sni),
+        vec![17070],
+        "the client's p7070 dial must reach the HTTP :7070 targetPort"
+    );
+    assert_eq!(
+        backend_ports_for("p7070-udp.svc-b.default.svc.cluster.local"),
+        vec![27070],
+        "the UDP sibling on the same number keeps its own alias and backend"
+    );
+    assert_eq!(
+        backend_ports_for("p8080.svc-b.default.svc.cluster.local"),
+        vec![18080]
+    );
+}
+
+/// An HTTP-family port and a raw-TCP port on one number would share the
+/// `p<port>` alias, so the client refuses to route either cross-cluster (the
+/// destination refuses them too) instead of guessing.
+#[test]
+fn cross_cluster_refuses_http_and_raw_tcp_sharing_a_port_number() {
+    let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    local.ports = vec![WorkloadPort {
+        port: 7070,
+        protocol: AppProtocol::Tcp,
+        name: Some("tcp".to_string()),
+    }];
+    let mut remote = remote_workload(Some(REMOTE_NETWORK));
+    remote.ports = local.ports.clone();
+    let mut service = svc_b_service(&local, &remote);
+    service.cluster_ips = vec!["10.96.0.50".to_string()];
+    service.ports = vec![
+        ServicePort {
+            port: 7070,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 7070,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+            target_port: None,
+        },
+    ];
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &sidecar_client_runtime());
+    assert!(
+        !upstreams
+            .values()
+            .flatten()
+            .any(|target| target.tags.contains_key(MESH_CROSS_CLUSTER_TAG)),
+        "neither port of an ambiguous HTTP/raw-TCP number may route cross-cluster"
     );
 }
 
@@ -2464,7 +2622,8 @@ fn cross_cluster_udp_materializes_per_port_targets_for_both_captured_topologies(
                 .tags
                 .get(MESH_EASTWEST_SNI_TAG)
                 .map(String::as_str),
-            Some("p5353-tcp.svc-b.default.svc.cluster.local")
+            Some("p5353.svc-b.default.svc.cluster.local"),
+            "the TCP port keeps the bare p<port> alias; only UDP carries a suffix"
         );
     }
 }

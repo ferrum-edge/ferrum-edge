@@ -2380,7 +2380,11 @@ pub struct MeshTelemetryConfig {
     pub access_logging: Option<MeshAccessLoggingConfig>,
 }
 
+/// Closed schema (`deny_unknown_fields`): a misspelled or removed key — such as
+/// the retired singular `provider` — fails the load instead of silently
+/// disabling tracing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTracingConfig {
     /// Istio tracing mode selector — `Server`, `Client`, or `ClientAndServer`.
     /// `None` defers to the default (Istio treats unset as SERVER for sidecar
@@ -6219,6 +6223,7 @@ impl MeshConfig {
             &self.ext_authz_providers,
             &mut errors,
         );
+        validate_mesh_extension_configs(&self.extension_configs, &mut errors);
         errors
     }
 
@@ -6617,6 +6622,26 @@ pub fn validate_mesh_config(
         trust_bundles,
         None,
     )
+}
+
+/// Refuse operator ECDS extension configs that declare the DestinationRule
+/// carrier type. DestinationRules reach data planes only through the reserved
+/// carriers the xDS translator emits from `destination_rules`; a data plane
+/// NACKs that type under any other name, which would wedge every later ECDS
+/// update on last-known-good.
+fn validate_mesh_extension_configs(
+    extension_configs: &[crate::modes::mesh::slice::MeshExtensionConfig],
+    errors: &mut Vec<String>,
+) {
+    for extension in extension_configs {
+        if extension.type_url == crate::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
+            errors.push(format!(
+                "MeshConfig.extension_configs {:?}: type_url {:?} is reserved for Ferrum \
+                 DestinationRule carriers; declare the rule in destination_rules instead",
+                extension.name, extension.type_url
+            ));
+        }
+    }
 }
 
 /// Validate VirtualService-derived CORS policies at the config boundary:
@@ -8352,9 +8377,8 @@ fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
 }
 
 /// Return the base service FQDN claimed by a generated exact alias
-/// (`p<port>.<base>`, or the transport-discriminated `p<port>-http` /
-/// `p<port>-tcp` / `p<port>-udp` form) or by a wildcard alias owner
-/// (`*.<base>`).
+/// (`p<port>.<base>`, or `p<port>-udp.<base>` for a UDP port) or by a wildcard
+/// alias owner (`*.<base>`).
 ///
 /// The suffix must have Ferrum's `<service>.<namespace>.svc.<cluster-domain>`
 /// shape. This keeps unrelated explicit hosts such as `p9090.example.com`
@@ -8369,10 +8393,7 @@ fn east_west_alias_claim_base(host: &str) -> Option<String> {
     }
 
     let port = alias_label.strip_prefix('p')?;
-    let port = ["-http", "-tcp", "-udp"]
-        .iter()
-        .find_map(|suffix| port.strip_suffix(suffix))
-        .unwrap_or(port);
+    let port = port.strip_suffix("-udp").unwrap_or(port);
     // `cross_cluster_service_sni` renders a non-zero u16 without leading
     // zeroes. Recognize only that canonical generated namespace so an ordinary
     // hostname such as `p65536.example` is not reinterpreted as an alias.

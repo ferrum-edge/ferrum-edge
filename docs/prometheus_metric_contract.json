@@ -2989,7 +2989,6 @@
     "help": "SPIFFE federation trust-bundle poll failures.",
     "labels": [
       "trust_domain",
-      "endpoint",
       "gateway_namespace"
     ],
     "subsystem": "mesh_federation",

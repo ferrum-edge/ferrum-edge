@@ -1824,10 +1824,7 @@ async fn mesh_poll_failure_counters_are_live_across_the_render_cache() {
         "test identities must be absent before the first failure:\n{primed}"
     );
 
-    prometheus_helpers::increment_mesh_federation_poll_failure(
-        &trust_domain,
-        format!("https://federation-{suffix}.example:8443"),
-    );
+    prometheus_helpers::increment_mesh_federation_poll_failure(&trust_domain);
     prometheus_helpers::increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
 
     // Second scrape inside the TTL: the cached body is reused, but the mesh
@@ -1849,10 +1846,7 @@ async fn mesh_poll_failure_counters_are_live_across_the_render_cache() {
     );
 
     // A second increment must also land rather than being frozen by the cache.
-    prometheus_helpers::increment_mesh_federation_poll_failure(
-        &trust_domain,
-        format!("https://federation-{suffix}.example:8443"),
-    );
+    prometheus_helpers::increment_mesh_federation_poll_failure(&trust_domain);
     let rescraped = registry.render();
     assert_sample_value(
         &rescraped,

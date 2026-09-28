@@ -97,6 +97,7 @@ mod k8s_http_route_retry_tests;
 mod k8s_http_route_timeouts_tests;
 mod k8s_listenerset_translation_tests;
 mod k8s_resource_store_snapshot_tests;
+mod k8s_service_port_ambiguity_tests;
 mod k8s_status_budget_tests;
 mod k8s_status_planning_tests;
 mod k8s_status_snapshot_tests;

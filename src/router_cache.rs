@@ -756,10 +756,11 @@ impl HostRouteTable {
     ///
     /// Behavior matrix (see [`MeshInboundPortGroup`]):
     /// - route not grouped → keep `current`;
-    /// - a single-port SERVICE-default group (`is_ingress == false`) → keep
-    ///   `current` unconditionally (back-compat: single-port services accept
-    ///   bare-Host clients, older peers, and any explicit port today — selection
-    ///   adds no new requirement to them);
+    /// - a single-port SERVICE-default group (`is_ingress == false`) → a
+    ///   request with no port signal keeps `current` (bare-Host clients); a
+    ///   PRESENT signal must name the sole port — the orig-dst its container
+    ///   port, else the authority its service port — or
+    ///   [`MeshInboundPortSelectError::PortNotMaterialized`];
     /// - a single-listener INGRESS group (`is_ingress == true`) → a present port
     ///   signal MUST equal the declared listener port (else
     ///   [`MeshInboundPortSelectError::PortNotMaterialized`]); a request with no
@@ -799,10 +800,9 @@ impl HostRouteTable {
                 // absorb traffic to any other port. A request that names a port
                 // (captured orig-dst or explicit authority) is accepted only when
                 // that port matches the sole listener; a present-but-unmatched
-                // signal fails closed (a single-port service-default group keeps
-                // the back-compat passthrough below). With NO port signal the
-                // request falls through to the sole listener — there is no other
-                // inbound destination to confuse it with.
+                // signal fails closed. With NO port signal the request falls
+                // through to the sole listener — there is no other inbound
+                // destination to confuse it with.
                 let listener_port = group.ports.first().map(|s| s.authority_port);
                 let signal = orig_dst_port.or(authority_port);
                 if let Some(port) = signal
@@ -812,10 +812,26 @@ impl HostRouteTable {
                 }
                 return Ok((current, listener_port));
             }
-            // Single declared SERVICE port (non-ingress): keep the representative
-            // unconditionally (back-compat — single-port services accept bare-Host
-            // clients and any explicit port). Not an ingress group, so no authz
-            // listener port to stamp.
+            // Single declared SERVICE port (non-ingress): a request with no port
+            // signal (a bare-Host client) keeps the representative. A PRESENT
+            // signal must name this port with the same priority as a multi-port
+            // group — the captured orig-dst its container port, else the
+            // authority its service port — and a mismatch fails closed rather
+            // than being absorbed onto the only port. Not an ingress group, so no
+            // authz listener port to stamp.
+            let sibling = group.ports.first();
+            let signal_matches = match (orig_dst_port, authority_port) {
+                (Some(container_port), _) => {
+                    sibling.is_some_and(|sibling| sibling.orig_dst_match_port == container_port)
+                }
+                (None, Some(service_port)) => {
+                    sibling.is_some_and(|sibling| sibling.authority_port == service_port)
+                }
+                (None, None) => true,
+            };
+            if !signal_matches {
+                return Err(MeshInboundPortSelectError::PortNotMaterialized);
+            }
             return Ok((current, None));
         }
         let selected = if let Some(container_port) = orig_dst_port {
@@ -5811,11 +5827,12 @@ mod tests {
         ));
     }
 
-    /// Single-declared-port local services keep today's behavior
-    /// unconditionally: bare-Host clients, older peers, and any explicit
-    /// port all keep routing (selection adds no new requirement to them).
+    /// Single-declared-port local services keep serving bare-Host clients (no
+    /// port signal), but a PRESENT port signal must name the sole port: the
+    /// orig-dst its container port, else the authority its service port. A
+    /// mismatched explicit port fails closed instead of being absorbed.
     #[test]
-    fn mesh_inbound_single_port_group_keeps_route_unconditionally() {
+    fn mesh_inbound_single_port_group_requires_a_present_signal_to_match() {
         let mut p =
             minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-ratings-8080", "/");
         p.hosts = vec!["ratings".to_string()];
@@ -5828,15 +5845,39 @@ mod tests {
         let cache = RouterCache::new(&config, 100);
         let table = cache.route_table_for_tests();
 
-        for (orig_dst, authority) in [(None, None), (None, Some(9999u16)), (Some(9999u16), None)] {
+        // No signal, a matching orig-dst (container port 8081), or a matching
+        // authority (service port 8080) keeps the route. A present orig-dst
+        // outranks the authority, as for a multi-port group.
+        for (orig_dst, authority) in [
+            (None, None),
+            (Some(8081u16), None),
+            (None, Some(8080u16)),
+            (Some(8081u16), Some(9999u16)),
+        ] {
             let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
             let (kept, ingress_authz_port) = table
                 .select_mesh_inbound_port_route(rm, orig_dst, authority)
-                .expect("single-port group never demands a signal");
+                .expect("a matching or absent signal keeps the single-port route");
             assert_eq!(kept.proxy.id, "__mesh-inbound-default-ratings-8080");
             assert_eq!(
                 ingress_authz_port, None,
                 "service-port group is not ingress"
+            );
+        }
+
+        // A mismatched explicit port is refused rather than absorbed.
+        for (orig_dst, authority) in [
+            (None, Some(9999u16)),
+            (Some(9999u16), None),
+            (Some(8080u16), Some(8080u16)),
+        ] {
+            let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
+            assert!(
+                matches!(
+                    table.select_mesh_inbound_port_route(rm, orig_dst, authority),
+                    Err(MeshInboundPortSelectError::PortNotMaterialized)
+                ),
+                "orig_dst={orig_dst:?} authority={authority:?} must fail closed"
             );
         }
     }

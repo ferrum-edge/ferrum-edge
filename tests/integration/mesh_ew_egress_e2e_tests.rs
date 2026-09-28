@@ -148,8 +148,9 @@ fn east_west_gateway_materializes_local_service_proxies_for_sni_routing() {
 
 /// Multi-port east-west (issue #2010 phase 3): a service with two HTTP ports
 /// materializes ONE SNI-passthrough proxy PER port, each on its deterministic
-/// `p<port>.<fqdn>` alias and backed by that port's container port. This is the gateway (destination) side
-/// of the per-port SNI scheme the client materializers dial.
+/// `p<port>.<fqdn>` alias and backed by that port's container port. This is the
+/// gateway (destination) side of the per-port SNI scheme the client
+/// materializers dial.
 #[test]
 fn east_west_gateway_materializes_per_port_proxies_for_multiport_service() {
     let workload = workload_for(
@@ -302,7 +303,7 @@ fn east_west_gateway_materializes_raw_tcp_and_udp_per_port_sni_relays() {
 
     for (alias, port) in [
         ("p7070.l4-service.default.svc.cluster.local", 7070),
-        ("p5353.l4-service.default.svc.cluster.local", 5353),
+        ("p5353-udp.l4-service.default.svc.cluster.local", 5353),
     ] {
         let proxy = prepared
             .proxies
@@ -321,7 +322,70 @@ fn east_west_gateway_materializes_raw_tcp_and_udp_per_port_sni_relays() {
 }
 
 #[test]
-fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
+fn east_west_alias_depends_only_on_port_number_and_transport() {
+    // HTTP :8080 and UDP :8080 share a number but not a transport: HTTP keeps
+    // the bare p8080 alias and UDP takes p8080-udp. Neither alias changes when
+    // the service also declares other ports.
+    let workload = workload_for("mixed", DEFAULT_NAMESPACE, [("app", "mixed")], ["10.0.0.9"]);
+    let mut service = service_for("mixed", DEFAULT_NAMESPACE, &[&workload]);
+    service.ports = vec![
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Udp,
+            name: Some("udp".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 9090,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+            target_port: None,
+        },
+    ];
+    let prepared = prepare_gateway_config_for_mesh(
+        gateway_config_with_mesh(
+            Vec::new(),
+            Vec::new(),
+            mesh_config_with(vec![workload], vec![service], Vec::new()),
+        ),
+        &east_west_runtime(),
+    )
+    .expect("prepared");
+
+    for (alias, upstream_id) in [
+        (
+            "p8080.mixed.default.svc.cluster.local",
+            "__mesh-ew-upstream-default-mixed.p8080",
+        ),
+        (
+            "p8080-udp.mixed.default.svc.cluster.local",
+            "__mesh-ew-upstream-default-mixed.p8080-udp",
+        ),
+        (
+            "p9090.mixed.default.svc.cluster.local",
+            "__mesh-ew-upstream-default-mixed.p9090",
+        ),
+    ] {
+        let proxy = prepared
+            .proxies
+            .iter()
+            .find(|proxy| proxy.hosts.iter().any(|host| host == alias))
+            .unwrap_or_else(|| panic!("east-west passthrough for {alias}"));
+        assert_eq!(proxy.upstream_id.as_deref(), Some(upstream_id));
+    }
+}
+
+#[test]
+fn east_west_refuses_http_and_raw_tcp_sharing_a_port_number() {
+    // An HTTP port and a raw-TCP port on one number would share the p8080
+    // alias, so the destination refuses both rather than pick one. The
+    // service's unambiguous port still routes.
     let workload = workload_for("mixed", DEFAULT_NAMESPACE, [("app", "mixed")], ["10.0.0.9"]);
     let mut service = service_for("mixed", DEFAULT_NAMESPACE, &[&workload]);
     service.ports = vec![
@@ -338,9 +402,9 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
             target_port: None,
         },
         ServicePort {
-            port: 8080,
-            protocol: AppProtocol::Udp,
-            name: Some("udp".to_string()),
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
             target_port: None,
         },
     ];
@@ -354,36 +418,14 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
     )
     .expect("prepared");
 
-    for alias in [
-        "p8080-http.mixed.default.svc.cluster.local",
-        "p8080-tcp.mixed.default.svc.cluster.local",
-        "p8080-udp.mixed.default.svc.cluster.local",
-    ] {
-        assert!(
-            prepared
-                .proxies
-                .iter()
-                .any(|proxy| proxy.hosts.iter().any(|host| host == alias))
-        );
-    }
-    assert!(
+    let routes = |alias: &str| {
         prepared
-            .upstreams
+            .proxies
             .iter()
-            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080-http")
-    );
-    assert!(
-        prepared
-            .upstreams
-            .iter()
-            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080-tcp")
-    );
-    assert!(
-        prepared
-            .upstreams
-            .iter()
-            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080-udp")
-    );
+            .any(|proxy| proxy.hosts.iter().any(|host| host == alias))
+    };
+    assert!(!routes("p8080.mixed.default.svc.cluster.local"));
+    assert!(routes("p9090.mixed.default.svc.cluster.local"));
 }
 
 /// codex #2040 Finding B (id collision): a MULTI-port service `foo` (ports 8080,
