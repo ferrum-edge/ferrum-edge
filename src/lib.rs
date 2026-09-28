@@ -1108,7 +1108,9 @@ pub mod _test_support {
         WriteWatermark,
         /// A gRPC-Web deadline that fired after the attempt was handed to the
         /// backend, or before.
-        GrpcWebDeadline { handed_off: bool },
+        GrpcWebDeadline {
+            handed_off: bool,
+        },
         PeerGone,
         UploadTooLarge,
     }
