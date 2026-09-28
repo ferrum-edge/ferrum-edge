@@ -1106,7 +1106,9 @@ pub mod _test_support {
         Response(u16),
         HeaderTimeout,
         WriteWatermark,
-        GrpcWebDeadline,
+        /// A gRPC-Web deadline that fired after the attempt was handed to the
+        /// backend, or before.
+        GrpcWebDeadline { handed_off: bool },
         PeerGone,
         UploadTooLarge,
     }
@@ -1127,7 +1129,9 @@ pub mod _test_support {
             }
             PlainBridgeAttemptEndForTest::HeaderTimeout => PlainAttemptEnd::HeaderTimeout,
             PlainBridgeAttemptEndForTest::WriteWatermark => PlainAttemptEnd::WriteWatermark,
-            PlainBridgeAttemptEndForTest::GrpcWebDeadline => PlainAttemptEnd::GrpcWebDeadline,
+            PlainBridgeAttemptEndForTest::GrpcWebDeadline { handed_off } => {
+                PlainAttemptEnd::GrpcWebDeadline { handed_off }
+            }
             PlainBridgeAttemptEndForTest::PeerGone => PlainAttemptEnd::PeerGone,
             PlainBridgeAttemptEndForTest::UploadTooLarge => PlainAttemptEnd::UploadTooLarge(()),
         };

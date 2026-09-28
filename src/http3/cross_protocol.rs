@@ -1430,8 +1430,10 @@ pub(crate) enum PlainAttemptEnd<T, D = std::convert::Infallible> {
     WriteWatermark,
     /// The request's authorization lifetime expired (issue #3815).
     AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
-    /// The gRPC-Web pass-through RPC deadline fired.
-    GrpcWebDeadline,
+    /// The gRPC-Web pass-through RPC deadline fired. `handed_off` is whether
+    /// the attempt had been handed to the backend by then, the only case in
+    /// which a route attempt budget (#5646) expiry is charged to it.
+    GrpcWebDeadline { handed_off: bool },
     /// The client went away before the response head.
     PeerGone,
     /// The client's streamed upload exceeded the request body limit.
@@ -1441,10 +1443,10 @@ pub(crate) enum PlainAttemptEnd<T, D = std::convert::Infallible> {
 impl<T: PlainSettledAttempt, D> PlainAttemptEnd<T, D> {
     /// Record the attempt: end its `otel_tracing` CLIENT span and add it to
     /// the request's diagnostic reference. A deadline or a disconnect is the
-    /// client's, except a gRPC-Web deadline that was the route attempt budget
-    /// (#5646), the backend's timeout, exactly as the terminal records the
-    /// attempt's outcome. Nothing is derived for a request that records no
-    /// attempts.
+    /// client's, except a gRPC-Web deadline that fired after the handoff and
+    /// was the route attempt budget (#5646), the backend's timeout, exactly as
+    /// the terminal records the attempt's outcome. Nothing is derived for a
+    /// request that records no attempts.
     pub(crate) fn record(&self, ctx: &RequestContext) {
         if !ctx.records_backend_attempts() {
             return;
@@ -1454,10 +1456,12 @@ impl<T: PlainSettledAttempt, D> PlainAttemptEnd<T, D> {
             Self::HeaderTimeout | Self::WriteWatermark => {
                 PlainAttemptRecord::failed(ErrorClass::ReadWriteTimeout)
             }
-            Self::GrpcWebDeadline if plain_grpc_web_deadline_charges_backend(ctx) => {
+            Self::GrpcWebDeadline { handed_off: true }
+                if plain_grpc_web_deadline_charges_backend(ctx) =>
+            {
                 PlainAttemptRecord::failed(ErrorClass::ReadWriteTimeout)
             }
-            Self::AuthorizationExpired(_) | Self::GrpcWebDeadline | Self::PeerGone => {
+            Self::AuthorizationExpired(_) | Self::GrpcWebDeadline { .. } | Self::PeerGone => {
                 PlainAttemptRecord::failed(ErrorClass::ClientDisconnect)
             }
             Self::UploadTooLarge(_) => PlainAttemptRecord::failed(ErrorClass::RequestBodyTooLarge),
@@ -4056,117 +4060,126 @@ where
                     let plain_upload_deadline = plain_write_bound.deadline();
                     let plain_peer_signal = ctx.peer_connection.as_ref();
                     let mut plain_attempt_builder = plain_request_builder.body(plain_upload_body);
-                    // The H3 STOP_SENDING future must be constructed directly
-                    // for each attempt. Retaining `stream` inside the generic
-                    // replay closure would either require the transport to be
-                    // `Sync` or let an `FnMut` future borrow its capture. The
-                    // returned cancellation future is `'static`, so this local
-                    // construction releases the stream reborrow before the
-                    // attempt is awaited and the stream remains available for
-                    // the eventual response.
-                    let header_bound = loop {
-                        let stream_cancelled =
-                            crate::http3::stream_util::peer_response_cancelled(stream);
-                        let attempt = crate::plugins::await_deadline_first(
-                            plain_header_deadline_at,
-                            await_h3_backend_or_peer(
-                                plain_upload_deadline,
-                                plain_peer_signal,
-                                stream_cancelled,
-                                plain_attempt_builder.send(),
-                            ),
-                        );
-                        // Polled in the attempt's scope, which hands the attempt
-                        // to the backend. A protocol-NACK replay stays in it.
-                        let outcome = {
-                            let attempt = await_upload_write_watermark_first(
-                                attempt,
-                                plain_upload_pump.as_mut(),
-                            );
-                            tokio::pin!(attempt);
-                            attempt_span.scope(attempt).await
-                        };
-                        let should_replay = outcome.as_ref().is_ok_and(plain_send_is_protocol_nack);
-                        if !should_replay {
-                            break outcome;
-                        }
-                        let Some(replay) = plain_buffered_replay.as_mut() else {
-                            break outcome;
-                        };
-                        let Some(next) = replay
-                            .replay_after_protocol_nack(&mut plain_upload_pump)
-                            .await
-                        else {
-                            break outcome;
-                        };
-                        plain_attempt_builder = next;
-                    };
-                    drop(pending_slot);
                     // Every way this attempt can end, classified before anything
                     // acts on it, so it is recorded at ONE point below (issue
-                    // #5875) and then handled exactly as before.
-                    let attempt_end: PlainAttemptEnd<_> = match header_bound {
-                        Err(()) => PlainAttemptEnd::WriteWatermark,
-                        // The route attempt budget (#5646) ended this attempt
-                        // before its response head: the ordinary backend
-                        // timeout, charged to this backend and retryable.
-                        Ok(Err(())) if route.attempt_budget_expired(route_attempt_deadline) => {
-                            if let Some(pump) = plain_upload_pump.as_mut() {
-                                pump.cancel();
+                    // #5875) and then handled exactly as before. The raw wait
+                    // result ends with this block, so the terminals' awaits below
+                    // do not carry it in this already-large coroutine.
+                    let attempt_end: PlainAttemptEnd<_> = {
+                        // The H3 STOP_SENDING future must be constructed directly
+                        // for each attempt. Retaining `stream` inside the generic
+                        // replay closure would either require the transport to be
+                        // `Sync` or let an `FnMut` future borrow its capture. The
+                        // returned cancellation future is `'static`, so this local
+                        // construction releases the stream reborrow before the
+                        // attempt is awaited and the stream remains available for
+                        // the eventual response.
+                        let header_bound = loop {
+                            let stream_cancelled =
+                                crate::http3::stream_util::peer_response_cancelled(stream);
+                            let attempt = crate::plugins::await_deadline_first(
+                                plain_header_deadline_at,
+                                await_h3_backend_or_peer(
+                                    plain_upload_deadline,
+                                    plain_peer_signal,
+                                    stream_cancelled,
+                                    plain_attempt_builder.send(),
+                                ),
+                            );
+                            // Polled in the attempt's scope, which hands the attempt
+                            // to the backend. A protocol-NACK replay stays in it.
+                            let outcome = {
+                                let attempt = await_upload_write_watermark_first(
+                                    attempt,
+                                    plain_upload_pump.as_mut(),
+                                );
+                                tokio::pin!(attempt);
+                                attempt_span.scope(attempt).await
+                            };
+                            let should_replay =
+                                outcome.as_ref().is_ok_and(plain_send_is_protocol_nack);
+                            if !should_replay {
+                                break outcome;
                             }
-                            PlainAttemptEnd::Settled(Err(PlainAttemptFailure::AttemptBudget))
-                        }
-                        Ok(Err(())) => PlainAttemptEnd::HeaderTimeout,
-                        // A buffered body is part of its attempt (#5738): collect
-                        // it here when a failure during collection could be
-                        // retried, so a route attempt budget expiry, read timeout
-                        // or reset there reaches the retry policy below like one
-                        // before the head. Without an attempt budget the head
-                        // passes straight through.
-                        Ok(Ok(H3BackendOrPeer::Ready(Ok(response))))
-                            if route_attempt_deadline.is_some() =>
-                        {
-                            let response = collect_plain_response_within_attempt(
-                                state,
-                                proxy,
-                                plugins,
-                                ctx,
-                                method,
-                                retry_config,
-                                route_retry_ceiling,
-                                current_target.as_deref(),
-                                attempt,
-                                route,
-                                route_attempt_deadline,
-                                should_buffer_response,
-                                effective_max_response_body_size_bytes,
-                                response,
-                            )
-                            .await;
-                            PlainAttemptEnd::Settled(Ok(response))
-                        }
-                        Ok(Ok(H3BackendOrPeer::Ready(result))) => {
-                            let result = result
-                                .map(PlainAttemptResponse::Live)
-                                .map_err(PlainAttemptFailure::Transport);
-                            PlainAttemptEnd::Settled(result)
-                        }
-                        Ok(Ok(H3BackendOrPeer::Deadline)) => {
-                            match plain_write_bound.expired_authorization() {
-                                Some(termination) => {
-                                    PlainAttemptEnd::AuthorizationExpired(termination)
+                            let Some(replay) = plain_buffered_replay.as_mut() else {
+                                break outcome;
+                            };
+                            let Some(next) = replay
+                                .replay_after_protocol_nack(&mut plain_upload_pump)
+                                .await
+                            else {
+                                break outcome;
+                            };
+                            plain_attempt_builder = next;
+                        };
+                        drop(pending_slot);
+                        match header_bound {
+                            Err(()) => PlainAttemptEnd::WriteWatermark,
+                            // The route attempt budget (#5646) ended this attempt
+                            // before its response head: the ordinary backend
+                            // timeout, charged to this backend and retryable.
+                            Ok(Err(())) if route.attempt_budget_expired(route_attempt_deadline) => {
+                                if let Some(pump) = plain_upload_pump.as_mut() {
+                                    pump.cancel();
                                 }
-                                None => PlainAttemptEnd::GrpcWebDeadline,
+                                PlainAttemptEnd::Settled(Err(PlainAttemptFailure::AttemptBudget))
                             }
+                            Ok(Err(())) => PlainAttemptEnd::HeaderTimeout,
+                            // A buffered body is part of its attempt (#5738): collect
+                            // it here when a failure during collection could be
+                            // retried, so a route attempt budget expiry, read timeout
+                            // or reset there reaches the retry policy below like one
+                            // before the head. Without an attempt budget the head
+                            // passes straight through.
+                            Ok(Ok(H3BackendOrPeer::Ready(Ok(response))))
+                                if route_attempt_deadline.is_some() =>
+                            {
+                                let response = collect_plain_response_within_attempt(
+                                    state,
+                                    proxy,
+                                    plugins,
+                                    ctx,
+                                    method,
+                                    retry_config,
+                                    route_retry_ceiling,
+                                    current_target.as_deref(),
+                                    attempt,
+                                    route,
+                                    route_attempt_deadline,
+                                    should_buffer_response,
+                                    effective_max_response_body_size_bytes,
+                                    response,
+                                )
+                                .await;
+                                PlainAttemptEnd::Settled(Ok(response))
+                            }
+                            Ok(Ok(H3BackendOrPeer::Ready(result))) => {
+                                let result = result
+                                    .map(PlainAttemptResponse::Live)
+                                    .map_err(PlainAttemptFailure::Transport);
+                                PlainAttemptEnd::Settled(result)
+                            }
+                            Ok(Ok(H3BackendOrPeer::Deadline)) => {
+                                match plain_write_bound.expired_authorization() {
+                                    Some(termination) => {
+                                        PlainAttemptEnd::AuthorizationExpired(termination)
+                                    }
+                                    None => PlainAttemptEnd::GrpcWebDeadline { handed_off: true },
+                                }
+                            }
+                            Ok(Ok(H3BackendOrPeer::PeerGone)) => PlainAttemptEnd::PeerGone,
                         }
-                        Ok(Ok(H3BackendOrPeer::PeerGone)) => PlainAttemptEnd::PeerGone,
                     };
                     // The attempt's one record point: whichever way it ended,
                     // before a retry replaces it or a terminal answers it.
                     attempt_end.record(ctx);
+                    // Each terminal arm below that owns no payload ends `attempt_end`
+                    // first, so the terminal's await does not carry it in this
+                    // already-large coroutine.
                     let send_result = match attempt_end {
                         PlainAttemptEnd::Settled(send_result) => send_result,
                         PlainAttemptEnd::WriteWatermark => {
+                            drop(attempt_end);
                             if let Some(pump) = plain_upload_pump.as_mut() {
                                 pump.cancel();
                             }
@@ -4198,6 +4211,7 @@ where
                             .await;
                         }
                         PlainAttemptEnd::HeaderTimeout => {
+                            drop(attempt_end);
                             crate::http3::stream_util::halt_request_body(stream);
                             warn!(
                                 proxy_id = %proxy.id,
@@ -4226,6 +4240,7 @@ where
                             .await;
                         }
                         PlainAttemptEnd::AuthorizationExpired(termination) => {
+                            drop(attempt_end);
                             ctx.record_authorization_termination_once(
                                 termination,
                                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
@@ -4259,7 +4274,8 @@ where
                             )
                             .await;
                         }
-                        PlainAttemptEnd::GrpcWebDeadline => {
+                        PlainAttemptEnd::GrpcWebDeadline { .. } => {
+                            drop(attempt_end);
                             // The attempt was handed to the backend: a gRPC-Web
                             // route attempt budget expiry is charged to it.
                             let charged = record_plain_grpc_web_deadline_after_handoff(
@@ -4290,6 +4306,7 @@ where
                             .await;
                         }
                         PlainAttemptEnd::PeerGone => {
+                            drop(attempt_end);
                             crate::http3::stream_util::halt_request_body(stream);
                             return Ok(plain_peer_gone_before_response_headers(
                                 PlainPeerGoneBeforeResponseHeadersCtx {
@@ -4835,14 +4852,17 @@ where
                 // An upload the composed bound (`plain_write_bound`) has already
                 // ended is refused below without polling the race: it is never
                 // handed to the backend, so it begins no attempt (issue #5875).
-                // No await separates this check from that refusal.
-                let upload_bound_elapsed = plain_write_bound
+                // The refusal re-checks the bound where it is taken, so a bound
+                // that ends between here and there still refuses the upload;
+                // that attempt was begun but never polled, so it was never
+                // handed off and is not exported.
+                let bound_elapsed_before_attempt = plain_write_bound
                     .deadline()
                     .is_some_and(|at| tokio::time::Instant::now() >= at);
                 // The attempt's `otel_tracing` CLIENT span (issue #5875): the
                 // request carries the attempt's own `traceparent`, and the
                 // backend exchange is polled in the attempt's scope below.
-                let attempt_span = if upload_bound_elapsed {
+                let attempt_span = if bound_elapsed_before_attempt {
                     crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE
                 } else {
                     ctx.begin_backend_attempt_span(&current_url, proxy_headers)
@@ -5147,6 +5167,10 @@ where
                 let mut peer_gone = peer_signal
                     .as_ref()
                     .is_some_and(crate::plugins::PeerConnectionSignal::is_closed);
+                // No await separates this check from the refusal it decides.
+                let upload_bound_elapsed = plain_write_bound
+                    .deadline()
+                    .is_some_and(|at| tokio::time::Instant::now() >= at);
                 let send_result = if upload_bound_elapsed {
                     upload_auth_expired = plain_write_bound.expired_authorization();
                     drop(pending_slot.take());
@@ -5333,15 +5357,20 @@ where
                         None if backend_write_watermark_expired => PlainAttemptEnd::WriteWatermark,
                         None if header_wait_expired => PlainAttemptEnd::HeaderTimeout,
                         None if peer_gone => PlainAttemptEnd::PeerGone,
-                        None => PlainAttemptEnd::GrpcWebDeadline,
+                        None => PlainAttemptEnd::GrpcWebDeadline {
+                            handed_off: upload_deadline_after_handoff,
+                        },
                     },
                 };
-                // The attempt's one record point. An upload the composed bound
-                // had already ended was never handed to the backend and began
-                // no attempt.
+                // The attempt's one record point. An upload refused because the
+                // composed bound had already ended was never handed to the
+                // backend, so no attempt is recorded for it.
                 if !upload_bound_elapsed {
                     attempt_end.record(ctx);
                 }
+                // Each terminal arm below that owns no payload ends `attempt_end`
+                // first, so the terminal's await does not carry it in this
+                // already-large coroutine.
                 let send_result = match attempt_end {
                     PlainAttemptEnd::Settled(send_result) => send_result,
                     // The authorization bound fired before any response header
@@ -5351,6 +5380,7 @@ where
                     // literal: no expiry value, claim, subject, certificate
                     // field, or provider detail reaches the client.
                     PlainAttemptEnd::AuthorizationExpired(termination) => {
+                        drop(attempt_end);
                         ctx.record_authorization_termination_once(
                             termination,
                             crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
@@ -5385,6 +5415,7 @@ where
                         .await;
                     }
                     PlainAttemptEnd::HeaderTimeout | PlainAttemptEnd::WriteWatermark => {
+                        drop(attempt_end);
                         // One macro, two attributions. At `opt-level = 0` each
                         // `warn!` invocation is its own set of allocas in this
                         // already-oversized coroutine, so the branch picks
@@ -5427,6 +5458,7 @@ where
                         .await;
                     }
                     PlainAttemptEnd::PeerGone => {
+                        drop(attempt_end);
                         return Ok(plain_peer_gone_before_response_headers(
                             PlainPeerGoneBeforeResponseHeadersCtx {
                                 state,
@@ -5445,8 +5477,9 @@ where
                             },
                         ));
                     }
-                    PlainAttemptEnd::GrpcWebDeadline => {
-                        let charged = if upload_deadline_after_handoff {
+                    PlainAttemptEnd::GrpcWebDeadline { handed_off } => {
+                        drop(attempt_end);
+                        let charged = if handed_off {
                             record_plain_grpc_web_deadline_after_handoff(
                                 ctx,
                                 state,

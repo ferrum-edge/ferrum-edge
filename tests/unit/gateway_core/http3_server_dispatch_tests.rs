@@ -2011,19 +2011,22 @@ fn streaming_h3_grpc_web_dispatch_is_bounded_before_response_headers() {
     // An ALREADY-elapsed composed bound must not poll the race at all: the
     // backend send and the frontend reader are both dropped, and the owner is
     // read from the captured composition rather than from a second clock read.
-    // The elapsed check itself is taken just before the attempt would begin,
-    // with no await in between, so such an upload begins no attempt either
-    // (issue #5875).
+    // The elapsed check sits with the refusal it decides, with no await in
+    // between (issue #5875).
     let elapsed_check = dispatch
         .split("let upload_bound_elapsed = plain_write_bound")
         .nth(1)
         .expect("the already-elapsed check of the composed bound")
-        .split(';')
+        .split("let send_result = if upload_bound_elapsed {")
         .next()
         .expect("bounded already-elapsed check");
     assert!(
         elapsed_check.contains("tokio::time::Instant::now() >= at"),
         "an already-elapsed composed bound must refuse before polling the race"
+    );
+    assert!(
+        !elapsed_check.contains(".await"),
+        "no await may separate the already-elapsed check from its refusal"
     );
     let refusal = bridge
         .split("} else {")
@@ -2032,6 +2035,20 @@ fn streaming_h3_grpc_web_dispatch_is_bounded_before_response_headers() {
     assert!(
         refusal.contains("plain_write_bound.expired_authorization()"),
         "the refusal must attribute from the captured composition"
+    );
+    // A refused upload was never handed to the backend, so the attempt record
+    // is gated on the refusal's own check, not on the earlier sample that
+    // decided whether to begin the attempt's span.
+    let record_gate = bridge
+        .split("if !upload_bound_elapsed {")
+        .nth(1)
+        .expect("the attempt record must be gated on the refusal")
+        .split('}')
+        .next()
+        .expect("bounded attempt record gate");
+    assert!(
+        record_gate.contains("attempt_end.record(ctx);"),
+        "a refused upload must record no attempt"
     );
     let deadline = bridge
         .find("_ = &mut upload_deadline, if upload_deadline_active =>")
@@ -4798,9 +4815,16 @@ fn the_h3_prebuffered_plain_arm_writes_under_the_backend_write_watermark() {
     // is the typed 504 backend-timeout terminal, never a generic 502.
     // The raced wait's `Err(())` is the write watermark. The prebuffered arm
     // classifies it before acting on it, so the attempt is recorded at one
-    // point (issue #5875), then answers it with the arm that follows.
+    // point (issue #5875), then answers it with the arm that follows. The raw
+    // wait result is scoped to the classification block.
     let classification = dispatch
-        .split("let attempt_end: PlainAttemptEnd<_> = match header_bound {")
+        .split("let attempt_end: PlainAttemptEnd<_> = {")
+        .nth(1)
+        .expect("the prebuffered arm must classify each attempt end")
+        .split("let header_bound = loop {")
+        .nth(1)
+        .expect("the raced wait must be scoped to the classification")
+        .split("match header_bound {")
         .nth(1)
         .expect("the prebuffered arm must bound its response headers");
     assert!(

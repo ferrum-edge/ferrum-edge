@@ -796,7 +796,7 @@ async fn http3_bridge_attempts_record_the_class_their_terminal_reports() {
         PlainBridgeAttemptEndForTest::Response(503),
         PlainBridgeAttemptEndForTest::HeaderTimeout,
         PlainBridgeAttemptEndForTest::WriteWatermark,
-        PlainBridgeAttemptEndForTest::GrpcWebDeadline,
+        PlainBridgeAttemptEndForTest::GrpcWebDeadline { handed_off: true },
         PlainBridgeAttemptEndForTest::PeerGone,
         PlainBridgeAttemptEndForTest::UploadTooLarge,
         PlainBridgeAttemptEndForTest::Response(200),
@@ -830,6 +830,39 @@ async fn http3_bridge_attempts_record_the_class_their_terminal_reports() {
     assert_eq!(
         string_attr(&clients[1], "gateway.backend.retry_reason"),
         Some("http_status")
+    );
+}
+
+#[tokio::test]
+async fn an_http3_bridge_attempt_budget_expiry_is_the_backends_only_after_handoff() {
+    let server = collector().await;
+    let plugin = otel(Some(&endpoint(&server)), json!({}));
+    let (mut ctx, headers) = traced_request(&plugin).await;
+    // The route's per-attempt budget (#5646) is the gRPC-Web RPC deadline in
+    // force, and it has passed.
+    ctx.route_override_attempt_timeout_ms = Some(1);
+    ctx.arm_route_request_deadline(true);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(ctx.grpc_deadline_is_route_attempt_budget());
+    let deadline = ctx.grpc_deadline_at().expect("RPC deadline");
+    assert!(deadline <= tokio::time::Instant::now());
+
+    // The terminal charges the backend only for an attempt it was handed
+    // (issue #5875): before the handoff the expiry stays the client's, and the
+    // attempt is recorded the same way.
+    for handed_off in [true, false] {
+        let end = PlainBridgeAttemptEndForTest::GrpcWebDeadline { handed_off };
+        record_bridge_attempt(&ctx, &headers, end).await;
+    }
+
+    let clients = client_spans(&exported_spans(&server, 2).await);
+    let outcomes: Vec<(Option<i64>, Option<&str>)> = clients.iter().map(attempt_outcome).collect();
+    assert_eq!(
+        outcomes,
+        [
+            (None, Some("read_write_timeout")),
+            (None, Some("client_disconnect")),
+        ]
     );
 }
 
