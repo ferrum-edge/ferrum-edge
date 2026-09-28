@@ -5540,8 +5540,24 @@ fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
         .next()
         .expect("bounded cross-protocol plain dispatcher");
 
-    let upload = balanced_block_after(dispatch, "if let Some(termination) = upload_auth_expired {")
-        .expect("streaming upload authorization-expiry arm");
+    // The streamed upload classifies an authorization expiry before acting on
+    // it, so its attempt is recorded at one point (issue #5875), then answers
+    // it in the matching arm of the upload's terminal match.
+    let upload_race = dispatch
+        .split("let send_result = if upload_bound_elapsed {")
+        .nth(1)
+        .expect("streaming upload/backend response race");
+    assert!(
+        upload_race.contains(
+            "Some(termination) => PlainAttemptEnd::AuthorizationExpired(termination),"
+        ),
+        "the streaming upload must classify an authorization expiry as its own attempt end"
+    );
+    let upload = balanced_block_after(
+        upload_race,
+        "PlainAttemptEnd::AuthorizationExpired(termination) => {",
+    )
+    .expect("streaming upload authorization-expiry arm");
     assert!(upload.contains("record_authorization_termination_once("));
     assert!(upload.contains("write_plain_authorization_expired_terminal("));
     assert!(

@@ -2005,20 +2005,30 @@ fn streaming_h3_grpc_web_dispatch_is_bounded_before_response_headers() {
     // with the admitted credential's authorization lifetime (issue #3815) — so
     // a plain HTTP client with no RPC deadline is bounded too.
     let bridge = dispatch
-        .split("let send_result = if plain_write_bound")
+        .split("let send_result = if upload_bound_elapsed {")
         .nth(1)
         .expect("streaming upload/backend response race");
     // An ALREADY-elapsed composed bound must not poll the race at all: the
     // backend send and the frontend reader are both dropped, and the owner is
     // read from the captured composition rather than from a second clock read.
+    // The elapsed check itself is taken just before the attempt would begin,
+    // with no await in between, so such an upload begins no attempt either
+    // (issue #5875).
+    let elapsed_check = dispatch
+        .split("let upload_bound_elapsed = plain_write_bound")
+        .nth(1)
+        .expect("the already-elapsed check of the composed bound")
+        .split(';')
+        .next()
+        .expect("bounded already-elapsed check");
+    assert!(
+        elapsed_check.contains("tokio::time::Instant::now() >= at"),
+        "an already-elapsed composed bound must refuse before polling the race"
+    );
     let refusal = bridge
         .split("} else {")
         .next()
         .expect("bounded already-elapsed refusal arm");
-    assert!(
-        refusal.contains("tokio::time::Instant::now() >= at"),
-        "an already-elapsed composed bound must refuse before polling the race"
-    );
     assert!(
         refusal.contains("plain_write_bound.expired_authorization()"),
         "the refusal must attribute from the captured composition"
@@ -4786,15 +4796,29 @@ fn the_h3_prebuffered_plain_arm_writes_under_the_backend_write_watermark() {
     // client deadline, a peer-gone, and a completed exchange all still win over
     // the write watermark. The watermark terminal is the LAST arm added, and it
     // is the typed 504 backend-timeout terminal, never a generic 502.
-    // Slice the whole `Err(())` arm, not just the tail after the watermark
-    // field: the arm halts the request half BEFORE it emits the attributing
-    // `warn!`, so a window opened at the watermark marker would exclude the
-    // very call this asserts.
-    let arm = dispatch
-        .split("let send_result = match header_bound {")
+    // The raced wait's `Err(())` is the write watermark. The prebuffered arm
+    // classifies it before acting on it, so the attempt is recorded at one
+    // point (issue #5875), then answers it with the arm that follows.
+    let classification = dispatch
+        .split("let attempt_end: PlainAttemptEnd<_> = match header_bound {")
         .nth(1)
-        .expect("the prebuffered arm must bound its response headers")
-        .split("Ok(Err(())) => {")
+        .expect("the prebuffered arm must bound its response headers");
+    assert!(
+        classification.contains("Err(()) => PlainAttemptEnd::WriteWatermark,"),
+        "the write-watermark expiry must stay classified as its own attempt end"
+    );
+    // Slice the whole write-watermark arm, not just the tail after the
+    // watermark field: the arm halts the request half BEFORE it emits the
+    // attributing `warn!`, so a window opened at the watermark marker would
+    // exclude the very call this asserts.
+    let arm = dispatch
+        .split("let send_result = match attempt_end {")
+        .nth(1)
+        .expect("the prebuffered arm must answer each attempt end")
+        .split("PlainAttemptEnd::WriteWatermark => {")
+        .nth(1)
+        .expect("the prebuffered write-watermark terminal")
+        .split("PlainAttemptEnd::HeaderTimeout => {")
         .next()
         .expect("bounded prebuffered write-watermark terminal");
     assert!(

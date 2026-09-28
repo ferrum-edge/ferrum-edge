@@ -1319,6 +1319,153 @@ impl std::fmt::Display for PlainAttemptFailure {
     }
 }
 
+/// How one H3→HTTP plain-bridge attempt is recorded in its diagnostic
+/// reference and `otel_tracing` CLIENT span (issues #5846, #5864, and #5875):
+/// the gateway error class that ended it, whether its request reached the
+/// wire, and the backend's response status.
+#[derive(Clone, Copy)]
+pub(crate) struct PlainAttemptRecord {
+    error_class: Option<ErrorClass>,
+    on_wire: bool,
+    status: Option<u16>,
+}
+
+impl PlainAttemptRecord {
+    /// An attempt the retry policy sees as `result`.
+    fn of_result(result: &crate::retry::BackendResponse) -> Self {
+        Self {
+            error_class: result.error_class,
+            on_wire: !result.connection_error,
+            status: Some(result.status_code),
+        }
+    }
+
+    /// An attempt the backend answered with a `status` response head.
+    fn response(status: u16) -> Self {
+        Self {
+            error_class: None,
+            on_wire: true,
+            status: Some(status),
+        }
+    }
+
+    /// An attempt that ended with the gateway error `class` before any
+    /// response head.
+    fn failed(class: ErrorClass) -> Self {
+        Self {
+            error_class: Some(class),
+            on_wire: crate::retry::request_reached_wire(class),
+            status: None,
+        }
+    }
+
+    /// An attempt whose reqwest exchange failed. A TLS handshake failure's
+    /// detail is noted for the diagnostic reference first, as every other
+    /// dispatch path notes it at its failure site.
+    fn transport_failure(ctx: &RequestContext, error: &reqwest::Error) -> Self {
+        let class = crate::retry::classify_reqwest_error(error);
+        if class == ErrorClass::TlsError {
+            crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
+        }
+        Self::failed(class)
+    }
+
+    /// The plain bridge's one call to `RequestContext::record_backend_attempt`.
+    fn record(self, ctx: &RequestContext) {
+        ctx.record_backend_attempt(self.error_class, self.on_wire, self.status);
+    }
+}
+
+/// A plain-bridge attempt its backend exchange settled: a response head, or a
+/// failure the retry policy judges (issue #5875).
+pub(crate) trait PlainSettledAttempt {
+    /// How the attempt is recorded.
+    fn attempt_record(&self, ctx: &RequestContext) -> PlainAttemptRecord;
+}
+
+/// A prebuffered attempt: its response head, with any body collected inside
+/// the attempt (#5738), or why it produced none.
+impl PlainSettledAttempt for Result<PlainAttemptResponse, PlainAttemptFailure> {
+    fn attempt_record(&self, ctx: &RequestContext) -> PlainAttemptRecord {
+        match self {
+            Ok(response) => PlainAttemptRecord::of_result(&response.attempt_result()),
+            Err(PlainAttemptFailure::Transport(error)) => {
+                PlainAttemptRecord::transport_failure(ctx, error)
+            }
+            Err(PlainAttemptFailure::AttemptBudget) => {
+                PlainAttemptRecord::failed(ErrorClass::ReadWriteTimeout)
+            }
+        }
+    }
+}
+
+/// A streamed-upload attempt: the backend's response head, or its failure.
+impl PlainSettledAttempt for reqwest::Result<reqwest::Response> {
+    fn attempt_record(&self, ctx: &RequestContext) -> PlainAttemptRecord {
+        match self {
+            Ok(response) => PlainAttemptRecord::response(response.status().as_u16()),
+            Err(error) => PlainAttemptRecord::transport_failure(ctx, error),
+        }
+    }
+}
+
+/// How one H3→HTTP plain-bridge reqwest attempt ended (issue #5875).
+///
+/// `dispatch_plain` has dozens of terminal exits. Each of its reqwest dispatch
+/// arms therefore classifies an attempt into this value before acting on it,
+/// records the attempt from it at one point ([`Self::record`]), and only then
+/// runs the retry policy or the terminal the value names. No exit can end an
+/// attempt without recording it, so none leaves its `otel_tracing` CLIENT span
+/// to be exported as `cancelled` when the request is dropped later.
+///
+/// `D` is what an upload too large discards: `Infallible` for the prebuffered
+/// arm, whose request body was read before the attempt.
+pub(crate) enum PlainAttemptEnd<T, D = std::convert::Infallible> {
+    /// The backend answered with a response head, or the exchange failed.
+    Settled(T),
+    /// `backend_read_timeout_ms` or the matched route rule's deadline (#5646)
+    /// ended the wait for the response head.
+    HeaderTimeout,
+    /// The backend stopped reading the upload for `backend_write_timeout_ms`.
+    WriteWatermark,
+    /// The request's authorization lifetime expired (issue #3815).
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+    /// The gRPC-Web pass-through RPC deadline fired.
+    GrpcWebDeadline,
+    /// The client went away before the response head.
+    PeerGone,
+    /// The client's streamed upload exceeded the request body limit.
+    UploadTooLarge(D),
+}
+
+impl<T: PlainSettledAttempt, D> PlainAttemptEnd<T, D> {
+    /// Record the attempt: end its `otel_tracing` CLIENT span and add it to
+    /// the request's diagnostic reference. A deadline or a disconnect is the
+    /// client's, except a gRPC-Web deadline that was the route attempt budget
+    /// (#5646), the backend's timeout, exactly as the terminal records the
+    /// attempt's outcome. Nothing is derived for a request that records no
+    /// attempts.
+    pub(crate) fn record(&self, ctx: &RequestContext) {
+        if !ctx.records_backend_attempts() {
+            return;
+        }
+        let record = match self {
+            Self::Settled(settled) => settled.attempt_record(ctx),
+            Self::HeaderTimeout | Self::WriteWatermark => {
+                PlainAttemptRecord::failed(ErrorClass::ReadWriteTimeout)
+            }
+            Self::GrpcWebDeadline if plain_grpc_web_deadline_charges_backend(ctx) => {
+                PlainAttemptRecord::failed(ErrorClass::ReadWriteTimeout)
+            }
+            Self::AuthorizationExpired(_) | Self::GrpcWebDeadline | Self::PeerGone => {
+                PlainAttemptRecord::failed(ErrorClass::ClientDisconnect)
+            }
+            Self::UploadTooLarge(_) => PlainAttemptRecord::failed(ErrorClass::RequestBodyTooLarge),
+        };
+        record.record(ctx);
+    }
+}
+
 fn reqwest_error_response_for_cross_protocol(
     state: &ProxyState,
     e: &reqwest::Error,
@@ -2368,6 +2515,18 @@ fn record_plain_grpc_web_client_deadline(
     );
 }
 
+/// Whether a gRPC-Web pass-through RPC deadline that fired after the attempt
+/// was handed to the backend was the matched route rule's per-attempt budget
+/// (#5646, `attempt_timeout_ms` / Gateway API `timeouts.backendRequest`):
+/// the backend held the attempt past its bound, so the expiry is charged to
+/// it. Any other deadline is the client's.
+fn plain_grpc_web_deadline_charges_backend(ctx: &RequestContext) -> bool {
+    ctx.grpc_deadline_is_route_attempt_budget()
+        && ctx
+            .grpc_deadline_at()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+}
+
 /// Record a gRPC-Web pass-through RPC deadline that fired after the attempt
 /// was handed to the backend, before its response was complete.
 ///
@@ -2392,11 +2551,7 @@ fn record_plain_grpc_web_deadline_after_handoff(
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
 ) -> Option<ErrorClass> {
-    let route_attempt_budget_expired = ctx.grpc_deadline_is_route_attempt_budget()
-        && ctx
-            .grpc_deadline_at()
-            .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
-    if !route_attempt_budget_expired {
+    if !plain_grpc_web_deadline_charges_backend(ctx) {
         record_plain_grpc_web_client_deadline(
             state,
             epoch,
@@ -3438,19 +3593,25 @@ where
                                     route,
                                 );
                         }
+                        // The attempt's `otel_tracing` CLIENT span (issue #5875):
+                        // the mesh request carries the attempt's own
+                        // `traceparent`, and the attempt is polled in its scope.
+                        let attempt_span =
+                            ctx.begin_backend_attempt_span(&current_url, proxy_headers);
                         // Boxed out of line — see `boxed_proxy_h3_plain_http_mesh_buffered`.
-                        let mesh_attempt = crate::proxy::await_route_request_deadline(
+                        let mesh_attempt = crate::proxy::await_backend_attempt_route_deadline(
                             route.total(),
                             crate::proxy::RouteAttemptBudget::from_start(
                                 route.attempt_timeout(),
                                 &mut route_attempt_deadline,
                             ),
+                            attempt_span.trace(),
                             crate::proxy::boxed_proxy_h3_plain_http_mesh_buffered(
                                 state,
                                 dispatch_proxy,
                                 &current_url,
                                 method,
-                                proxy_headers,
+                                attempt_span.headers(proxy_headers),
                                 Bytes::from(buffered_body.clone()),
                                 target,
                                 plugins,
@@ -3497,6 +3658,10 @@ where
                             );
                             ctx.end_charged_grpc_route_attempt();
                         }
+                        // The attempt's one record point (issue #5875): it ends
+                        // with its result, whether a retry replaces it or the
+                        // loop serves it.
+                        PlainAttemptRecord::of_result(&attempt_result).record(ctx);
                         if let Some(retry_config) = retry_config
                             && !crate::http3::route_deadline::total_expiry_recorded(route, ctx)
                             && crate::retry::should_retry(
@@ -3840,12 +4005,16 @@ where
                             route,
                         );
                     }
+                    // The attempt's `otel_tracing` CLIENT span (issue #5875): the
+                    // request carries the attempt's own `traceparent`, and the
+                    // exchange is polled in the attempt's scope below.
+                    let attempt_span = ctx.begin_backend_attempt_span(&current_url, proxy_headers);
                     let plain_request_builder = build_plain_request_builder(
                         &client,
                         state,
                         dispatch_proxy,
                         req_method.clone(),
-                        proxy_headers,
+                        attempt_span.headers(proxy_headers),
                         dial_url,
                         effective_host,
                         client_ip,
@@ -3907,9 +4076,16 @@ where
                                 plain_attempt_builder.send(),
                             ),
                         );
-                        let outcome =
-                            await_upload_write_watermark_first(attempt, plain_upload_pump.as_mut())
-                                .await;
+                        // Polled in the attempt's scope, which hands the attempt
+                        // to the backend. A protocol-NACK replay stays in it.
+                        let outcome = {
+                            let attempt = await_upload_write_watermark_first(
+                                attempt,
+                                plain_upload_pump.as_mut(),
+                            );
+                            tokio::pin!(attempt);
+                            attempt_span.scope(attempt).await
+                        };
                         let should_replay = outcome.as_ref().is_ok_and(plain_send_is_protocol_nack);
                         if !should_replay {
                             break outcome;
@@ -3925,9 +4101,72 @@ where
                         };
                         plain_attempt_builder = next;
                     };
-                    let send_result = match header_bound {
-                        Err(()) => {
-                            drop(pending_slot);
+                    drop(pending_slot);
+                    // Every way this attempt can end, classified before anything
+                    // acts on it, so it is recorded at ONE point below (issue
+                    // #5875) and then handled exactly as before.
+                    let attempt_end: PlainAttemptEnd<_> = match header_bound {
+                        Err(()) => PlainAttemptEnd::WriteWatermark,
+                        // The route attempt budget (#5646) ended this attempt
+                        // before its response head: the ordinary backend
+                        // timeout, charged to this backend and retryable.
+                        Ok(Err(())) if route.attempt_budget_expired(route_attempt_deadline) => {
+                            if let Some(pump) = plain_upload_pump.as_mut() {
+                                pump.cancel();
+                            }
+                            PlainAttemptEnd::Settled(Err(PlainAttemptFailure::AttemptBudget))
+                        }
+                        Ok(Err(())) => PlainAttemptEnd::HeaderTimeout,
+                        // A buffered body is part of its attempt (#5738): collect
+                        // it here when a failure during collection could be
+                        // retried, so a route attempt budget expiry, read timeout
+                        // or reset there reaches the retry policy below like one
+                        // before the head. Without an attempt budget the head
+                        // passes straight through.
+                        Ok(Ok(H3BackendOrPeer::Ready(Ok(response))))
+                            if route_attempt_deadline.is_some() =>
+                        {
+                            let response = collect_plain_response_within_attempt(
+                                state,
+                                proxy,
+                                plugins,
+                                ctx,
+                                method,
+                                retry_config,
+                                route_retry_ceiling,
+                                current_target.as_deref(),
+                                attempt,
+                                route,
+                                route_attempt_deadline,
+                                should_buffer_response,
+                                effective_max_response_body_size_bytes,
+                                response,
+                            )
+                            .await;
+                            PlainAttemptEnd::Settled(Ok(response))
+                        }
+                        Ok(Ok(H3BackendOrPeer::Ready(result))) => {
+                            let result = result
+                                .map(PlainAttemptResponse::Live)
+                                .map_err(PlainAttemptFailure::Transport);
+                            PlainAttemptEnd::Settled(result)
+                        }
+                        Ok(Ok(H3BackendOrPeer::Deadline)) => {
+                            match plain_write_bound.expired_authorization() {
+                                Some(termination) => {
+                                    PlainAttemptEnd::AuthorizationExpired(termination)
+                                }
+                                None => PlainAttemptEnd::GrpcWebDeadline,
+                            }
+                        }
+                        Ok(Ok(H3BackendOrPeer::PeerGone)) => PlainAttemptEnd::PeerGone,
+                    };
+                    // The attempt's one record point: whichever way it ended,
+                    // before a retry replaces it or a terminal answers it.
+                    attempt_end.record(ctx);
+                    let send_result = match attempt_end {
+                        PlainAttemptEnd::Settled(send_result) => send_result,
+                        PlainAttemptEnd::WriteWatermark => {
                             if let Some(pump) = plain_upload_pump.as_mut() {
                                 pump.cancel();
                             }
@@ -3958,17 +4197,7 @@ where
                             )
                             .await;
                         }
-                        // The route attempt budget (#5646) ended this attempt
-                        // before its response head: the ordinary backend
-                        // timeout, charged to this backend and retryable.
-                        Ok(Err(())) if route.attempt_budget_expired(route_attempt_deadline) => {
-                            if let Some(pump) = plain_upload_pump.as_mut() {
-                                pump.cancel();
-                            }
-                            Err(PlainAttemptFailure::AttemptBudget)
-                        }
-                        Ok(Err(())) => {
-                            drop(pending_slot);
+                        PlainAttemptEnd::HeaderTimeout => {
                             crate::http3::stream_util::halt_request_body(stream);
                             warn!(
                                 proxy_id = %proxy.id,
@@ -3996,45 +4225,41 @@ where
                             )
                             .await;
                         }
-                        Ok(Ok(H3BackendOrPeer::Ready(result))) => {
-                            result.map_err(PlainAttemptFailure::Transport)
+                        PlainAttemptEnd::AuthorizationExpired(termination) => {
+                            ctx.record_authorization_termination_once(
+                                termination,
+                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                            );
+                            record_cross_protocol_backend_admission_outcome(
+                                &mut backend_admission_permits,
+                                401,
+                                false,
+                                Some(ErrorClass::ClientDisconnect),
+                                backend_admission_start.elapsed(),
+                            );
+                            record_backend_outcome_no_conn_end(
+                                state,
+                                proxy,
+                                &epoch.load_balancer,
+                                upstream_balancer,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                401,
+                                false,
+                                None,
+                                cb_probe.take_slot(),
+                                false,
+                                backend_start.elapsed(),
+                            );
+                            return write_plain_authorization_expired_terminal(
+                                stream,
+                                ctx,
+                                backend_start,
+                                bytes_sent,
+                            )
+                            .await;
                         }
-                        Ok(Ok(H3BackendOrPeer::Deadline)) => {
-                            drop(pending_slot);
-                            if let Some(termination) = plain_write_bound.expired_authorization() {
-                                ctx.record_authorization_termination_once(
-                                    termination,
-                                    crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-                                );
-                                record_cross_protocol_backend_admission_outcome(
-                                    &mut backend_admission_permits,
-                                    401,
-                                    false,
-                                    Some(ErrorClass::ClientDisconnect),
-                                    backend_admission_start.elapsed(),
-                                );
-                                record_backend_outcome_no_conn_end(
-                                    state,
-                                    proxy,
-                                    &epoch.load_balancer,
-                                    upstream_balancer,
-                                    current_target.as_deref(),
-                                    current_cb_target_key.as_deref(),
-                                    401,
-                                    false,
-                                    None,
-                                    cb_probe.take_slot(),
-                                    false,
-                                    backend_start.elapsed(),
-                                );
-                                return write_plain_authorization_expired_terminal(
-                                    stream,
-                                    ctx,
-                                    backend_start,
-                                    bytes_sent,
-                                )
-                                .await;
-                            }
+                        PlainAttemptEnd::GrpcWebDeadline => {
                             // The attempt was handed to the backend: a gRPC-Web
                             // route attempt budget expiry is charged to it.
                             let charged = record_plain_grpc_web_deadline_after_handoff(
@@ -4064,8 +4289,7 @@ where
                             )
                             .await;
                         }
-                        Ok(Ok(H3BackendOrPeer::PeerGone)) => {
-                            drop(pending_slot);
+                        PlainAttemptEnd::PeerGone => {
                             crate::http3::stream_util::halt_request_body(stream);
                             return Ok(plain_peer_gone_before_response_headers(
                                 PlainPeerGoneBeforeResponseHeadersCtx {
@@ -4085,35 +4309,8 @@ where
                                 },
                             ));
                         }
-                    };
-                    drop(pending_slot);
-                    // A buffered body is part of its attempt (#5738): collect it
-                    // here when a failure during collection could be retried, so
-                    // a route attempt budget expiry, read timeout or reset there
-                    // reaches the retry policy below like one before the head.
-                    // Without an attempt budget the head passes straight through.
-                    let send_result = match send_result {
-                        Ok(response) if route_attempt_deadline.is_some() => {
-                            let response = collect_plain_response_within_attempt(
-                                state,
-                                proxy,
-                                plugins,
-                                ctx,
-                                method,
-                                retry_config,
-                                route_retry_ceiling,
-                                current_target.as_deref(),
-                                attempt,
-                                route,
-                                route_attempt_deadline,
-                                should_buffer_response,
-                                effective_max_response_body_size_bytes,
-                                response,
-                            )
-                            .await;
-                            Ok(response)
-                        }
-                        send_result => send_result.map(PlainAttemptResponse::Live),
+                        // The prebuffered upload was read before the attempt.
+                        PlainAttemptEnd::UploadTooLarge(never) => match never {},
                     };
                     match send_result {
                         Ok(response) => {
@@ -4635,12 +4832,27 @@ where
                     Err(outcome) => return Ok(outcome),
                 };
 
+                // An upload the composed bound (`plain_write_bound`) has already
+                // ended is refused below without polling the race: it is never
+                // handed to the backend, so it begins no attempt (issue #5875).
+                // No await separates this check from that refusal.
+                let upload_bound_elapsed = plain_write_bound
+                    .deadline()
+                    .is_some_and(|at| tokio::time::Instant::now() >= at);
+                // The attempt's `otel_tracing` CLIENT span (issue #5875): the
+                // request carries the attempt's own `traceparent`, and the
+                // backend exchange is polled in the attempt's scope below.
+                let attempt_span = if upload_bound_elapsed {
+                    crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE
+                } else {
+                    ctx.begin_backend_attempt_span(&current_url, proxy_headers)
+                };
                 let req_builder = build_plain_request_builder(
                     &client,
                     state,
                     dispatch_proxy,
                     req_method,
-                    proxy_headers,
+                    attempt_span.headers(proxy_headers),
                     dial_url,
                     effective_host,
                     client_ip,
@@ -4935,10 +5147,7 @@ where
                 let mut peer_gone = peer_signal
                     .as_ref()
                     .is_some_and(crate::plugins::PeerConnectionSignal::is_closed);
-                let send_result = if plain_write_bound
-                    .deadline()
-                    .is_some_and(|at| tokio::time::Instant::now() >= at)
-                {
+                let send_result = if upload_bound_elapsed {
                     upload_auth_expired = plain_write_bound.expired_authorization();
                     drop(pending_slot.take());
                     drop(send_future);
@@ -4946,6 +5155,9 @@ where
                     None
                 } else {
                     tokio::pin!(send_future);
+                    // Polled in the attempt's scope, which hands the attempt to
+                    // the backend.
+                    let mut send_future = attempt_span.scope(send_future);
                     tokio::pin!(reader_future);
                     let upload_deadline_at = plain_write_bound.deadline();
                     let upload_deadline_active = upload_deadline_at.is_some();
@@ -5108,14 +5320,37 @@ where
                 // reader cost only one extra frame.
                 crate::http3::stream_util::halt_request_body(stream);
                 let bytes_sent = bytes_read.load(Ordering::Relaxed);
-                let Some(send_result) = send_result else {
+                // Every way this attempt can end, classified before anything
+                // acts on it, so it is recorded at ONE point below (issue
+                // #5875) and then handled exactly as before.
+                let attempt_end = match send_result {
+                    Some(result) if oversized.load(Ordering::Relaxed) => {
+                        PlainAttemptEnd::UploadTooLarge(result)
+                    }
+                    Some(result) => PlainAttemptEnd::Settled(result),
+                    None => match upload_auth_expired {
+                        Some(termination) => PlainAttemptEnd::AuthorizationExpired(termination),
+                        None if backend_write_watermark_expired => PlainAttemptEnd::WriteWatermark,
+                        None if header_wait_expired => PlainAttemptEnd::HeaderTimeout,
+                        None if peer_gone => PlainAttemptEnd::PeerGone,
+                        None => PlainAttemptEnd::GrpcWebDeadline,
+                    },
+                };
+                // The attempt's one record point. An upload the composed bound
+                // had already ended was never handed to the backend and began
+                // no attempt.
+                if !upload_bound_elapsed {
+                    attempt_end.record(ctx);
+                }
+                let send_result = match attempt_end {
+                    PlainAttemptEnd::Settled(send_result) => send_result,
                     // The authorization bound fired before any response header
                     // was committed, so the terminal is a fixed `401` — the
                     // pre-commitment case in issue #3815 — not the gRPC-Web
                     // client-deadline terminal below. The body is a compiled-in
                     // literal: no expiry value, claim, subject, certificate
                     // field, or provider detail reaches the client.
-                    if let Some(termination) = upload_auth_expired {
+                    PlainAttemptEnd::AuthorizationExpired(termination) => {
                         ctx.record_authorization_termination_once(
                             termination,
                             crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
@@ -5149,7 +5384,7 @@ where
                         )
                         .await;
                     }
-                    if header_wait_expired || backend_write_watermark_expired {
+                    PlainAttemptEnd::HeaderTimeout | PlainAttemptEnd::WriteWatermark => {
                         // One macro, two attributions. At `opt-level = 0` each
                         // `warn!` invocation is its own set of allocas in this
                         // already-oversized coroutine, so the branch picks
@@ -5191,7 +5426,7 @@ where
                         )
                         .await;
                     }
-                    if peer_gone {
+                    PlainAttemptEnd::PeerGone => {
                         return Ok(plain_peer_gone_before_response_headers(
                             PlainPeerGoneBeforeResponseHeadersCtx {
                                 state,
@@ -5210,82 +5445,85 @@ where
                             },
                         ));
                     }
-                    let charged = if upload_deadline_after_handoff {
-                        record_plain_grpc_web_deadline_after_handoff(
+                    PlainAttemptEnd::GrpcWebDeadline => {
+                        let charged = if upload_deadline_after_handoff {
+                            record_plain_grpc_web_deadline_after_handoff(
+                                ctx,
+                                state,
+                                epoch,
+                                proxy,
+                                upstream_balancer,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                cb_probe,
+                                backend_start,
+                                &mut backend_admission_permits,
+                                backend_admission_start.elapsed(),
+                            )
+                        } else {
+                            record_plain_grpc_web_client_deadline(
+                                state,
+                                epoch,
+                                proxy,
+                                upstream_balancer,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                cb_probe,
+                                backend_start,
+                                &mut backend_admission_permits,
+                                backend_admission_start.elapsed(),
+                            );
+                            None
+                        };
+                        return write_plain_grpc_web_deadline_after_handoff(
+                            stream,
+                            plugins,
                             ctx,
-                            state,
-                            epoch,
-                            proxy,
-                            upstream_balancer,
-                            current_target.as_deref(),
-                            current_cb_target_key.as_deref(),
-                            cb_probe,
+                            response_committed_plugins,
+                            initial_response_header_policy_plugins,
                             backend_start,
-                            &mut backend_admission_permits,
-                            backend_admission_start.elapsed(),
+                            bytes_sent,
+                            &current_url,
+                            charged,
+                            None,
                         )
-                    } else {
-                        record_plain_grpc_web_client_deadline(
-                            state,
-                            epoch,
-                            proxy,
-                            upstream_balancer,
-                            current_target.as_deref(),
-                            current_cb_target_key.as_deref(),
-                            cb_probe,
-                            backend_start,
+                        .await;
+                    }
+                    // The backend's result is discarded with the upload.
+                    PlainAttemptEnd::UploadTooLarge(_discarded) => {
+                        record_cross_protocol_backend_admission_outcome(
                             &mut backend_admission_permits,
+                            413,
+                            false,
+                            Some(ErrorClass::ClientDisconnect),
                             backend_admission_start.elapsed(),
                         );
-                        None
-                    };
-                    return write_plain_grpc_web_deadline_after_handoff(
-                        stream,
-                        plugins,
-                        ctx,
-                        response_committed_plugins,
-                        initial_response_header_policy_plugins,
-                        backend_start,
-                        bytes_sent,
-                        &current_url,
-                        charged,
-                        None,
-                    )
-                    .await;
+                        record_backend_outcome_no_conn_end(
+                            state,
+                            proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer,
+                            current_target.as_deref(),
+                            current_cb_target_key.as_deref(),
+                            413,
+                            false,
+                            None,
+                            cb_probe.take_slot(),
+                            false,
+                            backend_start.elapsed(),
+                        );
+                        return write_plain_gateway_error(
+                            stream,
+                            ctx,
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                            None,
+                            backend_start,
+                            bytes_sent,
+                        )
+                        .await;
+                    }
                 };
-                if oversized.load(Ordering::Relaxed) {
-                    record_cross_protocol_backend_admission_outcome(
-                        &mut backend_admission_permits,
-                        413,
-                        false,
-                        Some(ErrorClass::ClientDisconnect),
-                        backend_admission_start.elapsed(),
-                    );
-                    record_backend_outcome_no_conn_end(
-                        state,
-                        proxy,
-                        &epoch.load_balancer,
-                        upstream_balancer,
-                        current_target.as_deref(),
-                        current_cb_target_key.as_deref(),
-                        413,
-                        false,
-                        None,
-                        cb_probe.take_slot(),
-                        false,
-                        backend_start.elapsed(),
-                    );
-                    return write_plain_gateway_error(
-                        stream,
-                        ctx,
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
-                        None,
-                        backend_start,
-                        bytes_sent,
-                    )
-                    .await;
-                }
 
                 match send_result {
                     Ok(response) => (
@@ -8086,7 +8324,14 @@ where
                 true,
                 cb_probe.take_slot(),
             );
-            // This attempt is settled and a retry replaces it (issue #5867).
+            // This attempt is settled and a retry replaces it (issue #5867),
+            // with its TLS failure detail as the other gRPC paths note it
+            // (issue #5875).
+            if retry_error_class == Some(crate::retry::ErrorClass::TlsError)
+                && let Err(error) = &result
+            {
+                crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
+            }
             ctx.record_backend_attempt(
                 retry_error_class,
                 retry_error_class.is_none_or(crate::retry::request_reached_wire),
@@ -8248,6 +8493,11 @@ where
             .as_ref()
             .err()
             .map(crate::retry::classify_grpc_proxy_error);
+        if dispatch_error == Some(crate::retry::ErrorClass::TlsError)
+            && let Err(error) = &result
+        {
+            crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
+        }
         ctx.record_backend_attempt(
             dispatch_error,
             dispatch_error.is_none_or(crate::retry::request_reached_wire),
@@ -9659,6 +9909,12 @@ pub(crate) async fn dispatch_grpc_streaming(
         .as_ref()
         .err()
         .map(crate::retry::classify_grpc_proxy_error);
+    // Its TLS failure detail, as the other gRPC paths note it (issue #5875).
+    if dispatch_error == Some(crate::retry::ErrorClass::TlsError)
+        && let Err(error) = &result
+    {
+        crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
+    }
     ctx.record_backend_attempt(
         dispatch_error,
         dispatch_error.is_none_or(crate::retry::request_reached_wire),

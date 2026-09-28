@@ -1,5 +1,5 @@
 //! Live `otel_tracing` per-attempt CLIENT spans on the HTTP/3 and WebSocket
-//! dispatch paths (issue #5867).
+//! dispatch paths (issues #5867 and #5875).
 //!
 //! A real gateway exports to an in-test OTLP/HTTP collector, and each scripted
 //! backend records the `traceparent` it received. Every backend attempt must
@@ -12,8 +12,11 @@
 //!   buffered loop. Both attempts are exported.
 //! * HTTP/3, streamed request body: a single streamed attempt, ended at its
 //!   response head.
+//! * HTTP/3 bridged to an HTTP/1.1 backend: a `503 -> 200` status retry
+//!   through the bridge's prebuffered retry loop exports one span per attempt.
 //! * WebSocket: an HTTP/1.1 upgrade, whose attempt ends with the backend's
-//!   `101`.
+//!   `101`, and an upgrade the gateway's dial policy refuses, which reached no
+//!   backend and exports no attempt span.
 //!
 //! ```bash
 //! cargo build --bin ferrum-edge && \
@@ -21,8 +24,8 @@
 //! ```
 
 use super::functional_otel_attempt_spans_test::{
-    client_spans, in_trace, int_attr, otel_plugin, start_collector, string_attr, traceparent_ids,
-    wait_for_spans,
+    client_spans, in_trace, int_attr, otel_plugin, received_spans, start_collector, string_attr,
+    traceparent_ids, wait_for_spans,
 };
 use crate::scaffolding::backends::{
     H3Step, H3TlsConfig, ScriptedH3Backend, ScriptedTlsBackend, TcpStep, TlsConfig,
@@ -31,7 +34,7 @@ use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{
-    BIND_DROP_SPAWN_ATTEMPTS, reserve_colocated_tcp_udp, reserve_port,
+    BIND_DROP_SPAWN_ATTEMPTS, reserve_colocated_tcp_udp, reserve_port, reserve_refused_tcp_port,
 };
 use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
@@ -567,4 +570,252 @@ async fn websocket_upgrade_exports_one_client_span_for_its_backend_attempt() {
     assert_eq!(int_attr(attempt, "http.response.status_code"), Some(101));
     assert_eq!(string_attr(attempt, "error.type"), None);
     assert_eq!(string_attr(attempt, "http.request.method"), Some("GET"));
+}
+
+/// A scripted HTTP/1.1 backend for the HTTP/3 bridge. It answers only
+/// `GET /recover` (so the gateway's startup capability probe cannot use up a
+/// scripted answer), `503` first and `200` after, one request per connection,
+/// and records each answered request's `traceparent` values.
+async fn spawn_recovering_http1_backend() -> (u16, Arc<Mutex<Vec<Vec<String>>>>) {
+    let listener = reserve_port().await.expect("reserve port").into_listener();
+    let port = listener.local_addr().expect("backend addr").port();
+    let requests: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let Ok(Ok(head)) = timeout(IO_TIMEOUT, read_head(&mut stream)).await else {
+                    return;
+                };
+                if !head.starts_with("GET /recover ") {
+                    return;
+                }
+                let traceparents: Vec<String> = header_values(&head, "traceparent")
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                let answered = match recorded.lock() {
+                    Ok(mut requests) => {
+                        requests.push(traceparents);
+                        requests.len()
+                    }
+                    Err(_) => return,
+                };
+                let response: &[u8] = if answered == 1 {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\nConnection: close\r\n\r\nretry"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nrecovered"
+                };
+                if stream.write_all(response).await.is_ok() {
+                    let _ = stream.shutdown().await;
+                }
+            });
+        }
+    });
+    (port, requests)
+}
+
+/// The `traceparent` values each answered backend request carried.
+fn recorded_traceparents(requests: &Mutex<Vec<Vec<String>>>) -> Vec<Vec<String>> {
+    requests
+        .lock()
+        .map(|requests| requests.clone())
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_plain_bridge_retry_exports_one_client_span_per_attempt() {
+    let collector = start_collector().await;
+    let (backend_port, requests) = spawn_recovering_http1_backend().await;
+    // An `http` backend never takes native HTTP/3 dispatch, so the HTTP/3
+    // frontend bridges the request to HTTP/1.1, and a bodiless GET takes the
+    // bridge's prebuffered retry loop.
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "otel-attempts-h3-plain",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "retry": {
+                "max_retries": 1,
+                "retryable_status_codes": [503],
+                "retryable_methods": ["GET"],
+                "retry_on_connect_failure": false,
+                "backoff": {"fixed": {"delay_ms": 10}}
+            }
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [otel_plugin(&collector)],
+    });
+    let (harness, https_port) = spawn_h3_gateway(to_file_mode_yaml(&config)).await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/recover");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let response = loop {
+        let outcome = timeout(IO_TIMEOUT, client.get(&url)).await;
+        if let Ok(Ok(response)) = outcome {
+            break response;
+        }
+        // The QUIC listener may still be coming up: retry only while no
+        // request has reached the backend.
+        let retryable =
+            tokio::time::Instant::now() < deadline && recorded_traceparents(&requests).is_empty();
+        if !retryable {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 request failed: {outcome:?}\n--- logs ---\n{logs}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(response.status.as_u16(), 200, "response={response:?}");
+    assert_eq!(&response.body_bytes[..], b"recovered");
+
+    let recorded = recorded_traceparents(&requests);
+    assert_eq!(
+        recorded.len(),
+        2,
+        "503 -> 200 makes two attempts: {recorded:?}"
+    );
+    let parents: Vec<(String, String)> = recorded
+        .iter()
+        .map(|traceparents| {
+            assert_eq!(
+                traceparents.len(),
+                1,
+                "one traceparent per attempt: {recorded:?}"
+            );
+            traceparent_ids(&traceparents[0])
+        })
+        .collect();
+    let trace_id = parents[0].0.clone();
+    assert_eq!(parents[1].0, trace_id, "both attempts belong to one trace");
+    assert_ne!(parents[0].1, parents[1].1, "each attempt has its own span");
+
+    let spans = wait_for_spans(&collector, |spans| in_trace(spans, &trace_id).len() >= 3).await;
+    let trace = in_trace(&spans, &trace_id);
+    let servers = server_spans(&trace);
+    assert_eq!(servers.len(), 1, "one SERVER span: {trace:#?}");
+    let server_span_id = servers[0]["spanId"].as_str().expect("server span id");
+    assert!(!parents.iter().any(|(_, parent)| parent == server_span_id));
+
+    // Before issue #5875 the bridge handed every attempt the SERVER span as its
+    // parent and exported no attempt span.
+    let clients = client_spans(trace.iter().copied());
+    assert_attempts_parent_backends(&clients, &parents, &[server_span_id]);
+    assert_eq!(int_attr(clients[0], "http.response.status_code"), Some(503));
+    assert_eq!(string_attr(clients[0], "error.type"), Some("503"));
+    assert_eq!(int_attr(clients[1], "http.response.status_code"), Some(200));
+    assert_eq!(string_attr(clients[1], "error.type"), None);
+    assert_eq!(
+        string_attr(clients[1], "gateway.backend.retry_reason"),
+        Some("http_status")
+    );
+    for span in &clients {
+        assert_eq!(string_attr(span, "http.request.method"), Some("GET"));
+        assert_eq!(int_attr(span, "server.port"), Some(i64::from(backend_port)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn websocket_upgrade_refused_by_dial_policy_exports_no_client_span() {
+    let collector = start_collector().await;
+    // Never dialed: the dial policy refuses the upgrade before any connection.
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    // Trust the client's trace context, so the refused upgrade's spans are
+    // found by the trace the client names.
+    let mut otel = otel_plugin(&collector);
+    otel["config"]["trace_context_trust"] = json!("trusted");
+    // The upstream's backend TLS SNI override is one the WebSocket transport
+    // cannot apply, so the gateway refuses the dial by policy (issue #2416).
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "otel-attempts-ws-refused",
+            "listen_path": "/ws",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": refused.port,
+            "strip_listen_path": false,
+            "backend_connect_timeout_ms": 2000,
+            "backend_tls_verify_server_cert": false,
+            "upstream_id": "otel-attempts-ws-sni"
+        }],
+        "consumers": [],
+        "upstreams": [{
+            "id": "otel-attempts-ws-sni",
+            "name": "WebSocket SNI upstream",
+            "algorithm": "round_robin",
+            "backend_tls_sni": "backend.example.com",
+            "targets": [{"host": "127.0.0.1", "port": refused.port, "weight": 1}]
+        }],
+        "plugin_configs": [otel],
+    });
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(to_file_mode_yaml(&config))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let proxy_port: u16 = harness
+        .proxy_base_url()
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .expect("proxy port");
+
+    let trace_id = "5875feedfacecafe5875feedfacecafe";
+    let mut client = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect gateway");
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{proxy_port}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\ntraceparent: 00-{trace_id}-00f067aa0ba902b7-01\r\n\r\n"
+    );
+    client
+        .write_all(request.as_bytes())
+        .await
+        .expect("send upgrade");
+    let head = timeout(IO_TIMEOUT, read_head(&mut client))
+        .await
+        .expect("upgrade response in time")
+        .expect("read upgrade response");
+    assert!(
+        head.starts_with("HTTP/1.1 502"),
+        "the refused upgrade is still answered with a 502: {head}"
+    );
+    drop(client);
+
+    let spans = wait_for_spans(&collector, |spans| {
+        !server_spans(&in_trace(spans, trace_id)).is_empty()
+    })
+    .await;
+    assert!(
+        !server_spans(&in_trace(&spans, trace_id)).is_empty(),
+        "the refused upgrade's SERVER span: {spans:#?}"
+    );
+    // An attempt span is exported when its attempt is recorded, before the
+    // SERVER span; allow a later export batch to land before the check.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let spans = received_spans(&collector).await;
+    // Before issue #5875 the refusal ran inside the attempt's scope and was
+    // exported as a `dispatch_policy_rejected` attempt that reached no backend.
+    let clients = client_spans(in_trace(&spans, trace_id));
+    assert!(
+        clients.is_empty(),
+        "a dial the gateway refused by policy exports no CLIENT span: {clients:#?}"
+    );
 }

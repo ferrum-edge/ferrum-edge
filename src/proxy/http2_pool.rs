@@ -1135,8 +1135,8 @@ impl Http2ConnectionPool {
                     let _ = key;
                     // Only the creator runs this closure, so the connection
                     // this attempt waits on is one it set up (issue #5864).
-                    crate::plugins::otel_tracing::note_backend_connection_setup_started();
-                    let setup_started = crate::plugins::otel_tracing::backend_attempt_clock();
+                    let setup_started =
+                        crate::plugins::otel_tracing::backend_connection_setup_clock();
                     let created = manager.create_connection(proxy, svid_generation).await;
                     if created.is_ok() {
                         crate::plugins::otel_tracing::note_backend_connection_established_since(

@@ -15447,27 +15447,78 @@ async fn handle_websocket_request_authenticated(
                 }
             });
 
+        // Gateway-local dial refusals are decided BEFORE the attempt's
+        // `otel_tracing` CLIENT span begins (issue #5875), as the HTTP retry
+        // planner refuses a rotated target before it begins that target's
+        // attempt: a refusal reaches no backend, so it exports no span and
+        // records no attempt. It still fails through the handshake-failure
+        // handling below exactly as before. A Unix-tagged target is screened
+        // BEFORE mesh egress and before the direct dial, so no WebSocket error
+        // path can reach the placeholder loopback authority.
+        //
+        // Match ordinary Unix HTTP dispatch: preserve the authenticated
+        // client's Host only when the route explicitly opts in. Otherwise the
+        // target-effective backend authority owns the local application's
+        // virtual-host selection. The parse-only upgrade URI always uses that
+        // backend authority so an untrusted Host cannot rewrite the
+        // request-target. A malformed, authority-less, or unsafe backend URL
+        // fails closed here — before admission/dial — rather than substituting
+        // a local virtual host.
+        let ws_unix_dial: Option<Result<(&str, String), &'static str>> = match ws_unix_dispatch {
+            #[cfg(unix)]
+            Some(Ok(socket_path)) => match unix_websocket_url_authority(&current_backend_url) {
+                None => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        "Refusing WebSocket upgrade over unix-socket backend: \
+                         target-effective URL has no safe authority; failing closed \
+                         rather than substituting a local virtual host"
+                    );
+                    Some(Err(retry::WS_UNIX_BACKEND_AUTHORITY_INVALID))
+                }
+                Some(url_authority) => Some(Ok((socket_path, url_authority))),
+            },
+            // Non-Unix builds never produce `Ok` above.
+            #[cfg(not(unix))]
+            Some(Ok(_)) => Some(Err(retry::WS_UNIX_SOCKET_INADMISSIBLE)),
+            Some(Err(reason)) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    reason,
+                    "Refusing WebSocket upgrade over unix-socket backend; failing closed \
+                     rather than dialing the placeholder loopback address"
+                );
+                Some(Err(reason))
+            }
+            None => None,
+        };
+        // The direct dial's literal-IP egress denial and unsupported TLS SNI
+        // override, screened as `connect_websocket_backend` screens them.
+        let ws_dial_refusal: Option<Box<dyn std::error::Error + Send + Sync>> =
+            match (&ws_unix_dial, &ws_mesh_egress, current_target.as_deref()) {
+                (Some(Err(reason)), _, _) => Some((*reason).into()),
+                (Some(Ok(_)), _, _) | (None, Some(_), Some(_)) => None,
+                (None, _, _) => {
+                    websocket_backend_dial_refusal(&current_backend_url, ws_dial_proxy, &env_config)
+                }
+            };
+        let ws_attempt_dispatched = ws_dial_refusal.is_none();
         // The attempt's `otel_tracing` CLIENT span (issue #5867): the upgrade
         // request carries the attempt's own `traceparent`, and the handshake is
-        // polled in the attempt's scope. It ends with the handshake below.
-        let ws_attempt_span =
-            ctx.begin_backend_attempt_span_for_header_list(&current_backend_url, &client_headers);
+        // polled in the attempt's scope. It ends with the handshake below. A
+        // refused dial begins none.
+        let ws_attempt_span = if ws_attempt_dispatched {
+            ctx.begin_backend_attempt_span_for_header_list(&current_backend_url, &client_headers)
+        } else {
+            crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE
+        };
         let ws_attempt_headers = ws_attempt_span.header_list(&client_headers);
-        // A Unix-tagged target is screened BEFORE mesh egress and before the
-        // direct dial, so no WebSocket error path can reach the placeholder
-        // loopback authority.
         let ws_dial = async {
-            if let Some(unix_dispatch) = ws_unix_dispatch {
-                // Match ordinary Unix HTTP dispatch: preserve the authenticated
-                // client's Host only when the route explicitly opts in.
-                // Otherwise the target-effective backend authority owns the
-                // local application's virtual-host selection. The parse-only
-                // upgrade URI always uses that backend authority so an
-                // untrusted Host cannot rewrite the request-target. A
-                // malformed, authority-less, or unsafe backend URL fails
-                // closed here — before admission/dial — rather than
-                // substituting a local virtual host.
-                match unix_dispatch {
+            if let Some(refusal) = ws_dial_refusal {
+                return Err(refusal);
+            }
+            if let Some(unix_dial) = ws_unix_dial {
+                match unix_dial {
                     // Boxed: this dial future (admission gate + hyper/tungstenite
                     // H1 upgrade + framer construction) would otherwise be stored
                     // INLINE in this function's state machine, which is itself a
@@ -15477,52 +15528,34 @@ async fn handle_websocket_request_authenticated(
                     // `proxy_to_backend`: the generic future's size is a
                     // whole-gateway stack budget, not a WS-path cost.
                     #[cfg(unix)]
-                    Ok(socket_path) => match unix_websocket_url_authority(&current_backend_url) {
-                        None => {
-                            warn!(
-                                proxy_id = %proxy.id,
-                                "Refusing WebSocket upgrade over unix-socket backend: \
-                                 target-effective URL has no safe authority; failing closed \
-                                 rather than substituting a local virtual host"
-                            );
-                            Err(retry::WS_UNIX_BACKEND_AUTHORITY_INVALID.into())
-                        }
-                        Some(url_authority) => {
-                            let host = unix_websocket_backend_host(
-                                proxy.preserve_host_header,
-                                ws_client_host.as_deref(),
-                                &url_authority,
-                            );
-                            Box::pin(connect_unix_websocket_backend(
-                                &state.unix_backend_pool,
-                                ws_dial_proxy,
-                                &env_config,
-                                socket_path,
-                                &url_authority,
-                                host.as_ref(),
-                                ws_path_and_query.as_ref(),
-                                ws_attempt_headers,
-                                ws_size_limits.max_frame_bytes,
-                                ws_size_limits.max_message_bytes,
-                                state.websocket_write_buffer_size,
-                                ws_idle_tracker.clone(),
-                            ))
-                            .await
-                            .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake)))
-                        }
-                    },
+                    Ok((socket_path, url_authority)) => {
+                        let host = unix_websocket_backend_host(
+                            proxy.preserve_host_header,
+                            ws_client_host.as_deref(),
+                            &url_authority,
+                        );
+                        Box::pin(connect_unix_websocket_backend(
+                            &state.unix_backend_pool,
+                            ws_dial_proxy,
+                            &env_config,
+                            socket_path,
+                            &url_authority,
+                            host.as_ref(),
+                            ws_path_and_query.as_ref(),
+                            ws_attempt_headers,
+                            ws_size_limits.max_frame_bytes,
+                            ws_size_limits.max_message_bytes,
+                            state.websocket_write_buffer_size,
+                            ws_idle_tracker.clone(),
+                        ))
+                        .await
+                        .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake)))
+                    }
                     // Non-Unix builds never produce `Ok` above.
                     #[cfg(not(unix))]
                     Ok(_) => Err(retry::WS_UNIX_SOCKET_INADMISSIBLE.into()),
-                    Err(reason) => {
-                        warn!(
-                            proxy_id = %proxy.id,
-                            reason,
-                            "Refusing WebSocket upgrade over unix-socket backend; failing closed \
-                             rather than dialing the placeholder loopback address"
-                        );
-                        Err(reason.into())
-                    }
+                    // Refused above, before the attempt began.
+                    Err(reason) => Err(reason.into()),
                 }
             } else {
                 match (&ws_mesh_egress, current_target.as_deref()) {
@@ -15613,8 +15646,11 @@ async fn handle_websocket_request_authenticated(
                 // DispatchPolicyRejected dispatch path.
                 let ws_egress_denied =
                     matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
-                // Every failed handshake ends its attempt, retried or not.
-                ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                // Every failed handshake ends its attempt, retried or not. A
+                // dial refused before its attempt began has none (issue #5875).
+                if ws_attempt_dispatched {
+                    ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                }
 
                 // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
                 // handshake / port exhaustion). A backend that got the
@@ -17585,6 +17621,65 @@ impl WsBackendHandshake {
     }
 }
 
+/// The gateway-local refusal of a direct WebSocket dial to `backend_url` with
+/// `proxy`, decided without dialing: a literal-IP backend the egress policy
+/// denies, or a backend TLS SNI override the WebSocket transport cannot carry.
+/// Both classify as `DispatchPolicyRejected`.
+///
+/// [`connect_websocket_backend`] fails with exactly this error before it
+/// dials. The H1/H2 and H3 WebSocket handshake loops also screen a direct dial
+/// with it BEFORE they begin the attempt's `otel_tracing` CLIENT span (issue
+/// #5875), so a refusal that reaches no backend exports no span and records no
+/// attempt, while it still fails through their handshake-failure handling.
+pub(crate) fn websocket_backend_dial_refusal(
+    backend_url: &str,
+    proxy: &Proxy,
+    env_config: &crate::config::EnvConfig,
+) -> Option<Box<dyn std::error::Error + Send + Sync>> {
+    // Enforce the backend egress policy for a literal-IP WebSocket backend
+    // before dialing (the dial skips the DnsCacheResolver for IP literals).
+    if let Ok(parsed) = url::Url::parse(backend_url) {
+        let literal_ip = match parsed.host() {
+            Some(url::Host::Ipv4(a)) => Some(std::net::IpAddr::V4(a)),
+            Some(url::Host::Ipv6(a)) => Some(std::net::IpAddr::V6(a)),
+            _ => None,
+        };
+        if let Some(ip) = literal_ip
+            && let Some(reason) = env_config.backend_allow_ips.deny_reason(&ip)
+        {
+            return Some(format!(
+                "backend egress policy denied literal-IP WebSocket backend {ip}: {reason}"
+            )
+            .into());
+        }
+    }
+
+    // Fail closed on a backend TLS SNI override this transport cannot carry
+    // (issue #2416). The WebSocket dial derives both the `Host` header and the
+    // TLS server name from the request URI, so a `resolved_tls.sni` value —
+    // whether it came from the proxy/upstream or from the selected target's
+    // DestinationRule port-level `tls` projection — would be silently dropped
+    // and the handshake would verify the URI host instead of the configured
+    // server name. Refuse the dial rather than trust the wrong name; this
+    // mirrors the reqwest retry path, which also 502s on an unreplayable SNI
+    // override instead of dialing without it. Gateway-side and pre-dial, so the
+    // shared `retry::WS_BACKEND_TLS_SNI_UNSUPPORTED` anchor classifies it as
+    // `DispatchPolicyRejected`: non-retryable and neutral to the circuit
+    // breaker / passive health, exactly like the literal-IP denial above. The
+    // configured SNI value itself is never logged or echoed. Shared by the H1/H2
+    // and H3 WebSocket bridges, which both dial through this function.
+    if websocket_backend_tls_sni_unsupported(proxy) {
+        warn!(
+            proxy_id = %proxy.id,
+            "Refusing WebSocket backend dial: backend TLS SNI override cannot be applied to a \
+             WebSocket transport (server name is derived from the request URI); failing closed \
+             rather than verifying the wrong server name"
+        );
+        return Some(retry::WS_BACKEND_TLS_SNI_UNSUPPORTED.into());
+    }
+    None
+}
+
 /// Connect to backend WebSocket server before sending 101 to client.
 /// Returns the connected backend stream + negotiated handshake metadata,
 /// or an error if the backend is unreachable.
@@ -17627,46 +17722,10 @@ pub(crate) async fn connect_websocket_backend(
         }
     }
 
-    // Enforce the backend egress policy for a literal-IP WebSocket backend
-    // before dialing (the dial skips the DnsCacheResolver for IP literals).
-    if let Ok(parsed) = url::Url::parse(backend_url) {
-        let literal_ip = match parsed.host() {
-            Some(url::Host::Ipv4(a)) => Some(std::net::IpAddr::V4(a)),
-            Some(url::Host::Ipv6(a)) => Some(std::net::IpAddr::V6(a)),
-            _ => None,
-        };
-        if let Some(ip) = literal_ip
-            && let Some(reason) = env_config.backend_allow_ips.deny_reason(&ip)
-        {
-            return Err(format!(
-                "backend egress policy denied literal-IP WebSocket backend {ip}: {reason}"
-            )
-            .into());
-        }
-    }
-
-    // Fail closed on a backend TLS SNI override this transport cannot carry
-    // (issue #2416). The WebSocket dial derives both the `Host` header and the
-    // TLS server name from the request URI, so a `resolved_tls.sni` value —
-    // whether it came from the proxy/upstream or from the selected target's
-    // DestinationRule port-level `tls` projection — would be silently dropped
-    // and the handshake would verify the URI host instead of the configured
-    // server name. Refuse the dial rather than trust the wrong name; this
-    // mirrors the reqwest retry path, which also 502s on an unreplayable SNI
-    // override instead of dialing without it. Gateway-side and pre-dial, so the
-    // shared `retry::WS_BACKEND_TLS_SNI_UNSUPPORTED` anchor classifies it as
-    // `DispatchPolicyRejected`: non-retryable and neutral to the circuit
-    // breaker / passive health, exactly like the literal-IP denial above. The
-    // configured SNI value itself is never logged or echoed. Shared by the H1/H2
-    // and H3 WebSocket bridges, which both dial through this function.
-    if websocket_backend_tls_sni_unsupported(proxy) {
-        warn!(
-            proxy_id = %proxy.id,
-            "Refusing WebSocket backend dial: backend TLS SNI override cannot be applied to a \
-             WebSocket transport (server name is derived from the request URI); failing closed \
-             rather than verifying the wrong server name"
-        );
-        return Err(retry::WS_BACKEND_TLS_SNI_UNSUPPORTED.into());
+    // The gateway-local refusals, before any dial. The H1/H2 and H3 WebSocket
+    // loops screen with the same helper before they begin the attempt.
+    if let Some(refusal) = websocket_backend_dial_refusal(backend_url, proxy, env_config) {
+        return Err(refusal);
     }
 
     // Only a TLS backend scheme needs a connector; a plaintext `ws://` upgrade

@@ -1072,17 +1072,78 @@ pub mod _test_support {
         (dispatched, output)
     }
 
-    /// Time a connection setup as the connection pools do (issue #5867): read
-    /// the attempt clock, which only a traced attempt being polled arms, then
-    /// report every setup phase from it. Returns whether the clock was read.
+    /// Time a connection setup as the connection pools do (issues #5867 and
+    /// #5875): read the setup clock, which only a traced attempt being polled
+    /// arms, then report every setup phase from it. Returns whether the clock
+    /// was read.
     pub fn note_backend_connection_setup_timed_for_test() -> bool {
-        let started = crate::plugins::otel_tracing::backend_attempt_clock();
-        crate::plugins::otel_tracing::note_backend_connection_setup_started();
+        let started = crate::plugins::otel_tracing::backend_connection_setup_clock();
         crate::plugins::otel_tracing::note_backend_dns_resolution_since(started);
         crate::plugins::otel_tracing::note_backend_tcp_connect_since(started);
         crate::plugins::otel_tracing::note_backend_tls_handshake_since(started);
         crate::plugins::otel_tracing::note_backend_connection_established_since(started);
         started.is_some()
+    }
+
+    /// Begin a connection setup as the connection pools do (issue #5875) and
+    /// abandon it, as a setup that fails does: the setup clock notes the
+    /// setup in the same lookup that reads it. Returns whether the clock was
+    /// read.
+    pub fn note_backend_connection_setup_failed_for_test() -> bool {
+        crate::plugins::otel_tracing::backend_connection_setup_clock().is_some()
+    }
+
+    /// Whether `ctx` records backend attempts: a diagnostic-reference slot or
+    /// an `otel_tracing` attempt recorder is installed (issue #5875).
+    pub fn records_backend_attempts_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.records_backend_attempts()
+    }
+
+    /// How an HTTP/3 → HTTP/1.1/HTTP/2 bridge attempt ended, as the bridge
+    /// classifies it before recording it (issue #5875).
+    pub enum PlainBridgeAttemptEndForTest {
+        /// The backend answered with this status.
+        Response(u16),
+        HeaderTimeout,
+        WriteWatermark,
+        GrpcWebDeadline,
+        PeerGone,
+        UploadTooLarge,
+    }
+
+    /// Record a bridge attempt that ended as `end` at the bridge's one record
+    /// point (issue #5875).
+    pub fn record_plain_bridge_attempt_for_test(
+        ctx: &crate::plugins::RequestContext,
+        end: PlainBridgeAttemptEndForTest,
+    ) {
+        use crate::http3::cross_protocol::PlainAttemptEnd;
+        let end: PlainAttemptEnd<reqwest::Result<reqwest::Response>, ()> = match end {
+            PlainBridgeAttemptEndForTest::Response(status) => {
+                let mut response = http::Response::new(reqwest::Body::from(Vec::<u8>::new()));
+                *response.status_mut() =
+                    http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK);
+                PlainAttemptEnd::Settled(Ok(reqwest::Response::from(response)))
+            }
+            PlainBridgeAttemptEndForTest::HeaderTimeout => PlainAttemptEnd::HeaderTimeout,
+            PlainBridgeAttemptEndForTest::WriteWatermark => PlainAttemptEnd::WriteWatermark,
+            PlainBridgeAttemptEndForTest::GrpcWebDeadline => PlainAttemptEnd::GrpcWebDeadline,
+            PlainBridgeAttemptEndForTest::PeerGone => PlainAttemptEnd::PeerGone,
+            PlainBridgeAttemptEndForTest::UploadTooLarge => PlainAttemptEnd::UploadTooLarge(()),
+        };
+        end.record(ctx);
+    }
+
+    /// The gateway-local refusal of a direct WebSocket dial, as the WebSocket
+    /// handshake loops screen it before an attempt begins (issue #5875):
+    /// `Some` with the refusal's message, `None` when the dial may proceed.
+    pub fn websocket_backend_dial_refusal_for_test(
+        backend_url: &str,
+        proxy: &crate::config::types::Proxy,
+        env_config: &crate::config::EnvConfig,
+    ) -> Option<String> {
+        crate::proxy::websocket_backend_dial_refusal(backend_url, proxy, env_config)
+            .map(|refusal| refusal.to_string())
     }
 
     /// A begun backend attempt's `otel_tracing` CLIENT span (issue #5864),

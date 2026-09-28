@@ -4,8 +4,9 @@
 //! context in `before_proxy` when it has an exporter. Every backend attempt an
 //! instrumented dispatch site sends (the H1/H2 loop, the native gRPC loop, the
 //! native HTTP/3 frontend's buffered, streamed-body, and header-refined
-//! dispatches, the HTTP/3-to-gRPC bridges, and the WebSocket upgrades, retries
-//! included; issues #5864 and #5867) then:
+//! dispatches, the HTTP/3-to-gRPC bridges, the HTTP/3-to-HTTP/1.1/HTTP/2
+//! bridge, and the WebSocket upgrades, retries included; issues #5864, #5867,
+//! and #5875) then:
 //!
 //! 1. begins at its dispatch site ([`BackendAttemptTrace::begin`]), which mints
 //!    the attempt's span id and returns a copy of the backend header map whose
@@ -578,6 +579,19 @@ pub(crate) fn poll_backend_attempt<F: Future>(
 /// read, otherwise. Only the attempt span consumes these timings.
 pub(crate) fn backend_attempt_clock() -> Option<Instant> {
     ACTIVE_BACKEND_ATTEMPT.try_with(|_| Instant::now()).ok()
+}
+
+/// [`note_backend_connection_setup_started`] and [`backend_attempt_clock`] in
+/// one task-local lookup (issue #5875): the active attempt is establishing a
+/// new connection, timed from the returned reading. `None`, with no clock read
+/// and nothing noted, outside a traced attempt.
+pub(crate) fn backend_connection_setup_clock() -> Option<Instant> {
+    ACTIVE_BACKEND_ATTEMPT
+        .try_with(|trace| {
+            trace.update_in_flight(|attempt| attempt.connection.reused = Some(false));
+            Instant::now()
+        })
+        .ok()
 }
 
 fn with_active_attempt(update: impl FnOnce(&mut InFlightAttempt)) {

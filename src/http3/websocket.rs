@@ -1004,13 +1004,43 @@ pub(crate) async fn handle_h3_websocket(
                     .map(|pq| std::borrow::Cow::Owned(pq.as_str().to_string()))
                     .unwrap_or(std::borrow::Cow::Borrowed("/"))
             });
+        // Gateway-local dial refusals are decided BEFORE the attempt's
+        // `otel_tracing` CLIENT span begins (issue #5875), as on the H1/H2
+        // bridge: a mesh target whose target-effective URL does not parse, and
+        // the direct dial's literal-IP egress denial and unsupported TLS SNI
+        // override. A refusal reaches no backend, so it exports no span and
+        // records no attempt. It still fails through the handshake-failure
+        // handling below exactly as before.
+        let ws_dial_refusal: Option<Box<dyn std::error::Error + Send + Sync>> = match (
+            &ws_mesh_egress,
+            current_target.as_deref(),
+            ws_path_and_query.as_deref(),
+        ) {
+            (Some(_), Some(_), Some(_)) => None,
+            (Some(_), Some(_), None) => {
+                Some(crate::retry::WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into())
+            }
+            _ => crate::proxy::websocket_backend_dial_refusal(
+                &current_backend_url,
+                ws_dial_proxy,
+                &state.env_config,
+            ),
+        };
+        let ws_attempt_dispatched = ws_dial_refusal.is_none();
         // The attempt's `otel_tracing` CLIENT span (issue #5867): the upgrade
         // request carries the attempt's own `traceparent`, and the handshake is
-        // polled in the attempt's scope. It ends with the handshake below.
-        let ws_attempt_span =
-            ctx.begin_backend_attempt_span_for_header_list(&current_backend_url, &client_headers);
+        // polled in the attempt's scope. It ends with the handshake below. A
+        // refused dial begins none.
+        let ws_attempt_span = if ws_attempt_dispatched {
+            ctx.begin_backend_attempt_span_for_header_list(&current_backend_url, &client_headers)
+        } else {
+            crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE
+        };
         let ws_attempt_headers = ws_attempt_span.header_list(&client_headers);
         let ws_dial = async {
+            if let Some(refusal) = ws_dial_refusal {
+                return Err(refusal);
+            }
             match (
                 &ws_mesh_egress,
                 current_target.as_deref(),
@@ -1034,6 +1064,7 @@ pub(crate) async fn handle_h3_websocket(
                     .await
                     .map(|handshake| crate::proxy::WsBackendHandshake::Mesh(Box::new(handshake)))
                 }
+                // Refused above, before the attempt began.
                 (Some(_), Some(_), None) => {
                     Err(crate::retry::WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into())
                 }
@@ -1088,8 +1119,11 @@ pub(crate) async fn handle_h3_websocket(
                 // failure), matching the H1/H2 path.
                 let ws_egress_denied =
                     matches!(ws_error_class, retry::ErrorClass::DispatchPolicyRejected);
-                // Every failed handshake ends its attempt, retried or not.
-                ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                // Every failed handshake ends its attempt, retried or not. A
+                // dial refused before its attempt began has none (issue #5875).
+                if ws_attempt_dispatched {
+                    ctx.record_backend_attempt(Some(ws_error_class), !ws_is_pre_wire, None);
+                }
                 let retry_delay = proxy.retry.as_ref().and_then(|retry_config| {
                     let route_retry_ceiling =
                         crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);

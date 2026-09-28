@@ -3756,6 +3756,15 @@ impl RequestContext {
         }
     }
 
+    /// Whether [`Self::record_backend_attempt`] records anything for this
+    /// request: a diagnostic-reference slot or an `otel_tracing` attempt
+    /// recorder is installed. A dispatch whose attempt record takes work to
+    /// derive checks this first, so a request that records nothing does none
+    /// of it (issue #5875).
+    pub(crate) fn records_backend_attempts(&self) -> bool {
+        self.diagnostic_slot.is_some() || self.backend_attempt_trace.is_some()
+    }
+
     /// Install (or clear) the `otel_tracing` per-attempt span recorder.
     pub(crate) fn set_backend_attempt_trace(
         &mut self,

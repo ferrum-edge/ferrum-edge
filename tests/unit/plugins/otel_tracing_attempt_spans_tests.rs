@@ -5,23 +5,26 @@
 //! polls it in the attempt scope the connection pools report into) and ends at
 //! `record_backend_attempt`. Live retry coverage is in
 //! `tests/functional/functional_otel_attempt_spans_test.rs`, and for the
-//! HTTP/3 and WebSocket paths (issue #5867) in
+//! HTTP/3 and WebSocket paths (issues #5867 and #5875) in
 //! `tests/functional/functional_otel_attempt_spans_protocols_test.rs`.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    BackendAttemptForTest, note_backend_attempt_handed_off_for_test,
-    note_backend_connection_reused_for_test, note_backend_connection_setup_for_test,
-    note_backend_connection_setup_timed_for_test, record_backend_attempt_for_test,
-    run_backend_attempt_for_test, run_backend_attempt_with_header_list_for_test,
+    BackendAttemptForTest, PlainBridgeAttemptEndForTest, note_backend_attempt_handed_off_for_test,
+    note_backend_connection_reused_for_test, note_backend_connection_setup_failed_for_test,
+    note_backend_connection_setup_for_test, note_backend_connection_setup_timed_for_test,
+    record_backend_attempt_for_test, record_plain_bridge_attempt_for_test,
+    records_backend_attempts_for_test, run_backend_attempt_for_test,
+    run_backend_attempt_with_header_list_for_test, websocket_backend_dial_refusal_for_test,
 };
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig, types::Proxy};
 use ferrum_edge::plugins::{
     Plugin, PluginResult, RequestContext, TransactionSummary, otel_tracing::OtelTracing,
     utils::PluginHttpClient,
 };
-use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::retry::{ErrorClass, WS_BACKEND_TLS_SNI_UNSUPPORTED};
 use serde_json::{Value, json};
 
 const BACKEND_URL: &str = "http://backend.internal:8080/api/test";
@@ -705,4 +708,176 @@ async fn connection_setup_timing_reads_the_clock_only_for_a_traced_attempt() {
     })
     .await;
     assert!(!armed, "a request without tracing reads no clock");
+}
+
+#[tokio::test]
+async fn a_failed_connection_setup_is_noted_by_the_setup_clock_lookup() {
+    let server = collector().await;
+    let plugin = otel(Some(&endpoint(&server)), json!({}));
+    let (ctx, headers) = traced_request(&plugin).await;
+
+    // Outside every attempt's poll the setup clock reads and notes nothing.
+    assert!(!note_backend_connection_setup_failed_for_test());
+
+    let (_, armed) = run_backend_attempt_for_test(&ctx, BACKEND_URL, &headers, async {
+        note_backend_connection_setup_failed_for_test()
+    })
+    .await;
+    assert!(armed, "a traced attempt arms the connection-setup clock");
+    record_backend_attempt_for_test(&ctx, Some(ErrorClass::ConnectionRefused), false, None);
+
+    // The one lookup that read the clock also noted the setup: a connection
+    // that never came up reports `reused: false` without `setup_ms`.
+    let clients = client_spans(&exported_spans(&server, 1).await);
+    let attempt = &clients[0];
+    assert_eq!(
+        bool_attr(attempt, "gateway.backend.connection.reused"),
+        Some(false)
+    );
+    assert!(double_attr(attempt, "gateway.backend.connection.setup_ms").is_none());
+    assert_eq!(
+        string_attr(attempt, "error.type"),
+        Some("connection_refused")
+    );
+}
+
+#[tokio::test]
+async fn only_a_request_with_an_attempt_recorder_records_backend_attempts() {
+    // Without `otel_tracing` (and without a diagnostic reference) nothing
+    // records an attempt, so the HTTP/3 bridge derives no attempt record.
+    let ctx = RequestContext::new(CLIENT_IP.into(), "GET".into(), "/".into());
+    assert!(!records_backend_attempts_for_test(&ctx));
+
+    let propagation_only = otel(None, json!({}));
+    let (ctx, _) = traced_request(&propagation_only).await;
+    assert!(!records_backend_attempts_for_test(&ctx));
+
+    let server = collector().await;
+    let unsampled = otel(
+        Some(&endpoint(&server)),
+        json!({ "root_sampling": "always_off" }),
+    );
+    let (ctx, _) = traced_request(&unsampled).await;
+    assert!(!records_backend_attempts_for_test(&ctx));
+
+    let sampled = otel(Some(&endpoint(&server)), json!({}));
+    let (ctx, _) = traced_request(&sampled).await;
+    assert!(records_backend_attempts_for_test(&ctx));
+}
+
+/// Run one HTTP/3 bridge attempt in its scope, then record how it ended at
+/// the bridge's one record point.
+async fn record_bridge_attempt(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    end: PlainBridgeAttemptEndForTest,
+) {
+    let (_, ()) = run_backend_attempt_for_test(ctx, BACKEND_URL, headers, async {}).await;
+    record_plain_bridge_attempt_for_test(ctx, end);
+}
+
+/// An attempt span's `(http.response.status_code, error.type)`.
+fn attempt_outcome(span: &Value) -> (Option<i64>, Option<&str>) {
+    (
+        int_attr(span, "http.response.status_code"),
+        string_attr(span, "error.type"),
+    )
+}
+
+#[tokio::test]
+async fn http3_bridge_attempts_record_the_class_their_terminal_reports() {
+    let server = collector().await;
+    let plugin = otel(Some(&endpoint(&server)), json!({}));
+    let (ctx, headers) = traced_request(&plugin).await;
+
+    // Every way an HTTP/3 → HTTP/1.1/HTTP/2 bridge attempt can end, each
+    // recorded once, in order (issue #5875).
+    for end in [
+        PlainBridgeAttemptEndForTest::Response(503),
+        PlainBridgeAttemptEndForTest::HeaderTimeout,
+        PlainBridgeAttemptEndForTest::WriteWatermark,
+        PlainBridgeAttemptEndForTest::GrpcWebDeadline,
+        PlainBridgeAttemptEndForTest::PeerGone,
+        PlainBridgeAttemptEndForTest::UploadTooLarge,
+        PlainBridgeAttemptEndForTest::Response(200),
+    ] {
+        record_bridge_attempt(&ctx, &headers, end).await;
+    }
+
+    let clients = client_spans(&exported_spans(&server, 7).await);
+    let attempts: Vec<Option<i64>> = clients
+        .iter()
+        .map(|span| int_attr(span, "gateway.backend.attempt"))
+        .collect();
+    assert_eq!(attempts, (1..=7).map(Some).collect::<Vec<_>>());
+    let outcomes: Vec<(Option<i64>, Option<&str>)> = clients.iter().map(attempt_outcome).collect();
+    assert_eq!(
+        outcomes,
+        [
+            // The backend's own answer keeps its status.
+            (Some(503), Some("503")),
+            // A backend read or write watermark before the response head.
+            (None, Some("read_write_timeout")),
+            (None, Some("read_write_timeout")),
+            // A gRPC-Web deadline that was not the route attempt budget, and
+            // a client that went away, are the client's.
+            (None, Some("client_disconnect")),
+            (None, Some("client_disconnect")),
+            (None, Some("request_body_too_large")),
+            (Some(200), None),
+        ]
+    );
+    assert_eq!(
+        string_attr(&clients[1], "gateway.backend.retry_reason"),
+        Some("http_status")
+    );
+}
+
+#[test]
+fn websocket_dial_policy_refusals_are_screened_without_dialing() {
+    // The screen `connect_websocket_backend` applies before it dials, which
+    // the WebSocket handshake loops also run BEFORE an attempt begins, so a
+    // refusal exports no CLIENT span (issue #5875).
+    let env_config = EnvConfig {
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both),
+        ..EnvConfig::default()
+    };
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "ws-dial-refusal",
+        "backend_host": "backend.internal",
+        "backend_port": 8443,
+        "backend_scheme": "https",
+    }))
+    .expect("test proxy should deserialize");
+
+    let denied = websocket_backend_dial_refusal_for_test(
+        "wss://169.254.169.254:8443/ws",
+        &proxy,
+        &env_config,
+    )
+    .expect("a literal-IP backend the egress policy denies is refused");
+    assert!(denied.contains("egress policy"), "refusal: {denied}");
+
+    // A hostname is screened by the resolver while the attempt dials, and an
+    // allowed literal dials.
+    for allowed in ["wss://backend.internal:8443/ws", "wss://127.0.0.1:8443/ws"] {
+        assert_eq!(
+            websocket_backend_dial_refusal_for_test(allowed, &proxy, &env_config),
+            None,
+            "{allowed} must dial"
+        );
+    }
+
+    let mut sni_proxy = proxy.clone();
+    sni_proxy.resolved_tls.sni = Some("backend.example.com".to_string());
+    assert_eq!(
+        websocket_backend_dial_refusal_for_test(
+            "wss://backend.internal:8443/ws",
+            &sni_proxy,
+            &env_config,
+        )
+        .as_deref(),
+        Some(WS_BACKEND_TLS_SNI_UNSUPPORTED),
+        "a backend TLS SNI override the WebSocket transport cannot apply is refused"
+    );
 }
