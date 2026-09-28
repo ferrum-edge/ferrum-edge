@@ -1,11 +1,8 @@
 # feat(upgrade): allow resetting an HTTP/2 upgrade with CONNECT_ERROR
 
-<!-- DRAFT, not filed. Opening this PR in hyperium/hyper needs the Ferrum Edge
-     owner's approval. The vendored patch is against 1.9.0; master restructured
-     `UpgradedSendStreamTask::tick` (the `buffered` write, #4003), so the reset
-     poll moves to just after `poll_reset`, ahead of the capacity wait. -->
+<!-- Filed as hyperium/hyper#4210 on 2026-09-28; kept as the record of what was filed (the PR itself is authoritative for later edits). -->
 
-Fixes #NNN
+Closes #4209
 
 ## Problem
 

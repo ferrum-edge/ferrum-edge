@@ -6,15 +6,35 @@
 
 ## Status
 
-Deliberate fork, not yet filed upstream, governed by the
+Filed upstream on 2026-09-28: issue
+[hyperium/hyper#4209](https://github.com/hyperium/hyper/issues/4209) and PR
+[hyperium/hyper#4210](https://github.com/hyperium/hyper/pull/4210), against
+hyper `master`. [`issue.md`](issue.md) and
+[`pr-description.md`](pr-description.md) keep the texts as filed. Until a
+release carries the change, the vendored copy stays a deliberate fork,
+governed by the
 [deliberate fork policy](../../dependency-policy.md#deliberate-fork-policy-and-sla).
-The upstream issue and PR texts are drafted in [`issue.md`](issue.md) and
-[`pr-description.md`](pr-description.md). Filing them in `hyperium/hyper`
-needs the owner's approval; when they are filed, record the numbers here, in
-the inventory row, and in `docs/vendored-patch-lifecycle.json`. Owner: Ferrum
-Edge maintainers. This patch fixes Ferrum issue
+Exit criterion: drop the vendored fork once a hyper release containing #4210
+(or an equivalent) is adopted; see [Retirement plan](#retirement-plan). Owner:
+Ferrum Edge maintainers. This patch fixes Ferrum issue
 [#5781](https://github.com/ferrum-edge/ferrum-edge/issues/5781), a follow-up
 to #5765.
+
+### Known difference from the upstream PR
+
+hyperium/hyper#4210 is a port of this patch onto hyper `master`, with extra
+tests. It differs in one detail: when `UpgradedSendStreamTask` ends with an
+error, the upstream version clears the reset receiver before it sends that
+error to `H2Upgraded`. In the vendored copy the receiver lives until the
+finished task is dropped, so a `reset_with_connect_error` call that races the
+task's end (for example, right after a write returned the peer's reset) can
+return `true` although no `RST_STREAM` will be sent. The wire result is the
+same either way: the stream has already ended. Edge does not need the change
+for correctness: its only caller, `end_hbone_connect_stream` in
+`src/proxy/hbone_proxy.rs`, uses the return value only to decide whether to
+log a debug line, then drops the stream. The vendored copy is left as is, so
+the drift manifest does not change; the next re-vendor (or the retirement)
+picks up the upstream form.
 
 ## The problem
 
@@ -139,8 +159,8 @@ CONNECTs through the gateway with a raw h2 client:
 ## Retirement plan
 
 Retire when a hyper release can reset an upgraded HTTP/2 stream with a chosen
-error code (the API proposed in [`pr-description.md`](pr-description.md), or
-an equivalent). Then:
+error code (the API in hyperium/hyper#4210, whose text is in
+[`pr-description.md`](pr-description.md), or an equivalent). Then:
 
 1. Move `end_hbone_connect_stream` in `src/proxy/hbone_proxy.rs` to the
    upstream API.

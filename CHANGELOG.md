@@ -284,6 +284,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `correlation_id.header_name`, and `mesh_route_dispatch` `request_transform`
   destinations. `proxy::headers::is_consumer_assertion_header` is the single
   predicate every boundary uses. There is no opt-out.
+- The vendored hyper patch that resets an upgraded HTTP/2 `CONNECT` stream
+  with `CONNECT_ERROR` (#5781) is filed upstream as hyperium/hyper#4209 and
+  hyperium/hyper#4210; the fork is dropped once a hyper release containing
+  #4210 is adopted. See
+  `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/`.
 - **WAF admission: `on_unlisted_content_type: block` needs a body method**
   (#5865). With `body_methods: []` no HTTP request body is governed, so `block`
   can never fire; under `mode: enforce` it no longer counts as an enforcement

@@ -4407,7 +4407,11 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   the backend half-closed first, the stream's send side is already closed and
   nothing is reset. A revocation resets
   deliberately: the fence cut a live tunnel mid-stream, and a clean close
-  would present the bytes relayed so far as the complete stream. A reset is
+  would present the bytes relayed so far as the complete stream. The peer
+  sees a stream error, not a complete response; the reset is intentional and
+  kept. A revocation counts in `ferrum_mesh_hbone_tunnel_revocations_total`
+  (label `reason`), never in `ferrum_mesh_hbone_relay_failures_total`, which
+  counts backend and socket failures. A reset is
   only possible while the stream's send side is still open, so a failure
   after the relay already half-closed the stream toward the client (the
   backend sent FIN first) leaves that `END_STREAM` in place. Resetting needs a vendored hyper
