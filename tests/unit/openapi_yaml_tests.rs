@@ -2445,7 +2445,9 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
         validator
             .validate(&json!({
                 "rule_overrides": {
-                    "FE-XSS-001": { "exclude": { "query_params": ["html"], "headers": ["referer"] } }
+                    "FE-XSS-001": {
+                        "exclude": { "query_params": ["html"], "headers": ["referer"] }
+                    }
                 }
             }))
             .is_ok(),

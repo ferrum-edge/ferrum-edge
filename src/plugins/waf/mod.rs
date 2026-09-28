@@ -498,6 +498,11 @@ impl Waf {
         let scoring = parse_scoring(object.get("scoring"))?;
         let inspect_multipart = optional_bool(object, "inspect_multipart")?.unwrap_or(false);
         let inspect_binary_body = optional_bool(object, "inspect_binary_body")?.unwrap_or(false);
+        let body_methods: Vec<String> = optional_string_vec(object, "body_methods")?
+            .unwrap_or_else(default_body_methods)
+            .into_iter()
+            .map(|method| method.to_ascii_uppercase())
+            .collect();
         validate_enforce_mode_has_enforcing_rules(
             mode,
             &compiled,
@@ -509,6 +514,7 @@ impl Waf {
                 response: response_inspection,
                 response_body: response_body_inspection,
                 every_request_body_content_type: inspect_multipart && inspect_binary_body,
+                request_body_methods: !body_methods.is_empty(),
             },
             on_body_too_large,
             on_unlisted_content_type,
@@ -529,11 +535,7 @@ impl Waf {
             on_scan_timeout,
             on_body_too_large,
             on_unlisted_content_type,
-            body_methods: optional_string_vec(object, "body_methods")?
-                .unwrap_or_else(default_body_methods)
-                .into_iter()
-                .map(|method| method.to_ascii_uppercase())
-                .collect(),
+            body_methods,
             body_content_types: optional_string_vec(object, "body_content_types")?
                 .unwrap_or_else(default_body_content_types)
                 .into_iter()
@@ -720,10 +722,14 @@ impl Waf {
     ///
     /// Cheapest tests first: an ordinary request with a scanned `Content-Type`
     /// returns before the exemption walk and before `fail_closed` scans every
-    /// compiled rule for an applicable enforcing body policy.
+    /// compiled rule for an applicable enforcing body policy. `block` while
+    /// enforcing always refuses, so it never records here and returns before
+    /// any per-request test.
     fn observe_unlisted_content_type(&self, ctx: &mut RequestContext) {
         if !self.config.log_to_metadata
             || self.config.on_unlisted_content_type == UnlistedContentTypeAction::Allow
+            || (self.config.on_unlisted_content_type == UnlistedContentTypeAction::Block
+                && self.config.mode == GlobalMode::Enforce)
             || self
                 .request_body_eligible_for_scan(ctx.headers.get("content-type").map(String::as_str))
             || !crate::proxy::inbound_request_declares_body(ctx)
@@ -2345,6 +2351,10 @@ struct WafInspectionSurfaces {
     /// Both `inspect_multipart` and `inspect_binary_body` are on, so every
     /// request body (including one with no `Content-Type`) is in scan scope.
     every_request_body_content_type: bool,
+    /// `body_methods` names at least one method, so an HTTP request body can
+    /// reach the request-body hook at all. WebSocket messages ignore
+    /// `body_methods`, so this gates only HTTP-body-specific paths.
+    request_body_methods: bool,
 }
 
 impl WafInspectionSurfaces {
@@ -2405,8 +2415,8 @@ fn validate_enforce_mode_has_enforcing_rules(
          rules in via `rule_modes` / `custom_rules[].action`, enable anomaly scoring over an \
          inspected HTTP rule, enable a stream enforcement rule, set `on_body_too_large` \
          to `block` on an inspected body surface, or set `on_unlisted_content_type` to \
-         `block` with request-body inspection on and at least one content type left \
-         unscanned"
+         `block` with request-body inspection on, at least one `body_methods` entry, and \
+         at least one content type left unscanned"
             .to_string(),
     )
 }
@@ -2417,6 +2427,10 @@ fn validate_enforce_mode_has_enforcing_rules(
 /// inspection hook that consults the setting can actually run — the same
 /// request/response body buffering predicates the runtime uses, including the
 /// body-scoped encoding specials that also pull a session into inspection.
+///
+/// An empty `body_methods` does not make the request side unreachable: it stops
+/// HTTP request bodies from being buffered, but client-to-backend WebSocket
+/// messages ignore `body_methods` and still apply this cap.
 fn oversize_body_block_is_reachable(
     on_body_too_large: TooLargeAction,
     compiled: &CompiledRules,
@@ -2441,7 +2455,9 @@ fn oversize_body_block_is_reachable(
 /// `action`. It is a reachable enforcement path exactly when the request-body
 /// hook that applies it can run and some body can be unlisted: with both
 /// `inspect_multipart` and `inspect_binary_body` on, every content type (and a
-/// missing one) is scanned, so `block` can never fire.
+/// missing one) is scanned, and with `body_methods: []` no HTTP request body is
+/// governed at all, so in either case `block` can never fire. WebSocket
+/// messages carry no `Content-Type` and never reach this setting.
 fn unlisted_content_type_block_is_reachable(
     on_unlisted_content_type: UnlistedContentTypeAction,
     compiled: &CompiledRules,
@@ -2449,6 +2465,7 @@ fn unlisted_content_type_block_is_reachable(
 ) -> bool {
     on_unlisted_content_type == UnlistedContentTypeAction::Block
         && !surfaces.every_request_body_content_type
+        && surfaces.request_body_methods
         && surfaces.request
         && surfaces.request_body
         && (compiled.request_body_rules_active
