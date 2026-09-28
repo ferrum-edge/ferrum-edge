@@ -172,6 +172,7 @@ pub mod udp_proxy;
 pub mod unix_backend;
 pub mod unix_backend_pool;
 pub mod upload_pump;
+pub mod ws_permessage_deflate;
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
@@ -15187,6 +15188,12 @@ async fn handle_websocket_request_authenticated(
         &mut client_headers,
         &proxy_headers,
     );
+    // RFC 7692 terminate (issue #5769): each leg negotiates on its own.
+    let ws_deflate_termination = begin_permessage_deflate_termination(
+        proxy.websocket_permessage_deflate,
+        &mut client_headers,
+        &proxy_headers,
+    );
 
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
@@ -16033,6 +16040,42 @@ async fn handle_websocket_request_authenticated(
         ));
     }
 
+    let ws_deflate_negotiation = match ws_deflate_termination {
+        None => ws_permessage_deflate::NegotiatedTermination::default(),
+        Some(handshake) => match complete_permessage_deflate_termination(
+            handshake,
+            &backend_handshake,
+            state
+                .env_config
+                .websocket_permessage_deflate_max_message_bytes,
+        ) {
+            Ok(negotiated) => negotiated,
+            Err(reason) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    reason,
+                    "Rejecting WebSocket upgrade: invalid backend permessage-deflate answer"
+                );
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    502,
+                    start_time,
+                    "websocket_permessage_deflate",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                record_request(&state, 502);
+                return Ok(build_websocket_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"error":"Backend WebSocket extension negotiation failed"}"#,
+                    &initial_response_header_policy_plugins,
+                ));
+            }
+        },
+    };
+
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.as_deref(), upstream_balancer.as_deref());
     if let Some(permits) = backend_admission_permits.as_ref() {
@@ -16185,7 +16228,7 @@ async fn handle_websocket_request_authenticated(
     // Forward the backend's permessage-deflate answer only when this upgrade
     // offered it. Same post-policy placement as the subprotocol.
     let ws_negotiated_deflate = if ws_deflate_offered {
-        backend_handshake.negotiated_permessage_deflate().cloned()
+        backend_handshake.negotiated_permessage_deflate()
     } else {
         None
     };
@@ -16193,6 +16236,11 @@ async fn handle_websocket_request_authenticated(
     if let Some(extensions) = ws_negotiated_deflate {
         ws_resp_builder = ws_resp_builder.header("sec-websocket-extensions", extensions);
     }
+    // A `terminate` proxy answers the client with the gateway's own agreement.
+    if let Some(extensions) = ws_deflate_negotiation.client_response {
+        ws_resp_builder = ws_resp_builder.header("sec-websocket-extensions", extensions);
+    }
+    let ws_deflate_session = ws_deflate_negotiation.session;
 
     let upgrade_response = ws_resp_builder
         .body(ProxyBody::empty())
@@ -16357,7 +16405,7 @@ async fn handle_websocket_request_authenticated(
                 let relay_result = match backend_handshake {
                     WsBackendHandshake::Direct(handshake) => {
                         let handshake = *handshake;
-                        run_websocket_proxy(
+                        run_websocket_session(
                             client_io,
                             handshake.stream,
                             &proxy_id,
@@ -16378,12 +16426,13 @@ async fn handle_websocket_request_authenticated(
                             ws_fragment_policy,
                             &adaptive_buf,
                             ws_client_trust_session,
+                            ws_deflate_session,
                         )
                         .await
                     }
                     WsBackendHandshake::Mesh(handshake) => {
                         let handshake = *handshake;
-                        run_websocket_proxy(
+                        run_websocket_session(
                             client_io,
                             handshake.stream,
                             &proxy_id,
@@ -16404,6 +16453,7 @@ async fn handle_websocket_request_authenticated(
                             ws_fragment_policy,
                             &adaptive_buf,
                             ws_client_trust_session,
+                            ws_deflate_session,
                         )
                         .await
                     }
@@ -16413,7 +16463,7 @@ async fn handle_websocket_request_authenticated(
                     // dedicated connection is owned by this session and closes
                     // with it; it is never returned to the #3731 idle pool.
                     //
-                    // Boxed so this third `run_websocket_proxy` monomorphization
+                    // Boxed so this third `run_websocket_session` monomorphization
                     // is not a third inline copy of the relay's state machine in
                     // the spawned session future (which is built on the caller's
                     // stack before `tokio::spawn` moves it to the heap). One
@@ -16421,7 +16471,7 @@ async fn handle_websocket_request_authenticated(
                     #[cfg(unix)]
                     WsBackendHandshake::Unix(handshake) => {
                         let handshake = *handshake;
-                        let relay_result = Box::pin(run_websocket_proxy(
+                        let relay_result = Box::pin(run_websocket_session(
                             client_io,
                             handshake.stream,
                             &proxy_id,
@@ -16442,6 +16492,7 @@ async fn handle_websocket_request_authenticated(
                             ws_fragment_policy,
                             &adaptive_buf,
                             ws_client_trust_session,
+                            ws_deflate_session,
                         ))
                         .await;
                         // This is the Unix pool's per-target PHYSICAL
@@ -16730,6 +16781,65 @@ pub(crate) fn forward_permessage_deflate_offer(
         && push_permessage_deflate_offer(client_headers, proxy_headers)
 }
 
+/// Start a `websocket_permessage_deflate: terminate` upgrade (issue #5769),
+/// shared by the H1/H2 and HTTP/3 WebSocket paths: answer the client's offer
+/// from the plugin-sanitized request headers and give the backend the
+/// gateway's own offer. `None` for every other mode, which leaves
+/// `client_headers` untouched.
+pub(crate) fn begin_permessage_deflate_termination(
+    mode: crate::config::types::WebSocketPermessageDeflate,
+    client_headers: &mut Vec<(String, String)>,
+    proxy_headers: &HashMap<String, String>,
+) -> Option<ws_permessage_deflate::TerminationHandshake> {
+    if !mode.is_terminate() {
+        return None;
+    }
+    let offer = proxy_header_entry_case_insensitive(proxy_headers, "sec-websocket-extensions")
+        .map(|(_, value)| value.as_str());
+    let connection_listed = headers_mod::parse_connection_listed_from_str_map(proxy_headers)
+        .iter()
+        .any(|listed| listed.eq_ignore_ascii_case("sec-websocket-extensions"));
+    Some(ws_permessage_deflate::offer_termination(
+        offer,
+        connection_listed,
+        client_headers,
+    ))
+}
+
+/// Finish a `terminate` negotiation against the backend's handshake answer.
+/// An invalid answer is an error: RFC 7692 §7 requires the client (here the
+/// gateway) to fail the connection.
+///
+/// The backend's whole `Sec-WebSocket-Extensions` answer is judged, not just
+/// its `permessage-deflate` part: the gateway offered nothing else, so a
+/// foreign extension (RFC 6455 §4.1), a malformed list, or a non-ASCII value
+/// refuses the upgrade too.
+pub(crate) fn complete_permessage_deflate_termination(
+    handshake: ws_permessage_deflate::TerminationHandshake,
+    backend_handshake: &WsBackendHandshake,
+    max_decompressed_message_bytes: usize,
+) -> Result<ws_permessage_deflate::NegotiatedTermination, &'static str> {
+    finish_permessage_deflate_termination(
+        handshake,
+        backend_handshake.backend_extensions(),
+        max_decompressed_message_bytes,
+    )
+}
+
+/// [`complete_permessage_deflate_termination`] against a raw extension answer
+/// (see [`backend_extensions_answer`]).
+pub(crate) fn finish_permessage_deflate_termination(
+    handshake: ws_permessage_deflate::TerminationHandshake,
+    backend_extensions: Option<&hyper::header::HeaderValue>,
+    max_decompressed_message_bytes: usize,
+) -> Result<ws_permessage_deflate::NegotiatedTermination, &'static str> {
+    let answer = match backend_extensions {
+        Some(value) => Some(value.to_str().map_err(|_| "non-ASCII extension answer")?),
+        None => None,
+    };
+    handshake.complete(answer, max_decompressed_message_bytes)
+}
+
 /// Forward the client's `permessage-deflate` offer to the backend handshake of
 /// a `websocket_permessage_deflate: passthrough` proxy (issue #5769).
 ///
@@ -16760,25 +16870,48 @@ pub(crate) fn push_permessage_deflate_offer(
     true
 }
 
-/// The `permessage-deflate` part of a backend handshake answer, or `None`.
+/// A backend handshake's whole `Sec-WebSocket-Extensions` answer, every field
+/// line joined with `", "` (RFC 9110 §5.3), or `None` when it sent none.
 ///
-/// Every `Sec-WebSocket-Extensions` field line is considered; a non-visible
-/// ASCII value fails closed. The caller forwards the result only when
-/// [`push_permessage_deflate_offer`] actually offered the extension.
-pub(crate) fn permessage_deflate_answer(
+/// Kept raw: a `terminate` proxy validates all of it, and a `passthrough`
+/// proxy extracts only the `permessage-deflate` part through
+/// [`permessage_deflate_answer_from`].
+pub(crate) fn backend_extensions_answer(
     headers: &hyper::HeaderMap,
 ) -> Option<hyper::header::HeaderValue> {
     let mut values = headers
         .get_all(hyper::header::SEC_WEBSOCKET_EXTENSIONS)
         .iter();
-    let first = values.next()?.to_str().ok()?;
-    let mut joined = first.to_string();
-    for value in values {
-        joined.push_str(", ");
-        joined.push_str(value.to_str().ok()?);
+    let first = values.next()?;
+    let mut rest = values.peekable();
+    if rest.peek().is_none() {
+        return Some(first.clone());
     }
-    let answer = retain_permessage_deflate_extensions(&joined)?;
+    let mut joined = first.as_bytes().to_vec();
+    for value in rest {
+        joined.extend_from_slice(b", ");
+        joined.extend_from_slice(value.as_bytes());
+    }
+    // Every part is already a valid field value, so the join is one too.
+    hyper::header::HeaderValue::from_bytes(&joined).ok()
+}
+
+/// The `permessage-deflate` part of a backend's extension answer (see
+/// [`backend_extensions_answer`]), or `None`. A non-visible-ASCII value fails
+/// closed. The caller forwards the result only when
+/// [`push_permessage_deflate_offer`] actually offered the extension.
+pub(crate) fn permessage_deflate_answer_from(
+    answer: &hyper::header::HeaderValue,
+) -> Option<hyper::header::HeaderValue> {
+    let answer = retain_permessage_deflate_extensions(answer.to_str().ok()?)?;
     hyper::header::HeaderValue::from_str(&answer).ok()
+}
+
+/// The `permessage-deflate` part of a backend handshake answer, or `None`.
+pub(crate) fn permessage_deflate_answer(
+    headers: &hyper::HeaderMap,
+) -> Option<hyper::header::HeaderValue> {
+    permessage_deflate_answer_from(&backend_extensions_answer(headers)?)
 }
 
 fn push_forwardable_header_override(
@@ -17330,12 +17463,12 @@ pub(crate) fn websocket_backend_tls_sni_unsupported(proxy: &Proxy) -> bool {
 /// that offered a subprotocol list see no negotiated value and fail
 /// application-level handshakes.
 ///
-/// `negotiated_permessage_deflate` carries only the `permessage-deflate` part
-/// of the backend's `Sec-WebSocket-Extensions` answer. The frontend forwards it
-/// solely for a `websocket_permessage_deflate: passthrough` proxy that offered
-/// the extension, and then relays the session as raw bytes: the frame bridge
-/// cannot decode RSV1-compressed frames (issue #5769). Every other path keeps
-/// the extension stripped end to end.
+/// `backend_extensions` carries the backend's whole `Sec-WebSocket-Extensions`
+/// answer. A `websocket_permessage_deflate: passthrough` proxy that offered
+/// the extension forwards only its `permessage-deflate` part and then relays
+/// the session as raw bytes: the frame bridge cannot decode RSV1-compressed
+/// frames (issue #5769). A `terminate` proxy validates the whole answer. Every
+/// other path keeps the extension stripped end to end.
 /// Backend WebSocket transport: TLS (or plain) over the byte-level idle
 /// activity adapter over TCP. The `WsActivityIo` layer sits UNDER the
 /// framer so fragmented-message read progress refreshes the shared idle
@@ -17347,7 +17480,7 @@ pub type BackendWsStream =
 pub(crate) struct BackendWsHandshake {
     pub stream: BackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
-    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
+    pub backend_extensions: Option<hyper::header::HeaderValue>,
 }
 
 /// Backend WebSocket transport for a mesh egress session: the raw WebSocket
@@ -17361,7 +17494,7 @@ type MeshBackendWsStream = WebSocketStream<WsActivityIo<crate::proxy::hbone_pool
 pub(crate) struct MeshBackendWsHandshake {
     pub stream: MeshBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
-    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
+    pub backend_extensions: Option<hyper::header::HeaderValue>,
 }
 
 /// Backend WebSocket transport for a sidecar-ingress Unix-domain backend
@@ -17377,7 +17510,7 @@ type UnixBackendWsStream = WebSocketStream<WsActivityIo<tokio::net::UnixStream>>
 pub(crate) struct UnixBackendWsHandshake {
     pub stream: UnixBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
-    pub negotiated_permessage_deflate: Option<hyper::header::HeaderValue>,
+    pub backend_extensions: Option<hyper::header::HeaderValue>,
     conn_lease: unix_backend_pool::UnixWebSocketConnLease,
 }
 
@@ -17406,14 +17539,21 @@ impl WsBackendHandshake {
         }
     }
 
-    /// The backend's `permessage-deflate` answer (see [`BackendWsHandshake`]).
-    pub(crate) fn negotiated_permessage_deflate(&self) -> Option<&hyper::header::HeaderValue> {
+    /// The backend's whole extension answer (see [`BackendWsHandshake`]).
+    pub(crate) fn backend_extensions(&self) -> Option<&hyper::header::HeaderValue> {
         match self {
-            Self::Direct(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
-            Self::Mesh(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
+            Self::Direct(handshake) => handshake.backend_extensions.as_ref(),
+            Self::Mesh(handshake) => handshake.backend_extensions.as_ref(),
             #[cfg(unix)]
-            Self::Unix(handshake) => handshake.negotiated_permessage_deflate.as_ref(),
+            Self::Unix(handshake) => handshake.backend_extensions.as_ref(),
         }
+    }
+
+    /// The `permessage-deflate` part of the backend's answer, which a
+    /// `passthrough` proxy forwards.
+    pub(crate) fn negotiated_permessage_deflate(&self) -> Option<hyper::header::HeaderValue> {
+        self.backend_extensions()
+            .and_then(permessage_deflate_answer_from)
     }
 }
 
@@ -17625,12 +17765,12 @@ pub(crate) async fn connect_websocket_backend(
         .headers()
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
-    let negotiated_permessage_deflate = permessage_deflate_answer(backend_response.headers());
+    let backend_extensions = backend_extensions_answer(backend_response.headers());
 
     Ok(BackendWsHandshake {
         stream: backend_ws_stream,
         negotiated_subprotocol,
-        negotiated_permessage_deflate,
+        backend_extensions,
     })
 }
 
@@ -17796,12 +17936,12 @@ async fn connect_unix_websocket_backend(
         .headers()
         .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
-    let negotiated_permessage_deflate = permessage_deflate_answer(response.headers());
+    let backend_extensions = backend_extensions_answer(response.headers());
 
     Ok(UnixBackendWsHandshake {
         stream,
         negotiated_subprotocol,
-        negotiated_permessage_deflate,
+        backend_extensions,
         conn_lease,
     })
 }
@@ -18136,7 +18276,7 @@ pub(crate) async fn connect_mesh_websocket_backend(
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol: ws_tunnel.negotiated_subprotocol,
-                negotiated_permessage_deflate: ws_tunnel.negotiated_permessage_deflate,
+                backend_extensions: ws_tunnel.backend_extensions,
             })
         }
         MeshWsEgress::AmbientHbone => {
@@ -18357,12 +18497,12 @@ pub(crate) async fn connect_mesh_websocket_backend(
                 .headers()
                 .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
                 .cloned();
-            let negotiated_permessage_deflate = permessage_deflate_answer(response.headers());
+            let backend_extensions = backend_extensions_answer(response.headers());
 
             Ok(MeshBackendWsHandshake {
                 stream,
                 negotiated_subprotocol,
-                negotiated_permessage_deflate,
+                backend_extensions,
             })
         }
     }
@@ -19057,6 +19197,20 @@ pub(crate) fn ws_capacity_error_class(_size: usize, client_to_backend: bool) -> 
     }
 }
 
+/// Directional class for a terminated `permessage-deflate` read fault: a size
+/// limit is the same body-too-large class as a parser capacity overflow, and
+/// corrupt compressed data is a protocol error.
+pub(crate) fn ws_permessage_deflate_error_class(
+    fault: ws_permessage_deflate::PermessageDeflateFault,
+    client_to_backend: bool,
+) -> retry::ErrorClass {
+    if fault.is_size_limit() {
+        ws_capacity_error_class(0, client_to_backend)
+    } else {
+        retry::ErrorClass::ProtocolError
+    }
+}
+
 /// Bounded, non-secret RFC 6455 Close 1009 for global parser capacity overflow.
 pub(crate) fn ws_global_capacity_close_frame() -> CloseFrame {
     CloseFrame {
@@ -19572,6 +19726,123 @@ where
     writer.flush().await
 }
 
+/// Entry point for every frontend's WebSocket relay (H1 Upgrade, H2 and H3
+/// Extended CONNECT).
+///
+/// `permessage_deflate` is `Some` only for a `websocket_permessage_deflate:
+/// terminate` session in which at least one leg negotiated RFC 7692
+/// compression (issue #5769). That session runs the parsed relay over
+/// inflating transports ([`ws_permessage_deflate::PermessageDeflateIo`]) with
+/// per-leg encoders, never tunnel mode, because the two legs may disagree on
+/// compression and every message must reach the plugins as plaintext. It is
+/// boxed and type-erased so it is one relay instantiation for every transport
+/// pair and adds nothing to the size of the ordinary session future.
+///
+/// Every other session (`strip`, `passthrough`, or a `terminate` session whose
+/// peers both declined) goes straight to [`run_websocket_proxy`] with the
+/// identity codec, exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_websocket_session<C, B>(
+    client_io: C,
+    backend_ws_stream: WebSocketStream<B>,
+    proxy_id: &str,
+    connection_id: u64,
+    ws_framing_plugins: Vec<Arc<dyn Plugin>>,
+    ws_frame_plugins: Vec<Arc<dyn Plugin>>,
+    ws_disconnect_plugins: Vec<Arc<dyn Plugin>>,
+    session_meta: WsSessionMeta,
+    ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
+    websocket_tunnel_mode: bool,
+    websocket_tunnel_idle_disabled_safety_cap: Duration,
+    ws_idle_tracker: Option<Arc<WsIdleTracker>>,
+    session_deadline: WsSessionDeadline,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    overload: Arc<crate::overload::OverloadState>,
+    fragment_policy: WsFragmentPolicy,
+    adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
+    client_trust: Option<crate::tls::ClientTrustSession>,
+    permessage_deflate: Option<ws_permessage_deflate::WsDeflateTermination>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(permessage_deflate) = permessage_deflate else {
+        return run_websocket_proxy(
+            client_io,
+            backend_ws_stream,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            ws_connection_permit,
+            max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            websocket_tunnel_mode,
+            websocket_tunnel_idle_disabled_safety_cap,
+            ws_idle_tracker,
+            session_deadline,
+            shutdown_rx,
+            overload,
+            fragment_policy,
+            adaptive_buffer,
+            client_trust,
+            ws_permessage_deflate::PlainOutbound,
+            ws_permessage_deflate::PlainOutbound,
+        )
+        .await;
+    };
+    // Boxed as a whole, so the terminated branch's framer rebuild and relay
+    // occupy heap, not the caller's session future.
+    Box::pin(async move {
+        // The client framer's ceilings, computed exactly as the relay computes
+        // them, bound the client-leg inflater; the backend framer's own
+        // configuration bounds the backend-leg inflater.
+        let client_limits = EffectiveWsSizeLimits::from_plugins(
+            max_websocket_frame_size_bytes,
+            &ws_framing_plugins,
+        );
+        let streams = permessage_deflate
+            .wrap(
+                client_io,
+                backend_ws_stream,
+                client_limits.max_frame_bytes,
+                client_limits.max_message_bytes,
+            )
+            .await;
+        run_websocket_proxy(
+            streams.client_io,
+            streams.backend,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            ws_connection_permit,
+            max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            false,
+            websocket_tunnel_idle_disabled_safety_cap,
+            ws_idle_tracker,
+            session_deadline,
+            shutdown_rx,
+            overload,
+            fragment_policy,
+            adaptive_buffer,
+            client_trust,
+            streams.to_backend,
+            streams.to_client,
+        )
+        .await
+    })
+    .await
+}
+
 /// Generic over the client transport type `C`. The H1/H2 frontend passes
 /// `TokioIo::new(upgraded)` (hyper's `Upgraded` adapted to tokio AsyncRead+AsyncWrite);
 /// the H3 frontend (RFC 9220 Extended CONNECT) passes a `tokio::io::DuplexStream`
@@ -19592,8 +19863,13 @@ where
 /// — so H1, H2, and H3 all run this framer with `accept_unmasked_frames` off:
 /// masked client frames are unmasked here, and an unmasked one is a protocol
 /// error that closes the client with 1002 (issue #5011).
+///
+/// Frontends call [`run_websocket_session`], which dispatches here: with the
+/// identity [`ws_permessage_deflate::PlainOutbound`] codec for ordinary
+/// sessions, or over inflating transports with per-leg encoders for a
+/// `websocket_permessage_deflate: terminate` session (issue #5769).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_websocket_proxy<C, B>(
+pub(crate) async fn run_websocket_proxy<C, B, E>(
     client_io: C,
     mut backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
@@ -19618,6 +19894,10 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     // not admitted on a client certificate, in which case the stop arbiter
     // registers no additional waker at all.
     client_trust: Option<crate::tls::ClientTrustSession>,
+    // Applied to each message after every plugin has seen it, just before it
+    // is written toward the backend / client (RFC 7692 re-deflate).
+    mut to_backend_codec: E,
+    mut to_client_codec: E,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -19628,6 +19908,7 @@ where
     // fast path is H1-only; both transports satisfy the bound, so the early
     // return below stays generic.
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    E: ws_permessage_deflate::WsOutboundCodec,
 {
     // Issue #3857: the HTTP connection guard is dropped when
     // `serve_connection_with_upgrades` returns, which for an H1 upgrade is
@@ -20104,6 +20385,10 @@ where
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
                             let delivery =
                                 prepare_ws_frame_deliveries(&ctb_plugins, &outgoing);
+                            // RFC 7692 terminate: re-deflate toward a backend
+                            // leg that negotiated compression, after every
+                            // plugin saw the plaintext. Identity otherwise.
+                            let outgoing = to_backend_codec.encode(outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_ctb.cancelled() => {
@@ -20280,6 +20565,24 @@ where
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::ProtocolError
+                            } else if let Some(fault) =
+                                ws_permessage_deflate::permessage_deflate_fault(&e)
+                            {
+                                let limit_kind = fault.kind();
+                                warn_sampled!(
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    "WebSocket permessage-deflate input rejected before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(fault.close_frame()),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                ws_permessage_deflate_error_class(fault, true)
                             } else {
                                 error!("Error receiving from client: {}", e);
                                 let class = retry::classify_boxed_error(&e);
@@ -20443,6 +20746,9 @@ where
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
                             let delivery =
                                 prepare_ws_frame_deliveries(&btc_plugins, &outgoing);
+                            // Mirror of c2b: re-deflate toward a client leg
+                            // that negotiated compression.
+                            let outgoing = to_client_codec.encode(outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
@@ -20604,6 +20910,24 @@ where
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
                                 retry::ErrorClass::ProtocolError
+                            } else if let Some(fault) =
+                                ws_permessage_deflate::permessage_deflate_fault(&e)
+                            {
+                                let limit_kind = fault.kind();
+                                warn_sampled!(
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    "WebSocket permessage-deflate input rejected before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(fault.close_frame()),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                ws_permessage_deflate_error_class(fault, false)
                             } else {
                                 error!("Error receiving from backend: {}", e);
                                 let class = retry::classify_boxed_error(&e);
@@ -35783,28 +36107,34 @@ async fn handle_proxy_request_inner(
             if grpc_has_retry {
                 grpc_replay_headers = grpc_headers.clone();
             }
-            let result = grpc_proxy::proxy_grpc_request_core(
-                grpc_method,
-                grpc_headers,
-                grpc_req_body.clone(),
-                crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                grpc_dispatch_proxy,
-                &grpc_backend_url,
-                // The transport materialized for THIS target before any dial:
-                // the direct pool for an untagged target, the nested-HTTP/2
-                // HBONE transport for an Ambient `mesh.hbone` one. A
-                // `mesh.mtls` target never reaches here — it is routed onto the
-                // generic mesh-mTLS path by `grpc_mesh_dispatch_falls_through`
-                // and defensively refused by the screen above (issues #2003,
-                // #3284, #3728).
-                &grpc_transport,
-                &state.dns_cache,
-                owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                grpc_should_stream,
-                effective_max_response_body_size_bytes,
-                ctx.grpc_deadline_at(),
-            )
-            .await;
+            let headers_view = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+            // The attempt's `otel_tracing` CLIENT span (issue #5864).
+            let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
+            let result = {
+                let attempt = grpc_proxy::proxy_grpc_request_core(
+                    grpc_method,
+                    grpc_headers,
+                    grpc_req_body.clone(),
+                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                    grpc_dispatch_proxy,
+                    &grpc_backend_url,
+                    // The transport materialized for THIS target before any dial:
+                    // the direct pool for an untagged target, the nested-HTTP/2
+                    // HBONE transport for an Ambient `mesh.hbone` one. A
+                    // `mesh.mtls` target never reaches here — it is routed onto the
+                    // generic mesh-mTLS path by `grpc_mesh_dispatch_falls_through`
+                    // and defensively refused by the screen above (issues #2003,
+                    // #3284, #3728).
+                    &grpc_transport,
+                    &state.dns_cache,
+                    attempt_span.headers(headers_view),
+                    grpc_should_stream,
+                    effective_max_response_body_size_bytes,
+                    ctx.grpc_deadline_at(),
+                );
+                tokio::pin!(attempt);
+                attempt_span.scope(attempt).await
+            };
             (result, grpc_req_body)
         } else {
             // Fast path: no plugin body hooks needed
@@ -35947,41 +36277,47 @@ async fn handle_proxy_request_inner(
                     Arc::clone(&ctx.bytes_sent_observed),
                     request_bytes_latch,
                 );
-                let result = grpc_proxy::proxy_grpc_request_streaming(
-                    request,
-                    grpc_dispatch_proxy,
-                    &grpc_backend_url,
-                    // Same materialized transport as the buffered arms. A
-                    // fully-streamed (non-replayable) upload can therefore ride
-                    // the Ambient HBONE tunnel's nested HTTP/2 connection with
-                    // frames committed incrementally and no retry (issue #3728).
-                    &grpc_transport,
-                    &state.dns_cache,
-                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                    effective_max_grpc_recv_size_bytes,
-                    body_size_exceeded,
-                    upload_observer,
-                    ctx.grpc_deadline_at(),
-                    &mut held_frontend_grpc_upload,
-                    // Scans the upload's own framing: a pass-through
-                    // gRPC-Web upload counts decoded message frames only.
-                    Some(
-                        crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
-                            Arc::clone(&ctx.grpc_request_messages_observed),
-                            crate::plugins::grpc_web::request_upload_grpc_message_framing(&ctx),
+                let headers_view = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+                // The attempt's `otel_tracing` CLIENT span (issue #5864).
+                let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
+                let result = {
+                    let attempt = grpc_proxy::proxy_grpc_request_streaming(
+                        request,
+                        grpc_dispatch_proxy,
+                        &grpc_backend_url,
+                        // Same materialized transport as the buffered arms. A
+                        // fully-streamed (non-replayable) upload can therefore ride
+                        // the Ambient HBONE tunnel's nested HTTP/2 connection with
+                        // frames committed incrementally and no retry (issue #3728).
+                        &grpc_transport,
+                        &state.dns_cache,
+                        attempt_span.headers(headers_view),
+                        effective_max_grpc_recv_size_bytes,
+                        body_size_exceeded,
+                        upload_observer,
+                        ctx.grpc_deadline_at(),
+                        &mut held_frontend_grpc_upload,
+                        // Scans the upload's own framing: a pass-through
+                        // gRPC-Web upload counts decoded message frames only.
+                        Some(
+                            crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
+                                Arc::clone(&ctx.grpc_request_messages_observed),
+                                crate::plugins::grpc_web::request_upload_grpc_message_framing(&ctx),
+                            ),
                         ),
-                    ),
-                    // The buffered arms `fetch_max` the collected length into
-                    // this counter; the streamed arm has no collected length,
-                    // so the body publishes its forwarded DATA tally at upload
-                    // termination instead (GHSA-8x5h-g4xh-hgc9).
-                    Some(request_bytes_accounting),
-                    // Same absolute plan the buffered gRPC arms use (#3815);
-                    // the fully-streamed upload gets the gateway-owned pump
-                    // instead of a bounded collect.
-                    grpc_buffered_upload_auth_deadline.as_ref(),
-                )
-                .await;
+                        // The buffered arms `fetch_max` the collected length into
+                        // this counter; the streamed arm has no collected length,
+                        // so the body publishes its forwarded DATA tally at upload
+                        // termination instead (GHSA-8x5h-g4xh-hgc9).
+                        Some(request_bytes_accounting),
+                        // Same absolute plan the buffered gRPC arms use (#3815);
+                        // the fully-streamed upload gets the gateway-owned pump
+                        // instead of a bounded collect.
+                        grpc_buffered_upload_auth_deadline.as_ref(),
+                    );
+                    tokio::pin!(attempt);
+                    attempt_span.scope(attempt).await
+                };
                 (result, Bytes::new())
             } else {
                 // Mixed path: collect request body up-front (required for
@@ -36080,23 +36416,30 @@ async fn handle_proxy_request_inner(
                         if grpc_has_retry {
                             grpc_replay_headers = grpc_headers.clone();
                         }
-                        let result = grpc_proxy::proxy_grpc_request_core(
-                            grpc_method,
-                            grpc_headers,
-                            grpc_req_body.clone(),
-                            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                            grpc_dispatch_proxy,
-                            &grpc_backend_url,
-                            // The same materialized transport as the split-path
-                            // call above (issues #2003, #3284, #3728).
-                            &grpc_transport,
-                            &state.dns_cache,
-                            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                            grpc_should_stream,
-                            effective_max_response_body_size_bytes,
-                            ctx.grpc_deadline_at(),
-                        )
-                        .await;
+                        let headers_view = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+                        // The attempt's `otel_tracing` CLIENT span (issue #5864).
+                        let attempt_span =
+                            ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
+                        let result = {
+                            let attempt = grpc_proxy::proxy_grpc_request_core(
+                                grpc_method,
+                                grpc_headers,
+                                grpc_req_body.clone(),
+                                crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                                grpc_dispatch_proxy,
+                                &grpc_backend_url,
+                                // The same materialized transport as the split-path
+                                // call above (issues #2003, #3284, #3728).
+                                &grpc_transport,
+                                &state.dns_cache,
+                                attempt_span.headers(headers_view),
+                                grpc_should_stream,
+                                effective_max_response_body_size_bytes,
+                                ctx.grpc_deadline_at(),
+                            );
+                            tokio::pin!(attempt);
+                            attempt_span.scope(attempt).await
+                        };
                         (result, grpc_req_body)
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
@@ -36671,26 +37014,32 @@ async fn handle_proxy_request_inner(
                 // A fresh route attempt budget for this retry (a no-op unless the
                 // matched rule carries one), still capped by the total deadline.
                 ctx.begin_grpc_route_attempt();
-                grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
-                    grpc_method.clone(),
-                    grpc_req_headers.clone(),
-                    grpc_body_bytes.clone(),
-                    // A retry replays the complete request, trailers included.
-                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                    grpc_retry_effective_proxy.as_ref(),
-                    &grpc_backend_url,
-                    // The transport re-materialized for THIS attempt's target:
-                    // the loop re-screens every rotated target above and refuses
-                    // any class this pipeline cannot carry before reaching here
-                    // (issues #2003, #3728).
-                    &grpc_retry_transport,
-                    &state.dns_cache,
-                    owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
-                    grpc_should_stream,
-                    effective_max_response_body_size_bytes,
-                    ctx.grpc_deadline_at(),
-                )
-                .await;
+                let headers_view = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+                // The attempt's `otel_tracing` CLIENT span (issue #5864).
+                let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
+                grpc_result = {
+                    let attempt = grpc_proxy::proxy_grpc_request_from_bytes(
+                        grpc_method.clone(),
+                        grpc_req_headers.clone(),
+                        grpc_body_bytes.clone(),
+                        // A retry replays the complete request, trailers included.
+                        crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                        grpc_retry_effective_proxy.as_ref(),
+                        &grpc_backend_url,
+                        // The transport re-materialized for THIS attempt's target:
+                        // the loop re-screens every rotated target above and refuses
+                        // any class this pipeline cannot carry before reaching here
+                        // (issues #2003, #3728).
+                        &grpc_retry_transport,
+                        &state.dns_cache,
+                        attempt_span.headers(headers_view),
+                        grpc_should_stream,
+                        effective_max_response_body_size_bytes,
+                        ctx.grpc_deadline_at(),
+                    );
+                    tokio::pin!(attempt);
+                    attempt_span.scope(attempt).await
+                };
                 grpc_last_attempt_recorded = false;
                 if charge_grpc_route_attempt_budget_expiry(&ctx, &mut grpc_result) {
                     // As for the initial attempt: the charged terminal bounds
@@ -39102,19 +39451,30 @@ async fn handle_proxy_request_inner(
         // and the rule's per-attempt budget starts there. It also keeps the
         // retained request body if the budget cancels the attempt.
         let initial_attempt_handoff = BackendAttemptHandoff::default();
-        let initial_attempt = await_route_request_deadline(
+        // The attempt's `otel_tracing` CLIENT span (issue #5864): the backend
+        // receives the attempt's own `traceparent` when a trace is installed.
+        let initial_attempt_span = ctx.begin_backend_attempt_span(
+            &current_url,
+            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+        );
+        // `proxy_to_backend` admits and prepares the request before it hands
+        // it over, and marks that handoff itself: an attempt refused before it
+        // (backend admission) never reached the backend and is not exported.
+        initial_attempt_span.handoff_reported_by_dispatch();
+        let initial_attempt = await_backend_attempt_route_deadline(
             route_request_deadline,
             RouteAttemptBudget::from_handoff(
                 route_attempt_timeout,
                 initial_attempt_handoff.marker(),
                 &mut route_attempt_deadline,
             ),
+            initial_attempt_span.trace(),
             proxy_to_backend(
                 &state,
                 &proxy,
                 &current_url,
                 &method,
-                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                initial_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
                 client_request_body,
                 upstream_target.as_deref(),
                 &plugins,
@@ -39141,6 +39501,11 @@ async fn handle_proxy_request_inner(
         )
         .await;
         let initial_handed_to_backend = initial_attempt_handoff.handed_to_backend();
+        // The attempt span starts where the backend dial / send began, after
+        // the dispatch prepared the request (issue #5864).
+        if initial_handed_to_backend {
+            initial_attempt_span.handed_off_at(backend_admission_started_at);
+        }
         let initial_dispatch = match initial_attempt {
             Ok(dispatch) => dispatch,
             Err(expiry) => route_deadline_dispatch_result(
@@ -39779,16 +40144,25 @@ async fn handle_proxy_request_inner(
             ctx.begin_grpc_route_attempt();
             let retry_attempt_budget =
                 RouteAttemptBudget::from_start(route_attempt_timeout, &mut route_attempt_deadline);
+            // This retry's own `otel_tracing` CLIENT span and `traceparent`
+            // (issue #5864).
+            let retry_attempt_span = ctx.begin_backend_attempt_span(
+                &current_url,
+                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+            );
+            let retry_attempt_headers =
+                retry_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers));
             let attempt_result = if retry_dispatch_hbone || retry_dispatch_mesh_mtls {
-                match await_route_request_deadline(
+                match await_backend_attempt_route_deadline(
                     route_request_deadline,
                     retry_attempt_budget,
+                    retry_attempt_span.trace(),
                     proxy_to_backend_mesh_retry(
                         &state,
                         &proxy,
                         &current_url,
                         &method,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        retry_attempt_headers,
                         current_target.as_deref(),
                         retained_body.as_ref(),
                         mesh_retry_headers.as_deref(),
@@ -39815,15 +40189,16 @@ async fn handle_proxy_request_inner(
                     }
                 }
             } else if current_dispatch_h3 {
-                await_route_request_deadline(
+                await_backend_attempt_route_deadline(
                     route_request_deadline,
                     retry_attempt_budget,
+                    retry_attempt_span.trace(),
                     proxy_to_backend_http3_retry(
                         &state,
                         &proxy,
                         &current_url,
                         &method,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        retry_attempt_headers,
                         current_target.as_deref(),
                         retained_body.as_deref(),
                         should_stream,
@@ -39837,15 +40212,16 @@ async fn handle_proxy_request_inner(
                 )
                 .await
             } else {
-                await_route_request_deadline(
+                await_backend_attempt_route_deadline(
                     route_request_deadline,
                     retry_attempt_budget,
+                    retry_attempt_span.trace(),
                     proxy_to_backend_retry(
                         &state,
                         &proxy,
                         &current_url,
                         &method,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        retry_attempt_headers,
                         current_target.as_deref(),
                         retained_body.as_deref(),
                         should_stream,
@@ -39918,19 +40294,26 @@ async fn handle_proxy_request_inner(
         let mut body_hook_ctx = deferred_body_hook_ctx.take();
         // See `initial_attempt_handoff` in the retry arm above.
         let dispatch_attempt_handoff = BackendAttemptHandoff::default();
-        let dispatch_attempt = await_route_request_deadline(
+        // See `initial_attempt_span` in the retry arm above.
+        let dispatch_attempt_span = ctx.begin_backend_attempt_span(
+            &backend_url,
+            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+        );
+        dispatch_attempt_span.handoff_reported_by_dispatch();
+        let dispatch_attempt = await_backend_attempt_route_deadline(
             route_request_deadline,
             RouteAttemptBudget::from_handoff(
                 route_attempt_timeout,
                 dispatch_attempt_handoff.marker(),
                 &mut route_attempt_deadline,
             ),
+            dispatch_attempt_span.trace(),
             proxy_to_backend(
                 &state,
                 &proxy,
                 &backend_url,
                 &method,
-                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                dispatch_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
                 client_request_body,
                 upstream_target.as_deref(),
                 &plugins,
@@ -39957,6 +40340,10 @@ async fn handle_proxy_request_inner(
         )
         .await;
         let dispatch_handed_to_backend = dispatch_attempt_handoff.handed_to_backend();
+        // See `initial_attempt_span.handed_off_at` in the retry arm above.
+        if dispatch_handed_to_backend {
+            dispatch_attempt_span.handed_off_at(backend_admission_started_at);
+        }
         let dispatch = match dispatch_attempt {
             Ok(dispatch) => dispatch,
             Err(expiry) => route_deadline_dispatch_result(
@@ -50554,6 +50941,9 @@ impl BackendAttemptHandoff {
             let _ = self.retained_body.set(body.clone());
         }
         self.handed_to_backend.store(true, Ordering::Relaxed);
+        // The attempt's `otel_tracing` CLIENT span, if any, is now the parent
+        // the backend holds (issue #5864).
+        crate::plugins::otel_tracing::note_backend_attempt_handed_off();
     }
 
     /// The dispatch marker the route deadline wrapper observes.
@@ -50671,12 +51061,29 @@ pub(crate) fn await_route_request_deadline<F>(
 where
     F: std::future::Future,
 {
+    await_backend_attempt_route_deadline(deadline, attempt_budget, None, attempt)
+}
+
+/// [`await_route_request_deadline`] for a backend attempt begun with
+/// `RequestContext::begin_backend_attempt_span`: every poll of the attempt runs
+/// in the attempt's `otel_tracing` scope (issue #5864). With `trace` `None`
+/// this is exactly [`await_route_request_deadline`].
+pub(crate) fn await_backend_attempt_route_deadline<F>(
+    deadline: Option<tokio::time::Instant>,
+    attempt_budget: Option<RouteAttemptBudget<'_>>,
+    trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
+    attempt: F,
+) -> RouteDeadlineAttempt<'_, F>
+where
+    F: std::future::Future,
+{
     RouteDeadlineAttempt {
         attempt,
         sleep: None,
         deadline,
         attempt_budget,
         started: false,
+        trace,
     }
 }
 
@@ -50696,6 +51103,7 @@ pin_project_lite::pin_project! {
         deadline: Option<tokio::time::Instant>,
         attempt_budget: Option<RouteAttemptBudget<'a>>,
         started: bool,
+        trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
     }
 }
 
@@ -50705,7 +51113,12 @@ impl<F: std::future::Future> std::future::Future for RouteDeadlineAttempt<'_, F>
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         if this.deadline.is_none() && this.attempt_budget.is_none() {
-            return this.attempt.poll(cx).map(Ok);
+            return crate::plugins::otel_tracing::poll_backend_attempt(
+                this.trace.as_ref(),
+                this.attempt,
+                cx,
+            )
+            .map(Ok);
         }
         let deadline = *this.deadline;
         // The first poll: a spent total budget refuses the attempt before any
@@ -50719,7 +51132,11 @@ impl<F: std::future::Future> std::future::Future for RouteDeadlineAttempt<'_, F>
         if let Some(budget) = this.attempt_budget.as_mut() {
             budget.arm_if_handed_over();
         }
-        if let Poll::Ready(output) = this.attempt.poll(cx) {
+        if let Poll::Ready(output) = crate::plugins::otel_tracing::poll_backend_attempt(
+            this.trace.as_ref(),
+            this.attempt.as_mut(),
+            cx,
+        ) {
             // An attempt handed to the backend and answered within the same
             // poll still starts its budget, which then bounds the committed
             // attempt's streaming body.
@@ -66301,8 +66718,9 @@ mod tests {
             .find(call_marker)
             .expect("retry-loop call to proxy_grpc_request_from_bytes not found");
         let call_tail = &loop_body[call_idx..];
+        // Anchored on the pin that follows the call, not on its indentation.
         let call_end = call_tail
-            .find(")\n                .await")
+            .find("tokio::pin!(attempt)")
             .expect("end of retry-loop call not found");
         let call_args = &call_tail[..call_end];
 

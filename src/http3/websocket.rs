@@ -91,7 +91,9 @@
 //! passthrough` session that actually negotiated the extension (issue #5769):
 //! its RSV1-compressed frames cannot pass the frame parser, so it is relayed
 //! as raw bytes between the duplex half and the backend. The offer is only
-//! forwarded when no plugin on the chain requires the parsed relay.
+//! forwarded when no plugin on the chain requires the parsed relay. A
+//! `terminate` session is the opposite: it always frame-parses, over
+//! transports that inflate each leg's compressed frames beneath the framer.
 //!
 //! ## Circuit breaker + load balancer accounting
 //!
@@ -741,6 +743,12 @@ pub(crate) async fn handle_h3_websocket(
         &mut client_headers,
         &proxy_headers,
     );
+    // RFC 7692 terminate (issue #5769), the same shared negotiation as H1/H2.
+    let ws_deflate_termination = crate::proxy::begin_permessage_deflate_termination(
+        proxy.websocket_permessage_deflate,
+        &mut client_headers,
+        &proxy_headers,
+    );
 
     // ── Backend WebSocket handshake (reuses H1.1 Upgrade path) ──────
     //
@@ -1355,6 +1363,50 @@ pub(crate) async fn handle_h3_websocket(
         return Ok(());
     }
 
+    let ws_deflate_negotiation = match ws_deflate_termination {
+        None => crate::proxy::ws_permessage_deflate::NegotiatedTermination::default(),
+        Some(handshake) => match crate::proxy::complete_permessage_deflate_termination(
+            handshake,
+            &backend_handshake,
+            state
+                .env_config
+                .websocket_permessage_deflate_max_message_bytes,
+        ) {
+            Ok(negotiated) => negotiated,
+            Err(reason) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    reason,
+                    "H3 WS: rejecting upgrade: invalid backend permessage-deflate answer"
+                );
+                // Boxed: this future is polled inside `handle_h3_request`'s
+                // stack budget, so the reject ladder must not add inline slots.
+                Box::pin(async {
+                    crate::proxy::log_rejected_request_with_path(
+                        &plugins,
+                        &ctx,
+                        502,
+                        start_time,
+                        "websocket_permessage_deflate",
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                    )
+                    .await;
+                    send_h3_error_body(
+                        &mut stream,
+                        StatusCode::BAD_GATEWAY,
+                        r#"{"error":"Backend WebSocket extension negotiation failed"}"#,
+                        &initial_response_header_policy_plugins,
+                    )
+                    .await;
+                })
+                .await;
+                crate::proxy::record_request(&state, 502);
+                return Ok(());
+            }
+        },
+    };
+
     // Capture the LB connection guard NOW — before the 200 is sent — so
     // a panic anywhere below still releases the per-target connection
     // count. The guard is moved into the session task below.
@@ -1427,7 +1479,7 @@ pub(crate) async fn handle_h3_websocket(
     // Forward the backend's permessage-deflate answer only when this upgrade
     // offered it; a negotiated session is relayed as raw bytes below.
     let ws_negotiated_deflate = if ws_deflate_offered {
-        backend_handshake.negotiated_permessage_deflate().cloned()
+        backend_handshake.negotiated_permessage_deflate()
     } else {
         None
     };
@@ -1435,6 +1487,11 @@ pub(crate) async fn handle_h3_websocket(
     if let Some(extensions) = ws_negotiated_deflate {
         response_builder = response_builder.header("sec-websocket-extensions", extensions);
     }
+    // A `terminate` proxy answers the client with the gateway's own agreement.
+    if let Some(extensions) = ws_deflate_negotiation.client_response {
+        response_builder = response_builder.header("sec-websocket-extensions", extensions);
+    }
+    let ws_deflate_session = ws_deflate_negotiation.session;
     let response = match response_builder.body(()) {
         Ok(r) => r,
         Err(e) => {
@@ -1628,7 +1685,7 @@ pub(crate) async fn handle_h3_websocket(
     let relay_result = match backend_handshake {
         crate::proxy::WsBackendHandshake::Direct(handshake) => {
             let handshake = *handshake;
-            crate::proxy::run_websocket_proxy(
+            crate::proxy::run_websocket_session(
                 client_io,
                 handshake.stream,
                 &proxy_id_for_relay,
@@ -1649,12 +1706,13 @@ pub(crate) async fn handle_h3_websocket(
                 crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
                 &adaptive_buf,
                 ws_client_trust_session,
+                ws_deflate_session,
             )
             .await
         }
         crate::proxy::WsBackendHandshake::Mesh(handshake) => {
             let handshake = *handshake;
-            crate::proxy::run_websocket_proxy(
+            crate::proxy::run_websocket_session(
                 client_io,
                 handshake.stream,
                 &proxy_id_for_relay,
@@ -1675,6 +1733,7 @@ pub(crate) async fn handle_h3_websocket(
                 crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
                 &adaptive_buf,
                 ws_client_trust_session,
+                ws_deflate_session,
             )
             .await
         }

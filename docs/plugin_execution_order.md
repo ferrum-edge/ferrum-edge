@@ -1190,6 +1190,14 @@ require the parsed relay (`waf`, `ws_frame_logging`, `ws_message_size_limiting`,
 requirement is `false`. A session that negotiates `permessage-deflate` always uses
 the raw relay, on H1, H2, and H3 alike.
 
+`websocket_permessage_deflate: terminate` does not interact with this
+requirement. The gateway inflates each message beneath the relay's frame parser,
+so `on_ws_frame`, `on_ws_reassembly_frames`, parser size limits, and delivery
+hooks all observe plaintext messages with their wire fragmentation, and it
+re-deflates a Text or Binary message toward a compressing leg only after the
+whole chain (and the delivery preparation) has run. A negotiated terminate
+session always uses the parsed relay, even with no framing plugin.
+
 ## UDP Datagram Lifecycle (`on_udp_datagram`)
 
 UDP proxies support per-datagram plugin hooks that fire before each client-to-backend and backend-to-client datagram is forwarded. This is separate from the `on_stream_connect`/`on_stream_disconnect` lifecycle, which fires once per session.

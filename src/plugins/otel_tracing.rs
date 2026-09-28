@@ -56,6 +56,16 @@ use super::{
     TransactionSummary, WsDisconnectContext,
 };
 
+mod attempt_spans;
+
+use attempt_spans::{AttemptSpanSink, BackendAttemptAttributes};
+pub(crate) use attempt_spans::{
+    BackendAttemptSpan, BackendAttemptTrace, note_backend_attempt_handed_off,
+    note_backend_connection_established, note_backend_connection_reused,
+    note_backend_connection_setup_started, note_backend_dns_resolution, note_backend_tcp_connect,
+    note_backend_tls_handshake, poll_backend_attempt,
+};
+
 const TRACEPARENT_HEADER: &str = "traceparent";
 const TRACESTATE_HEADER: &str = "tracestate";
 const SUPPORTED_TRACEPARENT_VERSION: &str = "00";
@@ -134,6 +144,8 @@ pub struct OtelTracing {
     include_url_path: bool,
     max_attribute_bytes: usize,
     exporter: Option<Arc<dyn TraceExporter>>,
+    /// Exports per-attempt CLIENT spans; present exactly when `exporter` is.
+    attempt_sink: Option<Arc<AttemptSpanSink>>,
     export_drop_log_limiter: Mutex<LogRateLimiter>,
 }
 
@@ -226,6 +238,8 @@ pub(crate) struct SpanData {
     pub(crate) stream_io_side: Option<String>,
     pub(crate) ws_frames_client_to_backend: Option<u64>,
     pub(crate) ws_frames_backend_to_client: Option<u64>,
+    /// Set only on a CLIENT backend attempt span (issue #5864).
+    pub(crate) backend_attempt: Option<Box<BackendAttemptAttributes>>,
 }
 
 /// Queue-backed span exporter used by tracing plugins.
@@ -360,6 +374,7 @@ impl SpanData {
             stream_io_side: None,
             ws_frames_client_to_backend: None,
             ws_frames_backend_to_client: None,
+            backend_attempt: None,
         })
     }
 
@@ -468,6 +483,7 @@ impl SpanData {
             stream_io_side: None,
             ws_frames_client_to_backend: None,
             ws_frames_backend_to_client: None,
+            backend_attempt: None,
         })
     }
 
@@ -545,6 +561,7 @@ impl SpanData {
             stream_io_side: ctx.io_side.map(stream_io_side_label).map(str::to_string),
             ws_frames_client_to_backend: Some(ctx.frames_client_to_backend),
             ws_frames_backend_to_client: Some(ctx.frames_backend_to_client),
+            backend_attempt: None,
         })
     }
 
@@ -585,6 +602,11 @@ impl SpanData {
                 .iter()
                 .map(|(k, v)| k.len() + v.len())
                 .sum::<usize>()
+            + self
+                .backend_attempt
+                .as_ref()
+                .map(|attempt| attempt.approx_bytes())
+                .unwrap_or(0)
             + 256
     }
 }
@@ -638,6 +660,13 @@ impl OtelTracing {
         } else {
             None
         };
+        let attempt_sink = exporter.as_ref().map(|exporter| {
+            Arc::new(AttemptSpanSink::new(
+                Arc::clone(exporter),
+                service_name.clone(),
+                max_attribute_bytes,
+            ))
+        });
 
         Ok(Self {
             service_name,
@@ -647,6 +676,7 @@ impl OtelTracing {
             include_url_path,
             max_attribute_bytes,
             exporter,
+            attempt_sink,
             export_drop_log_limiter: Mutex::new(LogRateLimiter::new()),
         })
     }
@@ -993,6 +1023,14 @@ impl Plugin for OtelTracing {
         }
         if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER) {
             headers.insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
+        }
+        // Per-attempt CLIENT spans (issue #5864): only an exporting instance
+        // records them, and only for a sampled request. The header written
+        // above stays the SERVER span's until an instrumented dispatch site
+        // begins an attempt and hands the backend that attempt's own copy.
+        if let Some(sink) = self.attempt_sink.as_ref() {
+            let trace = BackendAttemptTrace::for_request(sink, &ctx.metadata, &ctx.method);
+            ctx.set_backend_attempt_trace(trace);
         }
         PluginResult::Continue
     }
@@ -1759,6 +1797,7 @@ fn probe_span_for_test(index: usize, attribute_bytes: usize) -> SpanData {
         stream_io_side: None,
         ws_frames_client_to_backend: None,
         ws_frames_backend_to_client: None,
+        backend_attempt: None,
     }
 }
 
@@ -2401,6 +2440,9 @@ fn build_otlp_payload(
     let otlp_spans: Vec<Value> = spans
         .iter()
         .map(|s| {
+            if let Some(attempt) = s.backend_attempt.as_deref() {
+                return attempt_spans::otlp_attempt_span(s, attempt);
+            }
             // OTLP/JSON maps `bytes` ID fields to lowercase hex, not to the
             // generic protobuf base64 encoding. `take_w3c_trace_ids` already
             // admitted only 32/16-digit lowercase hex, so the retained strings
@@ -3763,6 +3805,7 @@ mod tests {
             stream_io_side: None,
             ws_frames_client_to_backend: None,
             ws_frames_backend_to_client: None,
+            backend_attempt: None,
         }
     }
 

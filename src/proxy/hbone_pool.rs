@@ -3121,9 +3121,10 @@ pub(crate) async fn open_h2_connect_stream(
 pub struct H2WsConnectTunnel {
     pub tunnel: H2ConnectTunnel,
     pub negotiated_subprotocol: Option<http::HeaderValue>,
-    /// The `permessage-deflate` part of the peer's `Sec-WebSocket-Extensions`
-    /// answer; forwarded only for a passthrough proxy that offered it.
-    pub negotiated_permessage_deflate: Option<http::HeaderValue>,
+    /// The peer's whole `Sec-WebSocket-Extensions` answer; a passthrough
+    /// proxy that offered the extension forwards only its `permessage-deflate`
+    /// part, and a `terminate` proxy validates all of it.
+    pub backend_extensions: Option<http::HeaderValue>,
 }
 
 /// Open one HTTP/2 **Extended** CONNECT stream (RFC 8441 — `:method=CONNECT`
@@ -3301,7 +3302,7 @@ pub(crate) async fn open_h2_ws_connect_stream(
         .headers()
         .get(http::header::SEC_WEBSOCKET_PROTOCOL)
         .cloned();
-    let negotiated_permessage_deflate = super::permessage_deflate_answer(response.headers());
+    let backend_extensions = super::backend_extensions_answer(response.headers());
     Ok(H2WsConnectTunnel {
         tunnel: H2ConnectTunnel {
             recv_stream: response.into_body(),
@@ -3317,7 +3318,7 @@ pub(crate) async fn open_h2_ws_connect_stream(
             reuse_advertised: false,
         },
         negotiated_subprotocol,
-        negotiated_permessage_deflate,
+        backend_extensions,
     })
 }
 

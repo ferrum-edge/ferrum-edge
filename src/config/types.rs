@@ -2599,20 +2599,29 @@ pub enum ResponseBodyMode {
 ///   requiring the parsed WebSocket relay
 ///   ([`crate::plugins::Plugin::requires_websocket_framing`]), attached
 ///   directly, through a proxy group, or inherited from a global plugin.
+/// - **Terminate**: the gateway negotiates `permessage-deflate` with the
+///   client and with the backend independently, inflates every message before
+///   the frame relay and its plugins see it, and re-deflates toward each leg
+///   that negotiated compression. Decompression is bounded by the frame and
+///   message ceilings (see [`crate::proxy::ws_permessage_deflate`]). Every
+///   plugin stays allowed, on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3
+///   Extended CONNECT.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebSocketPermessageDeflate {
     #[default]
     Strip,
     Passthrough,
+    Terminate,
 }
 
 impl WebSocketPermessageDeflate {
-    /// Wire / SQL form (`"strip"` / `"passthrough"`).
+    /// Wire / SQL form (`"strip"` / `"passthrough"` / `"terminate"`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Strip => "strip",
             Self::Passthrough => "passthrough",
+            Self::Terminate => "terminate",
         }
     }
 
@@ -2621,6 +2630,7 @@ impl WebSocketPermessageDeflate {
         match value {
             "strip" => Some(Self::Strip),
             "passthrough" => Some(Self::Passthrough),
+            "terminate" => Some(Self::Terminate),
             _ => None,
         }
     }
@@ -2631,6 +2641,10 @@ impl WebSocketPermessageDeflate {
 
     pub fn is_passthrough(&self) -> bool {
         matches!(self, Self::Passthrough)
+    }
+
+    pub fn is_terminate(&self) -> bool {
+        matches!(self, Self::Terminate)
     }
 }
 
@@ -3091,7 +3105,7 @@ pub struct Proxy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<u64>,
     /// RFC 7692 `permessage-deflate` handling for WebSocket upgrades on this
-    /// proxy: `strip` (default) or `passthrough`. See
+    /// proxy: `strip` (default), `passthrough`, or `terminate`. See
     /// [`WebSocketPermessageDeflate`]. Only valid on HTTP-family proxies.
     #[serde(default, skip_serializing_if = "WebSocketPermessageDeflate::is_strip")]
     pub websocket_permessage_deflate: WebSocketPermessageDeflate,
@@ -8621,7 +8635,7 @@ impl Proxy {
             errors.push("Stream proxies (TCP/UDP) must use response_body_mode 'stream'".into());
         }
 
-        if is_stream_proxy && self.websocket_permessage_deflate.is_passthrough() {
+        if is_stream_proxy && !self.websocket_permessage_deflate.is_strip() {
             errors.push(
                 "Stream proxies (TCP/UDP) carry no WebSocket upgrade; \
                  `websocket_permessage_deflate` must be 'strip'"

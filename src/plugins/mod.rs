@@ -2578,6 +2578,10 @@ pub struct RequestContext {
     /// frontends; the terminal transaction log records the request's detail
     /// into it. Not visible to plugins and not serialized.
     diagnostic_slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
+    /// `otel_tracing` per-attempt CLIENT span recorder (issue #5864). `None`
+    /// unless an exporting `otel_tracing` instance sampled this request. Not
+    /// visible to plugins and not serialized.
+    backend_attempt_trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
     /// Whether the gateway selected the health-neutral retained-response
     /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) or its deterministic
     /// JSON output-policy counterpart (`502`) for this request.
@@ -3745,6 +3749,35 @@ impl RequestContext {
         if let Some(slot) = self.diagnostic_slot.as_ref() {
             slot.record_attempt(error_class, request_on_wire, response_status);
         }
+        // The same hook ends the attempt's `otel_tracing` CLIENT span (issue
+        // #5864); a no-op unless a sampled trace is installed.
+        if let Some(trace) = self.backend_attempt_trace.as_ref() {
+            trace.finish(error_class, response_status);
+        }
+    }
+
+    /// Install (or clear) the `otel_tracing` per-attempt span recorder.
+    pub(crate) fn set_backend_attempt_trace(
+        &mut self,
+        trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
+    ) {
+        self.backend_attempt_trace = trace;
+    }
+
+    /// Begin the next backend attempt's `otel_tracing` CLIENT span (issue
+    /// #5864) at its dispatch site. The attempt must dispatch
+    /// `span.headers(headers)` and be polled in the span's scope.
+    /// [`Self::record_backend_attempt`] ends it. Inactive, with no allocation,
+    /// unless a sampled trace is installed.
+    pub(crate) fn begin_backend_attempt_span(
+        &self,
+        backend_url: &str,
+        headers: &HashMap<String, String>,
+    ) -> crate::plugins::otel_tracing::BackendAttemptSpan {
+        match self.backend_attempt_trace.as_ref() {
+            Some(trace) => trace.begin(backend_url, headers),
+            None => crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE,
+        }
     }
 
     /// Whether this request's short-circuit response is an origin-authored
@@ -3932,6 +3965,7 @@ impl RequestContext {
             route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
             diagnostic_slot: None,
+            backend_attempt_trace: None,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
@@ -5422,6 +5456,7 @@ impl RequestContext {
             route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
             diagnostic_slot: self.diagnostic_slot.clone(),
+            backend_attempt_trace: self.backend_attempt_trace.clone(),
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
             final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,

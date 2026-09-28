@@ -2960,6 +2960,16 @@ pub struct EnvConfig {
     /// completing continuation and interleaved Ping/Pong. Independent of the
     /// frame-count bound. `0` disables the bound. Default: 60.
     pub websocket_max_incomplete_message_seconds: u64,
+    /// Maximum size, in bytes, a single WebSocket message may inflate to on a
+    /// `websocket_permessage_deflate: terminate` session. Exceeding it closes
+    /// the session with RFC 6455 code `1009`. Default: 1 MiB, because DEFLATE
+    /// expands up to about 1032:1, so a small compressed message can force
+    /// large inflate, inspection, and re-compression work. `0` is an explicit
+    /// opt-in to the parser's reassembled-message ceiling (4x
+    /// `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`, or a lower
+    /// `ws_message_size_limiting` limit); a positive value can only lower that
+    /// ceiling, never raise it.
+    pub websocket_permessage_deflate_max_message_bytes: usize,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
     /// HTTP header-read / pre-request admission timeout in seconds.
@@ -4224,6 +4234,7 @@ impl Default for EnvConfig {
             authenticated_stream_max_lifetime_seconds: 3_600,
             websocket_max_incomplete_message_frames: 1_024,
             websocket_max_incomplete_message_seconds: 60,
+            websocket_permessage_deflate_max_message_bytes: 1_048_576,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             frontend_tls_handshake_timeout_seconds: 10,
@@ -4875,6 +4886,7 @@ impl EnvConfig {
             authenticated_stream_max_lifetime_seconds: u64 = "FERRUM_AUTHENTICATED_STREAM_MAX_LIFETIME_SECONDS" => 3_600u64;
             websocket_max_incomplete_message_frames: usize = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES" => 1_024usize;
             websocket_max_incomplete_message_seconds: u64 = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS" => 60u64;
+            websocket_permessage_deflate_max_message_bytes: usize = "FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES" => 1_048_576usize;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
@@ -5749,6 +5761,7 @@ impl EnvConfig {
             authenticated_stream_max_lifetime_seconds,
             websocket_max_incomplete_message_frames,
             websocket_max_incomplete_message_seconds,
+            websocket_permessage_deflate_max_message_bytes,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
             frontend_tls_handshake_timeout_seconds,

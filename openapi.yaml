@@ -10060,7 +10060,7 @@ components:
             when an H3 WebSocket listener is actually reachable.
         websocket_permessage_deflate:
           type: string
-          enum: [strip, passthrough]
+          enum: [strip, passthrough, terminate]
           default: strip
           description: |
             RFC 7692 `permessage-deflate` handling for WebSocket upgrades on this
@@ -10080,6 +10080,21 @@ components:
               `ws_message_size_limiting`, `ws_rate_limiting`, or a custom plugin
               whose `requires_websocket_framing()` is true), whether attached
               directly, through a proxy group, or inherited from a global plugin.
+            - `terminate`: the gateway negotiates `permessage-deflate` with the
+              client and with the backend independently (the backend receives
+              the gateway's own `permessage-deflate` offer), inflates every
+              message before the frame relay and its plugins see it, and
+              re-deflates toward each leg that negotiated compression. Every
+              plugin stays allowed and sees plaintext. Decompression is bounded:
+              a compressed frame may not exceed the frame ceiling, a frame may not
+              inflate past it, and a message may not inflate past
+              `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES` (default
+              1 MiB; `0` opts into the reassembled-message ceiling); exceeding
+              either closes with 1009. An invalid backend answer (including a
+              foreign extension, a malformed list, or a non-ASCII value) refuses
+              the upgrade with 502.
+              Applies on HTTP/1.1, HTTP/2 Extended CONNECT, and HTTP/3 Extended
+              CONNECT.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64

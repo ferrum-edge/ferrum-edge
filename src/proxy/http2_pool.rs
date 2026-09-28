@@ -352,6 +352,7 @@ impl Http2PoolManager {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
+        let dns_started = std::time::Instant::now();
         let candidates = self
             .dns_cache
             .resolve_candidates(
@@ -364,6 +365,7 @@ impl Http2PoolManager {
                 message: format!("DNS resolution failed for {}: {}", host, e),
                 source: Some(BackendUnavailableSource::Dns),
             })?;
+        crate::plugins::otel_tracing::note_backend_dns_resolution(dns_started.elapsed());
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let pool_config = self.global_pool_config.for_proxy(proxy);
@@ -424,12 +426,14 @@ impl Http2PoolManager {
             // drops its clone, so only an established connection keeps the slot.
             let conn_slot = conn_slot.clone();
             async move {
+                let connect_started = std::time::Instant::now();
                 let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                     .await
                     .map_err(|e| Http2PoolError::BackendUnavailable {
                         message: format!("Connection refused: {}", e),
                         source: Some(BackendUnavailableSource::Io(e)),
                     })?;
+                crate::plugins::otel_tracing::note_backend_tcp_connect(connect_started.elapsed());
 
                 let _ = tcp.set_nodelay(true);
                 // Honor the DestinationRule `connectionPool.tcp.tcpKeepalive`
@@ -444,12 +448,14 @@ impl Http2PoolManager {
                     pool_config.tcp_keepalive_seconds,
                 );
 
+                let tls_started = std::time::Instant::now();
                 let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
                     Http2PoolError::BackendUnavailable {
                         message: format!("TLS handshake failed: {}", e),
                         source: Some(BackendUnavailableSource::Tls(e)),
                     }
                 })?;
+                crate::plugins::otel_tracing::note_backend_tls_handshake(tls_started.elapsed());
 
                 // A TCP-successful candidate is not usable by this pool until
                 // it negotiates ALPN h2 and completes the HTTP/2 handshake.
@@ -1110,7 +1116,10 @@ impl Http2ConnectionPool {
         });
 
         let (selected_key, base_len, start) = match phase1 {
-            Phase1::Hit(sender) => return Ok(sender),
+            Phase1::Hit(sender) => {
+                crate::plugins::otel_tracing::note_backend_connection_reused();
+                return Ok(sender);
+            }
             Phase1::Miss {
                 selected_key,
                 base_len,
@@ -1124,7 +1133,17 @@ impl Http2ConnectionPool {
             self.pool
                 .create_or_get_existing_owned(selected_key, |key| async move {
                     let _ = key;
-                    manager.create_connection(proxy, svid_generation).await
+                    // Only the creator runs this closure, so the connection
+                    // this attempt waits on is one it set up (issue #5864).
+                    crate::plugins::otel_tracing::note_backend_connection_setup_started();
+                    let setup_started = std::time::Instant::now();
+                    let created = manager.create_connection(proxy, svid_generation).await;
+                    if created.is_ok() {
+                        crate::plugins::otel_tracing::note_backend_connection_established(
+                            setup_started.elapsed(),
+                        );
+                    }
+                    created
                 })
         });
         match acquired {

@@ -1136,7 +1136,10 @@ impl GrpcConnectionPool {
         });
 
         let (selected_key, base_len, start) = match phase1 {
-            GrpcPhase1::Hit(sender) => return Ok(sender),
+            GrpcPhase1::Hit(sender) => {
+                crate::plugins::otel_tracing::note_backend_connection_reused();
+                return Ok(sender);
+            }
             GrpcPhase1::Miss {
                 selected_key,
                 base_len,
@@ -1153,9 +1156,19 @@ impl GrpcConnectionPool {
                 |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
                 |key, attempt| async move {
                     let _ = key;
-                    manager
+                    // Only the creator runs this closure, so the connection
+                    // this attempt waits on is one it set up (issue #5864).
+                    crate::plugins::otel_tracing::note_backend_connection_setup_started();
+                    let setup_started = std::time::Instant::now();
+                    let created = manager
                         .create_connection(proxy, svid_generation, purpose, Some(attempt))
-                        .await
+                        .await;
+                    if created.is_ok() {
+                        crate::plugins::otel_tracing::note_backend_connection_established(
+                            setup_started.elapsed(),
+                        );
+                    }
+                    created
                 },
             )
         });
@@ -1250,6 +1263,7 @@ impl GrpcPoolManager {
 
         // Resolve backend hostname via the shared DNS cache. Errors propagate
         // — no silent fallback to raw hostname that would bypass the cache.
+        let dns_started = std::time::Instant::now();
         let candidates = self
             .dns_cache
             .resolve_candidates(
@@ -1264,6 +1278,7 @@ impl GrpcPoolManager {
                     format!("DNS resolution failed for {}: {}", host, e),
                 )
             })?;
+        crate::plugins::otel_tracing::note_backend_dns_resolution(dns_started.elapsed());
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let pool_config = self.global_pool_config.for_proxy(proxy);
@@ -1329,6 +1344,7 @@ impl GrpcPoolManager {
                 // its clone, so only an established connection keeps the slot.
                 let conn_slot = conn_slot.clone();
                 async move {
+                    let connect_started = std::time::Instant::now();
                     let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                         .await
                         .map_err(|e| {
@@ -1338,6 +1354,9 @@ impl GrpcPoolManager {
                                 e,
                             )
                         })?;
+                    crate::plugins::otel_tracing::note_backend_tcp_connect(
+                        connect_started.elapsed(),
+                    );
                     let _ = tcp.set_nodelay(true);
                     crate::socket_opts::apply_pooled_tcp_keepalive(
                         "grpc_proxy",
@@ -1356,6 +1375,7 @@ impl GrpcPoolManager {
                 let pool_config = &pool_config;
                 let conn_slot = conn_slot.clone();
                 async move {
+                    let connect_started = std::time::Instant::now();
                     let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                         .await
                         .map_err(|e| {
@@ -1365,6 +1385,9 @@ impl GrpcPoolManager {
                                 e,
                             )
                         })?;
+                    crate::plugins::otel_tracing::note_backend_tcp_connect(
+                        connect_started.elapsed(),
+                    );
                     let _ = tcp.set_nodelay(true);
                     crate::socket_opts::apply_pooled_tcp_keepalive(
                         "grpc_proxy",
@@ -1523,6 +1546,7 @@ impl GrpcPoolManager {
         pool_config: &PoolConfig,
         conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<GrpcPooledSender, GrpcProxyError> {
+        let tls_started = std::time::Instant::now();
         let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::TlsHandshake,
@@ -1530,6 +1554,7 @@ impl GrpcPoolManager {
                 e,
             )
         })?;
+        crate::plugins::otel_tracing::note_backend_tls_handshake(tls_started.elapsed());
         if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
             let message = "TLS peer did not negotiate ALPN h2".to_string();
             return Err(GrpcProxyError::backend_unavailable_with_source(

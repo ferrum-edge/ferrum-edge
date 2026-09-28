@@ -2350,6 +2350,37 @@ Gateway spans are `SERVER`. `server.address` / `server.port` come from the clien
 
 Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/stream failures, and classified stream/WebSocket errors. HTTP 4xx responses — including gateway rejects that set `rejection_phase` — are **not** errors, but a genuine transport or body failure is evaluated first and wins: a 4xx whose body was truncated, whose transfer errored, or whose client disconnected is `ERROR` like the equivalent 200. Every non-error span is `UNSET`, never explicit `OK`: `OK` is reserved for a status the instrumented application asserts, and gateway instrumentation only observes. Stream and WebSocket teardown spans carry bounded byte/frame counts plus stable disconnect cause/direction/I/O-side attributes; client-side and backend-side failures remain distinct across OTLP, Zipkin, and Datadog. WebSocket upgrades emit the HTTP handshake span from `log` and a separate disconnect span from `on_ws_disconnect` with a new span ID under the same trace and a start time derived from the final session duration.
 
+#### Backend attempt spans
+
+With an `endpoint` configured, every sampled request also exports one `CLIENT` span per backend attempt, retries included, as a child of the gateway `SERVER` span. A request that needed three attempts therefore exports four spans; size `buffer_capacity` / `buffer_max_bytes` for that. Attempt spans share the plugin's export queue, its byte budget, and `max_attribute_bytes`.
+
+Each attempt dispatches its own `traceparent`, naming the attempt's span with the request's trace ID and sampled flag, so the backend's `SERVER` span nests under the attempt that reached it. `tracestate` is forwarded unchanged. The `traceparent` echoed to the client still names the gateway `SERVER` span. Unsampled requests, propagation-only mode, and requests without `otel_tracing` dispatch exactly as before: the backend receives the gateway span's context and nothing extra is recorded.
+
+Attempts are instrumented where the gateway records a per-attempt outcome: the HTTP/1.1 and HTTP/2 frontend's backend loop (including its direct HTTP/2, native HTTP/3, HBONE, and mesh-mTLS dispatch), the native gRPC loop, and the HTTP/3 frontend's buffered retry loop. Any other dispatch path, such as WebSocket upgrades or an HTTP/3 request whose body is streamed, keeps the gateway span's `traceparent` and exports no attempt span, so a backend is never handed a parent that is not exported. The same holds for the first attempt of an HTTP/3 request whose response buffering is decided from the backend's response headers: that attempt is dispatched by the header-refinement step, which is not instrumented, so it is counted but not exported, and a retry of it reports `gateway.backend.attempt` `2`.
+
+An attempt span starts when the attempt is dispatched (for the first HTTP/1.1/HTTP/2 attempt, when its prepared request is handed to the backend) and ends when its outcome is known: the response head for a streamed response, the complete response for a buffered one, or the failure. Retry backoff falls between attempt spans. The span is named for the request method (bounded as above).
+
+A request dropped mid-attempt never records that attempt's outcome, for example when the client disconnects while the backend is still working. Once the attempt was handed to the backend, the gateway still exports its span when the request is dropped, ended at that moment with `error.type` `cancelled` and no status, so the backend's `SERVER` span keeps an exported parent. An attempt refused before its handoff, for example by backend admission control, reached no backend and is not exported. The export only queues the span; if the export buffer is full the span is dropped, as any other span would be.
+
+| Attribute | Present when | Value |
+|---|---|---|
+| `http.request.method` | always | Request method, bounded to 32 bytes |
+| `server.address`, `server.port` | known | The attempt's backend host and port; the address is bounded by `max_attribute_bytes` |
+| `gateway.backend.attempt` | always | 1-based attempt number |
+| `http.request.resend_count` | retries | Attempt number minus one |
+| `gateway.backend.retry_reason` | retries | Why the previous attempt was retried: its gateway error class (for example `connection_refused`), or `http_status` for a retryable status |
+| `http.response.status_code` | backend answered | The backend's status. Omitted when the gateway classified the attempt as a failure, whose status it synthesized |
+| `error.type` | failures | The gateway error class, the status code of a `4xx`/`5xx` backend response, or `cancelled` for an attempt whose request was dropped before it ended |
+| `gateway.backend.connection.reused` | pool observed it | `true` when the attempt rode a pooled connection it did not open, `false` when it set one up |
+| `gateway.backend.connection.setup_ms` | attempt set up a connection | Whole connection establishment, DNS through the HTTP/2 handshake |
+| `gateway.backend.connection.dns_ms`, `gateway.backend.connection.tcp_connect_ms`, `gateway.backend.connection.tls_handshake_ms` | the pool timed that phase | DNS resolution, TCP connect, and TLS handshake of the connection the attempt set up |
+
+Connection attributes come only from what a pool measures. The direct HTTP/2 and gRPC pools report reuse and setup, including a failed setup (`reused: false` without `setup_ms`). The bundled HTTP/1.1 client, the HTTP/3 pool, and the HBONE and mesh-mTLS pools do not expose them, and an attempt that joined a connection another request was already setting up is not attributed either; those attempts omit the attributes. An unknown value is never reported as zero.
+
+Status follows the OTel HTTP client conventions: `ERROR` for a gateway error class and for any `4xx`/`5xx` backend response, `UNSET` otherwise.
+
+With tracing absent, the request unsampled, or propagation-only mode, every attempt hook is a single check, and a pooled HTTP/2 or gRPC checkout or an HTTP/1.1/HTTP/2 backend handoff adds one task-local lookup; nothing is allocated or locked. A sampled request allocates one recorder, a copy of the backend header map per attempt, and one span per attempt.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode. Must be an `http`/`https` URL with a non-empty host. URL userinfo is rejected; diagnostics redact path/query |
@@ -5376,7 +5407,8 @@ because a WebSocket message carries no `Content-Type`. Control frames
 (Ping/Pong/Close) are never scanned as application payload, messages arrive
 reassembled and uncompressed (`permessage-deflate` is never negotiated end to
 end; `websocket_permessage_deflate: passthrough` is refused on a proxy where
-`waf` is effective), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` close the
+`waf` is effective, and with `terminate` the gateway inflates every message
+before the scanner sees it), and `max_scan_bytes` / `on_body_too_large` / `on_scan_timeout` close the
 connection with RFC 6455 code 1008 and a fixed reason that never echoes message
 bytes, on the same terms as the HTTP body path — the session policy resolved at
 upgrade mirrors `request_body_policy_enforces` / `response_body_policy_enforces`,

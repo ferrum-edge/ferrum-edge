@@ -932,6 +932,12 @@ exists, and none is needed:
   Payloads reaching the WAF are therefore always uncompressed. Config validation
   refuses `websocket_permessage_deflate: passthrough` on any proxy where a `waf`
   instance is effective (directly, through a proxy group, or as a global).
+- With `websocket_permessage_deflate: terminate` the gateway negotiates
+  compression with each peer itself and inflates every message before the
+  relay parses it, so the WAF still scans plaintext, with bounded decompression
+  (Close 1009 past the frame or decompressed-message ceiling). The message is
+  re-compressed only after the scan, toward a leg that negotiated compression.
+  See [routing.md](routing.md#gateway-terminated-compression-terminate).
 
 **Fail-closed behavior** mirrors the HTTP body path, with the connection Close
 taking the place of an HTTP rejection response:
