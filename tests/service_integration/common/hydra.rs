@@ -146,27 +146,29 @@ async fn start_hydra_container_once() -> Result<HydraContainer, BoxError> {
             .unwrap_or(0)
     );
 
-    let image = GenericImage::new(HYDRA_IMAGE, HYDRA_TAG)
-        .with_exposed_port(HYDRA_PUBLIC_PORT.tcp())
-        .with_exposed_port(HYDRA_ADMIN_PORT.tcp())
-        .with_mapped_port(public_port, HYDRA_PUBLIC_PORT.tcp())
-        .with_mapped_port(admin_port, HYDRA_ADMIN_PORT.tcp())
-        .with_env_var("DSN", "memory")
-        .with_env_var("SECRETS_SYSTEM", HYDRA_SYSTEM_SECRET)
-        .with_env_var("URLS_SELF_ISSUER", &issuer)
-        .with_env_var("URLS_LOGIN", &login_url)
-        .with_env_var("URLS_CONSENT", &consent_url)
-        .with_env_var(
-            "URLS_LOGOUT",
-            format!("http://127.0.0.1:{consent_port}/logout"),
-        )
-        .with_env_var("SERVE_PUBLIC_CORS_ENABLED", "true")
-        .with_env_var("SERVE_ADMIN_CORS_ENABLED", "true")
-        .with_env_var("OIDC_SUBJECT_IDENTIFIERS_SUPPORTED_TYPES", "public")
-        .with_env_var("STRATEGIES_ACCESS_TOKEN", "opaque")
-        .with_env_var("STRATEGIES_SCOPE", "exact")
-        .with_cmd(["serve", "all", "--dev"]);
-    let container = start_within_deadline("Hydra", image.start()).await?;
+    let image = || {
+        GenericImage::new(HYDRA_IMAGE, HYDRA_TAG)
+            .with_exposed_port(HYDRA_PUBLIC_PORT.tcp())
+            .with_exposed_port(HYDRA_ADMIN_PORT.tcp())
+            .with_mapped_port(public_port, HYDRA_PUBLIC_PORT.tcp())
+            .with_mapped_port(admin_port, HYDRA_ADMIN_PORT.tcp())
+            .with_env_var("DSN", "memory")
+            .with_env_var("SECRETS_SYSTEM", HYDRA_SYSTEM_SECRET)
+            .with_env_var("URLS_SELF_ISSUER", &issuer)
+            .with_env_var("URLS_LOGIN", &login_url)
+            .with_env_var("URLS_CONSENT", &consent_url)
+            .with_env_var(
+                "URLS_LOGOUT",
+                format!("http://127.0.0.1:{consent_port}/logout"),
+            )
+            .with_env_var("SERVE_PUBLIC_CORS_ENABLED", "true")
+            .with_env_var("SERVE_ADMIN_CORS_ENABLED", "true")
+            .with_env_var("OIDC_SUBJECT_IDENTIFIERS_SUPPORTED_TYPES", "public")
+            .with_env_var("STRATEGIES_ACCESS_TOKEN", "opaque")
+            .with_env_var("STRATEGIES_SCOPE", "exact")
+            .with_cmd(["serve", "all", "--dev"])
+    };
+    let container = start_within_deadline("Hydra", || image().start()).await?;
 
     let public_url = format!("http://127.0.0.1:{public_port}");
     let admin_url = format!("http://127.0.0.1:{admin_port}");

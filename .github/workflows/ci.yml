@@ -936,8 +936,10 @@ jobs:
         # `host_port_allocation` needs no container: it is the pure unit
         # coverage for the host-port allocator every fixture above maps
         # through, and the filter list is exhaustive, so a module missing
-        # from it never runs (issue #3999).
-        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection clickhouse host_port_allocation db_tls
+        # from it never runs (issue #3999). `container_start_retry` is the
+        # same kind of Docker-free coverage for the shared transient
+        # image-pull retry every fixture starts through.
+        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection clickhouse host_port_allocation container_start_retry db_tls
         env:
           RUST_BACKTRACE: 1
 
