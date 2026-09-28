@@ -15,12 +15,8 @@ use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-use super::common::containers::{
-    BoxError, CONTAINER_START_TIMEOUT, fail_in_ci_else_skip, with_phase_deadline,
-};
-use super::common::host_ports::{
-    allocate_host_port, is_host_port_collision, retry_on_host_port_collision,
-};
+use super::common::containers::{BoxError, fail_in_ci_else_skip, start_within_deadline};
+use super::common::host_ports::{allocate_host_port, retry_on_host_port_collision};
 
 struct MySqlFixture {
     _container: ContainerAsync<GenericImage>,
@@ -28,64 +24,22 @@ struct MySqlFixture {
     pool: sqlx::AnyPool,
 }
 
-/// Bound transient Docker image-transfer/start failures without turning a
-/// deterministic fixture failure into an unbounded CI retry. Host-port bind
-/// collisions are not retried here: they must surface so
-/// `retry_on_host_port_collision` can re-allocate a fresh port.
-async fn start_mysql_container(
-    password: &str,
-    host_port: u16,
-) -> Result<ContainerAsync<GenericImage>, BoxError> {
-    const START_ATTEMPTS: u32 = 3;
-
-    for attempt in 1..=START_ATTEMPTS {
-        let started = tokio::time::Instant::now();
-        let start = with_phase_deadline(
-            &format!("MySQL image pull/start (attempt {attempt}/{START_ATTEMPTS})"),
-            CONTAINER_START_TIMEOUT,
-            GenericImage::new("mysql", "8.4")
-                .with_exposed_port(3306.tcp())
-                .with_mapped_port(host_port, 3306.tcp())
-                .with_env_var("MYSQL_ROOT_PASSWORD", password)
-                .with_env_var("MYSQL_ROOT_HOST", "%")
-                .with_env_var("MYSQL_DATABASE", "ferrum")
-                .start(),
-        )
-        .await?;
-        match start {
-            Ok(container) => return Ok(container),
-            Err(error) => {
-                let elapsed = started.elapsed().as_secs_f64();
-                if is_host_port_collision(&error.to_string()) {
-                    return Err(format!(
-                        "MySQL image pull/start failed after {elapsed:.1}s: {error}"
-                    )
-                    .into());
-                }
-                if attempt == START_ATTEMPTS {
-                    return Err(format!(
-                        "MySQL image pull/start failed after {START_ATTEMPTS} attempts \
-                         (last attempt {elapsed:.1}s): {error}"
-                    )
-                    .into());
-                }
-                eprintln!(
-                    "MySQL image pull/start attempt {attempt}/{START_ATTEMPTS} failed \
-                     after {elapsed:.1}s; retrying: {error}"
-                );
-                tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
-            }
-        }
-    }
-
-    Err("MySQL image pull/start retry loop did not execute".into())
-}
-
 async fn start_mysql() -> Result<MySqlFixture, BoxError> {
     const PASSWORD: &str = "ferrum-mysql-test-password";
     let (container, port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
-        let container = start_mysql_container(PASSWORD, host_port).await?;
+        // Transient image-pull failures are retried inside the shared start
+        // helper; host-port collisions surface to the outer retry.
+        let container = start_within_deadline("MySQL", || {
+            GenericImage::new("mysql", "8.4")
+                .with_exposed_port(3306.tcp())
+                .with_mapped_port(host_port, 3306.tcp())
+                .with_env_var("MYSQL_ROOT_PASSWORD", PASSWORD)
+                .with_env_var("MYSQL_ROOT_HOST", "%")
+                .with_env_var("MYSQL_DATABASE", "ferrum")
+                .start()
+        })
+        .await?;
         Ok((container, host_port))
     })
     .await?;

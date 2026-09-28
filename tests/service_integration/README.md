@@ -96,8 +96,9 @@ The allocator therefore:
 2. Retries container start **only** when the error is a host-port bind
    collision (`port is already allocated`, `address already in use`,
    `EADDRINUSE`), with a fresh port each time and a bound attempt budget.
-3. Returns every other start failure immediately so an image-pull or wait
-   condition failure still hard-fails in CI.
+3. Returns every other start failure to the caller so a wait-condition or
+   setup failure still hard-fails in CI. Transient image-pull/registry errors
+   are retried one layer down, inside `start_within_deadline()` (see below).
 
 Do not pin a single fixed host port (that trades a race for a hard collision
 under parallel jobs) and do not blanket-retry unrelated container errors.
@@ -119,8 +120,21 @@ The shared bounds live in `common/containers.rs`:
   `FIXTURE_HTTP_CONNECT_TIMEOUT` (5s). Never use `reqwest::Client::new()` in a
   fixture: its default is no request timeout at all.
 - `start_within_deadline()` / `CONTAINER_START_TIMEOUT` — 5 minutes for one
-  `start()` (image pull + create + start). The retry-on-collision behaviour
-  above is unchanged; the deadline only stops an attempt hanging forever.
+  `start()` phase (image pull + create + start), including any retries. It
+  takes a closure that builds and starts a fresh request per attempt, and
+  retries **only** transient image-pull/registry errors
+  (`is_transient_image_pull_error()`: `failed to pull`, `bytes remaining on
+  stream`, connection resets, timeouts, TLS handshake failures,
+  `toomanyrequests`, registry 5xx) up to `CONTAINER_START_ATTEMPTS` (3) times
+  with a short linear backoff, logging each retry to stderr. Wait-condition
+  failures (`container startup timeout`, unhealthy/exited containers),
+  deterministic registry answers (`manifest unknown`, `pull access denied`,
+  `unauthorized`) and host-port collisions are returned after the first
+  attempt; collisions then reach the retry-on-collision loop above, which
+  allocates a fresh port. Every fixture, ClickHouse and MySQL included, starts
+  through this one helper; `container_start_retry` is its Docker-free unit
+  coverage (main CI run 36370971003 failed on a `postgres:17` pull that ended
+  with `bytes remaining on stream`).
 - `with_phase_deadline()` — the general form, for any other phase that needs a
   named bound (e.g. `docker exec`, `CONTAINER_EXEC_TIMEOUT`).
 
@@ -150,7 +164,7 @@ depend on which stream a given image logs to.
 `.github/workflows/ci.yml` job `test-service-integration` runs on
 `ubuntu-latest` (Docker available). Every module (`consul`, `ldap`, `kafka`,
 `mysql`, `oidc`, `oauth2_introspection`, `clickhouse`, `host_port_allocation`,
-`db_tls`) runs in one `cargo nextest run --no-fail-fast` invocation, which keeps
+`container_start_retry`, `db_tls`) runs in one `cargo nextest run --no-fail-fast` invocation, which keeps
 per-test reporting and continues past a failing backend without a second
 runner. The job feeds the `test` aggregation gate, so a failure blocks merge.
 Hydra (or any provider) startup failure is a hard failure in CI.

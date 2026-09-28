@@ -64,6 +64,7 @@ mod scaffolding;
 
 mod clickhouse;
 mod consul;
+mod container_start_retry;
 mod db_tls;
 mod host_port_allocation;
 mod kafka;

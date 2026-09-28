@@ -22,12 +22,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use super::common::containers::{
-    BoxError, CONTAINER_START_TIMEOUT, fail_in_ci_else_skip, fixture_http_client,
-    with_phase_deadline,
+    BoxError, fail_in_ci_else_skip, fixture_http_client, start_within_deadline,
 };
-use super::common::host_ports::{
-    allocate_host_port, is_host_port_collision, retry_on_host_port_collision,
-};
+use super::common::host_ports::{allocate_host_port, retry_on_host_port_collision};
 
 const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server";
 const CLICKHOUSE_TAG: &str = "24.8";
@@ -39,56 +36,6 @@ struct ClickHouseFixture {
     _container: ContainerAsync<GenericImage>,
     url: String,
     client: reqwest::Client,
-}
-
-async fn start_clickhouse_container(
-    host_port: u16,
-) -> Result<ContainerAsync<GenericImage>, BoxError> {
-    const START_ATTEMPTS: u32 = 3;
-
-    for attempt in 1..=START_ATTEMPTS {
-        // The image pull + container start is the one phase that can block on
-        // something outside this host (a stalled registry). Bound it so the
-        // failure names the phase instead of being killed by nextest with a
-        // message that names only the test (issue #4600).
-        let started = tokio::time::Instant::now();
-        let start = with_phase_deadline(
-            &format!("ClickHouse image pull/start (attempt {attempt}/{START_ATTEMPTS})"),
-            CONTAINER_START_TIMEOUT,
-            GenericImage::new(CLICKHOUSE_IMAGE, CLICKHOUSE_TAG)
-                .with_exposed_port(CLICKHOUSE_HTTP_PORT.tcp())
-                .with_mapped_port(host_port, CLICKHOUSE_HTTP_PORT.tcp())
-                .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
-                .start(),
-        )
-        .await?;
-        match start {
-            Ok(container) => return Ok(container),
-            Err(error) => {
-                let elapsed = started.elapsed().as_secs_f64();
-                if is_host_port_collision(&error.to_string()) {
-                    return Err(format!(
-                        "ClickHouse image pull/start failed after {elapsed:.1}s: {error}"
-                    )
-                    .into());
-                }
-                if attempt == START_ATTEMPTS {
-                    return Err(format!(
-                        "ClickHouse image pull/start failed after \
-                         {START_ATTEMPTS} attempts (last attempt {elapsed:.1}s): {error}"
-                    )
-                    .into());
-                }
-                eprintln!(
-                    "ClickHouse image pull/start attempt {attempt}/{START_ATTEMPTS} \
-                     failed after {elapsed:.1}s; retrying: {error}"
-                );
-                tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
-            }
-        }
-    }
-
-    Err("ClickHouse image pull/start retry loop did not execute".into())
 }
 
 async fn wait_clickhouse_ready(client: &reqwest::Client, url: &str) -> Result<(), BoxError> {
@@ -122,7 +69,18 @@ async fn wait_clickhouse_ready(client: &reqwest::Client, url: &str) -> Result<()
 async fn start_clickhouse() -> Result<ClickHouseFixture, BoxError> {
     let (container, port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
-        let container = start_clickhouse_container(host_port).await?;
+        // The image pull + container start is the one phase that can block on
+        // something outside this host (a stalled registry). The shared helper
+        // bounds it (issue #4600) and retries transient pull failures;
+        // host-port collisions surface to the outer retry.
+        let container = start_within_deadline("ClickHouse", || {
+            GenericImage::new(CLICKHOUSE_IMAGE, CLICKHOUSE_TAG)
+                .with_exposed_port(CLICKHOUSE_HTTP_PORT.tcp())
+                .with_mapped_port(host_port, CLICKHOUSE_HTTP_PORT.tcp())
+                .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
+                .start()
+        })
+        .await?;
         Ok((container, host_port))
     })
     .await?;
