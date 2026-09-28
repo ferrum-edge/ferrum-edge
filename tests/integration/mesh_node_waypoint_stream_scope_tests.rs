@@ -29,8 +29,6 @@
 //! cgroup hooks), and a shared UDP frontend socket has no per-source-pod
 //! cookie. See `docs/mesh.md` and the comments in `src/proxy/udp_proxy.rs`.
 
-use crate::scaffolding::port_registry::TestSocket;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -317,6 +315,7 @@ fn enrolled_pod_whose_workload_is_absent_from_slice_fails_closed() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
+    use crate::scaffolding::port_registry::TestSocket;
     use ferrum_edge::identity::TrustDomain;
     use ferrum_edge::modes::mesh::config::Workload;
     use tokio::net::{TcpListener, TcpStream};
