@@ -601,6 +601,18 @@ async fn materialized_query_names_are_compared_as_stored() {
     assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
 }
 
+#[tokio::test]
+async fn a_percent_u_name_is_not_an_excluded_name() {
+    // Only IIS-style parsers decode `%u`; elsewhere `%u0068tml` is its own
+    // parameter, so a payload under it must not ride the `html` exclusion.
+    let plugin = recommended_with_overrides(json!({
+        "FE-XSS-001": { "exclude": { "query_params": ["html"] } }
+    }));
+    let (result, request) = query(&plugin, "%u0068tml=%3Cscript%3Ewidget()%3C/script%3E").await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-XSS-001"));
+}
+
 #[test]
 fn exclusions_are_validated_against_the_rule_target() {
     let wrong_kind = waf(json!({
