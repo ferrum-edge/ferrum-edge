@@ -214,42 +214,63 @@ VERIFY_IDENTITY = (
     "            --certificate-github-workflow-trigger workflow_run\n"
     "          )\n"
 )
+# Each reuse check runs its literal registry command in a bounded
+# three-attempt loop and uses only the attempt that succeeded. An unsigned
+# leftover (any non-transient verify failure) is rebuilt; a tag that is not
+# found is reported as absent, and any other inspect failure stops the run.
 REUSE_SIGNED_CHECK = (
-    'registry_read "$work/verify.err" cosign verify "${verify_common_args[@]}" '
-    '"$image_ref" > "$work/signature.json" &&'
+    "            for attempt in 1 2 3; do\n"
+    '              if cosign verify "${verify_common_args[@]}" "$image_ref" > '
+    '"$work/signature.json" 2>"$work/verify.err"; then\n'
+    "                break\n"
+    "              fi\n"
+    '              if ! retry_registry_read "$work/verify.err" "$attempt"; then\n'
+    "                return 1\n"
+    "              fi\n"
+    "            done\n"
+    '            jq -e --arg digest "$digest" \\\n'
 )
 REUSE_INSPECT = (
-    'manifest="$(registry_read "$work/inspect.err" docker buildx imagetools inspect '
-    '"$tag_ref" --format \'{{json .Manifest}}\')"'
+    "            for attempt in 1 2 3; do\n"
+    '              if manifest="$(docker buildx imagetools inspect "$tag_ref" --format '
+    '\'{{json .Manifest}}\' 2>"$work/inspect.err")"; then\n'
+    "                break\n"
+    "              fi\n"
+    '              if ! retry_registry_read "$work/inspect.err" "$attempt"; then\n'
+    '                if grep -qi \'not found\' "$work/inspect.err"; then\n'
+    "                  return 0\n"
+    "                fi\n"
+    '                echo "::error::could not inspect ${tag_ref}" >&2\n'
+    '                cat "$work/inspect.err" >&2\n'
+    "                exit 1\n"
+    "              fi\n"
+    "            done\n"
 )
 # Docker Hub is read anonymously, so `resolve`, the Syft scan, and `smoke` retry
 # a throttled, failed, or dropped registry read with exponential backoff, at
 # most three attempts in all, and stop the run once the retries are exhausted.
-REGISTRY_READ = (
+# The helper only decides what follows a failed attempt; it never runs the
+# registry command itself, so every call site keeps a literal executable (the
+# trusted Cross policy treats a function that runs its argument vector as an opaque
+# executable surface).
+REGISTRY_RETRY = (
     "          transient_registry_error='toomanyrequests|too many requests|"
     "internal server error|bad gateway|service unavailable|timeout|connection reset|"
     "connection refused|no such host|temporary failure|\\beof\\b|deadline exceeded'\n"
-    "          registry_read() {\n"
+    "          retry_registry_read() {\n"
     '            local err_file="$1"\n'
-    "            shift\n"
-    "            local attempt\n"
-    "            for attempt in 1 2 3; do\n"
-    '              if "$@" >"${err_file}.out" 2>"$err_file"; then\n'
-    '                cat "${err_file}.out"\n'
-    "                return 0\n"
-    "              fi\n"
-    '              if ! grep -Eqi "$transient_registry_error" "$err_file"; then\n'
-    "                return 1\n"
-    "              fi\n"
-    '              if [ "$attempt" -lt 3 ]; then\n'
-    '                echo "::warning::transient registry error (attempt ${attempt} of 3); '
+    '            local attempt="$2"\n'
+    '            if ! grep -Eqi "$transient_registry_error" "$err_file"; then\n'
+    "              return 1\n"
+    "            fi\n"
+    '            if [ "$attempt" -ge 3 ]; then\n'
+    '              echo "::error::registry read still failing after 3 attempts" >&2\n'
+    '              cat "$err_file" >&2\n'
+    "              exit 1\n"
+    "            fi\n"
+    '            echo "::warning::transient registry error on attempt ${attempt} of 3, '
     'retrying" >&2\n'
-    '                sleep $((10 * 2 ** (attempt - 1)))\n'
-    "              fi\n"
-    "            done\n"
-    '            echo "::error::registry read still failing after 3 attempts" >&2\n'
-    '            cat "$err_file" >&2\n'
-    "            exit 1\n"
+    "            sleep $((10 * 2 ** (attempt - 1)))\n"
     "          }\n"
 )
 REUSE_SIGNED_CALLS = (
@@ -282,7 +303,17 @@ VERIFY_OUTPUT_LINES = (
     'echo "ghcr_ref=${GHCR_REF}" >> "$GITHUB_OUTPUT"',
 )
 SMOKE_PULL = (
-    'if ! registry_read "$pull_err" docker pull "ferrumedge/ferrum-edge@${DIGEST}"; then'
+    '          pull_err="$RUNNER_TEMP/smoke-pull.err"\n'
+    "          for attempt in 1 2 3; do\n"
+    '            if docker pull "ferrumedge/ferrum-edge@${DIGEST}" 2>"$pull_err"; then\n'
+    "              break\n"
+    "            fi\n"
+    '            if ! retry_registry_read "$pull_err" "$attempt"; then\n'
+    '              echo "::error::could not pull ferrumedge/ferrum-edge@${DIGEST}" >&2\n'
+    '              cat "$pull_err" >&2\n'
+    "              exit 1\n"
+    "            fi\n"
+    "          done\n"
 )
 SMOKE_RUN = (
     'version_json="$(docker run --rm --network none --pull never '
@@ -358,11 +389,23 @@ SYFT_IMAGE = (
 # proved both registries hold identical platform descriptors). This is the whole
 # Syft command, joined.
 SYFT_RUN = (
-    'if ! registry_read "$work/syft.err" docker run --rm -e SYFT_CHECK_FOR_APP_UPDATE=false '
+    'if docker run --rm -e SYFT_CHECK_FOR_APP_UPDATE=false '
     '-v "$sbom_dir:/out" '
     + SYFT_IMAGE
     + ' scan "registry:${DOCKER_REF}" --platform "$platform" '
-    '-o "spdx-json=/out/${arch}.spdx.json"; then'
+    '-o "spdx-json=/out/${arch}.spdx.json" 2>"$work/syft.err"; then'
+)
+# The Syft scan's bounded retry, from the command's success branch to the end
+# of its three-attempt loop: a failure that is not transient stops the run.
+SYFT_RETRY = (
+    "                break\n"
+    "              fi\n"
+    '              if ! retry_registry_read "$work/syft.err" "$attempt"; then\n'
+    '                echo "::error::Syft could not scan ${DOCKER_REF} for ${platform}" >&2\n'
+    '                cat "$work/syft.err" >&2\n'
+    "                exit 1\n"
+    "              fi\n"
+    "            done\n"
 )
 SYFT_OUTPUT_DIR = ('sbom_dir="$RUNNER_TEMP/syft-output"', 'mkdir "$sbom_dir"')
 SYFT_CREDENTIAL_MARKERS = (
@@ -504,8 +547,8 @@ SYFT_MESSAGE = (
     "token, and it runs exactly the pinned credential-free scan of the Docker Hub image"
 )
 REGISTRY_RETRY_MESSAGE = (
-    "must read Docker Hub anonymously through the pinned bounded-retry registry_read "
-    "helper"
+    "must read Docker Hub anonymously in a pinned three-attempt loop that consults the "
+    "pinned retry_registry_read helper"
 )
 
 
@@ -783,7 +826,7 @@ def validate_resolve(block: str, active: str) -> list[str]:
     step = existing[0]
     if VERIFY_IDENTITY not in step:
         failures.append(RESOLVE_IDENTITY_MESSAGE)
-    if REGISTRY_READ not in step or REUSE_INSPECT not in step:
+    if REGISTRY_RETRY not in step or REUSE_INSPECT not in step:
         failures.append(f"jobs.resolve {REGISTRY_RETRY_MESSAGE}")
     skip = step.find('echo "build=false"')
     calls = [step.find(call) for call in REUSE_SIGNED_CALLS]
@@ -841,11 +884,7 @@ def validate_smoke(block: str) -> list[str]:
         return [SMOKE_MESSAGE]
     step = steps[smoke[0]]
     pull = step.find(SMOKE_PULL)
-    if (
-        REGISTRY_READ not in step
-        or not 0 <= pull < step.find(SMOKE_RUN)
-        or not branch_contains(step, SMOKE_PULL, "exit 1")
-    ):
+    if REGISTRY_RETRY not in step or not 0 <= pull < step.find(SMOKE_RUN):
         return [f"jobs.smoke {REGISTRY_RETRY_MESSAGE}"]
     return []
 
@@ -864,7 +903,8 @@ def validate_syft(steps: list[str]) -> list[str]:
         or SECRET_REFERENCE.search(step) is not None
         or any(marker in step for marker in SYFT_CREDENTIAL_MARKERS)
         or any(line not in step for line in SYFT_OUTPUT_DIR)
-        or REGISTRY_READ not in syft_steps_raw[0]
+        or REGISTRY_RETRY not in syft_steps_raw[0]
+        or SYFT_RETRY not in syft_steps_raw[0]
     ):
         return [SYFT_MESSAGE]
     return []
@@ -1212,8 +1252,8 @@ def self_test() -> int:
         "          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}\n"
     )
     syft_token_env = "          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}\n"
-    syft_update_check = "              -e SYFT_CHECK_FOR_APP_UPDATE=false \\\n"
-    syft_token_arg = '              -e SYFT_REGISTRY_AUTH_PASSWORD="$DOCKERHUB_PASSWORD" \\\n'
+    syft_update_check = "                -e SYFT_CHECK_FOR_APP_UPDATE=false \\\n"
+    syft_token_arg = '                -e SYFT_REGISTRY_AUTH_PASSWORD="$DOCKERHUB_PASSWORD" \\\n'
     other_identity = 'main-latest-image.yml@refs/heads/feature"'
     # Each mutation maps to (mutation, a fragment its rejection must contain).
     # None accepts any rejection.
@@ -1555,13 +1595,33 @@ def self_test() -> int:
         ),
         "smoke pull without retry": (
             replace_in_job(
-                "smoke", 'if ! registry_read "$pull_err" docker pull', "if ! docker pull"
+                "smoke", 'if ! retry_registry_read "$pull_err" "$attempt"; then', "if true; then"
             ),
             f"jobs.smoke {REGISTRY_RETRY_MESSAGE}",
         ),
         "unbounded registry retry": (
             replace_in_job("resolve", "for attempt in 1 2 3; do", "while true; do"),
             f"jobs.resolve {REGISTRY_RETRY_MESSAGE}",
+        ),
+        "registry retry never gives up": (
+            replace_in_job("resolve", '[ "$attempt" -ge 3 ]', '[ "$attempt" -ge 30 ]'),
+            f"jobs.resolve {REGISTRY_RETRY_MESSAGE}",
+        ),
+        "reuse signature check without retry": (
+            replace_in_job(
+                "resolve",
+                'if ! retry_registry_read "$work/verify.err" "$attempt"; then',
+                "if true; then",
+            ),
+            REUSE_MESSAGE,
+        ),
+        "Syft scan without retry": (
+            replace_in_job(
+                "attest",
+                'if ! retry_registry_read "$work/syft.err" "$attempt"; then',
+                "if true; then",
+            ),
+            SYFT_MESSAGE,
         ),
         "Syft receives the Docker Hub token": (
             chain(
