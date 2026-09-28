@@ -7,6 +7,7 @@
 //! without standing up a CP.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::fips::approved::Sha256;
@@ -14,6 +15,7 @@ use chrono::{DateTime, Utc};
 use semver::Version;
 use serde_json::Value;
 
+use crate::FERRUM_VERSION;
 use crate::config::types::GatewayConfig;
 use crate::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::util::backoff::{BACKOFF_INITIAL_SECS, BACKOFF_MAX_SECS, next_backoff_secs};
@@ -825,22 +827,21 @@ impl VersionCompatError {
             ),
             VersionCompatError::Incompatible { local, peer } => format!(
                 "Version mismatch: {local_role} is v{local} but {peer_role} is v{peer:?}. \
-                 Major and minor versions must match. \
-                 Upgrade the CP first, then upgrade DPs to the same major.minor version."
+                 The CP and its data planes must run the same Ferrum Edge build; \
+                 upgrade them together."
             ),
         }
     }
 }
 
-/// CP/DP version compatibility using SemVer.
+/// MeshSubscribe peer version floor using SemVer.
 ///
-/// # Prerelease policy
-///
-/// Compatibility compares **major and minor only**. Patch, prerelease
-/// (`-rc.1`), and build metadata (`+gitsha`) differences are allowed when
-/// major.minor match. Empty and unparseable versions are rejected on both
-/// CP admission and every DP ConfigUpdate envelope, including heartbeats, so
-/// an incompatible peer cannot keep an otherwise-refused stream alive.
+/// ConfigSync does not use this check; it enforces the exact build identity
+/// ([`check_config_sync_build_identity`]). MeshSubscribe keeps this coarser
+/// floor, which rejects empty, unparseable, and different-major.minor
+/// versions on CP admission and on every mesh config envelope, including
+/// heartbeats. Passing it is not a support statement: the CP and its data
+/// planes must run the same build, and mixed builds are unsupported.
 pub fn check_peer_version_compatibility(
     local_version: &str,
     peer_version: &str,
@@ -868,6 +869,72 @@ pub fn check_peer_version_compatibility(
     }
 
     Ok(())
+}
+
+/// ConfigSync wire-protocol revision.
+///
+/// CP and DP must run the same build. The build does not embed a git commit,
+/// so two builds that share a crate version are told apart only by this
+/// revision: bump it on every change to the ConfigSync messages, frame
+/// semantics, or the snapshot/delta JSON contract, even when the crate
+/// version stays the same.
+pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 1;
+
+/// Leading text of every ConfigSync build-mismatch refusal. The DP recognises
+/// the CP's `FAILED_PRECONDITION` Subscribe status by this prefix.
+pub const CONFIG_SYNC_BUILD_MISMATCH_PREFIX: &str = "ConfigSync build mismatch";
+
+/// Longest peer build identity echoed back in refusals and logs.
+const MAX_PEER_BUILD_CHARS: usize = 128;
+
+/// This build's ConfigSync identity: `<crate version>+configsync.r<revision>`.
+///
+/// The DP sends it on `SubscribeRequest` / `FullConfigRequest`, and the CP
+/// stamps it on every `ConfigUpdate` (heartbeats included) and on
+/// `FullConfigResponse`. Each side requires an exact match.
+pub fn config_sync_build_identity() -> &'static str {
+    static IDENTITY: LazyLock<String> = LazyLock::new(|| {
+        let revision = CONFIG_SYNC_PROTOCOL_REVISION;
+        format!("{FERRUM_VERSION}+configsync.r{revision}")
+    });
+    IDENTITY.as_str()
+}
+
+/// A ConfigSync peer reported a build identity other than this build's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildIdentityMismatch {
+    /// The peer's reported identity, truncated for logging. Empty when the
+    /// peer sent none.
+    pub peer: String,
+}
+
+impl BuildIdentityMismatch {
+    /// Operator-facing refusal naming both build identities.
+    pub fn message(&self, local_role: &str, peer_role: &str) -> String {
+        let local = config_sync_build_identity();
+        let peer = if self.peer.is_empty() {
+            format!("{peer_role} reported no build identity")
+        } else {
+            format!("{peer_role} build is {:?}", self.peer)
+        };
+        format!(
+            "{CONFIG_SYNC_BUILD_MISMATCH_PREFIX}: {local_role} build is {local:?} but {peer}. \
+             CP and DP must run the same Ferrum Edge build; upgrade the CP and every DP together."
+        )
+    }
+}
+
+/// Require the peer's ConfigSync build identity to equal this build's.
+///
+/// There is no compatibility window: a different crate version, a different
+/// [`CONFIG_SYNC_PROTOCOL_REVISION`], or a missing identity is refused.
+pub fn check_config_sync_build_identity(peer_build: &str) -> Result<(), BuildIdentityMismatch> {
+    if peer_build == config_sync_build_identity() {
+        return Ok(());
+    }
+    Err(BuildIdentityMismatch {
+        peer: peer_build.chars().take(MAX_PEER_BUILD_CHARS).collect(),
+    })
 }
 
 /// Multi-CP reconnect backoff state. Backoff follows the failure sequence and
@@ -900,6 +967,13 @@ impl Default for MultiCpBackoffState {
 pub enum ConfigSyncAttemptOutcome {
     /// Transport/RPC failure before this attempt accepted any config.
     ConnectionError,
+    /// The CP and DP run different builds: the CP refused Subscribe with its
+    /// `FAILED_PRECONDITION` build-mismatch status, or a CP frame carried a
+    /// build identity other than this DP's. Failover and accumulating backoff
+    /// match [`Self::ConnectionError`], so a mixed rollout retries on the
+    /// normal failure schedule instead of hot-looping. The mismatched CP is
+    /// not an authoritative source for this DP.
+    BuildMismatch,
     /// The CP answered the Subscribe RPC with `RESOURCE_EXHAUSTED`: a CP gRPC
     /// stream admission budget (total / per-namespace / per-principal /
     /// per-node / distinct-node) is saturated (issue #4531).
@@ -962,6 +1036,7 @@ pub fn advance_multi_cp_backoff(
             true
         }
         ConfigSyncAttemptOutcome::ConnectionError
+        | ConfigSyncAttemptOutcome::BuildMismatch
         | ConfigSyncAttemptOutcome::AdmissionRefused
         | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
         | ConfigSyncAttemptOutcome::StaleSnapshotFenced

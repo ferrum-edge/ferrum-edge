@@ -37,6 +37,7 @@ use ferrum_edge::grpc::auth::{
     AuthorizedResponseStream, MESH_LOCAL_SUBSCRIBE_AUDIENCE, StreamAuthSurface,
     StreamAuthorizationLease, remote_discovery_audience,
 };
+use ferrum_edge::grpc::configsync_lifecycle::config_sync_build_identity;
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
 use ferrum_edge::grpc::cp_trust::{
     CpDpTrustBundle, CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo, PeerNamespaceScope,
@@ -434,6 +435,7 @@ fn subscribe_request(node_id: &str, namespace: &str) -> ferrum_edge::grpc::proto
     ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: node_id.to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: namespace.to_string(),
         real_ip_header: Some(String::new()),
     }
@@ -1323,6 +1325,7 @@ async fn get_full_config_refuses_cross_tenant_forgery() {
             ferrum_edge::grpc::proto::FullConfigRequest {
                 node_id: "dp-a".to_string(),
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                config_sync_build: config_sync_build_identity().to_string(),
                 namespace: TENANT_B.to_string(),
                 real_ip_header: Some(String::new()),
             },

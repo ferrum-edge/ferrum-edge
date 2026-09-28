@@ -2399,8 +2399,9 @@ pub async fn run(
             XdsAdsServer::with_sidecar_enforcement(
                 config_arc.clone(),
                 // ADS reads every namespace through `with_namespace_broadcasts`
-                // below; this constructor sender is the CP's own namespace.
-                broadcasts.sender_for(&env_config.namespace),
+                // below and never subscribes to this constructor sender, so it
+                // is a detached placeholder rather than a namespace channel.
+                tokio::sync::broadcast::channel(1).0,
                 grpc_secret,
                 env_config.cp_dp_grpc_jwt_issuer.clone(),
                 env_config.namespace.clone(),

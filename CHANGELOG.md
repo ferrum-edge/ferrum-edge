@@ -278,6 +278,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MeshGrpcServer` are built only through `builder()`, and
   `CpGrpcServerBuilder::build()` returns only the server (per-namespace
   senders come from `broadcasts()`). Same-build CP/DP behavior is unchanged.
+- **ConfigSync enforces the same build.** The major.minor version gate is
+  replaced by a build identity, `<crate version>+configsync.r<revision>`,
+  carried on new fields: `SubscribeRequest.config_sync_build` (6),
+  `FullConfigRequest.config_sync_build` (5), `FullConfigResponse.config_sync_build`
+  (5), and `ConfigUpdate.config_sync_build` (9). The CP refuses any other DP
+  build with `FAILED_PRECONDITION`, the DP refuses any CP frame from another
+  build, and a refused DP backs off on the normal failure schedule while it
+  keeps serving last-known-good config. Upgrade CP and DP together.
 - The vendored hyper patch that resets an upgraded HTTP/2 `CONNECT` stream
   with `CONNECT_ERROR` (#5781) is filed upstream as hyperium/hyper#4209 and
   hyperium/hyper#4210; the fork is dropped once a hyper release containing

@@ -34,6 +34,11 @@ message SubscribeRequest {
   // CP and DP no longer negotiate them.
   reserved 5;
   reserved "supports_heartbeat";
+  // ConfigSync build identity of the DP
+  // (`<crate version>+configsync.r<CONFIG_SYNC_PROTOCOL_REVISION>`). CP and DP
+  // must run the same build: the CP refuses Subscribe with FAILED_PRECONDITION
+  // unless this equals its own identity exactly.
+  string config_sync_build = 6;
 }
 
 message FullConfigRequest {
@@ -44,6 +49,8 @@ message FullConfigRequest {
   string namespace = 3;
   // Same required effective-header advertisement as SubscribeRequest.
   optional string real_ip_header = 4;
+  // Same required build identity as SubscribeRequest.config_sync_build.
+  string config_sync_build = 5;
 }
 
 message FullConfigResponse {
@@ -55,6 +62,8 @@ message FullConfigResponse {
   // or JSON null to clear previously delivered CP trust material. Kept
   // out-of-band so config_json never carries trust authority material.
   string trust_bundles_json = 4;
+  // ConfigSync build identity of the CP (see SubscribeRequest.config_sync_build).
+  string config_sync_build = 5;
 }
 
 message ConfigUpdate {
@@ -82,6 +91,10 @@ message ConfigUpdate {
   // Retired heartbeat capability confirmation (heartbeats are always on).
   reserved 8;
   reserved "heartbeat_negotiated";
+  // ConfigSync build identity of the CP, stamped on every frame including
+  // heartbeats. The DP terminates the stream and backs off unless it equals
+  // its own identity exactly (see SubscribeRequest.config_sync_build).
+  string config_sync_build = 9;
 }
 
 message MeshSubscribeRequest {
@@ -129,8 +142,8 @@ message MeshSubscribeRequest {
   // authentications` fields. It does NOT widen `workloads` / `services` /
   // `peer_authentications`. Deliberately separate from
   // `ambient_udp_source_scoping`: NodeWaypoint UDP stays mesh-wide-only.
-  // Absent/false on legacy DPs, which then receive no inventory and whose
-  // capture path resolves nothing (fail closed).
+  // Absent/false means the subscriber receives no inventory and its capture
+  // path resolves nothing (fail closed).
   bool node_waypoint_capture_scoping = 9;
 }
 
@@ -138,8 +151,8 @@ message MeshSubscribeRequest {
 //
 // CONSUMER CONTRACT (enforced fail-closed by every Ferrum mesh config consumer
 // before a slice is installed or its endpoints imported):
-//   * `ferrum_version` MUST be present and major/minor-compatible with the
-//     subscriber.
+//   * `ferrum_version` MUST be present and pass the subscriber's Ferrum
+//     version check. The CP and its mesh data planes run the same build.
 //   * On a non-heartbeat frame, `version` MUST equal the embedded
 //     `MeshSlice.version` — the envelope stamp is a duplicate of the slice's own
 //     version, not an independent value.

@@ -1445,27 +1445,28 @@ path-backed file and their aggregate material in one candidate are limited to 1
 MiB, so split oversized trust inventories across control planes before the
 upgrade.
 
-### Version Negotiation (Built-In Safety Net)
+### Build Identity Gate
 
 **CP and DP must run the same build.** The ConfigSync wire contract (the protobuf messages and the JSON config bodies they carry) is only guaranteed between identical builds; there is no mixed-version compatibility layer, including between patch versions.
 
-Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version during gRPC handshake as a safety net for gross mismatches. Versions are parsed as **SemVer** and the **major and minor** components must match. Patch-level differences (e.g., `0.9.0` vs `0.9.1`) pass this gate but are not a supported deployment. **Prerelease policy:** prerelease (`-rc.1`) and build metadata (`+git`) are ignored by the gate; only major.minor are compared. Empty or malformed versions are rejected on both CP admission (`FailedPrecondition`) and DP ConfigUpdate processing. Every ConfigUpdate envelope — FULL_SNAPSHOT, DELTA, or heartbeat — must carry a valid compatible CP version.
+CP and DP enforce this with a ConfigSync **build identity**, `<crate version>+configsync.r<revision>` (for example `0.9.8+configsync.r1`). The revision is the `CONFIG_SYNC_PROTOCOL_REVISION` constant in `src/grpc/configsync_lifecycle.rs`. Builds do not embed a git commit, so two builds that share a crate version are told apart only by the revision: it is bumped on every change to the ConfigSync messages, frame semantics, or snapshot/delta JSON contract, even when the crate version stays the same.
 
-| CP Version | DP Version | Result |
-|------------|------------|--------|
-| `0.9.0` | `0.9.0` | Allowed |
-| `0.9.0` | `0.9.3` | Passes the gate (patch difference) — unsupported; run the same build |
-| `0.9.0` | `0.9.0-rc.1` | Passes the gate (prerelease ignored for major.minor gate) — unsupported; run the same build |
-| `0.9.0` | `1` / `garbage` / `` | **Rejected** — missing or malformed SemVer |
-| `0.9.0` | `0.10.0` | **Rejected** — DP Subscribe/GetFullConfig fails with `FAILED_PRECONDITION` |
-| `1.0.0` | `0.9.0` | **Rejected** — major version mismatch |
+- The DP sends its identity on `SubscribeRequest` / `FullConfigRequest` (`config_sync_build`). The CP compares it with its own and refuses any difference — a different crate version (patch, prerelease, and build metadata included), a different revision, or a missing identity — with `FAILED_PRECONDITION` before any config is streamed.
+- The CP stamps its identity on every `ConfigUpdate`, heartbeats included, and on `FullConfigResponse`. The DP terminates the stream on any frame from another build without applying it.
+
+| CP build | DP build | Result |
+|----------|----------|--------|
+| `0.9.8+configsync.r1` | `0.9.8+configsync.r1` | Allowed |
+| `0.9.8+configsync.r1` | `0.9.8+configsync.r2` | **Rejected** — same crate version, different build |
+| `0.9.8+configsync.r1` | `0.9.9+configsync.r1` | **Rejected** — different crate version |
+| `0.9.8+configsync.r1` | (none) | **Rejected** — the DP build predates the field |
 
 What happens on rejection:
-- The **CP** returns a gRPC `FAILED_PRECONDITION` status with a message identifying both versions and the required DP version.
-- The **DP** logs the error, disconnects, and enters the standard exponential-backoff/failover loop. It will keep failing until upgraded to a compatible version.
+- The **CP** returns a gRPC `FAILED_PRECONDITION` status starting with `ConfigSync build mismatch` that names both build identities, and records a failed tenant-subscription audit event.
+- The **DP** logs the refusal with both identities and backs off on the standard exponential-backoff/failover schedule instead of reconnecting in a tight loop. It keeps failing until CP and DP run the same build.
 - **No config is exchanged** — the DP continues serving traffic with whatever config it had cached before the connection attempt, subject to the `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` bound.
 
-This prevents a scenario where a newer CP pushes config containing fields or structures that an older DP cannot deserialize, which could cause silent data loss or deserialization failures.
+This prevents a scenario where a CP pushes config containing fields or structures that a DP from another build cannot deserialize, which could cause silent data loss or deserialization failures.
 
 You can verify versions via the authenticated `GET /admin/metrics` endpoint on any node — the `gateway.ferrum_version` field reports the running binary version.
 
@@ -1474,12 +1475,10 @@ You can verify versions via the authenticated `GET /admin/metrics` endpoint on a
 Always upgrade in this order: **CP first, then DPs.** The CP owns the
 configuration database; during build-out that database is rebuilt with
 `GET /backup` / `POST /restore`, not in-place core schema migration. DPs are
-stateless proxies that receive config via gRPC. CP and DP must run the same
-build, so upgrade the DPs promptly after the CP: a DP on a different build is not
-guaranteed to understand the CP's ConfigSync stream and may reconnect or refuse
-updates until it is upgraded. The version gate additionally makes a DP with a
-different major.minor refuse the incompatible config rather than silently
-applying a partial parse.
+stateless proxies that receive config via gRPC. Upgrade CP and DP together;
+mixed builds are rejected at subscribe. Until a DP is upgraded, the new CP
+refuses its `Subscribe` and the DP keeps serving its last-known-good config
+while it backs off (see [Build Identity Gate](#build-identity-gate)).
 
 ### Step-by-Step
 
@@ -1540,9 +1539,9 @@ FERRUM_MODE=cp \
   ./ferrum-edge-new
 ```
 
-#### 4. Rolling Upgrade of DPs
+#### 4. Upgrade the DPs
 
-Upgrade DP nodes one at a time (or in batches). Each DP reconnects to the CP on startup and receives a fresh config snapshot.
+Upgrade CP and DP together; mixed builds are rejected at subscribe. Replace every DP right after the CP: an old DP cannot receive config from the new CP, so it serves its last-known-good config (bounded by `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`) and backs off until it is replaced. Each upgraded DP connects to the CP and receives a fresh config snapshot.
 
 ```bash
 # On each DP node, stop old binary and start new:
@@ -1557,13 +1556,7 @@ If a load balancer sits in front of the DP fleet, drain each node before restart
 
 #### Multi-CP Failover Deployments
 
-When DPs are configured with `FERRUM_DP_CP_GRPC_URLS` (multiple CPs), upgrades are smoother:
-
-1. Upgrade CP₁ first (DPs automatically fail over to CP₂ during the restart window)
-2. Upgrade CP₂ (DPs fail back to CP₁ which is already running the new version)
-3. Rolling upgrade DPs as above
-
-This eliminates the read-only window during CP upgrades — DPs always have at least one CP available for config updates.
+When DPs are configured with `FERRUM_DP_CP_GRPC_URLS` (multiple CPs), every CP must run the same build as the DPs. Upgrade CP and DP together; mixed builds are rejected at subscribe. Upgrade all CPs, then all DPs, in one maintenance window. Failover does not bridge builds: a DP refuses a CP on another build, and a CP refuses a DP on another build.
 
 ```bash
 # DP configured for multi-CP failover:
@@ -1672,7 +1665,7 @@ FERRUM_MODE=file \
 | Database schema (build-out) | No — rebuild fresh DB + `POST /restore` | No — old binary + old DB only |
 | Database schema (post-freeze tagged releases) | Yes (versioned forward migrations) | No (old binary cannot read new schema) |
 | Config file format (build-out) | No — update the config shape and validate | No compatibility guarantee |
-| gRPC protocol (CP↔DP) | No — CP and DP must run the same build (major.minor mismatch rejected at connect time) | No — same build required |
+| gRPC protocol (CP↔DP) | No — CP and DP must run the same build (any other build is rejected at Subscribe) | No — same build required |
 | Admin API | Generally stable | Check release notes |
 
 ### Downtime Expectations

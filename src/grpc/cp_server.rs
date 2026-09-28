@@ -60,7 +60,10 @@ use super::auth::{
     AllowedNamespaces, AuthorizedResponseStream, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
     StreamAuthSurface, VerifiedGrpcIdentity,
 };
-use super::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS;
+use super::configsync_lifecycle::{
+    CONFIGSYNC_HEARTBEAT_INTERVAL_SECS, check_config_sync_build_identity,
+    config_sync_build_identity,
+};
 use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
@@ -692,13 +695,13 @@ impl CpGrpcServer {
         &self.scope
     }
 
-    /// Check whether the DP's reported version is compatible with this CP.
+    /// MeshSubscribe version floor for a mesh data plane.
     ///
-    /// Compatibility uses SemVer parsing. Major and minor versions must match.
-    /// Patch-level and prerelease/build differences are allowed (see
+    /// Empty, malformed, and different-major.minor versions are rejected with
+    /// `FailedPrecondition` (issue #2395; see
     /// [`crate::grpc::configsync_lifecycle::check_peer_version_compatibility`]).
-    /// Empty and malformed versions are rejected with `FailedPrecondition`
-    /// (issue #2395).
+    /// ConfigSync does not use this check: it requires the exact build identity
+    /// ([`Self::check_config_sync_build`]).
     #[allow(clippy::result_large_err)]
     pub(crate) fn check_version_compatibility(dp_version: &str) -> Result<(), Status> {
         use crate::grpc::configsync_lifecycle::check_peer_version_compatibility;
@@ -706,20 +709,40 @@ impl CpGrpcServer {
         check_peer_version_compatibility(FERRUM_VERSION, dp_version)
             .map_err(|err| Status::failed_precondition(err.message("CP", "DP", FERRUM_VERSION)))?;
 
-        // Log patch-only differences for operators (still compatible).
-        if let (Ok(local), Ok(peer)) = (
-            semver::Version::parse(FERRUM_VERSION),
-            semver::Version::parse(dp_version),
-        ) && (local.patch != peer.patch || local.pre != peer.pre || local.build != peer.build)
-        {
-            info!(
-                "DP v{} connected to CP v{} (patch/prerelease difference OK)",
+        // The floor passed, but anything other than this exact version is a
+        // different build, which is unsupported.
+        if dp_version != FERRUM_VERSION {
+            warn!(
+                "Mesh data plane v{} connected to CP v{}: CP and data planes must run the \
+                 same build; upgrade them together",
                 crate::startup::sanitize_startup_cause(format!("{dp_version:?}"), &[]),
                 FERRUM_VERSION
             );
         }
 
         Ok(())
+    }
+
+    /// Require a ConfigSync DP to run this CP's exact build.
+    ///
+    /// Compares the DP's `config_sync_build` with
+    /// [`config_sync_build_identity`]. A mismatch, including a missing
+    /// identity, is audited with both identities and refused with
+    /// `FailedPrecondition` before any configuration is streamed. The DP
+    /// treats that status as a build mismatch and backs off.
+    #[allow(clippy::result_large_err)]
+    fn check_config_sync_build(
+        surface: &'static str,
+        node_id: &str,
+        namespace: &str,
+        dp_build: &str,
+    ) -> Result<(), Status> {
+        let Err(mismatch) = check_config_sync_build_identity(dp_build) else {
+            return Ok(());
+        };
+        let message = mismatch.message("CP", "DP");
+        Self::audit_tenant_subscription(surface, node_id, namespace, "failure", &message);
+        Err(Status::failed_precondition(message))
     }
 
     /// Filter a multi-namespace `GatewayConfig` down to a single namespace.
@@ -1660,11 +1683,18 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json: String::new(),
             heartbeat: true,
+            config_sync_build: config_sync_build_identity().to_string(),
         }
     }
 
-    /// Broadcast a full config snapshot to all connected DPs.
-    /// Returns whether a bounded message was sent to at least one subscriber.
+    /// Test support: broadcast an unpartitioned full config snapshot on one
+    /// raw sender. Returns whether a bounded message was sent to at least one
+    /// subscriber.
+    ///
+    /// Production never calls this. The CP publishes per namespace through
+    /// [`Self::broadcast_namespace_update`], which filters config and trust to
+    /// each namespace; do not use this helper outside tests.
+    #[doc(hidden)]
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) -> bool {
         let trust_bundles_json = match Self::trust_bundles_json(config.trust_bundles.as_deref()) {
             Ok(json) => json,
@@ -1721,6 +1751,7 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
+            config_sync_build: config_sync_build_identity().to_string(),
         };
         Self::send_bounded_update(tx, update, namespace)
     }
@@ -1837,6 +1868,7 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
+            config_sync_build: config_sync_build_identity().to_string(),
         };
         Self::send_bounded_update(tx, update, namespace)
     }
@@ -2082,8 +2114,14 @@ impl ConfigSync for CpGrpcServer {
         let dp_version = inner.ferrum_version;
         let dp_namespace = inner.namespace;
 
-        // Reject DPs with incompatible versions before streaming any config.
-        Self::check_version_compatibility(&dp_version)?;
+        // CP and DP must run the same build: refuse any other build before
+        // streaming config.
+        Self::check_config_sync_build(
+            "ConfigSync.Subscribe",
+            &node_id,
+            &dp_namespace,
+            &inner.config_sync_build,
+        )?;
         if let Err(status) =
             self.check_real_ip_header_compatibility(inner.real_ip_header.as_deref())
         {
@@ -2174,6 +2212,7 @@ impl ConfigSync for CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
+            config_sync_build: config_sync_build_identity().to_string(),
         };
 
         Self::check_message_size(&initial, &dp_namespace)?;
@@ -2255,6 +2294,7 @@ impl ConfigSync for CpGrpcServer {
                             ferrum_version: FERRUM_VERSION.to_string(),
                             trust_bundles_json,
                             heartbeat: false,
+                            config_sync_build: config_sync_build_identity().to_string(),
                         }))
                     }
                     Err(e) => {
@@ -2340,7 +2380,12 @@ impl ConfigSync for CpGrpcServer {
 
         let req = request.get_ref();
         let dp_version = &req.ferrum_version;
-        Self::check_version_compatibility(dp_version)?;
+        Self::check_config_sync_build(
+            "ConfigSync.GetFullConfig",
+            &req.node_id,
+            &req.namespace,
+            &req.config_sync_build,
+        )?;
         if let Err(status) = self.check_real_ip_header_compatibility(req.real_ip_header.as_deref())
         {
             Self::audit_tenant_subscription(
@@ -2397,6 +2442,7 @@ impl ConfigSync for CpGrpcServer {
             version: config.loaded_at.to_rfc3339(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
+            config_sync_build: config_sync_build_identity().to_string(),
         };
         Self::check_message_size(&response, &req.namespace)?;
         Self::audit_tenant_subscription(

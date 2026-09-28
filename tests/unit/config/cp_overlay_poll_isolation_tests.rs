@@ -525,14 +525,20 @@ fn proxy_ids(config: &GatewayConfig) -> BTreeSet<String> {
 }
 
 fn json_ids(payload: &serde_json::Value, field: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let Some(items) = payload.get(field).and_then(|value| value.as_array()) else {
-        return ids;
+    let Some(value) = payload.get(field) else {
+        return Vec::new();
     };
+    // Fail loudly on any other shape: silently skipping it would let a
+    // wire-format change disable the add/remove folds below unnoticed.
+    let Some(items) = value.as_array() else {
+        panic!("{field} is not an array: {value}");
+    };
+    let mut ids = Vec::new();
     for item in items {
-        if let Some(id) = item.get("id").and_then(|id| id.as_str()) {
-            ids.push(id.to_string());
-        }
+        let Some(id) = item.get("id").and_then(|id| id.as_str()) else {
+            panic!("{field} element is not an object with a string id: {item}");
+        };
+        ids.push(id.to_string());
     }
     ids
 }

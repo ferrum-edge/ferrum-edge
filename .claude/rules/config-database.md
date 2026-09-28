@@ -42,11 +42,12 @@ paths:
 
 ## Multi-Namespace CP/DP
 
-- `FERRUM_CP_NAMESPACES` controls CP scope. Empty or unset is back-compatible `Single(FERRUM_NAMESPACE)`, `*` is cluster-wide, CSV is an explicit set.
+- `FERRUM_CP_NAMESPACES` controls CP scope. Empty or unset is the default `Single(FERRUM_NAMESPACE)`, `*` is cluster-wide, CSV is an explicit set.
 - `src/grpc/cp_server.rs::NamespaceBroadcasts` partitions broadcasts by namespace so DPs receive only their namespace slice.
 - DP still runs `dp_client::filter_config_to_namespace` as defense in depth.
 - `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true` requires DP `ConfigSync.Subscribe` JWTs to carry an `ns` claim, string or array, authorizing the subscribe namespace.
-- xDS ADS, MeshConfigSync, and the K8s controller broadcast hook still use the back-compatible single-namespace sender. Do not claim multi-namespace support on those surfaces until implemented.
+- xDS ADS consumes the per-namespace `NamespaceBroadcasts` (`with_namespace_broadcasts`) as wake-ups and rebuilds from the shared config; the K8s controller publishes per namespace through `NamespaceBroadcasts` + `CpScope`. MeshConfigSync uses one `MeshConfigBroadcast` channel and applies scope/`ns`-claim filtering per subscriber.
+- CP and DP must run the same build. ConfigSync enforces it with `configsync_lifecycle::config_sync_build_identity()` (`<crate version>+configsync.r<CONFIG_SYNC_PROTOCOL_REVISION>`) on `SubscribeRequest`/`FullConfigRequest` and on every `ConfigUpdate`/`FullConfigResponse`. Bump `CONFIG_SYNC_PROTOCOL_REVISION` on any ConfigSync wire or snapshot/delta JSON change; never reuse the reserved proto field numbers.
 
 ## Config Admission And Schemas
 

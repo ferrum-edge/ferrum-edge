@@ -59,8 +59,8 @@ are announced.
 
 The CP↔DP gRPC protocol requires CP and DP to run the **same build**; mixed
 CP/DP builds, including patch-level differences, are not supported. The
-connect-time gate (`check_version_compatibility`) rejects any **major.minor**
-mismatch as a safety net.
+ConfigSync build-identity gate rejects any other build at `Subscribe` (see
+[Build Identity Gate](upgrade_guide.md#build-identity-gate)).
 
 ### When V002+ migrations start (the schema freeze)
 

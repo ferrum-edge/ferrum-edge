@@ -1182,7 +1182,7 @@ pub enum IncrementalFullReloadReason {
     /// Gateway trust-bundle mutation (issue #3727).
     ///
     /// Trust material is not carried in the `IncrementalResult` body: that body
-    /// is a same-major.minor CP/DP wire contract, and trust travels exclusively
+    /// is a same-build CP/DP wire contract, and trust travels exclusively
     /// through the `ConfigUpdate.trust_bundles_json` side channel so it never
     /// enters the DP-facing `GatewayConfig` JSON. Escalating instead of
     /// inventing a delta field keeps the rotation atomic — the control plane
