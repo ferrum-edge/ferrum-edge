@@ -67,15 +67,19 @@ const PROTOTYPE_POLLUTION_CONSTRUCTOR: &str =
 /// directly in front of it: the start of the value, a quote, `(`, `,`, `;`,
 /// `=`, `|`, `&`, or an SQL keyword, optionally followed by the same
 /// whitespace-or-bounded-comment separator the level-1 signatures above use.
-/// A method call (`.sleep(`) never qualifies. The remaining alternatives name
-/// database-specific functions that are not general-purpose code.
+/// A method call (`.sleep(`) never qualifies. A number that opens the value
+/// followed by an arithmetic, comparison, or bitwise operator
+/// (`1-sleep(5)`, `1*sleep(5)`, `1+sleep(5)`) is the numeric-context probe;
+/// it is anchored to the start of the value, where a query value holds only
+/// the injected expression. The remaining alternatives name database-specific
+/// functions that are not general-purpose code.
 ///
 /// That context is tight enough for a query value but not for a request body
 /// that carries source code: `foo();\n sleep(1);`, `x = sleep(5)`,
 /// `(sleep(1))`, and `benchmark(1000, fn)` are all ordinary code. The body
 /// mirror is therefore level 2, and level-1 body coverage comes from
 /// `SQLI_TIME_DELAY_SQL_CONTEXT`.
-const SQLI_TIME_DELAY: &str = r#"(?i)(?:(?:^|[(,;='"|&]|\b(?:and|or|xor|select|union|where|having|if|then|else|when)\b)(?:\s|/\*(?s:.){0,64}?\*/)*(?:sleep|pg_sleep)\s*\(\s*\d+(?:\.\d+)?\s*\)|\bbenchmark\s*\(\s*\d+\s*,|\bwaitfor(?:\s|/\*(?s:.){0,64}?\*/)+(?:delay|time)(?:\s|/\*(?s:.){0,64}?\*/)*['"]\d|\bdbms_(?:lock\.sleep|pipe\.receive_message)\s*\(|\brandomblob\s*\(\s*\d{6,})"#;
+const SQLI_TIME_DELAY: &str = r#"(?i)(?:(?:^|[(,;='"|&]|\b(?:and|or|xor|select|union|where|having|if|then|else|when)\b|^[\s(]*-?[0-9]{1,20}(?:\.[0-9]{1,20})?\s*[-+*/%^|&<>=]{1,2}\(*)(?:\s|/\*(?s:.){0,64}?\*/)*(?:sleep|pg_sleep)\s*\(\s*\d+(?:\.\d+)?\s*\)|\bbenchmark\s*\(\s*\d+\s*,|\bwaitfor(?:\s|/\*(?s:.){0,64}?\*/)+(?:delay|time)(?:\s|/\*(?s:.){0,64}?\*/)*['"]\d|\bdbms_(?:lock\.sleep|pipe\.receive_message)\s*\(|\brandomblob\s*\(\s*\d{6,})"#;
 
 /// Level-1 body time-delay signature, claimed by `FE-SQLI-010-B`. `sleep(n)`
 /// counts only where no general-purpose language puts it: after an SQL
@@ -86,27 +90,33 @@ const SQLI_TIME_DELAY: &str = r#"(?i)(?:(?:^|[(,;='"|&]|\b(?:and|or|xor|select|u
 /// Three unquoted shapes are also level 1, each anchored where source code
 /// does not put a delay call:
 ///
-/// * a later item of an `ORDER BY` / `GROUP BY` list (`ORDER BY 1,sleep(5)`);
-/// * a number that opens the value — at the start of the body, straight after
-///   a quote, `=`, or `&` — followed by an arithmetic or bitwise operator
-///   (`1-sleep(5)`, `"1*sleep(5)"`, `id=1|sleep(5)`). Code writes
-///   `x = 1 + sleep(5)` with a space after the `=`, and never opens a string
-///   with the number;
-/// * a form-encoded pair whose whole value is the call (`id=sleep(5)`,
+/// * a later item of an `ORDER BY` / `GROUP BY` list (`ORDER BY 1,sleep(5)`,
+///   `ORDER/**/BY 1/**/,sleep(5)`);
+/// * a value that is nothing but a number, an arithmetic, comparison, or
+///   bitwise operator, and the call (`1-sleep(5)`, `"1*sleep(5)"`,
+///   `"1=sleep(5)"`): it opens the body, a quoted string, or an `&`-separated
+///   field, and ends at the closing quote, `&`, the end of the body, or an SQL
+///   comment (`--`, `#`, `/*`);
+/// * a form-encoded pair whose whole value is the call, optionally behind the
+///   same number and operator (`id=sleep(5)`, `id=1-sleep(5)`,
 ///   `a=1&id=sleep(5)&b=2`): the pair must open the body or follow `&`, and the
-///   value must end at `&`, the end of the body, or an SQL comment. A JSON
-///   body never opens with `key=`, and a code line such as `x=sleep(5);` does
-///   not end its value there.
+///   value must end at `&`, the end of the body, or an SQL comment (`--`, `#`,
+///   `/*`). A JSON body never opens with `key=`, and a code line such as
+///   `x=sleep(5);` does not end its value there.
 ///
-/// An assignment inside code (`x = sleep(5)`), a statement (`foo(); sleep(1);`),
-/// and a method call (`time.sleep(1)`) stay clean; so does a JSON string whose
-/// whole value is `sleep(5)`, which only the level-2 `FE-SQLI-006-B` claims.
+/// Precision wins over recall here because the level-2 `FE-SQLI-006-B` is the
+/// backstop. An assignment inside code (`x = sleep(5)`, compact
+/// `x=1+sleep(5)` inside a JSON string), a spreadsheet formula
+/// (`"=2*sleep(1)"`), a statement (`foo(); sleep(1);`), and a method call
+/// (`time.sleep(1)`) stay clean; so does a JSON string whose whole value is
+/// `sleep(5)`, which only the level-2 `FE-SQLI-006-B` claims. A delay call
+/// followed by more SQL (`id=sleep(5) and 1=1`) is likewise left to level 2.
 ///
 /// `BENCHMARK` needs an SQL function as its expression (`MD5(`, `SHA1(`, a
 /// subquery), so `benchmark(1000, fn)` stays clean. `pg_sleep`,
 /// `WAITFOR DELAY`, the Oracle `dbms_*` calls, and `randomblob` are
 /// database-specific and keep the query rule's shape.
-const SQLI_TIME_DELAY_SQL_CONTEXT: &str = r#"(?i)(?:\b(?:and|or|xor|select|union|where|having|then|rlike|by)\b(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:\|\||&&|[-+*=^])(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|\bif\s*\([^;]{0,64}?,(?:\s|/\*(?s:.){0,64}?\*/)*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|\b(?:order|group)\s+by\s[0-9a-z_.`\s,]{0,64},(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|(?:^|['"=&])[0-9]{1,20}\s*[-+*/^|&]{1,2}(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|(?:^|&)[0-9a-z_.\[\]-]{1,64}=[\s(]*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)[\s)]*(?:(?:--|#)[^&]{0,32})?(?:&|$)|\bpg_sleep\s*\(\s*\d|\bbenchmark\s*\(\s*\d+\s*,\s*(?:(?:md5|sha1?|sha2|encode|aes_encrypt|compress|concat|rand|char)\s*\(|\(\s*select\b)|\bwaitfor(?:\s|/\*(?s:.){0,64}?\*/)+(?:delay|time)(?:\s|/\*(?s:.){0,64}?\*/)*['"]\d|\bdbms_(?:lock\.sleep|pipe\.receive_message)\s*\(|\brandomblob\s*\(\s*\d{6,})"#;
+const SQLI_TIME_DELAY_SQL_CONTEXT: &str = r#"(?i)(?:\b(?:and|or|xor|select|union|where|having|then|rlike|by)\b(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:\|\||&&|[-+*=^])(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|\bif\s*\([^;]{0,64}?,(?:\s|/\*(?s:.){0,64}?\*/)*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|\b(?:order|group)(?:\s|/\*(?s:.){0,64}?\*/)+by(?:\s|/\*(?s:.){0,64}?\*/)[0-9a-z_.`\s,/*]{0,64},(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)|(?:^|[&'"])[\s(]*-?[0-9]{1,20}(?:\.[0-9]{1,20})?\s*[-+*/%^|&<>=]{1,2}(?:\s|/\*(?s:.){0,64}?\*/|\()*sleep\s*\(\s*\d+(?:\.\d+)?\s*\)[\s)]*(?:(?:--|#|/\*)[^&'"]{0,32})?(?:[&'"]|$)|(?:^|&)[0-9a-z_.\[\]-]{1,64}=[\s(]*(?:-?[0-9]{1,20}(?:\.[0-9]{1,20})?\s*[-+*/%^|&<>=]{1,2}(?:\s|/\*(?s:.){0,64}?\*/|\()*)?sleep\s*\(\s*\d+(?:\.\d+)?\s*\)[\s)]*(?:(?:--|#|/\*)[^&]{0,32})?(?:&|$)|\bpg_sleep\s*\(\s*\d|\bbenchmark\s*\(\s*\d+\s*,\s*(?:(?:md5|sha1?|sha2|encode|aes_encrypt|compress|concat|rand|char)\s*\(|\(\s*select\b)|\bwaitfor(?:\s|/\*(?s:.){0,64}?\*/)+(?:delay|time)(?:\s|/\*(?s:.){0,64}?\*/)*['"]\d|\bdbms_(?:lock\.sleep|pipe\.receive_message)\s*\(|\brandomblob\s*\(\s*\d{6,})"#;
 
 /// Database catalog enumeration, claimed by `FE-SQLI-007` and its body
 /// mirror. Only catalog objects that ordinary application traffic never
@@ -126,12 +136,15 @@ const SQLI_SCHEMA_ENUMERATION: &str = r"(?i)(?:\binformation_schema(?:\s|/\*(?s:
 /// `load_file` is also an ordinary function name (`def load_file(path):`,
 /// `loader.load_file('/etc/app.conf')`), so it counts only as a bare call
 /// whose argument is what MySQL reads: a quoted absolute or UNC path, a hex
-/// literal in either spelling (`0x2f65…`, `X'2f65…'`), or a `CHAR(` /
-/// `CONCAT(` / `UNHEX(` / `FROM_BASE64(` expression. The argument may follow
-/// the level-1 whitespace-or-bounded-comment separator, so
-/// `load_file(/**/'/etc/passwd')` counts. A method or associated-function call
-/// (`.load_file(`, `->load_file(`, `::load_file(`) never qualifies.
-const SQLI_ERROR_OR_OOB_FUNCTION: &str = r#"(?i)(?:\b(?:extractvalue|updatexml)\s*\(|(?:^|[^.\w$>:])load_file\s*\((?:\s|/\*(?s:.){0,64}?\*/)*(?:0x[0-9a-f]{2,}|x'[0-9a-f]{2,}|(?:char|concat|unhex|from_base64)\s*\(|['"](?:/|\\\\|[a-z]:[\\/]))|\binto(?:\s|/\*(?s:.){0,64}?\*/)+(?:out|dump)file\b|\bxp_(?:cmdshell|dirtree|regread|fileexist|subdirs)\b|\bsp_(?:oacreate|oamethod|execute_external_script)\b|\bopenrowset\s*\(|\butl_(?:http\.request|inaddr\.get_host_(?:address|name)|file\.fopen)\b|\bdbms_(?:java\.runjava|xmlquery|scheduler\.create_job)\b|\blo_(?:import|export)\s*\()"#;
+/// literal in either spelling (`0x2f65…`, `X'2f65…'`), either of those behind
+/// a charset introducer (`_latin1'/etc/passwd'`, `_binary 0x2f65…`), or a
+/// `CHAR(` / `CONCAT(` / `CONCAT_WS(` / `UNHEX(` / `FROM_BASE64(` expression.
+/// The argument may follow the level-1 whitespace-or-bounded-comment
+/// separator, so `load_file(/**/'/etc/passwd')` counts. A method or
+/// associated-function call (`.load_file(`, `->load_file(`, `::load_file(`)
+/// never qualifies. A user-variable argument (`load_file(@v)`) is not matched:
+/// Ruby writes `load_file(@path)` as ordinary code.
+const SQLI_ERROR_OR_OOB_FUNCTION: &str = r#"(?i)(?:\b(?:extractvalue|updatexml)\s*\(|(?:^|[^.\w$>:])load_file\s*\((?:\s|/\*(?s:.){0,64}?\*/)*(?:(?:_[a-z0-9]{2,16}\s*)?(?:0x[0-9a-f]{2,}|x'[0-9a-f]{2,}|['"](?:/|\\\\|[a-z]:[\\/]))|(?:char|concat(?:_ws)?|unhex|from_base64)\s*\()|\binto(?:\s|/\*(?s:.){0,64}?\*/)+(?:out|dump)file\b|\bxp_(?:cmdshell|dirtree|regread|fileexist|subdirs)\b|\bsp_(?:oacreate|oamethod|execute_external_script)\b|\bopenrowset\s*\(|\butl_(?:http\.request|inaddr\.get_host_(?:address|name)|file\.fopen)\b|\bdbms_(?:java\.runjava|xmlquery|scheduler\.create_job)\b|\blo_(?:import|export)\s*\()"#;
 
 /// Quoted-string tautology (`' or 'a'='a`, `'or'1'='1`, `" || ""="`),
 /// claimed by `FE-SQLI-009` and its body mirror. `FE-SQLI-002` covers the
@@ -146,8 +159,11 @@ const SQLI_ERROR_OR_OOB_FUNCTION: &str = r#"(?i)(?:\b(?:extractvalue|updatexml)\
 /// (`' or 'a' like '%`), it is left unterminated for the application's own
 /// closing quote — the value ends inside it, or a JSON string closes it
 /// (`' or 'a' like 'a`) — or it is followed by an SQL comment
-/// (`' or 'a' like 'a'--`).
-const SQLI_STRING_TAUTOLOGY: &str = r#"(?i)['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:\bor\b|\|\|)(?:\s|/\*(?s:.){0,64}?\*/)*['"][^'"]{0,32}['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:=(?:\s|/\*(?s:.){0,64}?\*/)*['"]|\blike\b(?:\s|/\*(?s:.){0,64}?\*/)*(?:['"][%_]|'[^'"]{0,32}(?:"|$|'?\s*(?:--|#|/\*))|"[^'"]{0,32}(?:$|"?\s*(?:--|#|/\*))))"#;
+/// (`' or 'a' like 'a'--`). Closing parentheses, a statement `;`, and a
+/// `LIMIT n` / `LIMIT n, m` clause may sit between the string and the comment
+/// (`' or 'a' like 'a')--`, `' or 'a' like 'a';--`,
+/// `' or 'a' like 'a' limit 1--`).
+const SQLI_STRING_TAUTOLOGY: &str = r#"(?i)['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:\bor\b|\|\|)(?:\s|/\*(?s:.){0,64}?\*/)*['"][^'"]{0,32}['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:=(?:\s|/\*(?s:.){0,64}?\*/)*['"]|\blike\b(?:\s|/\*(?s:.){0,64}?\*/)*(?:['"][%_]|'[^'"]{0,32}(?:"|$|'?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))|"[^'"]{0,32}(?:$|"?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))))"#;
 
 /// Script-capable URL schemes, claimed by `FE-XSS-002` and its body / cookie
 /// mirrors. Browsers delete ASCII tab, LF, and CR anywhere inside a URL before
@@ -177,18 +193,25 @@ const HTML_ACTIVE_CONTENT_ELEMENT: &str =
 ///
 /// * a backtick or `$(` subshell running a common command;
 /// * a CR/LF command separator (`%0a`) followed by a Windows tool name in
-///   all-lower or all-upper case (`whoami`, `IPCONFIG`), or in any case when
-///   it takes a flag (`PowerShell -nop`, `Certutil /urlcache`) — a
-///   capitalised `PowerShell is great` is the start of a prose line; by a
-///   Unix tool name in the lower case a Unix shell requires; or by a short
-///   command word (`cat`, `id`, `sh`, `nc`, `bash`, `python`, `perl`) in lower
-///   case that then ends the value, takes an argument shaped like a flag,
-///   path, variable, or quoted string, or is followed by a shell operator.
-///   The operator must be one prose does not write after a word: `;`, `|`,
-///   `&`, `<`, `>`, a backtick, or a `#` comment directly against the word
-///   (`id#`, `cat|nc`), `&&` / `|` / `||` / `;` / a backtick after a space,
-///   or a redirect onto a path, descriptor, or variable (`cat > /tmp/x`).
-///   A lone spaced `&` (`cat & dog`, `cat &amp; dog`) is prose;
+///   all-lower or all-upper case (`whoami`, `IPCONFIG`). `cmd.exe` and
+///   PowerShell resolve commands in any case, so a mixed-case name
+///   (`Whoami`, `WhoAmI`, `PowerShell`) also counts when it ends the value,
+///   carries `.exe`, takes a flag (`PowerShell -nop`, `Certutil /urlcache`),
+///   or is followed by one of the shell operators listed below other than
+///   `#`; PowerShell also counts before `iex` / `invoke-`
+///   (`Powershell IEX(…)`). A capitalised `PowerShell is great` or
+///   `PowerShell - a primer` is the start of a prose line;
+/// * the same separator followed by a Unix tool name in the lower case a Unix
+///   shell requires, or by a short command word (`cat`, `id`, `sh`, `nc`,
+///   `bash`, `python`, `perl`) in lower case that then ends the value, takes
+///   an argument shaped like a flag, path, variable, or quoted string, or is
+///   followed by a shell operator. The operator must be one prose does not
+///   write after a word: `;`, `|`, `&`, `<`, `>`, a backtick, or a `#`
+///   directly against the word (`id#`, `cat|nc`); `&&`, `|`, `||`, `;`, a
+///   backtick, or a `#` comment after a space (`id #`, the form a POSIX shell
+///   treats as a comment); a spaced `&` that ends the value (`id &`); or a
+///   redirect onto a path, descriptor, or variable (`cat > /tmp/x`). A spaced
+///   `&` followed by more text (`cat & dog`, `cat &amp; dog`) is prose;
 /// * `;`, `|`, `&&`, or `||` followed by a reconnaissance tool that never
 ///   names a list item (`whoami`, `ifconfig`, `certutil`, `mkfifo`, …);
 /// * `&&` or `||` — which lists do not use — followed by a tool that can also
@@ -204,7 +227,7 @@ const HTML_ACTIVE_CONTENT_ELEMENT: &str =
 /// plus the `$IFS` field-separator trick used to smuggle spaces. A bare
 /// `x;uname` at the end of a value is indistinguishable from the list
 /// `fields=id;uname` and is deliberately not matched.
-const CMD_EXTENDED_EXECUTION: &str = r#"(?i)(?:(?:`|\$\()\s*(?:cat|tac|head|tail|ls|id|echo|printf|rm|ping|sleep|env|pwd|uname|whoami|curl|wget|nc|ncat|bash|sh|zsh|python[23]?|perl|ruby|php|base64|xxd|nslookup|dig|ifconfig)\b|[\r\n]\s*(?:(?-i:whoami|ipconfig|certutil|powershell|pwsh|systeminfo|WHOAMI|IPCONFIG|CERTUTIL|POWERSHELL|PWSH|SYSTEMINFO)\b|(?:whoami|ipconfig|certutil|powershell|pwsh|systeminfo)(?:\.exe)?\s+[-/][a-z]|(?-i:uname|ifconfig|nslookup|wget|curl|ncat)\b|(?-i:cat|id|sh|nc|bash|python[23]?|perl)(?:\s*$|[;|&<>`#]|\s*(?:&&|\|\|?|;|`)|\s*[<>]{1,2}\s*[/~.$&]|\s+[-/.~$'"]))|(?:[;|]|&&)\s*(?:whoami|ifconfig|ipconfig|nslookup|certutil|bitsadmin|systeminfo|tasklist|mkfifo)\b|(?:&&|\|\|)\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh|id|ls|sleep|ping)\b|[;|]\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)(?:\s+[-/$'"]|\s*[<>`]|\s*&&|\s*\|\|)|[;|]\s*(?:busybox\s+(?:nc|wget|sh|ash|telnet)\b|socat\s+(?:tcp|udp|exec|-)|(?:ncat|netcat|nc)\s+\S+\s+\d{1,5}\b)|\$\{?IFS\}?)"#;
+const CMD_EXTENDED_EXECUTION: &str = r#"(?i)(?:(?:`|\$\()\s*(?:cat|tac|head|tail|ls|id|echo|printf|rm|ping|sleep|env|pwd|uname|whoami|curl|wget|nc|ncat|bash|sh|zsh|python[23]?|perl|ruby|php|base64|xxd|nslookup|dig|ifconfig)\b|[\r\n]\s*(?:(?-i:whoami|ipconfig|certutil|powershell|pwsh|systeminfo|WHOAMI|IPCONFIG|CERTUTIL|POWERSHELL|PWSH|SYSTEMINFO)\b|(?:whoami|ipconfig|certutil|powershell|pwsh|systeminfo)(?:\.exe\b|\s*$|[;|&<>`]|\s*(?:&&|\|\|?|;|`)|\s*&\s*$|\s*[<>]{1,2}\s*[/~.$&]|\s+[-/][a-z])|(?:powershell|pwsh)\s+(?:iex\b|invoke-)|(?-i:uname|ifconfig|nslookup|wget|curl|ncat)\b|(?-i:cat|id|sh|nc|bash|python[23]?|perl)(?:\s*$|[;|&<>`#]|\s*(?:&&|\|\|?|;|`|#)|\s*&\s*$|\s*[<>]{1,2}\s*[/~.$&]|\s+[-/.~$'"]))|(?:[;|]|&&)\s*(?:whoami|ifconfig|ipconfig|nslookup|certutil|bitsadmin|systeminfo|tasklist|mkfifo)\b|(?:&&|\|\|)\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh|id|ls|sleep|ping)\b|[;|]\s*(?:uname|busybox|ncat|netcat|socat|powershell|pwsh)(?:\s+[-/$'"]|\s*[<>`]|\s*&&|\s*\|\|)|[;|]\s*(?:busybox\s+(?:nc|wget|sh|ash|telnet)\b|socat\s+(?:tcp|udp|exec|-)|(?:ncat|netcat|nc)\s+\S+\s+\d{1,5}\b)|\$\{?IFS\}?)"#;
 
 /// Explicit shell / interpreter invocation, claimed by `FE-CMD-005-Q`
 /// (level 1) and `FE-CMD-005-B` (level 2, because deployment and CI APIs
@@ -276,20 +299,23 @@ const RESTRICTED_BACKUP_ARTIFACT: &str =
 ///
 /// The parameter must sit on a `Content-Disposition:` line, so a form or JSON
 /// field that merely names a file (`filename=index.php`) is not an upload.
-/// An RFC 8187 `filename*` value opens with any charset and an optional
+/// An RFC 8187 `filename*` value opens with a charset and an optional
 /// language tag (`UTF-8''shell.php`, `ISO-8859-1''shell.php`,
-/// `UTF-8'en'shell.php`); the prefix is skipped by its RFC token shape, not by
-/// charset name. A percent-encoded name (`UTF-8''shell%2Ephp`) matches through
+/// `UTF-8'en_US'shell.php`). Lenient parsers split that prefix on `'` without
+/// checking the charset or tag, so the pattern skips a charset of any length
+/// and a tag of any length, each made of any characters except a quote, `;`,
+/// or a line break — a looser shape than the RFC token grammar, and no charset
+/// name list. A percent-encoded name (`UTF-8''shell%2Ephp`) matches through
 /// the decoded body view the layered decoder already scans.
 /// Windows and IIS strip trailing dots and spaces and treat `::$DATA` as the
 /// file's default stream, and a NUL (raw or `%00`) truncates the name in
 /// C-backed handlers, so `shell.php.`, `shell.php `, `shell.php::$DATA`, and
-/// `shell.php%00.jpg` all land as `shell.php` and all match. Both repeats are
-/// unbounded but confined by their classes, one to the header line and one to
-/// the parameter token: an unbounded class loop compiles to a single automaton
-/// state where a counted `{0,N}` repeat compiles to N, and a length bound
-/// would let a padded name slip past.
-const EXECUTABLE_UPLOAD_FILENAME: &str = r#"(?i)\bcontent-disposition\s*:[^\r\n]*?\bfilename\*?\s*=\s*(?:[0-9a-z!#$%&+^_`{}~-]{1,40}'[0-9a-z-]{0,35}'|["'])?[^"';\r\n]*?\.(?:php[3-8s]?|pht(?:ml)?|phar|jspx?|jspf|jsw|jsv|aspx?|asa|asax|ascx|ashx|asmx|cshtml|vbhtml|cgi|shtml|htaccess)(?:\.[a-z0-9]{1,8})*[. ]*(?:::\$data)?(?:["';\r\n\x00]|%00|$)"#;
+/// `shell.php%00.jpg` all land as `shell.php` and all match. The header-line,
+/// `filename*` prefix, and parameter-token repeats are unbounded but each is
+/// confined by its class: an unbounded class loop compiles to a single
+/// automaton state where a counted `{0,N}` repeat compiles to N, and a length
+/// bound would let a padded name slip past.
+const EXECUTABLE_UPLOAD_FILENAME: &str = r#"(?i)\bcontent-disposition\s*:[^\r\n]*?\bfilename\*?\s*=\s*(?:[^'"\r\n;]+'[^'"\r\n;]*'|["'])?[^"';\r\n]*?\.(?:php[3-8s]?|pht(?:ml)?|phar|jspx?|jspf|jsw|jsv|aspx?|asa|asax|ascx|ashx|asmx|cshtml|vbhtml|cgi|shtml|htaccess)(?:\.[a-z0-9]{1,8})*[. ]*(?:::\$data)?(?:["';\r\n\x00]|%00|$)"#;
 
 /// Unsafe YAML / serializer language tags that instantiate arbitrary types
 /// (PyYAML `!!python/object/apply`, SnakeYAML CVE-2022-1471 gadgets, Psych
@@ -308,12 +334,23 @@ const YAML_GADGET_TAG: &str = r"(?i)(?:!!(?:python/(?:object(?:/apply|/new)?|nam
 /// `[` characters are accepted before the namespace. The second branch is
 /// Jackson's `WRAPPER_ARRAY` default typing, `["com.sun…", {…}]`, which carries
 /// no discriminator key: a gadget class name as the first array element
-/// followed by the object it types. Keep the two namespace lists identical.
+/// followed by the object it types. Keep the namespace lists of the
+/// discriminator branch and this object form identical.
+///
+/// The same wrapper also types a gadget built from one string through its
+/// single-String constructor — the CVE-2017-17485 Spring payload
+/// `["org.springframework.context.support.FileSystemXmlApplicationContext",
+/// "http://…/spel.xml"]`. That string form counts only when the array is
+/// exactly `[class, string]` and the first element ends in a capitalised class
+/// name, so a list of package names (`["org.apache.commons","org.apache.http"]`)
+/// or of three class names stays clean. It leaves out the `java.*` and .NET
+/// namespaces: Jackson wraps JDK value types with a string as ordinary data
+/// (`["java.net.URL","https://…"]`), and Json.NET never writes this array form.
 ///
 /// Spring is listed by the packages that hold its known gadgets (`aop`,
-/// `beans`, `context`, `jndi`, `transaction`, …), not by the whole
-/// `org.springframework.` namespace. Spring Session's and Spring Security's
-/// Jackson modules write their own types with a discriminator
+/// `beans`, `context`, `jndi`, `transaction`, `web.context.support`, …), not by
+/// the whole `org.springframework.` namespace. Spring Session's and Spring
+/// Security's Jackson modules write their own types with a discriminator
 /// (`"@class":"org.springframework.security.core.context.SecurityContextImpl"`),
 /// and an application that switches default typing to `WRAPPER_ARRAY` writes
 /// `["org.springframework.security…SimpleGrantedAuthority",{…}]` — the same
@@ -321,7 +358,7 @@ const YAML_GADGET_TAG: &str = r"(?i)(?:!!(?:python/(?:object(?:/apply|/new)?|nam
 /// collection wrappers those modules also emit (`["java.util.ArrayList",[…]]`)
 /// are outside both lists, and a `java.lang.*` wrapper such as
 /// `["java.lang.Long",1]` wraps a scalar, not an object.
-const JSON_POLYMORPHIC_GADGET: &str = r#"(?i)(?:["'](?:@type|\$type|@class|__type)["']\s*:\s*["'](?-i:[\[L]){0,3}(?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))|\[\s*["'](?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))[\w.$]*["']\s*,\s*\{)"#;
+const JSON_POLYMORPHIC_GADGET: &str = r#"(?i)(?:["'](?:@type|\$type|@class|__type)["']\s*:\s*["'](?-i:[\[L]){0,3}(?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))|\[\s*["'](?:(?:com\.sun\.|java\.(?:net|lang|rmi|util\.logging)\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.|system\.(?:windows\.data\.objectdataprovider|diagnostics\.process|configuration\.install|management\.automation|web\.security|windows\.forms))[\w.$]*["']\s*,\s*\{|(?:com\.sun\.|javax\.(?:naming|management|script|swing)\.|org\.apache\.|org\.springframework\.(?:aop|beans|context|jndi|transaction|expression|jdbc|jms|jmx|remoting|scripting|web\.context\.support)\.|org\.hibernate\.|org\.codehaus\.groovy\.|com\.mchange\.|com\.zaxxer\.|com\.alibaba\.|ch\.qos\.logback\.)(?:[\w.$]*\.)?(?-i:[A-Z])[\w$]*["']\s*,\s*["'][^"'\r\n]*["']\s*\]))"#;
 
 /// Cloud-metadata endpoints and dotted IPv4 private/loopback/link-local forms
 /// claimed by `FE-SSRF-001` / `FE-SSRF-001-Q`. Body and query share this

@@ -250,20 +250,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **WAF rule shapes: missed injection forms and prose false positives**
   (#5865). `FE-SQLI-008` now matches `load_file` on a MySQL `X'2f65…'` hex
-  literal and after an inline comment (`load_file(/**/'/etc/passwd')`).
-  `FE-SQLI-010-B` (level 1) now matches three unquoted body forms: a later
-  `ORDER BY` / `GROUP BY` item (`ORDER BY 1,sleep(5)`), a number that opens
-  the value followed by an operator (`1-sleep(5)`), and a form pair whose whole
-  value is the call (`id=sleep(5)`). Code such as `x = sleep(5)` stays clean.
-  `FE-UPLOAD-001` now accepts any RFC 8187 charset and language tag in
-  `filename*=` (`UTF-8'en'shell.php`, `ISO-8859-1''shell.php`), including
-  percent-encoded names. `FE-SQLI-009` counts a `like` comparison only when
-  its right-hand string is a wildcard, left unterminated, or followed by an SQL
-  comment, so `'soda' or 'pop' like 'grandma'` is clean. `FE-CMD-004` no longer
-  fires on a prose line that starts `PowerShell …` or on `cat & dog` /
-  `cat &amp; dog` after a newline. `FE-DESER-005` names Spring's gadget
-  packages instead of all of `org.springframework.`, so Spring Session and
-  Spring Security JSON is clean.
+  literal, behind a charset introducer (`_latin1'/etc/passwd'`), on a
+  `CONCAT_WS(` path, and after an inline comment
+  (`load_file(/**/'/etc/passwd')`). `FE-SQLI-006` (query) now matches a number
+  that opens the value followed by an operator and a delay call
+  (`id=1-sleep(5)`). `FE-SQLI-010-B` (level 1) now matches three unquoted body
+  forms: a later `ORDER BY` / `GROUP BY` item (`ORDER BY 1,sleep(5)`,
+  `ORDER/**/BY 1,sleep(5)`), a value that is only a number, an operator, and
+  the call (`"1-sleep(5)"`), and a form pair whose whole value is the call
+  (`id=sleep(5)`, `id=1-sleep(5)`). Code such as `x = sleep(5)` or compact
+  `x=1+sleep(5)`, and a formula such as `"=2*sleep(1)"`, stay clean.
+  `FE-UPLOAD-001` now skips a `filename*=` charset and language-tag prefix of
+  any length and content short of a quote, `;`, or line break
+  (`UTF-8'en_US'shell.php`, `ISO-8859-1''shell.php`), and matches
+  percent-encoded names. `FE-SQLI-009` counts a `like` comparison only when its
+  right-hand string is a wildcard, left unterminated, or followed by an SQL
+  comment (after optional `)`, `;`, or `LIMIT n`), so
+  `'soda' or 'pop' like 'grandma'` is clean. `FE-CMD-004` no longer fires on a
+  prose line that starts `PowerShell is …` or on `cat & dog` / `cat &amp; dog`
+  after a newline, and still matches a mixed-case Windows tool after a newline
+  (`%0AWhoami`, `%0APowershell IEX(…)`), a spaced shell comment (`%0Aid%20%23`),
+  and a trailing background `&` (`%0Aid%20%26`). `FE-DESER-005` names Spring's
+  gadget packages (now including `web.context.support.`) instead of all of
+  `org.springframework.`, so Spring Session and Spring Security JSON is clean,
+  and matches Jackson's `WRAPPER_ARRAY` gadget with a string argument
+  (`["org.springframework.context.support.FileSystemXmlApplicationContext","http://…"]`).
 - An HBONE relay that ends on a socket error now resets its HTTP/2 CONNECT
   stream with `RST_STREAM(CONNECT_ERROR)` (RFC 9113 §8.5) instead of closing it
   with a clean `END_STREAM` (#5781). This covers the byte-stream relay (for
