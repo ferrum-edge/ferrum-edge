@@ -1165,7 +1165,7 @@ at all. The dynamic listener sockets are bound by the *data plane* — `file`,
 `proxy::gateway_listener::GatewayListenerManager`. The CP↔DP gRPC plane
 (`proto/ferrum.proto`) carries configuration from CP to DP only:
 `SubscribeRequest` / `FullConfigRequest` advertise a node id, version,
-namespace, real-IP header, and heartbeat capability, and there is no DP→CP
+namespace, and real-IP header, and there is no DP→CP
 status, realization, or health report message. There is therefore no existing
 production path by which a DP's local bind outcome could reach a Gateway status
 patch, and inventing one — writing Gateway listener conditions from a process

@@ -27,7 +27,10 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
-use ferrum_edge::grpc::cp_server::CpGrpcServer;
+use ferrum_edge::grpc::configsync_lifecycle::{
+    CONFIG_SYNC_BUILD_MISMATCH_PREFIX, CONFIG_SYNC_PROTOCOL_REVISION, config_sync_build_identity,
+};
+use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope};
 use ferrum_edge::grpc::dp_client::{self, DpCpConnectionState, DpGrpcTlsConfig, GrpcJwtSecret};
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
@@ -449,9 +452,10 @@ async fn start_test_cp_server(
     tokio::task::JoinHandle<()>,
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (server, update_tx) = CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let server = CpGrpcServer::builder(config_arc.clone(), TEST_JWT_SECRET.to_string()).build();
+    let update_tx = server.broadcasts().sender_for("ferrum");
     let (mesh_server, _mesh_update_tx) =
-        MeshGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+        MeshGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string()).build();
 
     // Bind to port 0 to get a random available port
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
@@ -524,9 +528,10 @@ impl Drop for SeverableTestCpServer {
 /// See [`SeverableTestCpServer`] for why `start_test_cp_server` cannot do this.
 async fn start_severable_test_cp_server(config: GatewayConfig) -> SeverableTestCpServer {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (server, update_tx) = CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let server = CpGrpcServer::builder(config_arc.clone(), TEST_JWT_SECRET.to_string()).build();
+    let update_tx = server.broadcasts().sender_for("ferrum");
     let (mesh_server, _mesh_update_tx) =
-        MeshGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+        MeshGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string()).build();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -570,7 +575,7 @@ async fn start_test_cp_server_with_real_ip_header(
     real_ip_header: &str,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (server, _update_tx) = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
+    let server = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
         .real_ip_header(Some(real_ip_header.to_string()))
         .build();
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
@@ -842,10 +847,10 @@ async fn invalid_trust_delta_terminates_without_mutating_last_known_good_generat
         version: delta.poll_timestamp.to_rfc3339(),
         timestamp: Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: serde_json::to_string(&invalid_trust)
             .expect("invalid trust fixture serializes"),
         heartbeat: false,
-        heartbeat_negotiated: false,
     };
     update_tx.send(update).expect("test subscriber is live");
 
@@ -1229,8 +1234,8 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_xds_ads_stream_returns_lds_snapshot() {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
-    let (_cp_server, update_tx) =
-        CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let cp_server = CpGrpcServer::builder(config_arc.clone(), TEST_JWT_SECRET.to_string()).build();
+    let update_tx = cp_server.broadcasts().sender_for("ferrum");
     let xds_server = XdsAdsServer::new(
         config_arc,
         update_tx,
@@ -1302,8 +1307,8 @@ async fn test_xds_ads_per_node_stream_cap_rejects_excess_streams() {
     use ferrum_edge::xds::proto::{DiscoveryRequest, Node};
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
-    let (_cp_server, update_tx) =
-        CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let cp_server = CpGrpcServer::builder(config_arc.clone(), TEST_JWT_SECRET.to_string()).build();
+    let update_tx = cp_server.broadcasts().sender_for("ferrum");
     // Cap concurrent ADS streams per node id at 1.
     let xds_server = XdsAdsServer::new(
         config_arc,
@@ -1561,9 +1566,9 @@ async fn test_cp_rejects_token_missing_required_claims() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "missing-claims-node".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1631,7 +1636,7 @@ macro_rules! connect_mesh_client_with_token {
     }};
 }
 
-/// Default issuer used by `start_test_cp_server`'s `CpGrpcServer::new()` path.
+/// Default issuer used by `start_test_cp_server`'s default `CpGrpcServer::builder()` path.
 const TEST_DEFAULT_ISSUER: &str = "ferrum-edge-cp-dp";
 
 /// Verify that the CP accepts a DP token whose `iss` claim matches the
@@ -1651,9 +1656,9 @@ async fn test_cp_accepts_token_with_matching_issuer() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "iss-good".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1683,9 +1688,9 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
         let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
             node_id: "real-ip-owner".to_string(),
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            config_sync_build: config_sync_build_identity().to_string(),
             namespace: "ferrum".to_string(),
             real_ip_header: advertised.map(str::to_string),
-            supports_heartbeat: true,
         });
         let status = client.subscribe(request).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -1697,6 +1702,7 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
             ferrum_edge::grpc::proto::FullConfigRequest {
                 node_id: "real-ip-owner".to_string(),
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some("x-real-ip".to_string()),
             },
@@ -1711,9 +1717,9 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
             ferrum_edge::grpc::proto::SubscribeRequest {
                 node_id: "real-ip-owner".to_string(),
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some("CF-CONNECTING-IP".to_string()),
-                supports_heartbeat: true,
             },
         ))
         .await;
@@ -1743,9 +1749,9 @@ async fn test_cp_treats_explicitly_empty_real_ip_header_as_unset() {
             ferrum_edge::grpc::proto::SubscribeRequest {
                 node_id: "real-ip-unset".to_string(),
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: None,
-                supports_heartbeat: true,
             },
         ))
         .await
@@ -1758,9 +1764,9 @@ async fn test_cp_treats_explicitly_empty_real_ip_header_as_unset() {
             ferrum_edge::grpc::proto::SubscribeRequest {
                 node_id: "real-ip-unset".to_string(),
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some(String::new()),
-                supports_heartbeat: true,
             },
         ))
         .await;
@@ -1775,6 +1781,7 @@ async fn test_cp_treats_explicitly_empty_real_ip_header_as_unset() {
             ferrum_edge::grpc::proto::FullConfigRequest {
                 node_id: "real-ip-unset".to_string(),
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some(String::new()),
             },
@@ -1807,9 +1814,9 @@ async fn test_cp_rejects_token_with_wrong_issuer() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "iss-bad".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1906,9 +1913,9 @@ async fn test_cp_rejects_token_with_no_issuer_claim() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "iss-missing".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1947,9 +1954,9 @@ async fn test_cp_still_rejects_token_signed_with_wrong_secret() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "iss-wrong-key".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1968,9 +1975,8 @@ async fn test_cp_still_rejects_token_signed_with_wrong_secret() {
 
 /// Verify that a CP configured with a non-default expected issuer accepts
 /// tokens with the matching custom issuer and rejects tokens with the
-/// default issuer. This exercises the
-/// `with_channel_capacity_registry_and_issuer` constructor that production
-/// uses to thread `FERRUM_CP_DP_GRPC_JWT_ISSUER` through.
+/// default issuer. This exercises the builder's `expected_issuer` setter that
+/// production uses to thread `FERRUM_CP_DP_GRPC_JWT_ISSUER` through.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
     use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
@@ -1979,13 +1985,11 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
 
     let config = create_test_config(1);
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (server, _update_tx) = CpGrpcServer::with_channel_capacity_registry_and_issuer(
-        config_arc,
-        TEST_JWT_SECRET.to_string(),
-        128,
-        Arc::new(DpNodeRegistry::new()),
-        CUSTOM_ISSUER.to_string(),
-    );
+    let server = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
+        .channel_capacity(128)
+        .registry(Arc::new(DpNodeRegistry::new()))
+        .expected_issuer(CUSTOM_ISSUER.to_string())
+        .build();
 
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -2009,9 +2013,9 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
     let good_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "custom-good".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     assert!(
         good_client.subscribe(good_req).await.is_ok(),
@@ -2027,9 +2031,9 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
     let stale_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "custom-bad".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     let stale_result = stale_client.subscribe(stale_req).await;
     assert!(
@@ -2091,9 +2095,9 @@ async fn test_dp_handles_malformed_config() {
         version: "bad".to_string(),
         timestamp: chrono::Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: String::new(),
         heartbeat: false,
-        heartbeat_negotiated: false,
     };
     let _ = update_tx.send(malformed_update);
 
@@ -2435,7 +2439,8 @@ async fn start_test_cp_server_with_tls(
     tokio::task::JoinHandle<()>,
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (server, update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+    let server = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string()).build();
+    let update_tx = server.broadcasts().sender_for("ferrum");
 
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -2924,13 +2929,8 @@ async fn test_dp_applies_delta_then_full_snapshot() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_keeps_last_good_config_after_unparseable_delta_shape() {
-    // Verify that an unclassifiable delta body doesn't corrupt existing config.
-    //
-    // Note this is deliberately NOT the legacy bare-ID removal shape: that one
-    // is a supported same-major.minor rolling-upgrade encoding and is applied
-    // (see `dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace`). Only
-    // a removal entry that is neither a bare ID nor a namespace-qualified key is
-    // unclassifiable, and it must fail closed.
+    // Verify that an unclassifiable delta body doesn't corrupt existing config:
+    // a removal entry that is not a namespace-qualified key must fail closed.
     let cp_config = create_test_config(2);
     let (addr, update_tx, config_arc, _server_handle) =
         start_test_cp_server_with_capacity(cp_config, 16).await;
@@ -2968,10 +2968,10 @@ async fn test_dp_keeps_last_good_config_after_unparseable_delta_shape() {
     .await;
     assert!(received.is_ok());
 
-    // A removal entry that is neither a bare ID string nor a namespace-qualified
-    // key is unclassifiable. It is valid JSON, so it must be rejected by the
-    // delta schema and fail closed rather than partially applying.
-    let mut legacy_delta = serde_json::to_value(IncrementalResult {
+    // A removal entry that is not a namespace-qualified key is unclassifiable.
+    // It is valid JSON, so it must be rejected by the delta schema and fail
+    // closed rather than partially applying.
+    let mut malformed_delta = serde_json::to_value(IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
         added_or_modified_consumers: vec![],
@@ -2984,16 +2984,16 @@ async fn test_dp_keeps_last_good_config_after_unparseable_delta_shape() {
         poll_timestamp: Utc::now(),
     })
     .unwrap();
-    legacy_delta["removed_consumer_ids"] = serde_json::json!([{"unexpected_key": 1}]);
+    malformed_delta["removed_consumer_ids"] = serde_json::json!([{"unexpected_key": 1}]);
     let malformed = ferrum_edge::grpc::proto::ConfigUpdate {
         update_type: 1, // DELTA
-        config_json: serde_json::to_string(&legacy_delta).unwrap(),
+        config_json: serde_json::to_string(&malformed_delta).unwrap(),
         version: "bad".to_string(),
         timestamp: Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: String::new(),
         heartbeat: false,
-        heartbeat_negotiated: false,
     };
     let _ = update_tx.send(malformed);
 
@@ -3255,14 +3255,15 @@ async fn test_dp_applies_delta_with_mixed_operations() {
     client_handle.abort();
 }
 
-/// Test that the CP rejects a DP with a mismatched minor version.
+/// The CP refuses a DP that runs a different build, including one that shares
+/// the crate version, and accepts the exact same build.
 #[allow(clippy::result_large_err)]
 #[tokio::test]
-async fn test_cp_rejects_dp_with_version_mismatch() {
+async fn test_cp_rejects_dp_with_different_build() {
     let config = create_test_config(1);
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
 
-    let (server, _update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+    let server = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string()).build();
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
@@ -3299,60 +3300,86 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
             },
         );
 
-    // Send a Subscribe with a fake incompatible version (different minor)
+    // Same crate version, different ConfigSync protocol revision: that is a
+    // different build, so the CP must refuse it before streaming config.
+    let revision = CONFIG_SYNC_PROTOCOL_REVISION + 1;
+    let other_build = format!("{}+configsync.r{revision}", ferrum_edge::FERRUM_VERSION);
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "test-dp".to_string(),
-        ferrum_version: "99.99.0".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
+        config_sync_build: other_build.clone(),
     });
 
     let result = client.subscribe(request).await;
-    assert!(result.is_err(), "CP should reject mismatched DP version");
+    assert!(result.is_err(), "CP must refuse another build");
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(
-        status.message().contains("Version mismatch"),
-        "Error should mention version mismatch, got: {}",
+        status
+            .message()
+            .starts_with(CONFIG_SYNC_BUILD_MISMATCH_PREFIX),
+        "refusal should name the build mismatch, got: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains(config_sync_build_identity())
+            && status.message().contains(&other_build),
+        "refusal should name both builds, got: {}",
         status.message()
     );
 
-    // Also test GetFullConfig with mismatched version
+    // GetFullConfig applies the same gate.
     let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
         node_id: "test-dp".to_string(),
-        ferrum_version: "99.99.0".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        config_sync_build: other_build,
     });
 
     let result = client.get_full_config(request).await;
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
 
-    // Verify that a matching version succeeds
+    // The exact same build is accepted, and every CP frame carries its build.
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
+        node_id: "test-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
+        config_sync_build: config_sync_build_identity().to_string(),
+    });
+    let response = client.get_full_config(request).await.unwrap();
+    let response = response.into_inner();
+    assert_eq!(response.config_sync_build, config_sync_build_identity());
+
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
+        config_sync_build: config_sync_build_identity().to_string(),
     });
 
     let result = client.subscribe(request).await;
-    assert!(result.is_ok(), "CP should accept DP with matching version");
+    assert!(result.is_ok(), "CP must accept the same build");
+    let mut stream = result.unwrap().into_inner();
+    let initial = stream.message().await.unwrap().unwrap();
+    assert_eq!(initial.config_sync_build, config_sync_build_identity());
 
     server_handle.abort();
 }
 
-/// Test that the CP rejects a DP that sends an empty version (pre-v0.9.0 DP).
+/// The CP refuses a DP that reports no ConfigSync build identity.
 #[allow(clippy::result_large_err)]
 #[tokio::test]
-async fn test_cp_rejects_dp_with_empty_version() {
+async fn test_cp_rejects_dp_without_build_identity() {
     let config = create_test_config(1);
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
 
-    let (server, _update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+    let server = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string()).build();
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = tokio::net::TcpListener::bind_test(addr).await.unwrap();
@@ -3388,22 +3415,22 @@ async fn test_cp_rejects_dp_with_empty_version() {
             },
         );
 
-    // Empty version simulates a pre-v0.9.0 DP that doesn't set the field
+    // A build that does not send the field is a different build.
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "test-dp".to_string(),
-        ferrum_version: String::new(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
+        config_sync_build: String::new(),
     });
 
     let result = client.subscribe(request).await;
-    assert!(result.is_err(), "CP should reject DP with empty version");
+    assert!(result.is_err(), "CP must refuse a missing build");
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(
-        status.message().contains("did not report its version"),
-        "Error should mention missing version, got: {}",
+        status.message().contains("reported no build identity"),
+        "Error should mention the missing build identity, got: {}",
         status.message()
     );
 
@@ -3980,11 +4007,10 @@ async fn start_test_cp_server_with_capacity(
     tokio::task::JoinHandle<()>,
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (server, update_tx) = CpGrpcServer::with_channel_capacity(
-        config_arc.clone(),
-        TEST_JWT_SECRET.to_string(),
-        channel_capacity,
-    );
+    let server = CpGrpcServer::builder(config_arc.clone(), TEST_JWT_SECRET.to_string())
+        .channel_capacity(channel_capacity)
+        .build();
+    let update_tx = server.broadcasts().sender_for("ferrum");
 
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -4120,22 +4146,20 @@ async fn start_test_cp_server_with_namespace(
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
     let registry = Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
-    let (server, update_tx) = CpGrpcServer::with_channel_capacity_registry_and_namespace(
-        config_arc.clone(),
-        TEST_JWT_SECRET.to_string(),
-        128,
-        registry,
-        cp_namespace.to_string(),
-    );
+    let server = CpGrpcServer::builder(config_arc.clone(), TEST_JWT_SECRET.to_string())
+        .channel_capacity(128)
+        .registry(registry)
+        .scope(CpScope::Single(cp_namespace.to_string()))
+        .build();
+    let update_tx = server.broadcasts().sender_for(cp_namespace);
+    let mesh_registry = Arc::new(ferrum_edge::grpc::mesh_registry::MeshNodeRegistry::new());
     let (mesh_server, _mesh_update_tx) =
-        MeshGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
-            config_arc,
-            TEST_JWT_SECRET.to_string(),
-            128,
-            Arc::new(ferrum_edge::grpc::mesh_registry::MeshNodeRegistry::new()),
-            TEST_DEFAULT_ISSUER.to_string(),
-            cp_namespace.to_string(),
-        );
+        MeshGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
+            .channel_capacity(128)
+            .registry(mesh_registry)
+            .expected_issuer(TEST_DEFAULT_ISSUER.to_string())
+            .namespace(cp_namespace.to_string())
+            .build();
 
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -4187,9 +4211,9 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "staging".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -4245,9 +4269,9 @@ async fn test_multi_region_ha_doc_cross_region_cp_failover_rejected() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "dp-east-1".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "us-east".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -4349,6 +4373,7 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_get_full_config() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
         node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "staging".to_string(),
         real_ip_header: Some(String::new()),
     });
@@ -4397,6 +4422,7 @@ async fn test_get_full_config_returns_gateway_trust_bundles_side_channel() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
         node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
     });
@@ -4452,9 +4478,9 @@ async fn test_cp_accepts_dp_with_matching_namespace() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "production".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
 
     let mut stream = client
@@ -4635,9 +4661,9 @@ async fn test_dp_consumes_heartbeat_without_applying_or_tearing_down_stream() {
         version: String::new(),
         timestamp: Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: String::new(),
         heartbeat: true,
-        heartbeat_negotiated: true,
     };
     update_tx
         .send(heartbeat)
@@ -4672,8 +4698,7 @@ async fn test_dp_consumes_heartbeat_without_applying_or_tearing_down_stream() {
 
 // ---------------------------------------------------------------------------
 // ConfigSync lifecycle regressions driven through the real production entry
-// points (issues #2967, #2969, #2970, #2971, #2972 and the #2395 mixed-version
-// compatibility cases).
+// points (issues #2967, #2969, #2970, #2971, #2972).
 // ---------------------------------------------------------------------------
 
 /// Copy one direction of a relayed TCP connection until the blackhole flips.
@@ -4832,9 +4857,9 @@ fn delta_update(body: String, version: &str) -> ferrum_edge::grpc::proto::Config
         version: version.to_string(),
         timestamp: Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: String::new(),
         heartbeat: false,
-        heartbeat_negotiated: false,
     }
 }
 
@@ -5620,51 +5645,42 @@ async fn dp_returns_promptly_on_shutdown_of_a_healthy_idle_stream() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cp_only_negotiates_heartbeats_with_subscribers_that_advertise_support() {
-    // Issue #2395 mixed-version, new CP → legacy DP: heartbeats are a negotiated
-    // capability. A subscriber that does not advertise support must never be
-    // told heartbeats are on, and therefore never receives an empty heartbeat
-    // envelope it would treat as an unusable FULL_SNAPSHOT and churn on.
+async fn cp_initial_subscribe_update_is_a_full_snapshot_not_a_heartbeat() {
+    // Heartbeats are always on. The first frame of every Subscribe stream is
+    // still the authoritative FULL_SNAPSHOT, never a keepalive frame.
     let (addr, _update_tx, _server_handle) = start_test_cp_server(create_test_config(1)).await;
 
-    for advertises in [false, true] {
-        let token =
-            dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "hb-neg", TEST_DEFAULT_ISSUER)
-                .unwrap();
-        let mut client = connect_client_with_token!(addr, token);
-        let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
-            node_id: "hb-neg".to_string(),
-            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
-            namespace: "ferrum".to_string(),
-            real_ip_header: Some(String::new()),
-            supports_heartbeat: advertises,
-        });
-        let mut stream = client.subscribe(request).await.unwrap().into_inner();
-        let initial = timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("initial update should arrive")
-            .expect("stream ok")
-            .expect("initial update present");
+    let token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "hb-initial", TEST_DEFAULT_ISSUER)
+            .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "hb-initial".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
+        namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
+    });
+    let mut stream = client.subscribe(request).await.unwrap().into_inner();
+    let initial = timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("initial update should arrive")
+        .expect("stream ok")
+        .expect("initial update present");
 
-        assert!(
-            !initial.heartbeat,
-            "the initial update is a real FULL_SNAPSHOT, never a heartbeat"
-        );
-        assert_eq!(
-            initial.heartbeat_negotiated, advertises,
-            "CP must confirm heartbeats only to subscribers that advertised them"
-        );
-    }
+    assert!(
+        !initial.heartbeat,
+        "the initial update is a real FULL_SNAPSHOT, never a heartbeat"
+    );
+    assert_eq!(initial.update_type, 0, "must be FULL_SNAPSHOT");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace() {
-    // Issue #2395 mixed-version, new DP ← legacy CP: a CP at an older patch
-    // sends removal keys as bare ID strings. The DP must accept that body and
-    // scope the removals to its already-authorized subscription namespace
-    // instead of rejecting the delta and churning through resync reconnects.
+async fn dp_applies_namespace_qualified_removal_delta() {
+    // The DELTA body carries every removal key as a `{namespace, id}` object.
+    // The DP applies removals in its own subscription namespace end to end.
     let mut cp_config = create_test_config(2);
-    let upstream = create_test_upstream("upstream-legacy", &[("backend", 8080)]);
+    let upstream = create_test_upstream("upstream-removed", &[("backend", 8080)]);
     cp_config.upstreams.push(upstream);
     let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
 
@@ -5675,7 +5691,7 @@ async fn dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace() {
         dp_client::connect_and_subscribe(
             &cp_url,
             &test_secret(),
-            "legacy-delta-node",
+            "qualified-delta-node",
             &ps,
             None,
             "ferrum",
@@ -5688,28 +5704,28 @@ async fn dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace() {
         "DP should apply the initial snapshot"
     );
 
-    // Exactly the body an older same-major.minor CP emits: bare-ID removal
-    // arrays and no additive `removed_*_keys`. Envelope version must still
-    // match the body's poll_timestamp instant (production CP contract).
+    // Envelope version must match the body's poll_timestamp instant
+    // (production CP contract).
     let poll_timestamp = Utc::now();
     let version = poll_timestamp.to_rfc3339();
-    let legacy_body = serde_json::json!({
+    let qualified_body = serde_json::json!({
         "added_or_modified_proxies": [],
-        "removed_proxy_ids": ["proxy-1"],
+        "removed_proxy_ids": [{"namespace": "ferrum", "id": "proxy-1"}],
         "added_or_modified_consumers": [],
         "removed_consumer_ids": [],
         "added_or_modified_plugin_configs": [],
         "removed_plugin_config_ids": [],
         "added_or_modified_upstreams": [],
-        "removed_upstream_ids": ["upstream-legacy"],
+        "removed_upstream_ids": [{"namespace": "ferrum", "id": "upstream-removed"}],
+        "sequence_cursor": 1,
         "poll_timestamp": version,
     });
-    let body = serde_json::to_string(&legacy_body).unwrap();
+    let body = serde_json::to_string(&qualified_body).unwrap();
     let _ = update_tx.send(delta_update(body, &version));
 
     assert!(
         wait_for_proxy_count_without_upstreams(&proxy_state, 1, Duration::from_secs(10)).await,
-        "a legacy bare-ID removal delta must apply in the subscription namespace"
+        "a namespace-qualified removal delta must apply in the subscription namespace"
     );
     assert_eq!(proxy_state.config.load().proxies[0].id, "proxy-0");
 
@@ -5717,11 +5733,9 @@ async fn dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn delta_broadcast_body_stays_parseable_by_a_legacy_removal_id_shape() {
-    // Issue #2395 mixed-version, new CP → legacy DP: the DELTA body the CP puts
-    // on the wire must still deserialize under the pre-qualified-removals
-    // schema, i.e. `removed_*_ids` are bare strings and the namespace-qualified
-    // keys ride in additive arrays a legacy DP ignores.
+async fn delta_broadcast_body_carries_namespace_qualified_removal_keys() {
+    // The DELTA body the CP puts on the wire carries every removal key as a
+    // `{namespace, id}` object and emits no additive `removed_*_keys` arrays.
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![create_test_proxy("proxy-new", "/new")],
         removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "proxy-gone")],
@@ -5744,17 +5758,22 @@ async fn delta_broadcast_body_stays_parseable_by_a_legacy_removal_id_shape() {
         .expect("broadcast payload");
 
     let body: serde_json::Value = serde_json::from_str(&broadcast.config_json).unwrap();
-    assert_eq!(body["removed_proxy_ids"], serde_json::json!(["proxy-gone"]));
-    assert_eq!(
-        body["removed_plugin_config_ids"],
-        serde_json::json!(["plugin-gone"])
-    );
-    assert_eq!(
-        body["removed_upstream_ids"],
-        serde_json::json!(["upstream-gone"])
-    );
-    assert_eq!(body["removed_proxy_keys"][0]["namespace"], "ferrum");
-    assert_eq!(body["removed_consumer_ids"][0]["namespace"], "ferrum");
+    for (field, id) in [
+        ("removed_proxy_ids", "proxy-gone"),
+        ("removed_consumer_ids", "consumer-gone"),
+        ("removed_plugin_config_ids", "plugin-gone"),
+        ("removed_upstream_ids", "upstream-gone"),
+    ] {
+        let expected = serde_json::json!([{"namespace": "ferrum", "id": id}]);
+        assert_eq!(body[field], expected, "{field}");
+    }
+    for retired in [
+        "removed_proxy_keys",
+        "removed_plugin_config_keys",
+        "removed_upstream_keys",
+    ] {
+        assert!(body.get(retired).is_none(), "{retired} is retired");
+    }
     assert!(
         !broadcast.heartbeat,
         "a resource delta must never be flagged as a heartbeat"
@@ -5793,12 +5812,13 @@ async fn start_native_admission_harness(
     let admission = ferrum_edge::grpc::admission::CpGrpcAdmissionController::new(limits);
     let dp_registry = Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
     let mesh_registry = Arc::new(ferrum_edge::grpc::mesh_registry::MeshNodeRegistry::new());
-    let (cp_server, config_tx) = CpGrpcServer::builder(config.clone(), TEST_JWT_SECRET.to_string())
+    let cp_server = CpGrpcServer::builder(config.clone(), TEST_JWT_SECRET.to_string())
         .channel_capacity(1)
         .admission(admission.clone())
         .registry(dp_registry.clone())
         .max_stream_lifetime(max_stream_lifetime)
         .build();
+    let config_tx = cp_server.broadcasts().sender_for("ferrum");
     let (mesh_server, mesh_tx) = MeshGrpcServer::builder(config, TEST_JWT_SECRET.to_string())
         .channel_capacity(1)
         .admission(admission.clone())
@@ -5848,9 +5868,9 @@ async fn request_native_admission(
                     ferrum_edge::grpc::proto::SubscribeRequest {
                         node_id: subject.to_string(),
                         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                        config_sync_build: config_sync_build_identity().to_string(),
                         namespace: "ferrum".to_string(),
                         real_ip_header: Some(String::new()),
-                        supports_heartbeat: true,
                     },
                 ))
                 .await
@@ -5906,9 +5926,9 @@ async fn open_configsync_stream_with_token(
     let mut request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: subject.to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: true,
     });
     request.metadata_mut().insert(
         "authorization",
@@ -6340,7 +6360,7 @@ async fn start_severable_native_admission_server() -> SeverableNativeAdmissionSe
     let admission = ferrum_edge::grpc::admission::CpGrpcAdmissionController::new(
         ferrum_edge::grpc::admission::CpGrpcAdmissionLimits::default(),
     );
-    let (cp_server, _) = CpGrpcServer::builder(config.clone(), TEST_JWT_SECRET.to_string())
+    let cp_server = CpGrpcServer::builder(config.clone(), TEST_JWT_SECRET.to_string())
         .admission(admission.clone())
         .build();
     let (mesh_server, _) = MeshGrpcServer::builder(config, TEST_JWT_SECRET.to_string())
@@ -6448,9 +6468,9 @@ async fn native_configsync_rejects_unsafe_node_id_before_allocation() {
             ferrum_edge::grpc::proto::SubscribeRequest {
                 node_id: "node\ninjected".to_string(),
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some(String::new()),
-                supports_heartbeat: true,
             },
         ))
         .await
@@ -6485,8 +6505,8 @@ async fn start_test_xds_server_with_limits(
     tokio::task::JoinHandle<()>,
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
-    let (_cp_server, update_tx) =
-        CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let cp_server = CpGrpcServer::builder(config_arc.clone(), TEST_JWT_SECRET.to_string()).build();
+    let update_tx = cp_server.broadcasts().sender_for("ferrum");
     let xds_server = XdsAdsServer::new(
         config_arc,
         update_tx,
@@ -7294,9 +7314,9 @@ mod configsync_identity_binding {
         let mut request = tonic::Request::new(SubscribeRequest {
             node_id: node_id.to_string(),
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            config_sync_build: config_sync_build_identity().to_string(),
             namespace: "ferrum".to_string(),
             real_ip_header: Some(String::new()),
-            supports_heartbeat: false,
         });
         request
             .metadata_mut()
@@ -7308,13 +7328,14 @@ mod configsync_identity_binding {
     async fn configsync_rejects_and_audits_forged_node_without_replacing_live_registration() {
         let registry = Arc::new(DpNodeRegistry::new());
         let admission = CpGrpcAdmissionController::new(CpGrpcAdmissionLimits::default());
-        let (server, tx) = CpGrpcServer::builder(
+        let server = CpGrpcServer::builder(
             Arc::new(ArcSwap::from_pointee(create_test_config(1))),
             TEST_JWT_SECRET.to_string(),
         )
         .registry(registry.clone())
         .admission(admission.clone())
         .build();
+        let tx = server.broadcasts().sender_for("ferrum");
         let logs = CapturedLogs::default();
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -7365,6 +7386,7 @@ mod configsync_identity_binding {
 
 mod configsync_size_bounds {
     use super::*;
+    use ferrum_edge::grpc::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS;
     use ferrum_edge::grpc::cp_server::{CpScope, DpNodeInfo, DpNodeRegistry};
     use ferrum_edge::grpc::proto::config_sync_server::ConfigSync;
     use ferrum_edge::grpc::proto::{ConfigUpdate, FullConfigRequest, SubscribeRequest};
@@ -7419,10 +7441,92 @@ mod configsync_size_bounds {
         authenticated(SubscribeRequest {
             node_id: "size-bound-dp".to_string(),
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            config_sync_build: config_sync_build_identity().to_string(),
             namespace: "ferrum".to_string(),
             real_ip_header: Some(String::new()),
-            supports_heartbeat: false,
         })
+    }
+
+    /// A subscribe request whose token carries an `ns` claim, which the
+    /// multi-namespace scopes require.
+    fn ns_claimed_subscribe_request(namespace: &str) -> tonic::Request<SubscribeRequest> {
+        let token = dp_client::generate_dp_jwt_with_issuer_and_namespace(
+            TEST_JWT_SECRET,
+            "size-bound-dp",
+            ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER,
+            Some(namespace),
+        )
+        .unwrap();
+        let mut request = tonic::Request::new(SubscribeRequest {
+            node_id: "size-bound-dp".to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            config_sync_build: config_sync_build_identity().to_string(),
+            namespace: namespace.to_string(),
+            real_ip_header: Some(String::new()),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    }
+
+    /// Subscribe in-process, take the FULL_SNAPSHOT, then prove the CP sends
+    /// a heartbeat on the idle stream once the heartbeat interval elapses.
+    /// The DP arms its silence watchdog unconditionally, so a CP that stopped
+    /// heartbeating would make every idle DP reconnect.
+    async fn assert_idle_stream_heartbeats(
+        server: &CpGrpcServer,
+        request: tonic::Request<SubscribeRequest>,
+    ) {
+        let mut stream = server.subscribe(request).await.unwrap().into_inner();
+        let snapshot = stream.next().await.unwrap().unwrap();
+        assert!(!snapshot.heartbeat, "first frame is the snapshot");
+
+        // Nothing arrives before the interval (paused time auto-advances).
+        let interval = Duration::from_secs(CONFIGSYNC_HEARTBEAT_INTERVAL_SECS);
+        let quiet = interval - Duration::from_secs(1);
+        assert!(timeout(quiet, stream.next()).await.is_err());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let heartbeat = stream.next().await.unwrap().unwrap();
+        assert!(heartbeat.heartbeat, "idle stream must heartbeat");
+        assert!(heartbeat.config_json.is_empty());
+        assert_eq!(heartbeat.ferrum_version, ferrum_edge::FERRUM_VERSION);
+        assert_eq!(heartbeat.config_sync_build, config_sync_build_identity());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cp_heartbeats_single_namespace_subscribe_stream() {
+        let server = CpGrpcServer::builder(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        )
+        .build();
+        assert!(matches!(server.scope(), CpScope::Single(_)));
+        assert_idle_stream_heartbeats(&server, subscribe_request()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cp_heartbeats_namespace_set_subscribe_stream() {
+        let namespaces = ["ferrum".to_string(), "staging".to_string()];
+        let server = CpGrpcServer::builder(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        )
+        .scope(CpScope::Set(namespaces.into_iter().collect()))
+        .build();
+        assert_idle_stream_heartbeats(&server, ns_claimed_subscribe_request("ferrum")).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cp_heartbeats_cluster_wide_subscribe_stream() {
+        let server = CpGrpcServer::builder(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        )
+        .scope(CpScope::All)
+        .build();
+        assert_idle_stream_heartbeats(&server, ns_claimed_subscribe_request("ferrum")).await;
     }
 
     fn delta(proxies: Vec<Proxy>) -> IncrementalResult {
@@ -7450,10 +7554,12 @@ mod configsync_size_bounds {
     #[test]
     fn configsync_rejected_broadcasts_disconnect_subscribers_without_reporting_delivery() {
         let config = oversized_config();
-        let (server, tx) = CpGrpcServer::new(
+        let server = CpGrpcServer::builder(
             Arc::new(ArcSwap::from_pointee(create_test_config(1))),
             TEST_JWT_SECRET.to_string(),
-        );
+        )
+        .build();
+        let tx = server.broadcasts().sender_for("ferrum");
         let broadcasts = server.broadcasts();
         let mut rx = tx.subscribe();
         let registry = DpNodeRegistry::new();
@@ -7519,12 +7625,11 @@ mod configsync_size_bounds {
     async fn configsync_oversized_initial_unary_and_lag_recovery_are_refused() {
         let config = Arc::new(ArcSwap::from_pointee(oversized_config()));
         let registry = Arc::new(DpNodeRegistry::new());
-        let (server, tx) = CpGrpcServer::with_channel_capacity_and_registry(
-            config.clone(),
-            TEST_JWT_SECRET.to_string(),
-            2,
-            registry.clone(),
-        );
+        let server = CpGrpcServer::builder(config.clone(), TEST_JWT_SECRET.to_string())
+            .channel_capacity(2)
+            .registry(registry.clone())
+            .build();
+        let tx = server.broadcasts().sender_for("ferrum");
         let logs = CapturedLogs::default();
         let _guard = tracing::subscriber::set_default(logs.subscriber());
         let status = server.subscribe(subscribe_request()).await.err().unwrap();
@@ -7534,6 +7639,7 @@ mod configsync_size_bounds {
             .get_full_config(authenticated(FullConfigRequest {
                 node_id: "size-bound-dp".to_string(),
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some(String::new()),
             }))
@@ -7572,10 +7678,12 @@ mod configsync_size_bounds {
 
     #[tokio::test]
     async fn configsync_exact_protobuf_bound_includes_trust_and_metadata() {
-        let (server, tx) = CpGrpcServer::new(
+        let server = CpGrpcServer::builder(
             Arc::new(ArcSwap::from_pointee(create_test_config(1))),
             TEST_JWT_SECRET.to_string(),
-        );
+        )
+        .build();
+        let tx = server.broadcasts().sender_for("ferrum");
         let mut stream = server
             .subscribe(subscribe_request())
             .await

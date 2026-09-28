@@ -505,8 +505,8 @@ fn incremental_result_is_empty_when_default() {
 }
 
 #[test]
-fn incremental_result_deserializes_legacy_delta_without_sequence_cursor() {
-    let result: IncrementalResult = serde_json::from_value(serde_json::json!({
+fn incremental_result_requires_sequence_cursor() {
+    let mut delta = serde_json::json!({
         "added_or_modified_proxies": [],
         "removed_proxy_ids": [],
         "added_or_modified_consumers": [],
@@ -516,10 +516,12 @@ fn incremental_result_deserializes_legacy_delta_without_sequence_cursor() {
         "added_or_modified_upstreams": [],
         "removed_upstream_ids": [],
         "poll_timestamp": "2026-06-21T00:00:00Z"
-    }))
-    .expect("legacy incremental deltas without sequence_cursor must deserialize");
+    });
+    assert!(serde_json::from_value::<IncrementalResult>(delta.clone()).is_err());
 
-    assert_eq!(result.sequence_cursor, 0);
+    delta["sequence_cursor"] = serde_json::json!(4);
+    let result: IncrementalResult = serde_json::from_value(delta).unwrap();
+    assert_eq!(result.sequence_cursor, 4);
     assert!(result.is_empty());
 }
 
@@ -583,10 +585,9 @@ fn incremental_result_not_empty_with_removed_consumer() {
 }
 
 #[test]
-fn incremental_result_decodes_legacy_removed_consumer_ids() {
-    // Same-major.minor rolling upgrade: a legacy peer may send bare removal IDs.
-    // Decode must accept them (unqualified) and qualification must scope them to
-    // the already-authorized subscription namespace — not reject at serde time.
+fn incremental_result_removed_consumer_ids_must_be_namespace_qualified() {
+    // Removal keys travel only as `{namespace, id}` objects. A bare ID string
+    // carries no namespace and is rejected at decode instead of being applied.
     let result = IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
@@ -601,20 +602,16 @@ fn incremental_result_decodes_legacy_removed_consumer_ids() {
     };
     let mut value = serde_json::to_value(result).unwrap();
     value["removed_consumer_ids"] = serde_json::json!(["c1"]);
+    assert!(serde_json::from_value::<IncrementalResult>(value.clone()).is_err());
 
-    let mut decoded: IncrementalResult = serde_json::from_value(value).unwrap();
-    assert_eq!(
-        decoded.removed_consumer_ids,
-        vec![NamespacedResourceId::new("", "c1")]
-    );
-    assert_eq!(decoded.qualify_unqualified_removals("ferrum"), 1);
+    value["removed_consumer_ids"] = serde_json::json!([{"namespace": "ferrum", "id": "c1"}]);
+    let decoded: IncrementalResult = serde_json::from_value(value).unwrap();
     assert_eq!(
         decoded.removed_consumer_ids,
         vec![NamespacedResourceId::new("ferrum", "c1")]
     );
 
-    // Entries that are neither a bare string nor a namespace-qualified object
-    // remain unclassifiable and must fail closed at decode.
+    // An object that is not a namespace-qualified key fails closed at decode.
     let mut malformed = serde_json::to_value(IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],

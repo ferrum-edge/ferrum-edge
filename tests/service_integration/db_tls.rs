@@ -88,42 +88,44 @@ async fn start_fixture(db_type: &str, expired: bool) -> Result<SqlTlsFixture, Bo
     std::fs::write(&ca_path, &ca_pem)?;
     let (container, port) = retry_on_host_port_collision(|| async {
         let port = allocate_host_port()?;
-        let image = if db_type == "postgres" {
-            GenericImage::new("postgres", "17")
-                .with_entrypoint("/bin/sh")
-                .with_exposed_port(5432.tcp())
-                .with_mapped_port(port, 5432.tcp())
-                .with_env_var("POSTGRES_USER", "ferrum")
-                .with_env_var("POSTGRES_PASSWORD", "fixture-password")
-                .with_env_var("POSTGRES_DB", "ferrum")
-                .with_cmd([
-                    "-ec",
-                    "chown postgres:postgres /tmp/server.key\n\
-                     chmod 600 /tmp/server.key\n\
-                     exec docker-entrypoint.sh postgres -c ssl=on \
-                     -c ssl_cert_file=/tmp/server.pem -c ssl_key_file=/tmp/server.key",
-                ])
-        } else {
-            GenericImage::new("mysql", "8.4")
-                .with_entrypoint("/bin/sh")
-                .with_exposed_port(3306.tcp())
-                .with_mapped_port(port, 3306.tcp())
-                .with_env_var("MYSQL_ROOT_PASSWORD", "fixture-password")
-                .with_env_var("MYSQL_ROOT_HOST", "%")
-                .with_env_var("MYSQL_DATABASE", "ferrum")
-                .with_cmd([
-                    "-ec",
-                    "chown mysql:mysql /tmp/server.key\n\
-                     chmod 600 /tmp/server.key\n\
-                     exec docker-entrypoint.sh mysqld --require-secure-transport=ON \
-                     --ssl-cert=/tmp/server.pem --ssl-key=/tmp/server.key --ssl-ca=/tmp/ca.pem",
-                ])
+        let image = || {
+            let image = if db_type == "postgres" {
+                GenericImage::new("postgres", "17")
+                    .with_entrypoint("/bin/sh")
+                    .with_exposed_port(5432.tcp())
+                    .with_mapped_port(port, 5432.tcp())
+                    .with_env_var("POSTGRES_USER", "ferrum")
+                    .with_env_var("POSTGRES_PASSWORD", "fixture-password")
+                    .with_env_var("POSTGRES_DB", "ferrum")
+                    .with_cmd([
+                        "-ec",
+                        "chown postgres:postgres /tmp/server.key\n\
+                         chmod 600 /tmp/server.key\n\
+                         exec docker-entrypoint.sh postgres -c ssl=on \
+                         -c ssl_cert_file=/tmp/server.pem -c ssl_key_file=/tmp/server.key",
+                    ])
+            } else {
+                GenericImage::new("mysql", "8.4")
+                    .with_entrypoint("/bin/sh")
+                    .with_exposed_port(3306.tcp())
+                    .with_mapped_port(port, 3306.tcp())
+                    .with_env_var("MYSQL_ROOT_PASSWORD", "fixture-password")
+                    .with_env_var("MYSQL_ROOT_HOST", "%")
+                    .with_env_var("MYSQL_DATABASE", "ferrum")
+                    .with_cmd([
+                        "-ec",
+                        "chown mysql:mysql /tmp/server.key\n\
+                         chmod 600 /tmp/server.key\n\
+                         exec docker-entrypoint.sh mysqld --require-secure-transport=ON \
+                         --ssl-cert=/tmp/server.pem --ssl-key=/tmp/server.key --ssl-ca=/tmp/ca.pem",
+                    ])
+            };
+            image
+                .with_copy_to("/tmp/server.pem", server_pem.as_bytes().to_vec())
+                .with_copy_to("/tmp/server.key", key.serialize_pem().into_bytes())
+                .with_copy_to("/tmp/ca.pem", ca_pem.as_bytes().to_vec())
         };
-        let image = image
-            .with_copy_to("/tmp/server.pem", server_pem.as_bytes().to_vec())
-            .with_copy_to("/tmp/server.key", key.serialize_pem().into_bytes())
-            .with_copy_to("/tmp/ca.pem", ca_pem.as_bytes().to_vec());
-        let container = start_within_deadline("SQL TLS", image.start()).await?;
+        let container = start_within_deadline("SQL TLS", || image().start()).await?;
         Ok((container, port))
     })
     .await?;

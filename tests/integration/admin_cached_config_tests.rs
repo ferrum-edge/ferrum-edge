@@ -9623,6 +9623,7 @@ async fn test_cluster_endpoint_requires_auth() {
 
 #[tokio::test]
 async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
+    use ferrum_edge::grpc::configsync_lifecycle::config_sync_build_identity;
     use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
     use ferrum_edge::grpc::dp_client::generate_dp_jwt;
     use ferrum_edge::grpc::proto::SubscribeRequest;
@@ -9634,7 +9635,7 @@ async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
     state.mode = "cp".to_string();
     state.dp_registry = Some(registry.clone());
     let secret = "test-cluster-configsync-secret";
-    let (server, _tx) = CpGrpcServer::builder(
+    let server = CpGrpcServer::builder(
         Arc::new(ArcSwap::from_pointee(GatewayConfig::default())),
         secret.to_string(),
     )
@@ -9643,9 +9644,9 @@ async fn test_cluster_endpoint_reports_authenticated_configsync_subscription() {
     let mut request = tonic::Request::new(SubscribeRequest {
         node_id: "cluster-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
-        supports_heartbeat: false,
     });
     let dp_token = generate_dp_jwt(secret, "cluster-dp").unwrap();
     request.metadata_mut().insert(
