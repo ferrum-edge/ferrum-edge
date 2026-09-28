@@ -222,6 +222,10 @@ async fn http1_status_retry_exports_one_client_span_per_attempt() {
         "plugin_configs": [otel_plugin(&collector)],
     });
     let harness = GatewayHarness::builder()
+        // Keep the scripted backend cold: binary-mode startup sends an h2c
+        // capability probe whose `PRI * HTTP/2.0` preface the backend records
+        // as a request, consuming the 503 script with no `traceparent`.
+        .mode_in_process()
         .file_config(to_file_mode_yaml(&config))
         .pool_warmup_enabled(false)
         .spawn()
@@ -408,6 +412,10 @@ async fn grpc_attempt_spans_cover_connect_retries_and_pooled_connection_reuse() 
         "plugin_configs": [otel_plugin(&collector)],
     });
     let harness = GatewayHarness::builder()
+        // Keep the gRPC pool cold: binary-mode startup's h2c capability probe
+        // pools a connection to the live target under the same pool key, and
+        // the first RPC would rightly report reusing it.
+        .mode_in_process()
         .file_config(to_file_mode_yaml(&config))
         .pool_warmup_enabled(false)
         .spawn()
