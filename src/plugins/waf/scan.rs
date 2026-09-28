@@ -456,8 +456,9 @@ impl Waf {
                 continue;
             };
             self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
-            let (variants, _) = normalize::decoded_variants_with_residual(text);
-            for variant in variants {
+            // `text` is already JSON-unescaped; its single-character escapes
+            // are not resolved a second time.
+            for variant in normalize::decoded_json_value_variants(text) {
                 self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
             }
         }
@@ -500,26 +501,55 @@ impl Waf {
             && !rule.suppresses_text(fp_filter_target)
     }
 
+    /// Scan each `name=value` cookie crumb as sent AND as decoded.
+    ///
+    /// Frameworks disagree about cookie values: the Servlet API and Go's
+    /// `net/http` hand the application the raw octets, while PHP (`urldecode`,
+    /// so `+` is a space), Express `cookie-parser` (`decodeURIComponent`), and
+    /// Rails unescape them first. A WAF that only scans the raw crumb misses
+    /// `pref=%3Cscript%3E`; one that only scans the decoded form misses a raw
+    /// payload a non-decoding backend reads verbatim. So the raw crumb is
+    /// always scanned and every distinct decoded view is scanned beside it.
+    /// Cookie views are percent decodes (`%XX`, `%uXXXX`, `+` as a space and,
+    /// Express-style, as `+`, and the bounded layered percent decode), plus
+    /// the code-point escapes (`\uXXXX`, `\xXX`) of an Express `j:` JSON
+    /// cookie. JSON single-character escapes and HTML entities are not cookie
+    /// encodings, and resolving them would turn a `j:` cookie's `\n` into a
+    /// control character. Splitting on `;` happens first, so an encoded `%3B`
+    /// cannot forge an extra crumb. A crumb with nothing to decode costs no
+    /// allocation.
     fn scan_cookies(&self, outcome: &mut ScanOutcome, header: &str, subject: ScanSubject<'_>) {
+        if !self.compiled.cookie_rules_active {
+            return;
+        }
         for cookie in header.split(';') {
             let cookie = cookie.trim();
-            if !cookie.is_empty() {
-                self.scan_text_set(
-                    outcome,
-                    self.compiled.cookies.as_ref(),
-                    cookie,
-                    subject,
-                    None,
-                );
-                self.scan_cidr_rules_matching(
-                    outcome,
-                    cookie,
-                    &self.compiled.text_cidr_rules,
-                    subject,
-                    |target| matches!(target, RuleTarget::Cookies),
-                );
+            if cookie.is_empty() {
+                continue;
+            }
+            self.scan_cookie_view(outcome, cookie, subject);
+            let views = normalize::canonical_cookie_views(cookie);
+            for view in views.iter().filter(|view| *view != cookie) {
+                self.scan_cookie_view(outcome, view, subject);
             }
         }
+    }
+
+    fn scan_cookie_view(&self, outcome: &mut ScanOutcome, cookie: &str, subject: ScanSubject<'_>) {
+        self.scan_text_set(
+            outcome,
+            self.compiled.cookies.as_ref(),
+            cookie,
+            subject,
+            None,
+        );
+        self.scan_cidr_rules_matching(
+            outcome,
+            cookie,
+            &self.compiled.text_cidr_rules,
+            subject,
+            |target| matches!(target, RuleTarget::Cookies),
+        );
     }
 
     fn scan_query_pair(

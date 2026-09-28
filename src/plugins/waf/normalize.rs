@@ -15,8 +15,6 @@
 
 use std::borrow::Cow;
 
-use percent_encoding::percent_decode_str;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Utf16Endian {
     Little,
@@ -38,7 +36,11 @@ enum Utf32Endian {
 /// `O((1 + MAX_WIDE_CHARSET_VIEWS) × (1 + MAX_VARIANTS) × bytes × rules)`.
 /// That is a deliberate bound for an uncommon Content-Type, not an unbounded
 /// expansion — do not raise this cap to "make room" for more endians.
-const MAX_VARIANTS: usize = 4;
+///
+/// Five is one slot per candidate [`decoded_variants`] builds (the layered
+/// decode, its second-to-last round, and the three single-layer decodes), so
+/// padding a value with unrelated escapes cannot push a view out of the set.
+const MAX_VARIANTS: usize = 5;
 
 /// Cap on UTF-16 / UTF-32 inspection views of one body. Explicit little/big
 /// names and BOMs resolve to one view. Bare `utf-16` / `utf-32` without a
@@ -79,24 +81,41 @@ const MAX_BRACED_ESCAPE_HEX_DIGITS: usize = 6;
 /// residual flag share a single layered decode pass rather than running it
 /// twice.
 pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) {
+    decoded_variants(text, StringEscapes::All)
+}
+
+/// Decoded variants of a string a JSON parser already unescaped (a JSON-path
+/// rule's value). The single-character escapes (`\n`, `\"`, `\\`, …) were
+/// resolved once by that parser, so they are not resolved a second time —
+/// `C:\new` in the parsed value stays a backslash and an `n`. The residual
+/// flag is not reported: JSON-path rules do not raise encoding evasion.
+pub(super) fn decoded_json_value_variants(text: &str) -> Vec<String> {
+    decoded_variants(text, StringEscapes::CodePointsOnly).0
+}
+
+fn decoded_variants(text: &str, escapes: StringEscapes) -> (Vec<String>, bool) {
     if !has_decodable_marker(text) {
         return (Vec::new(), false);
     }
 
     // Layered decode catches stacked encodings (e.g. percent-encoded HTML
-    // entities). The single-layer decodes are kept as well because a layered
-    // percent-decode can mangle a body that merely contains a literal `%`,
-    // and we still want the JSON/HTML-only decode to fire in that case.
-    let (layered, converged) = layered_decode_inner(text);
+    // entities). Its second-to-last round is kept too when it holds a `+`:
+    // the last round turns every `+` into a space, so `%252B` would otherwise
+    // only ever be seen as a space, never as the `+` a double-decoding
+    // application reads. The single-layer decodes are kept as well because a
+    // layered percent-decode can mangle a body that merely contains a literal
+    // `%`, and we still want the JSON/HTML-only decode to fire in that case.
+    let layered = layered_decode_inner(text, escapes);
     let candidates = [
-        layered,
-        unicode_unescape(text),
-        html_entity_decode(text),
-        percent_decode_plus(text),
+        Some(layered.decoded),
+        layered.intermediate.map(Cow::Owned),
+        Some(string_unescape(text, escapes)),
+        Some(html_entity_decode(text)),
+        Some(percent_decode_plus(text)),
     ];
 
     let mut out: Vec<String> = Vec::new();
-    for candidate in candidates {
+    for candidate in candidates.into_iter().flatten() {
         if out.len() >= MAX_VARIANTS {
             break;
         }
@@ -105,7 +124,7 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
             out.push(candidate.into_owned());
         }
     }
-    (out, !converged)
+    (out, !layered.converged)
 }
 
 /// Zero, one, or two UTF-8 inspection views of a UTF-16 / UTF-32 body.
@@ -588,6 +607,75 @@ pub(super) fn canonical_query_component_views(raw: &str) -> CanonicalQueryViews<
     CanonicalQueryViews { primary, variants }
 }
 
+/// Inspection views of one `name=value` cookie crumb:
+///
+/// * the percent decode with `+` → space (PHP `urldecode`, Rails);
+/// * when that is itself still percent-encoded, the layered percent decode
+///   capped at [`MAX_DECODE_ROUNDS`], plus its second-to-last round when that
+///   holds a `+`, since the last round turns the `+` a `%252B` yields into a
+///   space;
+/// * when the crumb holds both `%` and `+`, the percent decode that keeps `+`
+///   (Express `cookie-parser`, which uses `decodeURIComponent`);
+/// * when the value (split from the raw crumb at its first `=`, as Express
+///   splits it, then decoded) starts with `j:`, that Express reading with its
+///   `\uXXXX` / `\u{...}` / `\xXX` escapes and its `\"`, `\'`, `\/`, `\\`
+///   escapes resolved, because `cookie-parser` runs `JSON.parse` on such a
+///   value.
+///
+/// Callers split the `Cookie` header on `;` first, so `%3B` cannot forge an
+/// extra crumb. JSON control escapes and HTML entities are not cookie
+/// encodings: a `j:` JSON cookie whose string holds `\n` is a backslash and
+/// an `n` to the view that models it, so the control-character rule is not
+/// handed a line feed only a different decoder would produce. A crumb with
+/// nothing to decode costs no allocation.
+pub(super) fn canonical_cookie_views(raw: &str) -> CanonicalQueryViews<'_> {
+    let primary = percent_decode_plus(raw);
+    let mut variants = Vec::new();
+    if let Cow::Owned(first) = &primary {
+        let mut rounds: [Option<String>; 2] = [None, None];
+        for _ in 1..MAX_DECODE_ROUNDS {
+            let current = rounds[1].as_deref().unwrap_or(first.as_str());
+            let next = match percent_decode_plus(current) {
+                Cow::Owned(next) => next,
+                Cow::Borrowed(_) => break,
+            };
+            rounds = [rounds[1].take(), Some(next)];
+        }
+        let [intermediate, last] = rounds;
+        variants.extend(intermediate.filter(|round| round.contains('+')));
+        variants.extend(last);
+    }
+    let plus_kept = raw.contains('+').then(|| percent_decode(raw, false));
+    let express = plus_kept.as_deref().unwrap_or(&primary);
+    if let Some(json) = json_cookie_view(raw, express) {
+        variants.push(json);
+    }
+    if let Some(Cow::Owned(plus_kept)) = plus_kept {
+        variants.push(plus_kept);
+    }
+    CanonicalQueryViews { primary, variants }
+}
+
+/// The `JSON.parse` reading of `express`, the Express-decoded text of the
+/// cookie crumb `raw`, or `None` when the crumb is not a `j:` JSON cookie or
+/// has no escape to resolve.
+///
+/// Express splits the raw crumb at its first `=` and decodes only the value,
+/// so `a%3Db=j:…` is a `j:` value to it even though the decoded crumb reads
+/// `a=b=j:…`.
+fn json_cookie_view(raw: &str, express: &str) -> Option<String> {
+    let (_, value) = raw.split_once('=')?;
+    let value = value.trim();
+    let value = value.strip_prefix('"').unwrap_or(value);
+    if !percent_decode(value, false).starts_with("j:") {
+        return None;
+    }
+    match string_unescape(express, StringEscapes::JsonCookie) {
+        Cow::Owned(decoded) if decoded != express => Some(decoded),
+        _ => None,
+    }
+}
+
 /// Whether any decoder could change `text`. Runs over every inspected body, so
 /// it uses the SIMD `memchr` searchers rather than a byte-at-a-time loop: a
 /// body with no marker at all — the common case — costs two vectorised passes.
@@ -604,15 +692,15 @@ fn has_decodable_marker(text: &str) -> bool {
 /// changes nothing returns `Cow::Borrowed`, which is how
 /// [`layered_decode_inner`] recognises a fixed point without comparing the
 /// (up to `max_scan_bytes`-sized) strings.
-fn decode_round(text: &str) -> Cow<'_, str> {
+fn decode_round(text: &str, escapes: StringEscapes) -> Cow<'_, str> {
     let percent = percent_decode_plus(text);
-    let unicode = chain_stage(percent, unicode_unescape);
+    let unicode = chain_stage(percent, |text| string_unescape(text, escapes));
     chain_stage(unicode, html_entity_decode)
 }
 
 /// Apply `stage` to `input`, keeping `input` (and its borrow of the round's
 /// original text) when the stage decoded nothing.
-fn chain_stage<'a>(input: Cow<'a, str>, stage: fn(&str) -> Cow<'_, str>) -> Cow<'a, str> {
+fn chain_stage<'a>(input: Cow<'a, str>, stage: impl Fn(&str) -> Cow<'_, str>) -> Cow<'a, str> {
     let decoded = match stage(&input) {
         Cow::Borrowed(_) => None,
         Cow::Owned(decoded) => Some(decoded),
@@ -620,10 +708,24 @@ fn chain_stage<'a>(input: Cow<'a, str>, stage: fn(&str) -> Cow<'_, str>) -> Cow<
     decoded.map_or(input, Cow::Owned)
 }
 
+/// Result of [`layered_decode_inner`].
+struct LayeredDecode<'a> {
+    /// The value after the last round that changed it, borrowed when no round
+    /// changed it.
+    decoded: Cow<'a, str>,
+    /// The value before the last permitted round, kept only when that round
+    /// changed it and the value holds a `+`. The last round turns every `+`
+    /// into a space, so this is where a double-encoded `%252B` still reads as
+    /// `+`; any other change the last round makes only reveals more.
+    intermediate: Option<String>,
+    /// `false` when the value was still actively decoding when the round cap
+    /// was reached, i.e. it carries an encoding stacked deeper than the cap
+    /// can peel.
+    converged: bool,
+}
+
 /// Run the layered decode and report whether it reached a fixed point within
-/// [`MAX_DECODE_ROUNDS`]. Returns `(decoded, converged)`; `converged == false`
-/// means the value was still actively decoding when the round cap was reached,
-/// i.e. it carries an encoding stacked deeper than the cap can peel.
+/// [`MAX_DECODE_ROUNDS`].
 ///
 /// Convergence is judged by whether the *last* round made progress, not merely
 /// by exhausting the iteration count: a payload that finishes decoding on the
@@ -635,55 +737,243 @@ fn chain_stage<'a>(input: Cow<'a, str>, stage: fn(&str) -> Cow<'_, str>) -> Cow<
 /// that returns `Cow::Borrowed` is a fixed point. The equality check below is
 /// kept as a belt-and-braces guard; for a genuinely changed round it fails on
 /// the length comparison before touching the bytes.
-fn layered_decode_inner(text: &str) -> (Cow<'_, str>, bool) {
+fn layered_decode_inner(text: &str, escapes: StringEscapes) -> LayeredDecode<'_> {
     let mut current = Cow::Borrowed(text);
+    let mut intermediate = None;
     let mut converged = true;
     for round in 0..MAX_DECODE_ROUNDS {
-        let next = match decode_round(&current) {
+        let next = match decode_round(&current, escapes) {
             Cow::Owned(next) if next != *current => next,
             // Reached a fixed point before the cap — fully reduced.
             _ => break,
         };
-        current = Cow::Owned(next);
+        let previous = std::mem::replace(&mut current, Cow::Owned(next));
         // The last permitted round still changed the value; if a further round
-        // would change it again the payload is stacked deeper than the cap.
+        // would peel another real layer the payload is stacked deeper than the
+        // cap. Backslash-run collapsing alone is not such a layer.
         if round + 1 == MAX_DECODE_ROUNDS {
-            converged = match decode_round(&current) {
-                Cow::Borrowed(_) => true,
-                Cow::Owned(next) => next == *current,
-            };
+            intermediate = previous.contains('+').then(|| previous.into_owned());
+            converged = !has_pending_decode(&current);
         }
     }
-    (current, converged)
+    LayeredDecode {
+        decoded: current,
+        intermediate,
+        converged,
+    }
 }
 
-/// Percent-decode (`%XX`) and translate `+` to space (form-encoding). Lossy on
-/// invalid UTF-8 sequences, which is fine for pattern detection.
+/// Percent-decode (`%XX` and `%uXXXX`) and translate `+` to space
+/// (form-encoding) in a single pass. Lossy on invalid UTF-8 sequences, which
+/// is fine for pattern detection.
+///
+/// `%uXXXX` is not RFC 3986 percent-encoding, but IIS / classic ASP decode it
+/// in the query string and form body, and JavaScript `unescape()` decodes it
+/// too, so `%u003cscript%u003e` reaches such an application as `<script>`.
+///
+/// One pass matches the form decoders this models: only a literal `+` is a
+/// space, so `%2B` and `%u002B` decode to `+`, and a `%u0025` yields a literal
+/// `%` that is not decoded again within the same round (the layered decode's
+/// next round handles deliberate stacking). A lone surrogate code unit becomes
+/// `U+FFFD`. Text with nothing to decode is returned without copying.
 fn percent_decode_plus(text: &str) -> Cow<'_, str> {
-    if !text.as_bytes().contains(&b'%') {
-        if text.as_bytes().contains(&b'+') {
-            return Cow::Owned(text.replace('+', " "));
-        }
+    percent_decode(text, true)
+}
+
+/// [`percent_decode_plus`], with `+` kept as `+` unless `plus_is_space`
+/// (`decodeURIComponent` semantics). Nothing is allocated unless the text
+/// holds an escape that actually decodes.
+fn percent_decode(text: &str, plus_is_space: bool) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut first = 0;
+    while first < bytes.len() && !percent_decodes_at(&bytes[first..], plus_is_space) {
+        first += 1;
+    }
+    if first == bytes.len() {
         return Cow::Borrowed(text);
     }
-    let decoded = percent_decode_str(text).decode_utf8_lossy();
-    if decoded.as_bytes().contains(&b'+') {
-        Cow::Owned(decoded.replace('+', " "))
-    } else {
-        decoded
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..first]);
+    let mut i = first;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if plus_is_space && rest[0] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if let Some(unit) = percent_u_unit(rest) {
+            let ch = char::from_u32(unit).unwrap_or(char::REPLACEMENT_CHARACTER);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            i += 6;
+        } else if let Some(octet) = percent_octet(rest) {
+            out.push(octet);
+            i += 3;
+        } else {
+            out.push(rest[0]);
+            i += 1;
+        }
+    }
+    let decoded = match String::from_utf8(out) {
+        Ok(decoded) => decoded,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    };
+    Cow::Owned(decoded)
+}
+
+/// Whether [`percent_decode`] rewrites the bytes at the start of `rest`.
+fn percent_decodes_at(rest: &[u8], plus_is_space: bool) -> bool {
+    match rest.first() {
+        Some(b'+') => plus_is_space,
+        Some(b'%') => percent_u_unit(rest).is_some() || percent_octet(rest).is_some(),
+        _ => false,
     }
 }
 
-/// Decode JSON/JavaScript unicode escapes: `\uXXXX` (with surrogate pairs),
-/// `\u{XXXX}`, and `\xXX`. Unrecognized escapes keep their literal backslash.
+/// The code unit of a well-formed `%uXXXX` escape at the start of `bytes`.
+fn percent_u_unit(bytes: &[u8]) -> Option<u32> {
+    match bytes {
+        [b'%', b'u' | b'U', digits @ ..] => hex_n(digits.get(..4)?),
+        _ => None,
+    }
+}
+
+/// The octet of a well-formed `%XX` escape at the start of `bytes`.
+fn percent_octet(bytes: &[u8]) -> Option<u8> {
+    match bytes {
+        [b'%', digits @ ..] => hex2(digits.get(..2)?),
+        _ => None,
+    }
+}
+
+/// Whether one more decode round would still peel a percent, `\u` / `\x`,
+/// or HTML-entity layer from `text`. This is the residual probe applied after
+/// the last permitted round of [`layered_decode_inner`].
+///
+/// Two kinds of change are deliberately not counted: `+` → space, and the
+/// JSON / JavaScript single-character escapes (`\n`, `\"`, `\\`, …). A run
+/// of backslashes halves on every round, so ordinary multiply-stringified
+/// JSON, doubly escaped UNC paths, and regex or LaTeX source would otherwise
+/// still be "decoding" at the cap without hiding anything the other decoders
+/// would reveal.
+///
+/// A code-point escape body behind a run of backslashes of *any* length is
+/// pending: each round halves the run, so later rounds reach the escape
+/// however deep it is stacked (16 backslashes then `u003c` is `<` five
+/// decodes later). Which escapes count depends on their form (see
+/// [`code_point_escape_hides_syntax`]): any deep `\u` escape of ASCII does,
+/// while `\x64` in a Windows path or `\u00e9` in stringified text does not.
+fn has_pending_decode(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        match rest[0] {
+            b'%' if percent_u_unit(rest).is_some() || percent_octet(rest).is_some() => {
+                return true;
+            }
+            b'\\' => {
+                // Skip the whole run so every byte is visited once.
+                let run = rest.iter().take_while(|&&byte| byte == b'\\').count();
+                if code_point_escape_hides_syntax(&rest[run..]) {
+                    return true;
+                }
+                i += run;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    html_entity_decode(text).as_ref() != text
+}
+
+/// Whether the `\uXXXX` (or surrogate pair), `\u{...}`, or `\xXX` escape
+/// body at the start of `after` (the bytes following a backslash) is one a
+/// signature could miss while it stays encoded.
+///
+/// * `\u` / `\u{...}`: any ASCII character, or a C1 control. JSON and
+///   JavaScript serializers never write ASCII as a `\u` escape, so a deep
+///   `\u0073elect` or `<\u0073cript>` is evasion in itself even though it
+///   yields a letter.
+/// * `\xXX`: ASCII punctuation (quotes, angle brackets, slashes, …), a space
+///   (a SQL token separator), or an ASCII control (CR/LF, NUL, tab). `\x` is
+///   not a JSON escape: it shows up as literal text in Windows paths (`\x64`,
+///   `bin\x86\Release`), regex source, and hex dumps, so letters, digits, and
+///   C1 bytes are not counted.
+fn code_point_escape_hides_syntax(after: &[u8]) -> bool {
+    let unicode = match after.first() {
+        Some(b'u' | b'U') => true,
+        Some(b'x' | b'X') => false,
+        _ => return false,
+    };
+    let Some(ch) = decode_escape(after).and_then(|(cp, _)| char::from_u32(cp)) else {
+        return false;
+    };
+    if unicode {
+        ch.is_ascii() || ch.is_control()
+    } else {
+        ch.is_ascii_punctuation() || ch == ' ' || ch.is_ascii_control()
+    }
+}
+
+fn is_single_char_escape(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'n' | b't' | b'r' | b'f' | b'b' | b'v' | b'/' | b'"' | b'\'' | b'\\'
+    )
+}
+
+/// Which backslash escapes [`string_unescape`] resolves.
+#[derive(Clone, Copy)]
+enum StringEscapes {
+    /// Raw request or response text: every JSON / JavaScript escape.
+    All,
+    /// A value a JSON parser already unescaped: only the code-point escapes
+    /// (`\uXXXX`, `\u{...}`, `\xXX`) that model a second, application-level
+    /// decode. The single-character escapes were resolved once already.
+    CodePointsOnly,
+    /// An Express `j:` cookie value `JSON.parse` reads: the code-point escapes
+    /// and the escapes that yield a quote, slash, or backslash (`\"`, `\'`,
+    /// `\/`, `\\`). The control escapes (`\n`, `\r`, `\t`, `\b`, `\f`, `\v`)
+    /// stay a backslash and a letter, so the control-character rule is not
+    /// handed a line feed from a cookie.
+    JsonCookie,
+}
+
+impl StringEscapes {
+    fn decode(self, after: &[u8]) -> Option<(u32, usize)> {
+        let escape = decode_escape(after)?;
+        let single_char = after.first().copied().is_some_and(is_single_char_escape);
+        match self {
+            Self::CodePointsOnly if single_char => None,
+            Self::JsonCookie if single_char && escape.0 < 0x20 => None,
+            Self::All | Self::CodePointsOnly | Self::JsonCookie => Some(escape),
+        }
+    }
+}
+
+/// Decode JSON/JavaScript string escapes: `\uXXXX` (with surrogate pairs),
+/// `\u{XXXX}`, `\xXX`, and the single-character escapes (`\n`, `\t`, `\r`,
+/// `\f`, `\b`, `\v`, `\/`, `\"`, `\'`, `\\`). Unrecognized escapes keep
+/// their literal backslash. `escapes` narrows the set for text a JSON parser
+/// already unescaped once (see [`StringEscapes`]).
 ///
 /// Borrows unless at least one escape actually decodes: a body full of escapes
 /// this decoder does not recognise is returned untouched rather than copied.
 /// Literal text between escapes is copied in whole runs located with `memchr`,
 /// not one character at a time.
-fn unicode_unescape(text: &str) -> Cow<'_, str> {
+///
+/// The single-character escapes are not cosmetic. A JSON or JavaScript parser
+/// resolves them before the application sees the value, so
+/// `{"q":"1 union\tselect"}` reaches a SQL sink as `union<TAB>select`,
+/// `\"1\"=\"1` as `"1"="1`, and `file:\/\/\/etc\/passwd` as
+/// `file:///etc/passwd` — while the raw bytes carry a backslash where every
+/// signature expects whitespace, a quote, or a slash.
+fn string_unescape(text: &str, escapes: StringEscapes) -> Cow<'_, str> {
     decode_runs(text, b'\\', |after| {
-        decode_escape(after).map(|(cp, consumed)| (EntityVal::Cp(cp), consumed))
+        escapes
+            .decode(after)
+            .map(|(cp, consumed)| (EntityVal::Cp(cp), consumed))
     })
 }
 
@@ -774,6 +1064,17 @@ fn decode_escape(after: &[u8]) -> Option<(u32, usize)> {
             }
         }
         b'x' | b'X' => Some((hex2(after.get(1..3)?)? as u32, 3)),
+        b'n' => Some((u32::from(b'\n'), 1)),
+        b't' => Some((u32::from(b'\t'), 1)),
+        b'r' => Some((u32::from(b'\r'), 1)),
+        b'f' => Some((0x0C, 1)),
+        b'b' => Some((0x08, 1)),
+        b'v' => Some((0x0B, 1)),
+        // `\\` must consume both backslashes so `\\u003c` reads as the
+        // literal text `\u003c`, exactly as a JSON parser reads it; the
+        // layered decode's next round still reduces a deliberate double
+        // escape.
+        escaped @ (b'/' | b'"' | b'\'' | b'\\') => Some((u32::from(*escaped), 1)),
         _ => None,
     }
 }
@@ -922,6 +1223,10 @@ fn dec_n(bytes: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn unicode_unescape(text: &str) -> Cow<'_, str> {
+        string_unescape(text, StringEscapes::All)
+    }
+
     #[test]
     fn unicode_unescape_decodes_json_payload() {
         assert_eq!(unicode_unescape(r"<script>"), "<script>");
@@ -974,7 +1279,7 @@ mod tests {
     #[test]
     fn unicode_unescape_preserves_unknown_escapes_and_plain_text() {
         assert!(matches!(unicode_unescape("plain text"), Cow::Borrowed(_)));
-        assert_eq!(unicode_unescape(r"a\nb\qc"), r"a\nb\qc");
+        assert_eq!(unicode_unescape(r"a\qc\zd"), r"a\qc\zd");
     }
 
     #[test]
@@ -1009,6 +1314,10 @@ mod tests {
         assert_eq!(percent_decode_plus("%3Cscript%3E"), "<script>");
         assert_eq!(percent_decode_plus("a+b"), "a b");
         assert!(matches!(percent_decode_plus("plain"), Cow::Borrowed(_)));
+        // Only a valid escape costs a copy.
+        assert!(matches!(percent_decode_plus("1%zz%u1"), Cow::Borrowed(_)));
+        assert!(matches!(percent_decode("a+b", false), Cow::Borrowed(_)));
+        assert_eq!(percent_decode("a+b%2B", false), "a+b+");
     }
 
     #[test]
@@ -1064,12 +1373,14 @@ mod tests {
         // The decoded value a caller scans: a within-cap stack reduces fully,
         // and a beyond-cap stack reduces by exactly MAX_DECODE_ROUNDS layers
         // (leaving residual encoding the caller flags as evasion).
-        assert_eq!(layered_decode_inner("%25253Cx").0, "<x");
-        assert_eq!(layered_decode_inner("%2525253Cx").0, "%3Cx");
+        let within_cap = layered_decode_inner("%25253Cx", StringEscapes::All);
+        assert_eq!(within_cap.decoded, "<x");
+        let beyond_cap = layered_decode_inner("%2525253Cx", StringEscapes::All);
+        assert_eq!(beyond_cap.decoded, "%3Cx");
         // Nothing to decode: the input is borrowed through every round.
-        let (plain, converged) = layered_decode_inner("100% sure & done");
-        assert!(matches!(plain, Cow::Borrowed(_)));
-        assert!(converged);
+        let plain = layered_decode_inner("100% sure & done", StringEscapes::All);
+        assert!(matches!(plain.decoded, Cow::Borrowed(_)));
+        assert!(plain.converged);
     }
 
     #[test]

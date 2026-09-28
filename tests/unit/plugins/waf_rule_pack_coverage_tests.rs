@@ -328,11 +328,23 @@ async fn cookie_values_are_an_injection_surface() {
     )
     .await;
 
-    // `FE-SQLI-003-C` has no detection case here: the Cookie header is split
-    // on `;` before matching, so the stacked-statement `;` can only reach it
-    // percent-encoded (`id=1%3BDROP%20TABLE%20users`) once cookie values are
-    // also scanned decoded. That detection case belongs with the change that
-    // adds decoded cookie views.
+    // The Cookie header is split on `;` before matching, so the
+    // stacked-statement `;` reaches `FE-SQLI-003-C` only percent-encoded,
+    // through the decoded cookie views.
+    assert_detected(
+        &plugin,
+        "FE-SQLI-003-C",
+        Surface::Cookie("theme=dark; id=1%3BDROP%20TABLE%20users"),
+    )
+    .await;
+    // Benign twin: an encoded `;` before a word that merely starts with a
+    // statement keyword is a list separator, not a stacked statement.
+    assert_clean(
+        &plugin,
+        "FE-SQLI-003-C",
+        Surface::Cookie("filters=color%3Dred%3Bupdated_since%3D2026-01-01"),
+    )
+    .await;
 
     // Real-world cookie jars: analytics ids, JWT sessions, locale.
     for rule in [

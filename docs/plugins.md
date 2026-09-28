@@ -5435,7 +5435,16 @@ query map, so duplicate keys remain visible before the parsed `HashMap` can
 collapse them; synthetic contexts without a raw query string fall back to
 scanning the parsed key/value map and a best-effort reconstructed URL. Query
 rules match those percent-decoded parameter values plus the same bounded
-layered decode variants used for bodies, not raw whole-URI text.
+layered decode variants used for bodies, not raw whole-URI text. Cookie crumbs
+are matched both raw and percent-decoded (`%XX`, `%uXXXX`, `+` as a space
+and, Express-style, as `+`, and the bounded layered percent decode), because
+some frameworks unescape cookie values before binding them and others do not;
+an Express `j:` JSON cookie also has its `\uXXXX` / `\xXX` escapes and its
+`\"` / `\'` / `\/` / `\\` escapes resolved.
+Query and body decoding covers `%XX`, IIS/JavaScript `%uXXXX` (`%2B` and
+`%u002B` stay `+`, and a double-encoded `%252B` is scanned as both `+` and a
+space), HTML entities, and JSON/JavaScript string escapes including the
+single-character forms (`\t`, `\n`, `\"`, `\/`, `\\`).
 
 **Priority:** 2930
 **Phase:** `authorize`, `on_final_request_body`, `after_proxy`,

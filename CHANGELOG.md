@@ -288,6 +288,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X-Gateway-Error` already is (#5759), and a plugin- or hook-written copy is
   stripped at the final client boundary, so neither a backend nor a plugin can
   pre-seed or forge a reference.
+- WAF normalization now matches the decoders protected backends run, closing
+  three encoding bypasses. JSON / JavaScript single-character string escapes
+  (`\t`, `\n`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`, `\'`, `\\`) are
+  decoded, so `{"q":"1 union\tselect …"}`, `admin\" or \"1\"=\"1`, and
+  `file:\/\/\/etc\/passwd` reach the SQLi, SSRF, and LFI rules as the JSON
+  parser delivers them. The IIS / classic ASP and JavaScript `unescape()` form
+  `%uXXXX` is decoded in query values and bodies, in the same single pass as
+  `%XX`, so `%2B` and `%u002B` stay `+`; the layered decode also scans its
+  second-to-last round, so a double-encoded `%252B` is seen as `+` as well as
+  a space. Cookie crumbs are scanned both raw and percent-decoded (`%XX`,
+  `%u`, `+` as a space and, when the crumb also holds a `%`, as `+`, and the
+  bounded layered percent decode), since PHP, Express `cookie-parser`, and
+  Rails unescape cookie values before binding them; an Express `j:` JSON
+  cookie (found, as Express finds it, by splitting the raw crumb at its first
+  `=`) also has its `\uXXXX` / `\xXX` escapes and its `\"`, `\'`, `\/`,
+  `\\` escapes resolved. The header is split on `;` first, so an encoded
+  `%3B` cannot forge an extra crumb.
+  `body_json_path` values, already unescaped by the JSON parser, do not have
+  their single-character escapes resolved a second time. For the
+  `FE-ENCODING-001` residual, collapsing a run of backslashes no longer counts
+  as an unreduced layer, while behind a backslash run of any length a `\u`
+  escape of any ASCII character or control character, or a `\x` escape of
+  punctuation, a space, or an ASCII control character, still does.
 
 ### Performance
 

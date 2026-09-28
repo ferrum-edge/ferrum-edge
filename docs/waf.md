@@ -144,15 +144,37 @@ matching request and response bodies, the WAF also scans **decoded variants**:
   admitted by the direction's body content-type gates, using an explicit
   `charset`, a byte-order mark, or an undeclared wide-text prefix signature
   (bare `utf-16` / `utf-32` without a BOM tries both endiannesses)
-- JSON / JavaScript unicode escapes — `\uXXXX`, `\u{...}`, `\xXX`
+- JSON / JavaScript string escapes — `\uXXXX`, `\u{...}`, `\xXX`, and the
+  single-character escapes `\n`, `\t`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`,
+  `\'`, `\\`. A JSON parser resolves these before the application sees the
+  value, so `{"q":"1 union\tselect …"}` reaches a SQL sink as
+  `union<TAB>select`, `\"1\"=\"1` as `"1"="1`, and `file:\/\/\/etc\/passwd`
+  as `file:///etc/passwd`. `\\` is one backslash, exactly as the parser reads
+  it; the layered decode still reduces a deliberate double escape
+  (`\\u003c` → `\u003c` → `<`) one layer per round. A `body_json_path` value
+  has already been through the JSON parser, so only its `\uXXXX` / `\u{...}` /
+  `\xXX` escapes are decoded again; `C:\new` in a parsed value stays a
+  backslash and an `n`. A run of backslashes halves each round, but that
+  collapse alone never counts as an unreduced layer for the `FE-ENCODING-001`
+  residual described below, so multiply-stringified JSON, UNC paths, and regex
+  or LaTeX source are not flagged. A `\uXXXX` / `\u{...}` / `\xXX` escape
+  behind a run of backslashes of any length does count when it decodes to ASCII
+  punctuation, a space, or a control character, because later decodes reach
+  it however deep it is stacked.
 - HTML entities — `&lt;`, `&#60;`, `&#x3c;`
-- Percent-encoding and `+`-as-space (form bodies)
-- a fully layered decode for stacked encodings
+- Percent-encoding — `%XX`, the IIS / classic ASP and JavaScript `unescape()`
+  form `%uXXXX` (`%u003cscript%u003e`), and `+`-as-space (form bodies), in one
+  pass: only a literal `+` is a space, so `%2B` and `%u002B` decode to `+`
+- a fully layered decode for stacked encodings, scanned after its last round
+  and after the round before it: the last round turns every `+` into a space,
+  so a double-encoded `%252B` is scanned both as `+` (an application that
+  decodes twice) and as a space
 
-So a `<script>` written as `<script>`, `&lt;script&gt;`, or
-`%3Cscript%3E` in a body is still caught by the script-tag rule. The layered
-escape decoders are content-type-agnostic (an attacker controls the declared
-`Content-Type`) and bounded to a small number of variants.
+So a `<script>` written as `\u003cscript\u003e`, `&lt;script&gt;`,
+`%3Cscript%3E`, or `%u003cscript%u003e` in a body is still caught by the
+script-tag rule. The layered escape decoders are content-type-agnostic (an
+attacker controls the declared `Content-Type`) and bounded to a small number of
+variants.
 
 UTF-16 / UTF-32 transcoding does **not** decide whether a body is
 scanned. The `body_content_types`, `inspect_multipart`, and
@@ -240,14 +262,44 @@ fully reduced and are flagged as `encoding_evasion` on the raw URL/body
 rather than being decoded indefinitely. Decoding is inspection-only: the
 original query bytes are forwarded unchanged.
 
+Cookie values are scanned **both** as sent and as decoded. Frameworks disagree
+about cookies: the Servlet API and Go's `net/http` hand the application the raw
+octets, while PHP (`urldecode`, so `+` is a space), Express `cookie-parser`
+(`decodeURIComponent`), and Rails unescape them first. Each `name=value` crumb
+is therefore matched raw and beside its percent-decoded views — `%XX`,
+`%uXXXX`, `+` as a space, and the bounded layered percent decode — so
+`pref=%3Cscript%3E` and `lang=en%0d%0aSet-Cookie:…` reach the cookie rules. A
+crumb holding both `%` and `+` is also matched percent-decoded with `+` kept,
+as Express reads it, so `x=%27+alert(1)+%27` is seen as `'+alert(1)+'` as
+well as `' alert(1) '`. Express `cookie-parser` runs `JSON.parse` on a value
+starting with `j:`, so such a crumb is also matched with its `\uXXXX` /
+`\u{...}` / `\xXX` escapes and its `\"`, `\'`, `\/`, `\\` escapes resolved.
+Like Express, the WAF finds that value by splitting the raw crumb at its first
+`=`, so an encoded `=` in the name (`a%3Db=j:…`) does not hide it. The JSON
+control escapes (`\n`, `\t`, …) and HTML entities are not cookie encodings,
+so a `j:` JSON cookie whose string holds `\n` is not read as a line feed. The
+header is split on `;` before decoding, so an encoded `%3B` cannot forge an
+extra crumb. As with queries, decoding is inspection-only.
+
 The layered decode runs a bounded number of rounds (a cost guard against
 decompression-style blowups), so double- and triple-stacked encodings are fully
 reduced but a payload stacked deeper than the cap is not. Rather than silently
 forwarding such a body, the WAF raises the `encoding_evasion` signal
 (`FE-ENCODING-001`) for it — the same rule that flags URL double-encoding. The
-overlong-UTF8 (`FE-ENCODING-002`), double-encoding, and null-byte
-(`FE-ENCODING-001`) markers are likewise checked against request and response
-**bodies**, not just the URL/path, so an overlong-encoded body payload that
+signal fires when the value still holds a percent (`%XX`, `%uXXXX`) or HTML
+entity layer after the cap, or, behind a backslash run of any length, a
+`\uXXXX` / `\u{...}` escape of any ASCII character (letters included) or a
+control character, or a `\xXX` escape of ASCII punctuation, a space, or an
+ASCII control character. No JSON or JavaScript serializer writes ASCII as a
+`\u` escape, so a deep `\u0073elect` is evasion in itself, while `\xXX` is
+ordinary literal text in Windows paths, regex source, and hex dumps. Three
+kinds of stack are deliberately not flagged: runs of the single-character
+escapes (`\n`, `\"`, `\\`, …), which are ordinary in multiply-stringified
+JSON; `\u` escapes of non-ASCII characters (`\u00e9` in a name); and `\x`
+escapes of letters, digits, or C1 bytes (`\x64` or `bin\x86\Release` in a
+Windows path). The overlong-UTF8 (`FE-ENCODING-002`), double-encoding, and
+null-byte (`FE-ENCODING-001`) markers are likewise checked against request and
+response **bodies**, not just the URL/path, so an overlong-encoded body payload that
 lossy percent-decoding cannot recover to its literal character is still flagged
 as an evasion attempt.
 
@@ -299,7 +351,7 @@ and `rule_overrides`. Categories:
 
 | Category | Rules | Notes |
 | --- | --- | --- |
-| `sqli` | FE-SQLI-001..009 plus FE-SQLI-001-B..004-B, FE-SQLI-006-B..010-B, and FE-SQLI-001-C..003-C | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Those three accept either whitespace **or a bounded inline `/*…*/` comment** between SQL tokens, so `UNION/**/SELECT` and `;/**/DROP` are caught at level 1; the tautology rule also accepts an unspaced `\|\|` (`1'\|\|1=1`). The comment body is bounded, so a comment longer than the bound falls through to the comment-token catch-alls: 004 (query) and 004-B (body) are both level 2. SQLSTATE (005) is body-only level 2. Level 1 also covers blind time-delay probes (006: `SLEEP(n)`, `pg_sleep`, `BENCHMARK`, `WAITFOR DELAY`, Oracle `dbms_pipe`), catalog enumeration (007: `information_schema.`, `pg_catalog.`, `sqlite_master`, MSSQL `sys*` tables), error-based and out-of-band functions (008: `extractvalue`, `updatexml`, `load_file`, `INTO OUTFILE`, `xp_cmdshell`, `utl_http`), and quoted-string tautologies (009: `' or 'a'='a`, unspaced `'or'1'='1`). In 006, `sleep(n)` counts only after SQL-shaped context (a quote, `(`, `,`, `;`, `=`, `\|`, `&`, an SQL keyword, or the start of the value), so method calls such as `time.sleep(1)` stay clean. That context still matches source code (`foo(); sleep(1);`, `x = sleep(5)`, `benchmark(1000, fn)`), so the exact body mirror 006-B is level 2. Level-1 body coverage is 010-B: `sleep(n)` only after an SQL keyword (`AND`, `OR`, `SELECT`, `WHERE`, `ORDER BY`, …), after a closing quote and an SQL operator (`'+sleep(5)+'`, `'\|\|sleep(5)`), or as a branch of `IF(…, sleep(n), …)`; `BENCHMARK` only around an SQL function (`MD5(`, `SHA1(`, a subquery); and `pg_sleep`, `WAITFOR DELAY`, and the Oracle calls as in 006. 008 counts `load_file` only as a bare call on what MySQL reads — a quoted absolute or UNC path, a hex literal, or a `CHAR(` / `CONCAT(` / `UNHEX(` expression — so `def load_file(path):` and `loader.load_file(…)` stay clean. The `-C` mirrors apply 001–003 to cookie values. The Cookie header is split into crumbs on `;` before matching, so no raw crumb carries the stacked-statement `;` that 003-C needs: it can only fire on a percent-encoded `%3B`, once cookie values are also inspected in decoded form. |
+| `sqli` | FE-SQLI-001..009 plus FE-SQLI-001-B..004-B, FE-SQLI-006-B..010-B, and FE-SQLI-001-C..003-C | UNION/tautology/stacked (001–003) are level 1 across decoded query values and admitted request bodies; body mirrors use the exact query patterns. Those three accept either whitespace **or a bounded inline `/*…*/` comment** between SQL tokens, so `UNION/**/SELECT` and `;/**/DROP` are caught at level 1; the tautology rule also accepts an unspaced `\|\|` (`1'\|\|1=1`). The comment body is bounded, so a comment longer than the bound falls through to the comment-token catch-alls: 004 (query) and 004-B (body) are both level 2. SQLSTATE (005) is body-only level 2. Level 1 also covers blind time-delay probes (006: `SLEEP(n)`, `pg_sleep`, `BENCHMARK`, `WAITFOR DELAY`, Oracle `dbms_pipe`), catalog enumeration (007: `information_schema.`, `pg_catalog.`, `sqlite_master`, MSSQL `sys*` tables), error-based and out-of-band functions (008: `extractvalue`, `updatexml`, `load_file`, `INTO OUTFILE`, `xp_cmdshell`, `utl_http`), and quoted-string tautologies (009: `' or 'a'='a`, unspaced `'or'1'='1`). In 006, `sleep(n)` counts only after SQL-shaped context (a quote, `(`, `,`, `;`, `=`, `\|`, `&`, an SQL keyword, or the start of the value), so method calls such as `time.sleep(1)` stay clean. That context still matches source code (`foo(); sleep(1);`, `x = sleep(5)`, `benchmark(1000, fn)`), so the exact body mirror 006-B is level 2. Level-1 body coverage is 010-B: `sleep(n)` only after an SQL keyword (`AND`, `OR`, `SELECT`, `WHERE`, `ORDER BY`, …), after a closing quote and an SQL operator (`'+sleep(5)+'`, `'\|\|sleep(5)`), or as a branch of `IF(…, sleep(n), …)`; `BENCHMARK` only around an SQL function (`MD5(`, `SHA1(`, a subquery); and `pg_sleep`, `WAITFOR DELAY`, and the Oracle calls as in 006. 008 counts `load_file` only as a bare call on what MySQL reads — a quoted absolute or UNC path, a hex literal, or a `CHAR(` / `CONCAT(` / `UNHEX(` expression — so `def load_file(path):` and `loader.load_file(…)` stay clean. The `-C` mirrors apply 001–003 to cookie values. The Cookie header is split into crumbs on `;` before matching, so no raw crumb carries the stacked-statement `;` that 003-C needs: it fires on a percent-encoded `%3B` (`id=1%3BDROP%20TABLE%20users`) through the decoded cookie views. |
 | `nosqli` | FE-NOSQL-001 (operator key), FE-NOSQL-002 (bracket operator, L2) | |
 | `command_injection` | FE-CMD-001..004, FE-CMD-005-{Q,B} | shell-substitution (003) is level 2. 004 (query, L1) catches command execution without a classic `;cmd` chain: a backtick or `$(` subshell; a CR/LF separator followed by a Windows tool, a lower-case Unix tool, or a short lower-case command (`cat`, `id`, `sh`, `bash`) that ends the value or takes a flag, path, or quoted argument; `;`/`\|`/`&&` before a reconnaissance tool that never names a list item (`whoami`, `ifconfig`, `certutil`, `mkfifo`, …); `&&`/`\|\|` before a tool that can (`uname`, `busybox`, `powershell`, `pwsh`, `id`, `ls`, `sleep`, `ping`), or `;`/`\|` before one only when it takes a flag, path, or quoted argument, redirects, or chains again; `;`/`\|` before an argument shape a list never has (`busybox nc`/`wget`/`sh`/`ash`/`telnet`, `socat tcp:`/`udp:`/`exec:`/`-`, `ncat`/`netcat`/`nc` with a host and port); and `$IFS`. A CR/LF-separated short command also counts when a `#` comments out the rest of the line (`%0Aid%23`). 004 does not fire on delimited lists (`tags=linux;bash`, `tags=windows;powershell`, `skills=bash\|pwsh`, `fields=id\|uname`) or multi-line prose (`Order%0AID: 123`, `%0ACat food`), but the older level-1 001 still matches a list item that is one of its command words (`tags=linux;bash`, `tags=windows;powershell`, `q=dogs\|cat`); disable or scope FE-CMD-001 where such lists are expected. The cost is that a bare `x;uname` at the end of a value is not matched, because it cannot be told apart from a list. 005 flags explicit interpreter invocation (`/bin/sh`, `cmd /c`, `powershell -enc`, `sh -c`, `python -c`) at level 1 in query values and level 2 in bodies, where deployment APIs carry scripts. |
 | `jndi_injection` | FE-JNDI-001-{B,Q,H}, FE-JNDI-002-{B,Q,H} | **Log4Shell**; direct lookup is Critical/level 1 across body, query, and header; nested-obfuscation is level 2 |
@@ -659,10 +711,12 @@ including when no rule in that direction could have refused anything.
 **Size `scan_budget_ms` before reaching for `fail_closed`.** The scan cost is
 `O(active_rules × max_scan_bytes)`, and body normalization multiplies it: a
 `max_scan_bytes`-sized form-encoded or JSON body containing `%`, `+`, `\`, or `&`
-produces up to four decoded variants, each rescanned. With the 1 MiB default cap
-that is several MiB of matching per request, and exceeding a 50 ms budget on such
-traffic is routine rather than exceptional. Measure the deadline rate in
-`waf.scan_timed_out` under `log_and_allow` first, then either raise
+produces up to five decoded variants, each rescanned (the fifth, the layered
+decode's second-to-last round, only when all three rounds changed the body and
+that round still holds a `+`). With the 1 MiB default cap that is several MiB of
+matching per request, and exceeding a 50 ms budget on such traffic is routine
+rather than exceptional. Measure the deadline rate in `waf.scan_timed_out`
+under `log_and_allow` first, then either raise
 `scan_budget_ms`, lower `max_scan_bytes`, or trim the active rule set — the same
 "prefer sizing over rejecting" advice that applies to `max_scan_bytes` above.
 Turning on `fail_closed` (or `block`) while scans routinely exceed the budget
