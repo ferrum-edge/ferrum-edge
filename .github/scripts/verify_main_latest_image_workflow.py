@@ -270,7 +270,7 @@ REGISTRY_RETRY = (
     "            fi\n"
     '            echo "::warning::transient registry error on attempt ${attempt} of 3, '
     'retrying" >&2\n'
-    "            sleep $((10 * 2 ** (attempt - 1)))\n"
+    "            sleep $((attempt * 10))\n"
     "          }\n"
 )
 REUSE_SIGNED_CALLS = (

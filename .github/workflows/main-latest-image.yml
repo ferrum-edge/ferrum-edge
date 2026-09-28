@@ -226,7 +226,7 @@ jobs:
               exit 1
             fi
             echo "::warning::transient registry error on attempt ${attempt} of 3, retrying" >&2
-            sleep $((10 * 2 ** (attempt - 1)))
+            sleep $((attempt * 10))
           }
 
           # Prints the manifest digest of a tag, or nothing when it does not exist.
@@ -434,7 +434,7 @@ jobs:
               exit 1
             fi
             echo "::warning::transient registry error on attempt ${attempt} of 3, retrying" >&2
-            sleep $((10 * 2 ** (attempt - 1)))
+            sleep $((attempt * 10))
           }
 
           digests=(*)
@@ -657,7 +657,7 @@ jobs:
               exit 1
             fi
             echo "::warning::transient registry error on attempt ${attempt} of 3, retrying" >&2
-            sleep $((10 * 2 ** (attempt - 1)))
+            sleep $((attempt * 10))
           }
 
           sbom_dir="$RUNNER_TEMP/syft-output"
