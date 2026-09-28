@@ -290,6 +290,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ~10x faster on plain bodies. Global exemption checks no longer allocate or
   parse the client IP when their lists are empty.
 
+### Removed
+
+Ferrum Edge is pre-launch, so these mesh compatibility paths are removed
+outright with no deprecation period:
+
+- **Mesh tracing `provider` alias.** `MeshTracingConfig` reads only
+  `providers`, as an array; the singular `provider` key and the single-object
+  form are no longer accepted.
+- **Istio Telemetry snake_case tracing keys.** The Kubernetes translator reads
+  only the camelCase `agentUrl`, `collectorUrl`, `accessTokenEnv`, and
+  `serviceName` provider fields; `agent_url`, `collector_url`,
+  `access_token_env`, and `service_name` are no longer aliases.
+- **Unsuffixed `.ready` readiness markers.** The NodeWaypoint in-netns capture
+  manager publishes only `<registry>/.ready4/<pod_uid>` and
+  `<registry>/.ready6/<pod_uid>`; nothing is written to `<registry>/.ready`.
+- **`ferrum_mesh_udp_placement_migration_established_adoptions_total`.** Use
+  `ferrum_mesh_udp_placement_migration_adoptions_total{proof}`; the
+  `established_adoption` flag on authenticated `/health` is unchanged.
+- **The `control_plane="redacted"` label** on
+  `ferrum_mesh_remote_discovery_poll_failures_total`. The series is keyed by
+  `cluster` and `trust_domain` only.
+- **The pre-lock CNI socket owner probe.** The node-agent CNI listener relies
+  on its lifetime `<socket>.lock` lock alone and removes any socket it finds at
+  the path once it holds that lock.
+- **Bare-FQDN east-west SNI for single-port services.** Every cross-cluster
+  service port, including a single-port service's only port, routes on its
+  `p<port>.<service>.<namespace>.svc.<cluster-domain>` alias, and an HTTP port
+  that shares its number with a raw-TCP or UDP port uses `p<port>-http`. This
+  changes the cross-cluster wire format: upgrade client and destination
+  clusters together, and move any `EastWestGateway.sni_hosts` entry that took
+  over a single-port service's base FQDN to its alias.
+- **Non-reserved xDS DestinationRule ECDS carriers.** A resource carrying the
+  DestinationRule carrier type under any name other than
+  `ferrum-destination-rule-carrier/<namespace>/<name>` now NACKs, and the
+  control plane skips operator `mesh.extension_configs` entries that declare
+  that type.
+- **Shared-secret remote discovery.** Cross-cluster endpoint discovery polls a
+  `RemoteCluster` only with its own `discovery_credential_ref` credential from
+  `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS`; a cluster without one is no
+  longer polled with `FERRUM_CP_DP_GRPC_JWT_SECRET`.
+
 ### Fixed
 
 - **WAF rule shapes: missed injection forms and prose false positives**
