@@ -15712,17 +15712,9 @@ async fn arm_mesh_runtime_startup(
     // when discovery was never enabled (F4).
     let remote_discovery_config = if env_config.mesh_remote_discovery_poll_interval_seconds != 0 {
         // Cross-cluster remote discovery mints its own audience-bound token
-        // (issue #2475) and therefore still needs the shared secret; a
-        // token-file-only node simply does not serve remote discovery. The
-        // `kid` rides along so a peer CP running a trust bundle can select the
-        // credential bound to this cluster's namespaces.
-        let remote_grpc_secret = env_config.cp_dp_grpc_jwt_secret.clone().map(|secret| {
-            crate::grpc::dp_client::GrpcJwtSecret::with_issuer(
-                secret,
-                env_config.cp_dp_grpc_jwt_issuer.clone(),
-            )
-            .with_key_id(env_config.cp_dp_grpc_jwt_key_id.clone())
-        });
+        // (issue #2475) with each RemoteCluster's own discovery credential
+        // (`discovery_credential_ref` → FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS),
+        // resolved per cluster by the manager below.
         let remote_grpc_tls = multicluster::RemoteDiscoveryTlsConfig {
             tls_urls: build_dp_grpc_tls_config(
                 env_config,
@@ -15744,7 +15736,6 @@ async fn arm_mesh_runtime_startup(
             env_config.mesh_remote_discovery_poll_timeout_seconds,
             env_config.mesh_remote_discovery_max_stale_seconds,
             env_config.mesh_config_revision_adopt_secs,
-            remote_grpc_secret,
             runtime.node_id.clone(),
             runtime.namespace.clone(),
             remote_grpc_tls,
@@ -15798,10 +15789,8 @@ async fn arm_mesh_runtime_startup(
                 );
             }
         }
-        // The `kid` rides on per-remote credentials exactly as it does on the
-        // shared-secret fallback above, so a peer CP running a namespace-bound
-        // trust bundle can select this cluster's credential either way
-        // (advisory GHSA-3f2j-wwqw-grmg).
+        // The `kid` rides on every per-remote credential, so a peer CP running a
+        // namespace-bound trust bundle can select this cluster's credential.
         let remote_discovery_credentials = match multicluster::parse_remote_discovery_credentials(
             env_config.mesh_remote_discovery_credentials.as_deref(),
             &env_config.cp_dp_grpc_jwt_issuer,
@@ -15810,9 +15799,8 @@ async fn arm_mesh_runtime_startup(
             Ok(map) => std::sync::Arc::new(map),
             Err(err) => {
                 // Fail closed: a malformed per-remote credential map must not
-                // start discovery with an unknown auth posture. An empty map
-                // here still fails closed per-cluster in `start_cluster` for any
-                // RemoteCluster that references a (now-absent) credential.
+                // start discovery with an unknown auth posture. With an empty
+                // map every RemoteCluster fails closed in `start_cluster`.
                 error!("{}", sanitize_startup_cause(&err, &[]));
                 std::sync::Arc::new(std::collections::HashMap::new())
             }

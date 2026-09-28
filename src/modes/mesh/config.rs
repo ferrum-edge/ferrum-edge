@@ -3866,8 +3866,9 @@ pub struct RemoteCluster {
     /// reference is resolved data-plane-side against
     /// `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS` (a JSON map of ref -> secret,
     /// itself resolvable through the external-secret backends). The raw secret
-    /// is NEVER serialized into the slice/config — only this reference. When
-    /// unset, discovery falls back to the shared CP-DP JWT secret.
+    /// is NEVER serialized into the slice/config — only this reference. Remote
+    /// discovery requires it: a cluster without a resolvable reference is not
+    /// polled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_credential_ref: Option<String>,
 }

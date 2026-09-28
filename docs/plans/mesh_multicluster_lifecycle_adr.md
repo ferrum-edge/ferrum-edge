@@ -68,8 +68,8 @@ resolvable through the external-secret backends), so each remote cluster
 authenticates to its own control plane with a distinct JWT secret rather than a
 single shared one — and the raw secret is never embedded in or serialized from a
 mesh slice. A reference that does not resolve fails that cluster's discovery
-closed (it is not polled); an unset reference falls back to the shared CP/DP
-secret, a posture now warned-as-deprecated in production multi-cluster. Because
+closed (it is not polled), and so does an unset reference: the shared CP/DP
+secret fallback has been removed. Because
 the remote CP validates the HS256 signature with its own secret, a token issued
 for one cluster cannot authenticate to another.
 
@@ -82,7 +82,7 @@ per-remote one.
 ## Decision — Remote-Discovery Audience Binding
 
 Signature, issuer, and expiry bind a discovery token to a *credential*, not to
-a *destination*. Under the supported (deprecated) shared-secret fallback, two
+a *destination*. Under the former shared-secret fallback, two
 clusters sharing `FERRUM_CP_DP_GRPC_JWT_SECRET` and the same issuer accepted
 each other's discovery tokens. Ferrum binds each token to its target cluster:
 
