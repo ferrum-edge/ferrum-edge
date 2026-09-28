@@ -27,7 +27,7 @@ commit whose push CI succeeded. This verifier pins the fail-closed shape of
   parses the built image, runs with no credential: it scans the public Docker
   Hub image anonymously, and the GHCR attestations reuse those SBOMs;
 * anonymous Docker Hub reads in `resolve`, the Syft scan, and `smoke` retry
-  throttled, failed, or dropped requests with exponential backoff, at most
+  throttled, failed, or dropped requests with increasing backoff, at most
   three attempts in all;
 * every job holds exactly its least-privilege permissions, the downstream jobs
   require every needed job to have succeeded, and only the release registry
@@ -247,7 +247,7 @@ REUSE_INSPECT = (
     "            done\n"
 )
 # Docker Hub is read anonymously, so `resolve`, the Syft scan, and `smoke` retry
-# a throttled, failed, or dropped registry read with exponential backoff, at
+# a throttled, failed, or dropped registry read with increasing backoff, at
 # most three attempts in all, and stop the run once the retries are exhausted.
 # The helper only decides what follows a failed attempt; it never runs the
 # registry command itself, so every call site keeps a literal executable (the

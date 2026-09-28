@@ -206,7 +206,7 @@ jobs:
 
           # Docker Hub is read anonymously, so its per-IP rate limit applies. A
           # throttled (429), failed (5xx), or dropped request is retried with
-          # exponential backoff, at most three attempts; any other failure returns
+          # increasing backoff, at most three attempts; any other failure returns
           # to the caller at once, and exhausted retries stop the run. Each caller
           # runs its own literal registry command in a three-attempt loop and uses
           # only the attempt that succeeded. After a failed attempt this helper
@@ -414,7 +414,7 @@ jobs:
           set -euo pipefail
           # Docker Hub is read anonymously, so its per-IP rate limit applies. A
           # throttled (429), failed (5xx), or dropped request is retried with
-          # exponential backoff, at most three attempts; any other failure returns
+          # increasing backoff, at most three attempts; any other failure returns
           # to the caller at once, and exhausted retries stop the run. Each caller
           # runs its own literal registry command in a three-attempt loop and uses
           # only the attempt that succeeded. After a failed attempt this helper
@@ -637,7 +637,7 @@ jobs:
 
           # Docker Hub is read anonymously, so its per-IP rate limit applies. A
           # throttled (429), failed (5xx), or dropped request is retried with
-          # exponential backoff, at most three attempts; any other failure returns
+          # increasing backoff, at most three attempts; any other failure returns
           # to the caller at once, and exhausted retries stop the run. Each caller
           # runs its own literal registry command in a three-attempt loop and uses
           # only the attempt that succeeded. After a failed attempt this helper

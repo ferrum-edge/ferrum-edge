@@ -3352,7 +3352,7 @@ platform image, by digest, on its native runner before `manifest` creates
 **Anonymous Docker Hub reads.** `resolve` (the `main-<sha>` inspect and the
 `cosign verify` of an existing image), the Syft scan in `attest`, and `smoke`
 (the pull) read Docker Hub anonymously, so the per-IP rate limit applies. Each
-read is attempted at most three times with exponential backoff, and is retried
+read is attempted at most three times with increasing backoff, and is retried
 only when it was throttled (`429`), failed with a `5xx`, or was dropped on the
 network. Any other failure is handled at once, and exhausted retries fail the
 run, so a throttled read never publishes anything; `latest` waits for the next
