@@ -870,10 +870,13 @@ fn test_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
         source[remaining_hook..].contains("hbone_proxy::strip_egress_baggage_in_proxy_headers("),
         "egress baggage policy must be restored after every deferred hook pass"
     );
+    // The scrub delegates to the single shared predicate, which covers every
+    // case variant of the whole `x-consumer-*` namespace plus `x-geo-country`
+    // (asserted behaviourally in
+    // `gateway_assertion_predicate_covers_whole_consumer_namespace_case_insensitively`).
     assert!(
-        source.contains("name.eq_ignore_ascii_case(\"x-consumer-username\")")
-            && source.contains("name.eq_ignore_ascii_case(\"x-consumer-custom-id\")")
-            && source.contains("name.eq_ignore_ascii_case(\"x-geo-country\")"),
+        source
+            .contains("headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));"),
         "the shared scrub must reject case variants of every reserved assertion header"
     );
     assert!(

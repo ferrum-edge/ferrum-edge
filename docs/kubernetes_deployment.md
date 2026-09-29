@@ -76,8 +76,8 @@ Both `charts/ferrum-gateway` and `charts/ferrum-mesh` default an empty
 `image.tag` to `Chart.appVersion`. That tag must exist in the container
 registry before install. Override with a published tag on the command line or in
 your values file (for example `--set image.tag=<published-tag>`). The registry's
-`latest` tag is retired; existing images are historical artifacts and do not
-receive fixes. Always use a published version or digest.
+`latest` tag is a moving development build of the newest `main` commit that
+passed CI, not a release. Always use a published version or digest.
 
 For mirrored or private registries, both charts expose `image.pullSecrets` as a
 list of Secret **names** in the release namespace; each Secret must already exist (type

@@ -402,6 +402,11 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
             target_port,
         });
     }
+    // Ports that share one number and L4 transport (e.g. `3868/TCP` plus
+    // `3868/SCTP`, which has no mesh transport model) would share one
+    // cross-cluster east-west SNI alias. The Service still translates in full;
+    // the east-west materializers skip only that port for cross-cluster routing
+    // (with a rate-limited warning), exactly as for native/file/xDS sources.
     // `spec.clusterIPs` carries the dual-stack VIP list; older objects may
     // only have the singular `spec.clusterIP`. Headless services declare the
     // literal string "None" — skip it (and empties): an absent VIP list means

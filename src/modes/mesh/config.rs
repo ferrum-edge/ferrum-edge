@@ -2380,7 +2380,11 @@ pub struct MeshTelemetryConfig {
     pub access_logging: Option<MeshAccessLoggingConfig>,
 }
 
+/// Closed schema (`deny_unknown_fields`): a misspelled or removed key — such as
+/// the retired singular `provider` — fails the load instead of silently
+/// disabling tracing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTracingConfig {
     /// Istio tracing mode selector — `Server`, `Client`, or `ClientAndServer`.
     /// `None` defers to the default (Istio treats unset as SERVER for sidecar
@@ -2416,15 +2420,7 @@ pub struct MeshTracingConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_env_tags: HashMap<String, String>,
     /// Provider-specific tracing backends (Zipkin / Datadog / Lightstep / OpenTelemetry).
-    ///
-    /// The legacy singular `provider` spelling deserializes into this vector
-    /// for back-compat, but new slices serialize only `providers`.
-    #[serde(
-        default,
-        alias = "provider",
-        deserialize_with = "deserialize_tracing_providers",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<TracingProvider>,
 }
 
@@ -2542,23 +2538,6 @@ impl fmt::Debug for TracingProvider {
                 .field("endpoint", endpoint)
                 .finish(),
         }
-    }
-}
-
-fn deserialize_tracing_providers<'de, D>(deserializer: D) -> Result<Vec<TracingProvider>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    if value.is_null() {
-        return Ok(Vec::new());
-    }
-    if value.is_array() {
-        crate::util::deserialization::from_json_value(value).map_err(serde::de::Error::custom)
-    } else {
-        crate::util::deserialization::from_json_value(value)
-            .map(|provider| vec![provider])
-            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -3891,8 +3870,9 @@ pub struct RemoteCluster {
     /// reference is resolved data-plane-side against
     /// `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS` (a JSON map of ref -> secret,
     /// itself resolvable through the external-secret backends). The raw secret
-    /// is NEVER serialized into the slice/config — only this reference. When
-    /// unset, discovery falls back to the shared CP-DP JWT secret.
+    /// is NEVER serialized into the slice/config — only this reference. Remote
+    /// discovery requires it: a cluster without a resolvable reference is not
+    /// polled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_credential_ref: Option<String>,
 }
@@ -6243,6 +6223,7 @@ impl MeshConfig {
             &self.ext_authz_providers,
             &mut errors,
         );
+        validate_mesh_extension_configs(&self.extension_configs, &mut errors);
         errors
     }
 
@@ -6641,6 +6622,34 @@ pub fn validate_mesh_config(
         trust_bundles,
         None,
     )
+}
+
+/// Refuse operator ECDS extension configs that declare the DestinationRule
+/// carrier type or a mesh-slice carrier type. Those reach data planes only
+/// through the reserved carriers the xDS translator emits from the slice's own
+/// fields; a data plane NACKs either type under any other name, which would
+/// wedge every later ECDS update on last-known-good.
+fn validate_mesh_extension_configs(
+    extension_configs: &[crate::modes::mesh::slice::MeshExtensionConfig],
+    errors: &mut Vec<String>,
+) {
+    for extension in extension_configs {
+        if extension.type_url == crate::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
+            errors.push(format!(
+                "MeshConfig.extension_configs {:?}: type_url {:?} is reserved for Ferrum \
+                 DestinationRule carriers; declare the rule in destination_rules instead",
+                extension.name, extension.type_url
+            ));
+        } else if crate::xds::carrier::carrier_resource_name_for_type_url(&extension.type_url)
+            .is_some()
+        {
+            errors.push(format!(
+                "MeshConfig.extension_configs {:?}: type_url {:?} is reserved for Ferrum \
+                 mesh-slice carriers; declare that state in its mesh config field instead",
+                extension.name, extension.type_url
+            ));
+        }
+    }
 }
 
 /// Validate VirtualService-derived CORS policies at the config boundary:
@@ -8376,7 +8385,8 @@ fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
 }
 
 /// Return the base service FQDN claimed by a generated exact alias
-/// (`p<port>.<base>`) or by a wildcard alias owner (`*.<base>`).
+/// (`p<port>.<base>`, or `p<port>-udp.<base>` for a UDP port) or by a wildcard
+/// alias owner (`*.<base>`).
 ///
 /// The suffix must have Ferrum's `<service>.<namespace>.svc.<cluster-domain>`
 /// shape. This keeps unrelated explicit hosts such as `p9090.example.com`
@@ -8391,6 +8401,7 @@ fn east_west_alias_claim_base(host: &str) -> Option<String> {
     }
 
     let port = alias_label.strip_prefix('p')?;
+    let port = port.strip_suffix("-udp").unwrap_or(port);
     // `cross_cluster_service_sni` renders a non-zero u16 without leading
     // zeroes. Recognize only that canonical generated namespace so an ordinary
     // hostname such as `p65536.example` is not reinterpreted as an alias.

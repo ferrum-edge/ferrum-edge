@@ -26,9 +26,9 @@ pub const ECDS_TYPE_URL: &str = "type.googleapis.com/envoy.config.core.v3.TypedE
 pub const RTDS_TYPE_URL: &str = "type.googleapis.com/envoy.service.runtime.v3.Runtime";
 
 /// Inner `type_url` Ferrum uses for the DestinationRule-carrier ECDS payload.
-/// CPs that want full DR semantics across xDS wrap the original DR JSON in a
-/// TypedExtensionConfig with this inner type. GAP-2K's recovery path
-/// recognizes the marker and applies the embedded DR locally.
+/// Only the reserved carriers [`translate_destination_rule_carriers`] emits
+/// (named with [`FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX`]) may use it; the DP
+/// recovers the embedded DR from those and NACKs the type under any other name.
 pub const FERRUM_ECDS_DESTINATION_RULE_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier";
 pub const FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX: &str = "ferrum-destination-rule-carrier/";
@@ -205,10 +205,11 @@ pub fn translate_eds(slice: &MeshSlice) -> Vec<XdsResource> {
 /// Any{type_url, value}}`). Clients subscribe under `ECDS_TYPE_URL` and
 /// dispatch on the inner `typed_config.type_url`.
 ///
-/// The GAP-2K DestinationRule-carrier path emits one entry per DR with the
-/// inner `type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` and the original
-/// DR JSON as the inner bytes; the DP xDS consumer recognizes that marker
-/// and applies the embedded DR locally.
+/// DestinationRules ride only the reserved carriers
+/// [`translate_destination_rule_carriers`] emits. Mesh config validation
+/// refuses an operator entry that declares `FERRUM_ECDS_DESTINATION_RULE_TYPE_URL`,
+/// and this translator skips one defensively: the DP rejects that type_url
+/// under any non-reserved name.
 pub fn translate_ecds(slice: &MeshSlice) -> Vec<XdsResource> {
     let mut resources = Vec::new();
     let mut seen_names = HashSet::new();
@@ -246,6 +247,12 @@ pub fn translate_ecds(slice: &MeshSlice) -> Vec<XdsResource> {
             );
             continue;
         }
+        // Mesh config validation already refuses this type_url at admission
+        // (`MeshConfig::validate`); skip defensively without re-warning on
+        // every snapshot build.
+        if extension.type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
+            continue;
+        }
         let typed_config = proto::Any {
             type_url: extension.type_url.clone(),
             value: extension.value.clone(),
@@ -269,8 +276,7 @@ pub fn translate_ecds(slice: &MeshSlice) -> Vec<XdsResource> {
 /// CDS/EDS can only expose the effective Envoy cluster shape; they cannot
 /// reconstruct the original Ferrum/Istio DR object. These reserved ECDS
 /// resources carry the full JSON object so the DP recovers native-equivalent
-/// DR semantics through the same `FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` path
-/// that operator-defined extension configs used historically.
+/// DR semantics through the `FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` path.
 pub fn translate_destination_rule_carriers(slice: &MeshSlice) -> Vec<XdsResource> {
     let mut resources = Vec::new();
     for dr in &slice.destination_rules {

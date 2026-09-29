@@ -1853,6 +1853,7 @@ jobs:
               functional_request_mirror_admission_test
               functional_request_mirror_query_parity_test
               functional_request_transformer_query_test
+              functional_consumer_assertion_namespace_test
               functional_ai_stream_router_boundary_test
               functional_openapi_client_contract_test
               functional_load_testing_replay_test

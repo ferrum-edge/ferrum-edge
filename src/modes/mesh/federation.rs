@@ -995,7 +995,6 @@ async fn poll_federation_loop(
                 );
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_federation_poll_failure(
                     trust_domain.as_str(),
-                    &endpoint_for_logs,
                 );
                 expire_stale_bundle_after_failure(
                     &store,

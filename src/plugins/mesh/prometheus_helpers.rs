@@ -625,14 +625,12 @@ struct MeshMtlsHandshakeFailureKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MeshFederationPollFailureKey {
     trust_domain: Arc<str>,
-    endpoint: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MeshRemoteDiscoveryPollFailureKey {
     cluster: Arc<str>,
     trust_domain: Arc<str>,
-    control_plane: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -837,16 +835,14 @@ pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
         .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
 }
 
-pub fn increment_mesh_federation_poll_failure(
-    trust_domain: impl AsRef<str>,
-    _endpoint: impl AsRef<str>,
-) {
+/// Count one failed SPIFFE federation trust-bundle poll.
+///
+/// The series carries no endpoint label: federation URLs may carry credentials
+/// in userinfo, path, query, or fragment components, so no URL component is
+/// ever rendered.
+pub fn increment_mesh_federation_poll_failure(trust_domain: impl AsRef<str>) {
     let key = MeshFederationPollFailureKey {
         trust_domain: Arc::from(trust_domain.as_ref()),
-        // Federation URLs may carry credentials in userinfo, path, query, or
-        // fragment components. Keep even authenticated observability output
-        // free of those values by retaining only a fixed compatibility label.
-        endpoint: Arc::from("redacted"),
     };
     MESH_FEDERATION_POLL_FAILURES
         .entry(key)
@@ -871,32 +867,24 @@ pub fn clear_mesh_federation_poll_success(trust_domain: impl AsRef<str>) {
     MESH_FEDERATION_LAST_SUCCESS.remove(trust_domain.as_ref());
 }
 
+/// Count one failed remote-cluster discovery poll.
+///
+/// `/metrics` is unauthenticated, so the series carries no control-plane URL
+/// label at all: even a URL with userinfo/query/fragment stripped can reveal
+/// remote control-plane topology through its host/port, and deployments
+/// sometimes place bearer material in path segments.
 pub fn increment_mesh_remote_discovery_poll_failure(
     cluster: impl AsRef<str>,
     trust_domain: impl AsRef<str>,
-    control_plane: impl AsRef<str>,
 ) {
     let key = MeshRemoteDiscoveryPollFailureKey {
         cluster: Arc::from(cluster.as_ref()),
         trust_domain: Arc::from(trust_domain.as_ref()),
-        control_plane: Arc::from(redact_control_plane_label(control_plane.as_ref())),
     };
     MESH_REMOTE_DISCOVERY_POLL_FAILURES
         .entry(key)
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(1, Ordering::Relaxed);
-}
-
-/// Redact a control-plane URL before it becomes the `control_plane` metric
-/// label.
-///
-/// `/metrics` is unauthenticated. Even a URL with userinfo/query/fragment
-/// stripped can reveal remote control-plane topology through its host/port, and
-/// deployments sometimes place bearer material in path segments. Keep the
-/// legacy label key for metric compatibility, but store a fixed, non-sensitive
-/// value so no URL component is rendered.
-fn redact_control_plane_label(_control_plane: &str) -> &'static str {
-    "redacted"
 }
 
 pub fn record_mesh_remote_discovery_poll_success(
@@ -1526,9 +1514,8 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         output.push_str("# TYPE ferrum_mesh_federation_poll_failures_total counter\n");
         for entry in MESH_FEDERATION_POLL_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\",endpoint=\"{}\"{}}} {}\n",
+                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().trust_domain),
-                escape_label_value(&entry.key().endpoint),
                 gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
@@ -1569,10 +1556,9 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         output.push_str("# TYPE ferrum_mesh_remote_discovery_poll_failures_total counter\n");
         for entry in MESH_REMOTE_DISCOVERY_POLL_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{}\",trust_domain=\"{}\",control_plane=\"{}\"{}}} {}\n",
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().cluster),
                 escape_label_value(&entry.key().trust_domain),
-                escape_label_value(&entry.key().control_plane),
                 gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
@@ -3136,12 +3122,9 @@ mod tests {
     }
 
     #[test]
-    fn federation_failure_metric_never_renders_endpoint_secrets() {
+    fn federation_failure_series_has_no_endpoint_label() {
         let trust_domain = format!("security-{}-{}.example", std::process::id(), line!());
-        increment_mesh_federation_poll_failure(
-            &trust_domain,
-            "https://user:password@federation.example/secret/path?token=query-secret#fragment",
-        );
+        increment_mesh_federation_poll_failure(&trust_domain);
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
         let line = output
@@ -3152,10 +3135,7 @@ mod tests {
             })
             .expect("federation failure metric");
 
-        assert!(line.contains("endpoint=\"redacted\""), "{line}");
-        for secret in ["user", "password", "secret", "token", "fragment"] {
-            assert!(!line.contains(secret), "{secret} leaked in {line}");
-        }
+        assert!(!line.contains("endpoint="), "{line}");
     }
 
     #[test]
@@ -3254,11 +3234,10 @@ mod tests {
         let suffix = format!("{}-{}", std::process::id(), line!());
         let cluster = format!("remote-{suffix}");
         let trust_domain = format!("td-{suffix}.example");
-        let control_plane = format!("https://remote-{suffix}.example:9443");
         let fetched_at = unix_now_seconds().saturating_sub(5);
 
-        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
-        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
         record_mesh_remote_discovery_poll_success(&cluster, &trust_domain, fetched_at);
 
         let mut output = String::new();
@@ -3270,7 +3249,7 @@ mod tests {
         );
         assert!(
             output.contains(&format!(
-                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\",control_plane=\"redacted\"}} 2"
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} 2"
             )),
             "remote discovery failure counter series missing: {output}"
         );
@@ -3304,20 +3283,17 @@ mod tests {
         );
     }
 
-    /// SECURITY: a `control_plane_url` must not surface on the unauthenticated
-    /// `/metrics` failure-counter label. URLs can expose topology through the
-    /// host/port and credential-like material through path/query/fragment data.
+    /// SECURITY: the remote control plane must not surface on the
+    /// unauthenticated `/metrics` failure counter. URLs can expose topology
+    /// through the host/port and credential-like material through
+    /// path/query/fragment data, so the series carries no control-plane label.
     #[test]
-    fn remote_discovery_failure_label_redacts_control_plane_url() {
+    fn remote_discovery_failure_series_has_no_control_plane_label() {
         let suffix = format!("{}-{}", std::process::id(), line!());
         let cluster = format!("remote-{suffix}");
         let trust_domain = format!("td-{suffix}.example");
-        let host = format!("cp-{suffix}.example");
-        let leaky_url = format!(
-            "https://user:pw@{host}:9443/tenant/path-token-secret/subscribe?token=secret&api_key=abc#frag"
-        );
 
-        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &leaky_url);
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain);
 
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
@@ -3330,39 +3306,9 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("failure series for {cluster} missing: {output}"));
 
-        for sensitive in [
-            host.as_str(),
-            "user",
-            "pw",
-            "9443",
-            "tenant",
-            "path-token-secret",
-            "token",
-            "secret",
-            "api_key",
-            "abc",
-            "frag",
-        ] {
-            assert!(
-                !line.contains(sensitive),
-                "sensitive control-plane URL component leaked into metric label: {line}"
-            );
-        }
         assert!(
-            line.contains("control_plane=\"redacted\""),
-            "control-plane label should retain only a fixed redacted value: {line}"
-        );
-    }
-
-    #[test]
-    fn redact_control_plane_label_uses_fixed_non_sensitive_value() {
-        assert_eq!(
-            redact_control_plane_label("https://user:pw@cp.example:9443/p?token=x"),
-            "redacted"
-        );
-        assert_eq!(
-            redact_control_plane_label("not a url?token=secret"),
-            "redacted"
+            !line.contains("control_plane="),
+            "failure series must not carry a control-plane label: {line}"
         );
     }
 

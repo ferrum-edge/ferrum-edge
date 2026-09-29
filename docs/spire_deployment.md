@@ -573,6 +573,9 @@ multi_cluster:
       trust_domain: eu-west-1.prod.example.com
       network: network-eu
       control_plane_url: https://cp.eu-west-1.internal:50051
+      # Required for endpoint discovery: names this cluster's secret in
+      # FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS. Without it the cluster is not polled.
+      discovery_credential_ref: eu-west-1
       federation_endpoint: https://spire-server.eu-west-1.example.com/.well-known/spiffe
 ```
 
@@ -611,7 +614,7 @@ Watch the Prometheus series:
 
 - `ferrum_mesh_federation_last_success_timestamp_seconds{trust_domain="eu-west-1.prod.example.com"}` should advance every `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS`.
 - `ferrum_mesh_federation_bundle_age_seconds{trust_domain="..."}` should stay below `2 * FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` under healthy operation.
-- `ferrum_mesh_federation_poll_failures_total{trust_domain,endpoint}` should stay flat.
+- `ferrum_mesh_federation_poll_failures_total{trust_domain}` should stay flat.
 
 End-to-end test: drive a request from a workload in cluster `us-east-1` to a
 service in `eu-west-1` through HBONE; if the cross-cluster mTLS handshake
@@ -652,7 +655,7 @@ increasing.
 
 **Symptoms (federated bundles)**: `ferrum_mesh_federation_bundle_age_seconds`
 climbs past `2 * FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS`,
-`ferrum_mesh_federation_poll_failures_total{trust_domain,endpoint}` is
+`ferrum_mesh_federation_poll_failures_total{trust_domain}` is
 increasing.
 
 **Impact**: cross-cluster mTLS continues to verify against the last-good
@@ -712,7 +715,7 @@ that includes the identity / federation alerts when `observability.enabled=true`
 | `FerrumMeshCertificateRotationFailures` | critical | `sum by (spiffe_id, source) (increase(ferrum_mesh_cert_rotation_failures_total[10m])) > 0` |
 | `FerrumMeshCaUnhealthy` | critical | `min by (ca_type) (ferrum_mesh_ca_health) == 0` |
 | `FerrumMeshFederationBundleStale` | warning | `max by (trust_domain) (ferrum_mesh_federation_bundle_age_seconds) > observability.alerts.federationBundleStaleSeconds` (default 600s, i.e. `2 * poll_interval`) |
-| `FerrumMeshFederationPollFailures` | warning | `sum by (trust_domain, endpoint) (increase(ferrum_mesh_federation_poll_failures_total[10m])) > 0` |
+| `FerrumMeshFederationPollFailures` | warning | `sum by (trust_domain) (increase(ferrum_mesh_federation_poll_failures_total[10m])) > 0` |
 
 `FerrumMeshCaUnhealthy` is your single-best signal that the SPIRE Agent UDS
 is unreachable — it derives from the same `ferrum_mesh_ca_health{ca_type="spire_agent"}`

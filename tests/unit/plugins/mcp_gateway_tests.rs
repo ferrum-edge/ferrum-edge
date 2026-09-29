@@ -8055,6 +8055,38 @@ fn downstream_session_header_refuses_protocol_managed_destinations() {
     }
 }
 
+/// Both session headers cross the gateway-owned `x-consumer-*` request
+/// namespace: the downstream one is read from client requests (stripped at
+/// ingress) and the upstream one is written onto backend requests (scrubbed
+/// before dispatch), so either would silently break session correlation. Both
+/// spellings (`-` and `_`) are refused at construction.
+#[test]
+fn session_headers_refuse_the_consumer_assertion_namespace() {
+    for field in ["downstream_session_header", "upstream_session_header"] {
+        for spelling in [
+            "x-consumer-session",
+            "X-Consumer-Session-Id",
+            "X_Consumer_Session",
+            "x_consumer-session",
+        ] {
+            let mut config = transparent_config("http://127.0.0.1:9/mcp");
+            config["sessions"] = json!({ field: spelling });
+            let rendered = render_mcp_config_diagnostic(&config);
+            assert!(
+                rendered.contains(&format!("`sessions.{field}`"))
+                    && rendered.contains("`x-consumer-*`"),
+                "sessions.{field} = {spelling:?}: {rendered}"
+            );
+        }
+        let mut config = transparent_config("http://127.0.0.1:9/mcp");
+        config["sessions"] = json!({ field: "x-consumers-session" });
+        assert!(
+            create_plugin("mcp_gateway", &config).is_ok(),
+            "sessions.{field} = \"x-consumers-session\" must stay allowed"
+        );
+    }
+}
+
 async fn start_mcp_output_schema_tool_server(output_schema: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

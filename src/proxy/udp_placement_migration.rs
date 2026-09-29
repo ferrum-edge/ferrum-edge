@@ -2226,7 +2226,6 @@ static STATUS_PHASE: AtomicU8 = AtomicU8::new(0);
 static OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
 static FAILURES_TOTAL: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
-static ESTABLISHED_ADOPTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ADOPTION_PROOF: AtomicU8 = AtomicU8::new(0);
 static ADOPTIONS_TOTAL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -2246,21 +2245,23 @@ pub struct UdpMigrationStatusSnapshot {
 }
 
 /// Record one adoption that started WITHOUT a same-incarnation durable record.
-///
-/// `ESTABLISHED_ADOPTIONS_TOTAL` is the compatibility roll-up of the per-proof
-/// breakdown, not a release-attestation counter: `new_boot` (including a durable
-/// record that survived from an earlier boot of this same node UID) counts here
-/// exactly like `node_cleanup` and `operator_exempt`. The name predates the
-/// node-specific proof boundary (#3809) and is kept so existing dashboards and
-/// alerts keep working; `..._adoptions_total{proof}` is the surface to key new
-/// alerting on.
+/// `..._adoptions_total{proof}` carries the per-proof breakdown.
 fn record_adoption(proof: UdpAdoptionProof) {
     ENABLED.store(true, Ordering::Relaxed);
     ADOPTION_PROOF.store(proof.code(), Ordering::Relaxed);
     ADOPTIONS_TOTAL[proof.code() as usize].fetch_add(1, Ordering::Relaxed);
-    if proof != UdpAdoptionProof::None {
-        ESTABLISHED_ADOPTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    }
+}
+
+/// Whether any recordless adoption on a node-specific proof has been recorded
+/// by this process.
+fn any_established_adoption() -> bool {
+    [
+        UdpAdoptionProof::NewBoot,
+        UdpAdoptionProof::NodeCleanup,
+        UdpAdoptionProof::OperatorExempt,
+    ]
+    .into_iter()
+    .any(|proof| ADOPTIONS_TOTAL[proof.code() as usize].load(Ordering::Relaxed) > 0)
 }
 
 pub fn set_phase(phase: UdpMigrationStatusPhase, outstanding: usize) {
@@ -2287,7 +2288,7 @@ pub fn snapshot() -> UdpMigrationStatusSnapshot {
         failure_reason: UdpMigrationFailureReason::from_code(
             FAILURE_REASON.load(Ordering::Relaxed),
         ),
-        established_adoption: ESTABLISHED_ADOPTIONS_TOTAL.load(Ordering::Relaxed) > 0,
+        established_adoption: any_established_adoption(),
         adoption_proof: UdpAdoptionProof::from_code(ADOPTION_PROOF.load(Ordering::Relaxed)),
     }
 }
@@ -2327,18 +2328,6 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         output,
         "ferrum_mesh_udp_placement_migration_outstanding",
         snapshot.outstanding,
-        gateway_ns_label,
-    );
-    output.push_str(
-        "# HELP ferrum_mesh_udp_placement_migration_established_adoptions_total Ambient UDP placements adopted without a same-incarnation node-local durable record, summed over every node-specific proof; equals the sum of ferrum_mesh_udp_placement_migration_adoptions_total.\n",
-    );
-    output.push_str(
-        "# TYPE ferrum_mesh_udp_placement_migration_established_adoptions_total counter\n",
-    );
-    render_value(
-        output,
-        "ferrum_mesh_udp_placement_migration_established_adoptions_total",
-        ESTABLISHED_ADOPTIONS_TOTAL.load(Ordering::Relaxed),
         gateway_ns_label,
     );
     output.push_str(

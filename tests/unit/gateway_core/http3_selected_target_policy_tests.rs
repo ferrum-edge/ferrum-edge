@@ -1217,7 +1217,7 @@ fn h3_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
         "H3 client trailers must not reintroduce a reserved geo assertion"
     );
     assert!(
-        forbidden.contains("name.starts_with(\"x-consumer-\")"),
+        forbidden.contains("|| is_consumer_assertion_header(name)"),
         "shared request-trailer forbid helper must reject consumer identity assertions"
     );
 }

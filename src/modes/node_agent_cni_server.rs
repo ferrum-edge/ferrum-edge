@@ -107,11 +107,6 @@ const MAIN_LOOP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_CNI_CONNECTIONS: usize = 64;
 #[cfg(unix)]
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
-/// A legacy generation may predate the lifetime lock. Refuse to unlink its
-/// socket when a short local connect probe succeeds or cannot be resolved
-/// promptly; only a definitive refused/missing endpoint is stale.
-#[cfg(unix)]
-const CNI_SOCKET_OWNER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Spawn the CNI Unix-socket listener.
 ///
@@ -185,31 +180,17 @@ pub fn spawn_cni_listener(
             }
         };
 
-        match prepare_socket_after_lock(&socket_path).await {
-            Ok(SocketPreparation::Ready) => {}
-            Ok(SocketPreparation::LiveLegacyOwner) => {
-                metrics.record_cni_socket_lifecycle(
-                    crate::ebpf::CniSocketLifecycleReason::OwnershipConflict,
-                );
-                error!(
-                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
-                    reason = "ownership_conflict",
-                    "A live pre-lock node-agent still owns the CNI socket; refusing to evict it and falling back to the kube-rs watcher"
-                );
-                return;
-            }
-            Err(err) => {
-                error!(
-                    socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
-                    error = %sanitize_startup_cause(err, &[]),
-                    reason = "stale_socket_cleanup_error",
-                    "Failed to classify or remove stale node-agent CNI socket after acquiring ownership; CNI plugin path will fall back to kube-rs watcher"
-                );
-                metrics.record_cni_socket_lifecycle(
-                    crate::ebpf::CniSocketLifecycleReason::StaleSocketCleanupError,
-                );
-                return;
-            }
+        if let Err(err) = remove_stale_socket_after_lock(&socket_path).await {
+            error!(
+                socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
+                error = %sanitize_startup_cause(err, &[]),
+                reason = "stale_socket_cleanup_error",
+                "Failed to remove stale node-agent CNI socket after acquiring ownership; CNI plugin path will fall back to kube-rs watcher"
+            );
+            metrics.record_cni_socket_lifecycle(
+                crate::ebpf::CniSocketLifecycleReason::StaleSocketCleanupError,
+            );
+            return;
         }
 
         // bind() creates the socket inode world-reachable (mode 0777 & ~umask)
@@ -494,51 +475,14 @@ fn acquire_socket_ownership(socket_path: &str) -> std::io::Result<Option<File>> 
     }
 }
 
+/// Remove a pre-existing pathname left by a crashed generation. Called only
+/// while the lifetime lock is held: every live node-agent keeps that lock until
+/// its listener task exits, so anything still at the pathname is stale.
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SocketPreparation {
-    Ready,
-    LiveLegacyOwner,
-}
-
-/// Classify a pre-existing pathname only while the lifetime lock proves no
-/// cooperating generation owns it. A successful or inconclusive connect probe
-/// protects a live legacy (pre-lock) generation; only a definitive refused or
-/// missing endpoint is removed as stale.
-#[cfg(unix)]
-async fn prepare_socket_after_lock(socket_path: &str) -> std::io::Result<SocketPreparation> {
-    let metadata = match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SocketPreparation::Ready);
-        }
-        Err(err) => return Err(err),
-    };
-
-    if metadata.file_type().is_socket() {
-        match timeout(
-            CNI_SOCKET_OWNER_PROBE_TIMEOUT,
-            UnixStream::connect(socket_path),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                drop(stream);
-                return Ok(SocketPreparation::LiveLegacyOwner);
-            }
-            Err(_elapsed) => return Ok(SocketPreparation::LiveLegacyOwner),
-            Ok(Err(err))
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) => {}
-            Ok(Err(err)) => return Err(err),
-        }
-    }
-
+async fn remove_stale_socket_after_lock(socket_path: &str) -> std::io::Result<()> {
     match tokio::fs::remove_file(socket_path).await {
-        Ok(()) => Ok(SocketPreparation::Ready),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(SocketPreparation::Ready),
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -1086,43 +1030,6 @@ mod tests {
         );
 
         stop_listener(owner_shutdown, owner).await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn live_legacy_owner_without_lock_is_probed_and_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("node-agent-cni.sock");
-        let legacy = UnixListener::bind(&socket_path).expect("legacy listener bind");
-        let legacy_identity = SocketIdentity::from_path(&socket_path).unwrap();
-
-        let (work, _rx) = cni_work_channel();
-        let metrics = Arc::new(NodeAgentMetrics::default());
-        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
-        let contender = spawn_cni_listener(
-            socket_path.to_string_lossy().to_string(),
-            work,
-            metrics.clone(),
-            shutdown_rx,
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(2), contender)
-            .await
-            .expect("legacy-owner probe must finish promptly")
-            .expect("contender task should not panic");
-
-        assert_eq!(
-            SocketIdentity::from_path(&socket_path).unwrap(),
-            legacy_identity,
-            "legacy live owner must not be unlinked"
-        );
-        assert_eq!(
-            metrics.snapshot().cni_socket_lifecycle
-                [crate::ebpf::CniSocketLifecycleReason::OwnershipConflict as usize],
-            1
-        );
-
-        drop(legacy);
-        std::fs::remove_file(&socket_path).expect("remove legacy test socket");
     }
 
     #[cfg(unix)]

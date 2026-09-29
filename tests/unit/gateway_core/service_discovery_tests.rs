@@ -3065,7 +3065,7 @@ async fn mesh_sd_sidecar_topology_bridges_remote_workloads_via_east_west_gateway
     );
     assert_eq!(
         tags.get("mesh.eastwest_sni").map(String::as_str),
-        Some("api.ferrum.svc.cluster.local"),
+        Some("p8080.api.ferrum.svc.cluster.local"),
         "SNI the remote east-west gateway passthrough routes on"
     );
     assert_eq!(
@@ -3209,7 +3209,7 @@ async fn mesh_sd_sidecar_bridges_service_name_matched_remote_workloads_without_r
     );
     assert_eq!(
         tags.get("mesh.eastwest_sni").map(String::as_str),
-        Some("api.ferrum.svc.cluster.local")
+        Some("p8080.api.ferrum.svc.cluster.local")
     );
     assert_eq!(
         tags.get("mesh.mtls_port").map(String::as_str),
@@ -3600,7 +3600,7 @@ async fn mesh_sd_ambient_topology_bridges_remote_workloads_via_east_west_gateway
     );
     assert_eq!(
         tags.get("mesh.eastwest_sni").map(String::as_str),
-        Some("api.ferrum.svc.cluster.local")
+        Some("p8080.api.ferrum.svc.cluster.local")
     );
     assert_eq!(
         tags.get("mesh.cross_cluster").map(String::as_str),

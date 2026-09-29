@@ -14,6 +14,9 @@ use ferrum_edge::modes::mesh::config::{
     ServicePort, TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef,
     WorkloadSelector, validate_mesh_config,
 };
+use ferrum_edge::modes::mesh::slice::MeshExtensionConfig;
+use ferrum_edge::xds::carrier::FERRUM_ECDS_SERVICES_TYPE_URL;
+use ferrum_edge::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -1673,6 +1676,38 @@ fn multi_cluster_rejects_base_fqdn_and_wildcard_alias_owner() {
         "a wildcard that owns every per-port alias overlaps the base-FQDN gateway, got: \
          {errors:?}"
     );
+}
+
+#[test]
+fn multi_cluster_rejects_base_fqdn_and_udp_alias() {
+    let mesh = mesh_with_same_scope_east_west_snis(
+        "reviews.default.svc.cluster.local",
+        "p8080-udp.reviews.default.svc.cluster.local",
+    );
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "base FQDN and its derived UDP alias must be rejected, got: {errors:?}"
+    );
+}
+
+#[test]
+fn multi_cluster_does_not_treat_retired_transport_suffixes_as_generated_aliases() {
+    // Only `-udp` is a generated discriminator; `p<port>-http` / `p<port>-tcp`
+    // are never derived, so they stay literal hosts that do not claim the base.
+    for alias in [
+        "p8080-http.reviews.default.svc.cluster.local",
+        "p8080-tcp.reviews.default.svc.cluster.local",
+    ] {
+        let mesh = mesh_with_same_scope_east_west_snis("reviews.default.svc.cluster.local", alias);
+
+        let errors = mesh.validate();
+        assert!(
+            !errors.iter().any(|err| err.contains("sni_hosts overlap")),
+            "{alias} is not a generated alias of the base FQDN, got: {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -3917,4 +3952,65 @@ fn mesh_policy_admits_istio_dynamic_map_key_shapes() {
             "Istio-admitted dynamic map key '{key}' must validate: {errors:?}"
         );
     }
+}
+
+#[test]
+fn extension_config_declaring_destination_rule_carrier_type_is_rejected() {
+    // DestinationRules reach data planes only through the translator's reserved
+    // carriers; an operator entry with that type would be NACKed by every DP.
+    let mesh = MeshConfig {
+        extension_configs: vec![
+            MeshExtensionConfig {
+                name: "operator-dr".to_string(),
+                namespace: "default".to_string(),
+                type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+                value: Vec::new(),
+            },
+            MeshExtensionConfig {
+                name: "operator-ext".to_string(),
+                namespace: "default".to_string(),
+                type_url: "type.googleapis.com/example.OperatorExtension".to_string(),
+                value: Vec::new(),
+            },
+        ],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    let names_the_entry = |error: &String| {
+        error.contains("\"operator-dr\"")
+            && error.contains("reserved for Ferrum DestinationRule carriers")
+    };
+    assert!(
+        errors.iter().any(names_the_entry),
+        "the error must name the offending entry, got {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("operator-ext")),
+        "an ordinary operator extension stays admissible, got {errors:?}"
+    );
+}
+
+#[test]
+fn extension_config_declaring_mesh_slice_carrier_type_is_rejected() {
+    // Mesh-slice carriers ride only the translator's reserved ECDS names; an
+    // operator entry declaring one of their types would be NACKed by every DP.
+    let mesh = MeshConfig {
+        extension_configs: vec![MeshExtensionConfig {
+            name: "operator-services".to_string(),
+            namespace: "default".to_string(),
+            type_url: FERRUM_ECDS_SERVICES_TYPE_URL.to_string(),
+            value: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("\"operator-services\"")
+                && error.contains("reserved for Ferrum mesh-slice carriers")
+        }),
+        "the error must name the offending entry, got {errors:?}"
+    );
 }

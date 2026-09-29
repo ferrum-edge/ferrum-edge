@@ -408,3 +408,37 @@ async fn jwks_auth_strips_client_claim_header_when_the_token_omits_the_claim() {
          got {headers:?}"
     );
 }
+
+/// The whole `x-consumer-*` namespace is gateway-owned consumer assertion
+/// metadata: a claim may not be fanned out to any name beneath it, not only to
+/// the two identity fields the gateway itself asserts.
+#[test]
+fn claim_headers_refuse_the_whole_consumer_assertion_namespace() {
+    for header in [
+        "X-Consumer-Role",
+        "x-consumer-groups",
+        "x-consumer-username",
+        "X_Consumer_Role",
+        "x_consumer-groups",
+    ] {
+        let config = json!({"claim_headers": {"role": header}});
+        let error = parse_claim_headers(
+            config.as_object().expect("object"),
+            "claim_headers",
+            "test_auth",
+            PREFIX,
+        )
+        .expect_err("an x-consumer-* claim destination must fail admission");
+        assert!(
+            error.contains("claim_headers[0].header"),
+            "{header}: {error}"
+        );
+        assert!(error.contains("`x-consumer-*`"), "{header}: {error}");
+    }
+    assert!(
+        ferrum_edge::plugins::utils::claim_header_fanout::is_output_claim_reserved_header(
+            "X-Consumer-Tenant"
+        ),
+        "Istio outputClaimToHeaders shares the reserved namespace"
+    );
+}

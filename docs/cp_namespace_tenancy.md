@@ -494,13 +494,13 @@ Two client-side options, both applying equally to DP ConfigSync, native
   CP has bound to that tenant.
 
 Cross-cluster mesh remote discovery still self-mints, because it needs a
-per-target audience no external issuer can be asked for. It signs with either a
+per-target audience no external issuer can be asked for. It signs only with the
 per-`RemoteCluster` credential (`discovery_credential_ref` resolved against
-`FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS` — the recommended posture, since a
-credential for one cluster then cannot authenticate to another) or, failing
-that, the shared `FERRUM_CP_DP_GRPC_JWT_SECRET`. `FERRUM_CP_DP_GRPC_JWT_KEY_ID`
-rides on **both** paths, so a peer control plane running a trust bundle can
-select the credential it bound to this cluster either way.
+`FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS`), so a credential for one cluster
+cannot authenticate to another; a cluster without a resolvable credential is not
+polled. `FERRUM_CP_DP_GRPC_JWT_KEY_ID` rides on every per-remote credential, so
+a peer control plane running a trust bundle can select the credential it bound
+to this cluster.
 
 ### Rotate after upgrading
 

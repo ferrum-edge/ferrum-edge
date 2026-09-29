@@ -2656,9 +2656,9 @@ wait_for_node_waypoint_ready_markers() {
         all_ready=false
         echo "$pod_name on $node missing registry entry $NODE_WAYPOINT_REGISTRY_DIR/$uid" >>"$missing_file"
       fi
-      if ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready/$uid"; then
+      if ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready4/$uid"; then
         all_ready=false
-        echo "$pod_name on $node missing ready marker $NODE_WAYPOINT_REGISTRY_DIR/.ready/$uid" >>"$missing_file"
+        echo "$pod_name on $node missing ready marker $NODE_WAYPOINT_REGISTRY_DIR/.ready4/$uid" >>"$missing_file"
       fi
     done < <(workload_pod_records)
     if [[ "$count" -ge 4 && "$all_ready" == "true" ]]; then
@@ -2741,7 +2741,6 @@ try_wait_for_node_waypoint_marker_removed() {
   local uid="$2"
   for _ in $(seq 1 60); do
     if ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/$uid" &&
-      ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready/$uid" &&
       ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready4/$uid" &&
       ! node_host_file_exists "$node" "$NODE_WAYPOINT_REGISTRY_DIR/.ready6/$uid"; then
       return

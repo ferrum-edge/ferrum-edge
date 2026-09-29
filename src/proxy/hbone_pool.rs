@@ -363,7 +363,7 @@ pub enum HbonePoolError {
     )]
     ExtendedConnectUnsupported { authority: String },
     /// Cross-cluster east-west Ambient target with a missing / empty
-    /// `mesh.eastwest_sni` tag — the destination-FQDN SNI the remote gateway's
+    /// `mesh.eastwest_sni` tag — the per-port alias SNI the remote gateway's
     /// passthrough routes on is mandatory (never dial the gateway IP as SNI).
     /// A PRE-WIRE fail-closed reject: no gateway is dialed. Mirrors the Sidecar
     /// `MeshMtlsDialError::MissingCrossClusterSni` so the WebSocket egress path
@@ -1468,7 +1468,7 @@ impl HboneConnectionPool {
         expected_peer: Option<&crate::identity::SpiffeId>,
         // CROSS-CLUSTER east-west scope: `expected_trust_domain` scopes the
         // server-cert verifier to a single remote trust domain and `sni_override`
-        // sets the outer-TLS SNI to the destination service FQDN so the remote
+        // sets the outer-TLS SNI to the destination service port's alias so the remote
         // east-west gateway's SNI passthrough routes the dial. Both `None` for
         // the in-cluster Ambient/Waypoint/NodeWaypoint egress callers (the pinned
         // peer constrains the domain; SNI = dial host). They are part of the pool
@@ -1659,7 +1659,7 @@ impl HboneConnectionPool {
         // CROSS-CLUSTER east-west (issue #2010): `expected_trust_domain` scopes
         // the peer-cert verifier to a single remote trust domain (`expected_peer =
         // None`, since the SNI-passthrough gateway LB-picks the destination) and
-        // `sni_override` sets the ClientHello SNI to the destination service FQDN.
+        // `sni_override` sets the ClientHello SNI to the service port's alias.
         // Both `None` for the in-cluster byte-tunnel (SNI = dial host, pinned peer).
         expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
         sni_override: Option<&str>,
@@ -2731,7 +2731,7 @@ pub(crate) async fn dial_h2_connect_sender(
     // the prior hardcoded `None`.
     expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
     // Overrides the ClientHello SNI when `Some` (CROSS-CLUSTER: the destination
-    // service FQDN, so the remote east-west gateway's SNI passthrough routes to
+    // service port's alias, so the remote east-west gateway's SNI passthrough routes to
     // a destination terminator). `None` keeps the current behavior — SNI = the
     // dial host `target_host` — so the in-cluster HBONE / raw-TCP / UDP /
     // WebSocket-over-HBONE callers are byte-identical.
@@ -2812,7 +2812,7 @@ pub(crate) async fn dial_h2_connect_sender(
     // mesh-mTLS CONNECT tunnels (raw-TCP / UDP / WebSocket egress, all
     // `expected_peer = Some`), AND the CROSS-CLUSTER Ambient HBONE east-west path
     // (`expected_peer = None`, `expected_trust_domain = Some(remote TD)`,
-    // `sni_override = Some(service FQDN)`). For the in-cluster callers both
+    // `sni_override = Some(port alias)`). For the in-cluster callers both
     // `expected_trust_domain` and `sni_override` are `None` so behavior is
     // unchanged.
     let tls_config = build_spiffe_outbound_config(
@@ -2824,7 +2824,7 @@ pub(crate) async fn dial_h2_connect_sender(
     )?;
     let connector = TlsConnector::from(tls_config);
     // SNI = the `sni_override` when present (cross-cluster: the destination
-    // service FQDN the remote east-west gateway routes passthrough on), else the
+    // service port's alias the remote east-west gateway routes passthrough on), else the
     // dial host (every in-cluster path — byte-identical to the prior hardcode).
     let sni_host = sni_override.unwrap_or(target_host);
     let server_name =
@@ -3414,7 +3414,7 @@ pub fn target_expected_peer_spiffe(
 /// boolish-true). Such a target dials the REMOTE east-west gateway
 /// (`mesh.hbone_dial_host` / `mesh.hbone_port`) with the destination workload's
 /// pod addr:app-port as the inner CONNECT `:authority` (= `target.host:port`)
-/// and the destination service FQDN as the outer-TLS SNI override
+/// and the destination service port's `p<port>.<fqdn>` alias as the outer-TLS SNI override
 /// (`mesh.eastwest_sni`), using TRUST-DOMAIN-ONLY peer verification scoped to the
 /// remote trust domain (`mesh.trust_domain`). The cross-cluster / SNI / trust
 /// domain tags are shared with the Sidecar mesh-mTLS cross-cluster path (one

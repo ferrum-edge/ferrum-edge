@@ -55,13 +55,13 @@ spec:
             summary: Ferrum mesh federated trust bundle is stale
             description: "Trust bundle for {{ "{{ $labels.trust_domain }}" }} has not refreshed in {{ "{{ $value }}" }}s. Cross-cluster mTLS still verifies against the last-good bundle. See docs/spire_deployment.md#trust-bundle-rotation-failure."
         - alert: FerrumMeshFederationPollFailures
-          expr: sum by (trust_domain, endpoint) (increase(ferrum_mesh_federation_poll_failures_total[10m])) > 0
+          expr: sum by (trust_domain) (increase(ferrum_mesh_federation_poll_failures_total[10m])) > 0
           for: 5m
           labels:
             severity: warning
           annotations:
             summary: Ferrum mesh federation poll is failing
-            description: "SPIFFE federation poller hitting {{ "{{ $labels.endpoint }}" }} for trust domain {{ "{{ $labels.trust_domain }}" }} is failing. Pollers preserve the last-good bundle on failure; verifiers remain fail-closed against cached material."
+            description: "SPIFFE federation poller for trust domain {{ "{{ $labels.trust_domain }}" }} is failing. Pollers preserve the last-good bundle on failure; verifiers remain fail-closed against cached material."
     - name: ferrum.mesh.control-plane
       rules:
         - alert: FerrumMeshControlPlaneConfigStale

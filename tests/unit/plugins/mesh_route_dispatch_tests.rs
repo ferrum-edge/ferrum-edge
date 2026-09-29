@@ -1413,6 +1413,60 @@ fn mesh_route_dispatch_rejects_protocol_managed_response_transform_destinations(
     MeshRouteDispatch::new(&ordinary).expect("ordinary response_transform must still admit");
 }
 
+/// The whole `x-consumer-*` namespace is gateway-owned consumer assertion
+/// metadata, so a VirtualService `headers.request.{set,add}` modifier may not
+/// target it, matching `request_transformer` admission. The error names the
+/// offending rule.
+#[test]
+fn mesh_route_dispatch_rejects_consumer_assertion_request_transform_destinations() {
+    for key in [
+        "x-consumer-foo",
+        "X-Consumer-Role",
+        "x-consumer-username",
+        "X_Consumer_Role",
+        "x_consumer-groups",
+    ] {
+        for operation in ["add", "update"] {
+            let config = json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"backend_host": "svc.internal", "backend_port": 8080},
+                    "request_transform": [{
+                        "operation": operation,
+                        "key": key,
+                        "value": "admin"
+                    }]
+                }]
+            });
+            let error = MeshRouteDispatch::new(&config)
+                .expect_err("an x-consumer-* request_transform destination must fail admission");
+            assert!(
+                error.contains("rules[0].request_transform[0]"),
+                "{operation} {key} rejection must name the rule; got: {error}"
+            );
+            assert!(
+                error.contains("`x-consumer-*`"),
+                "{operation} {key} rejection must name the reason; got: {error}"
+            );
+            assert!(
+                ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", &config)
+                    .is_err(),
+                "the shared file/admin plugin admission path must reject {operation} {key}"
+            );
+        }
+
+        let removal = json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "svc.internal", "backend_port": 8080},
+                "request_transform": [{"operation": "remove", "key": key}]
+            }]
+        });
+        MeshRouteDispatch::new(&removal)
+            .unwrap_or_else(|e| panic!("remove of {key} must remain allowed; got: {e}"));
+    }
+}
+
 // ── GRPCRoute pathless-predicate live data path (issue #3271) ─────────────
 //
 // These drive the *translator-emitted* `mesh_route_dispatch` config, so the

@@ -286,11 +286,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build with `FAILED_PRECONDITION`, the DP refuses any CP frame from another
   build, and a refused DP backs off on the normal failure schedule while it
   keeps serving last-known-good config. Upgrade CP and DP together.
+- **The whole `x-consumer-*` request-header namespace is gateway-owned**
+  (breaking). Every client-supplied request header whose name starts with
+  `x-consumer-` (case-insensitive), not only `X-Consumer-Username` and
+  `X-Consumer-Custom-Id`, is now removed before plugins run and before
+  dispatch on HTTP/1.1, HTTP/2, HTTP/3, native and bridged gRPC, the
+  cross-protocol bridges, mesh/HBONE-forwarded HTTP, and third-party AI
+  provider calls; WebSocket handshakes and request trailers already did this.
+  A client `X-Consumer-Role` or `X-Consumer-Groups` no longer reaches a
+  backend. After the plugin phases the namespace is scrubbed again, so a
+  plugin cannot author a name beneath it, and only the gateway's authenticated
+  `X-Consumer-Username` / `X-Consumer-Custom-Id` are written back. Plugin
+  configuration that targets the namespace is rejected at config load, with an
+  error naming the rule: `request_transformer` header destinations,
+  `claim_headers` / `output_claim_headers` destinations,
+  `correlation_id.header_name`, and `mesh_route_dispatch` `request_transform`
+  destinations. `proxy::headers::is_consumer_assertion_header` is the single
+  predicate every boundary uses. There is no opt-out.
+  - `_` and `-` are equivalent in the namespace prefix, so `X_Consumer_Role`
+    and `x_consumer-groups` are stripped and refused too. CGI-style backends
+    (Rack, WSGI, PHP-FPM) fold both spellings onto the same
+    `HTTP_X_CONSUMER_*` variable.
+  - `request_deduplication.header_name` and `mcp_gateway`
+    `sessions.downstream_session_header` / `sessions.upstream_session_header`
+    naming an `x-consumer-*` header are rejected at config load, since the
+    header could never reach the plugin (`enforce_required` deduplication
+    would otherwise reject every request).
+  - A Gateway API HTTPRoute or GRPCRoute `RequestHeaderModifier` `set`/`add`
+    of an `x-consumer-*` name is refused per route (`Accepted=False`,
+    `UnsupportedValue`); the rest of the cluster's config still loads. An
+    Istio VirtualService `headers.request` `set`/`add` of such a name is
+    rejected when its `mesh_route_dispatch` instance is built.
+  - A load-balancer `hash_on: header:x-consumer-*` key no longer sees a
+    client-supplied value.
+  - A mesh AuthorizationPolicy `when` condition on
+    `request.headers[x-consumer-*]` sees the header as absent rather than the
+    client's value.
+  - Mesh sidecars strip `x-consumer-*` headers an application propagates on
+    outbound hops (previously only `X-Consumer-Username` /
+    `X-Consumer-Custom-Id`).
 - The vendored hyper patch that resets an upgraded HTTP/2 `CONNECT` stream
   with `CONNECT_ERROR` (#5781) is filed upstream as hyperium/hyper#4209 and
   hyperium/hyper#4210; the fork is dropped once a hyper release containing
   #4210 is adopted. See
   `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/`.
+
+- **The Docker `latest` tag tracks `main` again** (owner decision 2026-09-28,
+  reversing the 2026-09-19 retirement). The new `main-latest-image.yml` workflow
+  runs after each successful `push` run of CI on `main`, builds that exact
+  commit from the root `Dockerfile` for `linux/amd64` and `linux/arm64`,
+  smoke-runs each platform image, pushes a `main-<sha>` tag to Docker Hub and
+  GHCR, attests and signs it (Cosign, SLSA provenance, SPDX SBOMs), and then
+  moves `latest` to that verified digest. Runs are serialized and only the
+  newest waiting commit is built, so `latest` may skip intermediate commits and
+  `main-<sha>` exists only for built commits, each built once: a re-run reuses
+  the signed image. `latest` moves only forward: the commit must still be on
+  main's history, and the commit `latest` currently names must be its ancestor
+  whenever it is on main's history, both re-checked immediately before each
+  registry's move, so a late run never moves `latest` backwards. Jobs that hold
+  registry credentials never check out or run repository code: the contract
+  check and the image smoke run in credential-free jobs, the build fetches the
+  commit inside BuildKit, and Syft scans the public Docker Hub image with no
+  registry credential (the GHCR attestations reuse those SBOMs). A compare-API
+  `404` counts as "off main" only when GitHub corroborates it, and anonymous
+  Docker Hub reads retry throttled or failed requests a bounded number of times;
+  both otherwise fail the run. A run that fails before signing can leave an
+  unsigned `main-<sha>` until a re-run replaces it, so verify signatures.
+  `latest` is a development channel, not a release: pin `vX.Y.Z` or a digest in
+  production. Version tags, the `-ebpf` variants, and GitHub Releases are
+  unchanged, and `FERRUM_INJECTOR_SIDECAR_IMAGE` still refuses `latest`.
+  `verify_main_latest_image_workflow.py` pins the publisher contract in the
+  required `Tests` check, and both files are CODEOWNERS-protected.
+
 - **WAF admission: `on_unlisted_content_type: block` needs a body method**
   (#5865). With `body_methods: []` no HTTP request body is governed, so `block`
   can never fire; under `mode: enforce` it no longer counts as an enforcement
@@ -308,6 +375,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3–8x faster on bodies with JSON escapes, entities, or percent-encoding, and
   ~10x faster on plain bodies. Global exemption checks no longer allocate or
   parse the client IP when their lists are empty.
+- Mesh remote discovery warns once per `RemoteCluster` whose
+  `discovery_credential_ref` is missing or unresolved, instead of on every
+  reconcile.
+
+### Removed
+
+Ferrum Edge is pre-launch, so these mesh compatibility paths are removed
+outright with no deprecation period:
+
+- **Mesh tracing `provider` alias.** `MeshTracingConfig` reads only
+  `providers`, as an array. It now rejects unknown keys, so a config that
+  still sets the singular `provider` fails to load instead of silently
+  disabling tracing. The single-object form and `"providers": null` are also
+  errors.
+- **Istio Telemetry snake_case tracing keys.** The Kubernetes translator reads
+  only the camelCase `agentUrl`, `collectorUrl`, `accessTokenEnv`, and
+  `serviceName` provider fields; `agent_url`, `collector_url`,
+  `access_token_env`, and `service_name` are no longer aliases.
+- **Unsuffixed `.ready` readiness markers.** The NodeWaypoint in-netns capture
+  manager publishes only `<registry>/.ready4/<pod_uid>` and
+  `<registry>/.ready6/<pod_uid>`; nothing is written to `<registry>/.ready`.
+- **`ferrum_mesh_udp_placement_migration_established_adoptions_total`.** Use
+  `ferrum_mesh_udp_placement_migration_adoptions_total{proof}`; the
+  `established_adoption` flag on authenticated `/health` is unchanged.
+- **The `control_plane="redacted"` label** on
+  `ferrum_mesh_remote_discovery_poll_failures_total`. The series is keyed by
+  `cluster` and `trust_domain` only.
+- **The `endpoint="redacted"` label** on
+  `ferrum_mesh_federation_poll_failures_total`. The series is keyed by
+  `trust_domain` only; the bundled federation alert and dashboard now group by
+  `trust_domain`.
+- **The pre-lock CNI socket owner probe.** The node-agent CNI listener relies
+  on its lifetime `<socket>.lock` lock alone and removes any socket it finds at
+  the path once it holds that lock.
+- **Bare-FQDN east-west SNI for single-port services.** Every cross-cluster
+  service port, including a single-port service's only port, routes on its
+  `p<port>.<service>.<namespace>.svc.<cluster-domain>` alias. The alias depends
+  only on the port's number and transport: HTTP-family and raw-TCP ports use
+  `p<port>`, and UDP ports (by declared protocol, never `protocol_overrides`)
+  always use `p<port>-udp`. When more than one declared port maps to one alias
+  (for example HTTP plus raw TCP, or Kubernetes `3868/TCP` plus `3868/SCTP`),
+  every source still translates the service, and both ends skip only that
+  alias for cross-cluster routing with a rate-limited warning. This changes
+  the cross-cluster wire format.
+  - A destination `EastWestGateway` `sni_hosts` entry takes over a port only
+    when it names that port's alias (or a covering wildcard). An entry that
+    names only a local service's base FQDN now logs a one-time warning.
+  - Destination authorization sees the alias as `connection.sni` for
+    cross-cluster traffic. A `connection.sni` rule written against the bare
+    service FQDN no longer matches it, so a DENY rule written that way stops
+    applying.
+- **Non-reserved xDS DestinationRule ECDS carriers.** A resource carrying the
+  DestinationRule carrier type under any name other than
+  `ferrum-destination-rule-carrier/<namespace>/<name>` now NACKs. Mesh config
+  validation rejects an operator `mesh.extension_configs` entry that declares
+  that type, naming the entry.
+- **Non-reserved xDS mesh-slice carriers.** A resource carrying a mesh-slice
+  carrier type under any name other than that carrier's reserved
+  `ferrum-mesh-carrier/…` name now NACKs instead of being skipped with a
+  warning.
+- **Mismatched explicit ports on single-port inbound routes.** A Sidecar
+  inbound route for a single-port service still serves a request with no port
+  signal, and a `Host`/`:authority` port naming its service port or its
+  container port. Any other explicit port, or a captured original destination
+  other than the container port, now fails closed with 502, as it already did
+  for multi-port services. These rejections log a rate-limited warning.
+- **Shared-secret remote discovery.** Cross-cluster endpoint discovery polls a
+  `RemoteCluster` only with its own `discovery_credential_ref` credential from
+  `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS`; a cluster without one is no
+  longer polled with `FERRUM_CP_DP_GRPC_JWT_SECRET`.
 
 ### Fixed
 
