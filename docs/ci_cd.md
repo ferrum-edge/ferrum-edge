@@ -309,7 +309,7 @@ The Rust CI integration derives from
 
 ### BoringCache Rust CI rollout
 
-The full rollout uses the pinned v1.32.0 action and CLI for unit and ACME
+The full rollout uses the pinned v1.33.0 action and CLI for unit and ACME
 precompilation, secret/backend and service integration, PKCS#11, native test
 archives, conformance, dependency audit, vendored patches, Lint, Fuzz Smoke,
 eBPF builds and live tests, network-namespace and two-cluster tests, and native
