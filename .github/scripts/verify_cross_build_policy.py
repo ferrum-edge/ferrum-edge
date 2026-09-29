@@ -14092,6 +14092,28 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
         "0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27",
         "9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7",
     ),
+    # PR #5890 (BoringCache rollout): main's four Cross-sensitive cached jobs
+    # → OIDC BoringCache with an equivalent native Cargo/rust-cache fallback.
+    (
+        "build-binaries",
+        "534903aafb65c6bea0c86403c0fff124b81df1fd32beef6d26e91fa06ff01d93",
+        "17d18101b1884531cee7f2c67b971af12cac602dcc8b1136b3d5781cf9ab5cfb",
+    ),
+    (
+        "ebpf-live",
+        "a7beefbb4947bb9cf547a6844e6d1777a6ed7089767c3de8d05894ed5d77f856",
+        "82160c597497bd83d1c7b3f389d589ce426ec3a13c91cfaf3befaded8c81f68c",
+    ),
+    (
+        "netns-capture-live",
+        "9f18ade4733a936d93c249c63dc6695eaf04b1ba381297a3af76f93c6c64029b",
+        "20aa57cfa51d30132350f702f3752f1dfd016c0bd9eee091b8b1a55d95218471",
+    ),
+    (
+        "two-cluster-mesh-live",
+        "d52ce1dd7c8abd4852a5720fa3bdb02e7ac8eeb5b0358da83d4ce64d8279ae9b",
+        "0304fa5876b7377d3650e242299d48c03e512055602fc4bfc5eacc0f500f943d",
+    ),
     # PR #3916's `build-binaries` pair is retired: its destination
     # 14b0890e... is main's live value, so the tuple admitted a transition
     # between two states main is not in and only widened what a pull request
