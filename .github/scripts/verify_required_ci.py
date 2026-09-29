@@ -9,6 +9,7 @@ import re
 import sys
 import textwrap
 from pathlib import Path
+from verify_cross_build_policy import cargo_cache_branch_projection
 
 from test_ci_policy_parallel import run_self_test as ci_policy_parallel_self_test
 from test_release_dispatch import run_self_test as release_dispatch_self_test
@@ -771,6 +772,9 @@ def native_binary_compile_gate_self_test() -> list[str]:
         failures.append("push-to-main verification must build Linux x86_64 only")
 
     build_body = extract_job_body(ci_yml, "build-binaries")
+    build_body = cargo_cache_branch_projection(build_body)
+    build_body = re.sub(r'(?m)^(        )run: \|\n          (cargo [^\n]+)\n',
+                        r'\1run: \2\n', build_body)
     macos_check_gate = (
         "- name: Check merge-group macOS target\n"
         "        if: github.event_name == 'merge_group' && runner.os == 'macOS'\n"

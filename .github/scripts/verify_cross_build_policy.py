@@ -3770,14 +3770,16 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 # a new image family: as two byte-frozen GENERATIONS with a one-way transition
 # between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first).
 #
-# The pair now carries issue #4442. Issue #4238's own transition is spent: its
+# The generations retain issue #4442 and append the BoringCache rollout.
+# Issue #4238's own transition is spent: its
 # adopted generation reached `main`, and the rule is to retire a generation once
 # that is true, so the #3902 shape it retired is gone from this file.
 #
 #   * `CI_FUZZ_SMOKE_RETIRED_JOB` is #4238's adopted shape: the deterministic
 #     property smoke as the required pull-request and merge_group gate, and the
 #     six-target bounded budget on push to `main` / manual dispatch only.
-#   * `CI_FUZZ_SMOKE_JOB` is the adopted shape: identical except that the
+#   * `CI_FUZZ_SMOKE_PRE_BORINGCACHE_JOB` is the current main shape: identical
+#     except that the
 #     bounded budget additionally fuzzes `datagram_client_address`.
 #
 #     That target parses the Datagram PROXY v2 envelope -- address block, the
@@ -3801,7 +3803,11 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 #     must carry it verbatim exactly once, so a later revision cannot quietly
 #     drop the seventh target or re-bound it to the generic 4 KiB ceiling.
 #
-# Both generations are admitted so the trusted base stays valid while the
+#   * `CI_FUZZ_SMOKE_JOB` adds OIDC BoringCache with an equivalent plain Cargo
+#     and rust-cache fallback; compiler flags and all seven fuzz budgets stay
+#     fixed.
+#
+# All three generations are admitted so the trusted base stays valid while the
 # transition lands, and so the destination revision validates against a policy
 # that already carries it. The transition is one-way: a revision may move from
 # the retired generation to the adopted one, but
@@ -4119,7 +4125,7 @@ CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
             echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
           fi
 """
-CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+CI_FUZZ_SMOKE_PRE_BORINGCACHE_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
@@ -4424,9 +4430,380 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           fi
 """
 
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # issue #3902 decides where each half of it runs, and issue #4442 decides
+    # which targets it covers. This is its entire
+    # permitted shape. Every command, action pin, toolchain pin, tool version,
+    # target name, and libFuzzer bound below is part of the contract, so a pull
+    # request cannot widen the budget, change the target list, add a step, or
+    # redirect this job at a repository-supplied script.
+    #
+    # Lane split (#3902, narrowed by #4238): the deterministic property smoke
+    # stays the required gate and runs on pull_request AND merge_group. The
+    # sanitizer-instrumented libFuzzer build spends roughly 39 minutes
+    # compiling to buy under a minute of fuzzing, so it runs only on the push
+    # to `main` and on manual dispatch.
+    #
+    # #3902 took it off the pull-request path for cost. #4238 takes it off the
+    # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
+    # anywhere in that ~38-minute window ejected the queue entry and cascaded a
+    # rebuild of every entry behind it, and it did so without a defect in the
+    # ejected change. Discovery coverage is unchanged -- every merged change is
+    # still fuzzed at byte-identical bounds by the push to `main` that follows
+    # it. Only pushes to main may populate the cache.
+    #
+    # Target inventory (#4442): `datagram_client_address` is the seventh smoke
+    # target. It is invoked on its own rather than from the six-target loop
+    # because its documented input budget is 64 KiB
+    # (`fuzz_support::MAX_FUZZ_INPUT_BYTES`) rather than the loop's 4 KiB, and
+    # the scheduled sanitizer lane already fuzzes it at that ceiling. A parser
+    # whose length boundaries are reachable in one required lane and not the
+    # other is not actually scheduled. Every other bound is byte-identical to
+    # the loop's.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    # The repository-root Cargo config also selects the mold linker through
+    # per-target rustflags, and this isolated lane installs no fast linker, so
+    # the inherited rustflags are cleared explicitly. The rustc wrapper is
+    # deliberately NOT pinned here: `setup-sccache` below publishes either the
+    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
+    # and a job-level `env` entry of the same name would override that
+    # fail-closed decision.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Extend runner swap for sanitizer compilation
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          # The observed cold compile reached 14.3 GiB process RSS, less than
+          # 250 MiB available RAM and nearly full 3 GiB swap before shutdown.
+          # Match the existing unit/PKCS11 jobs' bounded 12 GiB extension,
+          # preserving the runner's existing swap and every compiler/test bound.
+          free -h
+          df -h /mnt
+          sudo fallocate -l 12G /mnt/ferrum-fuzz-swapfile
+          sudo chmod 600 /mnt/ferrum-fuzz-swapfile
+          sudo mkswap /mnt/ferrum-fuzz-swapfile
+          sudo swapon /mnt/ferrum-fuzz-swapfile
+          free -h
+          swapon --show
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      # The repository's own checksum-pinned sccache installer never enables the
+      # credential-bearing sccache GHA backend, never persists
+      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
+      # those credentials are absent before any build runs, and fails closed to
+      # no wrapper at all. It must run BEFORE the cache restore below so the
+      # lazily started sccache server indexes the restored entries.
+      - uses: ./.github/actions/setup-sccache
+
+      - name: BoringCache Cargo
+        uses: ./.github/actions/setup-boringcache
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: env.FERRUM_BORINGCACHE_ENABLED != 'true'
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the sanitizer build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Install pinned cargo-fuzz
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile tools install cargo-fuzz --locked --version 0.13.1
+          else
+            cargo install cargo-fuzz --locked --version 0.13.1
+          fi
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          property_started=$SECONDS
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-save test --locked
+          else
+            cargo test --locked
+          fi
+          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
+
+      - name: Run bounded libFuzzer smoke budget
+        # Issue #4238: the push to `main` and manual dispatch only. This step
+        # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
+        # must not be able to eject a merge-queue entry: its bounds buy about
+        # 48 seconds of fuzzing behind roughly 39 minutes of sanitizer compile,
+        # and a runner reclamation in that window costs the whole queue.
+        # Every merged change still reaches this budget through the push to
+        # `main`, at byte-identical bounds, seconds later.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          sanitizer_started=$SECONDS
+          # Logs and annotations are best effort: hard runner loss can prevent
+          # either upload. Send a few pressure transitions to the live timeline
+          # as well as the full log, without granting this process API access.
+          python3 -u - <<'PYRES' &
+          import json
+          import os
+          import time
+          from pathlib import Path
+
+
+          def counters(path, names=None):
+              try:
+                  text = Path(path).read_text()[:8192]
+              except (OSError, UnicodeError):
+                  return None
+              result = {}
+              for line in text.splitlines():
+                  parts = line.replace(":", " ").split()
+                  if len(parts) >= 2 and (names is None or parts[0] in names):
+                      try:
+                          result[parts[0]] = int(parts[1])
+                      except ValueError:
+                          continue
+              return result
+
+
+          def scalar(path):
+              try:
+                  value = Path(path).read_text()[:64].strip()
+                  return int(value) if value.isdecimal() else value
+              except (OSError, UnicodeError):
+                  return None
+
+
+          started = time.monotonic()
+          reported_notices = set()
+          initial_oom = None
+          for sample_index in range(240):
+              rss_sum = 0
+              rss_max = 0
+              process_count = 0
+              scan_truncated = False
+              try:
+                  with os.scandir("/proc") as entries:
+                      for entry in entries:
+                          if not entry.name.isdecimal():
+                              continue
+                          if process_count == 1024:
+                              scan_truncated = True
+                              break
+                          process_count += 1
+                          values = counters(entry.path + "/status", {"VmRSS"})
+                          rss = values.get("VmRSS", 0) if values is not None else 0
+                          rss_sum += rss
+                          rss_max = max(rss_max, rss)
+              except OSError:
+                  scan_truncated = True
+              snapshot = {
+                  "sample": sample_index,
+                  "elapsed_seconds": round(time.monotonic() - started, 3),
+                  "host_memory_kib": counters("/proc/meminfo", {
+                      "MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "Dirty"
+                  }),
+                  "host_swap_pages": counters("/proc/vmstat", {"pswpin", "pswpout"}),
+                  "root_cgroup_memory_current_bytes": scalar("/sys/fs/cgroup/memory.current"),
+                  "root_cgroup_memory_max": scalar("/sys/fs/cgroup/memory.max"),
+                  "root_cgroup_memory_events": counters("/sys/fs/cgroup/memory.events"),
+                  "process_count_scanned": process_count,
+                  "process_scan_truncated": scan_truncated,
+                  "process_rss_sum_kib": rss_sum,
+                  "largest_process_rss_kib": rss_max,
+              }
+              print("Fuzz build resources: " + json.dumps(snapshot, sort_keys=True), flush=True)
+              # At most nine distinct reasons, each emitted once. Group simultaneous
+              # transitions to stay below the runner's ten-notice limit per step.
+              reasons = {"initial"} if sample_index == 0 else set()
+              memory = snapshot["host_memory_kib"] or {}
+              total = memory.get("MemTotal", 0)
+              available = memory.get("MemAvailable")
+              if total > 0 and available is not None:
+                  for percent in (75, 50, 25, 10, 5):
+                      if available * 100 <= total * percent:
+                          reasons.add(f"available-memory-at-most-{percent}-percent")
+              swap_total = memory.get("SwapTotal", 0)
+              swap_free = memory.get("SwapFree")
+              if swap_total > 0 and swap_free is not None:
+                  for percent in (25, 5):
+                      if swap_free * 100 <= swap_total * percent:
+                          reasons.add(f"free-swap-at-most-{percent}-percent")
+              events = snapshot["root_cgroup_memory_events"] or {}
+              oom = {name: events[name] for name in ("oom", "oom_kill") if name in events}
+              if initial_oom is None and oom:
+                  initial_oom = oom
+              if initial_oom and any(oom.get(name, value) > value
+                                     for name, value in initial_oom.items()):
+                  reasons.add("root-cgroup-oom-counter-increased")
+              new_reasons = reasons - reported_notices
+              if new_reasons:
+                  notice = {
+                      "reasons": sorted(new_reasons),
+                      "sample": sample_index,
+                      "elapsed_seconds": snapshot["elapsed_seconds"],
+                      "host_memory_kib": memory,
+                      "host_swap_pages": snapshot["host_swap_pages"],
+                      "root_cgroup_oom_counters": oom,
+                      "largest_process_rss_kib": rss_max,
+                  }
+                  message = json.dumps(notice, sort_keys=True)
+                  message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print("::notice title=Fuzz build resource snapshot::" + message, flush=True)
+                  reported_notices.update(new_reasons)
+              remaining = 7200.0 - (time.monotonic() - started)
+              if remaining <= 0:
+                  break
+              time.sleep(min(30.0, remaining))
+          PYRES
+          fuzz_resource_pid=$!
+          stop_fuzz_resource_observer() {
+            local original_status=$?
+            trap - EXIT
+            if ! kill -0 "$fuzz_resource_pid" 2>/dev/null; then
+              echo "::warning::fuzz resource observer ended before the sanitizer step"
+            fi
+            kill "$fuzz_resource_pid" 2>/dev/null || true
+            wait "$fuzz_resource_pid" 2>/dev/null || true
+            exit "$original_status"
+          }
+          trap stop_fuzz_resource_observer EXIT
+
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          if [ -z "$sccache_bin" ] || [ ! -x "$sccache_bin" ]; then
+            echo "::warning::sccache wrapper is unavailable for this sanitizer build"
+          fi
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+              boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \
+                -runs=512 \
+                -max_total_time=8 \
+                -max_len=4096 \
+                -timeout=2 \
+                -rss_limit_mb=1024
+            else
+              cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+                -runs=512 \
+                -max_total_time=8 \
+                -max_len=4096 \
+                -timeout=2 \
+                -rss_limit_mb=1024
+            fi
+          done
+
+          echo "Fuzz smoke target: datagram_client_address"
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore fuzz run --codegen-units 16 datagram_client_address -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=65536 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          else
+            cargo fuzz run --codegen-units 16 datagram_client_address -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=65536 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          fi
+          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
+
+      - name: Report fuzz lane shape and cache availability
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Fuzz lane shape: property gate plus the seven-target sanitizer budget"
+          else
+            echo "Fuzz lane shape: deterministic property gate only"
+          fi
+
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            echo "sccache wrapper is available; see BoringCache Cargo command logs for cache results"
+          else
+            echo "::warning::sccache wrapper is unavailable"
+          fi
+"""
+
 # Oldest first. The index of a revision's job text in this tuple is its
 # generation; a higher index may replace a lower one, never the reverse.
-CI_FUZZ_SMOKE_JOB_GENERATIONS = (CI_FUZZ_SMOKE_RETIRED_JOB, CI_FUZZ_SMOKE_JOB)
+CI_FUZZ_SMOKE_JOB_GENERATIONS = (
+    CI_FUZZ_SMOKE_RETIRED_JOB, CI_FUZZ_SMOKE_PRE_BORINGCACHE_JOB, CI_FUZZ_SMOKE_JOB,
+)
+
+CI_FUZZ_CARGO_PREFIX = "boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz"
+
+
+CACHE_BRANCH_CONDITION = 'if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then'
+CACHE_CARGO_PREFIX_PATTERN = re.compile(
+    r"boringcache cargo --\$\{\{ github.event_name == 'push' && "
+    r"github.ref == 'refs/heads/main' && 'write' \|\| 'read-only' \}\} "
+    r'--profile (?:"[^"\n]+"|[\w-]+)(?: --skip-(?:restore|save))* '
+)
+
+
+def cargo_cache_branch_projection(contents: str) -> str:
+    """Project only equivalent cached/plain commands to their native Cargo form.
+
+    A differing argument, pipeline, status handler or missing fallback keeps the
+    original text, so frozen-budget and command-shape checks fail closed.
+    """
+    branch = re.compile(
+        r'(?m)^(?P<indent> *)' + re.escape(CACHE_BRANCH_CONDITION) + r'\n'
+        r'(?P<cached>[\s\S]*?)^(?P=indent)else\n'
+        r'(?P<plain>[\s\S]*?)^(?P=indent)fi\n'
+    )
+
+    def project(match: re.Match[str]) -> str:
+        cached = match['cached']
+        plain = match['plain']
+        native, count = CACHE_CARGO_PREFIX_PATTERN.subn('cargo ', cached)
+        if count != 1 or native != plain:
+            return match[0]
+        return ''.join(line[2:] for line in plain.splitlines(keepends=True))
+
+    return branch.sub(project, contents)
+
+
+def fuzz_budget_commands(job: str) -> str:
+    """Compare byte-identical native budgets in both cache backend branches."""
+    return cargo_cache_branch_projection(job)
 
 # The bounded libFuzzer budget, verbatim. Every admitted generation must carry
 # it exactly once, wherever in the job it runs.
@@ -7357,6 +7734,16 @@ def closed_job_field_errors(
     return errors
 
 
+CI_CACHE_OIDC_JOBS = (
+    "test-unit", "test-acme", "test-secrets", "test-service-integration",
+    "test-pkcs11-softhsm", "build-test-artifacts", "test-conformance",
+    "dependency-audit", "test-vendor-patches", "lint", "fuzz-smoke",
+    "build-ebpf", "build-ebpf-userspace", "ebpf-live", "netns-capture-live",
+    "two-cluster-mesh-live", "build-binaries",
+)
+CI_CACHE_PERMISSIONS = "    permissions:\n      contents: read\n      id-token: write\n"
+
+
 def nonpublishing_ci_errors(contents: str, source: str) -> list[str]:
     """CI can build and upload test artifacts, but cannot publish releases."""
     errors: list[str] = []
@@ -7364,7 +7751,27 @@ def nonpublishing_ci_errors(contents: str, source: str) -> list[str]:
     errors.extend(failures)
     if permission != "permissions:\n  contents: read\n":
         errors.append(f"{source} must default to contents: read only")
-    active = "\n".join(line for line in contents.splitlines() if not line.lstrip().startswith("#"))
+    # Only these build jobs may request an OIDC assertion for cache access.
+    # Release permissions, other jobs, and workflow-level OIDC remain denied.
+    permission_contents = contents
+    for job_name in CI_CACHE_OIDC_JOBS:
+        job, failures = extract_job_block(contents, source, job_name, required=False)
+        errors.extend(failures)
+        if job is None or failures:
+            continue
+        job_permissions, failures = extract_job_field_block(
+            contents, source, job_name, "permissions", required=False,
+        )
+        errors.extend(failures)
+        active_permissions = "".join(
+            line for line in (job_permissions or "").splitlines(keepends=True)
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if not failures and active_permissions == CI_CACHE_PERMISSIONS:
+            permission_contents = permission_contents.replace(
+                job, job.replace(CI_CACHE_PERMISSIONS, "    permissions:\n      contents: read\n", 1), 1,
+            )
+    active = "\n".join(line for line in permission_contents.splitlines() if not line.lstrip().startswith("#"))
     if re.search(r"\b(?:actions|contents|packages|id-token):\s*write\b|\bwrite-all\b", active):
         errors.append(f"{source} must not grant publication write permissions")
     for job in ("latest-release", "docker", "docker-manifest", "build-arm64-cross",
@@ -13717,6 +14124,8 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
 )
 
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
+# BoringCache adds one exact current-main -> complete backend/fallback transition.
+# Neither a partial rollout, an unrelated edit, nor its rollback is admitted.
 # `setup-rust-ci/action.yml` carries a two-step chain from PR #3889's landed
 # file: first the cache-budget generation (this change) that gates rust-cache
 # `save-if` to a trusted `refs/heads/main` run so pull requests and merge
@@ -13739,6 +14148,11 @@ LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
         "setup-rust-ci/action.yml",
         "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
         "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
+    ),
+    (
+        "setup-rust-ci/action.yml",
+        "a3e8405d91f12f307f8ecd4f378ff930c4890d4a385b4c8a2bd1bc8531d92385",
+        "08312c6bcbbe9696cf1a93237bab5a52cbf87b3e2d565af5377ea5160821a520",
     ),
 )
 
@@ -21233,10 +21647,15 @@ pre_build = []
             "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
             "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
         ),
+        (
+            "setup-rust-ci/action.yml",
+            "a3e8405d91f12f307f8ecd4f378ff930c4890d4a385b4c8a2bd1bc8531d92385",
+            "08312c6bcbbe9696cf1a93237bab5a52cbf87b3e2d565af5377ea5160821a520",
+        ),
     ):
         failures.append(
             "the setup-rust-ci generation table does not pin the cache-budget "
-            "generation chain and the rebased combined #3911 destination"
+            "generation chain, rebased #3911 destination and exact BoringCache fallback"
         )
 
     remote_action_composite = (
@@ -27249,6 +27668,23 @@ pre_build = []
     no_publish = "name: CI\npermissions:\n  contents: read\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
     if validate_publish_control_contract(no_publish, "CI workflow"):
         failures.append("read-only nonpublishing CI was rejected")
+    for job_name in CI_CACHE_OIDC_JOBS:
+        cache_oidc = no_publish.replace("  test:\n", f"  {job_name}:\n" + CI_CACHE_PERMISSIONS)
+        if validate_publish_control_contract(cache_oidc, "CI workflow"):
+            failures.append(f"cache OIDC permissions were rejected for {job_name}")
+        commented_oidc = cache_oidc.replace("    steps:", "    # Keep cache access scoped to this job.\n    steps:")
+        if validate_publish_control_contract(commented_oidc, "CI workflow"):
+            failures.append(f"a comment changed cache OIDC permissions for {job_name}")
+        for mutation in (
+            cache_oidc.replace("      contents: read", "      contents: write"),
+            cache_oidc.replace("      id-token: write", "      id-token: write\n      packages: write"),
+            cache_oidc.replace("      id-token: write", "      id-token: write\n      actions: write"),
+            cache_oidc.replace("      id-token: write", "      id-token: write\n      id-token: write"),
+            cache_oidc.replace(f"  {job_name}:\n", "  unrelated:\n"),
+            cache_oidc.replace("permissions:\n  contents: read", "permissions:\n  contents: read\n  id-token: write"),
+        ):
+            if not validate_publish_control_contract(mutation, "CI workflow"):
+                failures.append(f"widened cache OIDC permissions were accepted for {job_name}")
     for mutation in (
         no_publish.replace("contents: read", "contents: write"),
         no_publish.replace("    steps: []", "    permissions:\n      actions: write\n    steps: []"),
@@ -29782,7 +30218,7 @@ pre_build = []
     # Wherever the six-target budget runs, it runs at exactly these bounds. A
     # generation that moved the lane must not also have relaxed it.
     for generation, admitted in enumerate(CI_FUZZ_SMOKE_JOB_GENERATIONS):
-        if admitted.count(CI_FUZZ_SMOKE_BOUNDED_BUDGET) != 1:
+        if fuzz_budget_commands(admitted).count(CI_FUZZ_SMOKE_BOUNDED_BUDGET) != 1:
             failures.append(
                 f"admitted fuzz-smoke generation {generation} does not carry the "
                 "bounded six-target libFuzzer budget exactly once"
@@ -29792,7 +30228,7 @@ pre_build = []
     # revision from dropping `datagram_client_address` back out of the required
     # smoke, or re-bounding it to the loop's generic 4 KiB ceiling and leaving
     # the scheduled lane reaching parser lengths this lane never can (#4442).
-    if CI_FUZZ_SMOKE_JOB.count(CI_FUZZ_SMOKE_DATAGRAM_BUDGET) != 1:
+    if fuzz_budget_commands(CI_FUZZ_SMOKE_JOB).count(CI_FUZZ_SMOKE_DATAGRAM_BUDGET) != 1:
         failures.append(
             "the adopted fuzz-smoke generation does not carry the bounded "
             "datagram_client_address invocation exactly once"
@@ -29854,20 +30290,17 @@ pre_build = []
             "the adopted fuzz-smoke generation pins a job-level rustc wrapper, "
             "which would override the pinned installer's fail-closed decision"
         )
-    if CI_FUZZ_SMOKE_JOB.count("uses: ./.github/actions/") != 1:
+    if CI_FUZZ_SMOKE_JOB.count("uses: ./.github/actions/") != 2:
         failures.append(
-            "the adopted fuzz-smoke generation must reference exactly one local "
-            "action"
+            "the adopted fuzz-smoke generation must reference exactly two local "
+            "actions"
         )
     if "      - uses: ./.github/actions/setup-sccache\n" not in CI_FUZZ_SMOKE_JOB:
         failures.append(
             "the adopted fuzz-smoke generation no longer uses the repository's "
             "checksum-pinned sccache installer"
         )
-    if (
-        "          save-if: ${{ github.event_name == 'push' && "
-        "github.ref == 'refs/heads/main' }}\n"
-    ) not in CI_FUZZ_SMOKE_JOB:
+    if CI_CACHE_PERMISSIONS not in CI_FUZZ_SMOKE_JOB or CI_FUZZ_CARGO_PREFIX not in CI_FUZZ_SMOKE_JOB:
         failures.append(
             "the adopted fuzz-smoke generation lets an untrusted ref write the "
             "compiler cache the sanitizer build restores"
@@ -29993,8 +30426,8 @@ pre_build = []
         "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
         "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
         "unpinned cargo-fuzz": (
-            "cargo install cargo-fuzz --locked --version 0.13.1",
-            "cargo install cargo-fuzz",
+            "install cargo-fuzz --locked --version 0.13.1",
+            "install cargo-fuzz",
         ),
         "missing protoc setup": (
             "      - name: Install required build dependency\n"
@@ -30007,7 +30440,8 @@ pre_build = []
         ),
         "mutable toolchain pin": ("nightly-2025-07-01", "nightly"),
         "repository-supplied script": (
-            'cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\',
+            ('cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\',
+             CI_FUZZ_CARGO_PREFIX + ' --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \\'),
             'bash scripts/fuzz_smoke.sh --codegen-units 16 "$fuzz_target" -- \\',
         ),
         "mutable action ref": (
@@ -30015,7 +30449,8 @@ pre_build = []
             "actions/checkout@v6",
         ),
         "local action substitution": (
-            "uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2",
+            ("uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2",
+             "uses: ./.github/actions/setup-boringcache"),
             "uses: ./.github/actions/fuzz-cache",
         ),
         "widened permissions": (
@@ -30095,9 +30530,8 @@ pre_build = []
             "        if: github.event_name != 'pull_request'\n",
         ),
         "untrusted cache writes": (
-            "          save-if: ${{ github.event_name == 'push' && "
-            "github.ref == 'refs/heads/main' }}\n",
-            "          save-if: true\n",
+            CI_FUZZ_CARGO_PREFIX,
+            "boringcache cargo --write --profile fuzz",
         ),
         "unpinned third-party sccache installer": (
             "      - uses: ./.github/actions/setup-sccache\n",
@@ -30108,15 +30542,15 @@ pre_build = []
             '    env:\n      RUSTFLAGS: ""\n      SCCACHE_GHA_ENABLED: "true"\n',
         ),
         "cache directory escape": (
-            "          shared-key: fuzz-smoke\n",
-            "          shared-key: fuzz-smoke\n          cache-directories: /\n",
+            CI_FUZZ_CARGO_PREFIX + " --skip-save test --locked",
+            CI_FUZZ_CARGO_PREFIX + " --skip-save test --locked --target-dir /",
         ),
         # Issue #4442. The three ways a pull request could unschedule the
         # seventh target on the surface it controls: delete its invocation,
         # re-bound it to the loop's generic ceiling, or point the invocation at
         # a target the loop already covers so the step still prints seven runs.
         "datagram target dropped from the smoke budget": (
-            CI_FUZZ_SMOKE_DATAGRAM_BUDGET,
+            CI_FUZZ_CARGO_PREFIX + " --skip-restore fuzz run --codegen-units 16 datagram_client_address --",
             "",
         ),
         "datagram target re-bounded to the generic smoke ceiling": (
@@ -30124,8 +30558,8 @@ pre_build = []
             "            -max_len=4096 \\\n",
         ),
         "datagram target substituted for one already covered": (
-            "cargo fuzz run --codegen-units 16 datagram_client_address -- \\",
-            "cargo fuzz run --codegen-units 16 proxy_protocol -- \\",
+            "fuzz run --codegen-units 16 datagram_client_address -- \\",
+            "fuzz run --codegen-units 16 proxy_protocol -- \\",
         ),
     }
     for tamper_name, (original, replacement) in fuzz_smoke_adopted_tampering.items():
