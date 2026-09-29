@@ -4774,7 +4774,7 @@ CACHE_BRANCH_CONDITION = 'if [ "$CI_BORINGCACHE_ENABLED" = true ]; then'
 CACHE_CARGO_PREFIX_PATTERN = re.compile(
     r"boringcache cargo --\$\{\{ github.event_name == 'push' && "
     r"github.ref == 'refs/heads/main' && 'write' \|\| 'read-only' \}\} "
-    r'--profile (?:"[^"\n]+"|[\w-]+)(?: --skip-(?:restore|save))* '
+    r'--profile (?:"unit-\$UNIT_SHARD"|[\w-]+)(?: --skip-(?:restore|save))* '
 )
 
 
