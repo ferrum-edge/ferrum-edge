@@ -2477,6 +2477,10 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 | `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
 | `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
+| `build-binaries` | `534903aafb65c6bea0c86403c0fff124b81df1fd32beef6d26e91fa06ff01d93` | `17d18101b1884531cee7f2c67b971af12cac602dcc8b1136b3d5781cf9ab5cfb` | PR #5890 (BoringCache) |
+| `ebpf-live` | `a7beefbb4947bb9cf547a6844e6d1777a6ed7089767c3de8d05894ed5d77f856` | `82160c597497bd83d1c7b3f389d589ce426ec3a13c91cfaf3befaded8c81f68c` | PR #5890 (BoringCache) |
+| `netns-capture-live` | `9f18ade4733a936d93c249c63dc6695eaf04b1ba381297a3af76f93c6c64029b` | `20aa57cfa51d30132350f702f3752f1dfd016c0bd9eee091b8b1a55d95218471` | PR #5890 (BoringCache) |
+| `two-cluster-mesh-live` | `d52ce1dd7c8abd4852a5720fa3bdb02e7ac8eeb5b0358da83d4ce64d8279ae9b` | `0304fa5876b7377d3650e242299d48c03e512055602fc4bfc5eacc0f500f943d` | PR #5890 (BoringCache) |
 
 The three `#3915` pairs admit the per-suite planner-gate split (the union
 `run_ebpf_live` output becomes `run_ebpf_kernel_live` /
@@ -2488,6 +2492,13 @@ does not read as Cross-sensitive, so those need no pair here. The
 `performance-regression` job has since moved out of `ci.yml` into
 `performance-regression.yml`, so its pair can no longer match and should be
 retired.
+
+The four #5890 pairs admit BoringCache with an equivalent native Cargo and
+GitHub-cache fallback in the Cross-sensitive cached jobs. The same policy admits
+one exact trailing top-level `env` line,
+`BORINGCACHE_ENABLED: ${{ vars.BORINGCACHE_ENABLED }}` (with its comment), so a
+repository variable can switch every lane back to the legacy cache; the ARM64
+job never reads it, and any other env edit is still refused.
 
 PR #3916's `build-binaries` pair is retired: its destination is main's live
 value, so the tuple admitted a transition between two states `main` is not in
