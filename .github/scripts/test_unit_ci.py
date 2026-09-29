@@ -20,6 +20,37 @@ from run_unit_ci import (
     minimum_passed, proc_metrics, validate_output, validate_usage,
 )
 
+# Trusted self-tests compare proposed automation as data. Execute these fixed
+# fixtures only, never a shell program read from the candidate checkout.
+CACHE_BACKEND_SCRIPT = r'''set -euo pipefail
+enabled=false
+if [ "$CACHE_DISABLED" != true ] && [ "$OIDC_ELIGIBLE" = true ] && \
+   [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+  enabled=true
+fi
+echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+echo "FERRUM_BORINGCACHE_ENABLED=$enabled" >> "$GITHUB_ENV"
+if [ "$enabled" = true ]; then
+  echo 'Cache backend: BoringCache (OIDC)' >> "$GITHUB_STEP_SUMMARY"
+else
+  echo 'Cache backend: GitHub Rust cache / plain Cargo (BoringCache disabled or OIDC unavailable)' >> "$GITHUB_STEP_SUMMARY"
+fi'''
+LINT_NATIVE_SCRIPT = r'''cargo clippy \
+  --config profile.test.debug=0 \
+  --config profile.dev.debug=0 \
+  --all-targets -- -D warnings'''
+LINT_CACHE_PREFIX = (
+    "boringcache cargo --${{ github.event_name == 'push' && "
+    "github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile lint "
+)
+LINT_CACHE_SCRIPT = (
+    'if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then\n'
+    + ''.join('  ' + line + '\n' for line in
+              LINT_NATIVE_SCRIPT.replace('cargo ', LINT_CACHE_PREFIX, 1).splitlines())
+    + 'else\n'
+    + ''.join('  ' + line + '\n' for line in LINT_NATIVE_SCRIPT.splitlines())
+    + 'fi'
+)
 
 # The Unit Tests job is a four-shard matrix; the shard's targets arrive through
 # job-level `UNIT_PRECOMPILE_TARGETS` / `UNIT_TARGET` env (see ci.yml), so the
@@ -375,11 +406,21 @@ class ReportTests(unittest.TestCase):
 class CacheBackendTests(unittest.TestCase):
     def test_disabled_and_unavailable_identity_never_select_remote_cache(self):
         action = Path('.github/actions/setup-boringcache/action.yml').read_text()
+        self.assertIn("        CACHE_DISABLED: ${{ vars.BORINGCACHE_ENABLED == 'false' }}\n", action)
+        self.assertIn(
+            "        OIDC_ELIGIBLE: ${{ github.repository == 'ferrum-edge/ferrum-edge' "
+            "&& github.actor != 'dependabot[bot]' "
+            "&& github.event.pull_request.user.login != 'dependabot[bot]' "
+            "&& (github.event_name != 'pull_request' "
+            "|| github.event.pull_request.head.repo.full_name == github.repository) }}\n",
+            action,
+        )
         body = re.search(
             r'(?ms)    - name: Select cache backend\n.*?      run: \|\n(.*?)(?=^    - )',
             action,
         )[1]
         script = '\n'.join(line[8:] for line in body.splitlines())
+        self.assertEqual(script.strip(), CACHE_BACKEND_SCRIPT)
         for disabled, eligible, url, token, enabled in (
             ('false', 'true', 'test-url', 'test-capability', 'true'),
             ('true', 'true', 'test-url', 'test-capability', 'false'),
@@ -394,7 +435,7 @@ class CacheBackendTests(unittest.TestCase):
                                ACTIONS_ID_TOKEN_REQUEST_URL=url, ACTIONS_ID_TOKEN_REQUEST_TOKEN=token)
                     for variable in ('GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY'):
                         env[variable] = str(Path(directory) / variable)
-                    result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
+                    result = subprocess.run(['bash', '-euo', 'pipefail', '-c', CACHE_BACKEND_SCRIPT],
                                             env=env, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(Path(env['GITHUB_OUTPUT']).read_text(), f'enabled={enabled}\n')
@@ -420,7 +461,8 @@ class CacheBackendTests(unittest.TestCase):
         lint = re.search(r'(?ms)^  lint:\n.*?(?=^  fuzz-smoke:)', workflow)[0]
         script = re.search(r'(?ms)        run: \|\n(.*)', lint)[1]
         script = '\n'.join(line[10:] for line in script.splitlines())
-        script = re.sub(r'\$\{\{.*?\}\}', 'read-only', script)
+        self.assertEqual(script.strip(), LINT_CACHE_SCRIPT)
+        fixture = re.sub(r'\$\{\{.*?\}\}', 'read-only', LINT_CACHE_SCRIPT)
         with tempfile.TemporaryDirectory() as directory:
             for executable in ('cargo', 'boringcache'):
                 path = Path(directory) / executable
@@ -429,7 +471,7 @@ class CacheBackendTests(unittest.TestCase):
             for enabled in ('true', 'false'):
                 with self.subTest(enabled=enabled):
                     result = subprocess.run(
-                        ['bash', '-euo', 'pipefail', '-c', script],
+                        ['bash', '-euo', 'pipefail', '-c', fixture],
                         env=dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
                                  FERRUM_BORINGCACHE_ENABLED=enabled),
                         capture_output=True, text=True,
