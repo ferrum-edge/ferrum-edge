@@ -2572,7 +2572,7 @@ pub struct EnvConfig {
     /// through the external-secret suffixes (`_VAULT/_AWS/_AZURE/_GCP/_FILE`).
     /// A token minted with one cluster's secret will not verify at another, so a
     /// per-remote credential cannot authenticate to the wrong cluster. Never
-    /// logged. Unset falls back to the shared CP-DP JWT secret.
+    /// logged. A `RemoteCluster` without a resolvable reference is not polled.
     pub mesh_remote_discovery_credentials: Option<String>,
     /// Stable, operator-visible identifier this cluster is known by to its
     /// multi-cluster peers — the value a peer puts in `RemoteCluster.name` when

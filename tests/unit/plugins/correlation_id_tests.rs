@@ -213,6 +213,21 @@ fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names
 }
 
 #[test]
+fn test_constructor_rejects_consumer_assertion_namespace_header_name() {
+    for header_name in [
+        "X-Consumer-Request-Id",
+        "x-consumer-trace",
+        "X_Consumer_Trace",
+        "x_consumer-trace",
+    ] {
+        let err = CorrelationId::new(&json!({"header_name": header_name}))
+            .err()
+            .expect("an x-consumer-* correlation header must be rejected");
+        assert!(err.contains("`x-consumer-*`"), "{header_name}: {err}");
+    }
+}
+
+#[test]
 fn test_constructor_rejects_effective_real_ip_header_case_insensitively() {
     let error = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
         &json!({"header_name": " CF-Connecting-IP "}),

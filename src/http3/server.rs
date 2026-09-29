@@ -4714,20 +4714,16 @@ async fn handle_h3_request(
     // only removed the RAW client header BEFORE plugins ran, so an unauthenticated
     // route where a `before_proxy` transformer adds `x-consumer-*` or
     // `x-geo-country` would otherwise forward that plugin value to the backend —
-    // the exact spoofing path. The strip is case-insensitive (the gateway
-    // injects mixed-case keys; the H3 wire and plugins use lowercase). To
-    // preserve the zero-alloc hot path, only materialize/scrub when an
-    // assertion must be injected OR a reserved header is actually present in
-    // the effective source.
+    // the exact spoofing path. The strip covers the whole `x-consumer-*`
+    // namespace and is case-insensitive (the gateway injects mixed-case keys;
+    // the H3 wire and plugins use lowercase). To preserve the zero-alloc hot
+    // path, only materialize/scrub when an assertion must be injected OR a
+    // reserved header is actually present in the effective source.
     let source_has_reserved_assertion = owned_proxy_headers
         .as_ref()
         .unwrap_or(&ctx.headers)
         .keys()
-        .any(|k| {
-            k.eq_ignore_ascii_case("x-consumer-username")
-                || k.eq_ignore_ascii_case("x-consumer-custom-id")
-                || k.eq_ignore_ascii_case("x-geo-country")
-        });
+        .any(|k| crate::proxy::headers::is_gateway_assertion_header(k));
     if ctx.backend_consumer_username().is_some()
         || ctx.backend_geo_country().is_some()
         || source_has_reserved_assertion

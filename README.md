@@ -95,7 +95,7 @@ ferrum-edge version
 
 Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64. Releases ship raw platform binaries plus adjacent `.sha256` checksum files (for example `ferrum-edge-linux-x86_64` and `ferrum-edge-linux-x86_64.sha256`).
 
-Pin an explicit release tag in download URLs. Production artifacts are published only for version tags; main CI does not publish a moving `latest` build. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
+Pin an explicit release tag in download URLs. Binaries are published only for version tags; main does not publish a moving `latest` binary release. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
 
 Feature availability by release: resource labels (`labels` / `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig, [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483)) require **v0.9.5 or later**; artifacts through v0.9.4 reject `labels` with ``unknown field `labels` ``. See the [upgrade guidance](docs/upgrade_guide.md#upgrading-to-095) for database and CP/DP rollout requirements. Companion clients that inject `labels.provisioned-by` require matching gateway builds: Git Forge Ops ≥ [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218), Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), and Foundry ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
 
@@ -117,10 +117,12 @@ Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86
 ### Docker
 
 Choose a completed published version, not a source tag or chart `appVersion`
-that is still in release preparation. The container tag `latest` is retired:
-neither main CI nor versioned releases advance it. Any existing `latest` image
-is a historical artifact and does not receive subsequent fixes. Omitting a tag
-also selects `latest`, so always specify a published version or image digest.
+that is still in release preparation. The container tag `latest` moves forward
+to the newest `main` commit that passed CI and was built and signed (each built
+commit also gets a `main-<sha>` tag; intermediate commits may be skipped): a
+moving development channel for evaluation, not a release. Omitting a tag
+also selects `latest`, so for production always specify a published version or
+image digest.
 
 Versioned releases publish `vX.Y.Z`, `X.Y.Z`, and the moving `X.Y` series alias
 (for example, `0.9`). Pin the full version or digest for reproducible deployments;

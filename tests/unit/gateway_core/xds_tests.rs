@@ -174,9 +174,9 @@ fn translators_emit_all_phase_b_type_urls() {
 fn mesh_config_extension_configs_are_served_as_ecds_resources() {
     let mut config = gateway_config();
     config.mesh.as_mut().expect("mesh config").extension_configs = vec![MeshExtensionConfig {
-        name: "dr-carrier-api".to_string(),
+        name: "ext-api".to_string(),
         namespace: "default".to_string(),
-        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
         value: b"{\"name\":\"api\"}".to_vec(),
     }];
 
@@ -196,7 +196,7 @@ fn mesh_config_extension_configs_are_served_as_ecds_resources() {
         .map(|r| r.name.as_str())
         .filter(|name| !name.starts_with("ferrum-mesh-carrier/"))
         .collect();
-    assert_eq!(operator_configs, vec!["dr-carrier-api"]);
+    assert_eq!(operator_configs, vec!["ext-api"]);
 }
 
 #[test]
@@ -536,8 +536,10 @@ fn phase_b_conformance_stubs_cover_known_xds_edges() {
 // `MeshSlice.extension_configs`. The translator emits one ECDS resource per
 // entry; downstream xDS consumers subscribe under `ECDS_TYPE_URL` and
 // dispatch on the inner `typed_config.type_url`. The DR-carrier path
-// (GAP-2K) uses `FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` to wrap the original
-// DestinationRule JSON when full DR semantics are required across xDS.
+// (GAP-2K) uses `FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` under reserved names
+// only, so operator entries declaring that type_url are skipped.
+
+const OPERATOR_EXTENSION_TYPE_URL: &str = "type.googleapis.com/example.OperatorExtension";
 
 fn slice_with_extension_configs(configs: Vec<MeshExtensionConfig>) -> MeshSlice {
     let request = MeshSliceRequest {
@@ -587,15 +589,15 @@ fn translator_emits_labels_carrier_when_slice_has_no_extension_configs() {
 fn translator_emits_one_ecds_resource_per_extension_config() {
     let slice = slice_with_extension_configs(vec![
         MeshExtensionConfig {
-            name: "dr-carrier-api".to_string(),
+            name: "ext-api".to_string(),
             namespace: "default".to_string(),
-            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
             value: b"{\"name\":\"api\"}".to_vec(),
         },
         MeshExtensionConfig {
-            name: "dr-carrier-admin".to_string(),
+            name: "ext-admin".to_string(),
             namespace: "default".to_string(),
-            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
             value: b"{\"name\":\"admin\"}".to_vec(),
         },
     ]);
@@ -606,7 +608,7 @@ fn translator_emits_one_ecds_resource_per_extension_config() {
         .map(|r| r.name.clone())
         .filter(|name| !name.starts_with("ferrum-mesh-carrier/"))
         .collect();
-    assert_eq!(names, vec!["dr-carrier-admin", "dr-carrier-api"]);
+    assert_eq!(names, vec!["ext-admin", "ext-api"]);
 }
 
 #[test]
@@ -615,13 +617,13 @@ fn translator_skips_duplicate_extension_config_names() {
         MeshExtensionConfig {
             name: "dup".to_string(),
             namespace: "default".to_string(),
-            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
             value: b"{\"name\":\"first\"}".to_vec(),
         },
         MeshExtensionConfig {
             name: "dup".to_string(),
             namespace: "default".to_string(),
-            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
             value: b"{\"name\":\"second\"}".to_vec(),
         },
     ]);
@@ -650,9 +652,15 @@ fn translator_skips_extension_configs_that_impersonate_slice_carriers() {
             value: b"{}".to_vec(),
         },
         MeshExtensionConfig {
-            name: "dr-carrier-api".to_string(),
+            name: "operator-dr".to_string(),
             namespace: "default".to_string(),
             type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            value: b"{\"name\":\"api\"}".to_vec(),
+        },
+        MeshExtensionConfig {
+            name: "ext-api".to_string(),
+            namespace: "default".to_string(),
+            type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
             value: b"{\"name\":\"api\"}".to_vec(),
         },
     ]);
@@ -663,16 +671,18 @@ fn translator_skips_extension_configs_that_impersonate_slice_carriers() {
         .map(|r| r.name.clone())
         .filter(|name| !name.starts_with("ferrum-mesh-carrier/"))
         .collect();
-    assert_eq!(names, vec!["dr-carrier-api"]);
+    // The DestinationRule type_url is reserved for the CP's own
+    // `ferrum-destination-rule-carrier/*` resources.
+    assert_eq!(names, vec!["ext-api"]);
 }
 
 #[test]
 fn translator_round_trips_typed_extension_config_payload() {
     let inner_value = b"{\"trafficPolicy\":{\"tls\":{\"mode\":\"ISTIO_MUTUAL\"}}}";
     let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
-        name: "dr-carrier-reviews".to_string(),
+        name: "ext-reviews".to_string(),
         namespace: "default".to_string(),
-        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
         value: inner_value.to_vec(),
     }]);
     let snapshot = translate_mesh_slice_to_snapshot(&slice);
@@ -680,9 +690,9 @@ fn translator_round_trips_typed_extension_config_payload() {
     let entry = resources.first().expect("ECDS resource");
     let decoded = proto::TypedExtensionConfig::decode(entry.value.as_slice())
         .expect("ECDS payload should decode as TypedExtensionConfig");
-    assert_eq!(decoded.name, "dr-carrier-reviews");
+    assert_eq!(decoded.name, "ext-reviews");
     let typed_config = decoded.typed_config.expect("inner Any should be set");
-    assert_eq!(typed_config.type_url, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL);
+    assert_eq!(typed_config.type_url, OPERATOR_EXTENSION_TYPE_URL);
     assert_eq!(typed_config.value, inner_value.to_vec());
 }
 
@@ -701,7 +711,7 @@ fn translator_round_trips_binary_value_bytes() {
     let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
         name: "binary".to_string(),
         namespace: "default".to_string(),
-        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
         value: binary.clone(),
     }]);
     let snapshot = translate_mesh_slice_to_snapshot(&slice);
@@ -721,7 +731,7 @@ fn translator_emits_empty_value_when_extension_has_no_inner_bytes() {
     let slice = slice_with_extension_configs(vec![MeshExtensionConfig {
         name: "no-bytes".to_string(),
         namespace: "default".to_string(),
-        type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+        type_url: OPERATOR_EXTENSION_TYPE_URL.to_string(),
         value: Vec::new(),
     }]);
     let snapshot = translate_mesh_slice_to_snapshot(&slice);

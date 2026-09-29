@@ -41,11 +41,17 @@ from pr_ci_plan import (
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
 )
+from validate_migrate_k8s_contract import (
+    run_self_test as published_image_tags_self_test,
+)
 from verify_coverage_workflow import (
     main as coverage_workflow_main,
 )
 from verify_mesh_performance_baselines_workflow import (
     main as mesh_baselines_workflow_main,
+)
+from verify_main_latest_image_workflow import (
+    main as main_latest_image_workflow_main,
 )
 from verify_install_docs_contract import (
     run_self_test as install_docs_contract_self_test,
@@ -2225,6 +2231,11 @@ def main() -> int:
         planner_errors.append("coverage workflow verifier self-test failed")
     if coverage_workflow_main([]) != 0:
         planner_errors.append("coverage workflow shard-plan contract failed")
+    if main_latest_image_workflow_main(["--self-test"]) != 0:
+        planner_errors.append("main latest image publisher self-test failed")
+    if main_latest_image_workflow_main([]) != 0:
+        planner_errors.append("main latest image publisher contract failed")
+    planner_errors.extend(published_image_tags_self_test())
     if ci_runtime_cache_main(["--self-test"]) != 0:
         planner_errors.append("CI runtime cache contract self-test failed")
     if ci_runtime_cache_main([]) != 0:

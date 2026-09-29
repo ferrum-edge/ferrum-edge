@@ -2,7 +2,8 @@ image:
   repository: ferrumedge/ferrum-edge
   # Defaults to the chart appVersion when empty. That tag must exist in the
   # container registry. Override with a published tag (for example
-  # --set image.tag=<tag>). The registry's latest tag is retired.
+  # --set image.tag=<tag>). The latest tag is a moving development build of
+  # main, not a release; pin a published version or digest.
   tag: ""
   pullPolicy: IfNotPresent
   # Names of imagePullSecrets to attach to the pod.

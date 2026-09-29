@@ -7474,13 +7474,7 @@ fn telemetry_tracing_provider(
             TracingProvider::Zipkin { url }
         }
         "datadog" => {
-            let agent_url = telemetry_provider_string_field_aliased(
-                object,
-                entry,
-                "datadog",
-                "agentUrl",
-                &["agent_url"],
-            )?;
+            let agent_url = telemetry_provider_string_field(object, entry, "datadog", "agentUrl")?;
             let service = entry
                 .get("service")
                 .and_then(Value::as_str)
@@ -7488,20 +7482,10 @@ fn telemetry_tracing_provider(
             TracingProvider::Datadog { agent_url, service }
         }
         "lightstep" => {
-            let collector_url = telemetry_provider_string_field_aliased(
-                object,
-                entry,
-                "lightstep",
-                "collectorUrl",
-                &["collector_url"],
-            )?;
-            let access_token_env = telemetry_provider_string_field_aliased(
-                object,
-                entry,
-                "lightstep",
-                "accessTokenEnv",
-                &["access_token_env"],
-            )?;
+            let collector_url =
+                telemetry_provider_string_field(object, entry, "lightstep", "collectorUrl")?;
+            let access_token_env =
+                telemetry_provider_string_field(object, entry, "lightstep", "accessTokenEnv")?;
             TracingProvider::Lightstep {
                 collector_url,
                 access_token_env,
@@ -7612,36 +7596,22 @@ fn telemetry_tracing_mode(
     }
 }
 
+/// Read a required camelCase string field. Non-empty after trim is required.
+/// The returned value is trimmed so stray whitespace in CRDs (e.g.
+/// `"url": " http://zipkin:9411 "`) does not propagate into pool keys, DNS
+/// resolvers, or URL parsers downstream.
 fn telemetry_provider_string_field(
     object: &K8sObject,
     entry: &Value,
     provider_name: &str,
     field: &str,
 ) -> Result<String, K8sTranslateError> {
-    telemetry_provider_string_field_aliased(object, entry, provider_name, field, &[])
-}
-
-/// Read a required string field, trying the canonical (camelCase) name first
-/// then any provided aliases. Non-empty after trim is required. The returned
-/// value is trimmed so stray whitespace in CRDs (e.g. `"url": " http://zipkin:9411 "`)
-/// does not propagate into pool keys, DNS resolvers, or URL parsers downstream.
-fn telemetry_provider_string_field_aliased(
-    object: &K8sObject,
-    entry: &Value,
-    provider_name: &str,
-    field: &str,
-    aliases: &[&str],
-) -> Result<String, K8sTranslateError> {
-    std::iter::once(field)
-        .chain(aliases.iter().copied())
-        .find_map(|name| {
-            entry
-                .get(name)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
+    entry
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| {
             invalid_resource(
                 object,
@@ -11697,11 +11667,10 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tracing_datadog_snake_case_alias_still_accepted() {
-        // Backward compat: operators who wrote against the first draft used
-        // `agent_url`. The translator accepts both spellings so manifests
-        // captured before the camelCase canonicalisation keep working.
-        let result = translate_k8s_objects(
+    fn telemetry_tracing_datadog_snake_case_spelling_is_rejected() {
+        // Only the camelCase `agentUrl` spelling is accepted; `agent_url` is
+        // not an alias and leaves the required field missing.
+        let err = translate_k8s_objects(
             &[object(
                 "Telemetry",
                 serde_json::json!({
@@ -11715,21 +11684,13 @@ mod tests {
             )],
             options(),
         )
-        .expect("translation succeeds");
+        .expect_err("snake_case spelling should fail closed");
 
-        let mesh = result.config.mesh.expect("mesh config");
-        let tracing = mesh.telemetry_resources[0]
-            .config
-            .tracing
-            .as_ref()
-            .expect("tracing config");
-        match tracing.providers.first().expect("provider translated") {
-            TracingProvider::Datadog { agent_url, service } => {
-                assert_eq!(agent_url, "http://datadog-agent:8126");
-                assert!(service.is_none(), "service omitted in manifest");
-            }
-            other => panic!("expected Datadog, got {other:?}"),
-        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agentUrl"),
+            "error must mention missing field: {msg}"
+        );
     }
 
     #[test]

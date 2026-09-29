@@ -7332,6 +7332,12 @@ struct RequestConnectionMetadata {
 static H1_FRAMING_OBSERVER_FAILED_WARN: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
     crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
 
+/// Rate-limits the warning for a mesh inbound request refused because its port
+/// signal names no mesh-routable port of the local service (or a multi-port
+/// service got no signal), so the 502 is diagnosable without debug logging.
+static MESH_INBOUND_PORT_REJECT_WARN: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
+    crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
+
 /// RFC 9112 §6.1 requires closing after any HTTP/1 CL+TE response, even
 /// when Hyper drained the body according to Transfer-Encoding. A peer honoring
 /// Content-Length could place the next request boundary elsewhere, so no
@@ -16975,17 +16981,24 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
+/// Drop every gateway assertion (the whole `x-consumer-*` namespace plus
+/// `x-geo-country`), in any case variant, from a plugin-mutable header map.
 fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
-    headers.retain(|name, _| {
-        !name.eq_ignore_ascii_case("x-consumer-username")
-            && !name.eq_ignore_ascii_case("x-consumer-custom-id")
-            && !name.eq_ignore_ascii_case("x-geo-country")
-    });
+    headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));
 }
 
 /// Remove plugin-controlled gateway assertion headers and restore only the
 /// authenticated principal and private GeoIP lookup result for dispatch.
-pub(crate) fn refresh_backend_gateway_assertion_headers(
+///
+/// Every `x-consumer-*` name is gateway-owned, so a plugin- or config-authored
+/// `x-consumer-role` is dropped here exactly like a forged
+/// `x-consumer-username`; only the authenticated `x-consumer-username` /
+/// `x-consumer-custom-id` are written back.
+///
+/// `pub` (rather than `pub(crate)`) only so the external
+/// `tests/unit/gateway_core` target can exercise it; not a supported API.
+#[doc(hidden)]
+pub fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
@@ -16996,11 +17009,9 @@ pub(crate) fn refresh_backend_gateway_assertion_headers(
     let geo_country = ctx.backend_geo_country().map(str::to_string);
     let source_has_reserved_assertion = principal_username.is_none()
         && geo_country.is_none()
-        && headers.keys().any(|name| {
-            name.eq_ignore_ascii_case("x-consumer-username")
-                || name.eq_ignore_ascii_case("x-consumer-custom-id")
-                || name.eq_ignore_ascii_case("x-geo-country")
-        });
+        && headers
+            .keys()
+            .any(|name| headers_mod::is_gateway_assertion_header(name));
     if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
         return;
     }
@@ -32619,6 +32630,17 @@ async fn handle_proxy_request_inner(
                         client_ip = %ctx.client_ip,
                         "Mesh inbound port selection failed; rejecting inbound request"
                     );
+                    let now_ms = crate::socket_opts::monotonic_now_ms();
+                    if let Some(suppressed) = MESH_INBOUND_PORT_REJECT_WARN.on_event(now_ms) {
+                        warn!(
+                            proxy_id = %representative_id.id,
+                            orig_dst_port = ?ctx.orig_dst.map(|addr| addr.port()),
+                            authority_port = ?authority_port,
+                            reason = ?reason,
+                            suppressed,
+                            "Rejected mesh inbound request: its port signal (or its absence) matches no mesh-routable port of the local service"
+                        );
+                    }
                     state.request_count.fetch_add(1, Ordering::Relaxed);
                     let body: &[u8] = match reason {
                         crate::router_cache::MeshInboundPortSelectError::PortSignalUnavailable => {
@@ -34136,11 +34158,9 @@ async fn handle_proxy_request_inner(
     // authenticated principal and private GeoIP result. The common
     // no-assertion path avoids materializing an owned header map.
     let effective_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
-    let source_has_reserved_assertion = effective_headers.keys().any(|name| {
-        name.eq_ignore_ascii_case("x-consumer-username")
-            || name.eq_ignore_ascii_case("x-consumer-custom-id")
-            || name.eq_ignore_ascii_case("x-geo-country")
-    });
+    let source_has_reserved_assertion = effective_headers
+        .keys()
+        .any(|name| headers_mod::is_gateway_assertion_header(name));
     if ctx.backend_consumer_username().is_some()
         || ctx.backend_geo_country().is_some()
         || source_has_reserved_assertion

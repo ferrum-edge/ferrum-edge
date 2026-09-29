@@ -8,7 +8,10 @@ deprecations are announced, and how security fixes reach released versions.
 > exact-commit validation. Tag existence does not establish successful artifact
 > publication; verify the version's workflow and
 > [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases).
-> Historical `latest` artifacts may remain but are not refreshed by main.
+> The `latest` container tag follows `main` (the newest built commit that
+> passed CI and was signed; intermediate commits may be skipped); it is a
+> development channel, not a release. The historical `latest` GitHub prerelease
+> is not refreshed.
 > The "After 1.0" commitments below remain **proposed**; pre-1.0 tags do not
 > activate them.
 
@@ -63,7 +66,8 @@ metric contract against
 | Artifact | What it is | Use in production? |
 |---|---|---|
 | Published `vX.Y.Z` release and container image | version-tag workflow output after validation | Pin the published version or digest and review its build-out limitations |
-| Historical `latest` release/container tag | retained old artifact; main no longer refreshes it | No — not a current release or update channel |
+| `latest` / `main-<sha>` container tags | development build of the newest built `main` commit that passed CI; `latest` may skip intermediate commits and `main-<sha>` exists only for built commits | No — a moving development channel, not a release or update channel |
+| Historical `latest` GitHub prerelease | retained old binaries; not refreshed | No |
 | Source at a commit | source identity, not proof of a published artifact | Pin the commit and validate your own build |
 
 The Helm chart defaults to `Chart.appVersion`, which may name a version still in

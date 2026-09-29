@@ -277,7 +277,7 @@ impl MeshServiceDiscoverer {
     /// (`crate::modes::mesh::append_cross_cluster_mesh_targets_prematched`):
     /// reachability-filter, group per `(network, trust_domain)`, ONE target per
     /// group at the remote east-west gateway endpoint, tagged
-    /// `mesh.cross_cluster=true` + `mesh.eastwest_sni=<service FQDN>` +
+    /// `mesh.cross_cluster=true` + `mesh.eastwest_sni=<per-port alias>` +
     /// `mesh.mtls_port=<gateway port>` + `mesh.remote=true` with NO pinned pod
     /// SPIFFE (trust-domain-only verification). Do not fork that logic here.
     ///
@@ -295,11 +295,9 @@ impl MeshServiceDiscoverer {
     /// unify them — only the SD path routes around the ref-only one.
     ///
     /// BRIDGEABILITY (fail closed otherwise, one-time warn): the east-west
-    /// model routes each HTTP-family service port on its own SNI — a
-    /// single-HTTP-port service on the bare base FQDN, every port of a
-    /// multi-port service on its explicit `p<port>.<fqdn>` alias
-    /// (`cross_cluster_service_sni`; multi-port east-west, issue #2010 phase
-    /// 3) — and only over the HTTP-family cross-cluster dial. So the bridge
+    /// model routes each HTTP-family service port on its own explicit
+    /// `p<port>.<fqdn>` SNI alias (`cross_cluster_service_sni`; issue #2010
+    /// phase 3) — and only over the HTTP-family cross-cluster dial. So the bridge
     /// runs ONLY when the snapshot carries `mesh.multi_cluster` AND this
     /// upstream's selected service port is effective-HTTP-family
     /// (`protocol_overrides` applied, via the shared
@@ -423,10 +421,10 @@ impl MeshServiceDiscoverer {
         // bridge could not select it (fail closed with no path).
         let base_fqdn =
             crate::modes::mesh::cross_cluster_service_base_fqdn(service, &self.cluster_domain);
-        // The per-port alias only differs from the base for a MULTI-port service's
-        // selected HTTP-family port; fall back to the base FQDN alone when the
-        // selected port is absent or not HTTP-family (the bridge itself then stays
-        // fail-closed regardless, so the base-only judgment is safe).
+        // Judge by the selected HTTP-family port's alias; fall back to the base
+        // FQDN alone when the selected port is absent, not HTTP-family, or on
+        // an ambiguous alias (the bridge itself then stays fail-closed
+        // regardless, so the base-only judgment is safe).
         let dial_sni = selected_service_port
             .and_then(|selected| selected.service_port)
             .and_then(|port| {
@@ -434,15 +432,15 @@ impl MeshServiceDiscoverer {
                     .into_iter()
                     .find(|sp| sp.port == port)
             })
-            .map(|service_port| {
+            .and_then(|service_port| {
                 crate::modes::mesh::cross_cluster_service_sni(
                     service,
                     service_port,
                     &self.cluster_domain,
                 )
             });
-        let dial_sni = dial_sni.as_deref().unwrap_or(&base_fqdn);
-        let acceptable_snis = crate::modes::mesh::east_west_acceptable_snis(&base_fqdn, dial_sni);
+        let acceptable_snis =
+            crate::modes::mesh::east_west_acceptable_snis(&base_fqdn, dial_sni.as_deref());
         !crate::modes::mesh::east_west_gateway_governs_network(
             multi_cluster,
             workload.network.as_deref(),

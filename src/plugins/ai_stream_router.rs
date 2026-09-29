@@ -3766,13 +3766,10 @@ pub(crate) fn strip_client_credentials(headers: &mut HashMap<String, String>) {
 /// provider boundary. `before_proxy` sets
 /// `SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY` so proxy core stops
 /// appending them; this strip additionally removes any value a later generic
-/// header rule reintroduced (`GHSA-xhp5-hqj8-3mwg`).
+/// header rule reintroduced (`GHSA-xhp5-hqj8-3mwg`). It covers the whole
+/// gateway-owned `x-consumer-*` namespace, not only the two identity fields.
 pub(crate) fn strip_gateway_identity_assertions(headers: &mut HashMap<String, String>) {
-    headers.retain(|name, _| {
-        !name.eq_ignore_ascii_case("x-consumer-username")
-            && !name.eq_ignore_ascii_case("x-consumer-custom-id")
-            && !name.eq_ignore_ascii_case("x-geo-country")
-    });
+    headers.retain(|name, _| !crate::proxy::headers::is_gateway_assertion_header(name));
 }
 
 /// The complete set of request headers this plugin owns at the provider

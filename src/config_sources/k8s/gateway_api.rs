@@ -5954,6 +5954,13 @@ pub(crate) fn parse_gateway_api_duration_ms(value: &str) -> Option<u64> {
 /// punch a hole in the proxy boundary; the route is refused rather than
 /// silently dropping that one entry.
 ///
+/// Request-side `set` / `add` refuse the gateway-owned `x-consumer-*` consumer
+/// assertion namespace ([`crate::proxy::headers::is_consumer_assertion_header`],
+/// which also treats `_` as `-`). `mesh_route_dispatch` refuses the same
+/// destination when it is constructed, so admitting it here would emit a
+/// plugin config that fails the whole plugin-cache build instead of refusing
+/// this one route. `remove` stays allowed: the client value is already gone.
+///
 /// Response-side `set` / `add` / `remove` also refuse the gRPC terminal status
 /// fields ([`GRPC_TERMINAL_STATUS_FIELDS`]). In a Trailers-Only response —
 /// how a gRPC server reports most errors — those fields travel in the one
@@ -6007,6 +6014,14 @@ fn ensure_header_modifier_filter(
                     object,
                     format!(
                         "{where_}.name {UNSUPPORTED_SHAPE_MARKER}: hop-by-hop and framing response headers are protocol-managed and cannot be set by a route filter"
+                    ),
+                ));
+            }
+            if !response_side && crate::proxy::headers::is_consumer_assertion_header(name) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{where_}.name {UNSUPPORTED_SHAPE_MARKER}: the `x-consumer-*` request-header namespace is gateway-owned consumer assertion metadata and cannot be set by a route filter"
                     ),
                 ));
             }
