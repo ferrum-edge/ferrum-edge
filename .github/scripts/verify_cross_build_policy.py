@@ -109,6 +109,22 @@ WORKFLOW_CONTRACTS = (
     ),
 )
 
+# The one admitted addition to a protected top-level env: the BoringCache
+# kill switch, appended verbatim. Composite actions cannot read `vars`, so the
+# workflow maps the repository variable into every job; Cross never reads it.
+CI_BORINGCACHE_TOGGLE_ENV = (
+    "  # Composite actions cannot read `vars`; setup-boringcache reads this switch.\n"
+    "  BORINGCACHE_ENABLED: ${{ vars.BORINGCACHE_ENABLED }}\n"
+)
+
+
+def protected_top_level_env(block: str) -> str:
+    """Compare a protected env with only the exact trailing toggle removed."""
+    if block.endswith(CI_BORINGCACHE_TOGGLE_ENV):
+        return block[: -len(CI_BORINGCACHE_TOGGLE_ENV)]
+    return block
+
+
 DOCKER_ARTIFACT_MATRIX = (
     "    strategy:\n"
     "      fail-fast: false\n"
@@ -18642,7 +18658,9 @@ def validate_workflow_contract(
     errors.extend(env_failures)
     if not env_failures:
         assert env_block is not None
-        actual_env = hashlib.sha256(env_block.encode("utf-8")).hexdigest()
+        actual_env = hashlib.sha256(
+            protected_top_level_env(env_block).encode("utf-8")
+        ).hexdigest()
         if actual_env != expected_env_sha256:
             errors.append(
                 f"{source} top-level env differs from the trusted ARM64 host "
@@ -19276,7 +19294,11 @@ def compare_pr_workflow_job(
     errors.extend(baseline_env_failures)
     errors.extend(proposed_env_failures)
     if not baseline_env_failures and not proposed_env_failures:
-        if baseline_env != proposed_env:
+        if baseline_env != proposed_env and (
+            baseline_env is None
+            or proposed_env is None
+            or protected_top_level_env(baseline_env) != protected_top_level_env(proposed_env)
+        ):
             errors.append(
                 f"{source} top-level env cannot be changed by a pull request because "
                 "it is inherited by the protected ARM64 invocation"
@@ -20286,6 +20308,34 @@ pre_build = []
         "protected-arm",
     ):
         failures.append("merge-base comparison allowed a protected top-level env edit")
+    toggled_env = workflow.replace(
+        "  FIXED_INPUT: approved\n", "  FIXED_INPUT: approved\n" + CI_BORINGCACHE_TOGGLE_ENV
+    )
+    if compare_pr_workflow_job(workflow, toggled_env, "current workflow", "protected-arm"):
+        failures.append("merge-base comparison rejected the exact BoringCache toggle")
+    if validate_workflow_contract(
+        toggled_env, "self-test workflow", "protected-arm",
+        protected_hash, protected_env_hash, protected_trigger_hash,
+    ):
+        failures.append("trusted revalidation rejected the exact BoringCache toggle")
+    for toggle_tamper in (
+        toggled_env.replace("vars.BORINGCACHE_ENABLED", "vars.OTHER"),
+        toggled_env.replace("${{ vars.BORINGCACHE_ENABLED }}", "false"),
+        toggled_env.replace(
+            CI_BORINGCACHE_TOGGLE_ENV, CI_BORINGCACHE_TOGGLE_ENV + "  BASH_ENV: ./attacker.sh\n"
+        ),
+        toggled_env.replace(
+            "  FIXED_INPUT: approved\n" + CI_BORINGCACHE_TOGGLE_ENV,
+            CI_BORINGCACHE_TOGGLE_ENV + "  FIXED_INPUT: approved\n",
+        ),
+    ):
+        if not compare_pr_workflow_job(
+            workflow, toggle_tamper, "current workflow", "protected-arm"
+        ) or not validate_workflow_contract(
+            toggle_tamper, "self-test workflow", "protected-arm",
+            protected_hash, protected_env_hash, protected_trigger_hash,
+        ):
+            failures.append("a tampered BoringCache toggle was admitted")
     changed_trigger = workflow.replace("branches: [main]", "branches: [attacker]")
     if not compare_pr_workflow_job(
         workflow,
