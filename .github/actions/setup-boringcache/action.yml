@@ -22,7 +22,7 @@ runs:
           enabled=true
         fi
         echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
-        echo "FERRUM_BORINGCACHE_ENABLED=$enabled" >> "$GITHUB_ENV"
+        echo "CI_BORINGCACHE_ENABLED=$enabled" >> "$GITHUB_ENV"
         if [ "$enabled" = true ]; then
           echo 'Cache backend: BoringCache (OIDC)' >> "$GITHUB_STEP_SUMMARY"
         else
