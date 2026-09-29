@@ -32,6 +32,8 @@ env:
   # Rationale and the failure mode live in .cargo/config.toml.
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
+  # Composite actions cannot read `vars`; setup-boringcache reads this switch.
+  BORINGCACHE_ENABLED: ${{ vars.BORINGCACHE_ENABLED }}
 
 jobs:
   ci-plan:
