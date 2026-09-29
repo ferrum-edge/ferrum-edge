@@ -6,6 +6,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 
 - [Pipeline Overview](#pipeline-overview)
 - [Workflow Inventory](#workflow-inventory)
+- [BoringCache CI enrollment](#boringcache-ci-enrollment)
 - [CI runtime caching (production images and FIPS)](#ci-runtime-caching-production-images-and-fips)
 - [CI Pipeline (ci.yml)](#ci-pipeline-ciyml)
 - [Release Pipeline (release.yml)](#release-pipeline-releaseyml)
@@ -48,6 +49,7 @@ adding, removing, or materially changing a workflow.
 | `coverage.yml` | Coverage | PRs, `merge_group`, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs and merge-queue groups. |
 | `fips-build.yml` | FIPS Build Policy | PRs, `merge_group`, push to `main`, manual | Required FIPS feature-graph audit plus compile/clippy/handshake gate. Warm PR target <=30 minutes (p95 <=45); see [CI runtime caching](#ci-runtime-caching-production-images-and-fips). |
 | `release-dispatch.yml` | Start Production Release | Manual version input | Validate the selected main SHA and create its version tag. |
+| `boringcache-connect.yml` | Connect BoringCache | Manual (`workflow_dispatch` on upstream `main` only) | One-time browser-approved GitHub Actions OIDC enrollment into a BoringCache Machine connection. |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
@@ -268,6 +270,35 @@ Manual Start Production Release on main (version input, e.g. v0.2.0)
                                                 requires attestation success
                                                 (retracts an unverified release)
 ```
+
+## BoringCache CI enrollment
+
+**Connect BoringCache** links GitHub Actions' existing OIDC identity for
+`ferrum-edge/ferrum-edge` to the BoringCache Workspace `jeremy-j/ferrum-edge`.
+The enrollment workflow installs the SHA-256-verified v1.32.0 Linux CLI and
+grants `id-token: write` only to its manual enrollment job. It needs no
+BoringCache repository secret and runs only in the upstream repository on `main`.
+
+After merging the workflow:
+
+1. Open **Actions → Connect BoringCache → Run workflow**, select `main`, and
+   start the run.
+2. Open the **Enroll GitHub Actions Machine connection** step's live log.
+   While the job waits, open the verification URL printed by
+   `boringcache ci connect --oidc-provider github-actions`.
+3. Sign in to BoringCache, approve GitHub repository `ferrum-edge/ferrum-edge`,
+   and select Workspace `jeremy-j/ferrum-edge`.
+4. Wait for the job to succeed, then verify the repository and Workspace in
+   BoringCache's **Machine connections**. If the browser approval expires,
+   rerun the workflow and use its new verification URL.
+
+Enrollment is a one-time operation. It establishes the Machine connection;
+cache integration is a separate change tracked in
+[PR #5885](https://github.com/ferrum-edge/ferrum-edge/pull/5885). Once that
+integration is configured, `boringcache/one` starts and renews its OIDC session
+for each supported CI job. See the
+[BoringCache enrollment reference](https://boringcache.com/docs/cli) and
+[GitHub Actions guide](https://boringcache.com/docs/github-actions).
 
 ## CI runtime caching (production images and FIPS)
 
