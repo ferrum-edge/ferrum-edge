@@ -6812,7 +6812,7 @@ jobs:
       - name: Build BPF programs
         run: |
           if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
-            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf --skip-save +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
           else
             cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
           fi
@@ -6820,7 +6820,7 @@ jobs:
       - name: Test shared types
         run: |
           if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
-            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf test -p ferrum-ebpf-common
+            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf --skip-restore test -p ferrum-ebpf-common
           else
             cd ebpf && cargo test -p ferrum-ebpf-common
           fi
@@ -6906,7 +6906,7 @@ jobs:
       - name: Build BPF programs (kernel object)
         run: |
           if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
-            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf-live +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf-live --skip-restore --skip-save +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
           else
             cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
           fi
@@ -7388,6 +7388,7 @@ jobs:
           else
             cargo check --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
           fi
+        shell: bash
 
       - name: Build fast verification binary
         if: github.event_name != 'merge_group' || runner.os != 'macOS'
@@ -7397,6 +7398,7 @@ jobs:
           else
             cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
           fi
+        shell: bash
 
       - name: Report compiler cache statistics
         if: always()
