@@ -330,10 +330,10 @@ groups, and manual runs restore only, including manual runs on `main`.
 **Fallback and rollback.** Fork pull requests, Dependabot, and jobs without
 both GitHub OIDC request capabilities skip BoringCache entirely. They restore
 the existing GitHub Rust caches where available and execute the same native
-Cargo commands and gates. To turn BoringCache off without changing YAML, set
-the repository Actions variable `BORINGCACHE_ENABLED` to `false` and rerun the
-affected jobs. Unset it or set it to `true` to resume. This applies to every
-integrated lane. The job summary records the selected backend without printing
+Cargo commands and gates. The setup action disables BoringCache when the job
+environment sets `BORINGCACHE_ENABLED` to `false`. Composite actions cannot read
+repository `vars`, and the trusted policy pins CI's top-level `env`, so wiring a
+repository variable into every lane needs a reviewed policy change. The job summary records the selected backend without printing
 credentials. A selected BoringCache session uses strict cache-error handling;
 authentication/backend errors fail visibly and never switch to static tokens.
 
