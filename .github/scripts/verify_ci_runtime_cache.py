@@ -3419,7 +3419,7 @@ def check_direct_rust_cache_diet(
     if cargo_profile is not None and BORINGCACHE_CARGO_PREFIX in job:
         require(len(blocks) == 1, f"{source} must keep one GitHub cache fallback", failures)
         require(
-            "if: env.FERRUM_BORINGCACHE_ENABLED != 'true'" in job,
+            "if: env.CI_BORINGCACHE_ENABLED != 'true'" in job,
             f"{source} must gate the GitHub cache fallback", failures,
         )
         require(
@@ -5304,7 +5304,7 @@ def self_test() -> int:
         f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries check\n"
         f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries build\n"
         f"      - uses: {RUST_CACHE}\n"
-        "        if: env.FERRUM_BORINGCACHE_ENABLED != 'true'\n"
+        "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n"
         "        with:\n          save-if: false\n"
     )
     for mutation in (

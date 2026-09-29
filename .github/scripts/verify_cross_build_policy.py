@@ -4525,7 +4525,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         uses: ./.github/actions/setup-boringcache
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: env.FERRUM_BORINGCACHE_ENABLED != 'true'
+        if: env.CI_BORINGCACHE_ENABLED != 'true'
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
@@ -4538,7 +4538,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
 
       - name: Install pinned cargo-fuzz
         run: |
-          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+          if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
             boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile tools install cargo-fuzz --locked --version 0.13.1
           else
             cargo install cargo-fuzz --locked --version 0.13.1
@@ -4550,7 +4550,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           set -euo pipefail
 
           property_started=$SECONDS
-          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+          if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
             boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-save test --locked
           else
             cargo test --locked
@@ -4707,7 +4707,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
 
           for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
             echo "Fuzz smoke target: ${fuzz_target}"
-            if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
               boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \
                 -runs=512 \
                 -max_total_time=8 \
@@ -4725,7 +4725,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           done
 
           echo "Fuzz smoke target: datagram_client_address"
-          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+          if [ "$CI_BORINGCACHE_ENABLED" = true ]; then
             boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore fuzz run --codegen-units 16 datagram_client_address -- \
               -runs=512 \
               -max_total_time=8 \
@@ -4770,7 +4770,7 @@ CI_FUZZ_SMOKE_JOB_GENERATIONS = (
 CI_FUZZ_CARGO_PREFIX = "boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz"
 
 
-CACHE_BRANCH_CONDITION = 'if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then'
+CACHE_BRANCH_CONDITION = 'if [ "$CI_BORINGCACHE_ENABLED" = true ]; then'
 CACHE_CARGO_PREFIX_PATTERN = re.compile(
     r"boringcache cargo --\$\{\{ github.event_name == 'push' && "
     r"github.ref == 'refs/heads/main' && 'write' \|\| 'read-only' \}\} "
@@ -14152,7 +14152,7 @@ LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
     (
         "setup-rust-ci/action.yml",
         "a3e8405d91f12f307f8ecd4f378ff930c4890d4a385b4c8a2bd1bc8531d92385",
-        "08312c6bcbbe9696cf1a93237bab5a52cbf87b3e2d565af5377ea5160821a520",
+        "e000a790508bff7ac54f55a8325b519c419f76a3d4c9c3987427f5c04ff9185f",
     ),
 )
 
@@ -21650,7 +21650,7 @@ pre_build = []
         (
             "setup-rust-ci/action.yml",
             "a3e8405d91f12f307f8ecd4f378ff930c4890d4a385b4c8a2bd1bc8531d92385",
-            "08312c6bcbbe9696cf1a93237bab5a52cbf87b3e2d565af5377ea5160821a520",
+            "e000a790508bff7ac54f55a8325b519c419f76a3d4c9c3987427f5c04ff9185f",
         ),
     ):
         failures.append(

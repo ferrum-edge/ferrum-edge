@@ -29,7 +29,7 @@ if [ "$CACHE_DISABLED" != true ] && [ "$OIDC_ELIGIBLE" = true ] && \
   enabled=true
 fi
 echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
-echo "FERRUM_BORINGCACHE_ENABLED=$enabled" >> "$GITHUB_ENV"
+echo "CI_BORINGCACHE_ENABLED=$enabled" >> "$GITHUB_ENV"
 if [ "$enabled" = true ]; then
   echo 'Cache backend: BoringCache (OIDC)' >> "$GITHUB_STEP_SUMMARY"
 else
@@ -44,7 +44,7 @@ LINT_CACHE_PREFIX = (
     "github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile lint "
 )
 LINT_CACHE_SCRIPT = (
-    'if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then\n'
+    'if [ "$CI_BORINGCACHE_ENABLED" = true ]; then\n'
     + ''.join('  ' + line + '\n' for line in
               LINT_NATIVE_SCRIPT.replace('cargo ', LINT_CACHE_PREFIX, 1).splitlines())
     + 'else\n'
@@ -300,7 +300,7 @@ class ContractTests(unittest.TestCase):
             '--profile "unit-$UNIT_SHARD" test $UNIT_PRECOMPILE_TARGETS --no-run'
         )
         branch = (
-            'if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then\n'
+            'if [ "$CI_BORINGCACHE_ENABLED" = true ]; then\n'
             f'  {cached}\nelse\n  {native}\nfi\n'
         )
         self.assertEqual(cargo_cache_branch_projection(branch), native + '\n')
@@ -440,7 +440,7 @@ class CacheBackendTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(Path(env['GITHUB_OUTPUT']).read_text(), f'enabled={enabled}\n')
                     self.assertEqual(Path(env['GITHUB_ENV']).read_text(),
-                                     f'FERRUM_BORINGCACHE_ENABLED={enabled}\n')
+                                     f'CI_BORINGCACHE_ENABLED={enabled}\n')
                     self.assertNotIn('test-capability', result.stdout + result.stderr)
 
     def test_every_wrapped_command_has_an_equivalent_native_branch(self):
@@ -448,7 +448,7 @@ class CacheBackendTests(unittest.TestCase):
         projected = cargo_cache_branch_projection(workflow)
         self.assertGreater(workflow.count('boringcache cargo '), 0)
         self.assertNotIn('boringcache cargo ', projected)
-        self.assertNotIn('if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then', projected)
+        self.assertNotIn('if [ "$CI_BORINGCACHE_ENABLED" = true ]; then', projected)
         profiles = tomllib.loads(Path('.boringcache.toml').read_text())['profiles']
         for profile in re.findall(r'--profile ([\w-]+)', workflow):
             if profile != 'pr-build':
@@ -473,7 +473,7 @@ class CacheBackendTests(unittest.TestCase):
                     result = subprocess.run(
                         ['bash', '-euo', 'pipefail', '-c', fixture],
                         env=dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
-                                 FERRUM_BORINGCACHE_ENABLED=enabled),
+                                 CI_BORINGCACHE_ENABLED=enabled),
                         capture_output=True, text=True,
                     )
                     self.assertEqual(result.returncode, 42, result.stderr)
