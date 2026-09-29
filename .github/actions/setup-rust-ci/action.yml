@@ -26,7 +26,7 @@ description: >-
 
 inputs:
   cache:
-    description: Restore and save the GitHub Rust cache
+    description: Use GitHub Rust cache; false selects BoringCache with a GitHub fallback when OIDC is unavailable
     required: false
     default: "true"
   shared-key:
@@ -242,8 +242,12 @@ runs:
       with:
         install-linux-packages: "false"
 
+    - name: BoringCache Cargo
+      if: inputs.cache == 'false'
+      uses: ./.github/actions/setup-boringcache
+
     - name: Cache Rust dependencies
-      if: inputs.cache == 'true'
+      if: inputs.cache == 'true' || env.FERRUM_BORINGCACHE_ENABLED != 'true'
       id: rust-cache
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
@@ -251,10 +255,6 @@ runs:
         workspaces: ${{ inputs.workspaces }}
         cache-on-failure: ${{ inputs.save == 'true' && inputs.cache-on-failure == 'true' }}
         save-if: ${{ inputs.save == 'true' && github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true }}
-
-    - name: BoringCache Cargo
-      if: inputs.cache == 'false'
-      uses: ./.github/actions/setup-boringcache
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
       shell: bash

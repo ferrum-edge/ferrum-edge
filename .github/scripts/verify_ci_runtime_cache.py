@@ -3416,8 +3416,12 @@ def check_direct_rust_cache_diet(
     cargo_profile: str | None = None,
 ) -> None:
     blocks = rust_cache_with_blocks(job)
-    if cargo_profile is not None:
-        require(not blocks, f"{source} must not duplicate BoringCache with rust-cache", failures)
+    if cargo_profile is not None and BORINGCACHE_CARGO_PREFIX in job:
+        require(len(blocks) == 1, f"{source} must keep one GitHub cache fallback", failures)
+        require(
+            "if: env.FERRUM_BORINGCACHE_ENABLED != 'true'" in job,
+            f"{source} must gate the GitHub cache fallback", failures,
+        )
         require(
             job.count("uses: ./.github/actions/setup-boringcache") == 1,
             f"{source} must install BoringCache exactly once", failures,
@@ -5299,6 +5303,9 @@ def self_test() -> int:
         "      - uses: ./.github/actions/setup-boringcache\n"
         f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries check\n"
         f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries build\n"
+        f"      - uses: {RUST_CACHE}\n"
+        "        if: env.FERRUM_BORINGCACHE_ENABLED != 'true'\n"
+        "        with:\n          save-if: false\n"
     )
     for mutation in (
         None,

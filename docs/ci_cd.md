@@ -292,13 +292,59 @@ After merging the workflow:
    BoringCache's **Machine connections**. If the browser approval expires,
    rerun the workflow and use its new verification URL.
 
-Enrollment is a one-time operation. It establishes the Machine connection;
-cache integration is a separate change tracked in
-[PR #5885](https://github.com/ferrum-edge/ferrum-edge/pull/5885). Once that
-integration is configured, `boringcache/one` starts and renews its OIDC session
-for each supported CI job. See the
+Enrollment is a one-time operation. It establishes the Machine connection.
+The Rust CI integration derives from
+[PR #5885](https://github.com/ferrum-edge/ferrum-edge/pull/5885).
+`boringcache/one` starts and renews its OIDC session for each supported CI job. See the
 [BoringCache enrollment reference](https://boringcache.com/docs/cli) and
 [GitHub Actions guide](https://boringcache.com/docs/github-actions).
+
+### BoringCache Rust CI rollout
+
+The full rollout uses the pinned v1.32.0 action and CLI for unit and ACME
+precompilation, secret/backend and service integration, PKCS#11, native test
+archives, conformance, dependency audit, vendored patches, Lint, Fuzz Smoke,
+eBPF builds and live tests, network-namespace and two-cluster tests, and native
+platform binaries. Integration and functional shards reuse the native archives
+produced by the cached test-artifact build. Existing test selection, compiler
+profiles, warnings, artifact handoffs, and all seven fuzz targets and bounds
+remain in force. FIPS and production-release caching have separate contracts.
+
+`.boringcache.toml` names each lane's target archive and Cargo download profiles;
+reusable Rust/C/C++ compiler objects share the `rust` sccache tag. The fuzz
+target archive excludes sanitizer release output, whose previous 79 GiB archive
+exhausted runner disk; those compiler objects use the remote sccache store.
+Only a push to upstream `main` may write caches. Target archives save after a
+successful Cargo command; the setup action saves downloads after job success.
+Pull requests, merge
+groups, and manual runs restore only, including manual runs on `main`.
+
+**Fallback and rollback.** Fork pull requests, Dependabot, and jobs without
+both GitHub OIDC request capabilities skip BoringCache entirely. They restore
+the existing GitHub Rust caches where available and execute the same native
+Cargo commands and gates. To turn BoringCache off without changing YAML, set
+the repository Actions variable `BORINGCACHE_ENABLED` to `false` and rerun the
+affected jobs. Unset it or set it to `true` to resume. This applies to every
+integrated lane. The job summary records the selected backend without printing
+credentials. A selected BoringCache session uses strict cache-error handling;
+authentication/backend errors fail visibly and never switch to static tokens.
+
+**Activation and evidence.** The trusted policy prerequisite admits the current
+main Fuzz Smoke generation and the complete cached generation side by side;
+the integration cannot approve its own verifier. Adopt the reviewed policy
+through the repository's trusted policy process first, then validate and merge
+the integration against that base. Confirm the active upstream Machine
+connection and the agreed pilot allowance before activation.
+
+The first successful main push populates the new target/download/compiler
+caches. A restore-only PR or manual run cannot seed them. Record the main run's
+SHA, run ID/attempt, per-job wall time, restore hit/miss, transfer volume, and
+compiler hits/misses from BoringCache's command logs and Workspace reports.
+Then record at least three ordinary warm PR runs and subsequent successful
+main runs, using the same job/shard/profile and comparable changes. Compare
+medians and total runner-minutes with the GitHub-cache baseline, including
+restore/publish overhead, storage/request usage, and retries. A cache hit alone
+does not establish time saved. Expand or tune profiles from these measurements.
 
 ## CI runtime caching (production images and FIPS)
 

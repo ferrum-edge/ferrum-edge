@@ -578,7 +578,11 @@ jobs:
           python3 .github/scripts/run_unit_ci.py default-build --sample-parent "$$" &
           unit_sampler_pid=$!
           trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
-          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile "unit-$UNIT_SHARD" test $UNIT_PRECOMPILE_TARGETS --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile "unit-$UNIT_SHARD" test $UNIT_PRECOMPILE_TARGETS --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+          else
+            /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-build.time" cargo test $UNIT_PRECOMPILE_TARGETS --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-build.log"
+          fi
           kill "$unit_sampler_pid"
           wait "$unit_sampler_pid"
           trap - EXIT
@@ -802,7 +806,11 @@ jobs:
           python3 .github/scripts/run_unit_ci.py acme-build --sample-parent "$$" &
           unit_sampler_pid=$!
           trap 'kill "$unit_sampler_pid" 2>/dev/null || true; wait "$unit_sampler_pid" || true' EXIT
-          /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile acme test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile acme test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
+          else
+            /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/acme-build.time" cargo test --features acme --lib --test acme_dns01_tests --no-run --timings 2>&1 | tee "$RUNNER_TEMP/unit-ci/acme-build.log"
+          fi
           kill "$unit_sampler_pid"
           wait "$unit_sampler_pid"
           trap - EXIT
@@ -889,11 +897,19 @@ jobs:
         # by the all-features build and the backend-specific test filters.
         # Vault/AWS use testcontainers; GCP/Azure use in-process wiremock fakes.
         run: |
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile secrets --skip-save nextest run \
-            --features secrets-vault,secrets-aws,secrets-gcp,secrets-azure \
-            --test secrets_functional \
-            --no-fail-fast \
-            file_backend cross_backend vault_backend aws_backend gcp_backend azure_backend
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile secrets --skip-save nextest run \
+              --features secrets-vault,secrets-aws,secrets-gcp,secrets-azure \
+              --test secrets_functional \
+              --no-fail-fast \
+              file_backend cross_backend vault_backend aws_backend gcp_backend azure_backend
+          else
+            cargo nextest run \
+              --features secrets-vault,secrets-aws,secrets-gcp,secrets-azure \
+              --test secrets_functional \
+              --no-fail-fast \
+              file_backend cross_backend vault_backend aws_backend gcp_backend azure_backend
+          fi
         env:
           RUST_BACKTRACE: 1
 
@@ -905,10 +921,17 @@ jobs:
         # once more without cloud features so that coverage survives the
         # matrix consolidation.
         run: |
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile secrets --skip-restore nextest run \
-            --test secrets_functional \
-            --no-fail-fast \
-            cross_backend
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile secrets --skip-restore nextest run \
+              --test secrets_functional \
+              --no-fail-fast \
+              cross_backend
+          else
+            cargo nextest run \
+              --test secrets_functional \
+              --no-fail-fast \
+              cross_backend
+          fi
         env:
           RUST_BACKTRACE: 1
 
@@ -955,7 +978,12 @@ jobs:
         # from it never runs (issue #3999). `container_start_retry` is the
         # same kind of Docker-free coverage for the shared transient
         # image-pull retry every fixture starts through.
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile service-integration nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection clickhouse host_port_allocation container_start_retry db_tls
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile service-integration nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection clickhouse host_port_allocation container_start_retry db_tls
+          else
+            cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection clickhouse host_port_allocation container_start_retry db_tls
+          fi
         env:
           RUST_BACKTRACE: 1
 
@@ -1036,7 +1064,12 @@ jobs:
         # Both later filters execute in separate libtest binaries. Compile the
         # pair together so the certificate-pairing phase cannot trigger a
         # second full ferrum-edge compile after the signer smoke test passes.
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile pkcs11 test --features pkcs11 --lib --test unit_tests --no-run
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile pkcs11 test --features pkcs11 --lib --test unit_tests --no-run
+          else
+            cargo test --features pkcs11 --lib --test unit_tests --no-run
+          fi
         env:
           RUST_BACKTRACE: 1
 
@@ -1112,7 +1145,12 @@ jobs:
         # matching OS/arch + checkout layout, or update this artifact/path with
         # any future runner/workspace/target-dir change. These binaries are
         # used only for tests; release producers keep their shipping profile.
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile artifacts --skip-save test --no-run --test integration_tests --test functional_tests
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile artifacts --skip-save test --no-run --test integration_tests --test functional_tests
+          else
+            cargo test --no-run --test integration_tests --test functional_tests
+          fi
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
@@ -1120,17 +1158,29 @@ jobs:
         # MB larger and is omitted only from this transfer artifact.
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile artifacts --skip-restore --skip-save nextest archive \
-            --test integration_tests \
-            --archive-file "$archive_file"
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile artifacts --skip-restore --skip-save nextest archive \
+              --test integration_tests \
+              --archive-file "$archive_file"
+          else
+            cargo nextest archive \
+              --test integration_tests \
+              --archive-file "$archive_file"
+          fi
 
       - name: Build functional tests archive
         # Packages the functional target compiled by the step above.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile artifacts --skip-restore nextest archive \
-            --test functional_tests \
-            --archive-file "$archive_file"
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile artifacts --skip-restore nextest archive \
+              --test functional_tests \
+              --archive-file "$archive_file"
+          else
+            cargo nextest archive \
+              --test functional_tests \
+              --archive-file "$archive_file"
+          fi
 
       - name: Upload gateway binary
         # Consumers use the target/debug path and OS/arch-keyed artifact name.
@@ -1471,7 +1521,12 @@ jobs:
         # (a deleted/renamed GA test fails CI); --test-threads=1 guarantees the
         # `zz_`-named gate runs last with a fully populated registry. The
         # ordering-independent per-call GA assertion runs regardless.
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile conformance test --test conformance_tests -- --test-threads=1
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile conformance test --test conformance_tests -- --test-threads=1
+          else
+            cargo test --test conformance_tests -- --test-threads=1
+          fi
         env:
           RUST_BACKTRACE: 1
           FERRUM_CONFORMANCE_STRICT_GATE: "1"
@@ -1724,19 +1779,46 @@ jobs:
           tool: cargo-nextest
 
       - name: Run vendored h3 frame-drain regressions
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame
+          else
+            cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame
+          fi
 
       - name: Run vendored tungstenite raw-takeover and parser-policy regressions
         run: |
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
+          else
+            cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
+          fi
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
+          else
+            cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
+          fi
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
+          else
+            cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
+          fi
 
       - name: Run vendored tokio-tungstenite raw-takeover regression
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
+          else
+            cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
+          fi
 
       - name: Run vendored dimpl credential security regressions
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --features test-hooks --test auto credential_security
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --features test-hooks --test auto credential_security
+          else
+            cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --features test-hooks --test auto credential_security
+          fi
 
       - name: Run vendored sqlx-core exclusive-root-CA regressions
         # `verify-ca` waives only the hostname check, so a configured
@@ -1745,7 +1827,12 @@ jobs:
         # any name is accepted on a SQL connection. sqlx-core's default feature
         # list is empty, so the rustls TLS module is only built when a runtime
         # and a rustls backend are named explicitly.
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile vendor-patches test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests
+          else
+            cargo test --manifest-path vendor/sqlx-core-0.8.6-ferrum-patched/Cargo.toml --no-default-features --features _rt-tokio,_tls-rustls-ring-webpki --lib tls_rustls::tests
+          fi
 
       - name: Run vendored hyper-util HTTP/1 dispatch-close regressions
         # An HTTP/1 request queued while the connection closes can miss the
@@ -6340,10 +6427,17 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 1
         run: |
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile lint clippy \
-            --config profile.test.debug=0 \
-            --config profile.dev.debug=0 \
-            --all-targets -- -D warnings
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile lint clippy \
+              --config profile.test.debug=0 \
+              --config profile.dev.debug=0 \
+              --all-targets -- -D warnings
+          else
+            cargo clippy \
+              --config profile.test.debug=0 \
+              --config profile.dev.debug=0 \
+              --all-targets -- -D warnings
+          fi
 
   fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
@@ -6438,8 +6532,26 @@ jobs:
 
       - name: BoringCache Cargo
         uses: ./.github/actions/setup-boringcache
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: env.FERRUM_BORINGCACHE_ENABLED != 'true'
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the sanitizer build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       - name: Install pinned cargo-fuzz
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile tools install cargo-fuzz --locked --version 0.13.1
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile tools install cargo-fuzz --locked --version 0.13.1
+          else
+            cargo install cargo-fuzz --locked --version 0.13.1
+          fi
 
       - name: Run deterministic property smoke tests
         working-directory: fuzz
@@ -6447,7 +6559,11 @@ jobs:
           set -euo pipefail
 
           property_started=$SECONDS
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-save test --locked
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-save test --locked
+          else
+            cargo test --locked
+          fi
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
       - name: Run bounded libFuzzer smoke budget
@@ -6600,21 +6716,39 @@ jobs:
 
           for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
             echo "Fuzz smoke target: ${fuzz_target}"
-            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \
-              -runs=512 \
-              -max_total_time=8 \
-              -max_len=4096 \
-              -timeout=2 \
-              -rss_limit_mb=1024
+            if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+              boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \
+                -runs=512 \
+                -max_total_time=8 \
+                -max_len=4096 \
+                -timeout=2 \
+                -rss_limit_mb=1024
+            else
+              cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+                -runs=512 \
+                -max_total_time=8 \
+                -max_len=4096 \
+                -timeout=2 \
+                -rss_limit_mb=1024
+            fi
           done
 
           echo "Fuzz smoke target: datagram_client_address"
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore fuzz run --codegen-units 16 datagram_client_address -- \
-            -runs=512 \
-            -max_total_time=8 \
-            -max_len=65536 \
-            -timeout=2 \
-            -rss_limit_mb=1024
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile fuzz --skip-restore fuzz run --codegen-units 16 datagram_client_address -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=65536 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          else
+            cargo fuzz run --codegen-units 16 datagram_client_address -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=65536 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          fi
           echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
 
       - name: Report fuzz lane shape and cache availability
@@ -6661,14 +6795,34 @@ jobs:
 
       - name: BoringCache Cargo
         uses: ./.github/actions/setup-boringcache
+
+      - name: Cache eBPF Rust dependencies and compiler outputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: env.FERRUM_BORINGCACHE_ENABLED != 'true'
+        with:
+          shared-key: "ci-ebpf-programs"
+          workspaces: |
+            ebpf -> target
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       - name: Install bpf-linker
         uses: ./.github/actions/setup-bpf-linker
 
       - name: Build BPF programs
-        run: cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+          else
+            cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+          fi
 
       - name: Test shared types
-        run: cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf test -p ferrum-ebpf-common
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf test -p ferrum-ebpf-common
+          else
+            cd ebpf && cargo test -p ferrum-ebpf-common
+          fi
 
       - name: Upload BPF artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -6706,7 +6860,12 @@ jobs:
         # guarantees the loader keeps building as the shared BPF ABI
         # (ferrum-ebpf-common) and map set evolve. The kernel ELF is read at
         # runtime, so no compiled BPF object is needed here.
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf-userspace build --lib --features ebpf
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf-userspace build --lib --features ebpf
+          else
+            cargo build --lib --features ebpf
+          fi
         env:
           RUST_BACKTRACE: 1
 
@@ -6744,15 +6903,25 @@ jobs:
         uses: ./.github/actions/setup-bpf-linker
 
       - name: Build BPF programs (kernel object)
-        run: cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf-live +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            cd ebpf && boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf-live +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+          else
+            cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+          fi
 
       - name: Build and locate live-kernel test binary (--features ebpf)
         id: build_test_bin
         run: |
           set -euo pipefail
           mapfile -t bins < <(
-            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf-live test --features ebpf --lib --no-run --message-format=json-render-diagnostics \
-              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+            if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+              boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile ebpf-live test --features ebpf --lib --no-run --message-format=json-render-diagnostics \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+            else
+              cargo test --features ebpf --lib --no-run --message-format=json-render-diagnostics \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+            fi
           )
           if [ "${#bins[@]}" -ne 1 ]; then
             printf 'Expected exactly one lib test binary, found %s:\n' "${#bins[@]}" >&2
@@ -6851,8 +7020,13 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t bins < <(
-            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile netns-live --skip-save test --lib --no-run --message-format=json-render-diagnostics \
-              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+            if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+              boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile netns-live --skip-save test --lib --no-run --message-format=json-render-diagnostics \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+            else
+              cargo test --lib --no-run --message-format=json-render-diagnostics \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("lib"))) | .executable'
+            fi
           )
           if [ "${#bins[@]}" -ne 1 ]; then
             printf 'Expected exactly one lib test binary, found %s:\n' "${#bins[@]}" >&2
@@ -6863,10 +7037,19 @@ jobs:
           echo "In-netns live test binary: $BIN"
           echo "test_bin=$BIN" >> "$GITHUB_OUTPUT"
 
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile netns-live --skip-restore --skip-save build --bin ferrum-edge
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile netns-live --skip-restore --skip-save build --bin ferrum-edge
+          else
+            cargo build --bin ferrum-edge
+          fi
           mapfile -t functional_bins < <(
-            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile netns-live --skip-restore test --test functional_tests --no-run --message-format=json-render-diagnostics \
-              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+            if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+              boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile netns-live --skip-restore test --test functional_tests --no-run --message-format=json-render-diagnostics \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+            else
+              cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+            fi
           )
           if [ "${#functional_bins[@]}" -ne 1 ]; then
             printf 'Expected exactly one functional test binary, found %s:\n' "${#functional_bins[@]}" >&2
@@ -7013,10 +7196,19 @@ jobs:
         id: build_test_bin
         run: |
           set -euo pipefail
-          boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile two-cluster-live --skip-save build --bin ferrum-edge
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile two-cluster-live --skip-save build --bin ferrum-edge
+          else
+            cargo build --bin ferrum-edge
+          fi
           mapfile -t bins < <(
-            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile two-cluster-live --skip-restore test --test functional_tests --no-run --message-format=json-render-diagnostics \
-              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+            if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+              boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile two-cluster-live --skip-restore test --test functional_tests --no-run --message-format=json-render-diagnostics \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+            else
+              cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+            fi
           )
           if [ "${#bins[@]}" -ne 1 ]; then
             printf 'Expected exactly one functional test binary, found %s:\n' "${#bins[@]}" >&2
@@ -7119,6 +7311,27 @@ jobs:
 
       - name: BoringCache Cargo
         uses: ./.github/actions/setup-boringcache
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Cache restore/save is a build-time optimization, not a correctness
+        # input. The Windows runner occasionally fails the post-step cache
+        # upload to GitHub's cache service with no log output (observed on PR
+        # #884: tar.exe completes, then the step is marked failed before any
+        # error is printed). The release binary itself is already built and
+        # uploaded as an artifact before this step's post phase runs, so a
+        # cache miss / save failure should not gate the binary build. Treat
+        # this step as best-effort across all targets to avoid an entire
+        # build matrix entry going red on a transient GitHub Actions cache
+        # issue.
+        continue-on-error: true
+        if: env.FERRUM_BORINGCACHE_ENABLED != 'true'
+        with:
+          shared-key: "build-${{ matrix.target }}-prbuild"
+          # Restore-only: the repository cache quota is reserved for the
+          # PR-facing `ci-debug` / `ci-lint` lanes and the main-only fuzz lane.
+          save-if: "false"
+
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
@@ -7168,11 +7381,21 @@ jobs:
 
       - name: Check merge-group macOS target
         if: github.event_name == 'merge_group' && runner.os == 'macOS'
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile binaries check --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile binaries check --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+          else
+            cargo check --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+          fi
 
       - name: Build fast verification binary
         if: github.event_name != 'merge_group' || runner.os != 'macOS'
-        run: boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile binaries build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+        run: |
+          if [ "$FERRUM_BORINGCACHE_ENABLED" = true ]; then
+            boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile binaries build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+          else
+            cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
+          fi
 
       - name: Report compiler cache statistics
         if: always()

@@ -8,16 +8,41 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Select cache backend
+      id: backend
+      shell: bash
+      env:
+        CACHE_DISABLED: ${{ vars.BORINGCACHE_ENABLED == 'false' }}
+        OIDC_ELIGIBLE: ${{ github.repository == 'ferrum-edge/ferrum-edge' && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      run: |
+        set -euo pipefail
+        enabled=false
+        if [ "$CACHE_DISABLED" != true ] && [ "$OIDC_ELIGIBLE" = true ] && \
+           [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          enabled=true
+        fi
+        echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+        echo "FERRUM_BORINGCACHE_ENABLED=$enabled" >> "$GITHUB_ENV"
+        if [ "$enabled" = true ]; then
+          echo 'Cache backend: BoringCache (OIDC)' >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo 'Cache backend: GitHub Rust cache / plain Cargo (BoringCache disabled or OIDC unavailable)' >> "$GITHUB_STEP_SUMMARY"
+        fi
+
     - name: BoringCache Cargo
+      if: steps.backend.outputs.enabled == 'true'
       uses: boringcache/one@476c7df90bc1e7c2c4066aa7eb31cc057ef7f8d1 # v1.32.0
       with:
+        cli-version: v1.32.0
         mode: archive
         cache-profiles: ${{ inputs.cache-profiles }}
         trust-policy: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'auto' || 'restore' }}
+        save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'on-success' || 'never' }}
+        diagnostics: summary
         fail-on-cache-error: true
 
     - name: Expose the verified compiler cache
-      if: env.FERRUM_SCCACHE_BIN != ''
+      if: steps.backend.outputs.enabled == 'true' && env.FERRUM_SCCACHE_BIN != ''
       shell: bash
       run: |
         dirname "$FERRUM_SCCACHE_BIN" >> "$GITHUB_PATH"

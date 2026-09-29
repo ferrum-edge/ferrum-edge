@@ -143,7 +143,7 @@ fn datagram_client_address_is_fuzzed_at_its_documented_64_kib_budget() {
     // actually scheduled.
     let job = fuzz_smoke_job();
     let invocation = job
-        .find("fuzz run --codegen-units 16 datagram_client_address --")
+        .find("cargo fuzz run --codegen-units 16 datagram_client_address --")
         .expect("the fuzz-smoke job invokes datagram_client_address on its own");
     let bounds = &job[invocation..];
     let terminator = bounds
