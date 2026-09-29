@@ -283,7 +283,7 @@ Manual Start Production Release on main (version input, e.g. v0.2.0)
 
 **Connect BoringCache** links GitHub Actions' existing OIDC identity for
 `ferrum-edge/ferrum-edge` to the BoringCache Workspace `jeremy-j/ferrum-edge`.
-The enrollment workflow installs the SHA-256-verified v1.32.0 Linux CLI and
+The enrollment workflow installs the SHA-256-verified v1.33.0 Linux CLI and
 grants `id-token: write` only to its manual enrollment job. It needs no
 BoringCache repository secret and runs only in the upstream repository on `main`.
 

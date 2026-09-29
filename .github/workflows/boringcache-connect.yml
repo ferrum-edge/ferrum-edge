@@ -25,13 +25,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Keep the release and digest aligned with the v1.32.0 CI pilot.
+          # Keep the release and digest aligned with the v1.33.0 CI pilot.
           binary="$RUNNER_TEMP/boringcache"
           curl --fail --silent --show-error --location --retry 3 \
             --output "$binary" \
-            https://github.com/boringcache/cli/releases/download/v1.32.0/boringcache-linux-amd64
+            https://github.com/boringcache/cli/releases/download/v1.33.0/boringcache-linux-amd64
           printf '%s  %s\n' \
-            'ad6b82b1f4632702dce4e1e9a5e4398bf562026f37f1f3cac2958bed6285bf94' \
+            '2e39104cbb896bff8bcf1ab470833d31a968155a3485b36ab8ff8cfda1d87fe2' \
             "$binary" | sha256sum --check --strict
           chmod 0755 "$binary"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
