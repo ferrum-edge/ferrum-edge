@@ -427,6 +427,23 @@ fn a_deny_path_condition_blocks_the_stripped_spelling() {
 }
 
 #[test]
+fn a_mixed_case_path_condition_uses_the_path_spelling_for_each_pass() {
+    let mut condition = path_values(&["/admin/*"]);
+    condition.key = "request.headers[:PATH]".to_string();
+    let deny_admin = path_condition("deny-admin-path", PolicyAction::Deny, condition);
+    let mut request = request("/admin;x/users");
+    let raw_path = request.attributes.remove(PATH_KEY).expect("raw path attribute");
+    request
+        .attributes
+        .insert("request.headers[:PATH]".to_string(), raw_path);
+
+    assert_eq!(
+        evaluate_mesh_authorization_policies(&deny_admin, &request),
+        deny("deny-admin-path")
+    );
+}
+
+#[test]
 fn an_allow_path_condition_suffix_must_hold_for_the_stripped_spelling() {
     let allow_png = path_condition("allow-png", PolicyAction::Allow, path_values(&["*.png"]));
 

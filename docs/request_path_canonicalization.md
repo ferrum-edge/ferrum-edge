@@ -329,10 +329,10 @@ routes that have not opted in is unchanged. A path without a `;` has one
 spelling and is evaluated exactly once.
 
 **What a CUSTOM provider sees.** A CUSTOM (ext_authz) check is sent the raw
-request path only, as the HTTP ext-authz protocol defines it. A provider that
-makes its own path decisions on an opted-in service should apply the same rule
-to the stripped spelling, or be scoped with a DENY-safe `paths:` rule on the
-gateway side.
+request path only, as the HTTP ext-authz protocol defines it: the ext-authz
+check request carries the raw path. A provider that makes its own path
+decisions on an opted-in service should apply the same rule to the stripped
+spelling, or be scoped with a DENY-safe `paths:` rule on the gateway side.
 
 **VirtualService `uri` matches.** Ferrum compiles a VirtualService
 `http[].match[].uri` into the `listen_path` of the proxy it emits for that
