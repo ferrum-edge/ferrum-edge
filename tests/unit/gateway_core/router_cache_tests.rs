@@ -2187,7 +2187,10 @@ fn sibling_or_descendant_of_the_stripped_listen_path_still_refuses() {
 
 #[test]
 fn trailing_slash_parameter_listen_path_claims_its_segment() {
-    for (listen_path, path) in [("/api;v=1/", "/api;v=1/secret"), ("=/api;v=1/", "/api;v=1/")] {
+    for (listen_path, path) in [
+        ("/api;v=1/", "/api;v=1/secret"),
+        ("=/api;v=1/", "/api;v=1/"),
+    ] {
         let config = test_config(vec![
             opted_in(test_proxy("versioned", listen_path)),
             test_proxy("api", "/api"),
