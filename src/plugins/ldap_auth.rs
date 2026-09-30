@@ -543,7 +543,10 @@ impl LdapAuth {
                 ("ldap_url", Some(ldap_url.as_str())),
                 ("bind_dn_template", bind_dn_template.as_deref()),
                 ("search_base_dn", search_base_dn.as_deref()),
-                ("canonical_identity_attribute", canonical_identity_attribute.as_deref()),
+                (
+                    "canonical_identity_attribute",
+                    canonical_identity_attribute.as_deref(),
+                ),
             ],
         );
 

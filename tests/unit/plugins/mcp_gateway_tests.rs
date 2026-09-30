@@ -13575,7 +13575,8 @@ async fn external_identity_realm_is_committed_with_the_verifying_issuer() {
         "equal subjects from different issuers are different principals"
     );
     assert_eq!(
-        a_again.authenticated_identity_realm(), Some(realm_a),
+        a_again.authenticated_identity_realm(),
+        Some(realm_a),
         "one issuer is one realm"
     );
     let rendered = format!("{realm_a:?}");

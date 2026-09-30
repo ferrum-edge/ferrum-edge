@@ -4225,7 +4225,11 @@ impl McpGateway {
             ctx,
             "tools/call",
             &server.server_id,
-            Some(McpAdmittedTarget::with_arguments("name", &entry.upstream_name, envelope)),
+            Some(McpAdmittedTarget::with_arguments(
+                "name",
+                &entry.upstream_name,
+                envelope,
+            )),
         );
         PluginResult::Continue
     }
@@ -4333,7 +4337,11 @@ impl McpGateway {
             ctx,
             "prompts/get",
             &server.server_id,
-            Some(McpAdmittedTarget::with_arguments("name", &entry.upstream_name, envelope)),
+            Some(McpAdmittedTarget::with_arguments(
+                "name",
+                &entry.upstream_name,
+                envelope,
+            )),
         );
         PluginResult::Continue
     }
