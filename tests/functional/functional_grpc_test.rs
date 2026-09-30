@@ -1580,3 +1580,87 @@ async fn test_grpc_streaming_holds_per_ip_request_slot() {
     backend_handle.abort();
     println!("test_grpc_streaming_holds_per_ip_request_slot PASSED");
 }
+
+/// End-to-end regression for issue #5588: a gRPC client that ends each unary
+/// request with a separate zero-length END_STREAM DATA frame (tonic's shape)
+/// must not make the gateway send empty DATA frames without END_STREAM on its
+/// pooled backend connection.
+///
+/// h2 >= 0.4.16 (the backend below) bounds those per connection and answers
+/// the 101st with GOAWAY(ENHANCE_YOUR_CALM), failing every stream on that
+/// connection. Well over 100 sequential calls therefore fail on a gateway that
+/// relays the client's empty frame and pass on one that drops it.
+#[ignore]
+#[tokio::test]
+async fn test_grpc_separate_end_stream_frame_keeps_backend_connection_alive() {
+    use hyper::client::conn::http2;
+
+    const CALLS: usize = 250;
+
+    let backend_port = free_port().await;
+    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_grpc_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{gateway_port}").parse().unwrap();
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+        .await
+        .expect("h2 handshake with gateway");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let grpc_body = Bytes::from(grpc_unary_body(64, b'x'));
+    for call in 0..CALLS {
+        // A body that does not report end of stream with its only DATA frame,
+        // so hyper follows it with an empty END_STREAM frame — as tonic does.
+        let frames = futures_util::stream::iter([Ok::<_, std::convert::Infallible>(Frame::data(
+            grpc_body.clone(),
+        ))]);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/grpc/my.EchoService/Echo"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(StreamBody::new(frames))
+            .unwrap();
+        let response = sender
+            .send_request(req)
+            .await
+            .unwrap_or_else(|e| panic!("gRPC call {call} failed to send: {e}"));
+        let status = response.status().as_u16();
+        let grpc_status = response
+            .headers()
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("gRPC call {call} body failed: {e}"))
+            .to_bytes();
+        assert_eq!(status, 200, "call {call} should return HTTP 200");
+        assert_eq!(
+            grpc_status.as_deref(),
+            Some("0"),
+            "call {call} should return grpc-status OK, not a gateway UNAVAILABLE"
+        );
+        assert_eq!(body, grpc_body, "call {call} should echo the body");
+    }
+
+    conn_task.abort();
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}

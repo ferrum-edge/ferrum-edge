@@ -4684,7 +4684,19 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        futures_util::Stream::poll_next(Pin::new(&mut self.get_mut().inner), cx)
+        let inner = &mut self.get_mut().inner;
+        loop {
+            match futures_util::Stream::poll_next(Pin::new(&mut *inner), cx) {
+                // An H2 backend's END_STREAM often arrives as a zero-length
+                // DATA frame. This body cannot report end of stream ahead of
+                // `None`, so relaying it would put an empty DATA frame without
+                // END_STREAM on an H2 client connection, which h2 peers bound
+                // per connection (issue #5588). It carries no content: skip it.
+                Poll::Ready(Some(Ok(frame)))
+                    if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+                other => return other,
+            }
+        }
     }
 
     fn is_end_stream(&self) -> bool {

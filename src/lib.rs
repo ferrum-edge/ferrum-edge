@@ -11485,6 +11485,12 @@ pub mod _test_support {
                 std::task::Poll::Pending => std::task::Poll::Pending,
             }
         }
+
+        /// At its end once the probe closed the feed and nothing fed is left,
+        /// like an H2 `Incoming` whose END_STREAM rode its last DATA frame.
+        fn is_end_stream(&self) -> bool {
+            self.receiver.is_closed() && self.receiver.is_empty()
+        }
     }
 
     /// One gateway-owned upload pump under test, with its transport side held
@@ -11645,6 +11651,14 @@ pub mod _test_support {
         /// Drop the transport side, modelling hyper releasing the request body.
         pub fn drop_transport(&mut self) {
             self.source = None;
+        }
+
+        /// The transport side's `is_end_stream()`: what an HTTP/2 transport
+        /// reads to set END_STREAM on the DATA frame it just took.
+        pub fn transport_is_end_stream(&self) -> bool {
+            self.source
+                .as_ref()
+                .is_some_and(crate::proxy::upload_pump::UploadPumpSource::is_end_stream)
         }
     }
 

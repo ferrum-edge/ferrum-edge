@@ -331,7 +331,7 @@ impl Drop for ReleasePumpOnDrop {
 enum UploadFrames {
     /// Relayed by the pump over the bridge channel: a streaming client body
     /// the gateway must keep owning and polling.
-    Bridged(tokio::sync::mpsc::Receiver<Frame<Bytes>>),
+    Bridged(tokio::sync::mpsc::Receiver<BridgedFrame>),
     /// A fully buffered upload, sliced on demand and handed over synchronously
     /// (issue #5505). Nothing is relayed: the transport takes refcounted
     /// slices of the collected buffer straight from this body, and reports
@@ -340,6 +340,18 @@ enum UploadFrames {
         frames: BufferedUploadFrames,
         progress: Arc<DirectUploadProgress>,
     },
+}
+
+/// One client frame relayed over the bridge.
+///
+/// `last` is the client body's own `is_end_stream()` observed right after the
+/// pump read `frame`. It lets the transport side report a clean end of stream
+/// as soon as it takes that frame, so an HTTP/2 transport sets `END_STREAM` on
+/// the final DATA frame instead of following it with an empty one (issue
+/// #5588).
+struct BridgedFrame {
+    frame: Frame<Bytes>,
+    last: bool,
 }
 
 /// Transport-side half of the pump: an `http_body`-shaped view over the bridge
@@ -461,9 +473,16 @@ impl UploadPumpSource {
                 }
             },
             UploadFrames::Bridged(receiver) => match receiver.poll_recv(cx) {
-                Poll::Ready(Some(frame)) => {
+                Poll::Ready(Some(BridgedFrame { frame, last })) => {
                     if let Some(data) = frame.data_ref() {
                         self.delivered = self.delivered.saturating_add(data.len() as u64);
+                    }
+                    // The client body ended cleanly with this frame, so taking
+                    // it is the clean end of the upload: nothing of the client
+                    // body remains unrelayed. Report it now, exactly as a
+                    // direct source does once its last frame is taken.
+                    if last {
+                        self.ended = true;
                     }
                     Poll::Ready(Some(Ok(frame)))
                 }
@@ -507,7 +526,9 @@ impl UploadPumpSource {
     /// last frame — nothing of the upload remains unhanded — so an HTTP/2
     /// transport can flag `END_STREAM` on that DATA frame instead of sending
     /// an empty one, exactly as it did for the reusable `Bytes` body before
-    /// the watermark was installed on buffered uploads.
+    /// the watermark was installed on buffered uploads. A bridged source gets
+    /// there the same way once it takes the frame the client body ended on
+    /// ([`BridgedFrame::last`], which sets `ended`).
     pub(crate) fn is_end_stream(&self) -> bool {
         self.ended
             || match &self.frames {
@@ -1116,7 +1137,7 @@ async fn await_oneshot_signal(
 /// publishes through the shared terminal before releasing anything.
 struct UploadPumpTask<B> {
     body: B,
-    sender: tokio::sync::mpsc::Sender<Frame<Bytes>>,
+    sender: tokio::sync::mpsc::Sender<BridgedFrame>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
     plan: Option<RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
@@ -1210,7 +1231,7 @@ where
             },
         };
         let frame = 'frame: loop {
-            break tokio::select! {
+            let next = tokio::select! {
                 biased;
                 () = cancel_requested(&mut cancel) => break 'pump UploadPumpOutcome::Cancelled,
                 () = optional_sleep_elapsed(expiry.as_mut()) => {
@@ -1239,10 +1260,27 @@ where
                 }
                 frame = http_body_util::BodyExt::frame(&mut body) => frame,
             };
+            // A zero-length DATA frame carries no HTTP message content: an H2
+            // client's END_STREAM often arrives as one, after the last payload
+            // frame. Relaying it would make the H2 transport send an empty DATA
+            // frame without END_STREAM (the bridge cannot know yet that the
+            // body ended), and peers bound those per connection — h2 >= 0.4.16
+            // answers the 101st with GOAWAY(ENHANCE_YOUR_CALM), failing every
+            // stream on that backend connection (issue #5588). Keep the permit
+            // and read on; the end of stream is still relayed as `None`.
+            if let Some(Ok(frame)) = &next
+                && frame.data_ref().is_some_and(|data| data.is_empty())
+            {
+                continue 'frame;
+            }
+            break next;
         };
         match frame {
             None => break UploadPumpOutcome::Completed,
-            Some(Ok(frame)) => permit.send(frame),
+            Some(Ok(frame)) => {
+                let last = http_body::Body::is_end_stream(&body);
+                permit.send(BridgedFrame { frame, last });
+            }
             Some(Err(_)) => break UploadPumpOutcome::SourceError,
         }
     };

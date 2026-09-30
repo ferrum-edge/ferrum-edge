@@ -357,7 +357,18 @@ impl http_body::Body for GrpcBody {
                     }
                     return Poll::Ready(Some(Err(deadline.message().into())));
                 }
-                match incoming.poll_frame(cx) {
+                let polled = loop {
+                    match incoming.poll_frame(cx) {
+                        // A zero-length DATA frame carries no message content;
+                        // forwarding it would put an empty DATA frame without
+                        // END_STREAM on the backend connection, which h2 peers
+                        // bound per connection (issue #5588). Read past it.
+                        Poll::Ready(Some(Ok(frame)))
+                            if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+                        other => break other,
+                    }
+                };
+                match polled {
                     Poll::Ready(Some(Ok(frame))) => {
                         if let Some(data) = frame.data_ref() {
                             // Tally every forwarded DATA frame, limit or not:
@@ -424,7 +435,15 @@ impl http_body::Body for GrpcBody {
                 // cross the backend boundary. If the queue is pending, the
                 // response-side shutdown also wakes the pump, whose sender
                 // drop wakes this receiver.
-                let next_frame = receiver.poll_recv(cx);
+                let next_frame = loop {
+                    match receiver.poll_recv(cx) {
+                        // Never relay a zero-length DATA frame to the backend
+                        // (see the `Streaming` arm, issue #5588).
+                        Poll::Ready(Some(Ok(frame)))
+                            if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+                        other => break other,
+                    }
+                };
                 if cancelled.load(Ordering::Acquire) {
                     *cancelled_terminal = true;
                     return Poll::Ready(Some(Err(

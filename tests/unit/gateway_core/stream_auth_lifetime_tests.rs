@@ -8181,3 +8181,43 @@ fn authorization_expiry_messages_are_still_compiled_in_at_debug_level() {
         );
     }
 }
+
+/// Issue #5588: an H2 client's END_STREAM often arrives as a separate
+/// zero-length DATA frame. The bridge must not relay it — an HTTP/2 transport
+/// would send it as an empty DATA frame without END_STREAM, which h2 >= 0.4.16
+/// peers bound per connection (GOAWAY on the 101st) — and the transport must
+/// see end of stream once it takes the frame the client body ended on.
+#[tokio::test(start_paused = true)]
+async fn a_bridged_upload_drops_empty_data_frames_and_reports_end_of_stream() {
+    let mut probe = UploadPumpProbe::start_watermark_only(600_000);
+    assert!(probe.feed("hello"));
+    assert!(probe.feed(""));
+    assert!(probe.feed(""));
+    assert!(probe.feed("world"));
+    probe.end_client_body();
+
+    let mut sizes = Vec::new();
+    let mut end_stream_after = Vec::new();
+    for _ in 0..64 {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => {
+                sizes.push(len);
+                end_stream_after.push(probe.transport_is_end_stream());
+            }
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected transport poll: {other:?}"),
+        }
+    }
+    assert_eq!(
+        sizes,
+        vec![5, 5],
+        "zero-length DATA frames must not cross the bridge"
+    );
+    assert_eq!(
+        end_stream_after,
+        vec![false, true],
+        "the frame the client body ended on must carry end of stream"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
