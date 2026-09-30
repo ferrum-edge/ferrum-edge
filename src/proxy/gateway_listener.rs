@@ -776,6 +776,44 @@ impl GatewayListenerManager {
             .collect()
     }
 
+    /// Publish an allowed admission decision for the current generation
+    /// without opening any listener gates.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Library integration tests exercise this seam.
+    pub fn publish_allowed_admission_for_test(&self) -> bool {
+        let expected = self.state.request_epoch.load();
+        self.state
+            .publish_gateway_listener_admission(&expected, BTreeSet::new(), || {})
+    }
+
+    /// Bind and retain a listener with its accept gate closed so integration
+    /// tests can verify that a decided route still cannot serve before the
+    /// manager opens the gate.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Library integration tests exercise this seam.
+    pub async fn bind_listener_with_closed_accept_gate_for_test(
+        &self,
+        port: u16,
+        desired: DesiredGatewayListener,
+    ) -> Result<watch::Sender<bool>, GatewayListenerBindFailure> {
+        match self.spawn_listener(port, desired).await {
+            Ok(listener) => {
+                let accept_gate_tx = listener.accept_gate_tx.clone();
+                self.listeners.lock().await.insert(port, listener);
+                Ok(accept_gate_tx)
+            }
+            Err(error) => {
+                let failure = GatewayListenerBindFailure::tcp(
+                    port,
+                    GatewayListenerFailureCategory::BindFailed,
+                    error,
+                );
+                self.bind_failures.store(Arc::new(vec![failure.clone()]));
+                Err(failure)
+            }
+        }
+    }
+
     /// `(port, bind_addr)` pairs currently owned by this manager.
     #[allow(dead_code)]
     pub async fn active_binds(&self) -> Vec<(u16, IpAddr)> {

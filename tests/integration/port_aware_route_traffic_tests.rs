@@ -1059,16 +1059,17 @@ async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement
     manager.shutdown_all().await;
 }
 
-/// A Gateway listener becomes routable only after reconcile publishes admission
-/// for the same generation, then serves the configured backend.
+/// A bound Gateway listener stays closed until its gate opens, even after
+/// admission for its config generation has been decided.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_listener_serves_after_its_generation_is_admitted() {
     use ferrum_edge::dns::{DnsCache, DnsConfig};
     use ferrum_edge::proxy::ProxyState;
-    use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
+    use ferrum_edge::proxy::gateway_listener::{
+        DesiredGatewayListener, GatewayListenerClass, GatewayListenerManager, GatewayListenerTls,
+    };
 
     let (backend, _backend_task) = start_body_backend(b"admitted-listener").await;
-    let listener_port = reserve_free_port_avoiding(&[]).await;
     let state = ProxyState::new(
         config_with(vec![]),
         DnsCache::new(DnsConfig::default()),
@@ -1085,36 +1086,107 @@ async fn gateway_listener_serves_after_its_generation_is_admitted() {
     );
     manager.reconcile().await;
 
-    let outcome = state.update_config(config_with(vec![port_scoped_proxy(
-        "admitted-listener",
-        backend,
-        Some(listener_port),
-    )]));
-    assert!(
-        outcome.applied(),
-        "listener config must publish: {outcome:?}"
-    );
-    assert!(
-        state
-            .find_proxy_on_frontend_for_test(Some(HOST), "/api/x", Some(listener_port), false)
-            .is_none(),
-        "the route must remain pending until listener admission is published"
-    );
+    let mut used_ports = Vec::new();
+    for startup_attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let listener_port = reserve_free_port_avoiding(&used_ports).await;
+        let outcome = state.update_config(config_with(vec![port_scoped_proxy(
+            "admitted-listener",
+            backend,
+            Some(listener_port),
+        )]));
+        assert!(
+            outcome.applied(),
+            "listener config must publish: {outcome:?}"
+        );
+        assert!(
+            manager.publish_allowed_admission_for_test(),
+            "the current listener generation must receive a decided admission"
+        );
+        assert!(
+            state
+                .find_proxy_on_frontend_for_test(
+                    Some(HOST),
+                    "/api/x",
+                    Some(listener_port),
+                    false,
+                )
+                .is_some(),
+            "a bypassed accept gate must be able to serve the admitted route"
+        );
 
-    assert!(manager.reconcile().await.is_empty());
-    assert_eq!(manager.active_ports().await, vec![listener_port]);
-    assert!(
-        state
-            .find_proxy_on_frontend_for_test(Some(HOST), "/api/x", Some(listener_port), false)
-            .is_some(),
-        "reconcile must publish admission for the bound listener generation"
-    );
-    assert_eq!(
-        http_get(listener_port, "/api/x").await.1,
-        "admitted-listener"
-    );
+        let accept_gate_tx = match manager
+            .bind_listener_with_closed_accept_gate_for_test(
+                listener_port,
+                DesiredGatewayListener {
+                    class: GatewayListenerClass::Plaintext,
+                    bind_addr: std::net::IpAddr::from([127, 0, 0, 1]),
+                    mesh_direction: None,
+                },
+            )
+            .await
+        {
+            Ok(accept_gate_tx) => accept_gate_tx,
+            Err(failure)
+                if port_bind_lost_to_external_steal(
+                    std::slice::from_ref(&failure),
+                    listener_port,
+                ) =>
+            {
+                used_ports.push(listener_port);
+                if startup_attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                    panic!(
+                        "Gateway listener bind lost its port after \
+                         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts: {failure:?}"
+                    );
+                }
+                continue;
+            }
+            Err(failure) => panic!("Gateway listener bind failed: {failure:?}"),
+        };
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", listener_port))
+            .await
+            .expect("connect to bound listener");
+        stream
+            .write_all(
+                b"GET /api/x HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("send request while accept gate is closed");
+        let mut response = [0; 1];
+        match tokio::time::timeout(Duration::from_millis(100), stream.read(&mut response)).await {
+            Err(_) => {}
+            Ok(Ok(read)) => panic!(
+                "closed Gateway listener accept gate returned {read} response bytes: {:?}",
+                &response[..read]
+            ),
+            Ok(Err(error)) => panic!("reading before admission gate opened failed: {error}"),
+        }
+
+        accept_gate_tx.send_replace(true);
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("listener should respond after opening the accept gate")
+            .expect("read admitted listener response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected status 200 after opening the accept gate, got {response:?}"
+        );
+        assert!(
+            response.ends_with("admitted-listener"),
+            "expected admitted backend body, got {response:?}"
+        );
+        assert_eq!(manager.active_ports().await, vec![listener_port]);
+        manager.shutdown_all().await;
+        return;
+    }
 
     manager.shutdown_all().await;
+    panic!(
+        "Gateway listener never bound after {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+    );
 }
 
 /// An HTTP↔HTTPS class flip must never leave the retiring plaintext accept
