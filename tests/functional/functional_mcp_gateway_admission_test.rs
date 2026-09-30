@@ -1077,19 +1077,14 @@ async fn functional_mcp_gateway_forwards_shielded_upstream_tool_arguments() {
     let (status, body, _) = fixture.post("HTTP/1.1", Some(&session), &call).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["id"], json!(91), "{body}");
-    let forwarded = fixture
-        .captures
-        .lock()
-        .expect("upstream captures")
-        .clone();
+    let forwarded = fixture.captures.lock().expect("upstream captures").clone();
     let forwarded = forwarded
         .iter()
         .find(|request| request.method == "tools/call")
         .expect("upstream tools/call request");
     let call_body: Value = serde_json::from_slice(&forwarded.body).expect("forwarded JSON-RPC");
     assert_eq!(
-        call_body["params"]["arguments"]["contact"],
-        "[REDACTED:email]",
+        call_body["params"]["arguments"]["contact"], "[REDACTED:email]",
         "mcp_gateway must dispatch and log only the shielded arguments: {call_body}"
     );
     assert!(!call_body.to_string().contains("alice@example.com"));
@@ -1261,17 +1256,11 @@ async fn functional_mcp_gateway_lowercase_post_is_shielded_and_audited() {
     };
     let fixture = Fixture::start_with(Backend::Rest, config).await;
     let key = [("x-api-key", AGENT_KEY)];
-    let (status, _, headers) = fixture
-        .post_h1_with(None, &initialize_body(), &key)
-        .await;
+    let (status, _, headers) = fixture.post_h1_with(None, &initialize_body(), &key).await;
     assert_eq!(status, 200);
     let session = header_string(&headers).expect("initialize session");
 
-    let call = bridge_call_body(
-        81,
-        "pets.getPet",
-        json!({"petId": "alice@example.com"}),
-    );
+    let call = bridge_call_body(81, "pets.getPet", json!({"petId": "alice@example.com"}));
     let lower_post = http::Method::from_bytes(b"post").expect("lowercase HTTP method");
     let (status, body, _) = fixture
         .post_h1_method_with(lower_post, Some(&session), &call, &key)
@@ -1281,12 +1270,18 @@ async fn functional_mcp_gateway_lowercase_post_is_shielded_and_audited() {
     let received = fixture.received();
     assert!(
         received.iter().any(|request| {
-            request.head.starts_with("GET /pets/%5BREDACTED:email%5D HTTP/1.1")
+            request
+                .head
+                .starts_with("GET /pets/%5BREDACTED:email%5D HTTP/1.1")
         }),
         "the bridge must receive only the shielded argument: {received:#?}"
     );
     let audited = wait_for_audit_records(&records, 1).await;
-    assert_eq!(audited.len(), 1, "lowercase POST must be audited: {audited:#?}");
+    assert_eq!(
+        audited.len(),
+        1,
+        "lowercase POST must be audited: {audited:#?}"
+    );
     assert_eq!(audited[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
     assert!(
         !audited[0].to_string().contains("alice@example.com"),

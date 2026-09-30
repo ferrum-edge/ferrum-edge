@@ -4372,7 +4372,9 @@ async fn mcp_redaction_refuses_numeric_ids_that_cannot_round_trip() {
         let mut headers = make_post_headers();
         assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
         assert!(
-            !shield_metadata(&ctx, "request_body").unwrap_or_default().contains("REDACTED"),
+            !shield_metadata(&ctx, "request_body")
+                .unwrap_or_default()
+                .contains("REDACTED"),
             "a changed id token must not accompany a partial rewrite"
         );
     }

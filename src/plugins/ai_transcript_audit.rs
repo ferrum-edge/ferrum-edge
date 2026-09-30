@@ -3781,9 +3781,9 @@ impl AiTranscriptAudit {
         let bounded_mcp_scan = (scan_limited && self.capture.mcp_tool_calls)
             .then(|| mcp_jsonrpc::scan_request_bytes(body));
         let carries_tool_call = parsed.as_ref().is_some_and(mcp_jsonrpc::has_tool_call)
-            || bounded_mcp_scan.as_ref().is_some_and(|scan| {
-                matches!(scan, mcp_jsonrpc::RequestScan::ToolCalls { .. })
-            });
+            || bounded_mcp_scan
+                .as_ref()
+                .is_some_and(|scan| matches!(scan, mcp_jsonrpc::RequestScan::ToolCalls { .. }));
         let is_mcp = self.capture.mcp_tool_calls && carries_tool_call;
         if !is_ai && !is_mcp {
             self.discard_staged_candidate(ctx);
@@ -4907,10 +4907,7 @@ impl Plugin for AiTranscriptAudit {
             return true;
         }
         ctx.method.eq_ignore_ascii_case("POST")
-            && self.candidate_content_type(
-                ctx,
-                ctx.headers.get("content-type").map(String::as_str),
-            )
+            && self.candidate_content_type(ctx, ctx.headers.get("content-type").map(String::as_str))
     }
 
     async fn before_proxy(
@@ -5078,8 +5075,8 @@ impl Plugin for AiTranscriptAudit {
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
-        let is_json = self
-            .candidate_content_type(ctx, headers.get("content-type").map(String::as_str));
+        let is_json =
+            self.candidate_content_type(ctx, headers.get("content-type").map(String::as_str));
         if !is_json {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;

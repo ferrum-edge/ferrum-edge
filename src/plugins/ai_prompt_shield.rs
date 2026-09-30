@@ -1690,10 +1690,8 @@ impl AiPromptShield {
 /// exact signed/unsigned range.
 fn mcp_ids_round_trip(body: &str) -> bool {
     match mcp_jsonrpc::scan_request_bytes(body.as_bytes()) {
-        mcp_jsonrpc::RequestScan::ToolCalls { members, .. } => members
-            .iter()
-            .filter_map(|member| member.id)
-            .all(|id| {
+        mcp_jsonrpc::RequestScan::ToolCalls { members, .. } => {
+            members.iter().filter_map(|member| member.id).all(|id| {
                 let token = id.get();
                 if !token
                     .as_bytes()
@@ -1705,13 +1703,10 @@ fn mcp_ids_round_trip(body: &str) -> bool {
                 token
                     .parse::<i64>()
                     .map(|value| value.to_string() == token)
-                    .or_else(|_| {
-                        token
-                            .parse::<u64>()
-                            .map(|value| value.to_string() == token)
-                    })
+                    .or_else(|_| token.parse::<u64>().map(|value| value.to_string() == token))
                     .unwrap_or(false)
-            }),
+            })
+        }
         mcp_jsonrpc::RequestScan::NoToolCall | mcp_jsonrpc::RequestScan::Uninspectable(_) => true,
     }
 }
