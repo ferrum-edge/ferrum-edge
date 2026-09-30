@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mcp_gateway` per-consumer tool grants** (#5907). In `aggregate_router`
+  mode a `policy.tools` entry with `action: allow` can carry
+  `allowed_groups` and `denied_groups`, matched against the request
+  Consumer's `acl_groups`. A tool is granted when the caller is a mapped
+  Consumer that holds none of `denied_groups` (which takes precedence) and
+  either the entry has no `allowed_groups` or the Consumer holds one of them;
+  a request with no mapped Consumer is never granted a group-conditioned
+  tool. `tools/list` leaves out every ungranted tool, across every aggregated
+  upstream, and `tools/call` of one answers the existing `-32001`. Once any
+  entry carries a group list, an unknown tool name also answers `-32001`
+  instead of `-32003`, so hidden tool names cannot be probed. Groups are read
+  from the Consumer resolved for each request from the live configuration, so
+  an Admin API grant or revoke applies to that consumer's next request on the
+  same MCP session without a restart. The grant is re-decided in the final
+  request-body hook after the admission re-check, so a later plugin cannot
+  swap the identified Consumer to carry an ungranted call upstream.
+  `mcp.policy_decision` records `deny_group` or `deny_no_consumer`. Empty
+  lists, group lists on `deny` / `hide_from_discovery` entries, a group in
+  both lists, and more than 512 distinct groups per policy are rejected at
+  config load. Tool-name-only policies behave exactly as before.
+  `notifications/tools/list_changed` is not yet sent when grants change.
+
 - **`otel_tracing` attempt spans on the HTTP/3 bridge to HTTP/1.1 and HTTP/2
   backends** (#5875). The HTTP/3 frontend's bridge to a backend without
   native HTTP/3 now exports one `CLIENT` span per backend attempt, retries and

@@ -152,7 +152,7 @@ const MCP_CAPABILITIES_KEYS: &[&str] = &[
     "passthrough_unknown_methods",
 ];
 const MCP_POLICY_KEYS: &[&str] = &["default_action", "hide_denied_tools", "tools"];
-const MCP_POLICY_TOOL_KEYS: &[&str] = &["action"];
+const MCP_POLICY_TOOL_KEYS: &[&str] = &["action", "allowed_groups", "denied_groups"];
 const MCP_VALIDATION_KEYS: &[&str] = &[
     "max_batch_bytes",
     "max_batch_item_bytes",
@@ -367,16 +367,150 @@ struct McpCapabilitiesConfig {
 struct McpPolicy {
     default_action: PolicyAction,
     hide_denied_tools: bool,
-    tools: HashMap<String, PolicyAction>,
+    tools: HashMap<String, McpToolPolicy>,
+    /// Every ACL group name referenced by a `policy.tools.*.allowed_groups` or
+    /// `denied_groups` list, interned at config load to its bit position in an
+    /// [`McpGroupSet`]. Empty when no tool entry carries a group condition, in
+    /// which case no request does any grant work at all.
+    grant_groups: HashMap<String, usize>,
 }
 
 impl McpPolicy {
     fn action_for_tool(&self, public_name: &str) -> PolicyAction {
         self.tools
             .get(public_name)
-            .copied()
+            .map(|tool| tool.action)
             .unwrap_or(self.default_action)
     }
+
+    /// Whether any tool entry carries a per-consumer group condition.
+    fn has_grants(&self) -> bool {
+        !self.grant_groups.is_empty()
+    }
+
+    /// The precomputed group condition of one public tool, `None` for a tool
+    /// every consumer may use subject to its action.
+    ///
+    /// Keyed on the public namespaced tool name only, so any catalog source —
+    /// an upstream MCP server's `tools/list` or a generated tool — plugs into
+    /// the same grant decision.
+    fn grant_for_tool(&self, public_name: &str) -> Option<McpToolGrant> {
+        self.tools.get(public_name).and_then(|tool| tool.grant)
+    }
+
+    /// Resolve the request consumer's CURRENT `acl_groups` against the
+    /// interned policy groups.
+    ///
+    /// `consumer` is the `Consumer` the authentication phase resolved for THIS
+    /// request from the live config snapshot, never a copy captured when the
+    /// MCP session was minted, so an Admin API group grant or revoke applies
+    /// on the consumer's next request without restarting the session. Groups
+    /// the policy never names are ignored; no allocation happens here.
+    fn grant_view(&self, consumer: Option<&Consumer>) -> McpGrantView {
+        let mut held = McpGroupSet::default();
+        if let Some(consumer) = consumer {
+            for group in &consumer.acl_groups {
+                if let Some(index) = self.grant_groups.get(group.as_str()) {
+                    held.insert(*index);
+                }
+            }
+        }
+        McpGrantView {
+            has_consumer: consumer.is_some(),
+            held,
+        }
+    }
+}
+
+/// Upper bound on distinct ACL group names one `policy.tools` map may
+/// reference across all of its `allowed_groups` / `denied_groups` lists.
+///
+/// Interned names become bit positions in a fixed-size, stack-resident
+/// [`McpGroupSet`], so a per-request grant decision is a few word-wide ANDs
+/// with no allocation.
+const MAX_MCP_POLICY_GRANT_GROUPS: usize = 512;
+const MCP_GROUP_SET_WORDS: usize = MAX_MCP_POLICY_GRANT_GROUPS / 64;
+
+/// A set of interned policy group names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct McpGroupSet([u64; MCP_GROUP_SET_WORDS]);
+
+impl McpGroupSet {
+    fn insert(&mut self, index: usize) {
+        if let Some(word) = self.0.get_mut(index / 64) {
+            *word |= 1u64 << (index % 64);
+        }
+    }
+
+    fn intersects(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .any(|(left, right)| left & right != 0)
+    }
+}
+
+/// One `policy.tools` entry, precomputed at config load.
+#[derive(Debug, Clone, Copy)]
+struct McpToolPolicy {
+    action: PolicyAction,
+    /// Per-consumer group condition. Only an `allow` entry may carry one.
+    grant: Option<McpToolGrant>,
+}
+
+/// Per-consumer grant condition of an `allow` tool entry.
+///
+/// A tool is granted to a request iff the request carries a gateway-mapped
+/// `Consumer`, that consumer holds none of `denied`, and `allowed` is absent
+/// or the consumer holds at least one of its groups. It fails closed: no
+/// consumer (an anonymous proxy, or an external identity with no `Consumer`
+/// mapping) is never granted a group-conditioned tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct McpToolGrant {
+    allowed: Option<McpGroupSet>,
+    denied: McpGroupSet,
+}
+
+impl McpToolGrant {
+    fn decide(&self, view: &McpGrantView) -> Result<(), McpGrantDenial> {
+        if !view.has_consumer {
+            return Err(McpGrantDenial::NoConsumer);
+        }
+        // `denied_groups` takes precedence over every allow.
+        if self.denied.intersects(&view.held) {
+            return Err(McpGrantDenial::Group);
+        }
+        match self.allowed {
+            Some(allowed) if !allowed.intersects(&view.held) => Err(McpGrantDenial::Group),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Why a group-conditioned tool is not granted to a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpGrantDenial {
+    /// The request carries no gateway-mapped `Consumer`.
+    NoConsumer,
+    /// The consumer holds a denied group, or none of the allowed groups.
+    Group,
+}
+
+impl McpGrantDenial {
+    fn as_policy_decision(self) -> &'static str {
+        match self {
+            Self::NoConsumer => "deny_no_consumer",
+            Self::Group => "deny_group",
+        }
+    }
+}
+
+/// The request consumer's groups resolved against one policy, computed once
+/// per `tools/list` or `tools/call` and reused for every tool it decides.
+#[derive(Debug, Clone, Copy)]
+struct McpGrantView {
+    has_consumer: bool,
+    held: McpGroupSet,
 }
 
 #[derive(Debug, Clone)]
@@ -984,6 +1118,11 @@ struct McpAdmittedTarget {
     /// `params.arguments` exactly as admitted (and, for `tools/call` with
     /// `validation.validate_tool_arguments`, as validated). `None` when absent.
     arguments: Option<Value>,
+    /// The per-consumer group condition the admitted tool was granted under,
+    /// re-decided in the final request-body hook against the consumer on the
+    /// context at that point. `None` for an ungated tool, a prompt, or a
+    /// resource.
+    grant: Option<McpToolGrant>,
 }
 
 impl McpAdmittedTarget {
@@ -997,6 +1136,7 @@ impl McpAdmittedTarget {
                 .as_ref()
                 .and_then(|params| params.get("arguments"))
                 .cloned(),
+            grant: None,
         }
     }
 
@@ -1006,7 +1146,13 @@ impl McpAdmittedTarget {
             upstream_value: upstream_value.to_string(),
             binds_arguments: false,
             arguments: None,
+            grant: None,
         }
+    }
+
+    fn with_grant(mut self, grant: Option<McpToolGrant>) -> Self {
+        self.grant = grant;
+        self
     }
 }
 
@@ -3903,6 +4049,14 @@ impl McpGateway {
         if let Some(response) = family_unavailable_error(&catalog, "tools", envelope.id.clone()) {
             return response;
         }
+        // Per-consumer grants: a group-conditioned tool this request's
+        // consumer is not granted is omitted entirely, whatever
+        // `hide_denied_tools` says, so an agent never discovers a tool it may
+        // not call. Resolved once per list from the current request's consumer.
+        let grant_view = self
+            .policy
+            .has_grants()
+            .then(|| self.policy.grant_view(ctx.identified_consumer.as_deref()));
         let tools: Vec<Value> = catalog
             .tools
             .values()
@@ -3910,6 +4064,11 @@ impl McpGateway {
                 !entry.hidden_from_discovery
                     && (entry.enabled
                         || !(self.discovery.hide_denied_items || self.policy.hide_denied_tools))
+                    && grant_view.as_ref().is_none_or(|view| {
+                        self.policy
+                            .grant_for_tool(&entry.public_name)
+                            .is_none_or(|grant| grant.decide(view).is_ok())
+                    })
             })
             .map(tool_entry_to_public_value)
             .collect();
@@ -4116,6 +4275,12 @@ impl McpGateway {
                 ctx.metadata
                     .insert("mcp.policy_decision".to_string(), "deny".to_string());
             }
+            // With per-consumer grants configured, an unknown name answers
+            // exactly like a tool the caller is not granted, so probing
+            // `tools/call` cannot reveal which hidden tool names exist.
+            if self.policy.has_grants() {
+                return tool_call_denied(envelope.id.clone());
+            }
             return json_rpc_error(envelope.id.clone(), -32003, "Unknown MCP tool", None);
         };
         drop(catalog);
@@ -4143,12 +4308,27 @@ impl McpGateway {
                 ctx.metadata
                     .insert("mcp.route_decision".to_string(), "deny".to_string());
             }
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32001,
-                "MCP tool call denied by gateway policy",
-                None,
-            );
+            return tool_call_denied(envelope.id.clone());
+        }
+        // Per-consumer grant, decided on the call path itself and not only by
+        // `tools/list` filtering: a client that learned a tool name elsewhere
+        // still cannot call a tool its consumer is not granted. Checked before
+        // argument validation so an ungranted caller learns nothing about the
+        // tool's input schema either.
+        let grant = self.policy.grant_for_tool(&public_name);
+        if let Some(grant) = grant {
+            let view = self.policy.grant_view(ctx.identified_consumer.as_deref());
+            if let Err(denial) = grant.decide(&view) {
+                if self.observability.emit_metadata {
+                    ctx.metadata.insert(
+                        "mcp.policy_decision".to_string(),
+                        denial.as_policy_decision().to_string(),
+                    );
+                    ctx.metadata
+                        .insert("mcp.route_decision".to_string(), "deny".to_string());
+                }
+                return tool_call_denied(envelope.id.clone());
+            }
         }
         if self.observability.emit_metadata {
             ctx.metadata
@@ -4275,11 +4455,10 @@ impl McpGateway {
             headers,
             envelope,
             &server.server_id,
-            Some(McpAdmittedTarget::with_arguments(
-                "name",
-                &entry.upstream_name,
-                envelope,
-            )),
+            Some(
+                McpAdmittedTarget::with_arguments("name", &entry.upstream_name, envelope)
+                    .with_grant(grant),
+            ),
         );
         PluginResult::Continue
     }
@@ -5770,6 +5949,30 @@ impl McpGateway {
         None
     }
 
+    /// Re-decide the recorded per-consumer grant of an admitted `tools/call`.
+    /// `None` when the call carries no group condition or is still granted.
+    fn final_grant_denial(&self, ctx: &RequestContext) -> Option<McpGrantDenial> {
+        let grant = ctx
+            .mcp_admission
+            .as_deref()
+            .and_then(|record| record.target.as_ref())
+            .and_then(|target| target.grant)?;
+        let view = self.policy.grant_view(ctx.identified_consumer.as_deref());
+        grant.decide(&view).err()
+    }
+
+    fn reject_final_grant(&self, ctx: &mut RequestContext, denial: McpGrantDenial) -> PluginResult {
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(
+                "mcp.policy_decision".to_string(),
+                denial.as_policy_decision().to_string(),
+            );
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+        }
+        Self::correlate_gateway_terminal(ctx, tool_call_denied(None), &[])
+    }
+
     fn reject_admission_drift(
         &self,
         ctx: &mut RequestContext,
@@ -6090,9 +6293,17 @@ impl Plugin for McpGateway {
             let body = ctx.inspectable_final_request_body(body);
             self.final_admission_violation(ctx, headers, body)
         };
-        match violation {
+        if let Some(reason) = violation {
+            return self.reject_admission_drift(ctx, reason);
+        }
+        // Only now that the final body is proven to still name the admitted
+        // tool is its per-consumer grant re-decided, against the consumer on
+        // the context at this point: a later plugin that swapped or cleared
+        // the identified consumer after `before_proxy` cannot carry an
+        // ungranted call to the upstream.
+        match self.final_grant_denial(ctx) {
             None => PluginResult::Continue,
-            Some(reason) => self.reject_admission_drift(ctx, reason),
+            Some(denial) => self.reject_final_grant(ctx, denial),
         }
     }
 
@@ -7638,6 +7849,15 @@ fn json_rpc_error(
     )
 }
 
+/// The one `tools/call` refusal for a denied, hidden, ungranted, or (with
+/// per-consumer grants configured) unknown tool. It never names the tool, a
+/// group, or the reason, so the answer reveals nothing about which tools exist
+/// or who may call them; the reason is recorded only in
+/// `mcp.policy_decision`.
+fn tool_call_denied(id: Option<Value>) -> PluginResult {
+    json_rpc_error(id, -32001, "MCP tool call denied by gateway policy", None)
+}
+
 fn json_rpc_error_value(id: Option<Value>, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -8530,6 +8750,7 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
     };
     let hide_denied_tools = optional_bool_from_object(policy, "hide_denied_tools")?.unwrap_or(true);
     let mut tools = HashMap::new();
+    let mut grant_groups = HashMap::new();
     if let Some(tools_object) = policy
         .and_then(|policy| policy.get("tools"))
         .and_then(Value::as_object)
@@ -8547,7 +8768,8 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
                 })?,
                 "policy.tools.*.action",
             )?;
-            tools.insert(tool_name.clone(), action);
+            let grant = parse_tool_grant(object, tool_name, action, &mut grant_groups)?;
+            tools.insert(tool_name.clone(), McpToolPolicy { action, grant });
         }
     } else if policy
         .and_then(|policy| policy.get("tools"))
@@ -8559,7 +8781,105 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
         default_action,
         hide_denied_tools,
         tools,
+        grant_groups,
     })
+}
+
+/// Parse the optional `allowed_groups` / `denied_groups` condition of one
+/// `policy.tools` entry, interning each group name into `grant_groups`.
+///
+/// Diagnostics name the schema path and the tool, never a supplied group.
+fn parse_tool_grant(
+    object: &Map<String, Value>,
+    tool_name: &str,
+    action: PolicyAction,
+    grant_groups: &mut HashMap<String, usize>,
+) -> Result<Option<McpToolGrant>, String> {
+    let allowed = parse_grant_group_list(object, "allowed_groups", tool_name, grant_groups)?;
+    let denied = parse_grant_group_list(object, "denied_groups", tool_name, grant_groups)?;
+    if allowed.is_none() && denied.is_none() {
+        return Ok(None);
+    }
+    // A group condition narrows an allow. On `deny` or `hide_from_discovery`
+    // it could never grant anything, so it is refused rather than stored
+    // inert.
+    if action != PolicyAction::Allow {
+        return Err(format!(
+            "mcp_gateway: `policy.tools.*.allowed_groups` and `policy.tools.*.denied_groups` require `action: allow` for tool {tool_name:?}"
+        ));
+    }
+    let denied = denied.unwrap_or_default();
+    if allowed.is_some_and(|allowed| allowed.intersects(&denied)) {
+        return Err(format!(
+            "mcp_gateway: `policy.tools.*.allowed_groups` and `policy.tools.*.denied_groups` must not name the same group for tool {tool_name:?}"
+        ));
+    }
+    Ok(Some(McpToolGrant { allowed, denied }))
+}
+
+fn parse_grant_group_list(
+    object: &Map<String, Value>,
+    key: &str,
+    tool_name: &str,
+    grant_groups: &mut HashMap<String, usize>,
+) -> Result<Option<McpGroupSet>, String> {
+    let Some(value) = object.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        format!(
+            "mcp_gateway: `policy.tools.*.{key}` must be an array of ACL group names for tool {tool_name:?}"
+        )
+    })?;
+    // An empty list is ambiguous (nobody, or everybody?), so it is refused;
+    // omitting `allowed_groups` is how a tool is granted to every consumer.
+    if entries.is_empty() {
+        return Err(format!(
+            "mcp_gateway: `policy.tools.*.{key}` must not be empty for tool {tool_name:?}; omit it instead"
+        ));
+    }
+    if entries.len() > MAX_MCP_POLICY_GRANT_GROUPS {
+        return Err(format!(
+            "mcp_gateway: `policy.tools.*.{key}` must not have more than {MAX_MCP_POLICY_GRANT_GROUPS} entries for tool {tool_name:?}"
+        ));
+    }
+    let mut set = McpGroupSet::default();
+    for entry in entries {
+        let group = entry.as_str().ok_or_else(|| {
+            format!(
+                "mcp_gateway: `policy.tools.*.{key}` entries must be strings for tool {tool_name:?}"
+            )
+        })?;
+        // Stored byte-for-byte like `access_control` group rules: a consumer
+        // group is never canonicalized, so trimming would silently build a
+        // rule that can never match. Only whitespace-only names are refused.
+        if group.trim().is_empty() {
+            return Err(format!(
+                "mcp_gateway: `policy.tools.*.{key}` entries must contain non-whitespace characters for tool {tool_name:?}"
+            ));
+        }
+        if group.chars().count() > crate::config::types::MAX_ACL_GROUP_LENGTH {
+            return Err(format!(
+                "mcp_gateway: `policy.tools.*.{key}` entries must not exceed {} characters for tool {tool_name:?}",
+                crate::config::types::MAX_ACL_GROUP_LENGTH
+            ));
+        }
+        let index = match grant_groups.get(group) {
+            Some(index) => *index,
+            None => {
+                let index = grant_groups.len();
+                if index >= MAX_MCP_POLICY_GRANT_GROUPS {
+                    return Err(format!(
+                        "mcp_gateway: `policy.tools` must not reference more than {MAX_MCP_POLICY_GRANT_GROUPS} distinct ACL groups across `allowed_groups` and `denied_groups`"
+                    ));
+                }
+                grant_groups.insert(group.to_string(), index);
+                index
+            }
+        };
+        set.insert(index);
+    }
+    Ok(Some(set))
 }
 
 fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, String> {
