@@ -144,9 +144,9 @@ def bracket(values, start, end):
 
 
 def envoy_counter_provenance(image=None):
-    if image and image.endswith("@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb"):
+    if image and image.endswith("@sha256:be87c8b52663c1164a5bdf3c5419017a269cb3d8c74be1ec93638a71f1ffbd4b"):
         return dict(semantics="corrected_cumulative_SO_RXQ_OVFL_assignment",
-                    source="d7809ba2b07fd869d49bfb122b27f6a7977b4d94",
+                    source="b579d07d3ad7ee11d32b105e91a5a39ad24718d7",
                     kernel_socket_deltas_independent=True, exact_kernel_loss_claim=False)
     if image and "1.33.5" in image:
         return dict(semantics="historical_inflated_SO_RXQ_OVFL_totals_38652", exact_kernel_loss_claim=False)

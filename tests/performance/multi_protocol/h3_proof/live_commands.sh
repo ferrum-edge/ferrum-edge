@@ -7,7 +7,7 @@ case "${H3_LIVE_ACTION:?}" in
   docker-info) exec docker info --format '{{json .}}' ;;
   image-inspect)
     case "${H3_LIVE_IMAGE:?}" in
-      ferrum-h3-live:qualified|docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb) ;;
+      ferrum-h3-live:qualified|docker.io/envoyproxy/envoy@sha256:be87c8b52663c1164a5bdf3c5419017a269cb3d8c74be1ec93638a71f1ffbd4b) ;;
       *) exit 2 ;;
     esac
     exec docker image inspect "$H3_LIVE_IMAGE" ;;
@@ -75,7 +75,7 @@ case "${H3_LIVE_ACTION:?}" in
           --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
           -v /tmp/ferrum-h3-live/runtime/certs:/certs:ro \
           -v "/tmp/ferrum-h3-live/configs/$H3_LIVE_ARM.yaml:/etc/envoy/envoy.yaml:ro" \
-          docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb \
+          docker.io/envoyproxy/envoy@sha256:be87c8b52663c1164a5bdf3c5419017a269cb3d8c74be1ec93638a71f1ffbd4b \
           envoy -c /etc/envoy/envoy.yaml --concurrency "$H3_LIVE_CPUS" -l info --disable-hot-restart ;;
       *) exit 2 ;;
     esac ;;
