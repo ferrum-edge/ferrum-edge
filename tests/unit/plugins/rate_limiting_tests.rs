@@ -1979,10 +1979,21 @@ async fn default_fallback_retains_budget_on_reload_and_marks_request_metadata() 
 #[test]
 fn the_capacity_refusal_is_attributed_from_the_decision_not_from_availability() {
     let source = include_str!("../../../src/plugins/rate_limiting.rs");
-    let body = source
+    let check_rate = source
         .split("    async fn check_rate(")
         .nth(1)
         .expect("check_rate must exist")
+        .split("\n    async fn ")
+        .next()
+        .expect("the next method ends the body");
+    assert!(
+        check_rate.contains("self.decide(key, limit_op, ctx).await"),
+        "request admission must go through the shared decision"
+    );
+    let body = source
+        .split("    async fn decide(")
+        .nth(1)
+        .expect("decide must exist")
         .split("\n    async fn ")
         .next()
         .expect("the next method ends the body");
