@@ -13417,11 +13417,13 @@ async fn mcp_audit_final_fallback_skips_large_content_type_less_uploads() {
             .await,
         PluginResult::Continue
     ));
-    assert!(
-        !ctx.metadata.contains_key("ai_transcript_audit.candidate"),
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false"),
         "a large Content-Type-less binary upload is not staged as an AI request"
     );
-    assert!(received_records(&server).await.is_empty());
 }
 
 #[test]

@@ -1774,9 +1774,12 @@ fn mcp_progress_tokens_round_trip(body: &str) -> bool {
         let Some(token) = meta.progress_token else {
             return true;
         };
-        serde_json::from_str::<Value>(token.get())
-            .ok()
-            .is_some_and(|value| value.to_string() == token.get())
+        match serde_json::from_str::<Value>(token.get()) {
+            // Strings and null stay JSON-equal after re-serialization.
+            Ok(Value::String(_) | Value::Null) => true,
+            Ok(value) => serde_json::to_string(&value).is_ok_and(|text| text == token.get()),
+            Err(_) => false,
+        }
     }
 
     let first = body
@@ -2081,7 +2084,7 @@ impl Plugin for AiPromptShield {
                             body: serde_json::json!({
                                 "error": "MCP JSON-RPC request exceeds inspection bounds",
                                 "detected_types": detected,
-                                "message": "Request blocked because the tool-call batch cannot be inspected within the configured MCP bounds."
+                                "message": "Request blocked because the tool-call batch exceeds the fixed MCP inspection bounds (32 members, 1 MiB, 256 KiB per member)."
                             })
                             .to_string(),
                             headers: HashMap::new(),

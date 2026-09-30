@@ -4402,6 +4402,20 @@ async fn mcp_redaction_refuses_numeric_ids_that_cannot_round_trip() {
             .is_none(),
         "an id refusal must never emit a rewritten or original document"
     );
+
+    // Control: the same body with an id that round-trips is rewritten.
+    let control = body.replace("\"id\":1e3", "\"id\":7");
+    assert!(
+        plugin
+            .transform_request_body(
+                control.as_bytes(),
+                Some("application/json"),
+                &transform_headers,
+            )
+            .await
+            .is_some(),
+        "a round-trippable id still gets its redacted document"
+    );
 }
 
 #[tokio::test]
