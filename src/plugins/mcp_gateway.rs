@@ -431,7 +431,7 @@ impl McpPolicy {
 /// with no allocation.
 const MAX_MCP_POLICY_GRANT_GROUPS: usize = 512;
 const MCP_GROUP_SET_WORDS: usize = MAX_MCP_POLICY_GRANT_GROUPS / 64;
-const _: () = assert!(MAX_MCP_POLICY_GRANT_GROUPS % 64 == 0);
+const _: () = assert!(MAX_MCP_POLICY_GRANT_GROUPS.is_multiple_of(64));
 
 /// A set of interned policy group names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
