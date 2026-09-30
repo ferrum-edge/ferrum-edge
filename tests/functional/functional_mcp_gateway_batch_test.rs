@@ -239,7 +239,6 @@ async fn functional_mcp_gateway_batch_rejects_trailing_slash_alias() {
     }
     for path in [
         "/mcp/",
-        "/mcp//",
         "/mcp/tools",
         "/mcp/tools/",
         "/MCP",
@@ -257,6 +256,16 @@ async fn functional_mcp_gateway_batch_rejects_trailing_slash_alias() {
         assert_eq!(body["error"]["message"], "Unknown MCP endpoint");
         assert!(requests.try_recv().is_err());
     }
+    // An empty inner segment is refused by the shared frontend before any
+    // plugin runs (`empty_segment`, HTTP 400), so it never reaches the backend.
+    let response = client
+        .post(gateway.proxy_url("/mcp//"))
+        .json(&initialize)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400, "/mcp//");
+    assert!(requests.try_recv().is_err());
     // Use raw HTTP so a client URL parser cannot erase the dot segment. The
     // shared frontend rejects these before any plugin runs (HTTP 400); direct
     // plugin tests separately assert the Unknown MCP endpoint backstop.
