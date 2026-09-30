@@ -274,6 +274,7 @@ struct Fixture {
     backend: Backend,
     client: reqwest::Client,
     url: String,
+    framing: Framing,
     cutoff: usize,
     _certs: tempfile::TempDir,
     _provider: crate::scaffolding::ports::RefusedTcpPort,
@@ -381,6 +382,7 @@ impl Fixture {
             backend,
             client,
             url: format!("{scheme}://127.0.0.1:{port}{PATH}"),
+            framing,
             cutoff,
             _certs: certs,
             _provider: provider,
@@ -498,9 +500,14 @@ impl Fixture {
             .expect("request task");
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.version(), reqwest::Version::HTTP_11);
-        assert!(
-            response.content_length().is_none(),
-            "streamed wire length is unknown"
+        let expected_content_length = match self.framing {
+            Framing::Declared(length) => Some(length as u64),
+            Framing::Chunked => None,
+        };
+        assert_eq!(
+            response.content_length(),
+            expected_content_length,
+            "streamed response length must match backend framing"
         );
         receive_marker(&mut response, bytes, released).await;
         self.accounting(1).await;
