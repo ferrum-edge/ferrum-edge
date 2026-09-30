@@ -207,30 +207,26 @@ impl PathMatcher {
 
 impl CompiledConditions {
     fn compile(raw: &Conditions) -> Result<Self, String> {
-        use crate::policy_path::{
-            non_canonical_policy_path_pattern_reason, non_canonical_policy_path_reason,
-        };
-
         let path_matchers = raw
             .paths
             .iter()
             .enumerate()
             .map(|(index, pattern)| {
                 // Conditions are matched against the canonical request path,
-                // so a non-canonical value never matches and silently leaves
-                // the rule inactive. Refuse it at admission with the same
-                // rules as `listen_path` (GHSA-fcqw-793q-wg5x): a `~regex` is
-                // held to the escape rules only, a prefix or exact value to
-                // the full contract (no `//`, no dot segment, no escape).
-                let literal = pattern.strip_suffix('*').unwrap_or(pattern.as_str());
-                let reason = match pattern.strip_prefix('~') {
-                    Some(regex) => non_canonical_policy_path_pattern_reason(regex),
-                    None => non_canonical_policy_path_reason(literal),
-                };
-                if let Some(reason) = reason {
-                    return Err(format!(
-                        "waf: `conditions.paths[{index}]` is not a canonical policy path: {reason}"
-                    ));
+                // so a non-canonical exact or prefix value never matches and
+                // silently leaves the rule inactive. Refuse it at admission
+                // with the full canonical-path rules (GHSA-fcqw-793q-wg5x): no
+                // `//`, no dot segment, no escape. A `~regex` is left alone:
+                // `%`, `\`, `.`, and `//` are regex text there and can still
+                // describe canonical paths (`~^[^%]*$`).
+                if !pattern.starts_with('~') {
+                    let literal = pattern.strip_suffix('*').unwrap_or(pattern.as_str());
+                    let reason = crate::policy_path::non_canonical_policy_path_reason(literal);
+                    if let Some(reason) = reason {
+                        return Err(format!(
+                            "waf: `conditions.paths[{index}]` is not a canonical path: {reason}"
+                        ));
+                    }
                 }
                 if let Some(regex) = pattern.strip_prefix('~') {
                     // Rule path conditions scope when a rule is active. Keep

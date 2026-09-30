@@ -450,18 +450,14 @@ fn non_final_empty_segments_are_rejected() {
         "/a///b",
         "/;x/admin",
         "/;/admin",
-        "/;",
-        "/;x",
         "/a/;x/b",
         "/a/;/b",
-        "/admin/;x",
         ";x",
         // The same targets reach the decoding pass when they carry an escape.
         "//%61dmin",
         "/%61//b",
         "/%3Bx/admin",
         "/a/%3B/b",
-        "/%3b",
     ] {
         assert_eq!(
             rejection(path),
@@ -485,6 +481,54 @@ fn the_root_path_and_a_trailing_slash_are_not_empty_segments() {
 }
 
 #[test]
+fn a_final_parameter_only_segment_is_left_to_the_per_proxy_rule() {
+    // Tomcat emits `/ctx/;jsessionid=…` for directory URLs. A final segment
+    // that is empty before its `;` resolves to the trailing-slash path, not to
+    // a collapsed one, so the structural rule admits it; the `;` itself is
+    // still refused on any proxy that has not opted in (rule 10).
+    for (raw, expected, borrowed) in [
+        ("/ctx/;jsessionid=abc", "/ctx/;jsessionid=abc", true),
+        ("/;", "/;", true),
+        ("/;x", "/;x", true),
+        ("/ctx/%3Bjsessionid=abc", "/ctx/;jsessionid=abc", false),
+    ] {
+        let canonical = canonicalize_request_path(raw)
+            .unwrap_or_else(|rejection| panic!("{raw:?} rejected: {rejection:?}"));
+        assert_eq!(canonical.path, expected, "{raw:?}");
+        assert!(canonical.has_path_parameter, "{raw:?}");
+        assert_eq!(
+            matches!(canonical.path, Cow::Borrowed(_)),
+            borrowed,
+            "{raw:?} ownership"
+        );
+    }
+    // Only the final segment: the same shape mid-path is still refused.
+    assert_eq!(
+        rejection("/ctx/;jsessionid=abc/x"),
+        PolicyPathRejection::EmptySegment
+    );
+}
+
+#[test]
+fn stripping_path_parameters_yields_the_backend_resolved_path() {
+    use ferrum_edge::policy_path::strip_path_parameters;
+
+    assert!(matches!(
+        strip_path_parameters("/admin/users"),
+        Cow::Borrowed("/admin/users")
+    ));
+    for (raw, expected) in [
+        ("/admin;x/users", "/admin/users"),
+        ("/admin;/users", "/admin/users"),
+        ("/a;b=c;d/e;f", "/a/e"),
+        ("/ctx/;jsessionid=abc", "/ctx/"),
+        ("/v1;version=2", "/v1"),
+    ] {
+        assert_eq!(strip_path_parameters(raw), expected, "{raw:?}");
+    }
+}
+
+#[test]
 fn config_values_with_an_empty_segment_can_never_match() {
     assert_eq!(
         non_canonical_policy_path_reason("/api//admin"),
@@ -495,7 +539,7 @@ fn config_values_with_an_empty_segment_can_never_match() {
         Some("empty_segment")
     );
     assert_eq!(
-        non_canonical_policy_path_reason("/api/;x"),
+        non_canonical_policy_path_reason("/api/;x/y"),
         Some("empty_segment")
     );
     assert_eq!(non_canonical_policy_path_reason("/api/"), None);
@@ -761,6 +805,60 @@ async fn shared_before_proxy_boundary_validates_absolute_provider_paths() {
                 "rebase owns the offset reset"
             );
             assert_eq!(ctx.route_override_path_is_absolute, absolute);
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_before_proxy_boundary_leaves_the_override_query_byte_identical() {
+    // Provider overrides can carry the endpoint and client query. Only the
+    // path component is canonicalized: decoding the query in place would turn
+    // a client's `%26` / `%3D` into new provider parameters
+    // (GHSA-653r-wc8x-4fch), and the path rules do not apply to query text.
+    use ferrum_edge::_test_support::run_before_proxy_hooks_for_test;
+    use ferrum_edge::plugins::{PluginResult, RequestContext};
+    use std::collections::HashMap;
+
+    for (path, expected) in [
+        (
+            "/v1/chat?u=https://a//b&x=%26",
+            Some("/v1/chat?u=https://a//b&x=%26"),
+        ),
+        (
+            "/v1/chat?x=a%26api-version%3Devil",
+            Some("/v1/chat?x=a%26api-version%3Devil"),
+        ),
+        (
+            "/v1/%63hat?x=a%26b%3Dc&sig=a%2Bb%2F",
+            Some("/v1/chat?x=a%26b%3Dc&sig=a%2Bb%2F"),
+        ),
+        ("/v1/chat?q=../..", Some("/v1/chat?q=../..")),
+        ("/v1//chat?x=1", None),
+        ("/v1/../chat?x=%26", None),
+        ("/v1/chat%2Fx?y=1", None),
+    ] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/public".to_string(),
+        );
+        ctx.route_override_path = Some(path.to_string());
+        ctx.route_override_path_is_absolute = true;
+        let result = run_before_proxy_hooks_for_test(&[], &mut ctx, &mut HashMap::new()).await;
+        if let Some(expected) = expected {
+            assert!(matches!(result, PluginResult::Continue), "{path:?}");
+            assert_eq!(ctx.route_override_path.as_deref(), Some(expected));
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    PluginResult::Reject {
+                        status_code: 400,
+                        ..
+                    }
+                ),
+                "{path:?}"
+            );
         }
     }
 }

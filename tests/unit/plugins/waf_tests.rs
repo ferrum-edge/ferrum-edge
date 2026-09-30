@@ -401,7 +401,7 @@ fn rule_path_conditions_must_be_canonical_policy_paths() {
     // Conditions are matched against the canonical request path, so a value
     // that cannot appear in one would leave its rule silently inactive
     // (GHSA-fcqw-793q-wg5x). Exact and `prefix*` values are held to the full
-    // contract; a `~regex` only to the escape rules.
+    // contract; a `~regex` is regex text and is not canonicalized.
     let with_paths = |paths: serde_json::Value| {
         json!({
             "include_default_rules": false,
@@ -421,11 +421,10 @@ fn rule_path_conditions_must_be_canonical_policy_paths() {
     for (path, reason) in [
         ("/admin//users", "empty_segment"),
         ("//admin*", "empty_segment"),
-        ("/admin/;x", "empty_segment"),
+        ("/admin/;x/y", "empty_segment"),
         ("/admin/../users", "literal_dot_segment"),
         ("/%61dmin", "percent-escapes"),
         ("/admin%2F*", "encoded_separator"),
-        ("~/admin%2F.*", "encoded_separator"),
     ] {
         let error = waf(with_paths(json!([path])))
             .err()
@@ -435,7 +434,15 @@ fn rule_path_conditions_must_be_canonical_policy_paths() {
             "{path:?}: {error}"
         );
     }
-    for path in ["/admin", "/admin/*", "/admin;v=1", "~^/admin//x", "*"] {
+    for path in [
+        "/admin",
+        "/admin/*",
+        "/admin;v=1",
+        "~^/admin//x",
+        "~^[^%]*$",
+        "~/admin%2F.*",
+        "*",
+    ] {
         assert!(
             waf(with_paths(json!([path]))).is_ok(),
             "{path:?} must stay admissible"

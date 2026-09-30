@@ -490,7 +490,7 @@ const MAX_TARGET_HOST_LEN: usize = 253;
 /// already-canonicalized request path.
 ///
 /// The caller must pass the path *after*
-/// [`crate::policy_path::canonicalize_policy_path`], which has already decoded
+/// [`crate::policy_path::canonicalize_request_path`], which has already decoded
 /// every accepted percent-escape to one literal byte and refused ambiguous,
 /// encoded-separator, and traversal forms. That is what makes a single
 /// segment split unambiguous here — the RFC 9298 requirement that IPv6 colons

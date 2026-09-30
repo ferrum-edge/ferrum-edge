@@ -3316,16 +3316,26 @@ async fn handle_h3_request(
     };
 
     // A `;` path parameter is refused unless the routed proxy opted in with
-    // `allow_path_parameters`, at the same point in the ordering as H1/H2:
+    // `allow_path_parameters` and the parameter-stripped path routes to that
+    // same proxy, at the same point in the ordering as H1/H2:
     // after route lookup, before every plugin phase and backend dispatch
     // (GHSA-fcqw-793q-wg5x).
-    if let Err(rejection) = crate::policy_path::check_path_parameters(
+    if let Err(rejection) = crate::proxy::check_routed_path_parameters(
+        &state,
+        &epoch,
+        &path,
         request_path_has_parameter,
-        proxy.allow_path_parameters,
+        &proxy,
+        crate::proxy::RouteLookupScope {
+            host: request_host.as_deref(),
+            frontend_port: ctx.frontend_listen_port,
+            frontend_is_tls: true,
+            gateway_listener: gateway_listener_identity.as_ref(),
+        },
     ) {
         warn!(
             reason = rejection.reason(),
-            "Rejected HTTP/3 request: path parameter on a proxy without allow_path_parameters"
+            "Rejected HTTP/3 request: path parameter not admitted for the routed proxy"
         );
         record_h3_flavor_aware_reject(&state, http_flavor, 400);
         send_h3_error_flavor_aware(

@@ -2584,6 +2584,14 @@ pub(crate) struct RouteProxySpec {
 
 pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
     let now = Utc::now();
+    // A route whose literal path match itself contains `;` declares a path
+    // parameter explicitly, so it opts in rather than being unreachable and
+    // refused at admission (GHSA-fcqw-793q-wg5x). Every other translated
+    // route keeps the default refusal.
+    let allow_path_parameters = spec
+        .listen_path
+        .as_deref()
+        .is_some_and(crate::config::types::listen_path_requires_path_parameters);
     Proxy {
         labels: Default::default(),
         id: spec.id,
@@ -2647,7 +2655,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
         websocket_permessage_deflate: Default::default(),
-        allow_path_parameters: false,
+        allow_path_parameters,
         allowed_methods: None,
         allowed_ws_origins: Vec::new(),
         created_at: now,

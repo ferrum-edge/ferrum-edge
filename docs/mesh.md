@@ -2043,7 +2043,7 @@ rewritten into one of them:
 | `/api%20name`, any escape of a non-`pchar` byte | `400` | `unrepresentable_escape` |
 | `/admin\secret`, `/admin%5Csecret` | `400` | `literal_backslash` / `encoded_backslash` |
 | `//admin`, `/a//b`, `/;x/admin`, `/%3Bx/admin` | `400` | `empty_segment` |
-| `/admin;x/users`, `/v1;version=2`, `/admin%3Bx/users` | `400` | `path_parameter` (mesh-materialized routes do not set `allow_path_parameters`) |
+| `/admin;x/users`, `/v1;version=2`, `/admin%3Bx/users` | `400` | `path_parameter` (mesh-materialized routes cannot set `allow_path_parameters`; there is no mesh-level opt-in yet) |
 | `/%61dmin` | served as `/admin` | — (escape of a `pchar` byte is decoded) |
 | `/a..b`, `/...`, `/v1.0/x`, `/a/` | served unchanged | — (dots inside a segment NAME are not dot segments; a trailing slash is not an empty segment) |
 

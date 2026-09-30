@@ -1217,7 +1217,7 @@ fn mesh_authz_destination_ip(
 /// Ferrum settles both halves with ONE mechanism, the canonical policy path
 /// ([`crate::policy_path`]), rather than with a second authz-local
 /// normalizer. Every HTTP/1.1, HTTP/2, and HTTP/3 request target is run
-/// through [`crate::policy_path::canonicalize_policy_path`] at the frontend
+/// through [`crate::policy_path::canonicalize_request_path`] at the frontend
 /// boundary — before routing, before every plugin phase, and before backend
 /// dispatch — and an encoded separator or a dot segment is *refused* there
 /// rather than rewritten. Refusing is what removal cannot do: removing `..`

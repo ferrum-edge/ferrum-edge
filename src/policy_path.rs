@@ -90,10 +90,13 @@
 //!    `/%61dmin` canonicalizes to `/admin` and an operator's literal rule
 //!    matches.
 //! 9. **No empty segment survives except a trailing one.** A non-final empty
-//!    segment (`//admin`, `/a//b`) and a segment that is empty before its
-//!    first `;` (`/;x/admin`, `/a/;/b`) are
+//!    segment (`//admin`, `/a//b`) and a non-final segment that is empty
+//!    before its first `;` (`/;x/admin`, `/a/;/b`) are
 //!    [`PolicyPathRejection::EmptySegment`]. A trailing slash (`/a/`) and the
-//!    root path (`/`) are unaffected. Common backends collapse `//` (Tomcat,
+//!    root path (`/`) are unaffected, and so is a final parameter-only segment
+//!    (`/ctx/;jsessionid=1`, which Tomcat emits for directory URLs and which
+//!    resolves to the trailing-slash path); rule 10 still decides whether its
+//!    `;` is accepted. Common backends collapse `//` (Tomcat,
 //!    Spring, nginx `merge_slashes`) and strip `;…` before doing so, so
 //!    `//admin/users` and `/;x/admin/users` would execute `/admin/users`
 //!    while routing and policy read a different path. Collapsing here instead
@@ -114,7 +117,12 @@
 //!     plugin runs. Route lookup itself is a literal match on the canonical
 //!     path, not policy, so letting it see the `;` cannot grant anything: a
 //!     request routed to a proxy that has not opted in is refused before any
-//!     policy runs. Rules 5 and 9 still apply on an opted-in proxy.
+//!     policy runs. Rules 5 and 9 still apply on an opted-in proxy, and the
+//!     frontend also re-resolves the route with every parameter removed
+//!     ([`strip_path_parameters`]) and refuses the request when that path
+//!     belongs to a different proxy: the router splits only on `/`, so
+//!     `/admin;x/users` would otherwise miss an `/admin` proxy and reach an
+//!     opted-in catch-all whose backend executes `/admin/users`.
 //!
 //! Rules 4 and 8 together mean **no percent escape survives canonicalization**:
 //! an escape is either decoded to the literal byte it names or the request is
@@ -396,13 +404,28 @@ pub fn is_literal_dot_segment(segment: &str) -> bool {
     dot_segment_len(segment.as_bytes()).is_some()
 }
 
+/// Where a completed segment sits in the target, for rule 9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentPosition {
+    /// The text before the first `/`: empty for every absolute path.
+    Leading,
+    /// Any segment followed by a `/`.
+    Inner,
+    /// The last segment of a target that contains a `/`.
+    Final,
+}
+
 /// Reject a completed segment that rule 5 or rule 9 of the module contract
 /// refuses.
 ///
 /// `segment` is the segment's canonical bytes, without its `/` delimiters.
-/// `empty_allowed` is true only for the text before a leading `/` and for the
-/// final segment, so the root path and a trailing slash stay legal while every
-/// other empty segment (`//`, `/a//b`) is refused: one comparison per `/`.
+/// Only an [`SegmentPosition::Inner`] segment may not be empty, so the root
+/// path and a trailing slash stay legal while every other empty segment (`//`,
+/// `/a//b`) is refused: one comparison per `/`. A segment that is empty before
+/// its first `;` is refused unless it is [`SegmentPosition::Final`]: a final
+/// `;jsessionid=…` (which Tomcat emits for directory URLs) resolves to the
+/// trailing-slash path, not to a collapsed one, and whether any `;` is
+/// accepted at all is decided per proxy by rule 10.
 ///
 /// `first_escape` is the offset, within the segment, of the first byte that
 /// was decoded from a percent escape. A dot segment is ambiguous when that byte
@@ -412,11 +435,12 @@ pub fn is_literal_dot_segment(segment: &str) -> bool {
 #[inline]
 fn check_segment(
     segment: &[u8],
-    empty_allowed: bool,
+    position: SegmentPosition,
     first_escape: Option<usize>,
 ) -> Result<(), PolicyPathRejection> {
     match segment {
-        [] if empty_allowed => Ok(()),
+        [] if position != SegmentPosition::Inner => Ok(()),
+        [b';', ..] if position == SegmentPosition::Final => Ok(()),
         // A segment that is empty, or empty before its first `;`, collapses
         // into its neighbour on a backend that merges `//` after stripping
         // path parameters.
@@ -429,6 +453,43 @@ fn check_segment(
             None => Ok(()),
         },
     }
+}
+
+/// Classify a completed segment. `segment_start` is 0 only for the text
+/// before the first `/`; `at_end` is true for the segment the end of the
+/// target completed.
+#[inline]
+fn segment_position(segment_start: usize, at_end: bool) -> SegmentPosition {
+    if segment_start == 0 {
+        SegmentPosition::Leading
+    } else if at_end {
+        SegmentPosition::Final
+    } else {
+        SegmentPosition::Inner
+    }
+}
+
+/// `path` with every `;` path parameter removed from its segment: the path a
+/// backend that strips RFC 3986 path parameters resolves (`/admin;x/users`
+/// becomes `/admin/users`). Borrowed, and allocation-free, when `path` has no
+/// `;`.
+///
+/// Used to re-resolve a request that carries parameters on a proxy that opted
+/// in, so the opt-in cannot route a request past a more specific proxy that
+/// the stripped path belongs to.
+pub fn strip_path_parameters(path: &str) -> Cow<'_, str> {
+    if !path.contains(';') {
+        return Cow::Borrowed(path);
+    }
+    let mut stripped = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            stripped.push('/');
+        }
+        let name = segment.split_once(';').map_or(segment, |(name, _)| name);
+        stripped.push_str(name);
+    }
+    Cow::Owned(stripped)
 }
 
 /// What the allocation-free pre-scan concluded about a target.
@@ -462,9 +523,11 @@ fn prescan(bytes: &[u8], structure: LiteralStructure) -> Result<Prescan, PolicyP
             b'\\' if enforced => return Err(PolicyPathRejection::LiteralBackslash),
             b';' => has_path_parameter = true,
             b'/' if enforced => {
-                // `segment_start` is 0 only for the text before the first
-                // `/`, which is empty for every absolute path.
-                check_segment(&bytes[segment_start..index], segment_start == 0, None)?;
+                check_segment(
+                    &bytes[segment_start..index],
+                    segment_position(segment_start, false),
+                    None,
+                )?;
                 segment_start = index + 1;
             }
             _ => {}
@@ -473,7 +536,11 @@ fn prescan(bytes: &[u8], structure: LiteralStructure) -> Result<Prescan, PolicyP
     }
 
     if enforced {
-        check_segment(&bytes[segment_start..], true, None)?;
+        check_segment(
+            &bytes[segment_start..],
+            segment_position(segment_start, true),
+            None,
+        )?;
     }
     Ok(Prescan::AlreadyCanonical { has_path_parameter })
 }
@@ -567,7 +634,7 @@ fn canonicalize(
             if enforced {
                 check_segment(
                     &canonical[segment_start..],
-                    segment_start == 0,
+                    segment_position(segment_start, false),
                     segment_first_escape,
                 )?;
             }
@@ -635,7 +702,11 @@ fn canonicalize(
     }
 
     if enforced {
-        check_segment(&canonical[segment_start..], true, segment_first_escape)?;
+        check_segment(
+            &canonical[segment_start..],
+            segment_position(segment_start, true),
+            segment_first_escape,
+        )?;
     }
 
     // Reaching here means at least one `%` was consumed (the pre-scan handled

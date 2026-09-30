@@ -71,8 +71,8 @@ risking disagreement with the backend:
 | `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte is outside the `pchar` decode set (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would emit a byte the backend URL parser cannot carry (space, controls) or percent-encodes again (`"`, `{`, `}`, non-ASCII), so the forwarded request line would not be the canonical string. Neither is a single coordinate, so the target is refused. This rule governs *escapes*; see [Literal non-`pchar` bytes](#literal-non-pchar-bytes) for the same bytes sent literally. |
 | `ambiguous_dot_segment`  | `/a/%2e%2e/b`, `/a/%2e%2e;/b`, `/a/..%3B/b` | A percent escape produced a `.` or `..` segment, or the `;` that makes one a path-parameter dot segment. |
 | `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..`, `/a/..;/b`, `/a/.;x/b` | A `.` or `..` segment written literally, with or without a `;` path parameter. See below. |
-| `empty_segment`          | `//a`, `/a//b`, `/;x/a`, `/a/%3Bx/b` | A non-final empty segment, or a segment that is empty before its first `;`. See below. |
-| `path_parameter`         | `/a;x/b`, `/a%3Bx/b` | A `;` path parameter on a proxy that has not set `allow_path_parameters`. Applied after route lookup and before any plugin runs. See below. |
+| `empty_segment`          | `//a`, `/a//b`, `/;x/a`, `/a/%3Bx/b` | A non-final empty segment, or a non-final segment that is empty before its first `;`. See below. |
+| `path_parameter`         | `/a;x/b`, `/a%3Bx/b` | A `;` path parameter on a proxy that has not set `allow_path_parameters`, or whose parameter-stripped path routes to a different proxy. Applied after route lookup and before any plugin runs. See below. |
 
 Rejections carry a fixed JSON body and a fixed reason token. Neither echoes any
 request bytes, and the reject is logged with the reason token only.
@@ -106,8 +106,8 @@ ordinary segment (`/v1;version=2`, `/a;b`, `/..a;b`) is not a dot segment; it
 falls under the per-proxy path-parameter rule below.
 
 **Empty segments are rejected, except a trailing one.** A non-final empty
-segment (`//admin`, `/a//b`) and a segment that is empty before its first `;`
-(`/;x/admin`, `/a/;/b`, and the escaped `/%3Bx/admin`) are refused as
+segment (`//admin`, `/a//b`) and a non-final segment that is empty before its
+first `;` (`/;x/admin`, `/a/;/b`, and the escaped `/%3Bx/admin`) are refused as
 `empty_segment`. Tomcat, Spring, and nginx (`merge_slashes`, on by default)
 collapse `//`, and servlet stacks strip `;…` before doing so, so
 `//admin/users` and `/;x/admin/users` execute `/admin/users` while routing and
@@ -115,8 +115,11 @@ policy would read a different path: segment-aware routing could pick a
 catch-all over a protected `/admin` route, and even a bare prefix rule would
 miss. Collapsing inside the gateway would be a second reading, so the target
 is refused. A trailing slash (`/a/`) and the root path (`/`) are not empty
-segments and are unaffected. This applies on every proxy, including one that
-opts in to path parameters.
+segments and are unaffected. A *final* parameter-only segment
+(`/ctx/;jsessionid=abc`, which Tomcat emits for directory URLs) resolves to the
+trailing-slash path rather than a collapsed one, so this rule admits it; its
+`;` is still a path parameter under the per-proxy rule below. This applies on
+every proxy, including one that opts in to path parameters.
 
 ## Path parameters require a per-proxy opt-in
 
@@ -142,12 +145,26 @@ is routed, and canonicalization runs before routing. The frontends therefore:
 2. run route lookup on the canonical path;
 3. refuse the request if it contains a `;` and the matched proxy has not
    opted in;
-4. only then run any plugin phase or backend dispatch.
+4. on an opted-in proxy, re-resolve the route with every parameter removed
+   (the path a parameter-stripping backend executes) and refuse the request
+   when that path routes to a different proxy;
+5. only then run any plugin phase or backend dispatch.
 
 Route lookup is a literal match on the canonical path and grants nothing on its
-own, and step 3 runs before every policy surface, so no plugin ever evaluates a
-path carrying a `;` on a proxy that has not opted in. A route miss still
-answers `404` as before.
+own, and steps 3 and 4 run before every policy surface, so no plugin ever
+evaluates a path carrying a `;` on a proxy that has not opted in. A route miss
+still answers `404` as before.
+
+Step 4 is needed because the router splits only on `/`: `/admin;x/users` does
+not match an `/admin` route, so on its own it would fall through to an opted-in
+`/` or `/api` catch-all, whose parameter-stripping backend would then execute
+`/admin/users` without the `/admin` proxy's plugins. The stripped path
+`/admin/users` routes to `/admin`, a different proxy, so the request is
+refused. A stripped path that routes to the same proxy, or to no proxy at all,
+is accepted: neither can skip another proxy's policy, and the second keeps a
+proxy whose literal `listen_path` contains `;` reachable. The re-resolve
+allocates, but only for a request that carries a `;` and reached an opted-in
+proxy.
 
 **With the opt-in.** On a proxy with `allow_path_parameters: true`, the `;` is
 kept in the canonical path and forwarded unchanged, so routing, policy, and the
@@ -157,7 +174,22 @@ matrix parameters. The dot-segment and empty-segment rules still apply
 parameterised path: a rule for `/admin/users` does not match `/admin;x/users`.
 Enable it only for backends that give `;` a meaning, and write policy for the
 spellings those backends accept. A literal `listen_path` that contains `;`
-requires the opt-in on its proxy and is rejected at admission otherwise.
+requires the opt-in on its proxy and is rejected at admission otherwise. A
+`~regex` `listen_path` that contains `;` on a proxy without the opt-in is
+loaded with a warning, since the part of the pattern that needs a parameter is
+unreachable.
+
+Gateway API routes whose literal path match itself contains `;` are translated
+with `allow_path_parameters: true`, since the route declares the parameter
+explicitly; every other translated route keeps the default. Mesh-materialized
+routes cannot opt in yet and refuse `;`.
+
+**Provider override queries are not canonicalized.** A plugin that rewrites
+the backend path (`ai_stream_router`, `ai_federation`) may put the endpoint and
+client query into the override. Only the path component of an override goes
+through the canonicalizer; the query reaches the provider byte-identical, so an
+encoded `%26` or `%3D` in a client value is never decoded into a new provider
+parameter (GHSA-653r-wc8x-4fch).
 
 ## Literal non-`pchar` bytes
 
@@ -253,9 +285,8 @@ canonicalizer:
   or a literal space) are also refused so the trigger cannot be a silent no-op.
 - WAF `conditions.paths` (custom rules and `rule_overrides`) — rejected by the
   plugin constructor. An exact value and a `prefix*` value are held to the full
-  contract; a `~regex` value to the escape rules only, like a `~regex`
-  `listen_path`. A condition that can never match would leave its rule
-  silently inactive.
+  contract; a `~regex` value is regex text and is not canonicalized. A
+  condition that can never match would leave its rule silently inactive.
 - OpenAPI server base paths (`servers[].url`, Swagger `basePath`) — every base
   segment must be one a canonical request path can contain, so an empty
   segment or a surviving escape is refused on import.

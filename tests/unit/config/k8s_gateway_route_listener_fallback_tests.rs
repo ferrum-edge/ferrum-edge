@@ -289,6 +289,30 @@ fn assert_unresolved_cross_kind_pair_is_attachment_failure(
     }
 }
 
+/// A literal path match that itself contains `;` declares a path parameter,
+/// so its translated proxy opts in to path parameters instead of being
+/// unreachable and refused at admission (GHSA-fcqw-793q-wg5x). Every other
+/// route keeps the default refusal.
+#[test]
+fn a_literal_path_match_with_a_semicolon_opts_in_to_path_parameters() {
+    for (path, expected) in [
+        (json!({"type": "PathPrefix", "value": "/api;v=1"}), true),
+        (json!({"type": "Exact", "value": "/api;v=1"}), true),
+        (json!({"type": "PathPrefix", "value": "/api"}), false),
+    ] {
+        let mut route = http_route("sample", None);
+        route.spec["rules"][0]["matches"][0]["path"] = path.clone();
+        let result = translate_k8s_objects(&[route], options()).expect("translation succeeds");
+        assert!(
+            !result.config.proxies.is_empty(),
+            "{path}: the route must materialize"
+        );
+        for proxy in &result.config.proxies {
+            assert_eq!(proxy.allow_path_parameters, expected, "{path}");
+        }
+    }
+}
+
 /// No `parentRefs` at all: the route still programs traffic, port-agnostically.
 #[test]
 fn a_route_without_parent_refs_materializes_a_listener_less_claim() {

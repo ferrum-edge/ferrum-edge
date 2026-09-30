@@ -3917,7 +3917,7 @@ fn make_cache_key(
 ///
 /// Since the canonical-policy-path fix for advisory `GHSA-69xf-42xm-4w4f`,
 /// every HTTP/1.1, HTTP/2, and HTTP/3 request target is run through
-/// [`crate::policy_path::canonicalize_policy_path`] before it reaches routing,
+/// [`crate::policy_path::canonicalize_request_path`] before it reaches routing,
 /// and an encoded separator is *rejected* there rather than folded here.
 /// Folding changes a path's segment structure, so a folded route decision
 /// could still disagree with a backend that does not decode; rejecting cannot.

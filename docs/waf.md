@@ -636,8 +636,8 @@ Conditions are matched against the canonical request path
 value that is not itself canonical could never match and would leave its rule
 silently inactive. Construction therefore rejects one: an exact or `prefix*`
 value may not contain a percent escape, a `\`, a `.`/`..` segment, or a
-non-final empty segment (`/api//admin`), and a `~regex` value may not contain a
-percent escape. A request whose path carries a `;` parameter only reaches the
+non-final empty segment (`/api//admin`). A `~regex` value is regex text and is
+not checked this way (`~^[^%]*$` is a valid condition). A request whose path carries a `;` parameter only reaches the
 WAF on a proxy with `allow_path_parameters: true`; there the parameter is part
 of the path conditions see (`/admin;x/users` is not `/admin/users`).
 
