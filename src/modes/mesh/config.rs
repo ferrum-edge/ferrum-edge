@@ -7217,7 +7217,7 @@ fn validate_mesh_config_internal(
                         policy.name, i, j
                     ));
                 }
-                for (header, _) in &request.headers {
+                for header in request.headers.keys() {
                     if MESH_AUTHZ_PSEUDO_HEADERS
                         .iter()
                         .any(|pseudo_header| header.eq_ignore_ascii_case(pseudo_header))
