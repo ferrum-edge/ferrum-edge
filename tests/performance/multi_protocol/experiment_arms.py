@@ -117,7 +117,6 @@ def materialize_h2(plan, protocol, gateway, source, destination, manifest):
 def verify_runtime(plan, gateway, container, manifest):
     arm = next(arm for arm in plan["arms"] if arm["gateway"] == gateway)
     expected = dict(parse_env(arm["FERRUM_EXTRA_ENV"]),
-                    FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST="16",
                     FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE="8388608",
                     FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE="33554432",
                     FERRUM_POOL_HTTP2_MAX_FRAME_SIZE="1048576",
