@@ -291,7 +291,10 @@ fn malformed_viewer_namespace_ceilings_are_refused_at_startup() {
         (",staging", "entry 1 is empty"),
         ("staging, ,prod", "entry 2 is empty"),
         ("*", "wildcards are not supported"),
-        ("staging,Bad Namespace!", "Invalid FERRUM_ADMIN_JWT_VIEWER_NAMESPACES entry 2"),
+        (
+            "staging,Bad Namespace!",
+            "Invalid FERRUM_ADMIN_JWT_VIEWER_NAMESPACES entry 2",
+        ),
     ] {
         with_env_vars(&with_viewer_namespaces(raw), || {
             let error = EnvConfig::from_env().expect_err("a malformed ceiling must fail closed");
