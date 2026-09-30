@@ -99,19 +99,20 @@ gets `403` on operator and admin routes such as `POST /proxies` and
   `diagnostics:read` (or any later scope) from its own claim, so diagnostic
   reference lookups answer `403`.
 
-**The viewer secret is a fleet-wide read credential.** Whoever holds it can
-mint a token with any `sub` and any `ns` claim, so for these tokens neither is
-an identity or tenancy boundary:
+**Unless capped by `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, the viewer secret is a
+fleet-wide read credential.** Whoever holds it can mint a token with any `sub`
+and any `ns` claim, so for these tokens neither is an identity or tenancy
+boundary:
 
 - With `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` off, a viewer-secret token reads
   every namespace. With it on, the holder can still write whatever `ns` claim
-  it likes.
+  it likes. Only the operator-set namespace ceiling below bounds it.
 - Log lines that name an actor also carry `key_tier` (`primary` or `viewer`),
   and audit records name a viewer-secret actor as `viewer-key:<sub>`. A chosen
   subject can therefore never pass for one minted with the primary key.
-- For per-tenant or per-identity readers, pre-mint short-lived `viewer` tokens
-  with `FERRUM_ADMIN_JWT_SECRET` and an explicit `ns` claim instead, and hand
-  out the tokens, not the secret.
+- For per-identity readers, or tenants that need different namespace sets,
+  pre-mint short-lived `viewer` tokens with `FERRUM_ADMIN_JWT_SECRET` and an
+  explicit `ns` claim instead, and hand out the tokens, not the secret.
 
 - **Denied attempts are still audited under the chosen subject.** Security
   audit records for refused attempts, such as a `GET /backup` refused with
@@ -126,10 +127,44 @@ an identity or tenancy boundary:
   `primary-key:` is recorded as `primary-key:<sub>`, so no primary subject can
   render the same as a viewer-key actor.
 
-A namespace ceiling for the viewer key (a `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`
-that intersects the `ns` claim and is enforced on every namespace-scoped route
-and on the `/namespaces` registry) is a planned follow-up. It is not
-implemented yet.
+#### Namespace ceiling (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`)
+
+Set `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` to a comma-separated list (for example
+`staging,analytics`) to cap which namespaces viewer-secret tokens may read,
+**whatever their `ns` claim or `X-Ferrum-Namespace` header says**. Unset keeps
+the fleet-wide behaviour above. Tokens verified by `FERRUM_ADMIN_JWT_SECRET`
+are never affected.
+
+- Like the role ceiling, it is a property of the verifying key, applied when the
+  request's actor is built and enforced by the admin dispatcher before any
+  route runs. It does not depend on `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`.
+- Every namespace-scoped route listed above (proxies, consumers and
+  credentials, plugin configs, upstreams, API specs, trust bundles and
+  `/gateway-trust/status`, `/batch`, `/backup`, `/restore`, `/audit`) and
+  `GET /config/export` answer `403` for a namespace outside the ceiling,
+  including the `ferrum` default when the header is omitted. The refusal
+  depends only on the credential and the requested namespace, never on whether
+  any resource exists there, so it reveals nothing about another tenant.
+- `GET /namespaces` is filtered to the ceiling (and, when claim enforcement is
+  on, to the `ns` claim as well). `GET /namespaces/{name}` answers `403` for a
+  name outside it, exactly as for an `ns`-claim denial.
+- A present `ns` claim is narrowed to `claim ∩ ceiling`; a claim naming only
+  namespaces outside the ceiling therefore authorizes nothing. With claim
+  enforcement on, a namespace must be inside the ceiling **and** the claim.
+  Diagnostic reference lookups use the narrowed claim, and viewer-key tokens
+  never hold `diagnostics:read` in any case.
+- Global surfaces that are not selected by `X-Ferrum-Namespace` (observability,
+  `/cluster`, mesh introspection, `GET /plugins`, `/charges`) are unchanged.
+- Refusals log `audit.event = "admin_namespace_authz"` with
+  `namespace_ceiling = "outside"` next to `actor` and `key_tier`; `ns`-claim
+  refusals and served exports also carry `namespace_ceiling`
+  (`within`, `outside`, or `not_applicable`). `GET /backup` security audit
+  records for a ceiling-bound token add `namespace_ceiling` to their `diff`.
+- Startup and `ferrum-edge validate` refuse an empty value, an empty entry (for
+  example `staging,,prod` or a trailing comma), `*`, and any name that breaks
+  the namespace naming rules. Entries are trimmed and duplicates collapse. Set
+  without `FERRUM_ADMIN_JWT_VIEWER_SECRET`, it has no effect and startup logs a
+  warning.
 
 Generate a token:
 ```bash

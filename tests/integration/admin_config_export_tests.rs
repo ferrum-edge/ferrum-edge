@@ -4,13 +4,16 @@
 //! A read-only credential must be able to take a fingerprinted configuration
 //! snapshot for drift detection, and must not be able to reach `GET /backup`
 //! or any operator/admin route, whatever role its token claims.
+//!
+//! The `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` namespace ceiling for the same
+//! credential (issue #5929) is covered at the bottom of this file.
 
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use ferrum_edge::admin::{
     AdminState, MetricsAuthPolicy,
-    jwt_auth::{JwtConfig, JwtManager},
+    jwt_auth::{JwtConfig, JwtManager, ViewerNamespaceCeiling},
     serve_admin_on_listener,
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
@@ -665,4 +668,311 @@ async fn only_viewer_reads_strip_url_userinfo() {
     let labels = &proxy.body["labels"];
     assert_eq!(labels["runbook"], "https://redacted@wiki.internal/runbook");
     assert_eq!(labels["repo"], "ssh://redacted@github.com/org/repo");
+}
+
+// ── FERRUM_ADMIN_JWT_VIEWER_NAMESPACES (issue #5929) ────────────────────
+//
+// The namespace ceiling for viewer-key tokens is enforced by the admin
+// dispatcher, so every route family is exercised here over a real listener.
+
+const CEILING_REFUSAL: &str = "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES";
+
+/// Reads a viewer may make, one per namespace-scoped route family.
+const NAMESPACE_SCOPED_READS: &[&str] = &[
+    "/proxies",
+    "/proxies/proxy-prod",
+    "/consumers",
+    "/consumers/consumer-prod",
+    "/upstreams",
+    "/upstreams/upstream-prod",
+    "/plugins/config",
+    "/plugins/config/plugin-prod",
+    "/api-specs",
+    EXPORT,
+    "/gateway-trust-bundles",
+    "/gateway-trust/status",
+    "/backup",
+    "/audit",
+];
+
+fn ceiling_admin_state(
+    cached: Arc<ArcSwap<GatewayConfig>>,
+    require_namespace_claim: bool,
+    ceiling: &str,
+) -> AdminState {
+    let mut state = admin_state(cached, require_namespace_claim);
+    let ceiling = ViewerNamespaceCeiling::parse(ceiling).expect("valid ceiling");
+    state.jwt_manager = jwt_manager().with_viewer_namespace_ceiling(ceiling);
+    state
+}
+
+/// The two-tenant fixture with the namespace list file mode records at load.
+fn registry_config() -> GatewayConfig {
+    let mut config = two_tenant_config(STAGING_KEY);
+    config.known_namespaces = vec![
+        "ferrum".to_string(),
+        "prod".to_string(),
+        "staging".to_string(),
+    ];
+    config
+}
+
+fn listed_names(reply: &Reply) -> Vec<String> {
+    let items = reply.body["data"].as_array().cloned().unwrap_or_default();
+    let mut names: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+fn assert_ceiling_refusal(reply: &Reply, label: &str) {
+    assert_eq!(reply.status, 403, "{label}: {}", reply.text);
+    assert!(
+        reply.text.contains(CEILING_REFUSAL),
+        "{label} must be refused by the namespace ceiling: {}",
+        reply.text
+    );
+    for leaked in ["consumer-prod", "bob", "prod.internal", PROD_KEY] {
+        assert!(
+            !reply.text.contains(leaked),
+            "{label} disclosed {leaked}: {}",
+            reply.text
+        );
+    }
+}
+
+#[tokio::test]
+async fn viewer_key_token_is_refused_outside_the_namespace_ceiling_on_every_route_family() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(ceiling_admin_state(config, false, "staging")).await;
+
+    // The holder chooses its claims: none, one outside the ceiling, or one
+    // that lists both. None of them reaches `prod`.
+    let claim_less = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    let prod_claim = Some(json!("prod"));
+    let outside = token(VIEWER_SECRET, Algorithm::HS256, "viewer", prod_claim);
+    let both_claim = Some(json!(["staging", "prod"]));
+    let wide_admin = token(VIEWER_SECRET, Algorithm::HS256, "admin", both_claim);
+    let tokens = [
+        ("no ns claim", claim_less),
+        ("ns=prod", outside),
+        ("ns=[staging,prod] claiming admin", wide_admin),
+    ];
+    for (label, bearer) in &tokens {
+        for path in NAMESPACE_SCOPED_READS {
+            let reply = get(&base, path, Some(bearer), Some("prod")).await;
+            assert_ceiling_refusal(&reply, &format!("{label} GET {path} (prod)"));
+        }
+        // Omitting the header selects `ferrum`, also outside the ceiling.
+        let reply = get(&base, EXPORT, Some(bearer), None).await;
+        assert_ceiling_refusal(&reply, &format!("{label} GET {EXPORT} (default namespace)"));
+    }
+
+    // Writes are refused too, before the role check or any body handling.
+    let viewer = &tokens[0].1;
+    let proxy = json!({"id": "proxy-new", "listen_path": "/new", "backend_host": "h"});
+    let reply = send(
+        reqwest::Method::POST,
+        &base,
+        "/proxies",
+        Some(viewer),
+        Some("prod"),
+        Some(&proxy),
+    )
+    .await;
+    assert_ceiling_refusal(&reply, "POST /proxies (prod)");
+}
+
+#[tokio::test]
+async fn viewer_key_token_reads_normally_inside_the_namespace_ceiling() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(ceiling_admin_state(config, false, "staging,analytics")).await;
+
+    let claim_less = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    let wide_claim = Some(json!(["staging", "prod"]));
+    let wide = token(VIEWER_SECRET, Algorithm::HS256, "viewer", wide_claim);
+    for bearer in [&claim_less, &wide] {
+        let export = get(&base, EXPORT, Some(bearer), Some("staging")).await;
+        assert_eq!(export.status, 200, "{}", export.text);
+        assert_eq!(export.body["namespace"], "staging");
+        assert_eq!(export.body["consumers"][0]["username"], "alice");
+
+        for path in [
+            "/proxies",
+            "/proxies/proxy-staging",
+            "/consumers",
+            "/consumers/consumer-staging",
+            "/upstreams",
+            "/upstreams/upstream-staging",
+            "/plugins/config",
+        ] {
+            let reply = get(&base, path, Some(bearer), Some("staging")).await;
+            assert_eq!(reply.status, 200, "GET {path}: {}", reply.text);
+            assert!(!reply.text.contains(CEILING_REFUSAL), "{path}");
+        }
+
+        // Inside the ceiling the ordinary role ceiling still applies.
+        let backup = get(&base, "/backup", Some(bearer), Some("staging")).await;
+        assert_eq!(backup.status, 403, "{}", backup.text);
+        assert!(backup.text.contains("'viewer'"), "{}", backup.text);
+        assert!(!backup.text.contains(CEILING_REFUSAL), "{}", backup.text);
+    }
+
+    // A missing resource inside the ceiling is an ordinary 404, not a 403.
+    let missing = get(&base, "/proxies/nope", Some(&claim_less), Some("staging")).await;
+    assert_eq!(missing.status, 404, "{}", missing.text);
+    // An empty namespace inside the ceiling is readable (and empty).
+    let empty = get(&base, "/proxies", Some(&claim_less), Some("analytics")).await;
+    assert_eq!(empty.status, 200, "{}", empty.text);
+}
+
+#[tokio::test]
+async fn primary_key_tokens_ignore_the_viewer_namespace_ceiling() {
+    let config = cached(registry_config());
+    let (base, _sd) = start_admin(ceiling_admin_state(config, false, "staging")).await;
+
+    for role in ["viewer", "admin"] {
+        let primary = token(PRIMARY_SECRET, Algorithm::HS256, role, None);
+        let export = get(&base, EXPORT, Some(&primary), Some("prod")).await;
+        assert_eq!(export.status, 200, "{role}: {}", export.text);
+        assert_eq!(export.body["consumers"][0]["username"], "bob");
+        let proxy = get(&base, "/proxies/proxy-prod", Some(&primary), Some("prod")).await;
+        assert_eq!(proxy.status, 200, "{role}: {}", proxy.text);
+        let list = get(&base, "/namespaces", Some(&primary), None).await;
+        assert_eq!(list.status, 200, "{role}: {}", list.text);
+        let names = listed_names(&list);
+        assert_eq!(names, ["ferrum", "prod", "staging"], "{role}");
+        let detail = get(&base, "/namespaces/prod", Some(&primary), None).await;
+        assert_eq!(detail.status, 200, "{role}: {}", detail.text);
+    }
+}
+
+#[tokio::test]
+async fn unset_viewer_namespace_ceiling_keeps_viewer_key_tokens_fleet_wide() {
+    let config = cached(registry_config());
+    let (base, _sd) = start_admin(admin_state(config, false)).await;
+    let viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+
+    let proxy = get(&base, "/proxies/proxy-prod", Some(&viewer), Some("prod")).await;
+    assert_eq!(proxy.status, 200, "{}", proxy.text);
+    let export = get(&base, EXPORT, Some(&viewer), Some("prod")).await;
+    assert_eq!(export.status, 200, "{}", export.text);
+    let list = get(&base, "/namespaces", Some(&viewer), None).await;
+    assert_eq!(listed_names(&list), ["ferrum", "prod", "staging"]);
+    let detail = get(&base, "/namespaces/prod", Some(&viewer), None).await;
+    assert_eq!(detail.status, 200, "{}", detail.text);
+}
+
+#[tokio::test]
+async fn namespace_registry_is_filtered_to_the_viewer_namespace_ceiling() {
+    let config = cached(registry_config());
+    let (base, _sd) = start_admin(ceiling_admin_state(config, false, "staging")).await;
+
+    let claim_less = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    let wide_claim = Some(json!(["staging", "prod", "ferrum"]));
+    let wide = token(VIEWER_SECRET, Algorithm::HS256, "viewer", wide_claim);
+    for bearer in [&claim_less, &wide] {
+        let list = get(&base, "/namespaces", Some(bearer), None).await;
+        assert_eq!(list.status, 200, "{}", list.text);
+        assert_eq!(listed_names(&list), ["staging"], "{}", list.text);
+
+        let inside = get(&base, "/namespaces/staging", Some(bearer), None).await;
+        assert_eq!(inside.status, 200, "{}", inside.text);
+        for name in ["prod", "ferrum", "never-created"] {
+            let path = format!("/namespaces/{name}");
+            let outside = get(&base, &path, Some(bearer), None).await;
+            // The same answer whether or not the namespace exists.
+            assert_ceiling_refusal(&outside, &format!("GET {path}"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn database_namespace_registry_is_filtered_to_the_viewer_namespace_ceiling() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = sqlite_store(&dir).await;
+    for (id, namespace) in [("c-staging", "staging"), ("c-prod", "prod")] {
+        let consumer: Consumer = serde_json::from_value(json!({
+            "id": id,
+            "namespace": namespace,
+            "username": id,
+            "credentials": {},
+            "created_at": STAMP,
+            "updated_at": STAMP
+        }))
+        .expect("consumer fixture deserializes");
+        db.create_consumer(&consumer).await.expect("seed consumer");
+    }
+    let mut state = ceiling_admin_state(cached(GatewayConfig::default()), false, "staging");
+    state.db = Some(Arc::new(db));
+    state.mode = "database".to_string();
+    let (base, _sd) = start_admin(state).await;
+
+    let viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    let list = get(&base, "/namespaces", Some(&viewer), None).await;
+    assert_eq!(list.status, 200, "{}", list.text);
+    let names = listed_names(&list);
+    assert_eq!(names, ["staging"], "{}", list.text);
+
+    let primary = token(PRIMARY_SECRET, Algorithm::HS256, "viewer", None);
+    let list = get(&base, "/namespaces", Some(&primary), None).await;
+    let names = listed_names(&list);
+    assert!(names.iter().any(|name| name == "prod"), "{}", list.text);
+    assert!(names.iter().any(|name| name == "staging"), "{}", list.text);
+
+    let export = get(&base, EXPORT, Some(&viewer), Some("prod")).await;
+    assert_ceiling_refusal(&export, "database-mode export (prod)");
+    let export = get(&base, EXPORT, Some(&viewer), Some("staging")).await;
+    assert_eq!(export.status, 200, "{}", export.text);
+    assert_eq!(export.data_source.as_deref(), Some("database"));
+}
+
+#[tokio::test]
+async fn viewer_namespace_ceiling_composes_with_namespace_claim_enforcement() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(ceiling_admin_state(config, true, "staging")).await;
+
+    let staging_claim = Some(json!(["staging"]));
+    let scoped = token(VIEWER_SECRET, Algorithm::HS256, "viewer", staging_claim);
+    let allowed = get(&base, EXPORT, Some(&scoped), Some("staging")).await;
+    assert_eq!(allowed.status, 200, "{}", allowed.text);
+
+    // Inside the ceiling but outside the claim: the claim gate refuses.
+    let prod_claim = Some(json!(["prod"]));
+    let prod_only = token(VIEWER_SECRET, Algorithm::HS256, "viewer", prod_claim);
+    let refused = get(&base, EXPORT, Some(&prod_only), Some("staging")).await;
+    assert_eq!(refused.status, 403, "{}", refused.text);
+    assert!(!refused.text.contains(CEILING_REFUSAL), "{}", refused.text);
+    // Inside the claim but outside the ceiling: the ceiling refuses.
+    let refused = get(&base, "/proxies", Some(&prod_only), Some("prod")).await;
+    assert_ceiling_refusal(&refused, "GET /proxies (prod) with ns=prod");
+
+    // Claim enforcement still requires an explicit claim inside the ceiling.
+    let claim_less = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    let refused = get(&base, "/proxies", Some(&claim_less), Some("staging")).await;
+    assert_eq!(refused.status, 403, "{}", refused.text);
+    assert!(refused.text.contains("`ns` claim"), "{}", refused.text);
+
+    // Listing is filtered by both.
+    let list = get(&base, "/namespaces", Some(&scoped), None).await;
+    assert_eq!(list.status, 200, "{}", list.text);
+}
+
+#[tokio::test]
+async fn viewer_key_diagnostic_lookups_stay_refused_under_the_namespace_ceiling() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(ceiling_admin_state(config, false, "prod")).await;
+    let path = "/diagnostics/v1/refs/fd1_00000000000000000000000000000000";
+
+    // `scoped_token` carries `ns: [ferrum, staging]`, both outside `prod`.
+    let capped = scoped_token(VIEWER_SECRET);
+    let refused = get(&base, path, Some(&capped), None).await;
+    assert_eq!(refused.status, 403, "{}", refused.text);
+
+    // Primary-key lookups are unaffected by the viewer ceiling.
+    let primary = scoped_token(PRIMARY_SECRET);
+    let reached = get(&base, path, Some(&primary), None).await;
+    assert_eq!(reached.status, 404, "{}", reached.text);
 }

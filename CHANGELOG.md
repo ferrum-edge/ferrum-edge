@@ -107,11 +107,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second HS256 verification secret (at least 32 characters) authorizes every
   token it verifies as `viewer`, whatever its `role` claim says, and ignores
   its `scope` claims. A read-only process can hold this secret without holding
-  material that mints `operator` or `admin` tokens. It is a **fleet-wide read
+  material that mints `operator` or `admin` tokens. Unless capped by
+  `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` (#5929), it is a **fleet-wide read
   credential**: its holder chooses the token's `sub` and `ns`, so it reads
-  every namespace. Per-tenant readers should use tokens pre-minted with the
-  primary key and an `ns` claim. A namespace ceiling for the viewer key is a
-  planned follow-up.
+  every namespace. Per-tenant readers can also use tokens pre-minted with the
+  primary key and an `ns` claim.
+- **`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` namespace ceiling for viewer-key
+  admin JWTs** (#5929). An optional comma-separated list of the only
+  namespaces a token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` may read,
+  whatever its `ns` claim or `X-Ferrum-Namespace` header says. Like the role
+  ceiling it is a property of the verifying key, applied when the request's
+  actor is built and enforced by the admin dispatcher, independently of
+  `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`: every namespace-scoped route
+  (proxies, consumers, upstreams, plugin configs, API specs, trust bundles,
+  batch, backup, restore, audit) and `GET /config/export` answer `403` for a
+  namespace outside it, `GET /namespaces/{name}` answers the same `403`, and
+  `GET /namespaces` is filtered to it. A present `ns` claim is narrowed to
+  `claim ∩ ceiling`. Primary-key tokens are unaffected, and unset keeps
+  today's fleet-wide behaviour. Refusal logs carry `namespace_ceiling`, and
+  `GET /backup` security audit records for a ceiling-bound token record the
+  decision in their `diff`. Startup and `validate` refuse an empty value, an
+  empty entry, `*`, or an invalid namespace name.
 - **`mcp_gateway` per-consumer tool grants** (#5907). In `aggregate_router`
   mode a `policy.tools` entry with `action: allow` can carry
   `allowed_groups` and `denied_groups`, matched against the request
@@ -836,6 +852,12 @@ outright with no deprecation period:
 
 ### Security
 
+- Admin JWT namespace ceiling for the viewer key (#5929).
+  `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` bounds which tenants a
+  `FERRUM_ADMIN_JWT_VIEWER_SECRET` holder can read, which its own `ns` claim
+  never could, because the holder chooses that claim. The refusal is a `403`
+  that depends only on the credential and the requested namespace, so it
+  reveals nothing about resources in another tenant.
 - Admin JWT role ceiling (#5904). A token signed with
   `FERRUM_ADMIN_JWT_VIEWER_SECRET` can never reach `operator` or `admin`,
   including when it claims `admin`, and its `scope` claims grant nothing, so it

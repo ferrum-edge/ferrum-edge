@@ -69,7 +69,7 @@
 use crate::admin::audit_spool::{
     AuditSpool, RetainOutcome, SpoolError, SpoolErrorKind, SpooledAuditRecord,
 };
-use crate::admin::jwt_auth::{AdminKeyTier, AdminRole, VerifiedAdminToken};
+use crate::admin::jwt_auth::{AdminKeyTier, AdminRole, VerifiedAdminToken, ViewerNamespaceCeiling};
 use crate::config::db_backend::DatabaseBackend;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -512,15 +512,49 @@ impl AuditEvent {
 pub struct AuditActor {
     pub sub: String,
     pub role: AdminRole,
-    /// Namespaces authorized by the token's optional `ns` claim. Parsed
-    /// fail-closed at authentication time (a malformed claim rejects the
-    /// token); only *enforced* against `X-Ferrum-Namespace` when
-    /// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`.
+    /// Namespaces authorized by the token's optional `ns` claim, narrowed to
+    /// [`Self::namespace_ceiling`] when one applies. Parsed fail-closed at
+    /// authentication time (a malformed claim rejects the token); only
+    /// *enforced* against `X-Ferrum-Namespace` when
+    /// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` (and, when present, on
+    /// `GET /config/export`).
     pub allowed_namespaces: crate::grpc::auth::AllowedNamespaces,
     /// Which verification key accepted the token. A viewer-key token's `sub`
     /// and `ns` were chosen by whoever holds the viewer secret, so every log
     /// line and audit record that names the actor also names the tier.
     pub key_tier: AdminKeyTier,
+    /// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` for a viewer-key token when it is
+    /// configured; `None` for primary-key tokens and when it is unset. Unlike
+    /// the `ns` claim it is enforced on every namespace-scoped route whatever
+    /// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` says, because its holder, not the
+    /// operator, chooses the claim.
+    pub namespace_ceiling: Option<ViewerNamespaceCeiling>,
+}
+
+/// The viewer-key namespace ceiling's verdict on one requested namespace.
+///
+/// Rendered into `admin_namespace_authz` log lines and security audit diffs
+/// as `namespace_ceiling`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceCeilingDecision {
+    /// No ceiling applies: a primary-key token, or
+    /// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is unset.
+    NotApplicable,
+    /// The namespace is inside the ceiling.
+    Within,
+    /// The namespace is outside the ceiling; the request is refused.
+    Outside,
+}
+
+impl NamespaceCeilingDecision {
+    /// Stable log / audit label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Within => "within",
+            Self::Outside => "outside",
+        }
+    }
 }
 
 /// Prefix on the persisted audit `actor` of a viewer-key token, so a subject
@@ -533,13 +567,27 @@ impl AuditActor {
     /// of the verifying key, so a token verified by
     /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` is a `viewer` even when it claims
     /// `admin`. Every route's role check reads this actor.
+    ///
+    /// The viewer-key namespace ceiling is applied here too: `ns` is narrowed
+    /// to it and the ceiling is carried on the actor, so the dispatcher
+    /// enforces it without any route re-reading the token.
     pub fn from_verified(token: &VerifiedAdminToken) -> Result<Self, String> {
         Ok(Self {
             sub: token.claims.sub.clone(),
             role: token.effective_role()?,
-            allowed_namespaces: token.claims.allowed_namespaces()?,
+            allowed_namespaces: token.allowed_namespaces()?,
             key_tier: token.key_tier,
+            namespace_ceiling: token.namespace_ceiling.clone(),
         })
+    }
+
+    /// The viewer-key namespace ceiling's verdict on `namespace`.
+    pub fn namespace_ceiling_decision(&self, namespace: &str) -> NamespaceCeilingDecision {
+        match &self.namespace_ceiling {
+            None => NamespaceCeilingDecision::NotApplicable,
+            Some(ceiling) if ceiling.allows(namespace) => NamespaceCeilingDecision::Within,
+            Some(_) => NamespaceCeilingDecision::Outside,
+        }
     }
 
     /// The actor string persisted on audit records.
@@ -3094,6 +3142,26 @@ pub fn backup_failure_diff(category: BackupFailureCategory, resources: Value) ->
         "failure_category": category.as_str(),
         "resources": resources,
     })
+}
+
+/// Add the viewer-key namespace ceiling's verdict on `namespace` to a
+/// security audit diff as `namespace_ceiling`.
+///
+/// A no-op when no ceiling applies to `actor`, so records for primary-key
+/// tokens, and for every token while `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is
+/// unset, keep their existing shape.
+pub fn with_namespace_ceiling_decision(
+    mut diff: Value,
+    actor: &AuditActor,
+    namespace: &str,
+) -> Value {
+    let decision = actor.namespace_ceiling_decision(namespace);
+    if decision != NamespaceCeilingDecision::NotApplicable
+        && let Some(object) = diff.as_object_mut()
+    {
+        object.insert("namespace_ceiling".to_string(), json!(decision.as_str()));
+    }
+    diff
 }
 
 /// Backup attempt rejected because `X-Ferrum-Namespace` failed validation.

@@ -295,6 +295,7 @@ async fn cancellation_while_prepare_is_in_flight_finalizes_unknown_outcome() {
                         role: AdminRole::Admin,
                         allowed_namespaces: AllowedNamespaces::empty(),
                         key_tier: ferrum_edge::admin::jwt_auth::AdminKeyTier::Primary,
+                        namespace_ceiling: None,
                     },
                     &AuditRequestContext {
                         source_address: "203.0.113.7".to_string(),

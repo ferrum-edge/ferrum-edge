@@ -15,6 +15,7 @@ fn verified(claims: AdminClaims, key_tier: AdminKeyTier) -> VerifiedAdminToken {
         header: jsonwebtoken::Header::default(),
         claims,
         key_tier,
+        namespace_ceiling: None,
     }
 }
 
@@ -117,6 +118,7 @@ fn test_audit_event_new_populates_metadata_and_preserves_diff() {
         role: AdminRole::Admin,
         allowed_namespaces: ferrum_edge::grpc::auth::AllowedNamespaces::empty(),
         key_tier: AdminKeyTier::Primary,
+        namespace_ceiling: None,
     };
     let diff = update_diff(json!({ "enabled": false }), json!({ "enabled": true }));
     let before = Utc::now();

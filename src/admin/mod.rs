@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
-use crate::admin::audit::AuditActor;
+use crate::admin::audit::{AuditActor, NamespaceCeilingDecision};
 use crate::admin::backup::{
     ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR,
     BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, BatchCreateRequest,
@@ -2621,6 +2621,7 @@ fn enforce_namespace_claim(
             key_tier = auth.key_tier.as_str(),
             namespace = %namespace,
             path = %path,
+            namespace_ceiling = auth.namespace_ceiling_decision(namespace).as_str(),
             result = "denied",
             "Admin request rejected: JWT `ns` claim does not authorize the requested namespace"
         );
@@ -2639,6 +2640,7 @@ fn enforce_namespace_claim(
         key_tier = auth.key_tier.as_str(),
         namespace = %namespace,
         path = %path,
+        namespace_ceiling = auth.namespace_ceiling_decision(namespace).as_str(),
         result = "denied",
         "Admin request rejected: FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true but the JWT has no `ns` claim"
     );
@@ -2647,6 +2649,67 @@ fn enforce_namespace_claim(
         &json!({"error": "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true on this instance: the admin \
              JWT must include an `ns` claim (string or array) listing the namespaces it may manage"}),
     ))
+}
+
+/// Enforce the viewer-key namespace ceiling (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`,
+/// issue #5929) against the requested namespace. Returns `Some(403)` when
+/// `namespace` is outside it; `None` when it is inside or no ceiling applies
+/// (every primary-key token, and every token while the setting is unset).
+///
+/// Unlike [`enforce_namespace_claim`] this does not depend on
+/// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` or on the token's `ns` claim: the
+/// viewer secret's holder chooses its own claims, so only the operator-set
+/// ceiling bounds which tenants it reads. The refusal depends on the
+/// credential and the requested name only, never on whether any resource
+/// exists there.
+fn enforce_viewer_namespace_ceiling(
+    auth: &AuditActor,
+    namespace: &str,
+    path: &str,
+) -> Option<Response<Full<Bytes>>> {
+    let decision = auth.namespace_ceiling_decision(namespace);
+    if decision != NamespaceCeilingDecision::Outside {
+        return None;
+    }
+    warn!(
+        audit.event = "admin_namespace_authz",
+        actor = %auth.sub,
+        key_tier = auth.key_tier.as_str(),
+        namespace = %namespace,
+        path = %path,
+        namespace_ceiling = decision.as_str(),
+        result = "denied",
+        "Admin request rejected: the namespace is outside FERRUM_ADMIN_JWT_VIEWER_NAMESPACES \
+         for viewer-key tokens"
+    );
+    Some(json_response(
+        StatusCode::FORBIDDEN,
+        &json!({"error": format!(
+            "namespace '{namespace}' is outside the namespace ceiling for viewer-key tokens \
+             (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES)"
+        )}),
+    ))
+}
+
+/// Namespace authorization for a request that addresses `namespace`: the
+/// viewer-key namespace ceiling first, always, then the `ns` claim when
+/// `require_claim` (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`, or its automatic
+/// engagement on a multi-namespace CP). Every namespace-scoped route and the
+/// namespace registry authorize through here, so the ceiling is enforced in
+/// one place, exactly as the role ceiling is.
+fn authorize_request_namespace(
+    require_claim: bool,
+    auth: &AuditActor,
+    namespace: &str,
+    path: &str,
+) -> Option<Response<Full<Bytes>>> {
+    if let Some(resp) = enforce_viewer_namespace_ceiling(auth, namespace, path) {
+        return Some(resp);
+    }
+    if require_claim {
+        return enforce_namespace_claim(auth, namespace, path);
+    }
+    None
 }
 
 /// Whether the caller may see the detailed observability views (`/metrics`
@@ -3816,10 +3879,18 @@ async fn handle_admin_request_inner(
     // /namespaces registry, metrics, mesh introspection) are not selected
     // by X-Ferrum-Namespace. Registry handlers apply the claim to the
     // path/body name themselves.
-    if state.admin_require_namespace_claim
-        && is_namespace_scoped_route(segments_peek.as_slice())
-        && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
-    {
+    //
+    // The viewer-key namespace ceiling (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES,
+    // issue #5929) is enforced here too, and unconditionally: a token verified
+    // by FERRUM_ADMIN_JWT_VIEWER_SECRET may address only the namespaces it
+    // lists, whatever its `ns` claim or the header says.
+    let require_claim = state.admin_require_namespace_claim;
+    let namespace_denial = if is_namespace_scoped_route(segments_peek.as_slice()) {
+        authorize_request_namespace(require_claim, &auth, &namespace, &path)
+    } else {
+        None
+    };
+    if let Some(resp) = namespace_denial {
         // `GET` only: `/backup` has no other method, so auditing a denied
         // `POST`/`PUT`/`DELETE` here would fabricate a `backup` security record
         // for an export that was never a reachable route.
@@ -3827,13 +3898,18 @@ async fn handle_admin_request_inner(
             let resources = backup_resources_query_audit_value(query.as_deref());
             // The header was just denied: do not file the security record under
             // the unvalidated tenant the caller asked for.
+            let diff = audit::with_namespace_ceiling_decision(
+                audit::backup_failure_diff(audit::failure_category::NAMESPACE_DENIED, resources),
+                &auth,
+                &namespace,
+            );
             let event = audit::AuditEvent::new(
                 &auth,
                 "backup",
                 "gateway_config",
                 canonical_global_audit_namespace(),
                 canonical_global_audit_namespace(),
-                audit::backup_failure_diff(audit::failure_category::NAMESPACE_DENIED, resources),
+                diff,
             )
             .with_request_context(&audit_request_ctx)
             .with_outcome(audit::outcome::DENIED);
@@ -4566,13 +4642,18 @@ async fn handle_admin_request_inner(
             // Backup returns unredacted credentials and consul tokens — Admin only.
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 let resources = backup_resources_query_audit_value(query.as_deref());
+                let diff = audit::with_namespace_ceiling_decision(
+                    audit::backup_failure_diff(audit::failure_category::FORBIDDEN, resources),
+                    &auth,
+                    &namespace,
+                );
                 let event = audit::AuditEvent::new(
                     &auth,
                     "backup",
                     "gateway_config",
                     namespace.as_str(),
                     namespace.as_str(),
-                    audit::backup_failure_diff(audit::failure_category::FORBIDDEN, resources),
+                    diff,
                 )
                 .with_request_context(&audit_request_ctx)
                 .with_outcome(audit::outcome::DENIED);
@@ -11093,31 +11174,40 @@ async fn handle_audit_list(
 
 /// When `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is on, `GET /namespaces` is
 /// filtered to the token's claimed names (missing/empty claim → empty list)
-/// rather than 403, because the list route is a global surface.
+/// rather than 403, because the list route is a global surface. A viewer-key
+/// token under `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is always filtered to that
+/// ceiling as well, whatever the claim setting.
 fn filter_listed_namespaces(
     require_claim: bool,
     auth: &AuditActor,
     names: Vec<String>,
 ) -> Vec<String> {
-    if !require_claim {
+    if !listed_namespaces_filtered(require_claim, auth) {
         return names;
     }
     names
         .into_iter()
-        .filter(|name| auth.allowed_namespaces.allows(name))
+        .filter(|name| {
+            auth.namespace_ceiling_decision(name) != NamespaceCeilingDecision::Outside
+                && (!require_claim || auth.allowed_namespaces.allows(name))
+        })
         .collect()
 }
 
+/// Whether [`filter_listed_namespaces`] would drop anything for this caller.
+fn listed_namespaces_filtered(require_claim: bool, auth: &AuditActor) -> bool {
+    require_claim || auth.namespace_ceiling.is_some()
+}
+
+/// Namespace-registry authorization for `name`: the viewer-key namespace
+/// ceiling always, and the `ns` claim when claim enforcement is on.
 fn maybe_enforce_namespace_claim(
     state: &AdminState,
     auth: &AuditActor,
     name: &str,
     path: &str,
 ) -> Option<Response<Full<Bytes>>> {
-    if !state.admin_require_namespace_claim {
-        return None;
-    }
-    enforce_namespace_claim(auth, name, path)
+    authorize_request_namespace(state.admin_require_namespace_claim, auth, name, path)
 }
 
 /// Detail record for a name that exists only as a derived resource namespace
@@ -11375,10 +11465,11 @@ async fn handle_list_namespaces(
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
-        if state.admin_require_namespace_claim {
+        let require_claim = state.admin_require_namespace_claim;
+        if listed_namespaces_filtered(require_claim, auth) {
             match db.list_namespaces().await {
                 Ok(names) => {
-                    let filtered = filter_listed_namespaces(true, auth, names);
+                    let filtered = filter_listed_namespaces(require_claim, auth, names);
                     return Ok(json_response(
                         StatusCode::OK,
                         &paginate_response(&filtered, pagination),
@@ -12547,6 +12638,7 @@ mod tests {
             role: AdminRole::Admin,
             allowed_namespaces: allowed,
             key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
+            namespace_ceiling: None,
         };
 
         // No claim → denied when enforcement is on.
@@ -12591,6 +12683,7 @@ mod tests {
             role: AdminRole::Viewer,
             allowed_namespaces: allowed,
             key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
+            namespace_ceiling: None,
         };
         let names = vec![
             "alpha".to_string(),
@@ -12826,12 +12919,14 @@ mod tests {
             role: AdminRole::Operator,
             allowed_namespaces: crate::grpc::auth::AllowedNamespaces::empty(),
             key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
+            namespace_ceiling: None,
         };
         let admin = AuditActor {
             sub: "admin".to_string(),
             role: AdminRole::Admin,
             allowed_namespaces: crate::grpc::auth::AllowedNamespaces::empty(),
             key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
+            namespace_ceiling: None,
         };
         for (method, route) in admin_only {
             let required = tls_route_required_role(&method, &route);
