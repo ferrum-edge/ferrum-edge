@@ -7,9 +7,9 @@
 
 use ferrum_edge::admin::plugin_config_projection::{
     KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS, PlaceholderSiteRecorder,
-    is_credential_bearing_url_config_key, is_redaction_placeholder, is_safe_kafka_producer_property,
-    is_sensitive_plugin_config_key, normalize_config_key, project_plugin_config,
-    project_plugin_config_with, redact_endpoint_url, sensitivity_rules_for,
+    is_credential_bearing_url_config_key, is_redaction_placeholder,
+    is_safe_kafka_producer_property, is_sensitive_plugin_config_key, normalize_config_key,
+    project_plugin_config, project_plugin_config_with, redact_endpoint_url, sensitivity_rules_for,
 };
 use ferrum_edge::plugins::builtin_parity::BUILTIN_PLUGIN_PARITY_META;
 use serde_json::{Value, json};
