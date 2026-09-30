@@ -69,7 +69,7 @@
 use crate::admin::audit_spool::{
     AuditSpool, RetainOutcome, SpoolError, SpoolErrorKind, SpooledAuditRecord,
 };
-use crate::admin::jwt_auth::{AdminClaims, AdminRole};
+use crate::admin::jwt_auth::{AdminClaims, AdminRole, VerifiedAdminToken};
 use crate::config::db_backend::DatabaseBackend;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -520,11 +520,27 @@ pub struct AuditActor {
 }
 
 impl AuditActor {
+    /// Actor for raw claims, with no verification-key role ceiling applied.
+    ///
+    /// Request authorization must use [`AuditActor::from_verified`], which
+    /// caps the role at the ceiling of the key that verified the token.
     pub fn from_claims(claims: &AdminClaims) -> Result<Self, String> {
         Ok(Self {
             sub: claims.sub.clone(),
             role: claims.admin_role()?,
             allowed_namespaces: claims.allowed_namespaces()?,
+        })
+    }
+
+    /// Actor for a signature-verified token. The role is the `role` claim
+    /// capped at [`VerifiedAdminToken::role_ceiling`], so a token verified by
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` is a `viewer` even when it claims
+    /// `admin`. Every route's role check reads this actor.
+    pub fn from_verified(token: &VerifiedAdminToken) -> Result<Self, String> {
+        Ok(Self {
+            sub: token.claims.sub.clone(),
+            role: token.effective_role()?,
+            allowed_namespaces: token.claims.allowed_namespaces()?,
         })
     }
 }

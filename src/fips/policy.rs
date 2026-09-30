@@ -528,6 +528,10 @@ pub fn check_env_config_enforced(env_config: &EnvConfig) -> Result<(), String> {
             env_config.admin_jwt_secret.as_deref(),
         ),
         (
+            "FERRUM_ADMIN_JWT_VIEWER_SECRET",
+            env_config.admin_jwt_viewer_secret.as_deref(),
+        ),
+        (
             "FERRUM_CP_DP_GRPC_JWT_SECRET",
             env_config.cp_dp_grpc_jwt_secret.as_deref(),
         ),

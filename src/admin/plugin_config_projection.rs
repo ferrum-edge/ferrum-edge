@@ -44,8 +44,19 @@
 //! Full `admin` reads and `GET /backup` stay raw. That is deliberate repository
 //! policy: rotation by read-modify-write and restorable backups both require the
 //! stored value, and both surfaces are already gated to `AdminRole::Admin`.
+//!
+//! # Rendering
+//!
+//! Every point where a layer withholds or rewrites a value goes through a
+//! [`RedactionRendering`]. Ordinary reads and audit diffs use
+//! [`PlaceholderRendering`], which emits the markers documented above. The
+//! read-only configuration export (`GET /config/export`) passes a keyed
+//! fingerprint renderer instead, so it fingerprints exactly the values this
+//! projection withholds and no others.
 
 use serde_json::{Value, json};
+
+use crate::config::types::{PlaceholderRendering, RedactionRendering};
 
 use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use crate::plugins::utils::redis_rate_limiter;
@@ -492,6 +503,18 @@ pub fn normalize_config_key(key: &str) -> String {
 /// Safe to call on any JSON shape; see the module docs for the fail-closed
 /// rules on non-object configs.
 pub fn project_plugin_config(plugin_name: &str, config: &mut Value) {
+    project_plugin_config_with(plugin_name, config, &PlaceholderRendering);
+}
+
+/// [`project_plugin_config`] with an explicit [`RedactionRendering`].
+///
+/// This is the one projection; the ordinary reads and audit diffs call it with
+/// [`PlaceholderRendering`].
+pub fn project_plugin_config_with(
+    plugin_name: &str,
+    config: &mut Value,
+    rendering: &dyn RedactionRendering,
+) {
     if config.is_null() {
         return;
     }
@@ -499,20 +522,31 @@ pub fn project_plugin_config(plugin_name: &str, config: &mut Value) {
         // No built-in plugin accepts a scalar or array config. Anything else
         // here is hostile or pre-schema legacy data whose interior cannot be
         // classified, so it is not echoed.
-        *config = json!(REDACTED_PLACEHOLDER);
+        render_in_place(config, json!(REDACTED_PLACEHOLDER), rendering);
         return;
     }
 
     for rule in sensitivity_rules_for(plugin_name) {
-        apply_rule(config, rule.path, rule.sensitivity);
+        apply_rule(config, rule.path, rule.sensitivity, rendering);
     }
-    redact_sensitive_plugin_config_fields(config);
-    strip_url_userinfo_everywhere(config);
+    redact_sensitive_plugin_config_fields_with(config, rendering);
+    strip_url_userinfo_everywhere(config, rendering);
 }
 
-fn apply_rule(value: &mut Value, path: &[&str], sensitivity: FieldSensitivity) {
+/// Replace `value` with the renderer's form of `redacted`.
+fn render_in_place(value: &mut Value, redacted: Value, rendering: &dyn RedactionRendering) {
+    let stored = std::mem::take(value);
+    *value = rendering.render(&stored, redacted);
+}
+
+fn apply_rule(
+    value: &mut Value,
+    path: &[&str],
+    sensitivity: FieldSensitivity,
+    rendering: &dyn RedactionRendering,
+) {
     let Some((head, rest)) = path.split_first() else {
-        apply_sensitivity(value, sensitivity);
+        apply_sensitivity(value, sensitivity, rendering);
         return;
     };
 
@@ -520,13 +554,13 @@ fn apply_rule(value: &mut Value, path: &[&str], sensitivity: FieldSensitivity) {
         Value::Object(map) => {
             if *head == "*" {
                 for child in map.values_mut() {
-                    apply_rule(child, rest, sensitivity);
+                    apply_rule(child, rest, sensitivity, rendering);
                 }
             } else {
                 let wanted = normalize_config_key(head);
                 for (key, child) in map.iter_mut() {
                     if normalize_config_key(key) == wanted {
-                        apply_rule(child, rest, sensitivity);
+                        apply_rule(child, rest, sensitivity, rendering);
                     }
                 }
             }
@@ -541,43 +575,44 @@ fn apply_rule(value: &mut Value, path: &[&str], sensitivity: FieldSensitivity) {
                 // (`providers[0].name`), fail-closing values the schema never
                 // named.
                 for item in items {
-                    apply_rule(item, rest, sensitivity);
+                    apply_rule(item, rest, sensitivity, rendering);
                 }
             } else {
                 // A named segment traverses arrays transparently so one rule
                 // covers both an object-keyed and an array-shaped container,
                 // and so an array-wrapped scalar still reaches the leaf rule.
                 for item in items {
-                    apply_rule(item, path, sensitivity);
+                    apply_rule(item, path, sensitivity, rendering);
                 }
             }
         }
         Value::Null => {}
         // The schema expects a container here and found a scalar: legacy or
         // hostile data whose interior cannot be classified. Fail closed.
-        _ => apply_sensitivity(value, FieldSensitivity::Secret),
+        _ => apply_sensitivity(value, FieldSensitivity::Secret, rendering),
     }
 }
 
-fn apply_sensitivity(value: &mut Value, sensitivity: FieldSensitivity) {
+fn apply_sensitivity(
+    value: &mut Value,
+    sensitivity: FieldSensitivity,
+    rendering: &dyn RedactionRendering,
+) {
     if value.is_null() {
         return;
     }
-    match sensitivity {
-        FieldSensitivity::Secret => *value = json!(REDACTED_PLACEHOLDER),
+    let redacted = match sensitivity {
+        FieldSensitivity::Secret => json!(REDACTED_PLACEHOLDER),
         FieldSensitivity::EndpointUrl => match value.as_str() {
-            Some(raw) => *value = json!(redact_endpoint_url(raw)),
+            Some(raw) => json!(redact_endpoint_url(raw)),
             // A non-string where a URL belongs may nest credentials at any
             // depth (an array of objects holding signed trigger URLs), so it is
             // replaced wholesale rather than walked.
-            None => *value = json!(REDACTED_PLACEHOLDER),
+            None => json!(REDACTED_PLACEHOLDER),
         },
         FieldSensitivity::RedisUrl => match value.as_str() {
-            Some(raw) => {
-                let projected = redis_rate_limiter::redact_url_userinfo(raw);
-                *value = json!(projected);
-            }
-            None => *value = json!(REDACTED_PLACEHOLDER),
+            Some(raw) => json!(redis_rate_limiter::redact_url_userinfo(raw)),
+            None => json!(REDACTED_PLACEHOLDER),
         },
         FieldSensitivity::KafkaProducerProperties => match value.as_object_mut() {
             Some(props) => {
@@ -585,13 +620,15 @@ fn apply_sensitivity(value: &mut Value, sensitivity: FieldSensitivity) {
                     if !is_safe_kafka_producer_property(key) {
                         // Explicit null discloses nothing; keep it so projection
                         // does not invent a redaction marker for an unset property.
-                        apply_sensitivity(prop, FieldSensitivity::Secret);
+                        apply_sensitivity(prop, FieldSensitivity::Secret, rendering);
                     }
                 }
+                return;
             }
-            None => *value = json!(REDACTED_PLACEHOLDER),
+            None => json!(REDACTED_PLACEHOLDER),
         },
-    }
+    };
+    render_in_place(value, redacted, rendering);
 }
 
 /// True when a librdkafka producer property is a known non-credential tuning
@@ -649,21 +686,28 @@ pub fn redact_endpoint_url(raw: &str) -> String {
 /// It only ever *adds* redaction. Explicit JSON `null` values are left alone —
 /// they disclose nothing — matching [`apply_sensitivity`].
 pub fn redact_sensitive_plugin_config_fields(value: &mut Value) {
+    redact_sensitive_plugin_config_fields_with(value, &PlaceholderRendering);
+}
+
+fn redact_sensitive_plugin_config_fields_with(
+    value: &mut Value,
+    rendering: &dyn RedactionRendering,
+) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 if is_sensitive_plugin_config_key(key) {
-                    apply_sensitivity(child, FieldSensitivity::Secret);
+                    apply_sensitivity(child, FieldSensitivity::Secret, rendering);
                 } else if is_credential_bearing_url_config_key(key) {
-                    apply_sensitivity(child, FieldSensitivity::RedisUrl);
+                    apply_sensitivity(child, FieldSensitivity::RedisUrl, rendering);
                 } else {
-                    redact_sensitive_plugin_config_fields(child);
+                    redact_sensitive_plugin_config_fields_with(child, rendering);
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                redact_sensitive_plugin_config_fields(item);
+                redact_sensitive_plugin_config_fields_with(item, rendering);
             }
         }
         _ => {}
@@ -720,25 +764,25 @@ pub fn is_credential_bearing_url_config_key(key: &str) -> bool {
 /// the backstop for the ones it does not, including custom-plugin config. Only
 /// strings that parse as a URL *and* actually carry a username or password are
 /// rewritten, so ordinary configuration values are untouched.
-fn strip_url_userinfo_everywhere(value: &mut Value) {
+fn strip_url_userinfo_everywhere(value: &mut Value, rendering: &dyn RedactionRendering) {
     match value {
         Value::Object(map) => {
             for child in map.values_mut() {
-                strip_url_userinfo_everywhere(child);
+                strip_url_userinfo_everywhere(child, rendering);
             }
         }
         Value::Array(items) => {
             for item in items {
-                strip_url_userinfo_everywhere(item);
+                strip_url_userinfo_everywhere(item, rendering);
             }
         }
-        Value::String(_) => strip_url_userinfo_in_place(value),
+        Value::String(_) => strip_url_userinfo_in_place(value, rendering),
         _ => {}
     }
 }
 
 /// Rewrite one string value to drop URL userinfo, if it is a URL with userinfo.
-fn strip_url_userinfo_in_place(value: &mut Value) {
+fn strip_url_userinfo_in_place(value: &mut Value, rendering: &dyn RedactionRendering) {
     let Some(raw) = value.as_str() else {
         return;
     };
@@ -750,9 +794,11 @@ fn strip_url_userinfo_in_place(value: &mut Value) {
     }
     // `set_username`/`set_password` return Err for cannot-be-a-base URLs, which
     // by construction have no userinfo to strip; fail closed anyway.
-    if parsed.set_username("redacted").is_err() || parsed.set_password(None).is_err() {
-        *value = json!(REDACTED_PLACEHOLDER);
-        return;
-    }
-    *value = json!(parsed.to_string());
+    let stripped = parsed.set_username("redacted").is_ok() && parsed.set_password(None).is_ok();
+    let redacted = if stripped {
+        json!(parsed.to_string())
+    } else {
+        json!(REDACTED_PLACEHOLDER)
+    };
+    render_in_place(value, redacted, rendering);
 }

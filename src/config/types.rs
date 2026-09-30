@@ -135,6 +135,43 @@ pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] = &[
     ("jwt", "secret"),
     ("hmac_auth", "secret"),
 ];
+
+/// How a redacting projection renders a value it withholds or rewrites.
+///
+/// The credential-bearing projections (Consumer credentials, plugin `config`
+/// blobs, and upstream service-discovery tokens) decide *which* values are
+/// sensitive exactly once. At every point where a projection would replace or
+/// rewrite a stored value, it computes its ordinary redacted form and hands
+/// both the stored value and that redacted form to a renderer:
+///
+/// - [`PlaceholderRendering`] keeps the redacted form. Ordinary non-admin reads
+///   and audit diffs use it.
+/// - The read-only configuration export (`GET /config/export`) swaps in a keyed
+///   fingerprint renderer, so a credential change is still detectable without
+///   the value being disclosed.
+///
+/// Because the renderer never decides sensitivity, the two surfaces cannot
+/// drift apart: a field the ordinary projection redacts is fingerprinted by the
+/// export, and a field it leaves alone is left alone by both.
+pub trait RedactionRendering {
+    /// Render one withheld value. `stored` is the value as persisted;
+    /// `redacted` is what the ordinary projection would emit in its place.
+    fn render(&self, stored: &serde_json::Value, redacted: serde_json::Value) -> serde_json::Value;
+}
+
+/// The ordinary rendering: emit the redacted form unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaceholderRendering;
+
+impl RedactionRendering for PlaceholderRendering {
+    fn render(
+        &self,
+        _stored: &serde_json::Value,
+        redacted: serde_json::Value,
+    ) -> serde_json::Value {
+        redacted
+    }
+}
 /// Maximum length of a credential type key.
 pub const MAX_CREDENTIAL_TYPE_LENGTH: usize = 64;
 /// Credential types whose entries must contain exactly one field, paired with
@@ -8978,6 +9015,18 @@ fn record_consumer_identity<'a>(
 }
 
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
+    redact_consumer_credentials_with(consumer, &PlaceholderRendering)
+}
+
+/// [`redact_consumer_credentials`] with an explicit [`RedactionRendering`].
+///
+/// This is the one Consumer credential projection; the ordinary response and
+/// audit forms call it with [`PlaceholderRendering`], and the read-only
+/// configuration export calls it with a keyed-fingerprint renderer.
+pub fn redact_consumer_credentials_with(
+    consumer: &Consumer,
+    rendering: &dyn RedactionRendering,
+) -> Consumer {
     let mut redacted = consumer.clone();
 
     fn entry_objects(
@@ -8996,10 +9045,15 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     fn secret_placeholders(
         credential_value: &serde_json::Value,
         field: &str,
+        rendering: &dyn RedactionRendering,
     ) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
-            .map(|_| serde_json::json!({(field): CREDENTIAL_REDACTION_PLACEHOLDER}))
+            .map(|entry| {
+                let stored = entry.get(field).unwrap_or(&serde_json::Value::Null);
+                let marker = serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER);
+                serde_json::json!({(field): rendering.render(stored, marker)})
+            })
             .collect();
         (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
@@ -9029,7 +9083,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         if let Some(entries) = consumer
             .credentials
             .get(cred_type)
-            .and_then(|value| secret_placeholders(value, field))
+            .and_then(|value| secret_placeholders(value, field, rendering))
         {
             redacted.credentials.insert(cred_type.to_string(), entries);
         }
@@ -9048,16 +9102,25 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
 }
 
 pub fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
-    let mut redacted = redact_consumer_credentials(consumer);
-    if consumer.credentials.contains_key("basicauth") {
+    redact_consumer_credentials_for_audit_with(consumer, &PlaceholderRendering)
+}
+
+/// [`redact_consumer_credentials_for_audit`] with an explicit
+/// [`RedactionRendering`].
+pub fn redact_consumer_credentials_for_audit_with(
+    consumer: &Consumer,
+    rendering: &dyn RedactionRendering,
+) -> Consumer {
+    let mut redacted = redact_consumer_credentials_with(consumer, rendering);
+    if let Some(stored) = consumer.credentials.get("basicauth") {
         // Audit events need to show that Basic credentials were present or
         // changed, but must not disclose values, entry fields, or even the
         // stored credential shape/cardinality. A single stable marker keeps
         // the mutation visible without creating a credential side channel.
-        redacted.credentials.insert(
-            "basicauth".to_string(),
-            serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER),
-        );
+        let marker = serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER);
+        redacted
+            .credentials
+            .insert("basicauth".to_string(), rendering.render(stored, marker));
     }
     redacted
 }

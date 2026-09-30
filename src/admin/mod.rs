@@ -4,6 +4,7 @@ pub mod api_specs;
 pub mod audit;
 pub mod audit_spool;
 mod backup;
+pub mod config_export;
 pub mod conn_limit;
 pub(crate) mod crud;
 pub mod jwt_auth;
@@ -2313,6 +2314,9 @@ fn namespace_scoped_resource_kind(segments: &[&str]) -> Option<&'static str> {
         "api-specs" => "api-specs",
         "batch" => "batch",
         "backup" => "backup",
+        // Only the export: `/config/apply-status` is a process-topology
+        // surface, not a tenant-addressed resource.
+        "config" if segments.get(1) == Some(&"export") => "config-export",
         "restore" => "restore",
         "audit" => "audit",
         "gateway-trust-bundles" => "gateway-trust-bundles",
@@ -2667,7 +2671,7 @@ fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bo
         .jwt_manager
         .verify_request(auth_header)
         .ok()
-        .and_then(|token_data| AuditActor::from_claims(&token_data.claims).ok())
+        .and_then(|token| AuditActor::from_verified(&token).ok())
         .is_some()
 }
 
@@ -3616,7 +3620,7 @@ async fn handle_admin_request_inner(
     // Authenticate. The `diagnostics:read` scope is read from the same verified
     // claims, so the diagnostic reference lookup never re-verifies the token.
     let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
-        Ok(token_data) => match AuditActor::from_claims(&token_data.claims) {
+        Ok(token_data) => match AuditActor::from_verified(&token_data) {
             Ok(actor) => {
                 let diagnostics_read = token_data.claims.grants_scope(DIAGNOSTICS_READ_SCOPE);
                 (actor, diagnostics_read)
@@ -4527,6 +4531,25 @@ async fn handle_admin_request_inner(
                 provisioner.as_deref(),
             )
             .await
+        }
+
+        // Read-only configuration export (issue #5904). Any authenticated role,
+        // including a token verified by FERRUM_ADMIN_JWT_VIEWER_SECRET: every
+        // credential is replaced by a keyed fingerprint, so this carries no
+        // more than the viewer projections of the same resources. Namespace-
+        // scoped, and a present `ns` claim is always honoured here — even with
+        // FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM off — so a namespace-scoped
+        // read-only token cannot export another tenant.
+        (Method::GET, ["config", "export"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Viewer) {
+                return Ok(resp);
+            }
+            if auth.allowed_namespaces.is_present()
+                && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
+            {
+                return Ok(resp);
+            }
+            Ok(config_export::handle_config_export(&state, &namespace).await)
         }
 
         // Backup & Restore
@@ -12450,6 +12473,7 @@ mod tests {
             vec!["api-specs", "s1"],
             vec!["batch"],
             vec!["backup"],
+            vec!["config", "export"],
             vec!["restore"],
             vec!["audit"],
         ] {
@@ -12466,6 +12490,7 @@ mod tests {
             vec!["namespaces"],
             vec!["namespaces", "tenant-a"],
             vec!["cluster"],
+            vec!["config", "apply-status"],
             vec!["backend-capabilities"],
             vec!["metrics", "runtime"],
             vec!["admin", "tls", "inventory"],

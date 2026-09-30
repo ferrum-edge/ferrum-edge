@@ -28,7 +28,8 @@ use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_de
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::runtime_config_apply::LiveApplyMode;
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
+    Consumer, GatewayConfig, PlaceholderRendering, PluginConfig, PluginScope, Proxy,
+    RedactionRendering, Upstream, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
@@ -3414,17 +3415,37 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
 /// schema of credential-bearing paths, backed by the historical name heuristic
 /// and a structural URL-userinfo sweep.
 pub(crate) fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
+    plugin_config_audit_body_with(resource, &PlaceholderRendering)
+}
+
+/// [`plugin_config_audit_body`] with an explicit [`RedactionRendering`]; the
+/// read-only configuration export renders the same projection as fingerprints.
+pub(crate) fn plugin_config_audit_body_with(
+    resource: &PluginConfig,
+    rendering: &dyn RedactionRendering,
+) -> Value {
     let mut body = json!(resource);
     if let Some(config) = body.get_mut("config") {
-        crate::admin::plugin_config_projection::project_plugin_config(
+        crate::admin::plugin_config_projection::project_plugin_config_with(
             &resource.plugin_name,
             config,
+            rendering,
         );
     }
     body
 }
 
 fn upstream_audit_body(resource: &Upstream) -> Value {
+    upstream_audit_body_with(resource, &PlaceholderRendering)
+}
+
+/// The one redacted Upstream projection (non-admin reads and audit diffs),
+/// with an explicit [`RedactionRendering`] for the read-only configuration
+/// export.
+pub(crate) fn upstream_audit_body_with(
+    resource: &Upstream,
+    rendering: &dyn RedactionRendering,
+) -> Value {
     let mut body = json!(resource);
     if let Some(token) = body
         .get_mut("service_discovery")
@@ -3432,7 +3453,9 @@ fn upstream_audit_body(resource: &Upstream) -> Value {
         .and_then(|consul| consul.get_mut("token"))
         && !token.is_null()
     {
-        *token = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+        let stored = std::mem::take(token);
+        let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+        *token = rendering.render(&stored, marker);
     }
     body
 }

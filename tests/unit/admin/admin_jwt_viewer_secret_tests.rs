@@ -1,0 +1,325 @@
+//! Role-ceiling admin JWT verification: `FERRUM_ADMIN_JWT_VIEWER_SECRET`
+//! (issue #5904).
+//!
+//! A token whose signature verifies under the viewer secret is authorized as
+//! `viewer` whatever its `role` claim says. The ceiling comes from the key that
+//! verified the signature, both keys are pinned to HS256, and identical
+//! secrets are refused.
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{Duration, Utc};
+use ferrum_edge::admin::audit::AuditActor;
+use ferrum_edge::admin::jwt_auth::{
+    ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR, AdminRole, JwtConfig, JwtError, JwtManager,
+    create_jwt_manager_from_env, random_read_only_jwt_manager,
+};
+use ferrum_edge::fips::approved::HmacSha256;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use serde_json::{Value, json};
+
+use crate::unit::env_lock::EnvGuard;
+
+const PRIMARY_SECRET: &str = "primary-admin-secret-0123456789abcdef";
+const VIEWER_SECRET: &str = "viewer-ceiling-secret-0123456789abcdef";
+const ISSUER: &str = "viewer-ceiling-test";
+
+fn jwt_config(secret: &str, issuer: &str) -> JwtConfig {
+    JwtConfig {
+        secret: secret.to_string(),
+        issuer: issuer.to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: Algorithm::HS256,
+    }
+}
+
+fn manager_with_viewer_secret() -> JwtManager {
+    JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER))
+        .with_viewer_secret(VIEWER_SECRET.to_string())
+        .expect("a distinct 32+ character viewer secret is accepted")
+}
+
+fn claims_window(role: Option<&str>, iat_offset: i64, exp_offset: i64) -> Value {
+    let now = Utc::now();
+    let mut claims = json!({
+        "iss": ISSUER,
+        "sub": "drift-monitor",
+        "iat": (now + Duration::seconds(iat_offset)).timestamp(),
+        "nbf": (now + Duration::seconds(iat_offset)).timestamp(),
+        "exp": (now + Duration::seconds(exp_offset)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    if let Some(role) = role {
+        claims["role"] = json!(role);
+    }
+    claims
+}
+
+fn claims(role: &str) -> Value {
+    claims_window(Some(role), 0, 600)
+}
+
+fn sign(claims: &Value, secret: &str, algorithm: Algorithm) -> String {
+    encode(
+        &Header::new(algorithm),
+        claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+/// A token with an arbitrary header, HMAC-SHA-256-signed with `secret` — the
+/// shape of an algorithm-confusion attempt.
+fn forge_with_header(header: &Value, claims: &Value, secret: Option<&str>) -> String {
+    let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(header).unwrap());
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+    let signing_input = format!("{header}.{payload}");
+    let signature = match secret {
+        Some(secret) => {
+            let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+            mac.update(signing_input.as_bytes());
+            URL_SAFE_NO_PAD.encode(mac.finalize().as_ref())
+        }
+        None => String::new(),
+    };
+    format!("{signing_input}.{signature}")
+}
+
+#[test]
+fn viewer_secret_token_is_capped_at_viewer_whatever_its_role_claim() {
+    let manager = manager_with_viewer_secret();
+
+    for claimed in [AdminRole::Viewer, AdminRole::Operator, AdminRole::Admin] {
+        let token = sign(&claims(claimed.as_str()), VIEWER_SECRET, Algorithm::HS256);
+        let verified = manager
+            .verify_token(&token)
+            .expect("viewer-secret token verifies");
+
+        assert_eq!(verified.role_ceiling, AdminRole::Viewer);
+        // The claim is untouched; the ceiling is applied at authorization.
+        assert_eq!(verified.claims.admin_role().unwrap(), claimed);
+        assert_eq!(verified.effective_role().unwrap(), AdminRole::Viewer);
+
+        let actor = AuditActor::from_verified(&verified).expect("actor builds");
+        assert_eq!(
+            actor.role, AdminRole::Viewer,
+            "a viewer-secret token claiming `{}` must authorize as viewer",
+            claimed.as_str()
+        );
+        assert!(!actor.role.allows(AdminRole::Operator));
+        assert!(!actor.role.allows(AdminRole::Admin));
+    }
+}
+
+#[test]
+fn primary_secret_token_keeps_its_claimed_role() {
+    let manager = manager_with_viewer_secret();
+
+    for claimed in [AdminRole::Viewer, AdminRole::Operator, AdminRole::Admin] {
+        let token = sign(&claims(claimed.as_str()), PRIMARY_SECRET, Algorithm::HS256);
+        let verified = manager
+            .verify_token(&token)
+            .expect("primary-secret token verifies");
+        assert_eq!(verified.role_ceiling, AdminRole::Admin);
+        let actor = AuditActor::from_verified(&verified).expect("actor builds");
+        assert_eq!(actor.role, claimed);
+    }
+}
+
+#[test]
+fn viewer_secret_token_without_a_valid_role_claim_still_fails_closed() {
+    let manager = manager_with_viewer_secret();
+
+    let unknown_role = sign(&claims("superuser"), VIEWER_SECRET, Algorithm::HS256);
+    let verified = manager.verify_token(&unknown_role).unwrap();
+    assert!(verified.effective_role().is_err());
+    assert!(AuditActor::from_verified(&verified).is_err());
+
+    let missing_role = sign(
+        &claims_window(None, 0, 600),
+        VIEWER_SECRET,
+        Algorithm::HS256,
+    );
+    let verified = manager.verify_token(&missing_role).unwrap();
+    assert!(
+        AuditActor::from_verified(&verified).is_err(),
+        "the ceiling must never turn a role-less token into a viewer"
+    );
+}
+
+#[test]
+fn algorithm_confusion_is_rejected_for_both_keys() {
+    let manager = manager_with_viewer_secret();
+    let admin_claims = claims("admin");
+
+    // Other HMAC algorithms, signed with either real secret.
+    for secret in [PRIMARY_SECRET, VIEWER_SECRET] {
+        for algorithm in [Algorithm::HS384, Algorithm::HS512] {
+            let token = sign(&admin_claims, secret, algorithm);
+            assert!(
+                manager.verify_token(&token).is_err(),
+                "{algorithm:?} must be refused; both keys are pinned to HS256"
+            );
+        }
+    }
+
+    // `alg: none` with an empty signature.
+    let unsigned = forge_with_header(&json!({"alg": "none", "typ": "JWT"}), &admin_claims, None);
+    assert!(manager.verify_token(&unsigned).is_err());
+
+    // An asymmetric `alg` whose signature is really an HMAC under the viewer
+    // secret (the classic public-key-as-HMAC-secret confusion).
+    for alg in ["RS256", "ES256", "EdDSA", "PS256"] {
+        let forged = forge_with_header(
+            &json!({"alg": alg, "typ": "JWT"}),
+            &admin_claims,
+            Some(VIEWER_SECRET),
+        );
+        assert!(
+            manager.verify_token(&forged).is_err(),
+            "`alg: {alg}` must be refused"
+        );
+    }
+
+    // Control: the same hand-built shape with `HS256` is accepted, capped,
+    // so the refusals above are about the algorithm and not the forging.
+    let control = forge_with_header(
+        &json!({"alg": "HS256", "typ": "JWT"}),
+        &admin_claims,
+        Some(VIEWER_SECRET),
+    );
+    let verified = manager
+        .verify_token(&control)
+        .expect("HS256 control verifies");
+    assert_eq!(verified.effective_role().unwrap(), AdminRole::Viewer);
+}
+
+#[test]
+fn viewer_secret_tokens_get_the_full_claim_validation() {
+    let manager = manager_with_viewer_secret();
+
+    // Expired (validate_exp).
+    let expired = sign(
+        &claims_window(Some("viewer"), -900, -300),
+        VIEWER_SECRET,
+        Algorithm::HS256,
+    );
+    assert!(manager.verify_token(&expired).is_err());
+
+    // Wrong issuer.
+    let mut wrong_issuer = claims("viewer");
+    wrong_issuer["iss"] = json!("someone-else");
+    let wrong_issuer = sign(&wrong_issuer, VIEWER_SECRET, Algorithm::HS256);
+    assert!(manager.verify_token(&wrong_issuer).is_err());
+
+    // Lifetime beyond FERRUM_ADMIN_JWT_MAX_TTL.
+    let too_long = sign(
+        &claims_window(Some("viewer"), 0, 7200),
+        VIEWER_SECRET,
+        Algorithm::HS256,
+    );
+    assert!(manager.verify_token(&too_long).is_err());
+
+    // Signed with neither secret.
+    let foreign = sign(
+        &claims("viewer"),
+        "unrelated-secret-0123456789abcdef-xyz",
+        Algorithm::HS256,
+    );
+    assert!(manager.verify_token(&foreign).is_err());
+}
+
+#[test]
+fn viewer_signed_token_is_rejected_without_a_configured_viewer_secret() {
+    let manager = JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER));
+    assert!(!manager.has_viewer_secret());
+    let token = sign(&claims("viewer"), VIEWER_SECRET, Algorithm::HS256);
+    assert!(manager.verify_token(&token).is_err());
+}
+
+#[test]
+fn identical_and_short_viewer_secrets_are_refused_without_echoing_them() {
+    let identical = JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER))
+        .with_viewer_secret(PRIMARY_SECRET.to_string());
+    let Err(JwtError::VerificationFailed(message)) = identical else {
+        panic!("identical viewer and primary secrets must be refused");
+    };
+    assert_eq!(message, ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR);
+    assert!(!message.contains(PRIMARY_SECRET));
+
+    let short = "short-viewer-secret";
+    let refused = JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER))
+        .with_viewer_secret(short.to_string());
+    let Err(JwtError::VerificationFailed(message)) = refused else {
+        panic!("a viewer secret under 32 characters must be refused");
+    };
+    assert!(message.contains("FERRUM_ADMIN_JWT_VIEWER_SECRET"));
+    assert!(message.contains("at least"));
+    assert!(!message.contains(short));
+}
+
+#[test]
+fn create_jwt_manager_from_env_reads_and_validates_the_viewer_secret() {
+    let env = EnvGuard::new(&[]);
+    env.unset("FERRUM_ADMIN_JWT_ISSUER");
+    env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
+    env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
+    env.set("FERRUM_ADMIN_JWT_SECRET", PRIMARY_SECRET);
+
+    env.unset("FERRUM_ADMIN_JWT_VIEWER_SECRET");
+    let manager = create_jwt_manager_from_env().expect("primary secret alone is valid");
+    assert!(!manager.has_viewer_secret());
+
+    env.set("FERRUM_ADMIN_JWT_VIEWER_SECRET", PRIMARY_SECRET);
+    let Err(identical) = create_jwt_manager_from_env() else {
+        panic!("identical secrets must be refused at startup");
+    };
+    assert!(identical.to_string().contains("must differ"));
+    assert!(!identical.to_string().contains(PRIMARY_SECRET));
+
+    env.set("FERRUM_ADMIN_JWT_VIEWER_SECRET", "too-short");
+    assert!(create_jwt_manager_from_env().is_err());
+
+    env.set("FERRUM_ADMIN_JWT_VIEWER_SECRET", VIEWER_SECRET);
+    let manager = create_jwt_manager_from_env().expect("distinct viewer secret is accepted");
+    assert!(manager.has_viewer_secret());
+    let mut admin_claims = claims("admin");
+    admin_claims["iss"] = json!("ferrum-edge");
+    let token = sign(&admin_claims, VIEWER_SECRET, Algorithm::HS256);
+    let verified = manager
+        .verify_token(&token)
+        .expect("viewer-secret token verifies with the default issuer");
+    assert_eq!(verified.effective_role().unwrap(), AdminRole::Viewer);
+}
+
+#[test]
+fn random_read_only_fallback_keeps_the_viewer_secret() {
+    let env = EnvGuard::new(&[]);
+    env.unset("FERRUM_ADMIN_JWT_SECRET");
+    env.unset("FERRUM_ADMIN_JWT_ISSUER");
+    env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
+    env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
+    env.set("FERRUM_ADMIN_JWT_VIEWER_SECRET", VIEWER_SECRET);
+
+    assert!(matches!(
+        create_jwt_manager_from_env(),
+        Err(JwtError::NotConfigured)
+    ));
+    let manager = random_read_only_jwt_manager().expect("fallback builds");
+    assert!(manager.has_viewer_secret());
+
+    let mut admin_claims = claims("admin");
+    admin_claims["iss"] = json!("ferrum-edge");
+    let token = sign(&admin_claims, VIEWER_SECRET, Algorithm::HS256);
+    let verified = manager
+        .verify_token(&token)
+        .expect("viewer-secret token verifies under the random-primary fallback");
+    assert_eq!(verified.effective_role().unwrap(), AdminRole::Viewer);
+
+    env.set("FERRUM_ADMIN_JWT_VIEWER_SECRET", "too-short");
+    assert!(
+        random_read_only_jwt_manager().is_err(),
+        "an invalid viewer secret must fail startup, not be dropped"
+    );
+}

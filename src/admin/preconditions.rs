@@ -201,7 +201,11 @@ pub(crate) fn quoted(opaque: &str) -> String {
 /// `serde_json` map implementation any dependency may select through feature
 /// unification. Arrays keep their order; callers normalize arrays whose stored
 /// order is not meaningful before calling.
-fn write_canonical_json(value: &Value, out: &mut String) {
+///
+/// Also the canonical input of the `GET /config/export` credential
+/// fingerprints, so an unchanged stored value fingerprints identically however
+/// its object keys happen to be ordered.
+pub(crate) fn write_canonical_json(value: &Value, out: &mut String) {
     match value {
         Value::Object(map) => {
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();

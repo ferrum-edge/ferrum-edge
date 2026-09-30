@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Read-only configuration export, `GET /config/export`** (#5904). Any
+  authenticated role, including `viewer`, can now take a whole-namespace
+  snapshot of proxies, consumers, plugin configs, and upstreams for drift
+  detection. It uses the same authoritative load as `GET /backup` and the same
+  `X-Data-Source: database|cached` signal. Every value the ordinary viewer
+  projection redacts is replaced by a keyed fingerprint,
+  `hmac-sha256:<64 hex>`, instead of `[REDACTED]`. The export reuses the
+  projection that viewer plugin-config reads and audit diffs use, so the two
+  cannot disagree about which fields are sensitive. Fingerprints are keyed
+  from `FERRUM_ADMIN_JWT_SECRET`, bound to the resource kind, namespace, and
+  id, and computed over a key-sorted canonical form. An unchanged credential
+  therefore compares equal across calls and replicas, and a changed one does
+  not. The export is namespace-scoped and always honours a present `ns` claim.
+  It is not restorable, and `GET /backup` remains `admin`-only.
+- **`FERRUM_ADMIN_JWT_VIEWER_SECRET` role ceiling** (#5904). This optional
+  second HS256 verification secret (at least 32 characters) authorizes every
+  token it verifies as `viewer`, whatever its `role` claim says. A read-only
+  process can hold this secret without holding material that mints `operator`
+  or `admin` tokens.
+
 - **`otel_tracing` attempt spans on the HTTP/3 bridge to HTTP/1.1 and HTTP/2
   backends** (#5875). The HTTP/3 frontend's bridge to a backend without
   native HTTP/3 now exports one `CLIENT` span per backend attempt, retries and
@@ -665,6 +685,20 @@ outright with no deprecation period:
   finished exiting yet.
 
 ### Security
+
+- Admin JWT role ceiling (#5904). A token signed with
+  `FERRUM_ADMIN_JWT_VIEWER_SECRET` can never reach `operator` or `admin`,
+  including when it claims `admin`. The ceiling is recorded from which key
+  verified the signature and applied where the request's actor is built,
+  which is where every route reads its role. Both keys accept only `HS256`, so
+  `none`, `HS384`/`HS512`, and asymmetric algorithms are refused. The viewer key
+  is tried only after the primary key reports a signature mismatch. Startup and
+  `validate` refuse a viewer secret equal to `FERRUM_ADMIN_JWT_SECRET` or
+  `FERRUM_CP_DP_GRPC_JWT_SECRET`, and refuse one shorter than 32 characters,
+  without echoing either value. FIPS enforce mode applies its HMAC key-length
+  floor to the new secret. `GET /config/export` fingerprints are keyed from the
+  primary secret only, so a viewer-secret holder cannot compute or offline-guess
+  them.
 
 - `mcp_gateway` `aggregate_router` admission now holds on the final request
   (GHSA-3w98-6p32-8qm2). The message kind, method, selected upstream, mediated

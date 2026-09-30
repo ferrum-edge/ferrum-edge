@@ -193,3 +193,63 @@ fn equal_secret_error_never_includes_secret_material() {
         },
     );
 }
+
+// ── FERRUM_ADMIN_JWT_VIEWER_SECRET (issue #5904) ──────────────────────
+
+const VIEWER_SECRET: &str = "viewer-ceiling-secret-padding-32c!!";
+
+fn database_mode_env<'a>(admin: &'a str, viewer: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("FERRUM_MODE", "database"),
+        ("FERRUM_ADMIN_JWT_SECRET", admin),
+        ("FERRUM_ADMIN_JWT_VIEWER_SECRET", viewer),
+        ("FERRUM_DB_TYPE", "sqlite"),
+        ("FERRUM_DB_URL", "sqlite::memory:"),
+    ]
+}
+
+#[test]
+fn identical_admin_and_viewer_secrets_are_refused_at_startup() {
+    with_env_vars(&database_mode_env(SHARED_SECRET, SHARED_SECRET), || {
+        let error = EnvConfig::from_env().expect_err("identical secrets must fail closed");
+        assert!(error.contains("FERRUM_ADMIN_JWT_VIEWER_SECRET"), "{error}");
+        assert!(error.contains("FERRUM_ADMIN_JWT_SECRET"), "{error}");
+        assert!(
+            !error.contains(SHARED_SECRET),
+            "startup error must never include secret material: {error}"
+        );
+    });
+}
+
+#[test]
+fn viewer_secret_equal_to_cp_dp_secret_is_refused_at_startup() {
+    let mut vars = database_mode_env(ADMIN_SECRET, CP_DP_SECRET);
+    vars.push(("FERRUM_CP_DP_GRPC_JWT_SECRET", CP_DP_SECRET));
+    with_env_vars(&vars, || {
+        let error = EnvConfig::from_env().expect_err("shared viewer/CP-DP key must fail");
+        assert!(error.contains("FERRUM_ADMIN_JWT_VIEWER_SECRET"), "{error}");
+        assert!(error.contains("FERRUM_CP_DP_GRPC_JWT_SECRET"), "{error}");
+        assert!(!error.contains(CP_DP_SECRET), "{error}");
+    });
+}
+
+#[test]
+fn short_viewer_secret_is_refused_at_startup() {
+    with_env_vars(&database_mode_env(ADMIN_SECRET, "short-viewer"), || {
+        let error = EnvConfig::from_env().expect_err("short viewer secret must fail");
+        assert!(error.contains("FERRUM_ADMIN_JWT_VIEWER_SECRET"), "{error}");
+        assert!(error.contains("at least"), "{error}");
+        assert!(!error.contains("short-viewer"), "{error}");
+    });
+}
+
+#[test]
+fn distinct_viewer_secret_is_accepted() {
+    with_env_vars(&database_mode_env(ADMIN_SECRET, VIEWER_SECRET), || {
+        let config = EnvConfig::from_env().expect("distinct viewer secret is accepted");
+        assert_eq!(
+            config.admin_jwt_viewer_secret.as_deref(),
+            Some(VIEWER_SECRET)
+        );
+    });
+}

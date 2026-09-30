@@ -1931,6 +1931,13 @@ pub struct EnvConfig {
 
     // Admin JWT
     pub admin_jwt_secret: Option<String>,
+    /// Optional second HS256 verification secret for Admin API JWTs
+    /// (`FERRUM_ADMIN_JWT_VIEWER_SECRET`). A token it verifies is capped at the
+    /// `viewer` role whatever its `role` claim says. At least 32 characters,
+    /// and distinct from `FERRUM_ADMIN_JWT_SECRET` and
+    /// `FERRUM_CP_DP_GRPC_JWT_SECRET`. The admin plane reads it through
+    /// `create_jwt_manager_from_env()`; this field is the startup validation.
+    pub admin_jwt_viewer_secret: Option<String>,
     /// JWT issuer claim (iss) for Admin API tokens. Tokens with a different issuer
     /// are rejected during verification. Default: "ferrum-edge".
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs` for use sites
@@ -4035,6 +4042,7 @@ impl Default for EnvConfig {
             admin_bind_address: "127.0.0.1".into(),
             allow_insecure_admin_http: false,
             admin_jwt_secret: None,
+            admin_jwt_viewer_secret: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
             admin_jwt_audience: None,
@@ -4524,6 +4532,7 @@ impl EnvConfig {
             allow_insecure_admin_http: bool = "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" => false;
             admin_jwt_secret: Option<String> = "FERRUM_ADMIN_JWT_SECRET"
                 => required_for(["database", "cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+            admin_jwt_viewer_secret: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_SECRET";
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
@@ -5583,6 +5592,7 @@ impl EnvConfig {
             admin_bind_address,
             allow_insecure_admin_http,
             admin_jwt_secret,
+            admin_jwt_viewer_secret,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
             admin_jwt_audience,
@@ -7893,6 +7903,37 @@ impl EnvConfig {
                  issuer claims do not domain-separate shared signing material"
                     .into(),
             );
+        }
+
+        // The role-ceiling viewer secret must be strong and must not equal any
+        // other admin-plane or CP/DP signing key: an identical HMAC key would
+        // let its holder mint tokens another verifier accepts without the
+        // viewer ceiling. Diagnostics name the settings, never the values.
+        if let Some(viewer_secret) = self
+            .admin_jwt_viewer_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            if viewer_secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+                return Err(format!(
+                    "FERRUM_ADMIN_JWT_VIEWER_SECRET must be at least {} characters (got {})",
+                    crate::config::types::MIN_JWT_SECRET_LENGTH,
+                    viewer_secret.len()
+                ));
+            }
+            if self.admin_jwt_secret.as_deref() == Some(viewer_secret) {
+                return Err(
+                    crate::admin::jwt_auth::ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR.into(),
+                );
+            }
+            if self.cp_dp_grpc_jwt_secret.as_deref() == Some(viewer_secret) {
+                return Err(
+                    "FERRUM_ADMIN_JWT_VIEWER_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET must be \
+                     distinct secrets; identical HMAC keys are rejected because issuer claims \
+                     do not domain-separate shared signing material"
+                        .into(),
+                );
+            }
         }
 
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN
