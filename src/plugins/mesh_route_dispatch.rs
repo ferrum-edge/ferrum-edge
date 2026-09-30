@@ -551,10 +551,30 @@ fn compile_transform_field(
     }
     let context = format!("mesh_route_dispatch.rules[{rule_idx}].{field}");
     let parsed = parse_route_header_transforms(raw, &context)?;
+    // Request route overrides may not write the gateway-owned `x-consumer-*`
+    // consumer assertion namespace, matching `request_transformer` admission.
+    if field == "request_transform" {
+        for (idx, rule) in parsed.iter().enumerate() {
+            match rule.operation {
+                crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Remove => {}
+                crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Add
+                | crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Update => {
+                    if crate::proxy::headers::is_consumer_assertion_header(&rule.key) {
+                        return Err(format!(
+                            "`{context}[{idx}].key` {:?} is in the gateway-owned `x-consumer-*` \
+                             consumer assertion namespace and cannot be a `request_transform` \
+                             destination",
+                            rule.key
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // Response route overrides share the response_transformer write surface:
     // reject protocol-managed destinations so a VirtualService header modifier
     // cannot reintroduce Connection/Transfer-Encoding/Content-Length after the
-    // origin strip. Request transforms keep their existing contract.
+    // origin strip.
     if field == "response_transform" {
         for (idx, rule) in parsed.iter().enumerate() {
             match rule.operation {

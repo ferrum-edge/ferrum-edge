@@ -25,6 +25,17 @@
 //!     one the code under test made — an unreachable mapping surfaced as a
 //!     secret-resolution failure instead of a fixture error. Both fixtures now
 //!     poll their published endpoint from the host before returning.
+//!
+//! # Transient image pulls
+//!
+//! Container start goes through the same bounded retry as the
+//! service-integration fixtures ([`super::container_retry`]): a transient
+//! image-pull/registry failure (a truncated Docker Hub layer, a reset
+//! connection, rate limiting, a registry 5xx) is retried a bounded number of
+//! times inside one start deadline. Wait-condition failures, deterministic
+//! registry answers and host-port collisions are returned after the first
+//! attempt, and an exhausted retry is still a hard failure in CI through
+//! [`fail_in_ci_else_skip`].
 
 #![allow(dead_code)] // helpers are used selectively per feature-gated module
 
@@ -34,6 +45,7 @@ use testcontainers::core::{ExecCommand, IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+use super::container_retry::start_within_deadline;
 use super::host_ports::{allocate_host_port, retry_on_host_port_collision};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -132,15 +144,17 @@ pub struct VaultContainer {
 pub async fn start_vault_dev_container() -> Result<VaultContainer, BoxError> {
     let (container, host_port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
-        let container = GenericImage::new("hashicorp/vault", "1.15")
-            .with_exposed_port(8200.tcp())
-            .with_wait_for(WaitFor::message_on_stdout("Vault server started!"))
-            .with_mapped_port(host_port, 8200.tcp())
-            .with_env_var("VAULT_DEV_ROOT_TOKEN_ID", "root")
-            .with_env_var("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200")
-            .with_cmd(["server", "-dev"])
-            .start()
-            .await?;
+        let container = start_within_deadline("Vault", || {
+            GenericImage::new("hashicorp/vault", "1.15")
+                .with_exposed_port(8200.tcp())
+                .with_wait_for(WaitFor::message_on_stdout("Vault server started!"))
+                .with_mapped_port(host_port, 8200.tcp())
+                .with_env_var("VAULT_DEV_ROOT_TOKEN_ID", "root")
+                .with_env_var("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200")
+                .with_cmd(["server", "-dev"])
+                .start()
+        })
+        .await?;
         Ok::<_, BoxError>((container, host_port))
     })
     .await?;
@@ -207,14 +221,16 @@ pub struct LocalStackContainer {
 pub async fn start_localstack_for_aws_secretsmanager() -> Result<LocalStackContainer, BoxError> {
     let (container, host_port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
-        let container = GenericImage::new("localstack/localstack", "3")
-            .with_exposed_port(4566.tcp())
-            .with_wait_for(WaitFor::message_on_stdout("Ready."))
-            .with_mapped_port(host_port, 4566.tcp())
-            .with_env_var("SERVICES", "secretsmanager")
-            .with_env_var("EAGER_SERVICE_LOADING", "1")
-            .start()
-            .await?;
+        let container = start_within_deadline("LocalStack", || {
+            GenericImage::new("localstack/localstack", "3")
+                .with_exposed_port(4566.tcp())
+                .with_wait_for(WaitFor::message_on_stdout("Ready."))
+                .with_mapped_port(host_port, 4566.tcp())
+                .with_env_var("SERVICES", "secretsmanager")
+                .with_env_var("EAGER_SERVICE_LOADING", "1")
+                .start()
+        })
+        .await?;
         Ok::<_, BoxError>((container, host_port))
     })
     .await?;

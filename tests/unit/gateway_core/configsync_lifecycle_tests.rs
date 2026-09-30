@@ -22,19 +22,20 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     SnapshotFailureStreamDisposition, StaleSnapshotReject, SubscriptionApplyState,
     VersionCompatError, VersionReconcileError, advance_authority_from_committed,
     advance_multi_cp_backoff, authoritative_snapshot_payload_matches, backoff_max_secs,
-    check_peer_version_compatibility, connection_error_outcome, cp_endpoints_same_source,
-    delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
-    evaluate_delta_authority, evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew,
-    failure_backoff_sequence, full_snapshot_stream_disposition, gateway_config_content_matches,
+    check_config_sync_build_identity, check_peer_version_compatibility, config_sync_build_identity,
+    connection_error_outcome, cp_endpoints_same_source, delta_rejection_stream_disposition,
+    evaluate_delta_against_subscription_base, evaluate_delta_authority,
+    evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew, failure_backoff_sequence,
+    full_snapshot_stream_disposition, gateway_config_content_matches,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
     monotonic_watermark, reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
-    silence_exceeds_liveness, silence_watchdog_armed, snapshot_failure_stream_disposition,
+    silence_exceeds_liveness, snapshot_failure_stream_disposition,
     snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
 };
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, check_cp_version_compatibility, configure_configsync_endpoint,
-    filter_incremental_to_namespace,
+    filter_incremental_to_namespace, subscribe_admission_refusal, subscribe_build_mismatch,
 };
 use ferrum_edge::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet, TrustDomain};
 use ferrum_edge::util::backoff::BACKOFF_INITIAL_SECS;
@@ -987,8 +988,97 @@ fn rejected_delta_marks_divergence_until_full_snapshot_recovery() {
 }
 
 #[test]
+fn config_sync_build_identity_accepts_only_the_exact_build() {
+    use ferrum_edge::grpc::configsync_lifecycle::{
+        CONFIG_SYNC_BUILD_MISMATCH_PREFIX, CONFIG_SYNC_PROTOCOL_REVISION,
+    };
+
+    let local = config_sync_build_identity();
+    let revision = CONFIG_SYNC_PROTOCOL_REVISION;
+    let expected = format!("{FERRUM_VERSION}+configsync.r{revision}");
+    assert_eq!(local, expected);
+    assert!(check_config_sync_build_identity(local).is_ok());
+
+    // Same crate version, different protocol revision: a different build.
+    let next = CONFIG_SYNC_PROTOCOL_REVISION + 1;
+    let other = format!("{FERRUM_VERSION}+configsync.r{next}");
+    let mismatch = check_config_sync_build_identity(&other).unwrap_err();
+    assert_eq!(mismatch.peer, other);
+    let message = mismatch.message("DP", "CP");
+    assert!(message.starts_with(CONFIG_SYNC_BUILD_MISMATCH_PREFIX));
+    assert!(message.contains(local) && message.contains(&other));
+
+    // A different crate version is a different build.
+    let other_version = check_config_sync_build_identity("0.0.0+configsync.r1");
+    assert!(other_version.is_err());
+
+    // A build that sends no identity is refused too.
+    let missing = check_config_sync_build_identity("").unwrap_err();
+    let missing = missing.message("CP", "DP");
+    assert!(missing.contains("DP reported no build identity"));
+
+    // A hostile peer string is bounded before it reaches logs.
+    let huge = "x".repeat(10_000);
+    let bounded = check_config_sync_build_identity(&huge).unwrap_err();
+    assert!(bounded.peer.chars().count() <= 128);
+}
+
+#[test]
+fn build_mismatch_subscribe_refusal_backs_off_without_retaining_authority() {
+    // The CP refuses a different build at Subscribe with FAILED_PRECONDITION.
+    // The DP recognises that refusal (and only that one) as a build mismatch.
+    let other = format!("{FERRUM_VERSION}+configsync.r0");
+    let refusal = check_config_sync_build_identity(&other).unwrap_err();
+    let status = tonic::Status::failed_precondition(refusal.message("CP", "DP"));
+    let error = anyhow::Error::new(status);
+    assert!(subscribe_build_mismatch(&error).is_some());
+    assert!(subscribe_admission_refusal(&error).is_none());
+
+    let status = tonic::Status::failed_precondition("namespace refused");
+    let unrelated = anyhow::Error::new(status);
+    assert!(subscribe_build_mismatch(&unrelated).is_none());
+
+    // It fails over with accumulating backoff: never a hot loop, never reset.
+    let mut state = MultiCpBackoffState {
+        backoff_secs: 4,
+        ..MultiCpBackoffState::new()
+    };
+    let outcome = ConfigSyncAttemptOutcome::BuildMismatch;
+    assert!(advance_multi_cp_backoff(&mut state, 2, outcome));
+    assert_eq!(state.current_cp_index, 1, "fails over");
+    assert_eq!(state.backoff_secs, 4, "never resets backoff");
+    grow_backoff_after_failure_sleep(&mut state);
+    assert_eq!(state.backoff_secs, 8, "keeps growing");
+
+    // Both the Subscribe refusal and a mismatched CP frame end in
+    // BuildMismatch, and neither retains CP authority.
+    let refusal_arm = DP_CLIENT_SOURCE
+        .split("if let Some(status) = subscribe_build_mismatch(&e) {")
+        .nth(1)
+        .and_then(|tail| tail.split("subscribe_admission_refusal(&e)").next())
+        .expect("build-mismatch Subscribe refusal arm");
+    let frame_arm = DP_CLIENT_SOURCE
+        .split("Ok(DpStreamEnd::BuildMismatch) => {")
+        .nth(1)
+        .and_then(|tail| tail.split("Ok(DpStreamEnd::TransportFailure").next())
+        .expect("build-mismatch stream-end arm");
+    let lost = "update_state_disconnected(&connection_state, cp_url, is_primary, false);";
+    for arm in [refusal_arm, frame_arm] {
+        assert!(arm.contains("ConfigSyncAttemptOutcome::BuildMismatch"));
+        assert!(
+            arm.contains(lost),
+            "a build mismatch must not retain CP authority"
+        );
+    }
+    let frame_end = "return Ok(DpStreamEnd::BuildMismatch);";
+    assert!(DP_CLIENT_SOURCE.contains(frame_end));
+}
+
+#[test]
 fn semver_version_negotiation_rejects_empty_malformed_and_incompatible() {
-    // Issue #2395: fail closed on missing/malformed; allow patch/prerelease.
+    // Issue #2395: the MeshSubscribe version floor fails closed on
+    // missing/malformed/different-major.minor versions. ConfigSync uses the
+    // exact build identity instead (see the tests above).
     assert!(matches!(
         check_peer_version_compatibility(FERRUM_VERSION, ""),
         Err(VersionCompatError::Missing)
@@ -1396,31 +1486,9 @@ fn tls_reload_during_failure_backoff_preserves_accumulated_backoff() {
 }
 
 #[test]
-fn silence_watchdog_arms_only_when_silence_is_actually_anomalous() {
-    // Issue #2395 mixed-version safety: heartbeats are capability-negotiated, so
-    // a stream from a CP that never confirmed them is legitimately idle-silent
-    // and must NOT be torn down on the application silence bound. Transport
-    // keepalive still covers it.
-    assert!(!silence_watchdog_armed(false, true));
-
-    // Once the CP confirms heartbeat support, continued silence means the
-    // keepalive it promised stopped arriving — arm the watchdog.
-    assert!(silence_watchdog_armed(true, true));
-
-    // Issue #2967: before the first message, silence is anomalous at ANY peer
-    // version — every CP sends its initial FULL_SNAPSHOT immediately on
-    // Subscribe. Without this the DP would hang forever in `message().await`
-    // on a blackholed reconnect and never reach a fallback CP.
-    assert!(silence_watchdog_armed(false, false));
-    assert!(silence_watchdog_armed(true, false));
-}
-
-#[test]
-fn heartbeat_frames_require_an_accepted_negotiated_snapshot_base() {
-    assert!(!heartbeat_frame_admissible(false, false));
-    assert!(!heartbeat_frame_admissible(false, true));
-    assert!(!heartbeat_frame_admissible(true, false));
-    assert!(heartbeat_frame_admissible(true, true));
+fn heartbeat_frames_require_an_accepted_snapshot_base() {
+    assert!(!heartbeat_frame_admissible(false));
+    assert!(heartbeat_frame_admissible(true));
 }
 
 #[test]
@@ -1455,55 +1523,39 @@ fn qualified_removal_delta(namespace: &str) -> IncrementalResult {
 }
 
 #[test]
-fn delta_wire_body_keeps_legacy_bare_id_removal_arrays_for_older_peers() {
-    // Issue #2395 / rolling upgrade: `IncrementalResult` JSON is the CP→DP DELTA
-    // body, so its shape is a same-major.minor compatibility contract. A peer
-    // that predates namespace-qualified removals must still be able to parse the
-    // body, which means the historical arrays keep their bare-string element
-    // type and the qualified keys travel in ADDITIVE `removed_*_keys` arrays.
+fn delta_wire_body_carries_only_namespace_qualified_removal_keys() {
+    // `IncrementalResult` JSON is the CP→DP DELTA body. Every removal array
+    // carries `{namespace, id}` objects; there is no bare-ID or additive
+    // `removed_*_keys` shape.
     let wire = serde_json::to_value(qualified_removal_delta("production")).unwrap();
 
-    for legacy_field in [
+    for field in [
         "removed_proxy_ids",
+        "removed_consumer_ids",
         "removed_plugin_config_ids",
         "removed_upstream_ids",
     ] {
-        let array = wire[legacy_field].as_array().expect(legacy_field);
-        assert_eq!(array.len(), 1, "{legacy_field} must carry the removal");
-        assert!(
-            array[0].is_string(),
-            "{legacy_field} must stay a bare-ID string array for older peers, got {:?}",
-            array[0]
-        );
+        let array = wire[field].as_array().expect(field);
+        assert_eq!(array.len(), 1, "{field} must carry the removal");
+        assert_eq!(array[0]["namespace"], "production", "{field}");
+        assert!(array[0]["id"].is_string(), "{field}");
     }
-    for keyed_field in [
+    for retired in [
         "removed_proxy_keys",
+        "removed_consumer_keys",
         "removed_plugin_config_keys",
         "removed_upstream_keys",
     ] {
-        let array = wire[keyed_field].as_array().expect(keyed_field);
-        assert_eq!(array[0]["namespace"], "production");
-        assert!(array[0]["id"].is_string());
+        assert!(wire.get(retired).is_none(), "{retired} is retired");
     }
-    // Consumers already shipped the qualified object shape on this major.minor,
-    // so they keep it (no additive array) rather than regressing to bare IDs.
-    assert_eq!(wire["removed_consumer_ids"][0]["namespace"], "production");
-    assert!(wire.get("removed_consumer_keys").is_none());
 }
 
 #[test]
 fn delta_wire_body_round_trips_namespace_qualified_removals() {
-    // New CP → new DP must be lossless: the additive keys win over the legacy
-    // bare-ID arrays, so no namespace qualification is lost on the wire.
     let original = qualified_removal_delta("production");
     let json = serde_json::to_string(&original).unwrap();
-    let mut decoded: IncrementalResult = serde_json::from_str(&json).unwrap();
+    let decoded: IncrementalResult = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(
-        decoded.qualify_unqualified_removals("ferrum"),
-        0,
-        "a fully qualified delta must need no namespace qualification"
-    );
     assert_eq!(
         decoded.removed_proxy_ids,
         vec![NamespacedResourceId::new("production", "p1")]
@@ -1524,67 +1576,29 @@ fn delta_wire_body_round_trips_namespace_qualified_removals() {
 }
 
 #[test]
-fn legacy_bare_id_delta_decodes_and_scopes_to_the_authorized_namespace() {
-    // Issue #2395, new DP ← legacy CP: a CP that predates qualified removals
-    // sends bare ID strings in every removal array (consumers included). Those
-    // decode without a namespace and are then scoped to the DP's own already
-    // authorized subscription namespace, reproducing the legacy semantics
-    // exactly without widening reach.
-    let legacy = serde_json::json!({
-        "added_or_modified_proxies": [],
-        "removed_proxy_ids": ["p1"],
-        "added_or_modified_consumers": [],
-        "removed_consumer_ids": ["c1"],
-        "added_or_modified_plugin_configs": [],
-        "removed_plugin_config_ids": ["pc1"],
-        "added_or_modified_upstreams": [],
-        "removed_upstream_ids": ["u1"],
-        "poll_timestamp": "2026-07-24T12:00:00Z",
-    });
-
-    let mut decoded: IncrementalResult = serde_json::from_value(legacy).unwrap();
-    // Before qualification the keys carry no namespace, so the DP namespace
-    // filter would fail them closed rather than deleting anything.
-    let mut unqualified = decoded.clone();
-    assert_eq!(
-        filter_incremental_to_namespace(&mut unqualified, "production"),
-        4
-    );
-
-    assert_eq!(decoded.qualify_unqualified_removals("production"), 4);
-    assert_eq!(
-        decoded.removed_proxy_ids,
-        vec![NamespacedResourceId::new("production", "p1")]
-    );
-    assert_eq!(
-        decoded.removed_consumer_ids,
-        vec![NamespacedResourceId::new("production", "c1")]
-    );
-    assert_eq!(
-        decoded.removed_plugin_config_ids,
-        vec![NamespacedResourceId::new("production", "pc1")]
-    );
-    assert_eq!(
-        decoded.removed_upstream_ids,
-        vec![NamespacedResourceId::new("production", "u1")]
-    );
-    // Scoping is to the subscription namespace only: nothing survives a filter
-    // for a different tenant, so #2974's cross-namespace guarantee holds.
-    assert_eq!(filter_incremental_to_namespace(&mut decoded, "staging"), 4);
-    assert!(decoded.is_empty());
+fn bare_id_removal_delta_is_rejected_at_decode() {
+    // A removal key without a namespace can never be scoped safely, so a body
+    // that carries bare ID strings fails closed instead of being applied.
+    for field in [
+        "removed_proxy_ids",
+        "removed_consumer_ids",
+        "removed_plugin_config_ids",
+        "removed_upstream_ids",
+    ] {
+        let mut body = serde_json::to_value(qualified_removal_delta("production")).unwrap();
+        body[field] = serde_json::json!(["bare-id"]);
+        assert!(
+            serde_json::from_value::<IncrementalResult>(body).is_err(),
+            "{field} must reject a bare ID string"
+        );
+    }
 }
 
 #[test]
-fn qualified_removal_from_a_foreign_namespace_is_never_requalified() {
+fn qualified_removal_from_a_foreign_namespace_is_filtered_out() {
     // Defense in depth (#2974): a misrouted or adversarial delta that explicitly
-    // names another tenant must NOT be rewritten into this DP's namespace — it
-    // must stay foreign so the namespace filter drops it.
+    // names another tenant must stay foreign so the namespace filter drops it.
     let mut delta = qualified_removal_delta("staging");
-    assert_eq!(
-        delta.qualify_unqualified_removals("production"),
-        0,
-        "explicitly qualified keys must never be re-scoped"
-    );
     assert_eq!(filter_incremental_to_namespace(&mut delta, "production"), 4);
     assert!(delta.is_empty());
 }

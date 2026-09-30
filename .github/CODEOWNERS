@@ -1,7 +1,7 @@
 # CODEOWNERS — Ferrum Edge
 #
 # Scoped to vendored-dependency governance (see docs/dependency-policy.md) and
-# the release workflow.
+# the image/release publishing workflows.
 # Listed owners are auto-requested for review on changes to these paths, and —
 # if branch protection enables "Require review from Code Owners" — must approve.
 # This file is intentionally narrow; broaden ownership deliberately.
@@ -27,6 +27,11 @@
 # review on their own merits, since the release workflow publishes artifacts.
 /PRODUCTION_READINESS.md                    @jeremyjpj0916
 /.github/workflows/release.yml              @jeremyjpj0916
+# The `latest` / `main-<sha>` image publisher holds the same registry
+# credentials as the release workflow, so it and its contract verifier get the
+# same review bar.
+/.github/workflows/main-latest-image.yml    @jeremyjpj0916
+/.github/scripts/verify_main_latest_image_workflow.py @jeremyjpj0916
 
 # The ownership map itself. GitHub evaluates CODEOWNERS from the base branch,
 # so editing this file in a pull request cannot relax that pull request's own

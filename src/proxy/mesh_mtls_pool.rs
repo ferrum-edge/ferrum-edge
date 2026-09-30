@@ -93,7 +93,8 @@ pub const MESH_MTLS_AUTHORITY_HOST_TAG: &str = "mesh.mtls_authority_host";
 /// normal in-cluster shape where `target.host` is dialed directly.
 pub const MESH_MTLS_DIAL_HOST_TAG: &str = "mesh.mtls_dial_host";
 /// Tag overriding the ClientHello SNI of a Sidecar mesh-mTLS dial. Value = the
-/// DESTINATION service FQDN. Stamped ONLY on cross-cluster east-west targets
+/// DESTINATION service port's east-west alias `p<port>.<fqdn>` (`p<port>-udp`
+/// for UDP). Stamped ONLY on cross-cluster east-west targets
 /// (see [`MESH_CROSS_CLUSTER_TAG`]): the dial host is the remote east-west
 /// gateway address, but the gateway does SNI passthrough and routes the opaque
 /// outer TLS to the destination workload by the ClientHello SNI, so the SNI
@@ -583,8 +584,8 @@ impl MeshMtlsDialError {
 ///   gateway LB-picks the destination workload, so NO pod SPIFFE is pinned
 ///   (`expected_peer = None`); verification is scoped to the remote
 ///   `mesh.trust_domain` and the ClientHello SNI is overridden to the
-///   destination service FQDN (`mesh.eastwest_sni`). Both are mandatory —
-///   a missing one fails closed.
+///   destination service port's east-west alias (`mesh.eastwest_sni`,
+///   `p<port>.<fqdn>`). Both are mandatory — a missing one fails closed.
 #[derive(Debug)]
 pub struct MeshMtlsDialPlan<'a> {
     /// Whether this is a cross-cluster east-west dial.
@@ -595,9 +596,10 @@ pub struct MeshMtlsDialPlan<'a> {
     /// Remote trust domain verification is scoped to (cross-cluster only);
     /// `None` in-cluster (the pinned peer already constrains the domain).
     pub expected_trust_domain: Option<TrustDomain>,
-    /// ClientHello SNI override = the destination service FQDN (cross-cluster
-    /// only); `None` in-cluster (SNI = the dial host). Borrowed from the target
-    /// tag to avoid a per-dispatch allocation.
+    /// ClientHello SNI override = the destination service port's east-west
+    /// alias `p<port>.<fqdn>` (cross-cluster only); `None` in-cluster (SNI =
+    /// the dial host). Borrowed from the target tag to avoid a per-dispatch
+    /// allocation.
     pub sni_override: Option<&'a str>,
 }
 
@@ -1025,8 +1027,9 @@ impl MeshMtlsConnectionPool {
     ///   a trust bundle for the peer's trust domain.
     ///
     /// `sni_override` sets the ClientHello SNI when `Some` (cross-cluster: the
-    /// destination service FQDN so the gateway's SNI passthrough routes the
-    /// opaque TLS to the destination workload); `None` uses `target_host`.
+    /// destination service port's `p<port>.<fqdn>` alias so the gateway's SNI
+    /// passthrough routes the opaque TLS to that port's workload backend);
+    /// `None` uses `target_host`.
     ///
     /// `expected_trust_domain` scopes verification to a single remote trust
     /// domain on cross-cluster east-west dials (always paired with
@@ -1437,7 +1440,7 @@ impl MeshMtlsConnectionPool {
             mtls_port,
             // In-cluster: `Some(peer)` pins the workload identity, no SNI/TD
             // override. Cross-cluster: `None` peer + trust-domain scope + SNI
-            // override to the destination service FQDN (the plan the caller
+            // override to the destination service port's alias (the plan the caller
             // resolved via `MeshMtlsDialPlan`).
             expected_peer,
             expected_trust_domain,
@@ -1993,7 +1996,7 @@ impl MeshMtlsConnectionPool {
             crls,
         )?;
         let connector = TlsConnector::from(tls_config);
-        // SNI: the destination service FQDN for a cross-cluster east-west dial
+        // SNI: the destination service port's alias for a cross-cluster dial
         // (so the remote gateway's SNI passthrough routes the opaque TLS to the
         // destination workload), else the dial host (the normal in-cluster
         // path).

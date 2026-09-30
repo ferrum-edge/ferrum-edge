@@ -374,8 +374,8 @@
       "gridPos": {"h": 8, "w": 24, "x": 0, "y": 32},
       "targets": [
         {
-          "expr": "sum by (trust_domain, endpoint) (rate(ferrum_mesh_federation_poll_failures_total{trust_domain=~\"$trust_domain\"}[5m]))",
-          "legendFormat": "{{trust_domain}} {{endpoint}}",
+          "expr": "sum by (trust_domain) (rate(ferrum_mesh_federation_poll_failures_total{trust_domain=~\"$trust_domain\"}[5m]))",
+          "legendFormat": "{{trust_domain}}",
           "refId": "A"
         }
       ],

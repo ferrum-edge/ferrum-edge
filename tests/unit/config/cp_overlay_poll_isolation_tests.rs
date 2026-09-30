@@ -525,29 +525,22 @@ fn proxy_ids(config: &GatewayConfig) -> BTreeSet<String> {
 }
 
 fn json_ids(payload: &serde_json::Value, field: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let Some(items) = payload.get(field).and_then(|value| value.as_array()) else {
-        return ids;
+    let Some(value) = payload.get(field) else {
+        return Vec::new();
     };
+    // Fail loudly on any other shape: silently skipping it would let a
+    // wire-format change disable the add/remove folds below unnoticed.
+    let Some(items) = value.as_array() else {
+        panic!("{field} is not an array: {value}");
+    };
+    let mut ids = Vec::new();
     for item in items {
-        if let Some(id) = item.get("id").and_then(|id| id.as_str()) {
-            ids.push(id.to_string());
-        }
+        let Some(id) = item.get("id").and_then(|id| id.as_str()) else {
+            panic!("{field} element is not an object with a string id: {item}");
+        };
+        ids.push(id.to_string());
     }
     ids
-}
-
-fn json_strings(payload: &serde_json::Value, field: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let Some(items) = payload.get(field).and_then(|value| value.as_array()) else {
-        return values;
-    };
-    for item in items {
-        if let Some(value) = item.as_str() {
-            values.push(value.to_string());
-        }
-    }
-    values
 }
 
 /// Fold a mesh broadcast into the state a mesh node would hold, exactly as a
@@ -577,7 +570,7 @@ fn apply_dp_event(state: &mut BTreeSet<String>, update: &ConfigUpdate) {
     for id in json_ids(&payload, "added_or_modified_proxies") {
         state.insert(id);
     }
-    for id in json_strings(&payload, "removed_proxy_ids") {
+    for id in json_ids(&payload, "removed_proxy_ids") {
         state.remove(&id);
     }
 }

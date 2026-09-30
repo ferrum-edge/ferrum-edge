@@ -16,10 +16,15 @@
 //! resources that should not be projected (wrong location, empty
 //! hosts, no exported scope, no reachable workloads).
 
+use std::collections::HashMap;
+
+use ferrum_edge::config_sources::k8s::{
+    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+};
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MultiClusterConfig, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServicePort, WorkloadPort,
+    ServiceEntryLocation, ServicePort, ServiceTargetPort, WorkloadPort,
 };
 use ferrum_edge::modes::mesh::prepare_gateway_config_for_mesh;
 use ferrum_edge::modes::mesh::{MeshTopology, runtime::MeshRuntimeState};
@@ -97,7 +102,8 @@ fn east_west_gateway_materializes_sni_passthrough_proxy_from_remote_gateway_conf
 fn east_west_gateway_materializes_local_service_proxies_for_sni_routing() {
     // Workloads + services in the mesh slice produce per-service
     // passthrough proxies so inbound cross-cluster traffic SNI-routes
-    // to the right local workload. The SNI host is the service FQDN.
+    // to the right local workload. The SNI host is the port's
+    // `p<port>.<fqdn>` alias, exactly as for a multi-port service.
     let workload = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
@@ -110,18 +116,27 @@ fn east_west_gateway_materializes_local_service_proxies_for_sni_routing() {
     let prepared =
         prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("east-west prepared");
 
-    // One proxy per service, materialised with the FQDN SNI host.
+    // One proxy per service port, materialised with the per-port alias SNI.
     let service_proxy = prepared
         .proxies
         .iter()
         .find(|p| {
             p.hosts
                 .iter()
-                .any(|h| h.contains("reviews.default.svc.cluster.local"))
+                .any(|h| h == "p8080.reviews.default.svc.cluster.local")
         })
         .expect("east-west service proxy materialised");
     assert!(service_proxy.passthrough);
     assert_eq!(service_proxy.listen_port, Some(15443));
+    assert_eq!(service_proxy.id, "__mesh-ew-svc-default-reviews.p8080");
+    // No auto proxy routes on the bare base FQDN, even for a single-port
+    // service.
+    assert!(!prepared.proxies.iter().any(|proxy| {
+        proxy
+            .hosts
+            .iter()
+            .any(|host| host == "reviews.default.svc.cluster.local")
+    }));
 
     // One upstream per service with the workload addresses as targets.
     let upstream = prepared
@@ -137,10 +152,10 @@ fn east_west_gateway_materializes_local_service_proxies_for_sni_routing() {
 }
 
 /// Multi-port east-west (issue #2010 phase 3): a service with two HTTP ports
-/// materializes ONE SNI-passthrough proxy PER port — the first on the base
-/// service FQDN, the second on the deterministic `p<port>.<fqdn>` alias — each
-/// backed by that port's container port. This is the gateway (destination) side
-/// of the per-port SNI scheme the client materializers dial.
+/// materializes ONE SNI-passthrough proxy PER port, each on its deterministic
+/// `p<port>.<fqdn>` alias and backed by that port's container port. This is the
+/// gateway (destination) side of the per-port SNI scheme the client
+/// materializers dial.
 #[test]
 fn east_west_gateway_materializes_per_port_proxies_for_multiport_service() {
     let workload = workload_for(
@@ -293,7 +308,7 @@ fn east_west_gateway_materializes_raw_tcp_and_udp_per_port_sni_relays() {
 
     for (alias, port) in [
         ("p7070.l4-service.default.svc.cluster.local", 7070),
-        ("p5353.l4-service.default.svc.cluster.local", 5353),
+        ("p5353-udp.l4-service.default.svc.cluster.local", 5353),
     ] {
         let proxy = prepared
             .proxies
@@ -312,7 +327,10 @@ fn east_west_gateway_materializes_raw_tcp_and_udp_per_port_sni_relays() {
 }
 
 #[test]
-fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
+fn east_west_alias_depends_only_on_port_number_and_transport() {
+    // HTTP :8080 and UDP :8080 share a number but not a transport: HTTP keeps
+    // the bare p8080 alias and UDP takes p8080-udp. Neither alias changes when
+    // the service also declares other ports.
     let workload = workload_for("mixed", DEFAULT_NAMESPACE, [("app", "mixed")], ["10.0.0.9"]);
     let mut service = service_for("mixed", DEFAULT_NAMESPACE, &[&workload]);
     service.ports = vec![
@@ -324,14 +342,14 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
         },
         ServicePort {
             port: 8080,
-            protocol: AppProtocol::Tcp,
-            name: Some("tcp".to_string()),
+            protocol: AppProtocol::Udp,
+            name: Some("udp".to_string()),
             target_port: None,
         },
         ServicePort {
-            port: 8080,
-            protocol: AppProtocol::Udp,
-            name: Some("udp".to_string()),
+            port: 9090,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
             target_port: None,
         },
     ];
@@ -345,41 +363,287 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
     )
     .expect("prepared");
 
-    assert!(prepared.proxies.iter().any(|proxy| {
-        proxy
-            .hosts
-            .iter()
-            .any(|host| host == "mixed.default.svc.cluster.local")
-    }));
-    for alias in [
-        "p8080-tcp.mixed.default.svc.cluster.local",
-        "p8080-udp.mixed.default.svc.cluster.local",
+    for (alias, upstream_id) in [
+        (
+            "p8080.mixed.default.svc.cluster.local",
+            "__mesh-ew-upstream-default-mixed.p8080",
+        ),
+        (
+            "p8080-udp.mixed.default.svc.cluster.local",
+            "__mesh-ew-upstream-default-mixed.p8080-udp",
+        ),
+        (
+            "p9090.mixed.default.svc.cluster.local",
+            "__mesh-ew-upstream-default-mixed.p9090",
+        ),
     ] {
-        assert!(
-            prepared
-                .proxies
-                .iter()
-                .any(|proxy| proxy.hosts.iter().any(|host| host == alias))
+        let proxy = prepared
+            .proxies
+            .iter()
+            .find(|proxy| proxy.hosts.iter().any(|host| host == alias))
+            .unwrap_or_else(|| panic!("east-west passthrough for {alias}"));
+        assert_eq!(proxy.upstream_id.as_deref(), Some(upstream_id));
+    }
+}
+
+/// The east-west aliases (passthrough proxy SNI hosts) the destination
+/// materializes for a `mixed` service declaring `ports` and
+/// `protocol_overrides`.
+fn east_west_aliases_for(
+    ports: Vec<ServicePort>,
+    protocol_overrides: HashMap<u16, AppProtocol>,
+) -> Vec<String> {
+    let workload = workload_for("mixed", DEFAULT_NAMESPACE, [("app", "mixed")], ["10.0.0.9"]);
+    let mut service = service_for("mixed", DEFAULT_NAMESPACE, &[&workload]);
+    service.ports = ports;
+    service.protocol_overrides = protocol_overrides;
+    let prepared = prepare_gateway_config_for_mesh(
+        gateway_config_with_mesh(
+            Vec::new(),
+            Vec::new(),
+            mesh_config_with(vec![workload], vec![service], Vec::new()),
+        ),
+        &east_west_runtime(),
+    )
+    .expect("prepared");
+    let mut aliases: Vec<String> = prepared
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.hosts.iter())
+        .filter(|host| host.ends_with(".mixed.default.svc.cluster.local"))
+        .cloned()
+        .collect();
+    aliases.sort();
+    aliases
+}
+
+fn service_port(port: u16, protocol: AppProtocol, name: &str) -> ServicePort {
+    ServicePort {
+        port,
+        protocol,
+        name: Some(name.to_string()),
+        target_port: None,
+    }
+}
+
+#[test]
+fn east_west_refuses_http_and_raw_tcp_sharing_a_port_number() {
+    // An HTTP port and a raw-TCP port on one number would share the p8080
+    // alias, so the destination refuses both rather than pick one. The
+    // service's unambiguous port still routes.
+    let aliases = east_west_aliases_for(
+        vec![
+            service_port(8080, AppProtocol::Http, "http"),
+            service_port(8080, AppProtocol::Tcp, "tcp"),
+            service_port(9090, AppProtocol::Http, "http-alt"),
+        ],
+        HashMap::new(),
+    );
+    assert_eq!(aliases, vec!["p9090.mixed.default.svc.cluster.local"]);
+}
+
+#[test]
+fn east_west_refuses_tcp_and_sctp_sharing_a_port_number() {
+    // A Diameter-style `3868/TCP` + `3868/SCTP` pair: the K8s translator models
+    // SCTP as `Unknown`, which is not UDP, so both entries map to p3868. Only
+    // that number is skipped cross-cluster; the other port still routes.
+    let aliases = east_west_aliases_for(
+        vec![
+            service_port(3868, AppProtocol::Tcp, "tcp-diameter"),
+            service_port(3868, AppProtocol::Unknown, "sctp-diameter"),
+            service_port(9090, AppProtocol::Http, "http"),
+        ],
+        HashMap::new(),
+    );
+    assert_eq!(aliases, vec!["p9090.mixed.default.svc.cluster.local"]);
+}
+
+#[test]
+fn east_west_refuses_duplicate_port_entries() {
+    // Two entries of the same class on one number (duplicate native entries)
+    // are as ambiguous as a mixed pair: the upsert would be last-wins.
+    let mut second = service_port(8080, AppProtocol::Http, "http-b");
+    second.target_port = Some(ServiceTargetPort::Number(18080));
+    let aliases = east_west_aliases_for(
+        vec![
+            service_port(8080, AppProtocol::Http, "http-a"),
+            second,
+            service_port(9090, AppProtocol::Http, "http-alt"),
+        ],
+        HashMap::new(),
+    );
+    assert_eq!(aliases, vec!["p9090.mixed.default.svc.cluster.local"]);
+}
+
+#[test]
+fn east_west_protocol_override_never_moves_a_port_across_transports() {
+    // `protocol_overrides` is keyed by port NUMBER, so it applies to both the
+    // TCP and the UDP entry on 5353. The alias follows each entry's DECLARED
+    // transport, so neither override collapses the pair onto one alias.
+    for override_protocol in [AppProtocol::Http, AppProtocol::Udp] {
+        let aliases = east_west_aliases_for(
+            vec![
+                service_port(5353, AppProtocol::Tcp, "tcp-dns"),
+                service_port(5353, AppProtocol::Udp, "udp-dns"),
+            ],
+            HashMap::from([(5353, override_protocol)]),
+        );
+        assert_eq!(
+            aliases,
+            vec![
+                "p5353-udp.mixed.default.svc.cluster.local",
+                "p5353.mixed.default.svc.cluster.local",
+            ],
+            "override {override_protocol:?} must not move either entry onto the other's alias"
         );
     }
+}
+
+/// A Kubernetes object in the default namespace.
+fn k8s_object(kind: &str, name: &str, spec: serde_json::Value) -> K8sObject {
+    let api_version = if kind == "EndpointSlice" {
+        "discovery.k8s.io/v1"
+    } else {
+        "v1"
+    };
+    K8sObject {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        metadata: K8sMetadata {
+            name: name.to_string(),
+            uid: format!("uid-{name}"),
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            generation: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec,
+        status: serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// A Diameter-style Service declaring `3868/TCP` and `3868/SCTP` (legal in
+/// Kubernetes) plus an HTTP port, with one ready backing pod.
+fn diameter_k8s_objects() -> Vec<K8sObject> {
+    let service = k8s_object(
+        "Service",
+        "diameter",
+        serde_json::json!({
+            "clusterIP": "10.96.0.38",
+            "ports": [
+                {"name": "tcp-diameter", "port": 3868, "protocol": "TCP"},
+                {"name": "sctp-diameter", "port": 3868, "protocol": "SCTP"},
+                {"name": "http", "port": 9090, "protocol": "TCP", "appProtocol": "http"}
+            ]
+        }),
+    );
+    let mut pod = k8s_object(
+        "Pod",
+        "diameter-0",
+        serde_json::json!({
+            "serviceAccountName": "diameter",
+            "nodeName": "node-a",
+            "containers": [{
+                "ports": [
+                    {"name": "tcp-diameter", "containerPort": 3868, "protocol": "TCP"},
+                    {"name": "sctp-diameter", "containerPort": 3868, "protocol": "SCTP"},
+                    {"name": "http", "containerPort": 9090, "protocol": "TCP"}
+                ]
+            }]
+        }),
+    );
+    pod.metadata
+        .labels
+        .insert("app".to_string(), "diameter".to_string());
+    pod.status = serde_json::json!({
+        "phase": "Running",
+        "podIP": "10.1.0.38",
+        "conditions": [{"type": "Ready", "status": "True"}]
+    });
+    let mut slice = k8s_object(
+        "EndpointSlice",
+        "diameter-abc",
+        serde_json::json!({
+            "addressType": "IPv4",
+            "endpoints": [{
+                "addresses": ["10.1.0.38"],
+                "targetRef": {"kind": "Pod", "name": "diameter-0", "namespace": "default"},
+                "conditions": {"ready": true}
+            }],
+            "ports": [
+                {"name": "tcp-diameter", "port": 3868, "protocol": "TCP"},
+                {"name": "sctp-diameter", "port": 3868, "protocol": "SCTP"},
+                {"name": "http", "port": 9090, "protocol": "TCP"}
+            ]
+        }),
+    );
+    slice.metadata.labels.insert(
+        "kubernetes.io/service-name".to_string(),
+        "diameter".to_string(),
+    );
+    vec![service, pod, slice]
+}
+
+/// A Kubernetes Service declaring `3868/TCP` + `3868/SCTP` translates in full
+/// and routes in-cluster; only the ambiguous 3868 east-west alias is skipped
+/// for cross-cluster routing, while its other port keeps its alias.
+#[test]
+fn k8s_tcp_and_sctp_service_translates_and_routes_in_cluster() {
+    let options = K8sTranslationOptions::new(
+        "ferrum-system".to_string(),
+        TrustDomain::new("cluster.local").expect("trust domain"),
+    )
+    .with_source_namespaces(Vec::new())
+    .with_pod_discovery_enabled(true);
+    let translation =
+        translate_k8s_objects(&diameter_k8s_objects(), options).expect("K8s translation succeeds");
+    let mesh = translation.config.mesh.expect("mesh config");
+    let service = mesh
+        .services
+        .iter()
+        .find(|service| service.name == "diameter")
+        .expect("the TCP+SCTP Service translates");
+    let ports: Vec<u16> = service.ports.iter().map(|port| port.port).collect();
+    assert_eq!(ports, vec![3868, 3868, 9090]);
     assert!(
-        prepared
+        !service.workloads.is_empty(),
+        "the ready pod backs the Service"
+    );
+    let translated_mesh = mesh_config_with(mesh.workloads.clone(), mesh.services.clone(), vec![]);
+
+    // In-cluster: a Sidecar client routes to the pod on 3868.
+    let mut client = default_mesh_runtime();
+    client.workload_spiffe_id = Some("spiffe://cluster.local/ns/default/sa/client".to_string());
+    let in_cluster = prepare_gateway_config_for_mesh(
+        gateway_config_with_mesh(Vec::new(), Vec::new(), translated_mesh.clone()),
+        &client,
+    )
+    .expect("sidecar config prepared");
+    assert!(
+        in_cluster
             .upstreams
             .iter()
-            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed")
+            .flat_map(|upstream| upstream.targets.iter())
+            .any(|target| target.host == "10.1.0.38" && target.port == 3868),
+        "in-cluster egress to the Diameter port must still route to the pod"
     );
-    assert!(
-        prepared
-            .upstreams
-            .iter()
-            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080-tcp")
-    );
-    assert!(
-        prepared
-            .upstreams
-            .iter()
-            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080-udp")
-    );
+
+    // Cross-cluster: the destination skips only the ambiguous 3868 alias.
+    let destination = prepare_gateway_config_for_mesh(
+        gateway_config_with_mesh(Vec::new(), Vec::new(), translated_mesh),
+        &east_west_runtime(),
+    )
+    .expect("east-west config prepared");
+    let aliases: Vec<&str> = destination
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.hosts.iter())
+        .map(String::as_str)
+        .filter(|host| host.ends_with(".diameter.default.svc.cluster.local"))
+        .collect();
+    assert_eq!(aliases, vec!["p9090.diameter.default.svc.cluster.local"]);
 }
 
 /// codex #2040 Finding B (id collision): a MULTI-port service `foo` (ports 8080,
@@ -387,9 +651,8 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
 /// clobber each other in the materializer's id-keyed upsert map. The per-port id
 /// separator is `.` (a character a DNS-1035/1123 k8s service name cannot
 /// contain), so `foo`'s :8080 alias id is `__mesh-ew-svc-default-foo.p8080`
-/// while `foo-p8080`'s bare id is `__mesh-ew-svc-default-foo-p8080` (no dot) —
-/// distinct. The pre-`.` scheme (`-p8080`) produced the SAME id for both and one
-/// overwrote the other.
+/// while `foo-p8080`'s :8080 alias id is `__mesh-ew-svc-default-foo-p8080.p8080`
+/// — distinct. A `-p8080` marker would have produced the SAME id for both.
 #[test]
 fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     let foo_wl = workload_for("foo", DEFAULT_NAMESPACE, [("app", "foo")], ["10.0.0.1"]);
@@ -409,8 +672,8 @@ fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
         },
     ];
 
-    // A distinct service literally named `foo-p8080` — the id-space collision the
-    // `-p<port>` marker was vulnerable to. Single-port ⇒ port-less bare id.
+    // A distinct service literally named `foo-p8080` — the id-space collision a
+    // `-p<port>` marker would be vulnerable to.
     let collide_wl = workload_for(
         "foo-p8080",
         DEFAULT_NAMESPACE,
@@ -436,23 +699,17 @@ fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     assert!(has_upstream("__mesh-ew-upstream-default-foo.p8080"));
     assert!(has_upstream("__mesh-ew-upstream-default-foo.p9090"));
 
-    // `foo-p8080`'s bare (port-less) id uses the `-p8080` name literally — a
-    // DIFFERENT string from foo's `.p8080` alias, so neither was overwritten.
+    // `foo-p8080`'s alias id carries the `-p8080` name literally — a DIFFERENT
+    // string from foo's `.p8080` alias, so neither was overwritten.
     assert!(
-        has_proxy("__mesh-ew-svc-default-foo-p8080"),
-        "the distinct `foo-p8080` service's bare proxy must survive (not clobbered), got {:?}",
+        has_proxy("__mesh-ew-svc-default-foo-p8080.p8080"),
+        "the distinct `foo-p8080` service's proxy must survive (not clobbered), got {:?}",
         prepared.proxies.iter().map(|p| &p.id).collect::<Vec<_>>()
     );
-    assert!(has_upstream("__mesh-ew-upstream-default-foo-p8080"));
-
-    // The dotted alias id and the literal-name bare id are provably distinct.
-    assert_ne!(
-        "__mesh-ew-svc-default-foo.p8080", "__mesh-ew-svc-default-foo-p8080",
-        "the `.p<port>` alias id and the `-p<port>` literal-name id must never coincide"
-    );
+    assert!(has_upstream("__mesh-ew-upstream-default-foo-p8080.p8080"));
 
     // Both services keep their own backend: foo's alias backends 8080/9090,
-    // foo-p8080's bare upstream backends its 8080 workload port — no cross-wiring.
+    // foo-p8080's upstream backends its 8080 workload port — no cross-wiring.
     let foo_8080 = prepared
         .upstreams
         .iter()
@@ -462,7 +719,7 @@ fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     let collide_up = prepared
         .upstreams
         .iter()
-        .find(|u| u.id == "__mesh-ew-upstream-default-foo-p8080")
+        .find(|u| u.id == "__mesh-ew-upstream-default-foo-p8080.p8080")
         .expect("foo-p8080 upstream");
     assert!(collide_up.targets.iter().all(|t| t.host == "10.0.0.2"));
 }
@@ -517,12 +774,12 @@ fn east_west_gateway_skips_remote_gateway_from_other_namespace() {
 
 #[test]
 fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
-    // An explicit EastWestGateway that owns a local service's FQDN SNI host
+    // An explicit EastWestGateway that owns a local service port's SNI alias
     // must win over the automatic local-service proxy: materializing both
     // would emit two passthrough proxies claiming the same SNI on the shared
     // listen port, which `validate_stream_proxies` rejects as overlapping —
     // silently dropping the operator's explicit route. The auto proxy for the
-    // overlapping FQDN is suppressed so exactly one (the explicit) survives.
+    // overlapping alias is suppressed so exactly one (the explicit) survives.
     let workload = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
@@ -537,7 +794,7 @@ fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
         remote_clusters: Vec::new(),
         east_west_gateways: vec![east_west_gateway(
             "explicit-reviews",
-            vec!["reviews.default.svc.cluster.local"],
+            vec!["p8080.reviews.default.svc.cluster.local"],
         )],
     });
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
@@ -551,10 +808,10 @@ fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
             .any(|p| p.id.starts_with("__mesh-east-west-")
                 && p.hosts
                     .iter()
-                    .any(|h| h == "reviews.default.svc.cluster.local")),
+                    .any(|h| h == "p8080.reviews.default.svc.cluster.local")),
         "explicit east-west gateway proxy must own the reviews SNI"
     );
-    // ...and the auto local-service proxy for the same FQDN is suppressed, so
+    // ...and the auto local-service proxy for the same alias is suppressed, so
     // only one proxy claims that SNI on the shared listen port.
     let claimants = prepared
         .proxies
@@ -563,7 +820,7 @@ fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
             p.listen_port == Some(15443)
                 && p.hosts
                     .iter()
-                    .any(|h| h == "reviews.default.svc.cluster.local")
+                    .any(|h| h == "p8080.reviews.default.svc.cluster.local")
         })
         .count();
     assert_eq!(
@@ -667,9 +924,10 @@ fn east_west_overwritten_duplicate_gateway_does_not_suppress_auto_proxy() {
     // Two EastWestGateway entries in the same namespace that reuse the same
     // `name` collapse onto one generated proxy id (last wins). The override
     // set must reflect only the surviving gateway's SNI hosts: an overwritten
-    // entry that claimed `reviews.default.svc.cluster.local` must NOT suppress
-    // the auto local-service proxy for `reviews`, or that service silently
-    // disappears from east-west routing. The surviving entry claims `ratings`.
+    // entry that claimed `p8080.reviews.default.svc.cluster.local` must NOT
+    // suppress the auto local-service proxy for `reviews`, or that service
+    // silently disappears from east-west routing. The surviving entry claims
+    // `ratings`.
     let reviews_wl = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
@@ -686,8 +944,8 @@ fn east_west_overwritten_duplicate_gateway_does_not_suppress_auto_proxy() {
         federation_endpoint: None,
         remote_clusters: Vec::new(),
         east_west_gateways: vec![
-            east_west_gateway("dup", vec!["reviews.default.svc.cluster.local"]),
-            east_west_gateway("dup", vec!["ratings.default.svc.cluster.local"]),
+            east_west_gateway("dup", vec!["p8080.reviews.default.svc.cluster.local"]),
+            east_west_gateway("dup", vec!["p8080.ratings.default.svc.cluster.local"]),
         ],
     });
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
@@ -703,7 +961,7 @@ fn east_west_overwritten_duplicate_gateway_does_not_suppress_auto_proxy() {
             .any(|p| p.id.starts_with("__mesh-ew-svc-")
                 && p.hosts
                     .iter()
-                    .any(|h| h == "reviews.default.svc.cluster.local")),
+                    .any(|h| h == "p8080.reviews.default.svc.cluster.local")),
         "auto local-service proxy for reviews must survive when only an overwritten duplicate-name gateway claimed it, got {:?}",
         prepared
             .proxies

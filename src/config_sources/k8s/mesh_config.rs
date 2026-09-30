@@ -378,22 +378,20 @@ fn zipkin_provider(name: &str, config: &Value) -> Result<TracingProvider, String
 }
 
 fn datadog_provider(name: &str, config: &Value) -> Result<TracingProvider, String> {
-    let agent_url = trimmed_string_aliased(config, "agentUrl", &["agent_url"])
+    let agent_url = trimmed_string(config, "agentUrl")
         .map(Ok)
         .unwrap_or_else(|| service_endpoint(config, name, "datadog", 8126))?;
-    let service = trimmed_string_aliased(config, "serviceName", &["service_name"]);
+    let service = trimmed_string(config, "serviceName");
     Ok(TracingProvider::Datadog { agent_url, service })
 }
 
 fn lightstep_provider(name: &str, config: &Value) -> Result<TracingProvider, String> {
-    let collector_url = trimmed_string_aliased(config, "collectorUrl", &["collector_url"])
+    let collector_url = trimmed_string(config, "collectorUrl")
         .map(Ok)
         .unwrap_or_else(|| {
             service_endpoint_with_default_scheme(config, name, "lightstep", 443, "https")
         })?;
-    let Some(access_token_env) =
-        trimmed_string_aliased(config, "accessTokenEnv", &["access_token_env"])
-    else {
+    let Some(access_token_env) = trimmed_string(config, "accessTokenEnv") else {
         return Err(format!(
             "meshConfig.extensionProviders {name:?} lightstep provider requires accessTokenEnv"
         ));
@@ -875,14 +873,6 @@ fn trimmed_string(value: &Value, field: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-}
-
-fn trimmed_string_aliased(value: &Value, field: &str, aliases: &[&str]) -> Option<String> {
-    trimmed_string(value, field).or_else(|| {
-        aliases
-            .iter()
-            .find_map(|alias| trimmed_string(value, alias))
-    })
 }
 
 #[cfg(test)]

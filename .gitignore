@@ -1,9 +1,13 @@
 # Rust
 /target/
+/integration-tests-*.tar.zst
+/functional-tests-*.tar.zst
 **/target/
 **/*.rs.bk
 fuzz/artifacts/
 fuzz/target/
+# Generated libFuzzer inputs; committed corpus seeds remain tracked.
+/fuzz/corpus/
 
 # cargo-llvm-cov instrumented target dirs (scripts/coverage.sh)
 target/llvm-cov/

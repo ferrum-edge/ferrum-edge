@@ -214,12 +214,7 @@ fn assert_provider_boundary(protocol: &str, attempt: &str, request: &CapturedReq
             "{ctx}: '{forbidden}' must never cross the provider boundary:\n{raw}"
         );
     }
-    for forbidden_header in [
-        "x-api-key:",
-        "x-client-token:",
-        "x-consumer-username:",
-        "cookie:",
-    ] {
+    for forbidden_header in ["x-api-key:", "x-client-token:", "x-consumer-", "cookie:"] {
         assert!(
             !lower.contains(forbidden_header),
             "{ctx}: '{forbidden_header}' must be stripped at the provider boundary:\n{raw}"
@@ -507,6 +502,7 @@ impl BoundaryHarness {
             .post(url)
             .header("content-type", "application/json")
             .header("x-client-token", CLIENT_TOKEN)
+            .header("x-consumer-role", "admin")
             .header("cookie", format!("session={CLIENT_TOKEN}"))
             .body(body.to_vec())
             .send()
@@ -535,6 +531,7 @@ impl BoundaryHarness {
             ))
             .header("content-type", "application/json")
             .header("x-client-token", CLIENT_TOKEN)
+            .header("x-consumer-role", "admin")
             .header("cookie", format!("session={CLIENT_TOKEN}"))
             .body(Full::<Bytes>::new(Bytes::from(body.to_vec())))
             .expect("build h2 request");
@@ -558,6 +555,7 @@ impl BoundaryHarness {
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .header("x-client-token", CLIENT_TOKEN)
+                .header("x-consumer-role", "admin")
                 .header("cookie", format!("session={CLIENT_TOKEN}"))
                 .body(Bytes::from(body.to_vec()));
             match client.get_with_options(&url, options).await {
@@ -584,16 +582,15 @@ impl BoundaryHarness {
 /// The hostile later transformer. Header rules cover `update` (overwrite the
 /// installed provider credential), `add` (introduce a provider-shaped
 /// credential header the router had stripped), and `rename` (promote a
-/// client-supplied token into `Authorization`), plus a forged gateway identity
-/// assertion. The query rule tries to append a normal-backend secret to the
-/// third-party URL.
+/// client-supplied token into `Authorization`). A forged gateway identity
+/// assertion can no longer be configured (the `x-consumer-*` namespace is
+/// refused at admission), so the client sends one on the wire instead. The
+/// query rule tries to append a normal-backend secret to the third-party URL.
 fn hostile_header_and_query_rules() -> serde_json::Value {
     serde_json::json!([
         {"operation": "update", "target": "header", "key": "Authorization",
          "value": format!("Bearer {NORMAL_BACKEND_SECRET}")},
         {"operation": "add", "target": "header", "key": "X-Api-Key", "value": HOSTILE_API_KEY},
-        {"operation": "update", "target": "header", "key": "X-Consumer-Username",
-         "value": "forged-consumer"},
         {"operation": "rename", "target": "header", "key": "X-Client-Token",
          "new_key": "Authorization"},
         {"operation": "add", "target": "query", "key": HOSTILE_QUERY_KEY,

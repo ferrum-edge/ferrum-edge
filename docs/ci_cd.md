@@ -6,6 +6,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 
 - [Pipeline Overview](#pipeline-overview)
 - [Workflow Inventory](#workflow-inventory)
+- [BoringCache CI enrollment](#boringcache-ci-enrollment)
 - [CI runtime caching (production images and FIPS)](#ci-runtime-caching-production-images-and-fips)
 - [CI Pipeline (ci.yml)](#ci-pipeline-ciyml)
 - [Release Pipeline (release.yml)](#release-pipeline-releaseyml)
@@ -14,6 +15,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 - [Creating a New Release](#creating-a-new-release)
 - [Binaries and Downloads](#binaries-and-downloads)
 - [Image Signatures, SBOMs, and Provenance](#image-signatures-sboms-and-provenance)
+- [Main latest image](#main-latest-image)
 - [GitHub Actions Secrets](#github-actions-secrets)
 - [Root Merge Gate Attestation](#root-merge-gate-attestation)
 - [Customizing CI/CD](#customizing-cicd)
@@ -24,7 +26,12 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 
 CI validates pull requests, merge groups, and `main` with fast build profiles.
 A merge to `main` additionally packages the tested Linux amd64 binaries into an
-image artifact. It does not publish to Docker Hub, GHCR, or GitHub Releases.
+image artifact. CI itself does not publish to Docker Hub, GHCR, or GitHub
+Releases. After a `main` push CI run succeeds, the separate **Main Latest
+Image** workflow publishes a signed `main-<sha>` image for that commit and moves
+the `latest` container tag forward to it. Its runs are serialized and only the
+newest waiting commit is built, so intermediate commits may get no image; see
+[Main latest image](#main-latest-image).
 
 Production publishing starts from **Start Production Release**
 (`release-dispatch.yml`). Run it on `main` with a version such as `v1.2.3`.
@@ -36,6 +43,7 @@ separate `release.yml` production build and publishing workflow.
 | CI (`ci.yml`) | PR, merge group, main push | Tests and fast verification builds; Linux CI image artifact on main |
 | Start Production Release (`release-dispatch.yml`) | Manual, version input | Exact-commit validation and immutable tag creation |
 | Release (`release.yml`) | `v*` tag push | Production binaries, multi-architecture images, signatures, SBOMs and GitHub Release |
+| Main Latest Image (`main-latest-image.yml`) | Successful CI push run on `main` | Signed `latest` and `main-<sha>` development images; no binaries, no GitHub Release |
 
 ## Workflow Inventory
 
@@ -48,7 +56,9 @@ adding, removing, or materially changing a workflow.
 | `coverage.yml` | Coverage | PRs, `merge_group`, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs and merge-queue groups. |
 | `fips-build.yml` | FIPS Build Policy | PRs, `merge_group`, push to `main`, manual | Required FIPS feature-graph audit plus compile/clippy/handshake gate. Warm PR target <=30 minutes (p95 <=45); see [CI runtime caching](#ci-runtime-caching-production-images-and-fips). |
 | `release-dispatch.yml` | Start Production Release | Manual version input | Validate the selected main SHA and create its version tag. |
+| `boringcache-connect.yml` | Connect BoringCache | Manual (`workflow_dispatch` on upstream `main` only) | One-time browser-approved GitHub Actions OIDC enrollment into a BoringCache Machine connection. |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
+| `main-latest-image.yml` | Main Latest Image | `workflow_run` of CI on `main` (successful `push` runs only) | Serialized: builds the newest waiting CI-validated `main` commit (intermediate commits may be skipped), pushes and signs `main-<sha>`, then moves `latest` forward to it while that commit is on main's history and newer than the commit `latest` names. Never touches version tags. See [Main latest image](#main-latest-image). |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
@@ -268,6 +278,84 @@ Manual Start Production Release on main (version input, e.g. v0.2.0)
                                                 requires attestation success
                                                 (retracts an unverified release)
 ```
+
+## BoringCache CI enrollment
+
+**Connect BoringCache** links GitHub Actions' existing OIDC identity for
+`ferrum-edge/ferrum-edge` to the BoringCache Workspace `jeremy-j/ferrum-edge`.
+The enrollment workflow installs the SHA-256-verified v1.33.0 Linux CLI and
+grants `id-token: write` only to its manual enrollment job. It needs no
+BoringCache repository secret and runs only in the upstream repository on `main`.
+
+After merging the workflow:
+
+1. Open **Actions → Connect BoringCache → Run workflow**, select `main`, and
+   start the run.
+2. Open the **Enroll GitHub Actions Machine connection** step's live log.
+   While the job waits, open the verification URL printed by
+   `boringcache ci connect --oidc-provider github-actions`.
+3. Sign in to BoringCache, approve GitHub repository `ferrum-edge/ferrum-edge`,
+   and select Workspace `jeremy-j/ferrum-edge`.
+4. Wait for the job to succeed, then verify the repository and Workspace in
+   BoringCache's **Machine connections**. If the browser approval expires,
+   rerun the workflow and use its new verification URL.
+
+Enrollment is a one-time operation. It establishes the Machine connection.
+The Rust CI integration derives from
+[PR #5885](https://github.com/ferrum-edge/ferrum-edge/pull/5885).
+`boringcache/one` starts and renews its OIDC session for each supported CI job. See the
+[BoringCache enrollment reference](https://boringcache.com/docs/cli) and
+[GitHub Actions guide](https://boringcache.com/docs/github-actions).
+
+### BoringCache Rust CI rollout
+
+The full rollout uses the pinned v1.33.0 action and CLI for unit and ACME
+precompilation, secret/backend and service integration, PKCS#11, native test
+archives, conformance, dependency audit, vendored patches, Lint, Fuzz Smoke,
+eBPF builds and live tests, network-namespace and two-cluster tests, and native
+platform binaries. Integration and functional shards reuse the native archives
+produced by the cached test-artifact build. Existing test selection, compiler
+profiles, warnings, artifact handoffs, and all seven fuzz targets and bounds
+remain in force. FIPS and production-release caching have separate contracts.
+
+`.boringcache.toml` names each lane's target archive and Cargo download profiles;
+reusable Rust/C/C++ compiler objects share the `rust` sccache tag. The fuzz
+target archive excludes sanitizer release output, whose previous 79 GiB archive
+exhausted runner disk; those compiler objects use the remote sccache store.
+Only a push to upstream `main` may write caches. Target archives save after a
+successful Cargo command; the setup action saves downloads after job success.
+Pull requests, merge
+groups, and manual runs restore only, including manual runs on `main`.
+
+**Fallback and rollback.** Fork pull requests, Dependabot, and jobs without
+both GitHub OIDC request capabilities skip BoringCache entirely. They restore
+the existing GitHub Rust caches where available and execute the same native
+Cargo commands and gates. To switch every integrated lane back to the legacy
+GitHub Rust cache without changing YAML, set the repository Actions variable
+`BORINGCACHE_ENABLED` to `false` (Settings → Secrets and variables → Actions →
+Variables) and rerun the affected jobs. Delete it or set it to `true` to return
+to BoringCache. CI's top-level `env` maps the variable into each job because
+composite actions cannot read `vars`; the trusted policy admits exactly that one
+line. The job summary records the selected backend without printing
+credentials. A selected BoringCache session uses strict cache-error handling;
+authentication/backend errors fail visibly and never switch to static tokens.
+
+**Activation and evidence.** The trusted policy prerequisite admits the current
+main Fuzz Smoke generation and the complete cached generation side by side;
+the integration cannot approve its own verifier. Adopt the reviewed policy
+through the repository's trusted policy process first, then validate and merge
+the integration against that base. Confirm the active upstream Machine
+connection and the agreed pilot allowance before activation.
+
+The first successful main push populates the new target/download/compiler
+caches. A restore-only PR or manual run cannot seed them. Record the main run's
+SHA, run ID/attempt, per-job wall time, restore hit/miss, transfer volume, and
+compiler hits/misses from BoringCache's command logs and Workspace reports.
+Then record at least three ordinary warm PR runs and subsequent successful
+main runs, using the same job/shard/profile and comparable changes. Compare
+medians and total runner-minutes with the GitHub-cache baseline, including
+restore/publish overhead, storage/request usage, and retries. A cache hit alone
+does not establish time saved. Expand or tune profiles from these measurements.
 
 ## CI runtime caching (production images and FIPS)
 
@@ -2389,6 +2477,10 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 | `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
 | `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
+| `build-binaries` | `534903aafb65c6bea0c86403c0fff124b81df1fd32beef6d26e91fa06ff01d93` | `17d18101b1884531cee7f2c67b971af12cac602dcc8b1136b3d5781cf9ab5cfb` | PR #5890 (BoringCache) |
+| `ebpf-live` | `a7beefbb4947bb9cf547a6844e6d1777a6ed7089767c3de8d05894ed5d77f856` | `82160c597497bd83d1c7b3f389d589ce426ec3a13c91cfaf3befaded8c81f68c` | PR #5890 (BoringCache) |
+| `netns-capture-live` | `9f18ade4733a936d93c249c63dc6695eaf04b1ba381297a3af76f93c6c64029b` | `20aa57cfa51d30132350f702f3752f1dfd016c0bd9eee091b8b1a55d95218471` | PR #5890 (BoringCache) |
+| `two-cluster-mesh-live` | `d52ce1dd7c8abd4852a5720fa3bdb02e7ac8eeb5b0358da83d4ce64d8279ae9b` | `0304fa5876b7377d3650e242299d48c03e512055602fc4bfc5eacc0f500f943d` | PR #5890 (BoringCache) |
 
 The three `#3915` pairs admit the per-suite planner-gate split (the union
 `run_ebpf_live` output becomes `run_ebpf_kernel_live` /
@@ -2400,6 +2492,13 @@ does not read as Cross-sensitive, so those need no pair here. The
 `performance-regression` job has since moved out of `ci.yml` into
 `performance-regression.yml`, so its pair can no longer match and should be
 retired.
+
+The four #5890 pairs admit BoringCache with an equivalent native Cargo and
+GitHub-cache fallback in the Cross-sensitive cached jobs. The same policy admits
+one exact trailing top-level `env` line,
+`BORINGCACHE_ENABLED: ${{ vars.BORINGCACHE_ENABLED }}` (with its comment), so a
+repository variable can switch every lane back to the legacy cache; the ARM64
+job never reads it, and any other env edit is still refused.
 
 PR #3916's `build-binaries` pair is retired: its destination is main's live
 value, so the tuple admitted a transition between two states `main` is not in
@@ -2686,8 +2785,9 @@ Only ARM64, whose producer and consumer `needs` are both frozen, is joined
 after the fact: `linux-gnu-abi-release-gate` requires
 `verify-linux-gnu-abi-aarch64` and deletes the GitHub Release if it did not
 succeed. The former main-path `linux-gnu-abi-latest-gate` and moving prerelease
-publication are no longer part of CI; retained historical `latest` artifacts do
-not reflect subsequent main validation.
+publication are no longer part of CI. The `latest` GitHub prerelease and its
+binaries are not refreshed; only the `latest` container tag moves again, from
+`main-latest-image.yml` (see [Main latest image](#main-latest-image)).
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)
@@ -3018,12 +3118,24 @@ docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2.3
 docker pull ghcr.io/ferrum-edge/ferrum-edge:1.2
 ```
 
-The `latest` container tag is retired: neither main CI nor versioned releases
-update it. Existing `latest` and `main-<sha>` tags remain historical artifacts,
-not supported channels for subsequent fixes. An image reference without a tag
-implicitly selects `latest`; specify a completed published full version or digest.
-The `X.Y` alias is published by the version-tag workflow and moves within that
-release series, so use `vX.Y.Z`, `X.Y.Z`, or a digest when reproducibility matters.
+The `latest` container tag follows `main` (owner decision 2026-09-28, reversing
+the 2026-09-19 retirement): it moves forward to the newest `main` commit whose
+push CI passed and whose image was then built, signed, and verified, and never
+moves backwards. It trails `main` by at least one image build, and it may skip
+intermediate commits: publisher runs are serialized and only the newest waiting
+commit is built. It is a moving development channel, not a release: it may
+carry unreleased and breaking changes, and is not a supported upgrade or
+security-update channel. Each commit that is built also gets a
+`main-<40-character-sha>` tag, built once and reused on re-runs; a skipped
+commit gets none. Versioned releases never move `latest`, and the `latest`
+publisher never touches version tags. An image reference without a tag
+implicitly selects `latest`.
+
+For production, pin a completed published version (`vX.Y.Z` or `X.Y.Z`) or an
+image digest. The `X.Y` alias is published by the version-tag workflow and moves
+within that release series, so use `vX.Y.Z`, `X.Y.Z`, or a digest when
+reproducibility matters. The mesh injector is unchanged:
+`FERRUM_INJECTOR_SIDECAR_IMAGE` still refuses a `latest` (or untagged) image.
 
 The `anonymous-pull-smoke` job runs in `release.yml` after the standard
 version manifest is published, with an empty Docker configuration. Docker Hub
@@ -3031,7 +3143,7 @@ must permit anonymous pulls and pass the version smoke; GHCR remains warn-only
 until the package is public. The same script supports manual verification:
 `bash scripts/smoke_anonymous_pull.sh docker.io/ferrumedge/ferrum-edge:v0.9.3`.
 
-The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in `release.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
+The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in `release.yml` and `main-latest-image.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
 
 ## Image Signatures, SBOMs, and Provenance
 
@@ -3245,6 +3357,198 @@ To inspect the authenticated predicates after verification, replace the final
 .[].payload | @base64d | fromjson | .predicate
 ```
 
+## Main latest image
+
+`.github/workflows/main-latest-image.yml` implements the owner decision of
+2026-09-28: the `latest` tag of `ferrumedge/ferrum-edge` and
+`ghcr.io/ferrum-edge/ferrum-edge` moves forward to the newest `main` commit
+whose complete push CI succeeded and whose image this workflow then built,
+signed, and verified. It is a development channel for evaluation and
+integration testing. Pin `vX.Y.Z` or a digest for production;
+`FERRUM_INJECTOR_SIDECAR_IMAGE` still refuses `latest`.
+
+**Trigger and gating.** The workflow runs on `workflow_run` for completed CI
+runs on `main`. Its first job proceeds only when the triggering run concluded
+`success`, was a `push` event on `main` from `.github/workflows/ci.yml`, and
+belongs to this repository. A pull request, merge group, manual CI run, fork,
+failed or cancelled run publishes nothing. The build fetches exactly
+`github.event.workflow_run.head_sha`.
+
+**One publisher at a time; intermediate commits may be skipped.** Every run
+that can publish shares one workflow-level concurrency group, keyed on the
+repository and the triggering workflow path (plus the event and conclusion, so
+a failed or pull-request CI completion lands in a different group and cannot
+displace a waiting publisher), with `cancel-in-progress: false`. GitHub then
+keeps one running publisher and only the newest waiting one: when a newer
+commit's CI succeeds while an older commit is still waiting, the older run is
+cancelled before it starts. So `main-<sha>` exists for every commit that gets
+built, not for every commit, and `latest` may skip intermediate commits. This
+bounds the cost to one from-source build pair at a time, however fast `main`
+moves. `resolve` publishes only when the CI-validated SHA is an ancestor of (or
+equal to) both the commit that supplied the running workflow definition and the
+current head of `main`, read from the GitHub compare API; a commit that was
+removed from `main` publishes nothing.
+
+A waiting run is replaced by whichever qualifying run is queued after it, not
+necessarily by a newer commit. Re-running an old commit's CI, or re-running the
+publisher, queues a run that replaces a waiting newer one. The old run cannot
+move `latest` backwards (see below), so `latest` then lags until the next green
+merge to `main`.
+
+**`latest` only moves forward.** `promote` moves `latest` only when (a) the
+commit is still an ancestor of, or equal to, the current head of `main`, and
+(b) the commit that `latest` currently names, read from the
+`org.opencontainers.image.revision` label that the build sets, is not newer:
+it must be an ancestor of, or equal to, this commit whenever it is itself on
+main's history. A missing `latest`, one without a readable revision label (such
+as the image left over from the 2026-09-19 retirement), and one whose revision
+is not on main's history at all (the compare API reports it diverged from
+main's head, or does not know the commit, for example after a history rewrite)
+do not block the move; the last case also emits a warning annotation. So a
+rewrite of `main` never blocks `latest` forever, and `latest` never moves to a
+commit older than the one it names while that commit is on `main`. A compare
+`404` counts as "not on main's history" only when it is corroborated: GitHub
+reports no common ancestor, or the commits API does not know one of the two
+commits either. An uncorroborated `404` fails the run and leaves `latest`
+unchanged, so a spurious `404` can never move `latest` backwards. Both checks
+run again immediately before each registry's move, in the same step. Because
+publishers never overlap, no other run can move `latest` between a check and
+the move it guards.
+
+**Re-runs.** When both registries already hold `main-<sha>` and its signature
+verifies under this workflow's identity, `resolve` skips `build`, `smoke`,
+`manifest`, and signing; `attest` re-verifies the existing digest and `promote`
+re-applies the ancestry checks. Re-running CI or the publisher therefore never
+pushes a different digest under an existing, signed `main-<sha>`.
+
+**Build.** Each run builds the root `Dockerfile` `runtime` target with
+`FEATURES=cloud-secrets` on native `linux/amd64` (`ubuntu-latest`) and
+`linux/arm64` (`ubuntu-24.04-arm`) runners, pushes each platform by digest, and
+assembles one multi-arch manifest. BuildKit fetches the source itself from
+`https://github.com/ferrum-edge/ferrum-edge.git#<sha>`, so the credentialed
+build job never checks out the repository, and `github-token: ""` keeps the job
+token out of the build. This is the same distroless runtime base, environment,
+entrypoint and labels as the release default image, built the way
+`release.yml` builds its `-ebpf` families. The release default image instead
+packages the release binaries (x86_64 from the pinned GNU sysroot, ARM64 from
+the isolated Cross build); only `release.yml` may produce those, because the
+trusted Cross policy forbids a second Cross producer. The `-ebpf` and
+`-ebpf-tools` variants are not published from `main`; use a release for those.
+
+**Smoke.** The `smoke` job runs `ferrum-edge version --json` from each pushed
+platform image, by digest, on its native runner before `manifest` creates
+`main-<sha>`, so an image that cannot start never reaches `main-<sha>` or
+`latest`. It pulls the image anonymously from Docker Hub.
+
+**Anonymous Docker Hub reads.** `resolve` (the `main-<sha>` inspect and the
+`cosign verify` of an existing image), the Syft scan in `attest`, and `smoke`
+(the pull) read Docker Hub anonymously, so the per-IP rate limit applies. Each
+read is attempted at most three times with increasing backoff, and is retried
+only when it was throttled (`429`), failed with a `5xx`, or was dropped on the
+network. Any other failure is handled at once, and exhausted retries fail the
+run, so a throttled read never publishes anything; `latest` waits for the next
+run.
+
+**Tags.** A run pushes at most two tags per registry: `main-<40-character-sha>`
+and `latest`. It never creates or moves `vX.Y.Z`, `X.Y.Z`, `X.Y`, or `-ebpf*`
+tags.
+
+**Signing and SBOMs.** `main-<sha>` is pushed first. The `attest` job then
+applies the release attestation contract to that digest: both registries must
+hold the same `linux/amd64` + `linux/arm64` descriptors, the digest-pinned Syft
+image produces one SPDX inventory per platform, SLSA provenance v1 names the
+source commit and the CI run that validated it, and Cosign attests and then
+signs keylessly. Syft parses the image that the repository built, so it runs
+with no credential: its step references no secret or token, it scans the public
+Docker Hub image anonymously, and it writes only to its own new output
+directory. Because both registries hold identical platform descriptors, the GHCR
+attestations reuse the Docker Hub SBOMs. The verify step checks the signature,
+provenance, and SBOM attestations under the pinned identity
+(`https://github.com/ferrum-edge/ferrum-edge/.github/workflows/main-latest-image.yml@refs/heads/main`),
+issuer, repository, ref, and `workflow_run` trigger, and exports the
+`repo@sha256:` references it verified. `promote` creates `latest` only from
+those references, moves Docker Hub first and GHCR second, and checks each
+registry's `latest` digest right after its move. A mismatch fails the run before
+the next registry moves.
+
+The identity pins the workflow **path and ref**
+(`main-latest-image.yml@refs/heads/main`), not the workflow file's commit:
+verification does not pass `--certificate-github-workflow-sha`. A signature
+made by any past revision of this workflow on `main` therefore verifies. That is
+deliberate, because a re-run reuses a `main-<sha>` that an earlier revision
+signed, and it is sound because every revision of the workflow on `main`
+passed the contract below. To bind a signature to one workflow revision, add
+`--certificate-github-workflow-sha <workflow commit>` to `cosign verify`.
+
+**Unsigned `main-<sha>` after a failure.** `main-<sha>` is pushed before it is
+signed, so a run that fails between `manifest` and signing leaves an unsigned
+`main-<sha>` tag behind. `latest` never points at it, and a re-run rebuilds and
+replaces it, but until then the tag exists unsigned. Consumers must verify the
+signature (below) rather than trust a `main-<sha>` tag.
+
+**Credential isolation.** Repository code and registry credentials never share
+a job:
+
+| Job | Checks out or runs repository code | Credentials |
+| --- | --- | --- |
+| `resolve` | No (GitHub API and registry reads only) | `contents: read` + `packages: read`; GHCR read login; Docker Hub read anonymously |
+| `contract` | Checks out the running workflow's commit and runs the verifier with `python3 -I` | `contents: read` only; no secret, no login |
+| `build` | No checkout; BuildKit fetches the commit and runs the `Dockerfile` inside its own containers | `contents: read` + `packages: write`, Docker Hub token |
+| `smoke` | Runs the built image | `contents: read` only; no secret, no login |
+| `manifest`, `promote` | No | `contents: read` + `packages: write`, Docker Hub token |
+| `attest` | No (runs only the digest-pinned Syft image, which gets no credential) | `id-token: write` + `packages: write`, Docker Hub token (never passed to Syft) |
+
+`python3 -I` keeps the checkout's `.github/scripts/` off `sys.path` and ignores
+`PYTHON*` variables, so a planted module next to the verifier cannot run in its
+place. Code running in `contract` could write `$GITHUB_ENV` or `$GITHUB_PATH`,
+or leave a process behind, but only within that credential-free job. The
+workflow uses the same `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repository
+secrets and `GITHUB_TOKEN` as `release.yml`, with no deployment environment
+(release uses none). Every action is pinned to the same full commit SHA as in
+`release.yml`, and event data reaches shell only through `env:`.
+
+**Contract.** `.github/scripts/verify_main_latest_image_workflow.py` pins all of
+the above: trigger, gate conditions, the ancestry helper and every history check
+and the corroborated-`404` rule, the reuse rule, the bounded retry of anonymous
+Docker Hub reads, the single concurrency group, per-job permissions and `needs`,
+downstream conditions that require every needed job to have succeeded, the
+credential isolation (no checkout, interpreter, git, repository script, or
+built-image run in a credentialed job; no credential in `contract` or `smoke`;
+`python3 -I` everywhere; a credential-free, anonymous Syft scan), allowed
+secrets (matched case-insensitively), action pins matching release.yml, build
+parity and the Git build context, the smoke run, the attest-then-sign order, the
+verify step's identity and issuer, the exact tag set per job, the invoked gate
+sequence in `promote`, `latest` created only from the verified references, and
+the absence of version or eBPF tags. Its `--self-test` mutates the checked-in
+workflow and requires each regression to be rejected, most of them for their own
+specific reason. `verify_required_ci.py` runs both modes, so the required
+`Tests` check and `Trusted Policy Candidate` enforce it; the publisher's
+credential-free `contract` job also re-runs it from the running workflow's
+commit before anything is built or signed. The workflow and its verifier are
+CODEOWNERS-protected like `release.yml`.
+
+To verify a `latest` image, resolve it to a digest and verify that digest (not
+the tag). The signing identity is the workflow on `refs/heads/main`:
+
+```bash
+IMAGE=ferrumedge/ferrum-edge
+# Alternative registry:
+# IMAGE=ghcr.io/ferrum-edge/ferrum-edge
+DIGEST="$(
+  docker buildx imagetools inspect "${IMAGE}:latest" --format '{{json .Manifest}}' |
+    jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))'
+)"
+cosign verify \
+  --certificate-identity "https://github.com/ferrum-edge/ferrum-edge/.github/workflows/main-latest-image.yml@refs/heads/main" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  "${IMAGE}@${DIGEST}"
+```
+
+The provenance and SBOM checks in [Consumer verification](#consumer-verification)
+apply unchanged with that identity. The verified provenance names the source
+commit; `docker buildx imagetools inspect "${IMAGE}:main-<sha>"` returns the same
+digest.
+
 ## GitHub Actions Secrets
 
 Configure secrets for Docker image publishing and releases.
@@ -3259,7 +3563,7 @@ Configure secrets for Docker image publishing and releases.
 
 #### Docker Registry
 
-Required for pushing Docker Hub images. The workflows unconditionally run the Docker Hub login step on version-tag Docker jobs, so missing secrets fail publishing:
+Required for pushing Docker Hub images. The workflows unconditionally run the Docker Hub login step on version-tag Docker jobs and on the `main-latest-image.yml` publishing jobs, so missing secrets fail publishing:
 
 - `DOCKERHUB_USERNAME` - Docker Hub username
 - `DOCKERHUB_TOKEN` - Docker Hub access token
@@ -3273,8 +3577,8 @@ Required for pushing Docker Hub images. The workflows unconditionally run the Do
 For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare
 job-level `permissions: { contents: write }` for release creation,
 `permissions: { contents: read, packages: write }` for Docker/GHCR publishing,
-and `permissions: { id-token: write, packages: write }` only for release image
-signing and attestation. Repository **Settings → Actions → General → Workflow
+and `permissions: { id-token: write, packages: write }` only for release and
+`main-latest-image.yml` image signing and attestation. Repository **Settings → Actions → General → Workflow
 permissions** must allow read/write access (including `packages: write`) for
 those per-job grants to take effect.
 

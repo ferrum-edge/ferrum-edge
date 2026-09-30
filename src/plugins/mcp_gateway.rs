@@ -8507,13 +8507,25 @@ fn validate_server_id(server_id: &str) -> Result<(), String> {
 /// Validate a configured MCP session header name as a syntactically valid HTTP
 /// header name, so invalid characters (spaces, control bytes) are rejected at
 /// config time instead of failing every routed upstream request at runtime.
+///
+/// Session headers are read from client requests and written onto backend
+/// requests, so neither may name the gateway-owned `x-consumer-*` namespace:
+/// the gateway strips it from every client request and scrubs it again before
+/// dispatch, which would silently break session correlation.
 fn validate_session_header_name(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("mcp_gateway: `{field}` must not be empty"));
     }
-    http::header::HeaderName::from_bytes(value.as_bytes())
-        .map(|_| ())
-        .map_err(|_| {
-            format!("mcp_gateway: `{field}` must be a valid HTTP header name, got {value:?}")
-        })
+    if http::HeaderName::from_bytes(value.as_bytes()).is_err() {
+        return Err(format!(
+            "mcp_gateway: `{field}` must be a valid HTTP header name, got {value:?}"
+        ));
+    }
+    if crate::proxy::headers::is_consumer_assertion_header(value) {
+        return Err(format!(
+            "mcp_gateway: `{field}` is in the gateway-owned `x-consumer-*` consumer assertion \
+             namespace, which the gateway strips from client and backend requests"
+        ));
+    }
+    Ok(())
 }

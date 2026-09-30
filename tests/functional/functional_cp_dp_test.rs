@@ -27,7 +27,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
 use ferrum_edge::grpc::dp_client;
 use ferrum_edge::proxy::ProxyState;
 use tokio::time::sleep;
@@ -280,7 +280,8 @@ async fn test_cp_dp_grpc_config_sync() {
     // Start CP gRPC server
     println!("Starting CP gRPC server...");
     let config_arc = Arc::new(ArcSwap::new(Arc::new(initial_config.clone())));
-    let (cp_server, update_tx) = CpGrpcServer::new(config_arc.clone(), GRPC_JWT_SECRET.to_string());
+    let cp_server = CpGrpcServer::builder(config_arc.clone(), GRPC_JWT_SECRET.to_string()).build();
+    let update_tx = cp_server.broadcasts().sender_for("ferrum");
 
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -670,13 +671,12 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
     };
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(prod_only_config.clone())));
-    let (cp_server, update_tx) = CpGrpcServer::with_channel_capacity_registry_and_namespace(
-        config_arc.clone(),
-        GRPC_JWT_SECRET.to_string(),
-        1024,
-        Arc::new(DpNodeRegistry::new()),
-        "production".to_string(),
-    );
+    let cp_server = CpGrpcServer::builder(config_arc.clone(), GRPC_JWT_SECRET.to_string())
+        .channel_capacity(1024)
+        .registry(Arc::new(DpNodeRegistry::new()))
+        .scope(CpScope::Single("production".to_string()))
+        .build();
+    let update_tx = cp_server.broadcasts().sender_for("production");
 
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await

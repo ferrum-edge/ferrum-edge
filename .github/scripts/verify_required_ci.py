@@ -9,6 +9,7 @@ import re
 import sys
 import textwrap
 from pathlib import Path
+from verify_cross_build_policy import cargo_cache_branch_projection
 
 from test_ci_policy_parallel import run_self_test as ci_policy_parallel_self_test
 from test_release_dispatch import run_self_test as release_dispatch_self_test
@@ -40,11 +41,17 @@ from pr_ci_plan import (
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
 )
+from validate_migrate_k8s_contract import (
+    run_self_test as published_image_tags_self_test,
+)
 from verify_coverage_workflow import (
     main as coverage_workflow_main,
 )
 from verify_mesh_performance_baselines_workflow import (
     main as mesh_baselines_workflow_main,
+)
+from verify_main_latest_image_workflow import (
+    main as main_latest_image_workflow_main,
 )
 from verify_install_docs_contract import (
     run_self_test as install_docs_contract_self_test,
@@ -771,6 +778,9 @@ def native_binary_compile_gate_self_test() -> list[str]:
         failures.append("push-to-main verification must build Linux x86_64 only")
 
     build_body = extract_job_body(ci_yml, "build-binaries")
+    build_body = cargo_cache_branch_projection(build_body)
+    build_body = re.sub(r'(?m)^(        )run: \|\n          (cargo [^\n]+)\n',
+                        r'\1run: \2\n', build_body)
     macos_check_gate = (
         "- name: Check merge-group macOS target\n"
         "        if: github.event_name == 'merge_group' && runner.os == 'macOS'\n"
@@ -2221,6 +2231,11 @@ def main() -> int:
         planner_errors.append("coverage workflow verifier self-test failed")
     if coverage_workflow_main([]) != 0:
         planner_errors.append("coverage workflow shard-plan contract failed")
+    if main_latest_image_workflow_main(["--self-test"]) != 0:
+        planner_errors.append("main latest image publisher self-test failed")
+    if main_latest_image_workflow_main([]) != 0:
+        planner_errors.append("main latest image publisher contract failed")
+    planner_errors.extend(published_image_tags_self_test())
     if ci_runtime_cache_main(["--self-test"]) != 0:
         planner_errors.append("CI runtime cache contract self-test failed")
     if ci_runtime_cache_main([]) != 0:

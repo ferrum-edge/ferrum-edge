@@ -6471,12 +6471,15 @@ impl RequestContext {
 
     /// Whether a header name is reserved for gateway-asserted metadata and
     /// must not be trusted from client-supplied wire headers.
+    ///
+    /// Covers the whole gateway-owned `x-consumer-*` namespace
+    /// ([`crate::proxy::headers::is_consumer_assertion_header`]), the private
+    /// GeoIP result, and route path-param captures. `name` is expected to be
+    /// lowercase (the `HeaderName` form).
     #[inline]
     pub fn is_reserved_gateway_assertion_header(name: &str) -> bool {
-        matches!(
-            name,
-            "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
-        ) || name.starts_with("x-path-param-")
+        crate::proxy::headers::is_gateway_assertion_header(name)
+            || name.starts_with("x-path-param-")
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
@@ -6523,9 +6526,11 @@ impl RequestContext {
                 // lowercase at parse time. No `to_lowercase()` needed.
                 let key = name.as_str();
                 // Reserved gateway-asserted headers are never trusted from
-                // clients. Identity headers are injected after
-                // authentication; path-param headers are injected after
-                // route matching from regex captures.
+                // clients. The whole `x-consumer-*` namespace is dropped here
+                // at ingress, BEFORE any plugin runs, so only the gateway's
+                // post-authentication identity headers can reappear beneath
+                // it; path-param headers are injected after route matching
+                // from regex captures.
                 if Self::is_reserved_gateway_assertion_header(key) {
                     continue;
                 }

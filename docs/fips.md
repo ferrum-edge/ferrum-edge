@@ -86,9 +86,11 @@ and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
 `FIPS Build & Test` is **merge-blocking and publish-blocking** (issue #4445).
 It is one of the nine contexts branch protection and ruleset `20208307` require
 on `main`, so a red FIPS gate blocks the pull request and the merge queue, and
-it is an entry in `.github/required-publication-checks.json`, so the mutable
-`latest` release, the `latest` / `main-<sha>` Docker tags, and every immutable
-`v*` tag artifact fail closed unless it succeeded for the exact product SHA.
+it is an entry in `.github/required-publication-checks.json`, so every
+immutable `v*` tag artifact fails closed unless it succeeded for the exact
+product SHA. The `latest` / `main-<sha>` development images are gated on the
+`CI` workflow's push run only, not on this inventory (see
+[ci_cd.md → Main latest image](ci_cd.md#main-latest-image)).
 The workflow runs unconditionally on every push to `main` with no `paths:`
 filter, and on that event `fips-plan` force-runs the full gate, so each product
 commit carries its own exact-SHA evidence. See `docs/ci_cd.md` ->

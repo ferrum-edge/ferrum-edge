@@ -1170,6 +1170,47 @@ fn docker_fixtures_pin_host_ports_outside_the_ephemeral_range() {
 }
 
 // ---------------------------------------------------------------------------
+// Docker-backed fixtures retry transient image pulls through one helper
+//
+// Siblings: the service-integration fixtures (Consul, OpenLDAP, Redpanda,
+// Hydra, MySQL, ClickHouse, SQL TLS) and the secret-backend fixtures (Vault
+// dev server, LocalStack). A transient Docker Hub fault (a truncated layer,
+// main CI run 36370971003) hard-fails CI unless the start is retried, so every
+// container `start()` must go through the shared, bounded
+// `common/container_retry.rs::start_within_deadline` rather than a private
+// loop or no retry at all.
+// ---------------------------------------------------------------------------
+
+/// Every source that starts a testcontainers image.
+const CONTAINER_START_SOURCES: [&str; 6] = [
+    "tests/service_integration/common/containers.rs",
+    "tests/service_integration/common/hydra.rs",
+    "tests/service_integration/clickhouse.rs",
+    "tests/service_integration/db_tls.rs",
+    "tests/service_integration/mysql.rs",
+    "tests/secrets_functional/common/containers.rs",
+];
+
+#[test]
+fn docker_fixtures_start_through_the_shared_image_pull_retry() {
+    for relative in CONTAINER_START_SOURCES {
+        let text = source(relative);
+        let starts = text.matches(".start()").count();
+        let retried = text.matches("start_within_deadline(").count();
+        assert!(
+            starts > 0 && retried == starts,
+            "{relative}: every container start must go through the shared \
+             `start_within_deadline` image-pull retry ({starts} starts, {retried} retried)"
+        );
+    }
+    let secrets_common = source("tests/secrets_functional/common/mod.rs");
+    assert!(
+        secrets_common.contains("\"../../service_integration/common/container_retry.rs\""),
+        "the secrets fixtures must include the shared container_retry module, not a copy"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Object-valued admin admission fields reject positional sequences
 // ---------------------------------------------------------------------------
 //
@@ -1593,13 +1634,14 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/cni/rpc.rs:WireRequest.valid_attachments",
     "src/cni/spec.rs:CniNetConfig.ferrum",
     "src/cni/spec.rs:CniNetConfig.valid_attachments",
-    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_consumers",
-    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_plugin_configs",
-    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_proxies",
-    "src/config/db_backend.rs:IncrementalResultDe.added_or_modified_upstreams",
-    "src/config/db_backend.rs:IncrementalResultDe.removed_plugin_config_keys",
-    "src/config/db_backend.rs:IncrementalResultDe.removed_proxy_keys",
-    "src/config/db_backend.rs:IncrementalResultDe.removed_upstream_keys",
+    "src/config/db_backend.rs:IncrementalResult.added_or_modified_consumers",
+    "src/config/db_backend.rs:IncrementalResult.added_or_modified_plugin_configs",
+    "src/config/db_backend.rs:IncrementalResult.added_or_modified_proxies",
+    "src/config/db_backend.rs:IncrementalResult.added_or_modified_upstreams",
+    "src/config/db_backend.rs:IncrementalResult.removed_consumer_ids",
+    "src/config/db_backend.rs:IncrementalResult.removed_plugin_config_ids",
+    "src/config/db_backend.rs:IncrementalResult.removed_proxy_ids",
+    "src/config/db_backend.rs:IncrementalResult.removed_upstream_ids",
     "src/config/plugin_trigger.rs:PluginTriggerNode.all",
     "src/config/plugin_trigger.rs:PluginTriggerNode.any",
     "src/config/types.rs:GatewayConfig.consumers",
@@ -2676,5 +2718,161 @@ fn every_direct_h1_dispatch_awaits_through_the_sender_release() {
     assert_eq!(
         found, expected,
         "the direct HTTP/1.1 dispatch sites changed; list the new site above"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gateway-owned `x-consumer-*` consumer assertion namespace
+// ---------------------------------------------------------------------------
+//
+// Every boundary that decides whether a request header is a consumer
+// assertion must route through the ONE shared namespace predicate
+// (`proxy::headers::is_consumer_assertion_header`, or its
+// `is_gateway_assertion_header` superset that adds `x-geo-country`). Before
+// ferrum-alloy#25 item 4 the WebSocket and trailer boundaries stripped the
+// whole namespace while ordinary request headers only stripped the two
+// identity names, so a client `X-Consumer-Role` reached HTTP/gRPC backends.
+
+/// `(boundary, source file, delegation to the shared predicate)`.
+const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
+    (
+        "ingress materialization (every HTTP-family path) and mesh authz",
+        "src/plugins/mod.rs",
+        "crate::proxy::headers::is_gateway_assertion_header(name)",
+    ),
+    (
+        "raw native-gRPC / direct-H2 / mesh replay merge base",
+        "src/proxy/headers.rs",
+        ".filter(|name| is_consumer_assertion_header(name.as_str()))",
+    ),
+    (
+        "H1/H2/H3 request trailers",
+        "src/proxy/headers.rs",
+        "|| is_consumer_assertion_header(name)\n",
+    ),
+    (
+        "post-plugin refresh (H1/H2, H3, egress overlay, deferred passes)",
+        "src/proxy/mod.rs",
+        "headers.retain(|name, _| !headers_mod::is_gateway_assertion_header(name));",
+    ),
+    (
+        "H1/H2 dispatch refresh gate",
+        "src/proxy/mod.rs",
+        ".any(|name| headers_mod::is_gateway_assertion_header(name));",
+    ),
+    (
+        "H1/H2 WebSocket handshake",
+        "src/proxy/mod.rs",
+        "    headers_mod::is_consumer_assertion_header(name)\n        || matches!(",
+    ),
+    (
+        "native H3 dispatch refresh gate",
+        "src/http3/server.rs",
+        ".any(|k| crate::proxy::headers::is_gateway_assertion_header(k));",
+    ),
+    (
+        "H3 WebSocket handshake",
+        "src/http3/websocket.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(&lower)",
+    ),
+    (
+        "H3-to-gRPC bridge trusted overlay",
+        "src/http3/cross_protocol.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(key)",
+    ),
+    (
+        "H3-to-gRPC bridge prebuilt base",
+        "src/http3/cross_protocol.rs",
+        "crate::proxy::headers::is_gateway_assertion_header(name.as_str())",
+    ),
+    (
+        "AI provider boundary (ai_stream_router, ai_federation)",
+        "src/plugins/ai_stream_router.rs",
+        "headers.retain(|name, _| !crate::proxy::headers::is_gateway_assertion_header(name));",
+    ),
+    (
+        "request_transformer admission",
+        "src/plugins/request_transformer.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(dest)",
+    ),
+    (
+        "claim_headers / outputClaimToHeaders admission",
+        "src/plugins/utils/claim_header_fanout.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(name)",
+    ),
+    (
+        "correlation_id admission",
+        "src/plugins/correlation_id.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(name)",
+    ),
+    (
+        "mesh_route_dispatch request_transform admission",
+        "src/plugins/mesh_route_dispatch.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(&rule.key)",
+    ),
+    (
+        "Gateway API RequestHeaderModifier translation (per-route refusal)",
+        "src/config_sources/k8s/gateway_api.rs",
+        "!response_side && crate::proxy::headers::is_consumer_assertion_header(name)",
+    ),
+    (
+        "request_deduplication header_name admission",
+        "src/plugins/request_deduplication.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(&name)",
+    ),
+    (
+        "mcp_gateway session header admission",
+        "src/plugins/mcp_gateway.rs",
+        "crate::proxy::headers::is_consumer_assertion_header(value)",
+    ),
+];
+
+/// Production text of a source file: everything before its trailing inline
+/// `mod tests`, so an inline test's literal cannot satisfy or trip a guard.
+fn without_inline_test_module(text: &str) -> &str {
+    text.split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .unwrap_or(text)
+}
+
+#[test]
+fn every_consumer_assertion_boundary_routes_through_the_shared_namespace_predicate() {
+    for &(boundary, file, delegation) in CONSUMER_ASSERTION_NAMESPACE_SITES {
+        let text = source(file);
+        assert!(
+            without_inline_test_module(&text).contains(delegation),
+            "{boundary} ({file}) must decide the x-consumer-* namespace with the shared \
+             predicate: `{delegation}`"
+        );
+    }
+}
+
+#[test]
+fn no_production_boundary_reserves_only_the_two_consumer_identity_names() {
+    // The shapes every pre-fix site used. Each reserves `x-consumer-username`
+    // / `x-consumer-custom-id` by exact name and therefore lets any other
+    // `x-consumer-*` name through.
+    let two_name_shapes = [
+        "eq_ignore_ascii_case(\"x-consumer-username\")",
+        "eq_ignore_ascii_case(\"x-consumer-custom-id\")",
+        "\"x-consumer-username\" | \"x-consumer-custom-id\"",
+        "remove(\"x-consumer-username\")",
+        "starts_with(\"x-consumer-\")",
+    ];
+    for (path, text) in production_sources() {
+        let production = without_inline_test_module(&text);
+        for shape in two_name_shapes {
+            assert!(
+                !production.contains(shape),
+                "{path} matches the consumer assertion namespace with `{shape}`; route it \
+                 through `proxy::headers::is_consumer_assertion_header` instead"
+            );
+        }
+    }
+    let headers = source("src/proxy/headers.rs");
+    assert_eq!(
+        headers.matches("b\"x-consumer-\"").count(),
+        1,
+        "the x-consumer-* prefix must be spelled in exactly one predicate"
     );
 }

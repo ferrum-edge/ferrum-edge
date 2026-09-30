@@ -131,10 +131,15 @@ The shared bounds live in `common/containers.rs`:
   deterministic registry answers (`manifest unknown`, `pull access denied`,
   `unauthorized`) and host-port collisions are returned after the first
   attempt; collisions then reach the retry-on-collision loop above, which
-  allocates a fresh port. Every fixture, ClickHouse and MySQL included, starts
-  through this one helper; `container_start_retry` is its Docker-free unit
-  coverage (main CI run 36370971003 failed on a `postgres:17` pull that ended
-  with `bytes remaining on stream`).
+  allocates a fresh port. The helper and its policy live in
+  `common/container_retry.rs` (re-exported from `common/containers.rs`), which
+  the Vault/LocalStack fixtures in `tests/secrets_functional/` include through
+  `#[path]`, so both suites share one classifier, attempt count, backoff and
+  deadline. Every fixture, ClickHouse, MySQL, Vault and LocalStack included,
+  starts through this one helper (asserted structurally by
+  `shared_invariant_parity_tests`); `container_start_retry` is its Docker-free
+  unit coverage (main CI run 36370971003 failed on a `postgres:17` pull that
+  ended with `bytes remaining on stream`).
 - `with_phase_deadline()` — the general form, for any other phase that needs a
   named bound (e.g. `docker exec`, `CONTAINER_EXEC_TIMEOUT`).
 
