@@ -290,14 +290,11 @@ where
         }
     }
 
-    pub(crate) fn into_inner(self) -> (T, Bytes) {
-        // An upgrade hands over only the IO and the buffered bytes, so a
-        // read-ahead error still pending here is lost: the tunnel's next read
-        // may see EOF instead (ferrum-edge issue #5911).
-        if let Some(_error) = &self.pending_read_error {
-            debug!("upgrade drops a pending read-ahead error: {}", _error);
-        }
-        (self.io, self.read_buf.freeze())
+    /// FERRUM PATCH 003: also hands over a read-ahead error still pending, so
+    /// an upgrade can deliver it after the buffered bytes instead of letting
+    /// the tunnel's next read see EOF (ferrum-edge issue #5911).
+    pub(crate) fn into_inner(self) -> (T, Bytes, Option<io::Error>) {
+        (self.io, self.read_buf.freeze(), self.pending_read_error)
     }
 
     pub(crate) fn io_mut(&mut self) -> &mut T {
@@ -834,6 +831,129 @@ mod tests {
         assert_eq!(body, GREEDY_READ_MIN);
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
         assert!(!decoder.is_eof());
+    }
+
+    /// FERRUM PATCH 003: a transport that plays scripted reads once the first
+    /// write has arrived, then reports EOF, and accepts every write.
+    #[cfg(not(miri))]
+    struct ScriptedIo {
+        reads: std::collections::VecDeque<io::Result<Vec<u8>>>,
+        written: bool,
+        read_waker: Option<std::task::Waker>,
+    }
+
+    #[cfg(not(miri))]
+    impl Read for ScriptedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            mut buf: crate::rt::ReadBufCursor<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.written {
+                self.read_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            match self.reads.pop_front() {
+                None => Poll::Ready(Ok(())),
+                Some(Err(error)) => Poll::Ready(Err(error)),
+                Some(Ok(mut data)) => {
+                    let n = cmp::min(data.len(), buf.remaining());
+                    buf.put_slice(&data[..n]);
+                    if n < data.len() {
+                        let rest = data.split_off(n);
+                        self.reads.push_front(Ok(rest));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    impl Write for ScriptedIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written = true;
+            if let Some(waker) = self.read_waker.take() {
+                waker.wake();
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// ferrum-edge issue #5911: a connection upgraded by a 101 whose
+    /// read-ahead ended in a one-time error must hand the tunnel that error on
+    /// its first read after the buffered bytes, not the transport's EOF.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn ferrum_greedy_read_error_reaches_the_upgraded_tunnel() {
+        use http_body_util::Empty;
+        use tokio::io::AsyncReadExt;
+
+        let head =
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: tunnel\r\n\r\n";
+        let mut first = head.to_vec();
+        first.extend_from_slice(&[b't'; GREEDY_READ_MIN]);
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        let transport = ScriptedIo {
+            reads: vec![Ok(first), Err(reset)].into(),
+            written: false,
+            read_waker: None,
+        };
+
+        let (mut sender, conn) = crate::client::conn::http1::Builder::new()
+            .read_buf_exact_size(Some(64 * 1024))
+            .handshake::<_, Empty<Bytes>>(transport)
+            .await
+            .expect("handshake");
+        let conn = tokio::spawn(conn.with_upgrades());
+
+        let req = http::Request::builder()
+            .uri("/")
+            .header("connection", "upgrade")
+            .header("upgrade", "tunnel")
+            .body(Empty::new())
+            .expect("request");
+        let res = sender.send_request(req).await.expect("response");
+        assert_eq!(res.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        let upgraded = crate::upgrade::on(res).await.expect("upgrade");
+        conn.await.expect("connection task").expect("connection");
+
+        // Every byte read behind the 101 head reaches the tunnel first.
+        let mut tunnel = Compat::new(upgraded);
+        let mut buf = vec![0; 4096];
+        let mut drained = 0;
+        while drained < GREEDY_READ_MIN {
+            let n = tunnel
+                .read(&mut buf)
+                .await
+                .expect("buffered tunnel bytes must come before the read error");
+            assert!(n > 0, "the tunnel saw EOF before its buffered bytes drained");
+            assert!(buf[..n].iter().all(|b| *b == b't'));
+            drained += n;
+        }
+        assert_eq!(drained, GREEDY_READ_MIN);
+
+        let error = tunnel
+            .read(&mut buf)
+            .await
+            .expect_err("the read-ahead error must reach the upgraded tunnel");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+
+        // Delivered once: the transport's own EOF follows.
+        let n = tunnel.read(&mut buf).await.expect("the transport's EOF");
+        assert_eq!(n, 0);
     }
 
     #[cfg(not(miri))]

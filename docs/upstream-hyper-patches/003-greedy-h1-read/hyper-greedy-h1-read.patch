@@ -1,5 +1,129 @@
+diff --git a/src/client/conn/http1.rs b/src/client/conn/http1.rs
+index 85c1fdc..1013609 100644
+--- a/src/client/conn/http1.rs
++++ b/src/client/conn/http1.rs
+@@ -69,7 +69,12 @@ where
+     ///
+     /// Only works for HTTP/1 connections. HTTP/2 connections will panic.
+     pub fn into_parts(self) -> Parts<T> {
+-        let (io, read_buf, _) = self.inner.into_inner();
++        let (io, read_buf, read_error, _) = self.inner.into_inner();
++        // FERRUM PATCH 003: `Parts` has no place for a pending read-ahead
++        // error, so taking the connection apart drops it.
++        if let Some(_error) = &read_error {
++            debug!("into_parts drops a pending read-ahead error: {}", _error);
++        }
+         Parts { io, read_buf }
+     }
+ 
+@@ -600,8 +605,11 @@ mod upgrades {
+             match ready!(Pin::new(&mut self.inner.as_mut().unwrap().inner).poll(cx)) {
+                 Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
+                 Ok(proto::Dispatched::Upgrade(pending)) => {
+-                    let Parts { io, read_buf } = self.inner.take().unwrap().into_parts();
+-                    pending.fulfill(Upgraded::new(io, read_buf));
++                    // FERRUM PATCH 003: carry a pending read-ahead error
++                    // into the tunnel (ferrum-edge issue #5911).
++                    let (io, read_buf, read_error, _) =
++                        self.inner.take().unwrap().inner.into_inner();
++                    pending.fulfill(Upgraded::new_with_read_error(io, read_buf, read_error));
+                     Poll::Ready(Ok(()))
+                 }
+                 Err(e) => Poll::Ready(Err(e)),
+diff --git a/src/common/io/rewind.rs b/src/common/io/rewind.rs
+index 533a85a..83c0188 100644
+--- a/src/common/io/rewind.rs
++++ b/src/common/io/rewind.rs
+@@ -10,6 +10,9 @@ use crate::rt::{Read, ReadBufCursor, Write};
+ #[derive(Debug)]
+ pub(crate) struct Rewind<T> {
+     pre: Option<Bytes>,
++    // FERRUM PATCH 003: a read error the HTTP/1 connection hit while reading
++    // ahead, delivered once on the first read after `pre` (ferrum-edge #5911).
++    read_error: Option<io::Error>,
+     inner: T,
+ }
+ 
+@@ -22,6 +25,7 @@ impl<T> Rewind<T> {
+     pub(crate) fn new(io: T) -> Self {
+         Rewind {
+             pre: None,
++            read_error: None,
+             inner: io,
+         }
+     }
+@@ -29,10 +33,18 @@ impl<T> Rewind<T> {
+     pub(crate) fn new_buffered(io: T, buf: Bytes) -> Self {
+         Rewind {
+             pre: Some(buf),
++            read_error: None,
+             inner: io,
+         }
+     }
+ 
++    /// FERRUM PATCH 003: return `error` from the first read after the
++    /// buffered bytes, before reading `inner` again.
++    pub(crate) fn with_read_error(mut self, error: Option<io::Error>) -> Self {
++        self.read_error = error;
++        self
++    }
++
+     #[cfg(all(
+         test,
+         any(feature = "client", feature = "server"),
+@@ -43,8 +55,8 @@ impl<T> Rewind<T> {
+         self.pre = Some(bs);
+     }
+ 
+-    pub(crate) fn into_inner(self) -> (T, Bytes) {
+-        (self.inner, self.pre.unwrap_or_default())
++    pub(crate) fn into_inner(self) -> (T, Bytes, Option<io::Error>) {
++        (self.inner, self.pre.unwrap_or_default(), self.read_error)
+     }
+ 
+     #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
+@@ -77,6 +89,9 @@ where
+                 return Poll::Ready(Ok(()));
+             }
+         }
++        if let Some(error) = self.read_error.take() {
++            return Poll::Ready(Err(error));
++        }
+         Pin::new(&mut self.inner).poll_read(cx, buf)
+     }
+ }
+diff --git a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
+index 3373021..55ef168 100644
+--- a/src/proto/h1/conn.rs
++++ b/src/proto/h1/conn.rs
+@@ -156,7 +156,7 @@ where
+         self.state.date_header = false;
+     }
+ 
+-    pub(crate) fn into_inner(self) -> (I, Bytes) {
++    pub(crate) fn into_inner(self) -> (I, Bytes, Option<io::Error>) {
+         self.io.into_inner()
+     }
+ 
+diff --git a/src/proto/h1/dispatch.rs b/src/proto/h1/dispatch.rs
+index 5daeb5e..012d571 100644
+--- a/src/proto/h1/dispatch.rs
++++ b/src/proto/h1/dispatch.rs
+@@ -99,9 +99,9 @@ where
+         }
+     }
+ 
+-    pub(crate) fn into_inner(self) -> (I, Bytes, D) {
+-        let (io, buf) = self.conn.into_inner();
+-        (io, buf, self.dispatch)
++    pub(crate) fn into_inner(self) -> (I, Bytes, Option<std::io::Error>, D) {
++        let (io, buf, read_error) = self.conn.into_inner();
++        (io, buf, read_error, self.dispatch)
+     }
+ 
+     /// Run this dispatcher until HTTP says this connection is done,
 diff --git a/src/proto/h1/io.rs b/src/proto/h1/io.rs
-index 6a30d73..9e45593 100644
+index 6a30d73..b4d350f 100644
 --- a/src/proto/h1/io.rs
 +++ b/src/proto/h1/io.rs
 @@ -33,6 +33,7 @@ pub(crate) struct Buffered<T, B> {
@@ -75,20 +199,21 @@ index 6a30d73..9e45593 100644
                  let n = buf.filled().len();
                  trace!("received {} bytes", n);
                  unsafe {
-@@ -253,6 +291,12 @@ where
+@@ -252,8 +290,11 @@ where
+         }
      }
  
-     pub(crate) fn into_inner(self) -> (T, Bytes) {
-+        // An upgrade hands over only the IO and the buffered bytes, so a
-+        // read-ahead error still pending here is lost: the tunnel's next read
-+        // may see EOF instead (ferrum-edge issue #5911).
-+        if let Some(_error) = &self.pending_read_error {
-+            debug!("upgrade drops a pending read-ahead error: {}", _error);
-+        }
-         (self.io, self.read_buf.freeze())
+-    pub(crate) fn into_inner(self) -> (T, Bytes) {
+-        (self.io, self.read_buf.freeze())
++    /// FERRUM PATCH 003: also hands over a read-ahead error still pending, so
++    /// an upgrade can deliver it after the buffered bytes instead of letting
++    /// the tunnel's next read see EOF (ferrum-edge issue #5911).
++    pub(crate) fn into_inner(self) -> (T, Bytes, Option<io::Error>) {
++        (self.io, self.read_buf.freeze(), self.pending_read_error)
      }
  
-@@ -682,6 +726,116 @@ mod tests {
+     pub(crate) fn io_mut(&mut self) -> &mut T {
+@@ -682,6 +723,239 @@ mod tests {
          // io_buf.flush().await.expect("should short-circuit flush");
      }
  
@@ -202,6 +327,214 @@ index 6a30d73..9e45593 100644
 +        assert!(!decoder.is_eof());
 +    }
 +
++    /// FERRUM PATCH 003: a transport that plays scripted reads once the first
++    /// write has arrived, then reports EOF, and accepts every write.
++    #[cfg(not(miri))]
++    struct ScriptedIo {
++        reads: std::collections::VecDeque<io::Result<Vec<u8>>>,
++        written: bool,
++        read_waker: Option<std::task::Waker>,
++    }
++
++    #[cfg(not(miri))]
++    impl Read for ScriptedIo {
++        fn poll_read(
++            mut self: Pin<&mut Self>,
++            cx: &mut Context<'_>,
++            mut buf: crate::rt::ReadBufCursor<'_>,
++        ) -> Poll<io::Result<()>> {
++            if !self.written {
++                self.read_waker = Some(cx.waker().clone());
++                return Poll::Pending;
++            }
++            match self.reads.pop_front() {
++                None => Poll::Ready(Ok(())),
++                Some(Err(error)) => Poll::Ready(Err(error)),
++                Some(Ok(mut data)) => {
++                    let n = cmp::min(data.len(), buf.remaining());
++                    buf.put_slice(&data[..n]);
++                    if n < data.len() {
++                        let rest = data.split_off(n);
++                        self.reads.push_front(Ok(rest));
++                    }
++                    Poll::Ready(Ok(()))
++                }
++            }
++        }
++    }
++
++    #[cfg(not(miri))]
++    impl Write for ScriptedIo {
++        fn poll_write(
++            mut self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            self.written = true;
++            if let Some(waker) = self.read_waker.take() {
++                waker.wake();
++            }
++            Poll::Ready(Ok(buf.len()))
++        }
++
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    /// ferrum-edge issue #5911: a connection upgraded by a 101 whose
++    /// read-ahead ended in a one-time error must hand the tunnel that error on
++    /// its first read after the buffered bytes, not the transport's EOF.
++    #[cfg(not(miri))]
++    #[tokio::test]
++    async fn ferrum_greedy_read_error_reaches_the_upgraded_tunnel() {
++        use http_body_util::Empty;
++        use tokio::io::AsyncReadExt;
++
++        let head =
++            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: tunnel\r\n\r\n";
++        let mut first = head.to_vec();
++        first.extend_from_slice(&[b't'; GREEDY_READ_MIN]);
++        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
++        let transport = ScriptedIo {
++            reads: vec![Ok(first), Err(reset)].into(),
++            written: false,
++            read_waker: None,
++        };
++
++        let (mut sender, conn) = crate::client::conn::http1::Builder::new()
++            .read_buf_exact_size(Some(64 * 1024))
++            .handshake::<_, Empty<Bytes>>(transport)
++            .await
++            .expect("handshake");
++        let conn = tokio::spawn(conn.with_upgrades());
++
++        let req = http::Request::builder()
++            .uri("/")
++            .header("connection", "upgrade")
++            .header("upgrade", "tunnel")
++            .body(Empty::new())
++            .expect("request");
++        let res = sender.send_request(req).await.expect("response");
++        assert_eq!(res.status(), http::StatusCode::SWITCHING_PROTOCOLS);
++        let upgraded = crate::upgrade::on(res).await.expect("upgrade");
++        conn.await.expect("connection task").expect("connection");
++
++        // Every byte read behind the 101 head reaches the tunnel first.
++        let mut tunnel = Compat::new(upgraded);
++        let mut buf = vec![0; 4096];
++        let mut drained = 0;
++        while drained < GREEDY_READ_MIN {
++            let n = tunnel
++                .read(&mut buf)
++                .await
++                .expect("buffered tunnel bytes must come before the read error");
++            assert!(n > 0, "the tunnel saw EOF before its buffered bytes drained");
++            assert!(buf[..n].iter().all(|b| *b == b't'));
++            drained += n;
++        }
++        assert_eq!(drained, GREEDY_READ_MIN);
++
++        let error = tunnel
++            .read(&mut buf)
++            .await
++            .expect_err("the read-ahead error must reach the upgraded tunnel");
++        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
++
++        // Delivered once: the transport's own EOF follows.
++        let n = tunnel.read(&mut buf).await.expect("the transport's EOF");
++        assert_eq!(n, 0);
++    }
++
      #[cfg(not(miri))]
      #[tokio::test]
      async fn parse_reads_until_blocked() {
+diff --git a/src/server/conn/http1.rs b/src/server/conn/http1.rs
+index a2fa5e1..50834a2 100644
+--- a/src/server/conn/http1.rs
++++ b/src/server/conn/http1.rs
+@@ -148,7 +148,12 @@ where
+     /// # Panics
+     /// This method will panic if this connection is using an h2 protocol.
+     pub fn into_parts(self) -> Parts<I, S> {
+-        let (io, read_buf, dispatch) = self.conn.into_inner();
++        let (io, read_buf, read_error, dispatch) = self.conn.into_inner();
++        // FERRUM PATCH 003: `Parts` has no place for a pending read-ahead
++        // error, so taking the connection apart drops it.
++        if let Some(_error) = &read_error {
++            debug!("into_parts drops a pending read-ahead error: {}", _error);
++        }
+         Parts {
+             io,
+             read_buf,
+@@ -545,8 +550,10 @@ where
+             match ready!(Pin::new(&mut conn.conn).poll(cx)) {
+                 Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
+                 Ok(proto::Dispatched::Upgrade(pending)) => {
+-                    let (io, buf, _) = self.inner.take().unwrap().conn.into_inner();
+-                    pending.fulfill(Upgraded::new(io, buf));
++                    // FERRUM PATCH 003: carry a pending read-ahead error
++                    // into the tunnel (ferrum-edge issue #5911).
++                    let (io, buf, read_error, _) = self.inner.take().unwrap().conn.into_inner();
++                    pending.fulfill(Upgraded::new_with_read_error(io, buf, read_error));
+                     Poll::Ready(Ok(()))
+                 }
+                 Err(e) => Poll::Ready(Err(e)),
+diff --git a/src/upgrade.rs b/src/upgrade.rs
+index 27a1f9c..273c394 100644
+--- a/src/upgrade.rs
++++ b/src/upgrade.rs
+@@ -144,19 +144,43 @@ impl Upgraded {
+         }
+     }
+ 
++    /// FERRUM PATCH 003: an HTTP/1 upgrade whose read-ahead ended in an
++    /// error hands that error to the tunnel's first read after `read_buf`,
++    /// so a reset is not seen as a clean EOF (ferrum-edge issue #5911).
++    #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
++    pub(super) fn new_with_read_error<T>(
++        io: T,
++        read_buf: Bytes,
++        read_error: Option<io::Error>,
++    ) -> Self
++    where
++        T: Read + Write + Unpin + Send + 'static,
++    {
++        Upgraded {
++            io: Upgraded::new(io, read_buf).io.with_read_error(read_error),
++        }
++    }
++
+     /// Tries to downcast the internal trait object to the type passed.
+     ///
+     /// On success, returns the downcasted parts. On error, returns the
+     /// `Upgraded` back.
+     pub fn downcast<T: Read + Write + Unpin + 'static>(self) -> Result<Parts<T>, Self> {
+-        let (io, buf) = self.io.into_inner();
++        let (io, buf, read_error) = self.io.into_inner();
+         match io.__hyper_downcast() {
+-            Ok(t) => Ok(Parts {
+-                io: *t,
+-                read_buf: buf,
+-            }),
++            Ok(t) => {
++                // FERRUM PATCH 003: `Parts` has no place for a pending
++                // read-ahead error, so a downcast drops it.
++                if let Some(_error) = &read_error {
++                    debug!("downcast drops a pending read-ahead error: {}", _error);
++                }
++                Ok(Parts {
++                    io: *t,
++                    read_buf: buf,
++                })
++            }
+             Err(io) => Err(Upgraded {
+-                io: Rewind::new_buffered(io, buf),
++                io: Rewind::new_buffered(io, buf).with_read_error(read_error),
+             }),
+         }
+     }

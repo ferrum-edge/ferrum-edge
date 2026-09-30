@@ -144,19 +144,43 @@ impl Upgraded {
         }
     }
 
+    /// FERRUM PATCH 003: an HTTP/1 upgrade whose read-ahead ended in an
+    /// error hands that error to the tunnel's first read after `read_buf`,
+    /// so a reset is not seen as a clean EOF (ferrum-edge issue #5911).
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+    pub(super) fn new_with_read_error<T>(
+        io: T,
+        read_buf: Bytes,
+        read_error: Option<io::Error>,
+    ) -> Self
+    where
+        T: Read + Write + Unpin + Send + 'static,
+    {
+        Upgraded {
+            io: Upgraded::new(io, read_buf).io.with_read_error(read_error),
+        }
+    }
+
     /// Tries to downcast the internal trait object to the type passed.
     ///
     /// On success, returns the downcasted parts. On error, returns the
     /// `Upgraded` back.
     pub fn downcast<T: Read + Write + Unpin + 'static>(self) -> Result<Parts<T>, Self> {
-        let (io, buf) = self.io.into_inner();
+        let (io, buf, read_error) = self.io.into_inner();
         match io.__hyper_downcast() {
-            Ok(t) => Ok(Parts {
-                io: *t,
-                read_buf: buf,
-            }),
+            Ok(t) => {
+                // FERRUM PATCH 003: `Parts` has no place for a pending
+                // read-ahead error, so a downcast drops it.
+                if let Some(_error) = &read_error {
+                    debug!("downcast drops a pending read-ahead error: {}", _error);
+                }
+                Ok(Parts {
+                    io: *t,
+                    read_buf: buf,
+                })
+            }
             Err(io) => Err(Upgraded {
-                io: Rewind::new_buffered(io, buf),
+                io: Rewind::new_buffered(io, buf).with_read_error(read_error),
             }),
         }
     }

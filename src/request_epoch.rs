@@ -181,8 +181,10 @@ pub struct RequestEpoch {
     pub(crate) consumer_index: Arc<ConsumerIndexInner>,
     pub(crate) load_balancer: Arc<LoadBalancerCacheInner>,
     /// Listener routing admission for this exact config generation. Config
-    /// publication installs `pending`; only a reconcile derived from the same
-    /// config `Arc` may replace it with a decided refusal set.
+    /// publication carries the previous decision forward for listener ports
+    /// whose plan is unchanged and fails the rest closed; only a reconcile
+    /// derived from the same config `Arc` may replace it with a decided
+    /// refusal set.
     pub(crate) gateway_listener_admission: Arc<GatewayListenerAdmission>,
     /// Gateway-to-mesh trust/identity for this exact configuration generation.
     /// Published with the config in ONE store, so no request can pair this
@@ -1907,6 +1909,13 @@ impl RequestEpochStore {
         };
 
         let proxy_index_by_key = build_proxy_index_by_key(&staged.config);
+        // Listener routing admission is derived atomically with the new route
+        // table. Ports whose listener plan is unchanged keep their decided
+        // admission; new, changed, and withdrawn ports fail closed until the
+        // exact reconcile of this generation publishes its own decision.
+        let gateway_listener_admission = current
+            .gateway_listener_admission
+            .carry_forward(&staged.config);
         let lb_generation = if staged.lb_changed {
             next_lb_generation(current.lb_generation)?
         } else {
@@ -1919,10 +1928,7 @@ impl RequestEpochStore {
             plugin_cache: staged.plugin_cache,
             consumer_index: staged.consumer_index,
             load_balancer: staged.load_balancer,
-            // Every config generation is conservatively unavailable to
-            // listener-scoped routing until its exact reconcile acknowledges
-            // admission. This publication is atomic with the new route table.
-            gateway_listener_admission: GatewayListenerAdmission::pending(),
+            gateway_listener_admission,
             // A generation that changes gateway trust publishes fenced, so the
             // configuration and its trust roots become authenticating together
             // rather than one store apart (issue #3727).

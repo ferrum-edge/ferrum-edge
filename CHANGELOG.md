@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
+  GHSA-7gcf-g7xr-8hxj and `cmov` 0.5.4 for GHSA-3rjw-m598-pq24).
+
 ### Added
 
 - **`otel_tracing` attempt spans on the HTTP/3 bridge to HTTP/1.1 and HTTP/2
@@ -303,10 +308,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   patch 003 keeps reading after a full-record read while the transport has more
   ready; a short read still returns alone, and a read error met during that
   read-ahead is kept and delivered after the bytes already read, so a
-  close-delimited body cut by a connection reset still fails (#5909). On
-  Linux, large HTTPS/1.1 proxied
-  responses use 14–20% less CPU per request (+11% throughput at 70 KiB, +15% at
-  1 MiB), with no change at 10 KiB.
+  close-delimited body cut by a connection reset still fails (#5909). A
+  connection upgraded right after such a read (101 Switching Protocols,
+  WebSocket, or CONNECT) hands that error to its tunnel after the buffered
+  bytes, so the WebSocket or TCP relay sees the reset instead of a clean EOF
+  (#5911). On Linux, large HTTPS/1.1 proxied responses use 14–20% less CPU
+  per request (+11% throughput at 70 KiB, +15% at 1 MiB), with no change at
+  10 KiB.
 
 - **Streamed HTTP/1.x backend responses keep their `Content-Length`**
   (#5588). A streamed response used to lose its length and go to HTTP/1.1
@@ -499,6 +507,16 @@ outright with no deprecation period:
   longer polled with `FERRUM_CP_DP_GRPC_JWT_SECRET`.
 
 ### Fixed
+
+- **Config reloads no longer 404 live Gateway listener routes** (#5914). Every
+  config publication used to reset listener route admission to pending, so
+  each reload briefly answered 404 on listener-scoped routes of listeners that
+  were already serving, and on the single-listener Service remap of the
+  process-global port. A publication now keeps the previous decision for ports
+  whose listener plan (class, bind address, mesh direction, process-global
+  ownership) is unchanged. A new port waits for its reconcile. A withdrawn
+  port, or a changed port that had a live socket, fails closed at once, so its
+  old socket never serves under its old identity.
 
 - **Gateway listeners wait for matching route admission** (#5913). Newly bound
   listener sockets do not accept connections until their matching config

@@ -398,8 +398,9 @@ of the vendor copy and must keep passing after retirement:
   request (`await_pooled_response`) against a real pooled HTTP/1 connection.
 - An HTTP/1 read that returned a full TLS record's worth keeps reading while
   the transport has more ready, a short read never triggers another, and an
-  error from an additional read is delivered after the already-buffered bytes
-  (issue #5588) — the vendored hyper regressions
+  error from an additional read is delivered after the already-buffered bytes,
+  including to the tunnel of an upgraded connection (issues #5588, #5911) — the
+  vendored hyper regressions
   `proto::h1::io::tests::ferrum_greedy_read_*`, run with
   `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read`.
 - An HTTP/2 request body is never cut into sliver DATA frames from a 1-byte

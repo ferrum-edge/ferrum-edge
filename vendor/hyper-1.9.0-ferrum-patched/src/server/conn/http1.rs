@@ -148,7 +148,12 @@ where
     /// # Panics
     /// This method will panic if this connection is using an h2 protocol.
     pub fn into_parts(self) -> Parts<I, S> {
-        let (io, read_buf, dispatch) = self.conn.into_inner();
+        let (io, read_buf, read_error, dispatch) = self.conn.into_inner();
+        // FERRUM PATCH 003: `Parts` has no place for a pending read-ahead
+        // error, so taking the connection apart drops it.
+        if let Some(_error) = &read_error {
+            debug!("into_parts drops a pending read-ahead error: {}", _error);
+        }
         Parts {
             io,
             read_buf,
@@ -545,8 +550,10 @@ where
             match ready!(Pin::new(&mut conn.conn).poll(cx)) {
                 Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
                 Ok(proto::Dispatched::Upgrade(pending)) => {
-                    let (io, buf, _) = self.inner.take().unwrap().conn.into_inner();
-                    pending.fulfill(Upgraded::new(io, buf));
+                    // FERRUM PATCH 003: carry a pending read-ahead error
+                    // into the tunnel (ferrum-edge issue #5911).
+                    let (io, buf, read_error, _) = self.inner.take().unwrap().conn.into_inner();
+                    pending.fulfill(Upgraded::new_with_read_error(io, buf, read_error));
                     Poll::Ready(Ok(()))
                 }
                 Err(e) => Poll::Ready(Err(e)),
