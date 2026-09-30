@@ -3317,7 +3317,8 @@ async fn handle_h3_request(
 
     // A `;` path parameter is refused unless the routed proxy opted in with
     // `allow_path_parameters` and the parameter-stripped path routes to that
-    // same proxy, at the same point in the ordering as H1/H2:
+    // same proxy or to one `path_parameter_route_admitted` admits, at the
+    // same point in the ordering as H1/H2:
     // after route lookup, before every plugin phase and backend dispatch
     // (GHSA-fcqw-793q-wg5x).
     if let Err(rejection) = crate::proxy::check_routed_path_parameters(

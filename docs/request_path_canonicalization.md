@@ -176,10 +176,11 @@ the gateway therefore accepts a different stripped route when all of these
 hold:
 
 - the stripped route matched fewer bytes than the proxy's `listen_path` with
-  its own parameters stripped. The router matches prefixes only on `/`
-  boundaries, so such a route is an ancestor of the whole space the proxy
-  claims (`/` for `/api;v=1`). A host-only route matches zero bytes and counts
-  as an ancestor too;
+  its own parameters and any trailing `/` stripped (so `/api;v=1/` is measured
+  as `/api`). The router matches prefixes only on `/` boundaries, so such a
+  route is an ancestor of the whole space the proxy claims (`/` for
+  `/api;v=1`). A host-only route matches zero bytes and counts as an ancestor
+  too;
 - the stripped route sits in a host tier no more specific than the one the
   proxy was found in (exact host, then a longer wildcard, then a shorter
   wildcard, then no hosts);
@@ -198,6 +199,12 @@ regex, or that has none (host-only), keeps the plain rule: any different
 stripped route is refused. The classic case is unchanged: an opted-in `/` has a
 stripped prefix of one byte, so an `/admin` route always outranks it and
 `/admin;x/users` is refused.
+
+Trade-off: when the opted-in proxy and the ancestor it wins over share a
+backend that strips path parameters, that backend serves the whole stripped
+subtree (`/api/...` for `/api;v=1`) through the opted-in proxy and its plugins,
+not the ancestor's. Configure the opted-in proxy's own authentication and
+policy for that subtree, or give it a dedicated backend.
 
 The re-resolve does not yet repeat the mesh direction filtering of the original
 lookup, which only produces false refusals. It must mirror it once mesh routes

@@ -33299,7 +33299,8 @@ async fn handle_proxy_request_inner(
 
     // A `;` path parameter is refused unless the routed proxy opted in with
     // `allow_path_parameters`, and the parameter-stripped path routes to that
-    // same proxy (GHSA-fcqw-793q-wg5x). Canonicalization could only record
+    // same proxy or to one `path_parameter_route_admitted` admits
+    // (GHSA-fcqw-793q-wg5x). Canonicalization could only record
     // the `;`, because the proxy was not known yet; route lookup is a literal
     // match and grants nothing, and this runs before every plugin phase and
     // backend dispatch, so no policy surface is skipped by a path a

@@ -3608,7 +3608,7 @@ pub fn host_route_rank(hosts: &[String], request_host: Option<&str>) -> Option<H
 ///   host-only proxy claims no fixed path to compare against, so any other
 ///   stripped route is refused.
 /// - The stripped route consumed fewer bytes than `listen_path` with its own
-///   parameters stripped. The stripped request always begins with that
+///   parameters and any trailing `/` stripped. The stripped request always begins with that
 ///   stripped `listen_path`, and the router matches only on `/` boundaries, so
 ///   a shorter prefix route is an ancestor of the whole space `matched`
 ///   claims (`/` for `/api;v=1`), and a host-only route consumes nothing. An
@@ -3643,7 +3643,13 @@ pub fn path_parameter_route_admitted(
         return false;
     }
     let literal_path = listen_path.strip_prefix('=').unwrap_or(listen_path);
-    let claimed_len = crate::policy_path::strip_path_parameters(literal_path).len();
+    let claimed = crate::policy_path::strip_path_parameters(literal_path);
+    // A trailing `/` adds no segment: `/api;v=1/` claims the same `/api/...`
+    // space as `/api`, so it is measured without that slash (root stays 1).
+    let claimed_len = match claimed.trim_end_matches('/') {
+        "" => 1,
+        trimmed => trimmed.len(),
+    };
     if stripped_route.matched_prefix_len >= claimed_len {
         return false;
     }
