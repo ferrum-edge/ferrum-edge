@@ -644,8 +644,9 @@ outright with no deprecation period:
   fragment name, a nameless fragment, or an anonymous operation beside others;
   a spread of a fragment the document does not define, which was previously
   left unmeasured; and a JSON request body whose top-level object repeats
-  `query`, `operationName`, `variables`, or `extensions`, where the gateway
-  and the backend could each read a different copy. The final request-body
+  `query`, `operationName`, `variables`, or `extensions` (names compared after
+  JSON unescaping and ignoring ASCII case), where the gateway and the backend
+  could each read a different copy. The final request-body
   recheck applies the same rules.
 - `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
   says (#5767): a backend or serverless-function copy, in the headers or the

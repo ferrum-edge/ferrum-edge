@@ -2695,8 +2695,9 @@ fn create_raw_graphql_context(body: &str) -> RequestContext {
 }
 
 /// A top-level member that decides what the backend executes may appear only
-/// once. A JSON reader that keeps the first copy would run a different
-/// document from the last copy the gateway would otherwise measure.
+/// once, in any ASCII letter case. A JSON reader that keeps the first copy
+/// would run a different document from the last copy the gateway would
+/// otherwise measure.
 #[tokio::test]
 async fn repeated_graphql_envelope_members_are_rejected() {
     let plugin = create_plugin("graphql", &json!({ "introspection_allowed": false }))
@@ -2704,7 +2705,11 @@ async fn repeated_graphql_envelope_members_are_rejected() {
         .unwrap();
     for body in [
         r#"{"query":"{ __schema { types { name } } }","query":"{ ok }"}"#,
-        r#"{"query":"{ __schema { types { name } } }","query":"{ ok }"}"#,
+        r#"{"query":"{ __schema { types { name } } }","qu\u0065ry":"{ ok }"}"#,
+        // Member names are compared case-insensitively, for backends whose JSON
+        // binding is.
+        r#"{"query":"{ __schema { types { name } } }","Query":"{ ok }"}"#,
+        r#"{"query":"query A { ok } query B { ok }","operationName":"A","OPERATIONNAME":"B"}"#,
         r#"{"query":"query A { ok } query B { ok }","operationName":"A","operationName":"B"}"#,
         r#"{"query":"{ ok }","variables":{},"variables":{}}"#,
         r#"{"query":"{ ok }","extensions":{},"extensions":{}}"#,

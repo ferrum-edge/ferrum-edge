@@ -1757,9 +1757,11 @@ fn graphql_envelope_digest(envelope: &[u8]) -> [u8; 32] {
 const GRAPHQL_ENVELOPE_MEMBERS: [&str; 4] = ["query", "operationName", "variables", "extensions"];
 
 /// Whether the envelope's top-level JSON object names one of
-/// [`GRAPHQL_ENVELOPE_MEMBERS`] more than once (after JSON unescaping, so
-/// `"query"` is `query`). Only called on a body that already parsed as a
-/// JSON object; a body the audit cannot read is treated as repeating one.
+/// [`GRAPHQL_ENVELOPE_MEMBERS`] more than once, compared after JSON unescaping
+/// (`"qu\u0065ry"` is `query`) and ignoring ASCII case (`Query` is `query`,
+/// for backends whose JSON binding ignores case). Only called on a body that
+/// already parsed as a JSON object; a body the audit cannot read is treated as
+/// repeating one.
 fn envelope_repeats_a_graphql_member(body: &[u8]) -> bool {
     match serde_json::from_slice::<EnvelopeMemberAudit>(body) {
         Ok(audit) => audit.repeated,
@@ -1798,7 +1800,9 @@ impl<'de> serde::de::Visitor<'de> for EnvelopeMemberAuditVisitor {
         let mut repeated = false;
         while let Some(key) = map.next_key::<String>()? {
             map.next_value::<serde::de::IgnoredAny>()?;
-            let member = GRAPHQL_ENVELOPE_MEMBERS.iter().position(|m| *m == key);
+            let member = GRAPHQL_ENVELOPE_MEMBERS
+                .iter()
+                .position(|m| m.eq_ignore_ascii_case(&key));
             if let Some(index) = member {
                 repeated |= std::mem::replace(&mut seen[index], true);
             }
