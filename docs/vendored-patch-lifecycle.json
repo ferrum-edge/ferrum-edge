@@ -756,6 +756,36 @@
         "vendor/hyper-1.9.0-ferrum-patched (proto::h2::upgrade::ferrum_connect_error_reset_tests)",
         "tests/integration/mesh_hbone_tests.rs"
       ]
+    },
+    {
+      "id": "hyper-002-min-data-frame-capacity",
+      "label": "hyper HTTP/2 body pipe waits for useful send capacity",
+      "crate": "hyper",
+      "vendored_version": "1.9.0",
+      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/002-min-data-frame-capacity/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 body pipe handed a chunk to h2 while the stream held only its 1-byte claim, so on a nearly spent connection window a request body left as 1-byte DATA frames; h2 >= 0.4.16 peers GOAWAY(ENHANCE_YOUR_CALM, too_many_data_frames) the connection, failing every stream on it (#5588).",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "hyperium/hyper",
+        "pr_number": 4212,
+        "issue_number": 4211,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A hyper release containing hyperium/hyper#4212 (or another fix that stops cutting a chunk into sub-1 KiB frames from a sliver of capacity) is adopted.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_min_data_frame_capacity_tests)"
+      ]
     }
   ]
 }

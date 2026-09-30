@@ -1861,6 +1861,9 @@ jobs:
         run: |
           cargo update --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.19
           cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
+          # Patch 002: a body chunk is not cut into sliver DATA frames that h2
+          # >= 0.4.16 peers GOAWAY on (issue #5588, hyperium/hyper#4211).
+          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_min_data_frame_capacity
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
