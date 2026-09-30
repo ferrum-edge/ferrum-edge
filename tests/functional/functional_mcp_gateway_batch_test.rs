@@ -237,13 +237,7 @@ async fn functional_mcp_gateway_batch_rejects_trailing_slash_alias() {
         assert_eq!(body["error"]["code"], -32600);
         assert!(requests.try_recv().is_err());
     }
-    for path in [
-        "/mcp/",
-        "/mcp/tools",
-        "/mcp/tools/",
-        "/MCP",
-        "/mCp/",
-    ] {
+    for path in ["/mcp/", "/mcp/tools", "/mcp/tools/", "/MCP", "/mCp/"] {
         let response = client
             .post(gateway.proxy_url(path))
             .json(&initialize)
