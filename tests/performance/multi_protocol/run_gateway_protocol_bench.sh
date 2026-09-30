@@ -226,7 +226,7 @@ supports() {
     #   proxying — both are Enterprise-only (see
     #   https://www.krakend.io/docs/enterprise/backends/grpc/ and
     #   https://www.krakend.io/docs/enterprise/websockets/). We ship the CE
-    #   image (krakend:2.13.2), so krakend is omitted from grpcs and wss.
+    #   image (krakend:2.13.11), so krakend is omitted from grpcs and wss.
     #
     # - Kong HTTP/3: KONG_PROXY_LISTEN doesn't accept http3/quic flags, and
     #   HTTP/3 would require experimental KONG_NGINX_HTTP_LISTEN template
@@ -298,11 +298,11 @@ bench_params() {
 # tags) so benchmark runs remain reproducible over time. Bump deliberately when
 # upgrading; do not revert to floating tags.
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
-ENVOY_IMAGE="envoyproxy/envoy:v1.33.5"
-KONG_IMAGE="kong/kong-gateway:3.10.0.0"
-TYK_IMAGE="tykio/tyk-gateway:v5.3.0"
-REDIS_IMAGE="redis:7.4.1-alpine"
-KRAKEND_IMAGE="krakend:2.13.2"
+ENVOY_IMAGE="envoyproxy/envoy:v1.39.1"
+KONG_IMAGE="kong/kong-gateway:3.16.0.0"
+TYK_IMAGE="tykio/tyk-gateway:v5.15.0"
+REDIS_IMAGE="redis:8.4.7-alpine"
+KRAKEND_IMAGE="krakend:2.13.11"
 
 # ── State ────────────────────────────────────────────────────────────────────
 BACKEND_PID=""
@@ -703,6 +703,11 @@ start_kong() {
 
     local extra_env=()
     [ -n "$stream_listen_env" ] && extra_env+=(-e "KONG_STREAM_LISTEN=$stream_listen_env")
+    # configs/kong/wss.yaml raises the WebSocket payload limits from a
+    # pre-function plugin via kong.websocket.*. Kong 3.14+ defaults
+    # untrusted_lua to `strict`, which hides that PDK (every upgrade then
+    # 500s); `sandbox` restores the pre-3.14 default the config relies on.
+    [ "$PROTOCOL" = wss ] && extra_env+=(-e "KONG_UNTRUSTED_LUA=sandbox")
 
     GATEWAY_CID=$(docker run -d --rm --network host \
         -e "KONG_DATABASE=off" \
@@ -795,27 +800,24 @@ start_tyk() {
     # Tyk listens on 8443 when TLS is enabled in tyk.conf
     echo "[tyk] starting with apps=$apps_dir..."
 
-    # Install the benchmark CA into the container's system trust store
-    # before launching Tyk. Tyk Classic API `transport.ssl_ca_cert` does
-    # NOT configure upstream trust (confirmed locally: it's a no-op —
-    # handshakes fail with the same error whether ssl_ca_cert points at
-    # the real cert or a nonexistent path). The Go `net/http` transport
-    # Tyk uses for reverse-proxy upstreams consults the default system
-    # RootCAs pool, so the reliable fix is to install the PEM as a
-    # system CA before starting the gateway. Tyk's image is Debian
-    # bookworm-based with `update-ca-certificates` available, and runs
-    # as root by default.
+    # Point Tyk's system trust store at the benchmark CA. Tyk Classic API
+    # `transport.ssl_ca_cert` does NOT configure upstream trust (confirmed
+    # locally: it's a no-op — handshakes fail with the same error whether
+    # ssl_ca_cert points at the real cert or a nonexistent path). The Go
+    # `net/http` transport Tyk uses for reverse-proxy upstreams consults
+    # the default system RootCAs pool, which Go loads from SSL_CERT_FILE.
+    # The v5.15 image is distroless (no shell, non-root) and already sets
+    # SSL_CERT_FILE, so override it rather than running
+    # update-ca-certificates. The only upstream is the benchmark backend,
+    # and every API config keeps ssl_insecure_skip_verify=false, so
+    # upstream verification stays on against exactly the benchmark CA.
     GATEWAY_CID=$(docker run -d --rm --network host \
+        -e "SSL_CERT_FILE=/etc/tyk/certs/ca.pem" \
         -v "$apps_dir:/etc/tyk/apps:ro" \
         -v "$tyk_conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$CERT_DIR:/etc/tyk/certs:ro" \
-        --entrypoint sh \
         "$TYK_IMAGE" \
-        -c 'cp /etc/tyk/certs/ca.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1 && exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
-    # All-`&&` chain so a trust-store setup failure exits before Tyk
-    # starts. Otherwise Tyk would run without the benchmark CA while
-    # every API config enforces ssl_insecure_skip_verify=false, turning
-    # the bench into silent 0-RPS rows rather than a loud startup error.
+        --conf /opt/tyk-gateway/tyk.conf)
 
     wait_for_gateway
 }
@@ -1408,6 +1410,10 @@ PYEOF
             >> "$root_output/images.txt"
     fi
     if [ "$UDP_PROFILE" = profile ]; then
+        # The UDP internal profile keeps its manifest-declared unchanged Kong
+        # baseline, independent of the benchmark KONG_IMAGE pin above.
+        KONG_IMAGE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["kong_provenance"]["image"])' \
+            "$SCRIPT_DIR/udp_profile_manifest.json")
         # Preserve tag and immutable image evidence; no vendor correspondence inferred.
         docker image inspect "$KONG_IMAGE" > "$root_output/kong-image.json"
         KONG_IMAGE=$(docker image inspect "$KONG_IMAGE" --format '{{.Id}}')

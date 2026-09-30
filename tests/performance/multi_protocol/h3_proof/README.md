@@ -65,10 +65,10 @@ uses the existing upstream `backend_tls_sni` field, resolved by
 the config therefore references one numeric upstream target. There is no new
 production TLS option. Envoy retains `sni: localhost` and adds
 `match_typed_subject_alt_names: [{san_type: DNS, matcher: {exact: localhost}}]`.
-This is the pinned d7809ba2
-[CertificateValidationContext API](https://github.com/envoyproxy/envoy/blob/d7809ba2b07fd869d49bfb122b27f6a7977b4d94/api/envoy/extensions/transport_sockets/tls/v3/common.proto).
+This is the pinned v1.39.1 b579d07d
+[CertificateValidationContext API](https://github.com/envoyproxy/envoy/blob/b579d07d3ad7ee11d32b105e91a5a39ad24718d7/api/envoy/extensions/transport_sockets/tls/v3/common.proto).
 The pinned
-[QUIC verifier](https://github.com/envoyproxy/envoy/blob/d7809ba2b07fd869d49bfb122b27f6a7977b4d94/source/common/quic/envoy_quic_proof_verifier.cc)
+[QUIC verifier](https://github.com/envoyproxy/envoy/blob/b579d07d3ad7ee11d32b105e91a5a39ad24718d7/source/common/quic/envoy_quic_proof_verifier.cc)
 also checks the leaf hostname; neither source inspection nor SNI alone substitutes
 for the following actual behavior gate. Client frontend verification remains the
 existing explicitly insecure harness policy, separately from upstream identity.
@@ -123,9 +123,9 @@ registration is not a claim that this revision has passed them.
 
 `live_campaign.json` declares all experimental inputs before dispatch:
 
-- Official Envoy Linux amd64 image
-  `docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb`,
-  source `d7809ba2b07fd869d49bfb122b27f6a7977b4d94`, as approved in root's plan.
+- Official Envoy v1.39.1 Linux amd64 image
+  `docker.io/envoyproxy/envoy@sha256:be87c8b52663c1164a5bdf3c5419017a269cb3d8c74be1ec93638a71f1ffbd4b`,
+  source `b579d07d3ad7ee11d32b105e91a5a39ad24718d7`, as approved in root's plan.
   No Envoy compilation or source-build comparison occurs.
 - Direct, Ferrum, Envoy upstream 100 and **the same** Envoy upstream 4; actual
   downstream listener admission and HCM settings stay at 100. A parsed semantic

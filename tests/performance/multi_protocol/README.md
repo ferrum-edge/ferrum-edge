@@ -600,7 +600,7 @@ artifact audit remain required before drawing conclusions.
 matrix job. `H3_EXPERIMENT_MANIFEST` can select another data manifest; setting
 `enabled: false` disables it. With Envoy selected, the runner adds
 `envoy-limit-4` to the same counterbalanced pairs as `envoy` (limit 100), Ferrum,
-and direct. Both Envoy arms retain pinned 1.33.5, SNI `localhost`, CA validation,
+and direct. Both Envoy arms retain pinned 1.39.1, SNI `localhost`, CA validation,
 windows, timeouts, and strict HTTP 200/exact-body validation. Generated configs,
 image IDs/digests, the experiment manifest, and host socket settings are artifacts.
 
@@ -654,8 +654,9 @@ upstream sockets, including unconnected Quinn endpoints. Missing observations,
 counter resets, incomplete brackets, and unverified buffer parity stay explicit.
 
 Envoy stats are sampled via its loopback admin endpoint and retained in full.
-Pinned 1.33.5 repeatedly adds cumulative `SO_RXQ_OVFL` values; its reported drops
-are **not loss totals** ([upstream correction #38652](https://github.com/envoyproxy/envoy/pull/38652)).
+Historical 1.33.5 runs repeatedly added cumulative `SO_RXQ_OVFL` values; their reported
+drops are **not loss totals** ([upstream correction #38652](https://github.com/envoyproxy/envoy/pull/38652),
+first released in 1.34.0 and included in the pinned 1.39.1).
 Use independent kernel/socket deltas. `TOO_MANY_RTOS`, idle-close, and watchdog
 counters remain raw, timestamped observations. Both gateways use info logging;
 startup and per-payload logs have Docker timestamps, exposing BPF/GRO/GSO

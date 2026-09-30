@@ -31,10 +31,11 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_https_h2
                 codec_type: HTTP2
-                # HTTP/2 flow-control uses Envoy defaults (256KB stream / 1MB
-                # connection window) so the benchmark compares each gateway
-                # as-shipped. Kong/Tyk/KrakenD can't easily match Ferrum's
-                # 8MB/32MB defaults, so explicit tuning here would bias results.
+                # HTTP/2 flow-control uses Envoy defaults (since Envoy 1.36:
+                # 16 MiB stream / 24 MiB connection window, 1024 streams) so
+                # the benchmark compares each gateway as-shipped. Kong/Tyk/
+                # KrakenD can't easily match Ferrum's 8 MiB/32 MiB defaults,
+                # so explicit tuning here would bias results.
                 route_config:
                   name: local_route
                   virtual_hosts:

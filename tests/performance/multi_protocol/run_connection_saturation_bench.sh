@@ -104,11 +104,11 @@ GATEWAY_HTTPS_PORT=8443
 TARGET_URL="https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo"
 
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
-ENVOY_IMAGE="envoyproxy/envoy:v1.33.5"
-KONG_IMAGE="kong/kong-gateway:3.10.0.0"
-TYK_IMAGE="tykio/tyk-gateway:v5.3.0"
-REDIS_IMAGE="redis:7.4.1-alpine"
-KRAKEND_IMAGE="krakend:2.13.2"
+ENVOY_IMAGE="envoyproxy/envoy:v1.39.1"
+KONG_IMAGE="kong/kong-gateway:3.16.0.0"
+TYK_IMAGE="tykio/tyk-gateway:v5.15.0"
+REDIS_IMAGE="redis:8.4.7-alpine"
+KRAKEND_IMAGE="krakend:2.13.11"
 
 BACKEND_PID=""
 REDIS_CID=""
@@ -353,13 +353,15 @@ start_tyk() {
     local tyk_conf="$SCRIPT_DIR/configs/tyk/tyk.conf"
     echo "[tyk] starting..."
 
+    # Distroless Tyk image: trust the benchmark CA via Go's SSL_CERT_FILE
+    # (see run_gateway_protocol_bench.sh start_tyk for rationale).
     GATEWAY_CID=$(docker run -d --rm --network host $DOCKER_NOFILE_ULIMIT \
+        -e "SSL_CERT_FILE=/etc/tyk/certs/ca.pem" \
         -v "$apps_dir:/etc/tyk/apps:ro" \
         -v "$tyk_conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$CERT_DIR:/etc/tyk/certs:ro" \
-        --entrypoint sh \
         "$TYK_IMAGE" \
-        -c 'cp /etc/tyk/certs/ca.pem /usr/local/share/ca-certificates/bench.crt && update-ca-certificates >/dev/null 2>&1 && exec /opt/tyk-gateway/tyk --conf /opt/tyk-gateway/tyk.conf')
+        --conf /opt/tyk-gateway/tyk.conf)
     wait_for_gateway
 }
 

@@ -184,7 +184,7 @@ jobs:
           #
           # - KrakenD CE does NOT support gRPC or WebSocket proxying (both are
           #   Enterprise-only — /docs/enterprise/backends/grpc/ and /websockets/).
-          #   We ship CE (krakend:2.13.2), so krakend is omitted from grpcs + wss.
+          #   We ship CE (krakend:2.13.11), so krakend is omitted from grpcs + wss.
           # - Kong HTTP/2: Kong terminates H2 downstream but OpenResty/nginx
           #   `proxy_pass` is HTTP/1.1 only (no H2 upstream module in the
           #   Kong Docker image). A Kong/http2 row would be client→H2→Kong
@@ -247,10 +247,10 @@ jobs:
           # must match run_gateway_protocol_bench.sh. Bump deliberately.
           gws="${{ steps.gateways.outputs.list }}"
           images=""
-          echo " $gws " | grep -qw envoy && images="$images envoyproxy/envoy:v1.33.5"
-          echo " $gws " | grep -qw kong && images="$images kong/kong-gateway:3.10.0.0"
-          echo " $gws " | grep -qw tyk && images="$images tykio/tyk-gateway:v5.3.0 redis:7.4.1-alpine"
-          echo " $gws " | grep -qw krakend && images="$images krakend:2.13.2"
+          echo " $gws " | grep -qw envoy && images="$images envoyproxy/envoy:v1.39.1"
+          echo " $gws " | grep -qw kong && images="$images kong/kong-gateway:3.16.0.0"
+          echo " $gws " | grep -qw tyk && images="$images tykio/tyk-gateway:v5.15.0 redis:8.4.7-alpine"
+          echo " $gws " | grep -qw krakend && images="$images krakend:2.13.11"
           for img in $images; do
             echo "pulling $img..."
             docker pull "$img" &
