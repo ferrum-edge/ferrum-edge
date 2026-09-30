@@ -1529,7 +1529,6 @@ async fn functional_mcp_aggregate_sse_endpoint_scope_never_forwards_descendants(
         // Aliases and descendants must not route, attach SSE, or delete it.
         for path in [
             "/mcp/",
-            "/mcp//",
             "/mcp/child",
             "/mcp/tools",
             "/mcp/tools/",
@@ -1562,6 +1561,30 @@ async fn functional_mcp_aggregate_sse_endpoint_scope_never_forwards_descendants(
                     Err(mpsc::error::TryRecvError::Empty)
                 ));
             }
+        }
+        // An empty inner segment is refused by the shared frontend before any
+        // plugin runs (`empty_segment`, HTTP 400), so it never reaches MCP.
+        for method in [
+            reqwest::Method::POST,
+            reqwest::Method::GET,
+            reqwest::Method::DELETE,
+        ] {
+            let response = client
+                .request(method, format!("http://127.0.0.1:{port}/mcp//"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header(SESSION_HEADER, &session)
+                .header("mcp-protocol-version", PROTOCOL_VERSION)
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"session/echo"}"#)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 400, "{mode} /mcp//");
+            assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                fixture.arrivals.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
         }
         // Positive controls use the same gateway and backend. A query does
         // not alter endpoint selection, and the exact endpoint still routes
