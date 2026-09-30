@@ -510,7 +510,10 @@ fn server<'a>(catalog: &'a Value, server_id: &str) -> &'a Value {
 
 fn is_sha256_hex(value: &Value) -> bool {
     value.as_str().is_some_and(|hash| {
-        hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
 }
 
