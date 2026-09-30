@@ -3400,7 +3400,7 @@ fn ldap_identity_realm_binds_the_directory_and_identity_attribute() {
 #[tokio::test]
 async fn external_identity_runner_commits_the_mechanism_realm() {
     use ferrum_edge::plugins::utils::auth_flow::{
-        AuthMechanism, ExtractedCredential, ExternalIdentityRealm, VerifyOutcome,
+        AuthMechanism, ExternalIdentityRealm, ExtractedCredential, VerifyOutcome,
         run_auth_external_identity,
     };
 
@@ -3435,7 +3435,10 @@ async fn external_identity_runner_commits_the_mechanism_realm() {
         "/".to_string(),
     );
     let result = run_auth_external_identity(&RealmProbe, &mut ctx, &ConsumerIndex::new(&[])).await;
-    assert!(matches!(result, ferrum_edge::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
     assert_eq!(
         ctx.authenticated_identity_realm(),

@@ -13875,8 +13875,7 @@ async fn aggregate_final_check_binds_the_mediated_upstream_session_header() {
 
 fn issuer_a_inline_jwks() -> String {
     let key_a = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
-    super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid(key_a, "issuer-a")
-        .to_string()
+    super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid(key_a, "issuer-a").to_string()
 }
 
 fn single_provider_jwks_auth(provider: Value) -> ferrum_edge::plugins::jwks_auth::JwksAuth {
@@ -13943,4 +13942,119 @@ async fn jwks_identity_claim_path_is_part_of_the_realm() {
     let username_realm = realm_for(&by_username, claims.clone()).await;
     assert_ne!(sub_realm, username_realm);
     assert_eq!(sub_realm, realm_for(&by_sub, claims).await);
+}
+
+/// The final backend-header policy owns the mediated upstream session header:
+/// every spelling is replaced by exactly the recorded value, and tampering it
+/// observes before the final request-body hook is still refused there.
+#[tokio::test]
+async fn aggregate_final_backend_header_policy_reasserts_the_upstream_session() {
+    let (_server, plugin) = aggregate_plugin_with_catalog().await;
+    assert!(plugin.enforces_final_backend_header_policy());
+    let session_id = initialize(&plugin).await;
+
+    // A later before_proxy header rule swapped the session: the policy pass
+    // restores it, and the final request-body hook still refuses the call.
+    let (mut ctx, mut headers, body) =
+        admit_and_transform(&plugin, None, &session_id, allowed_tool_call(97)).await;
+    headers.insert("mcp-session-id".to_string(), "another-session".to_string());
+    headers.insert("MCP-SESSION-ID".to_string(), "third-session".to_string());
+    plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
+    let sessions: Vec<&String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(sessions, vec!["upstream-session"]);
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        97,
+        "session swapped before the final request-body hook",
+    );
+
+    // A finalized-egress overlay merged AFTER the final request-body hook is
+    // simply overwritten: the upstream still receives the recorded session.
+    let (mut ctx, mut headers, body) =
+        admit_and_transform(&plugin, None, &session_id, allowed_tool_call(98)).await;
+    plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "untouched session",
+    );
+    headers.insert("mcp-session-id".to_string(), "overlay-session".to_string());
+    plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
+    assert_eq!(
+        headers.get("mcp-session-id").map(String::as_str),
+        Some("upstream-session")
+    );
+
+    // A dropped header is re-inserted; a request this instance never routed is
+    // left alone.
+    headers.remove("mcp-session-id");
+    plugin.enforce_final_backend_header_policy(&ctx, &mut headers);
+    assert_eq!(
+        headers.get("mcp-session-id").map(String::as_str),
+        Some("upstream-session")
+    );
+    let unrelated = create_test_context();
+    let mut unrelated_headers =
+        HashMap::from([("mcp-session-id".to_string(), "client-value".to_string())]);
+    plugin.enforce_final_backend_header_policy(&unrelated, &mut unrelated_headers);
+    assert_eq!(
+        unrelated_headers.get("mcp-session-id").map(String::as_str),
+        Some("client-value")
+    );
+}
+
+/// JSON-RPC 2.0 forbids a message that is both a call and a reply; admission
+/// refuses it instead of classifying it as a reply and dispatching its method.
+#[tokio::test]
+async fn aggregate_admission_refuses_an_envelope_mixing_method_and_reply() {
+    let (_server, plugin) = passthrough_plugin_with_catalog().await;
+    let session_id = initialize(&plugin).await;
+    for mixed in [
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "result": {} }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "vendor/custom", "error": {} }),
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(mixed.clone());
+        headers.insert("mcp-session-id".to_string(), session_id.clone());
+        let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(status, 200, "{mixed}");
+        assert_eq!(body["error"]["code"], json!(-32600), "{mixed}: {body}");
+        assert!(ctx.route_override_backend_host.is_none(), "{mixed}");
+    }
+}
+
+/// `jwks_auth`'s generic mechanism path cannot stage a provider realm, so it
+/// never yields an external identity that would commit under a realm shared
+/// by every provider.
+#[tokio::test]
+async fn jwks_mechanism_verify_path_never_yields_an_external_identity() {
+    use ferrum_edge::plugins::utils::auth_flow::{AuthMechanism, ExtractedCredential, VerifyOutcome};
+    let auth = two_issuer_jwks_auth();
+    let claims = json!({ "iss": ISSUER_A, "sub": "alice" });
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &claims,
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "issuer-a",
+    );
+    let outcome = auth
+        .verify(
+            ExtractedCredential::BearerToken(token),
+            &ferrum_edge::ConsumerIndex::new(&[]),
+        )
+        .await;
+    match outcome {
+        VerifyOutcome::Success {
+            consumer,
+            external_identity,
+            external_identity_header,
+            ..
+        } => {
+            assert!(consumer.is_none());
+            assert!(external_identity.is_none());
+            assert!(external_identity_header.is_none());
+        }
+        other => panic!("a valid token still verifies: {other:?}"),
+    }
 }

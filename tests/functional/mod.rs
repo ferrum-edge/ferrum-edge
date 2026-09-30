@@ -83,6 +83,7 @@ mod functional_logging_plugins_test;
 mod functional_logging_test;
 mod functional_max_forwards_test;
 mod functional_mcp_aggregate_sse_test;
+mod functional_mcp_gateway_admission_test;
 mod functional_mcp_gateway_batch_test;
 mod functional_mesh_mode_test;
 mod functional_mesh_stock_xds_test;

@@ -1995,6 +1995,7 @@ jobs:
               functional_passthrough_test
               functional_sse_test
               functional_mcp_aggregate_sse_test
+              functional_mcp_gateway_admission_test
               functional_stream_listener_failure_test
               functional_tcp_proxy_test
               functional_tcp_splice_backend_timeout_test

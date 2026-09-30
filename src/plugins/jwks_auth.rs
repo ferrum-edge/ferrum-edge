@@ -1640,7 +1640,24 @@ impl AuthMechanism for JwksAuth {
             };
         }
 
-        self.resolve_identity(&claims, provider, consumer_index)
+        // This generic mechanism path is not a production entry point — the
+        // plugin's own `authenticate` is — and it cannot stage the provider's
+        // identity-realm authority. It therefore never yields an external
+        // identity, which would otherwise commit under a mechanism-only realm
+        // shared by every provider: only a mapped Consumer survives here.
+        match self.resolve_identity(&claims, provider, consumer_index) {
+            VerifyOutcome::Success {
+                consumer,
+                credential_deadline,
+                ..
+            } => VerifyOutcome::Success {
+                consumer,
+                external_identity: None,
+                external_identity_header: None,
+                credential_deadline,
+            },
+            other => other,
+        }
     }
 }
 

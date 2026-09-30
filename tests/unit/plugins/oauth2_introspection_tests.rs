@@ -2542,5 +2542,8 @@ async fn external_identity_realm_binds_the_introspection_authority_and_claim() {
     by_sub["providers"][0]["consumer_identity_claim"] = json!("sub");
     let plugin = introspection_plugin(by_sub);
     let by_sub = introspected_realm(&plugin, "token-4").await;
-    assert_ne!(realm, by_sub, "the identity claim path is part of the realm");
+    assert_ne!(
+        realm, by_sub,
+        "the identity claim path is part of the realm"
+    );
 }

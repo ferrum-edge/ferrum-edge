@@ -4521,5 +4521,8 @@ async fn external_identity_realm_binds_the_oidc_issuer_and_identity_claim() {
     let mut by_email = base_config();
     by_email["providers"][0]["consumer_identity_claim"] = json!("email");
     let by_email = oidc_session_realm(by_email, claims).await;
-    assert_ne!(realm, by_email, "the identity claim path is part of the realm");
+    assert_ne!(
+        realm, by_email,
+        "the identity claim path is part of the realm"
+    );
 }

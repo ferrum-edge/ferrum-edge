@@ -19,7 +19,7 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
@@ -888,7 +888,6 @@ enum McpCatalogError {
 /// Private and typed: forgeable `mcp.*` metadata cannot create, alter, or clear
 /// it. `Debug` never renders arguments, ids, session values, or target values,
 /// which can carry secrets.
-#[derive(Clone)]
 pub(crate) struct McpAdmissionRecord {
     /// The `mcp_gateway` instance that admitted the request.
     owner: u64,
@@ -908,6 +907,14 @@ pub(crate) struct McpAdmissionRecord {
     /// The mediated upstream session id the gateway placed on the backend
     /// request, `None` when the upstream session is stateless.
     upstream_session: Option<String>,
+    /// Latched by the final backend-header policy pass when it found the
+    /// upstream session header replaced, duplicated, or injected before it
+    /// re-asserted the recorded value. That pass runs after the `before_proxy`
+    /// chain, ahead of the final request-body hook, so the hook still refuses
+    /// the request a later header transform tampered with instead of silently
+    /// forwarding the corrected call. Shared by the H1/H2 hook-context clone
+    /// through the `Arc`, and private: no metadata key can set or clear it.
+    upstream_session_drift: AtomicBool,
     /// Admitted item identity, absent for passthrough methods and responses.
     target: Option<McpAdmittedTarget>,
 }
@@ -1642,6 +1649,7 @@ impl McpGateway {
             server_id: server_id.to_string(),
             destination,
             upstream_session: upstream_session.map(ToOwned::to_owned),
+            upstream_session_drift: AtomicBool::new(false),
             target,
         }));
     }
@@ -5711,7 +5719,9 @@ impl McpGateway {
         if !record.destination.still_targets(ctx) {
             return Some("destination_changed");
         }
-        if !self.upstream_session_intact(record.upstream_session.as_deref(), headers) {
+        if record.upstream_session_drift.load(Ordering::Relaxed)
+            || !self.upstream_session_intact(record.upstream_session.as_deref(), headers)
+        {
             return Some("upstream_session_changed");
         }
         // A duplicate member makes the upstream-visible operation
@@ -5992,6 +6002,47 @@ impl Plugin for McpGateway {
 
     fn needs_final_request_body_context(&self) -> bool {
         self.enabled && self.mode == McpGatewayMode::AggregateRouter
+    }
+
+    /// The mediated upstream session header is gateway-owned on every request
+    /// this instance routed, so it is re-asserted over the finalized backend
+    /// header map, including after a finalized-request-egress header overlay
+    /// (a `serverless_function` `pre_proxy` response) that runs after the final
+    /// request-body hook.
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        self.enabled && self.mode == McpGatewayMode::AggregateRouter
+    }
+
+    /// Remove every spelling of the upstream session header and re-insert
+    /// exactly the recorded value (none when the gateway selected none).
+    /// Idempotent and non-rejecting; tampering observed here is latched on the
+    /// admission record so the final request-body hook refuses it.
+    fn enforce_final_backend_header_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        if self.mode != McpGatewayMode::AggregateRouter || !self.owns_request(ctx) {
+            return;
+        }
+        let Some(record) = ctx.mcp_admission.as_deref() else {
+            return;
+        };
+        if record.owner != self.instance_id {
+            return;
+        }
+        let name = self.sessions.upstream_session_header.as_str();
+        let recorded = record.upstream_session.as_deref();
+        if !self.upstream_session_intact(recorded, headers) {
+            record.upstream_session_drift.store(true, Ordering::Relaxed);
+        } else if recorded.is_none() || header_value(headers, name).is_some() {
+            // Already exactly the recorded state.
+            return;
+        }
+        remove_header(headers, name);
+        if let Some(session) = recorded {
+            headers.insert(name.to_ascii_lowercase(), session.to_string());
+        }
     }
 
     /// Aggregate admission is re-decided over the finalized request, so an
@@ -7004,6 +7055,12 @@ fn parse_mcp_envelope_value(
     let params = object.get("params").cloned();
     let result = object.get("result").cloned();
     let error = object.get("error").cloned();
+    // JSON-RPC 2.0 forbids a message that is both a call and a reply. Such a
+    // body would be classified as a reply yet dispatched by its method, so it
+    // is refused rather than guessed at.
+    if object.contains_key("method") && (result.is_some() || error.is_some()) {
+        return Err("JSON-RPC envelope must not mix method with result or error".to_string());
+    }
     let message_kind = if error.is_some() {
         McpMessageKind::ErrorResponse
     } else if result.is_some() {

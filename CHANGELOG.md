@@ -631,7 +631,10 @@ outright with no deprecation period:
   transform. A routed `tools/call`, `prompts/get`, `resources/read`, or
   passthrough message that a later plugin changed is refused before it is sent
   upstream with JSON-RPC `-32014`; the gateway's own public-to-upstream name
-  rewrite is the only permitted difference. A client-sent JSON-RPC response
+  rewrite is the only permitted difference. The mediated upstream session
+  header is re-asserted over the final backend headers, including after a
+  `serverless_function` `pre_proxy` header overlay, and an envelope carrying
+  both `method` and `result`/`error` is refused. A client-sent JSON-RPC response
   forwarded through `passthrough_unknown_methods` is still admitted, bound to
   the request `id` it answers. A later route rewrite of an MCP-routed request,
   including a `mesh_route_dispatch` destination rewrite, is now refused. The
