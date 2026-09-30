@@ -500,6 +500,16 @@ outright with no deprecation period:
 
 ### Fixed
 
+- **Config reloads no longer 404 live Gateway listener routes** (#5914). Every
+  config publication used to reset listener route admission to pending, so
+  each reload briefly answered 404 on listener-scoped routes of listeners that
+  were already serving, and on the single-listener Service remap of the
+  process-global port. A publication now keeps the previous decision for ports
+  whose listener plan (class, bind address, mesh direction, process-global
+  ownership) is unchanged. A new port waits for its reconcile. A withdrawn
+  port, or a changed port that had a live socket, fails closed at once, so its
+  old socket never serves under its old identity.
+
 - **Gateway listeners wait for matching route admission** (#5913). Newly bound
   listener sockets do not accept connections until their matching config
   generation publishes admission, preventing brief 404 responses during reload.

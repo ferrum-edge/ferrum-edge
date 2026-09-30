@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, Upstream, wildcard_matches};
+use crate::proxy::gateway_listener::GatewayListenerAdmissionBasis;
 
 thread_local! {
     /// Thread-local buffer for router cache key construction.
@@ -120,9 +121,10 @@ struct HttpPortMatchContext<'a> {
     /// Same, for the one distinct TLS-scoped HTTP `listen_port`.
     single_tls_listen_port: Option<u16>,
     /// Listener admission published with the exact request/config generation.
-    /// A pending generation rejects every listener-scoped route. Once the
-    /// matching reconcile acknowledges it, every admission-refused or
-    /// bind-failed port remains ineligible for Service remap.
+    /// A pending generation rejects every listener-scoped route, and a pending
+    /// port rejects the routes scoped to it. Every admission-refused,
+    /// bind-failed, withdrawn, or retiring port remains ineligible for Service
+    /// remap.
     listener_admission: &'a GatewayListenerAdmission,
 }
 
@@ -431,18 +433,33 @@ pub(crate) struct HostRouteTable {
 
 /// Gateway listener routing admission for one exact request/config generation.
 ///
-/// New config generations start pending so a newly published port-scoped route
-/// cannot use an older generation's successful decision. The listener manager
-/// replaces pending with a decided refusal set only after reconciling that same
-/// config generation. The decided set includes both pre-bind admission
-/// refusals and OS bind failures so neither can expose a listener-scoped route
-/// through Service-fronted remapping. This also preserves the dedicated
-/// Sidecar-ingress boundary: a failed loopback bind cannot widen onto the
-/// process-global frontend.
+/// The listener manager publishes a decided refusal set only after
+/// reconciling that same config generation. The decided set includes both
+/// pre-bind admission refusals and OS bind failures so neither can expose a
+/// listener-scoped route through Service-fronted remapping. This also
+/// preserves the dedicated Sidecar-ingress boundary: a failed loopback bind
+/// cannot widen onto the process-global frontend.
+///
+/// A decision records the listener plan it was made against. Each config
+/// publication derives the next generation's admission from it, in the same
+/// store as the new route table (issue #5914). A port whose planned identity
+/// is unchanged keeps its decision, so live listeners keep serving across
+/// reloads. A new port is pending. A withdrawn or changed port that had a
+/// live socket is refused, so no request is routed under its old identity.
+/// These hold until the matching reconcile publishes its own decision. An
+/// admission with no recorded plan (startup, or a standalone harness) makes
+/// the next generation pending as a whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayListenerAdmission {
+    /// No decision covers this generation yet. Every listener-scoped route is
+    /// refused, but no frontend port is.
     pending: bool,
+    /// Ports refused both as a route `listen_port` and as a frontend port.
     refused_ports: BTreeSet<u16>,
+    /// Ports whose route admission waits for this generation's reconcile.
+    /// Unlike `refused_ports` they do not refuse the frontend port.
+    pending_ports: BTreeSet<u16>,
+    basis: Option<GatewayListenerAdmissionBasis>,
 }
 
 impl GatewayListenerAdmission {
@@ -450,19 +467,99 @@ impl GatewayListenerAdmission {
         Arc::new(Self {
             pending: true,
             refused_ports: BTreeSet::new(),
+            pending_ports: BTreeSet::new(),
+            basis: None,
         })
     }
 
+    /// A decision without a recorded plan. It cannot be carried forward, so
+    /// the next config generation starts pending.
     pub(crate) fn decided(refused_ports: BTreeSet<u16>) -> Arc<Self> {
         Arc::new(Self {
             pending: false,
             refused_ports,
+            pending_ports: BTreeSet::new(),
+            basis: None,
+        })
+    }
+
+    /// The decision a listener reconcile made against `basis`.
+    pub(crate) fn decided_for_plan(
+        refused_ports: BTreeSet<u16>,
+        basis: GatewayListenerAdmissionBasis,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            pending: false,
+            refused_ports,
+            pending_ports: BTreeSet::new(),
+            basis: Some(basis),
+        })
+    }
+
+    /// The admission `config` publishes with, derived from this one.
+    ///
+    /// Runs under the request-epoch writer lock, once per config publication,
+    /// never on the request path. Returns `self` unchanged when the listener
+    /// plan is identical, and never admits a port this admission does not.
+    pub(crate) fn carry_forward(self: &Arc<Self>, config: &GatewayConfig) -> Arc<Self> {
+        let Some(basis) = self.basis.as_ref().filter(|_| !self.pending) else {
+            return Self::pending();
+        };
+        let next_basis = basis.for_config(config);
+        if next_basis == *basis {
+            return Arc::clone(self);
+        }
+        let mut refused_ports = BTreeSet::new();
+        let mut pending_ports = BTreeSet::new();
+        for (port, planned) in next_basis.ports() {
+            let was_refused = self.refused_ports.contains(port);
+            let was_pending = self.pending_ports.contains(port);
+            let previous = basis.ports().get(port);
+            if was_refused || planned.is_refused() {
+                // A retiring socket keeps its refusal, and a plan refusal is
+                // known without waiting for reconcile.
+                refused_ports.insert(*port);
+            } else if previous == Some(planned) {
+                // Unchanged: keep this port's decision.
+                if was_pending {
+                    pending_ports.insert(*port);
+                }
+            } else if previous.is_some() && !was_pending {
+                // A decided port changed class, bind, or ownership. Its live
+                // socket keeps the old identity until reconcile retires it.
+                refused_ports.insert(*port);
+            } else {
+                // New to the plan, or still waiting for its first decision.
+                pending_ports.insert(*port);
+            }
+        }
+        // A withdrawn port keeps its socket, and its already accepted
+        // connections, until reconcile retires it. Refuse it now instead of
+        // letting the process-global route set or Service remap serve it.
+        // Ports the process-global frontend served have no socket to retire.
+        for (port, previous) in basis.ports() {
+            if !next_basis.ports().contains_key(port) && previous.owns_socket() {
+                refused_ports.insert(*port);
+            }
+        }
+        // Refusals outside the new plan belong to retiring sockets. Keep them
+        // until reconcile sees those sockets drained.
+        refused_ports.extend(
+            self.refused_ports
+                .iter()
+                .filter(|port| !next_basis.ports().contains_key(*port)),
+        );
+        Arc::new(Self {
+            pending: false,
+            refused_ports,
+            pending_ports,
+            basis: Some(next_basis),
         })
     }
 
     #[inline]
     pub(crate) fn allows(&self, port: u16) -> bool {
-        !self.pending && !self.refused_ports.contains(&port)
+        !self.pending && !self.refused_ports.contains(&port) && !self.pending_ports.contains(&port)
     }
 
     #[inline]

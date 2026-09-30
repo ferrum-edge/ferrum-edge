@@ -39,6 +39,18 @@
 //!   connections finish; nothing new is routed", not "traffic keeps being
 //!   served". Finished drains are reaped on every reconcile, so completed
 //!   handles never accumulate until process exit.
+//! - **Route admission across reloads.** Each decided admission records the
+//!   listener plan it was made against (`GatewayListenerAdmissionBasis`).
+//!   The config publication derives the new generation's admission from it,
+//!   in the same `ArcSwap` store as the new route table, instead of resetting
+//!   every port to pending (issue #5914). A port whose planned identity (class,
+//!   bind address, mesh direction, process-global ownership, or plan refusal)
+//!   is unchanged keeps serving under its previous decision, and so does the
+//!   single-listener Service remap onto it. A new port is pending until this
+//!   generation's reconcile publishes. A withdrawn port, or a changed port
+//!   that had a live socket, is refused as a frontend port at once, so its
+//!   old socket never routes under the old identity. Only a reconcile of the
+//!   exact generation may admit anything this carry-forward did not.
 //! - **Supervision.** A started listener whose task later finishes — cleanly,
 //!   with an error, or by panic — is reaped on the next reconcile, surfaced on
 //!   [`GatewayListenerManager::bind_failures`], and rebound. A dead accept loop
@@ -426,6 +438,105 @@ impl GatewayListenerPlan {
             quic_refused,
         }
     }
+
+    /// Per-port identity that decides route admission. QUIC-only refusals are
+    /// left out: they never enter the refused-route set.
+    fn admission_ports(&self) -> BTreeMap<u16, PlannedListenerPort> {
+        let mut ports: BTreeMap<u16, PlannedListenerPort> = self
+            .ports
+            .iter()
+            .map(|(port, desired)| (*port, PlannedListenerPort::Bind(*desired)))
+            .collect();
+        ports.extend(
+            self.already_served
+                .iter()
+                .map(|(port, class)| (*port, PlannedListenerPort::AlreadyServed(*class))),
+        );
+        ports.extend(
+            self.refused
+                .iter()
+                .map(|(port, refusal)| (*port, PlannedListenerPort::Refused(refusal.category))),
+        );
+        ports
+    }
+}
+
+/// What one Gateway listener port looks like in a [`GatewayListenerPlan`],
+/// reduced to the fields that decide its route admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlannedListenerPort {
+    /// A dedicated socket with this class, bind address, and mesh direction.
+    Bind(DesiredGatewayListener),
+    /// Served by the process-global proxy frontend of this class.
+    AlreadyServed(GatewayListenerClass),
+    /// Refused before any bind was tried.
+    Refused(GatewayListenerFailureCategory),
+}
+
+impl PlannedListenerPort {
+    pub(crate) fn is_refused(self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+
+    /// Whether this manager owns an accept socket for the port. A withdrawn
+    /// port like this keeps accepting until reconcile retires it.
+    pub(crate) fn owns_socket(self) -> bool {
+        matches!(self, Self::Bind(_))
+    }
+}
+
+/// The inputs [`GatewayListenerPlan::from_config`] takes besides the config.
+/// They are fixed for the life of one [`GatewayListenerManager`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayListenerPlanner {
+    reserved: Arc<std::collections::HashSet<u16>>,
+    existing_frontends: BTreeMap<u16, GatewayListenerClass>,
+    default_bind_addr: IpAddr,
+    http3_enabled: bool,
+}
+
+impl GatewayListenerPlanner {
+    fn plan(&self, config: &GatewayConfig) -> GatewayListenerPlan {
+        GatewayListenerPlan::from_config(
+            config,
+            self.reserved.as_ref(),
+            &self.existing_frontends,
+            self.default_bind_addr,
+            self.http3_enabled,
+        )
+    }
+}
+
+/// The listener plan a decided route admission was derived from (issue #5914).
+///
+/// Config publication uses it to derive the next generation's admission in
+/// the same store as the new route table, instead of resetting every port to
+/// pending. Ports whose planned identity is unchanged keep their decision.
+/// Ports that are new, changed, or withdrawn fail closed until the matching
+/// reconcile publishes its own decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayListenerAdmissionBasis {
+    planner: GatewayListenerPlanner,
+    ports: BTreeMap<u16, PlannedListenerPort>,
+}
+
+impl GatewayListenerAdmissionBasis {
+    fn new(planner: GatewayListenerPlanner, plan: &GatewayListenerPlan) -> Self {
+        Self {
+            planner,
+            ports: plan.admission_ports(),
+        }
+    }
+
+    /// The same planner applied to another config generation.
+    pub(crate) fn for_config(&self, config: &GatewayConfig) -> Self {
+        let plan = self.planner.plan(config);
+        Self::new(self.planner.clone(), &plan)
+    }
+
+    pub(crate) fn ports(&self) -> &BTreeMap<u16, PlannedListenerPort> {
+        &self.ports
+    }
 }
 
 /// A refusal or bind failure for one Gateway listener port (or protocol half).
@@ -512,6 +623,9 @@ struct ReconcileOutcome {
     status_observations: Vec<GatewayListenerFailureObservation>,
     transient_events: Vec<GatewayListenerTransientEvent>,
     refused_route_ports: BTreeSet<u16>,
+    /// The plan `refused_route_ports` was decided against. Published with the
+    /// decision so the next config generation can carry it forward.
+    admission_basis: GatewayListenerAdmissionBasis,
     h3_ports: Vec<u16>,
     /// Gateway listener ports this process must bind for this generation.
     desired_listeners: usize,
@@ -822,6 +936,7 @@ impl GatewayListenerManager {
                 status_observations,
                 transient_events,
                 refused_route_ports,
+                admission_basis,
                 h3_ports,
                 desired_listeners,
             } = self.reconcile_generation(&expected).await;
@@ -829,6 +944,7 @@ impl GatewayListenerManager {
             if !self.state.publish_gateway_listener_admission(
                 &expected,
                 refused_route_ports,
+                admission_basis,
                 move || {
                     for accept_gate_tx in pending_accept_gates {
                         accept_gate_tx.send_replace(true);
@@ -878,14 +994,9 @@ impl GatewayListenerManager {
         expected: &crate::request_epoch::RequestEpoch,
     ) -> ReconcileOutcome {
         let mut quic_rebind_budget = QuicRebindBudget::new();
-        let config = expected.config();
-        let plan = GatewayListenerPlan::from_config(
-            config,
-            self.state.reserved_gateway_ports.as_ref(),
-            &self.existing_frontends,
-            self.bind_addr,
-            self.http3.is_some(),
-        );
+        let planner = self.planner();
+        let plan = planner.plan(expected.config());
+        let admission_basis = GatewayListenerAdmissionBasis::new(planner, &plan);
         let mut failures: Vec<GatewayListenerBindFailure> = plan
             .refused
             .iter()
@@ -1279,8 +1390,19 @@ impl GatewayListenerManager {
             status_observations,
             transient_events,
             refused_route_ports,
+            admission_basis,
             h3_ports,
             desired_listeners,
+        }
+    }
+
+    /// The fixed inputs this manager derives every listener plan from.
+    fn planner(&self) -> GatewayListenerPlanner {
+        GatewayListenerPlanner {
+            reserved: Arc::clone(&self.state.reserved_gateway_ports),
+            existing_frontends: self.existing_frontends.clone(),
+            default_bind_addr: self.bind_addr,
+            http3_enabled: self.http3.is_some(),
         }
     }
 
@@ -2060,11 +2182,17 @@ mod tests {
             }
 
             let expected = state.request_epoch.load();
-            assert!(
-                state.publish_gateway_listener_admission(&expected, BTreeSet::new(), || {
+            let planner = manager.planner();
+            let plan = planner.plan(expected.config());
+            let published = state.publish_gateway_listener_admission(
+                &expected,
+                BTreeSet::new(),
+                GatewayListenerAdmissionBasis::new(planner, &plan),
+                || {
                     listener.accept_gate_tx.send_replace(true);
-                })
+                },
             );
+            assert!(published);
             manager.listeners.lock().await.insert(port, listener);
 
             let mut response = Vec::new();
