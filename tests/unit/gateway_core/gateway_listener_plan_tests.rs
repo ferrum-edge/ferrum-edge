@@ -521,7 +521,11 @@ fn a_wrong_class_route_on_a_process_global_frontend_is_rejected() {
         "{}",
         errors[0]
     );
-    assert!(errors[0].contains("`http_tls_listen_ports`"), "{}", errors[0]);
+    assert!(
+        errors[0].contains("`http_tls_listen_ports`"),
+        "{}",
+        errors[0]
+    );
 
     // Plaintext listener class on the TLS frontend.
     let config = frontend_config(vec![http_proxy("http-on-https", GLOBAL_HTTPS)], &[]);

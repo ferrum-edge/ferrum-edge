@@ -10786,8 +10786,14 @@ impl ProxyState {
         frontend_is_tls: bool,
     ) -> Option<crate::router_cache::RouteMatch> {
         let epoch = self.request_epoch.load();
-        self.router_cache
-            .find_proxy_in_epoch(&epoch, host, path, frontend_port, frontend_is_tls, None)
+        self.router_cache.find_proxy_in_epoch(
+            &epoch,
+            host,
+            path,
+            frontend_port,
+            frontend_is_tls,
+            None,
+        )
     }
 
     /// [`Self::find_proxy_on_frontend_for_test`] for a request on a
