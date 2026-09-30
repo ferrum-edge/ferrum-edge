@@ -652,6 +652,9 @@ async fn run_http_script(
 ) -> io::Result<()> {
     // Track whether we've already written the headers-body separator.
     let mut headers_ended = false;
+    // `RespondBodyEnd` closes this connection, so advertise that before the
+    // header section ends unless the script already sent `Connection: close`.
+    let mut connection_close_sent = false;
     // Track whether the status line has been sent. Used only by the error
     // descriptions; not otherwise observable.
     let mut _status_sent = false;
@@ -710,11 +713,21 @@ async fn run_http_script(
                 _status_sent = true;
             }
             HttpStep::RespondHeader { name, value } => {
+                if name.eq_ignore_ascii_case("connection")
+                    && value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("close"))
+                {
+                    connection_close_sent = true;
+                }
                 let line = format!("{name}: {value}\r\n");
                 stream.write_all(line.as_bytes()).await?;
             }
             HttpStep::RespondBodyChunk(bytes) => {
                 if !headers_ended {
+                    if !connection_close_sent {
+                        stream.write_all(b"Connection: close\r\n").await?;
+                    }
                     stream.write_all(b"\r\n").await?;
                     headers_ended = true;
                 }
@@ -722,6 +735,9 @@ async fn run_http_script(
             }
             HttpStep::RespondBodyEnd => {
                 if !headers_ended {
+                    if !connection_close_sent {
+                        stream.write_all(b"Connection: close\r\n").await?;
+                    }
                     stream.write_all(b"\r\n").await?;
                 }
                 let _ = stream.shutdown().await;

@@ -260,7 +260,11 @@ fn config_rejected(health: &serde_json::Value) -> bool {
 /// "`config_rejected` was raised" are both weaker than "the backend was never
 /// contacted".
 async fn proxy_post(gateway: &TestGateway, api_key: Option<&str>) -> reqwest::StatusCode {
-    let mut request = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("proxy client");
+    let mut request = client
         .post(gateway.proxy_url(&format!("{LISTEN_PATH}/write")))
         .body("payload");
     if let Some(key) = api_key {
@@ -274,7 +278,11 @@ async fn proxy_post(gateway: &TestGateway, api_key: Option<&str>) -> reqwest::St
 /// including in the window where a poll has applied the proxy but not yet its
 /// plugin association.
 async fn proxy_get(gateway: &TestGateway, api_key: Option<&str>) -> Option<u16> {
-    let mut request = reqwest::Client::new().get(gateway.proxy_url(&format!("{LISTEN_PATH}/read")));
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("proxy probe client");
+    let mut request = client.get(gateway.proxy_url(&format!("{LISTEN_PATH}/read")));
     if let Some(key) = api_key {
         request = request.header("X-API-Key", key);
     }
