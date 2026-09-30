@@ -639,6 +639,15 @@ outright with no deprecation period:
   for the next reader. Size limit, 5-second deadline, and refusal behavior are
   unchanged.
 
+- **Batched writes on TLS byte relays** (#5588). The TCP/TLS stream proxy and
+  WebSocket tunnel relay read one decrypted 16 KiB TLS record per read and
+  wrote each record separately. After a full-record read the relay now keeps
+  reading while more is ready (up to 8 extra reads, bounded by its buffer) and
+  writes the batch once. A short read ends the batch immediately, and a read
+  error met mid-batch is reported only after the bytes already read have been
+  written. On Linux at 1 MiB, TCP-TLS throughput rose 2–10% and WSS 8–13%, with
+  13–35% fewer syscalls per request; 10 KiB payloads are unchanged.
+
 ## [0.9.8] - 2026-09-27
 
 ### Changed

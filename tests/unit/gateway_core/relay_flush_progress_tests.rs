@@ -1630,3 +1630,91 @@ async fn an_empty_ws_tunnel_residual_writes_and_flushes_nothing() {
         "an empty residual must not add a flush"
     );
 }
+
+/// A transport whose reads hand out scripted chunks back to back (each one
+/// immediately ready), then EOF, and whose writes accept everything while
+/// recording each write's size.
+struct ScriptedChunks {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    writes: Arc<Mutex<Vec<usize>>>,
+}
+
+impl AsyncRead for ScriptedChunks {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Some(mut chunk) = self.chunks.pop_front() {
+            let n = chunk.len().min(buf.remaining());
+            buf.put_slice(&chunk[..n]);
+            if n < chunk.len() {
+                self.chunks.push_front(chunk.split_off(n));
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for ScriptedChunks {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.writes.lock().unwrap().push(buf.len());
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn relay_backend_write_sizes(client_reads: Vec<usize>) -> Vec<usize> {
+    let backend_writes = Arc::new(Mutex::new(Vec::new()));
+    let client = ScriptedChunks {
+        chunks: client_reads
+            .into_iter()
+            .map(|len| vec![b'x'; len])
+            .collect(),
+        writes: Arc::new(Mutex::new(Vec::new())),
+    };
+    let backend = ScriptedChunks {
+        chunks: Default::default(),
+        writes: Arc::clone(&backend_writes),
+    };
+    // An idle timeout routes through the direction-tracking relay loop (the
+    // production path); with every timeout off the relay takes tokio's
+    // `copy_bidirectional` fast path instead.
+    let _ = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        RELAY_IDLE_TIMEOUT,
+        None,
+        None,
+        None,
+        64 * 1024,
+    )
+    .await;
+    let writes = backend_writes.lock().unwrap().clone();
+    writes
+}
+
+/// Issue #5588: a userspace TLS reader hands the relay one 16 KiB record per
+/// read. While more is ready, the relay tops its buffer up and writes the
+/// batch once instead of once per record.
+#[tokio::test]
+async fn full_record_reads_are_batched_into_one_write() {
+    let writes = relay_backend_write_sizes(vec![16 * 1024, 16 * 1024, 5_000]).await;
+    assert_eq!(writes, vec![2 * 16 * 1024 + 5_000]);
+}
+
+/// A short read ends the batch at once: no speculative extra read.
+#[tokio::test]
+async fn a_short_read_is_written_without_topping_up() {
+    let writes = relay_backend_write_sizes(vec![1_000, 2_000]).await;
+    assert_eq!(writes, vec![1_000, 2_000]);
+}

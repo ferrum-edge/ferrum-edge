@@ -8458,7 +8458,20 @@ struct CopyDirectionState {
     /// Mirrors `need_flush` in tokio's own `CopyBuffer`, which exists for the
     /// same deadlock.
     needs_flush: bool,
+    /// A read error met while topping up a batch that already held bytes
+    /// (see [`RELAY_TOP_UP_MIN`]); reported by the next read, after the batch
+    /// is written, exactly as a first-read error would have been.
+    deferred_read_error: Option<std::io::Error>,
 }
+
+/// A relay read at least this large (one maximum TLS record's plaintext)
+/// suggests more is ready behind it (issue #5588). Userspace TLS readers
+/// (tokio-rustls) return one decrypted record per read, so without topping
+/// the buffer up the relay wrote each 16 KiB record separately: about twice
+/// the writes, and the per-write kernel cost, of a relay that batches.
+const RELAY_TOP_UP_MIN: usize = 16 * 1024;
+/// Bound on extra reads per batch.
+const RELAY_TOP_UP_MAX_ROUNDS: usize = 8;
 
 impl CopyDirectionState {
     fn new(buf_size: usize) -> Self {
@@ -8469,6 +8482,7 @@ impl CopyDirectionState {
             cap: 0,
             terminal_read_error: None,
             needs_flush: false,
+            deferred_read_error: None,
         }
     }
 }
@@ -8768,10 +8782,37 @@ where
                 };
             }
             CopyPhase::Reading => {
-                let read_outcome = {
+                let read_outcome = if let Some(e) = state.deferred_read_error.take() {
+                    CopyReadOutcome::Failed(e)
+                } else {
                     let mut read_buf = ReadBuf::new(state.buf.as_mut_slice());
                     match reader.as_mut().poll_read(cx, &mut read_buf) {
-                        Poll::Ready(Ok(())) => CopyReadOutcome::Filled(read_buf.filled().len()),
+                        Poll::Ready(Ok(())) => {
+                            // Top the batch up while a full record's worth keeps
+                            // arriving and the buffer has room (see
+                            // `RELAY_TOP_UP_MIN`). A short read, EOF or
+                            // `Pending` (waker already registered) ends the
+                            // batch; an error is deferred to the next read so
+                            // the bytes already read are written first.
+                            let mut last = read_buf.filled().len();
+                            let mut rounds = 0;
+                            while last >= RELAY_TOP_UP_MIN
+                                && read_buf.remaining() > 0
+                                && rounds < RELAY_TOP_UP_MAX_ROUNDS
+                            {
+                                let before = read_buf.filled().len();
+                                match reader.as_mut().poll_read(cx, &mut read_buf) {
+                                    Poll::Ready(Ok(())) => last = read_buf.filled().len() - before,
+                                    Poll::Ready(Err(e)) => {
+                                        state.deferred_read_error = Some(e);
+                                        break;
+                                    }
+                                    Poll::Pending => break,
+                                }
+                                rounds += 1;
+                            }
+                            CopyReadOutcome::Filled(read_buf.filled().len())
+                        }
                         Poll::Ready(Err(e)) => CopyReadOutcome::Failed(e),
                         Poll::Pending => CopyReadOutcome::Pending,
                     }
