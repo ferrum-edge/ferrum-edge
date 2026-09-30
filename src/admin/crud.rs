@@ -5642,11 +5642,7 @@ impl AdminResource for Consumer {
 /// caller's own body; no stored value is named.
 fn masked_placeholder_message<R: AdminResource>(role: AdminRole, sites: &[String]) -> String {
     const MAX_LISTED_SITES: usize = 16;
-    let mut listed_sites: Vec<String> = sites
-        .iter()
-        .take(MAX_LISTED_SITES)
-        .cloned()
-        .collect();
+    let mut listed_sites: Vec<String> = sites.iter().take(MAX_LISTED_SITES).cloned().collect();
     if sites.len() > MAX_LISTED_SITES {
         listed_sites.push(format!("…and {} more", sites.len() - MAX_LISTED_SITES));
     }

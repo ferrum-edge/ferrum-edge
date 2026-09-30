@@ -809,10 +809,7 @@ fn redis_url_keeps_its_documented_projection_shape() {
 #[test]
 fn redis_projection_placeholders_are_detected_at_the_masked_site() {
     for (raw_url, expected) in [
-        (
-            "redis://redacted@h:6379/0",
-            "redis://redacted@h:6379/0",
-        ),
+        ("redis://redacted@h:6379/0", "redis://redacted@h:6379/0"),
         (
             "redis://h:6379/0?[REDACTED_QUERY]",
             "redis://h:6379/0?[REDACTED_QUERY]",
