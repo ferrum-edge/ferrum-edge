@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Gateway listener accept loops now wait until their matching config generation
-  publishes listener admission, preventing newly bound ports from briefly
-  returning 404 during a config reload.
-
 ### Added
 
 - **`otel_tracing` attempt spans on the HTTP/3 bridge to HTTP/1.1 and HTTP/2
@@ -502,6 +496,10 @@ outright with no deprecation period:
   longer polled with `FERRUM_CP_DP_GRPC_JWT_SECRET`.
 
 ### Fixed
+
+- **Gateway listeners wait for matching route admission** (#5913). Newly bound
+  listener sockets do not accept connections until their matching config
+  generation publishes admission, preventing brief 404 responses during reload.
 
 - **`main-latest-image.yml` now moves `latest` after a successful publisher
   run** (#5893). GitHub withholds a job output that may contain a secret, and

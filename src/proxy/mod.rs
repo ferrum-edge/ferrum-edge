@@ -21834,6 +21834,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_mesh_plaintext_listener_with_accept_gate(
     addr: SocketAddr,
     state: ProxyState,

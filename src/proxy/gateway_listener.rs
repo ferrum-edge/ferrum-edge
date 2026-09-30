@@ -90,7 +90,10 @@
 //! A refusal — and any bind failure, such as `:80` without
 //! `CAP_NET_BIND_SERVICE` — is recorded in
 //! [`GatewayListenerManager::bind_failures`] and logged, then retried on a slow
-//! tick. It is deliberately never fatal: a Gateway listener port is
+//! tick. Reconcile can bind a socket before publishing its admission decision;
+//! accept gates open only after that decision, while the raw failure set is
+//! stored afterward and can briefly lag the listener state. Refusals are
+//! deliberately never fatal: a Gateway listener port is
 //! control-plane input, and killing the process over one unbindable port would
 //! take down every healthy listener with it.
 //!
@@ -1284,11 +1287,10 @@ impl GatewayListenerManager {
     /// Let newly bound listeners accept only after the matching route
     /// admission snapshot has been committed to the request epoch.
     async fn pending_accept_gates(&self) -> Vec<watch::Sender<bool>> {
-        let mut live = self.listeners.lock().await;
-        live.iter_mut()
-            .filter_map(|(_, listener)| {
-                (!*listener.accept_gate_tx.borrow()).then(|| listener.accept_gate_tx.clone())
-            })
+        let live = self.listeners.lock().await;
+        live.values()
+            .filter(|listener| !*listener.accept_gate_tx.borrow())
+            .map(|listener| listener.accept_gate_tx.clone())
             .collect()
     }
 

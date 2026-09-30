@@ -1059,6 +1059,58 @@ async fn listener_admission_is_generation_bound_before_reconcile_acknowledgement
     manager.shutdown_all().await;
 }
 
+/// A Gateway listener becomes routable only after reconcile publishes admission
+/// for the same generation, then serves the configured backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_listener_serves_after_its_generation_is_admitted() {
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
+
+    let (backend, _backend_task) = start_body_backend(b"admitted-listener").await;
+    let listener_port = reserve_free_port_avoiding(&[]).await;
+    let state = ProxyState::new(
+        config_with(vec![]),
+        DnsCache::new(DnsConfig::default()),
+        test_env_config(0, 0),
+        None,
+        None,
+    )
+    .expect("proxy state")
+    .0;
+    let manager = GatewayListenerManager::new(
+        state.clone(),
+        std::net::IpAddr::from([127, 0, 0, 1]),
+        GatewayListenerTls::default(),
+    );
+    manager.reconcile().await;
+
+    let outcome = state.update_config(config_with(vec![port_scoped_proxy(
+        "admitted-listener",
+        backend,
+        Some(listener_port),
+    )]));
+    assert!(outcome.applied(), "listener config must publish: {outcome:?}");
+    assert!(
+        state
+            .find_proxy_on_frontend_for_test(Some(HOST), "/api/x", Some(listener_port), false)
+            .is_none(),
+        "the route must remain pending until listener admission is published"
+    );
+
+    assert!(manager.reconcile().await.is_empty());
+    assert_eq!(manager.active_ports().await, vec![listener_port]);
+    assert!(
+        state
+            .find_proxy_on_frontend_for_test(Some(HOST), "/api/x", Some(listener_port), false)
+            .is_some(),
+        "reconcile must publish admission for the bound listener generation"
+    );
+    assert_eq!(http_get(listener_port, "/api/x").await.1, "admitted-listener");
+
+    manager.shutdown_all().await;
+}
+
 /// An HTTP↔HTTPS class flip must never leave the retiring plaintext accept
 /// loops running beside the new TLS ones.
 ///

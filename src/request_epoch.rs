@@ -555,15 +555,23 @@ mod tests {
             .expect("new config publication")
             .expect("new config epoch");
 
+        let (accept_gate_tx, _) = tokio::sync::watch::channel(false);
+        let gate_for_activation = accept_gate_tx.clone();
         assert!(
             store
                 .publish_gateway_listener_admission(
                     &old_ack,
                     GatewayListenerAdmission::decided(std::collections::BTreeSet::new()),
-                    |_| {},
+                    move |_| {
+                        gate_for_activation.send_replace(true);
+                    },
                 )
                 .is_none(),
             "generation N must not publish an admission decision for N+1"
+        );
+        assert!(
+            !*accept_gate_tx.borrow(),
+            "a stale admission decision must not open newly bound listener gates"
         );
         let pending = store.load();
         assert!(
