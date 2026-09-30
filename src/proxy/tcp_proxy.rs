@@ -8459,9 +8459,21 @@ struct CopyDirectionState {
     /// same deadlock.
     needs_flush: bool,
     /// A read error met while topping up a batch that already held bytes
-    /// (see [`RELAY_TOP_UP_MIN`]); reported by the next read, after the batch
-    /// is written, exactly as a first-read error would have been.
+    /// (see [`RELAY_TOP_UP_MIN`]). The next read phase reports it, after the
+    /// batch is written, as a first-read error would be reported — unless
+    /// writing the batch fails first. Then the write error ends the direction
+    /// and this read error is dropped, the same order as before batching,
+    /// when the failing read was simply never reached.
     deferred_read_error: Option<std::io::Error>,
+    /// A top-up read returned EOF after the batch already held bytes. The next
+    /// read phase half-closes straight away instead of polling the reader
+    /// again: a reader past EOF need not repeat it, and several relay wrappers
+    /// do not — `AdmittedStream` (admission closed), `TrustFencedStream`
+    /// (fence), `H2ConnectTunnel` (retired / keepalive failed) and
+    /// `AuthorizationDeadlineStream` (expired) can answer a second poll with
+    /// an error, turning a clean EOF into a read-side failure. A first-read
+    /// EOF needs no flag: it half-closes on the spot.
+    read_eof: bool,
 }
 
 /// A relay read at least this large (one maximum TLS record's plaintext)
@@ -8470,7 +8482,12 @@ struct CopyDirectionState {
 /// the buffer up the relay wrote each 16 KiB record separately: about twice
 /// the writes, and the per-write kernel cost, of a relay that batches.
 const RELAY_TOP_UP_MIN: usize = 16 * 1024;
-/// Bound on extra reads per batch.
+/// Bound on extra reads per batch. The relay buffer is usually the real
+/// limit: the default adaptive 64 KiB buffer holds four records, so a batch
+/// makes at most 3 extra reads; a buffer of 16 KiB or less never batches (a
+/// full first read leaves no room); and a peer that sends records smaller
+/// than 16 KiB never triggers a top-up at all. This cap only binds on buffers
+/// larger than 144 KiB.
 const RELAY_TOP_UP_MAX_ROUNDS: usize = 8;
 
 impl CopyDirectionState {
@@ -8483,6 +8500,7 @@ impl CopyDirectionState {
             terminal_read_error: None,
             needs_flush: false,
             deferred_read_error: None,
+            read_eof: false,
         }
     }
 }
@@ -8750,6 +8768,18 @@ fn relay_watchdog(interval: Duration) -> tokio::time::Interval {
 /// benign peer-already-gone one, ends the direction as a write-side failure
 /// rather than as a clean completion ([`finish_half_close`]).
 ///
+/// **Read batching (issue #5588):** a read that returns at least
+/// [`RELAY_TOP_UP_MIN`] bytes (one full TLS record's plaintext) is topped up
+/// with further reads into the same buffer, while it has room and for at most
+/// [`RELAY_TOP_UP_MAX_ROUNDS`] extra reads, so a userspace TLS reader's
+/// back-to-back records reach the writer as one write. A short read, `Pending`
+/// or EOF ends the batch; EOF is remembered ([`CopyDirectionState::read_eof`])
+/// so the next read phase half-closes without polling the reader again. A read
+/// error met while topping up is deferred
+/// ([`CopyDirectionState::deferred_read_error`]): the batch is written first
+/// and the error is then reported as a first-read error would be, unless that
+/// write fails first, in which case the write error ends the direction.
+///
 /// `read_watermark` / `write_watermark` are per-direction inactivity
 /// timestamps polled by the `bidirectional_copy` watchdog. Shared via
 /// bare references to parent-scoped `AtomicU64`s — no `Arc` indirection
@@ -8784,6 +8814,11 @@ where
             CopyPhase::Reading => {
                 let read_outcome = if let Some(e) = state.deferred_read_error.take() {
                     CopyReadOutcome::Failed(e)
+                } else if state.read_eof {
+                    // The top-up that ended the last batch already saw EOF, so
+                    // take the half-close path without polling the reader
+                    // again (see `CopyDirectionState::read_eof`).
+                    CopyReadOutcome::Filled(0)
                 } else {
                     let mut read_buf = ReadBuf::new(state.buf.as_mut_slice());
                     match reader.as_mut().poll_read(cx, &mut read_buf) {
@@ -8792,8 +8827,9 @@ where
                             // arriving and the buffer has room (see
                             // `RELAY_TOP_UP_MIN`). A short read, EOF or
                             // `Pending` (waker already registered) ends the
-                            // batch; an error is deferred to the next read so
-                            // the bytes already read are written first.
+                            // batch; EOF and an error are both carried to the
+                            // next read phase so the bytes already read are
+                            // written first.
                             let mut last = read_buf.filled().len();
                             let mut rounds = 0;
                             while last >= RELAY_TOP_UP_MIN
@@ -8802,7 +8838,13 @@ where
                             {
                                 let before = read_buf.filled().len();
                                 match reader.as_mut().poll_read(cx, &mut read_buf) {
-                                    Poll::Ready(Ok(())) => last = read_buf.filled().len() - before,
+                                    Poll::Ready(Ok(())) => {
+                                        last = read_buf.filled().len() - before;
+                                        if last == 0 {
+                                            state.read_eof = true;
+                                            break;
+                                        }
+                                    }
                                     Poll::Ready(Err(e)) => {
                                         state.deferred_read_error = Some(e);
                                         break;

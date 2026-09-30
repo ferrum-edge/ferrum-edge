@@ -49,12 +49,12 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    StreamIoSide, bidirectional_copy_for_fenced_relay_for_test,
+    StreamCopyResult, StreamIoSide, bidirectional_copy_for_fenced_relay_for_test,
     bidirectional_copy_for_test_with_timeouts, bidirectional_copy_with_authorization_for_test,
     forward_ws_tunnel_residual_for_test, tcp_forward_prefix_under_trust_fence_for_test,
 };
 use ferrum_edge::plugins::Direction;
-use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::retry::{ErrorClass, TLS_CLOSE_WITHOUT_NOTIFY};
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, DuplexStream, ReadBuf,
 };
@@ -1673,7 +1673,11 @@ impl AsyncWrite for ScriptedChunks {
     }
 }
 
-async fn relay_backend_write_sizes(client_reads: Vec<usize>) -> Vec<usize> {
+/// Relay `client_reads` (each chunk immediately ready, then EOF) to a backend
+/// through a relay with a `buf_size` buffer, and return the size of every
+/// write the backend saw. The relay must end cleanly with every byte counted.
+async fn relay_backend_write_sizes(buf_size: usize, client_reads: Vec<usize>) -> Vec<usize> {
+    let total: usize = client_reads.iter().sum();
     let backend_writes = Arc::new(Mutex::new(Vec::new()));
     let client = ScriptedChunks {
         chunks: client_reads
@@ -1689,32 +1693,405 @@ async fn relay_backend_write_sizes(client_reads: Vec<usize>) -> Vec<usize> {
     // An idle timeout routes through the direction-tracking relay loop (the
     // production path); with every timeout off the relay takes tokio's
     // `copy_bidirectional` fast path instead.
-    let _ = bidirectional_copy_for_test_with_timeouts(
+    let result = bidirectional_copy_for_test_with_timeouts(
         client,
         backend,
         RELAY_IDLE_TIMEOUT,
         None,
         None,
         None,
-        64 * 1024,
+        buf_size,
     )
     .await;
-    let writes = backend_writes.lock().unwrap().clone();
-    writes
+    assert!(
+        result.first_failure.is_none(),
+        "a scripted relay that ends in clean EOF must report no failure, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(result.bytes_client_to_backend, total as u64);
+    assert_eq!(result.bytes_backend_to_client, 0);
+    backend_writes.lock().unwrap().clone()
 }
+
+/// One maximum TLS record's plaintext: the read size that starts a top-up.
+const TLS_RECORD: usize = 16 * 1024;
 
 /// Issue #5588: a userspace TLS reader hands the relay one 16 KiB record per
 /// read. While more is ready, the relay tops its buffer up and writes the
 /// batch once instead of once per record.
 #[tokio::test]
 async fn full_record_reads_are_batched_into_one_write() {
-    let writes = relay_backend_write_sizes(vec![16 * 1024, 16 * 1024, 5_000]).await;
+    let writes = relay_backend_write_sizes(64 * 1024, vec![16 * 1024, 16 * 1024, 5_000]).await;
     assert_eq!(writes, vec![2 * 16 * 1024 + 5_000]);
 }
 
 /// A short read ends the batch at once: no speculative extra read.
 #[tokio::test]
 async fn a_short_read_is_written_without_topping_up() {
-    let writes = relay_backend_write_sizes(vec![1_000, 2_000]).await;
+    let writes = relay_backend_write_sizes(64 * 1024, vec![1_000, 2_000]).await;
     assert_eq!(writes, vec![1_000, 2_000]);
+}
+
+/// One byte under a full record is a short read: it is written on its own.
+#[tokio::test]
+async fn a_read_one_byte_under_a_full_record_does_not_top_up() {
+    let writes = relay_backend_write_sizes(64 * 1024, vec![TLS_RECORD - 1, TLS_RECORD]).await;
+    assert_eq!(writes, vec![TLS_RECORD - 1, TLS_RECORD]);
+}
+
+/// A batch stops when the buffer is full: the default adaptive 64 KiB buffer
+/// takes four records (three extra reads), and the fifth starts a new batch.
+#[tokio::test]
+async fn a_full_buffer_ends_the_batch() {
+    let writes = relay_backend_write_sizes(64 * 1024, vec![TLS_RECORD; 5]).await;
+    assert_eq!(writes, vec![65_536, 16_384]);
+}
+
+/// The round cap binds only on a buffer larger than 144 KiB: a batch is the
+/// first read plus at most `RELAY_TOP_UP_MAX_ROUNDS` (8) extra reads.
+#[tokio::test]
+async fn the_round_cap_ends_the_batch_on_a_large_buffer() {
+    let writes = relay_backend_write_sizes(256 * 1024, vec![TLS_RECORD; 12]).await;
+    assert_eq!(writes, vec![147_456, 49_152]);
+}
+
+/// One step of a [`ScriptedReader`] read script.
+enum ReadStep {
+    /// Hand out this many bytes, immediately ready.
+    Data(usize),
+    /// Fail the read with this error.
+    Fail(io::Error),
+    /// Stay `Pending` until the gate opens, keeping the waker so that opening
+    /// it wakes the relay.
+    Wait(Arc<ReadGate>),
+}
+
+/// The gate a [`ReadStep::Wait`] parks on.
+#[derive(Default)]
+struct ReadGate {
+    open: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl ReadGate {
+    fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+
+/// A client leg whose reads follow a script of [`ReadStep`]s and then report
+/// EOF, counting every `poll_read` so a test can prove the relay stopped
+/// asking. Its write half accepts everything; the backend→client direction
+/// (whose backend reports EOF at once) only half-closes it.
+struct ScriptedReader {
+    steps: std::collections::VecDeque<ReadStep>,
+    polls: Arc<AtomicUsize>,
+}
+
+impl ScriptedReader {
+    fn new(steps: Vec<ReadStep>) -> (Self, Arc<AtomicUsize>) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let reader = Self {
+            steps: steps.into(),
+            polls: Arc::clone(&polls),
+        };
+        (reader, polls)
+    }
+}
+
+impl AsyncRead for ScriptedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        loop {
+            match self.steps.pop_front() {
+                None => return Poll::Ready(Ok(())),
+                Some(ReadStep::Data(len)) => {
+                    let n = len.min(buf.remaining());
+                    buf.put_slice(&vec![b'x'; n]);
+                    if n < len {
+                        self.steps.push_front(ReadStep::Data(len - n));
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Some(ReadStep::Fail(e)) => return Poll::Ready(Err(e)),
+                Some(ReadStep::Wait(gate)) => {
+                    let mut waker = gate.waker.lock().unwrap();
+                    if gate.open.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    *waker = Some(cx.waker().clone());
+                    drop(waker);
+                    self.steps.push_front(ReadStep::Wait(gate));
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl AsyncWrite for ScriptedReader {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+const CLIENT_READ_FAILURE_TEXT: &str = "simulated client reset mid-batch";
+const BACKEND_WRITE_FAILURE_TEXT: &str = "simulated backend abort on write";
+
+/// What a [`RecordingBackend`] saw.
+#[derive(Clone, Default)]
+struct BackendLog {
+    writes: Arc<Mutex<Vec<usize>>>,
+    written: Arc<AtomicUsize>,
+    shut_down: Arc<AtomicBool>,
+}
+
+/// A backend leg that records each write's size and its half-close, and
+/// reports EOF on read. With `fail_writes` set, every write fails instead.
+struct RecordingBackend {
+    log: BackendLog,
+    fail_writes: Option<io::ErrorKind>,
+}
+
+impl RecordingBackend {
+    fn new(fail_writes: Option<io::ErrorKind>) -> (Self, BackendLog) {
+        let log = BackendLog::default();
+        let backend = Self {
+            log: log.clone(),
+            fail_writes,
+        };
+        (backend, log)
+    }
+}
+
+impl AsyncRead for RecordingBackend {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for RecordingBackend {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if let Some(kind) = self.fail_writes {
+            return Poll::Ready(Err(io::Error::new(kind, BACKEND_WRITE_FAILURE_TEXT)));
+        }
+        self.log.writes.lock().unwrap().push(buf.len());
+        self.log.written.fetch_add(buf.len(), Ordering::SeqCst);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.log.shut_down.store(true, Ordering::SeqCst);
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Run the direction-tracking relay (an idle timeout keeps it off tokio's
+/// `copy_bidirectional` fast path) with the default adaptive 64 KiB buffer.
+async fn run_relay(client: ScriptedReader, backend: RecordingBackend) -> StreamCopyResult {
+    let relay = bidirectional_copy_for_test_with_timeouts(
+        client,
+        backend,
+        RELAY_IDLE_TIMEOUT,
+        RELAY_HALF_CLOSE_CAP,
+        None,
+        None,
+        64 * 1024,
+    );
+    tokio::time::timeout(DELIVERY_WINDOW, relay)
+        .await
+        .expect("the scripted relay must finish on its own")
+}
+
+/// A top-up read that returns `Pending` ends the batch without holding it: the
+/// record already read is written at once, not kept until more arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_mid_top_up_still_writes_the_batch() {
+    let gate = Arc::new(ReadGate::default());
+    let (client, _polls) = ScriptedReader::new(vec![
+        ReadStep::Data(TLS_RECORD),
+        ReadStep::Wait(Arc::clone(&gate)),
+        ReadStep::Data(1_000),
+    ]);
+    let (backend, log) = RecordingBackend::new(None);
+    let relay = tokio::spawn(run_relay(client, backend));
+
+    // More data arrives only once the first record reached the backend, so it
+    // cannot be what completed that write.
+    wait_until_at_least(&log.written, TLS_RECORD, "backend bytes").await;
+    gate.open();
+
+    let result = relay.await.expect("relay task");
+    assert!(
+        result.first_failure.is_none(),
+        "a batch cut short by `Pending` is not a failure, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(*log.writes.lock().unwrap(), vec![TLS_RECORD, 1_000]);
+    assert_eq!(result.bytes_client_to_backend, (TLS_RECORD + 1_000) as u64);
+    assert!(
+        log.shut_down.load(Ordering::SeqCst),
+        "the backend must be half-closed"
+    );
+}
+
+/// A read error met while topping up waits until the batch is written, then
+/// ends the direction as a read-side failure — once, from the relay's own
+/// state rather than by asking the reader again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_error_mid_top_up_is_reported_after_the_batch() {
+    let reset = io::Error::new(io::ErrorKind::ConnectionReset, CLIENT_READ_FAILURE_TEXT);
+    let script = vec![ReadStep::Data(TLS_RECORD), ReadStep::Fail(reset)];
+    let (client, polls) = ScriptedReader::new(script);
+    let (backend, log) = RecordingBackend::new(None);
+    let result = run_relay(client, backend).await;
+
+    assert_eq!(
+        *log.writes.lock().unwrap(),
+        vec![TLS_RECORD],
+        "the record read before the error must be written first"
+    );
+    assert_eq!(result.bytes_client_to_backend, TLS_RECORD as u64);
+    let (dir, _class, side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("a client read error is a relay failure");
+    assert_eq!(*dir, Direction::ClientToBackend);
+    assert_eq!(
+        *side,
+        Some(StreamIoSide::Read),
+        "the error came from the reader"
+    );
+    assert_eq!(
+        msg.matches(CLIENT_READ_FAILURE_TEXT).count(),
+        1,
+        "the reader's own message must be reported once, got: {msg}"
+    );
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        2,
+        "the deferred error is reported without polling the reader again"
+    );
+}
+
+/// The deferred error may be userspace rustls' missing-`close_notify` EOF. It
+/// takes the same clean half-close a first-read one does: no failure, and the
+/// backend is shut down after the batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_without_notify_mid_top_up_half_closes_cleanly() {
+    let close = io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("peer closed connection {TLS_CLOSE_WITHOUT_NOTIFY}"),
+    );
+    let script = vec![ReadStep::Data(TLS_RECORD), ReadStep::Fail(close)];
+    let (client, polls) = ScriptedReader::new(script);
+    let (backend, log) = RecordingBackend::new(None);
+    let result = run_relay(client, backend).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "a close without close_notify is clean EOF, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(*log.writes.lock().unwrap(), vec![TLS_RECORD]);
+    assert_eq!(result.bytes_client_to_backend, TLS_RECORD as u64);
+    assert!(
+        log.shut_down.load(Ordering::SeqCst),
+        "the backend must be half-closed"
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+}
+
+/// EOF met while topping up is remembered: the batch is written, the backend
+/// is half-closed, and the reader is never polled past its EOF. Wrappers such
+/// as the admission, trust-fence, HBONE tunnel and authorization-deadline
+/// streams may answer a second poll with an error, which would turn this clean
+/// EOF into a read-side failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eof_mid_top_up_half_closes_after_the_batch() {
+    let (client, polls) = ScriptedReader::new(vec![ReadStep::Data(TLS_RECORD)]);
+    let (backend, log) = RecordingBackend::new(None);
+    let result = run_relay(client, backend).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "EOF mid-batch is a clean end, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(
+        *log.writes.lock().unwrap(),
+        vec![TLS_RECORD],
+        "one write, then EOF"
+    );
+    assert_eq!(result.bytes_client_to_backend, TLS_RECORD as u64);
+    assert!(
+        log.shut_down.load(Ordering::SeqCst),
+        "the backend must be half-closed"
+    );
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        2,
+        "the reader must not be polled again after the top-up saw EOF"
+    );
+}
+
+/// When writing the batch fails, the write error ends the direction and the
+/// deferred read error is dropped — the order the relay had before batching,
+/// when the failing read was never reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_failure_after_a_deferred_read_error_reports_the_write() {
+    let reset = io::Error::new(io::ErrorKind::ConnectionReset, CLIENT_READ_FAILURE_TEXT);
+    let script = vec![ReadStep::Data(TLS_RECORD), ReadStep::Fail(reset)];
+    let (client, polls) = ScriptedReader::new(script);
+    let (backend, log) = RecordingBackend::new(Some(io::ErrorKind::ConnectionAborted));
+    let result = run_relay(client, backend).await;
+
+    let (dir, _class, side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("a failed backend write is a relay failure");
+    assert_eq!(*dir, Direction::ClientToBackend);
+    assert_eq!(*side, Some(StreamIoSide::Write));
+    assert!(
+        msg.contains(BACKEND_WRITE_FAILURE_TEXT),
+        "the write error must be the one reported, got: {msg}"
+    );
+    assert!(
+        !msg.contains(CLIENT_READ_FAILURE_TEXT),
+        "the deferred read error must not replace the write error, got: {msg}"
+    );
+    assert!(log.writes.lock().unwrap().is_empty());
+    assert_eq!(result.bytes_client_to_backend, 0);
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
 }
