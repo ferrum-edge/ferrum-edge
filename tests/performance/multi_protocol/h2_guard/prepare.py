@@ -129,6 +129,7 @@ def check_pins_only(provenance):
     if admin.count(anchor) != 1:
         raise SystemExit("pin check failed: src/admin/mod.rs metrics anchor must occur once")
     hook = (ASSETS / "metrics-hook.txt").read_bytes()
+    hook_hash = sha(hook)
     after = admin.replace(anchor, anchor + hook)
     before_hash = sha(admin)
     after_hash = sha(after)
@@ -156,10 +157,16 @@ def check_pins_only(provenance):
     print('  "src/admin/mod.rs": {')
     print(f'    "before": "{before_hash}",')
     print(f'    "after": "{after_hash}"')
-    print("  }")
+    print("  },")
+    print('"assets": {')
+    print(f'  "metrics-hook.txt": "{hook_hash}"')
     print("}")
     if (before_hash, after_hash) != (expected["before"], expected["after"]):
         raise SystemExit("pin check failed: update source.json with the computed values above")
+    if hook_hash != provenance["assets"]["metrics-hook.txt"]:
+        raise SystemExit(
+            "pin check failed: update source.json with the computed metrics hook hash above"
+        )
     print("H2 guard pins match source.json and all pinned input anchors are present.")
 
 

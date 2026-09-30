@@ -945,14 +945,15 @@ request that changes one of those inputs or the H2 guard assets. Its
 `prepare.py --check-pins-only` mode uses only Python's standard library to read
 the checkout, hash the admin source and its prepared postimage, and validate
 the Cargo/Docker anchors. It does not download the crate or create a build
-context. A mismatch prints the exact replacement `context_files` object for
-`tests/performance/multi_protocol/h2_guard/source.json`; the heavier observation
-workflow remains responsible for build and regression validation.
+context. A mismatch prints the replacement `context_files` object and
+`metrics-hook.txt` hash for `tests/performance/multi_protocol/h2_guard/source.json`;
+the heavier observation workflow remains responsible for build and regression
+validation.
 
-When a pinned file changes on purpose, refresh the pin in the same PR where
-possible (run the lane with `workflow_dispatch` on the PR branch); otherwise
-the post-merge run goes red and the next PR must refresh it. Any new optional
-lane whose prepare script hashes files under `src/` (for example a
+When `src/admin/mod.rs` changes on purpose, refresh its pin in the same PR
+using the replacement values printed by the automatic `H2 guard pins` check.
+Otherwise the post-merge run goes red and the next PR must refresh it. Any new
+optional lane whose prepare script hashes files under `src/` (for example a
 `context_files` entry) must add those files to its `push` paths and a row here.
 Lanes that hash only their own assets or runtime evidence (the internal-profile
 and trace lanes, `native-cache-envelope.yml`) need no extra trigger.
