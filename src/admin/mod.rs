@@ -2618,6 +2618,7 @@ fn enforce_namespace_claim(
         warn!(
             audit.event = "admin_namespace_authz",
             actor = %auth.sub,
+            key_tier = auth.key_tier.as_str(),
             namespace = %namespace,
             path = %path,
             result = "denied",
@@ -2635,6 +2636,7 @@ fn enforce_namespace_claim(
     warn!(
         audit.event = "admin_namespace_authz",
         actor = %auth.sub,
+        key_tier = auth.key_tier.as_str(),
         namespace = %namespace,
         path = %path,
         result = "denied",
@@ -2712,6 +2714,9 @@ fn diagnostic_ref_lookup_response(
 ) -> Response<Full<Bytes>> {
     use crate::diagnostic_ref::DiagnosticRefLookup;
 
+    // Defense in depth: the caller already derived the grant through
+    // `VerifiedAdminToken::grants_scope`, which refuses viewer-key scopes.
+    let diagnostics_read_granted = diagnostics_read_granted && auth.key_tier.honours_scopes();
     let outcome = crate::diagnostic_ref::authorize_lookup(
         crate::diagnostic_ref::active_store(),
         &auth.sub,
@@ -2733,6 +2738,7 @@ fn diagnostic_ref_lookup_response(
         warn!(
             audit.event = "diagnostic_ref_lookup",
             actor = %auth.sub,
+            key_tier = auth.key_tier.as_str(),
             reference = %logged_reference,
             result = result.as_str(),
             suppressed_since_last = suppressed,
@@ -3622,7 +3628,8 @@ async fn handle_admin_request_inner(
     let (auth, diagnostics_read) = match state.jwt_manager.verify_request(auth_header.as_deref()) {
         Ok(token_data) => match AuditActor::from_verified(&token_data) {
             Ok(actor) => {
-                let diagnostics_read = token_data.claims.grants_scope(DIAGNOSTICS_READ_SCOPE);
+                // Tier-aware: a viewer-key token's `scope` claims grant nothing.
+                let diagnostics_read = token_data.grants_scope(DIAGNOSTICS_READ_SCOPE);
                 (actor, diagnostics_read)
             }
             Err(message) => {
@@ -4534,10 +4541,12 @@ async fn handle_admin_request_inner(
         }
 
         // Read-only configuration export (issue #5904). Any authenticated role,
-        // including a token verified by FERRUM_ADMIN_JWT_VIEWER_SECRET: every
-        // credential is replaced by a keyed fingerprint, so this carries no
-        // more than the viewer projections of the same resources. Namespace-
-        // scoped, and a present `ns` claim is always honoured here — even with
+        // including a token verified by FERRUM_ADMIN_JWT_VIEWER_SECRET. It is
+        // built from the same projections ordinary viewer reads use, with each
+        // withheld value rendered as a keyed fingerprint, plus one per-consumer
+        // fingerprint of the credential types viewer reads omit (which does
+        // not reveal whether any exist). Namespace-scoped, and a present `ns`
+        // claim is always honoured here — even with
         // FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM off — so a namespace-scoped
         // read-only token cannot export another tenant.
         (Method::GET, ["config", "export"]) => {
@@ -4549,7 +4558,7 @@ async fn handle_admin_request_inner(
             {
                 return Ok(resp);
             }
-            Ok(config_export::handle_config_export(&state, &namespace).await)
+            Ok(config_export::handle_config_export(&state, &auth, &namespace).await)
         }
 
         // Backup & Restore
@@ -5316,6 +5325,7 @@ async fn handle_mesh_config_revision_reset(
     let cleared = mesh_runtime.reset_accepted_revision();
     warn!(
         actor = %auth.sub,
+        key_tier = auth.key_tier.as_str(),
         cleared_authority = cleared
             .as_ref()
             .map(|revision| revision.authority.as_str())
@@ -12536,6 +12546,7 @@ mod tests {
             sub: "tester".to_string(),
             role: AdminRole::Admin,
             allowed_namespaces: allowed,
+            key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
         };
 
         // No claim → denied when enforcement is on.
@@ -12579,6 +12590,7 @@ mod tests {
             sub: "tester".to_string(),
             role: AdminRole::Viewer,
             allowed_namespaces: allowed,
+            key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
         };
         let names = vec![
             "alpha".to_string(),
@@ -12813,11 +12825,13 @@ mod tests {
             sub: "operator".to_string(),
             role: AdminRole::Operator,
             allowed_namespaces: crate::grpc::auth::AllowedNamespaces::empty(),
+            key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
         };
         let admin = AuditActor {
             sub: "admin".to_string(),
             role: AdminRole::Admin,
             allowed_namespaces: crate::grpc::auth::AllowedNamespaces::empty(),
+            key_tier: crate::admin::jwt_auth::AdminKeyTier::Primary,
         };
         for (method, route) in admin_only {
             let required = tls_route_required_role(&method, &route);

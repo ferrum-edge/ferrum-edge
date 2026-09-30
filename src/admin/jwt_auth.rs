@@ -21,10 +21,13 @@
 //! needs to read configuration (drift detection, dashboards) is given this
 //! secret and can then mint nothing that reaches `operator` or `admin`.
 //!
-//! The ceiling is a property of *which key verified the signature*, recorded on
-//! [`VerifiedAdminToken::role_ceiling`] and applied when the request's
+//! The ceiling is a property of *which key verified the signature*, recorded as
+//! [`VerifiedAdminToken::key_tier`] and applied when the request's
 //! [`crate::admin::audit::AuditActor`] is built — the single place every route
-//! reads its role from. It is never derived from a token header or claim:
+//! reads its role from. A viewer-key token's `scope` claims grant nothing, and
+//! its `sub` and `ns` are whatever its holder chose: the viewer secret is a
+//! fleet-wide read credential, not a per-tenant or per-identity one. The tier
+//! is never derived from a token header or claim:
 //!
 //! - both keys are pinned to HS256 (`Validation::new` sets the only accepted
 //!   algorithm, so `none`, `HS384`/`HS512`, and asymmetric algorithms are
@@ -83,6 +86,44 @@ impl AdminRole {
     /// The lower of `self` and `ceiling`.
     pub fn capped_at(self, ceiling: Self) -> Self {
         self.min(ceiling)
+    }
+}
+
+/// Which verification key accepted an admin JWT's signature.
+///
+/// The tier, not any claim, bounds what the token may do. It is carried on
+/// [`crate::admin::audit::AuditActor`] into authorization, log lines, and audit
+/// records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminKeyTier {
+    /// `FERRUM_ADMIN_JWT_SECRET`: the `role` and `scope` claims are honoured.
+    Primary,
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET`: the role is capped at
+    /// [`AdminRole::Viewer`] and `scope` claims grant nothing. Its holder can
+    /// mint any `sub` and `ns`, so neither is an identity or tenancy boundary.
+    Viewer,
+}
+
+impl AdminKeyTier {
+    /// Stable log / audit label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    /// Highest role a token verified by this key may exercise.
+    pub fn role_ceiling(self) -> AdminRole {
+        match self {
+            Self::Primary => AdminRole::Admin,
+            Self::Viewer => AdminRole::Viewer,
+        }
+    }
+
+    /// Whether `scope` claims (for example `diagnostics:read`) are honoured.
+    pub fn honours_scopes(self) -> bool {
+        matches!(self, Self::Primary)
     }
 }
 
@@ -190,25 +231,35 @@ impl Default for JwtConfig {
 
 /// A signature-verified admin JWT.
 ///
-/// `role_ceiling` records which verification key accepted the signature:
-/// [`AdminRole::Admin`] for `FERRUM_ADMIN_JWT_SECRET`, [`AdminRole::Viewer`]
-/// for `FERRUM_ADMIN_JWT_VIEWER_SECRET`. Authorization must use
-/// [`VerifiedAdminToken::effective_role`] (or
-/// [`crate::admin::audit::AuditActor::from_verified`]), never the raw `role`
-/// claim.
+/// `key_tier` records which verification key accepted the signature.
+/// Authorization must use [`VerifiedAdminToken::effective_role`] and
+/// [`VerifiedAdminToken::grants_scope`] (or
+/// [`crate::admin::audit::AuditActor::from_verified`]), never the raw `role` or
+/// `scope` claims.
 #[derive(Debug)]
 pub struct VerifiedAdminToken {
     pub header: jsonwebtoken::Header,
     pub claims: AdminClaims,
-    pub role_ceiling: AdminRole,
+    pub key_tier: AdminKeyTier,
 }
 
 impl VerifiedAdminToken {
+    /// Highest role the verifying key allows.
+    pub fn role_ceiling(&self) -> AdminRole {
+        self.key_tier.role_ceiling()
+    }
+
     /// The role this token may exercise: its `role` claim capped at the
     /// ceiling of the key that verified it. A missing or malformed `role`
     /// claim still fails closed.
     pub fn effective_role(&self) -> Result<AdminRole, String> {
-        Ok(self.claims.admin_role()?.capped_at(self.role_ceiling))
+        Ok(self.claims.admin_role()?.capped_at(self.role_ceiling()))
+    }
+
+    /// Whether the token grants `scope`. A viewer-key token grants no scope,
+    /// whatever its `scope` claim says.
+    pub fn grants_scope(&self, scope: &str) -> bool {
+        self.key_tier.honours_scopes() && self.claims.grants_scope(scope)
     }
 }
 
@@ -283,7 +334,7 @@ impl JwtManager {
     ///
     /// The primary secret is tried first. Only when it reports a signature
     /// mismatch is the optional viewer secret tried, and a token it verifies
-    /// carries [`AdminRole::Viewer`] as its ceiling. Every other failure
+    /// carries [`AdminKeyTier::Viewer`]. Every other failure
     /// (wrong algorithm, expired, bad claims) is final: the viewer key is
     /// never a second chance for a token the primary key could parse.
     pub fn verify_token(&self, token: &str) -> Result<VerifiedAdminToken, JwtEncodeError> {
@@ -293,7 +344,7 @@ impl JwtManager {
                 return Ok(VerifiedAdminToken {
                     header: data.header,
                     claims: data.claims,
-                    role_ceiling: AdminRole::Admin,
+                    key_tier: AdminKeyTier::Primary,
                 });
             }
             Err(error) => error,
@@ -313,7 +364,7 @@ impl JwtManager {
         Ok(VerifiedAdminToken {
             header: data.header,
             claims: data.claims,
-            role_ceiling: AdminRole::Viewer,
+            key_tier: AdminKeyTier::Viewer,
         })
     }
 

@@ -154,9 +154,26 @@ pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] = &[
 /// drift apart: a field the ordinary projection redacts is fingerprinted by the
 /// export, and a field it leaves alone is left alone by both.
 pub trait RedactionRendering {
-    /// Render one withheld value. `stored` is the value as persisted;
-    /// `redacted` is what the ordinary projection would emit in its place.
-    fn render(&self, stored: &serde_json::Value, redacted: serde_json::Value) -> serde_json::Value;
+    /// Render one withheld value. `pointer` is the RFC 6901 JSON pointer of the
+    /// site within the resource's response body (for example
+    /// `/credentials/keyauth/0/key` or `/config/headers/x-api-key`); `stored`
+    /// is the value as persisted; `redacted` is what the ordinary projection
+    /// would emit in its place.
+    fn render(
+        &self,
+        pointer: &str,
+        stored: &serde_json::Value,
+        redacted: serde_json::Value,
+    ) -> serde_json::Value;
+
+    /// Whether a value this renderer withheld is fully opaque, so a later
+    /// projection layer matching the same site has nothing left to hide and
+    /// must not render it again. The placeholder renderer is not: a URL
+    /// projection it emitted can still be narrowed to `[REDACTED]` by a
+    /// later name rule.
+    fn renders_opaque(&self) -> bool {
+        false
+    }
 }
 
 /// The ordinary rendering: emit the redacted form unchanged.
@@ -166,10 +183,23 @@ pub struct PlaceholderRendering;
 impl RedactionRendering for PlaceholderRendering {
     fn render(
         &self,
+        _pointer: &str,
         _stored: &serde_json::Value,
         redacted: serde_json::Value,
     ) -> serde_json::Value {
         redacted
+    }
+}
+
+/// Append one RFC 6901 reference token (`~` → `~0`, `/` → `~1`) to `pointer`.
+pub fn push_json_pointer_segment(pointer: &mut String, segment: &str) {
+    pointer.push('/');
+    for ch in segment.chars() {
+        match ch {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            other => pointer.push(other),
+        }
     }
 }
 /// Maximum length of a credential type key.
@@ -9029,30 +9059,40 @@ pub fn redact_consumer_credentials_with(
 ) -> Consumer {
     let mut redacted = consumer.clone();
 
+    /// Object entries of one credential type, each with its stored array index
+    /// (`None` for the legacy single-object form).
     fn entry_objects(
         credential_value: &serde_json::Value,
-    ) -> Vec<&serde_json::Map<String, serde_json::Value>> {
+    ) -> Vec<(Option<usize>, &serde_json::Map<String, serde_json::Value>)> {
         match credential_value {
             serde_json::Value::Array(entries) => entries
                 .iter()
-                .filter_map(serde_json::Value::as_object)
+                .enumerate()
+                .filter_map(|(index, entry)| Some((Some(index), entry.as_object()?)))
                 .collect(),
-            serde_json::Value::Object(object) => vec![object],
+            serde_json::Value::Object(object) => vec![(None, object)],
             _ => Vec::new(),
         }
     }
 
     fn secret_placeholders(
         credential_value: &serde_json::Value,
+        cred_type: &str,
         field: &str,
         rendering: &dyn RedactionRendering,
     ) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
-            .map(|entry| {
+            .map(|(index, entry)| {
+                let mut pointer = String::from("/credentials");
+                push_json_pointer_segment(&mut pointer, cred_type);
+                if let Some(index) = index {
+                    push_json_pointer_segment(&mut pointer, &index.to_string());
+                }
+                push_json_pointer_segment(&mut pointer, field);
                 let stored = entry.get(field).unwrap_or(&serde_json::Value::Null);
                 let marker = serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER);
-                serde_json::json!({(field): rendering.render(stored, marker)})
+                serde_json::json!({(field): rendering.render(&pointer, stored, marker)})
             })
             .collect();
         (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
@@ -9061,7 +9101,7 @@ pub fn redact_consumer_credentials_with(
     fn visible_mtls_identities(credential_value: &serde_json::Value) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
-            .filter_map(|entry| entry.get("identity").and_then(serde_json::Value::as_str))
+            .filter_map(|(_, entry)| entry.get("identity").and_then(serde_json::Value::as_str))
             .filter(|identity| {
                 !identity.trim().is_empty()
                     && identity.chars().count() <= MAX_CREDENTIAL_VALUE_LENGTH
@@ -9083,7 +9123,7 @@ pub fn redact_consumer_credentials_with(
         if let Some(entries) = consumer
             .credentials
             .get(cred_type)
-            .and_then(|value| secret_placeholders(value, field, rendering))
+            .and_then(|value| secret_placeholders(value, cred_type, field, rendering))
         {
             redacted.credentials.insert(cred_type.to_string(), entries);
         }
@@ -9102,25 +9142,16 @@ pub fn redact_consumer_credentials_with(
 }
 
 pub fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
-    redact_consumer_credentials_for_audit_with(consumer, &PlaceholderRendering)
-}
-
-/// [`redact_consumer_credentials_for_audit`] with an explicit
-/// [`RedactionRendering`].
-pub fn redact_consumer_credentials_for_audit_with(
-    consumer: &Consumer,
-    rendering: &dyn RedactionRendering,
-) -> Consumer {
-    let mut redacted = redact_consumer_credentials_with(consumer, rendering);
-    if let Some(stored) = consumer.credentials.get("basicauth") {
+    let mut redacted = redact_consumer_credentials(consumer);
+    if consumer.credentials.contains_key("basicauth") {
         // Audit events need to show that Basic credentials were present or
         // changed, but must not disclose values, entry fields, or even the
         // stored credential shape/cardinality. A single stable marker keeps
         // the mutation visible without creating a credential side channel.
-        let marker = serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER);
-        redacted
-            .credentials
-            .insert("basicauth".to_string(), rendering.render(stored, marker));
+        redacted.credentials.insert(
+            "basicauth".to_string(),
+            serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER),
+        );
     }
     redacted
 }

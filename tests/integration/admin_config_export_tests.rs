@@ -13,7 +13,8 @@ use ferrum_edge::admin::{
     jwt_auth::{JwtConfig, JwtManager},
     serve_admin_on_listener,
 };
-use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::types::{Consumer, GatewayConfig};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -29,6 +30,10 @@ const METRICS_TOKEN: &str = "config-export-metrics-bearer-token-0123456789";
 const STAGING_KEY: &str = "staging-api-key-must-not-leak";
 const PROD_KEY: &str = "prod-api-key-must-not-leak";
 const CONSUL_TOKEN: &str = "consul-token-must-not-leak";
+const CONSUL_PASSWORD: &str = "consul-address-password-must-not-leak";
+
+/// Fixed timestamps, so rebuilding the fixture yields the same configuration.
+const STAMP: &str = "2026-01-02T03:04:05Z";
 
 fn jwt_manager() -> JwtManager {
     JwtManager::new(JwtConfig {
@@ -74,7 +79,9 @@ fn two_tenant_config(staging_key: &str) -> GatewayConfig {
                 "listen_path": "/api",
                 "backend_host": "staging.internal",
                 "backend_port": 8080,
-                "backend_scheme": "http"
+                "backend_scheme": "http",
+                "created_at": STAMP,
+                "updated_at": STAMP
             },
             {
                 "id": "proxy-prod",
@@ -82,7 +89,9 @@ fn two_tenant_config(staging_key: &str) -> GatewayConfig {
                 "listen_path": "/api",
                 "backend_host": "prod.internal",
                 "backend_port": 8080,
-                "backend_scheme": "http"
+                "backend_scheme": "http",
+                "created_at": STAMP,
+                "updated_at": STAMP
             }
         ],
         "consumers": [
@@ -90,13 +99,17 @@ fn two_tenant_config(staging_key: &str) -> GatewayConfig {
                 "id": "consumer-staging",
                 "namespace": "staging",
                 "username": "alice",
-                "credentials": {"keyauth": [{"key": staging_key}]}
+                "credentials": {"keyauth": [{"key": staging_key}]},
+                "created_at": STAMP,
+                "updated_at": STAMP
             },
             {
                 "id": "consumer-prod",
                 "namespace": "prod",
                 "username": "bob",
-                "credentials": {"keyauth": [{"key": PROD_KEY}]}
+                "credentials": {"keyauth": [{"key": PROD_KEY}]},
+                "created_at": STAMP,
+                "updated_at": STAMP
             }
         ],
         "plugin_configs": [],
@@ -108,11 +121,13 @@ fn two_tenant_config(staging_key: &str) -> GatewayConfig {
             "service_discovery": {
                 "provider": "consul",
                 "consul": {
-                    "address": "http://consul.internal:8500",
+                    "address": format!("http://acl:{CONSUL_PASSWORD}@consul.internal:8500"),
                     "service_name": "orders",
                     "token": CONSUL_TOKEN
                 }
-            }
+            },
+            "created_at": STAMP,
+            "updated_at": STAMP
         }]
     }))
     .expect("fixture deserializes")
@@ -201,7 +216,21 @@ struct Reply {
 }
 
 async fn get(base: &str, path: &str, bearer: Option<&str>, namespace: Option<&str>) -> Reply {
-    let mut req = reqwest::Client::new().get(format!("{base}{path}"));
+    send(reqwest::Method::GET, base, path, bearer, namespace, None).await
+}
+
+async fn send(
+    method: reqwest::Method,
+    base: &str,
+    path: &str,
+    bearer: Option<&str>,
+    namespace: Option<&str>,
+    body: Option<&Value>,
+) -> Reply {
+    let mut req = reqwest::Client::new().request(method, format!("{base}{path}"));
+    if let Some(body) = body {
+        req = req.json(body);
+    }
     if let Some(bearer) = bearer {
         req = req.bearer_auth(bearer);
     }
@@ -258,6 +287,7 @@ async fn viewer_can_export_fingerprints_but_not_backup() {
         STAGING_KEY,
         PROD_KEY,
         CONSUL_TOKEN,
+        CONSUL_PASSWORD,
         PRIMARY_SECRET,
         VIEWER_SECRET,
     ] {
@@ -342,12 +372,15 @@ async fn fingerprints_are_stable_and_change_when_the_credential_changes() {
     let first = get(&base, EXPORT, Some(&viewer), Some("staging")).await;
     let second = get(&base, EXPORT, Some(&viewer), Some("staging")).await;
     assert_eq!(first.status, 200);
-    assert_eq!(first.body["consumers"], second.body["consumers"]);
-    assert_eq!(first.body["upstreams"], second.body["upstreams"]);
     assert_eq!(
-        first.body["redaction"]["fingerprint_key_id"],
-        second.body["redaction"]["fingerprint_key_id"]
+        first.text, second.text,
+        "exports of unchanged configuration must be byte-identical"
     );
+
+    // Republishing an identical snapshot changes nothing either.
+    config.store(Arc::new(two_tenant_config(STAGING_KEY)));
+    let republished = get(&base, EXPORT, Some(&viewer), Some("staging")).await;
+    assert_eq!(first.text, republished.text);
 
     config.store(Arc::new(two_tenant_config("rotated-staging-api-key")));
     let rotated = get(&base, EXPORT, Some(&viewer), Some("staging")).await;
@@ -397,4 +430,169 @@ async fn export_requires_an_ns_claim_when_enforcement_is_on() {
     let scoped = token(VIEWER_SECRET, Algorithm::HS256, "viewer", staging_claim);
     let allowed = get(&base, EXPORT, Some(&scoped), Some("staging")).await;
     assert_eq!(allowed.status, 200, "{}", allowed.text);
+}
+
+#[tokio::test]
+async fn viewer_secret_token_is_refused_on_every_write_route() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(admin_state(config, false)).await;
+    let capped_admin = token(VIEWER_SECRET, Algorithm::HS256, "admin", None);
+    let proxy = json!({
+        "id": "proxy-new",
+        "listen_path": "/new",
+        "backend_host": "new.internal",
+        "backend_port": 8080,
+        "backend_scheme": "http"
+    });
+    let consumer = json!({"id": "consumer-new", "username": "mallory"});
+    let empty = json!({});
+
+    use reqwest::Method;
+    let writes: [(Method, &str, Option<&Value>); 10] = [
+        (Method::POST, "/proxies", Some(&proxy)),
+        (Method::PUT, "/proxies/proxy-staging", Some(&proxy)),
+        (Method::DELETE, "/proxies/proxy-staging", None),
+        (Method::POST, "/consumers", Some(&consumer)),
+        (Method::PUT, "/consumers/consumer-staging", Some(&consumer)),
+        (Method::DELETE, "/consumers/consumer-staging", None),
+        (Method::DELETE, "/upstreams/upstream-staging", None),
+        (Method::POST, "/batch", Some(&empty)),
+        (Method::POST, "/restore?confirm=true", Some(&empty)),
+        (Method::POST, "/namespaces", Some(&empty)),
+    ];
+    for (method, path, body) in writes {
+        let label = format!("{method} {path}");
+        let reply = send(method, &base, path, Some(&capped_admin), None, body).await;
+        assert_eq!(reply.status, 403, "{label}: {}", reply.text);
+        assert!(
+            reply.text.contains("'viewer'"),
+            "{label} must be refused by the viewer ceiling: {}",
+            reply.text
+        );
+    }
+
+    // The resources are untouched.
+    let viewer = token(PRIMARY_SECRET, Algorithm::HS256, "viewer", None);
+    let export = get(&base, EXPORT, Some(&viewer), Some("staging")).await;
+    assert_eq!(export.body["counts"]["proxies"], 1);
+    assert_eq!(export.body["counts"]["consumers"], 1);
+}
+
+#[tokio::test]
+async fn viewer_secret_scope_claims_do_not_reach_diagnostic_lookups() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(admin_state(config, false)).await;
+    let path = "/diagnostics/v1/refs/fd1_00000000000000000000000000000000";
+
+    let capped = scoped_token(VIEWER_SECRET);
+    let refused = get(&base, path, Some(&capped), None).await;
+    assert_eq!(refused.status, 403, "{}", refused.text);
+    assert!(refused.text.contains("diagnostics:read"), "{}", refused.text);
+
+    // Control: the same claims under the primary key pass the scope check and
+    // reach the (empty) reference store.
+    let primary = scoped_token(PRIMARY_SECRET);
+    let reached = get(&base, path, Some(&primary), None).await;
+    assert_eq!(reached.status, 404, "{}", reached.text);
+}
+
+/// A token carrying `scope: diagnostics:read` and an `ns` claim.
+fn scoped_token(secret: &str) -> String {
+    let now = chrono::Utc::now();
+    let claims = json!({
+        "iss": ISSUER,
+        "sub": "diagnostics-reader",
+        "role": "admin",
+        "scope": "diagnostics:read",
+        "ns": ["ferrum", "staging"],
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn viewer_reads_and_the_export_mask_url_userinfo() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(admin_state(config, false)).await;
+    let viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+
+    let path = "/upstreams/upstream-staging";
+    let read = get(&base, path, Some(&viewer), Some("staging")).await;
+    assert_eq!(read.status, 200, "{}", read.text);
+    assert!(!read.text.contains(CONSUL_PASSWORD), "{}", read.text);
+    let address = &read.body["service_discovery"]["consul"]["address"];
+    assert_eq!(address, "http://redacted@consul.internal:8500/");
+
+    let export = get(&base, EXPORT, Some(&viewer), Some("staging")).await;
+    assert!(!export.text.contains(CONSUL_PASSWORD));
+    let exported = export
+        .body
+        .pointer("/upstreams/0/service_discovery/consul/address")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(is_fingerprint(&exported), "{exported}");
+}
+
+async fn sqlite_store(dir: &tempfile::TempDir) -> DatabaseStore {
+    let path = dir.path().join("config-export.db");
+    let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+    DatabaseStore::connect_with_pool_config("sqlite", &url, DbPoolConfig::default())
+        .await
+        .expect("connect sqlite store")
+}
+
+fn consumer_with_key(id: &str, username: &str, key: &str) -> Consumer {
+    serde_json::from_value(json!({
+        "id": id,
+        "username": username,
+        "credentials": {"keyauth": [{"key": key}]},
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("consumer fixture deserializes")
+}
+
+#[tokio::test]
+async fn database_export_is_labelled_and_falls_back_to_cached_on_database_error() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = sqlite_store(&dir).await;
+    let database_key = "database-api-key-must-not-leak";
+    db.create_consumer(&consumer_with_key("db-consumer", "dora", database_key))
+        .await
+        .expect("seed consumer");
+    let pool = db.pool();
+
+    let mut cached_config = GatewayConfig::default();
+    let cached_key = "cached-api-key-must-not-leak";
+    cached_config.consumers = vec![consumer_with_key("cached-consumer", "carol", cached_key)];
+    let mut state = admin_state(cached(cached_config), false);
+    state.db = Some(Arc::new(db));
+    state.mode = "database".to_string();
+    let (base, _sd) = start_admin(state).await;
+    let viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+
+    let live = get(&base, EXPORT, Some(&viewer), None).await;
+    assert_eq!(live.status, 200, "{}", live.text);
+    assert_eq!(live.data_source.as_deref(), Some("database"));
+    assert_eq!(live.body["source"], "database");
+    assert_eq!(live.body["consumers"][0]["username"], "dora");
+    assert!(is_fingerprint(&keyauth_fingerprint(&live.body)));
+    assert!(!live.text.contains(database_key));
+
+    // A database outage falls back to the labelled cached snapshot.
+    pool.close().await;
+    let fallback = get(&base, EXPORT, Some(&viewer), None).await;
+    assert_eq!(fallback.status, 200, "{}", fallback.text);
+    assert_eq!(fallback.data_source.as_deref(), Some("cached"));
+    assert_eq!(fallback.body["source"], "cached");
+    assert_eq!(fallback.body["consumers"][0]["username"], "carol");
+    assert!(!fallback.text.contains(cached_key));
 }

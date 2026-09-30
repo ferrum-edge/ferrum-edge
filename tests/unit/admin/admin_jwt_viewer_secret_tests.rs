@@ -11,8 +11,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
 use ferrum_edge::admin::audit::AuditActor;
 use ferrum_edge::admin::jwt_auth::{
-    ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR, AdminRole, JwtConfig, JwtError, JwtManager,
-    create_jwt_manager_from_env, random_read_only_jwt_manager,
+    ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR, AdminKeyTier, AdminRole, JwtConfig, JwtError,
+    JwtManager, create_jwt_manager_from_env, random_read_only_jwt_manager,
 };
 use ferrum_edge::fips::approved::HmacSha256;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -96,7 +96,8 @@ fn viewer_secret_token_is_capped_at_viewer_whatever_its_role_claim() {
             .verify_token(&token)
             .expect("viewer-secret token verifies");
 
-        assert_eq!(verified.role_ceiling, AdminRole::Viewer);
+        assert_eq!(verified.key_tier, AdminKeyTier::Viewer);
+        assert_eq!(verified.role_ceiling(), AdminRole::Viewer);
         // The claim is untouched; the ceiling is applied at authorization.
         assert_eq!(verified.claims.admin_role().unwrap(), claimed);
         assert_eq!(verified.effective_role().unwrap(), AdminRole::Viewer);
@@ -114,6 +115,34 @@ fn viewer_secret_token_is_capped_at_viewer_whatever_its_role_claim() {
 }
 
 #[test]
+fn viewer_secret_token_scopes_grant_nothing() {
+    let manager = manager_with_viewer_secret();
+    let mut scoped = claims("viewer");
+    scoped["scope"] = json!("diagnostics:read");
+
+    let capped = manager
+        .verify_token(&sign(&scoped, VIEWER_SECRET, Algorithm::HS256))
+        .expect("viewer-secret token verifies");
+    assert!(capped.claims.grants_scope("diagnostics:read"));
+    assert!(
+        !capped.grants_scope("diagnostics:read"),
+        "a viewer-key token must not obtain a scope from its own claim"
+    );
+    let actor = AuditActor::from_verified(&capped).unwrap();
+    assert_eq!(actor.key_tier, AdminKeyTier::Viewer);
+    assert!(!actor.key_tier.honours_scopes());
+    assert_eq!(actor.audit_subject(), "viewer-key:drift-monitor");
+
+    // Control: the same claims under the primary key keep the scope.
+    let primary = manager
+        .verify_token(&sign(&scoped, PRIMARY_SECRET, Algorithm::HS256))
+        .expect("primary token verifies");
+    assert!(primary.grants_scope("diagnostics:read"));
+    let actor = AuditActor::from_verified(&primary).unwrap();
+    assert_eq!(actor.audit_subject(), "drift-monitor");
+}
+
+#[test]
 fn primary_secret_token_keeps_its_claimed_role() {
     let manager = manager_with_viewer_secret();
 
@@ -122,7 +151,8 @@ fn primary_secret_token_keeps_its_claimed_role() {
         let verified = manager
             .verify_token(&token)
             .expect("primary-secret token verifies");
-        assert_eq!(verified.role_ceiling, AdminRole::Admin);
+        assert_eq!(verified.key_tier, AdminKeyTier::Primary);
+        assert_eq!(verified.role_ceiling(), AdminRole::Admin);
         let actor = AuditActor::from_verified(&verified).expect("actor builds");
         assert_eq!(actor.role, claimed);
     }

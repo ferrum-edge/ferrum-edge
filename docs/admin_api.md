@@ -95,6 +95,28 @@ gets `403` on operator and admin routes such as `POST /proxies` and
 - In `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET`, the
   random read-only primary secret still applies and the viewer secret keeps
   working.
+- **`scope` claims grant nothing.** A viewer-secret token cannot obtain
+  `diagnostics:read` (or any later scope) from its own claim, so diagnostic
+  reference lookups answer `403`.
+
+**The viewer secret is a fleet-wide read credential.** Whoever holds it can
+mint a token with any `sub` and any `ns` claim, so for these tokens neither is
+an identity or tenancy boundary:
+
+- With `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` off, a viewer-secret token reads
+  every namespace. With it on, the holder can still write whatever `ns` claim
+  it likes.
+- Log lines that name an actor also carry `key_tier` (`primary` or `viewer`),
+  and audit records name a viewer-secret actor as `viewer-key:<sub>`. A chosen
+  subject can therefore never pass for one minted with the primary key.
+- For per-tenant or per-identity readers, pre-mint short-lived `viewer` tokens
+  with `FERRUM_ADMIN_JWT_SECRET` and an explicit `ns` claim instead, and hand
+  out the tokens, not the secret.
+
+A namespace ceiling for the viewer key (a `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`
+that intersects the `ns` claim and is enforced on every namespace-scoped route
+and on the `/namespaces` registry) is a planned follow-up. It is not
+implemented yet.
 
 Generate a token:
 ```bash
@@ -1603,50 +1625,72 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
 ```
 
 - **What is fingerprinted.** The export does not decide on its own which
-  fields are sensitive. It runs the same projection that viewer reads and audit
-  diffs use, and puts a fingerprint wherever that projection would put
-  `[REDACTED]`:
+  fields are sensitive. It runs the same projections that ordinary viewer
+  reads use, and puts a fingerprint wherever those would put `[REDACTED]` or a
+  masked URL:
   - Consumer `keyauth` `key` and `jwt`/`hmac_auth` `secret` get one fingerprint
     per entry.
-  - `basicauth` gets a single fingerprint of the whole stored value, so neither
-    the hash nor the entry count is disclosed, as in audit diffs.
   - In plugin configs, fingerprints replace secrets and credential-bearing
     URLs, including URLs whose path or query would otherwise be masked.
-  - Upstream `service_discovery.consul.token` gets a fingerprint.
+  - Upstream `service_discovery.consul.token` gets a fingerprint, and any URL
+    carrying userinfo anywhere in a Proxy or Upstream (a Consul `address`,
+    for example) is fingerprinted. Ordinary viewer reads and audit diffs strip
+    that userinfo to `redacted@` as well.
 
-  A value the viewer projection shows is shown verbatim. Unknown/custom
-  credential types are omitted, as in ordinary Consumer reads.
+  A value the viewer projection shows is shown verbatim.
+- **Hidden credential types.** Ordinary Consumer reads omit `basicauth` and
+  unknown/custom credential types entirely, and so does the export's
+  `credentials` map. Instead, every exported consumer carries
+  `hidden_credentials_fingerprint`, one fingerprint over those omitted types.
+  It is present even when a consumer has none, so it shows that hidden
+  credentials changed without revealing whether any exist.
 - **Fingerprint format.** `hmac-sha256:<64 lowercase hex>`, computed as
   HMAC-SHA-256 under a subkey derived from `FERRUM_ADMIN_JWT_SECRET`
   (`HMAC-SHA-256(secret, "ferrum-edge/admin-config-export-fingerprint/v1")`).
   The subkey is never derived from the viewer secret, so the reader cannot
-  compute or dictionary-test a fingerprint. The MAC input binds the resource
-  kind, namespace, and id to a key-sorted canonical JSON of the stored value.
-  Equal secrets on two resources therefore fingerprint differently.
+  compute or dictionary-test a fingerprint.
+  - The MAC input binds the resource kind, namespace, id, and the field's JSON
+    pointer (for example `/credentials/keyauth/0/key` or
+    `/config/headers/x-api-key`) to a key-sorted canonical JSON of the stored
+    value.
+  - Equal secrets in two fields, or on two resources, therefore fingerprint
+    differently.
+  - A field that more than one projection rule matches is fingerprinted once.
 - **Stable.** An unchanged credential fingerprints identically across calls and
   across replicas that share `FERRUM_ADMIN_JWT_SECRET`. Rotating that secret
-  changes every fingerprint and `redaction.fingerprint_key_id`. In
-  `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET`, the key is
-  random per process.
-- **Comparable.** Collections are sorted by `id`. `api_spec_id` ownership tags
-  are stripped so a cached fallback compares equal to a database read.
-  `exported_at` changes on every call, so compare resources rather than whole
-  documents.
+  changes every fingerprint and `redaction.fingerprint_key_id`. Two caveats:
+  - In `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET`, the
+    key is random per process, so fingerprints change on every restart.
+  - A CP and a DP (or any two replicas) whose admin secrets differ never
+    produce comparable fingerprints.
+- **Residual oracle.** A principal that can *write* a field (an operator for
+  plugin configs, upstreams, and proxies; an admin for consumers) can confirm
+  a guess of that field's previous value by writing the guess and comparing
+  the new fingerprint with the old one. That needs write access to the exact
+  field, which already allows replacing the secret, and it destroys the stored
+  value.
+- **Byte-stable.** Collections are sorted by `id`, proxy plugin associations
+  by config id, and object keys are sorted. The document carries no timestamp,
+  so two exports of unchanged configuration under one key are byte-identical.
+  `api_spec_id` ownership tags are stripped so a cached fallback compares equal
+  to a database read.
 - **Data source.** Like `/backup`, the export falls back to the cached
   configuration when the database is unavailable and says so with
-  `X-Data-Source: cached`. It returns `503` when there is neither.
+  `X-Data-Source: cached`. It returns `503` when there is neither. At most two
+  database-backed exports load at once per process; later requests wait.
 - **Scope.** The export is namespace-scoped through `X-Ferrum-Namespace`. A
   present `ns` claim must authorize the namespace (`403` otherwise), even with
   `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` off. API-spec documents (Admin-gated)
   and gateway trust bundles (Operator-gated) are not included.
 - **Not a backup.** The document cannot be restored and is not accepted by
   `POST /restore`. It needs a valid admin JWT; a metrics bearer token or a
-  metrics CIDR allowlist does not grant it. It is a read, so it is not audited,
-  the same as ordinary list reads.
+  metrics CIDR allowlist does not grant it. It is a read, so it writes no audit
+  record, but each export logs one INFO line with the actor, `key_tier`,
+  namespace, data source, and size, and no configuration content.
 
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing, so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. The `namespace` field is the authorization-scoping key `GET /audit` filters on. Namespace-scoped mutations (after the `ns`-claim gate, when that flag is on) use the validated request namespace. Fleet-global mutations, invalid-header backup attempts, and namespace-claim denials use the canonical default namespace (`ferrum`) rather than an unvalidated `X-Ferrum-Namespace`. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing, so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim, or `viewer-key:<sub>` for a token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. The `namespace` field is the authorization-scoping key `GET /audit` filters on. Namespace-scoped mutations (after the `ns`-claim gate, when that flag is on) use the validated request namespace. Fleet-global mutations, invalid-header backup attempts, and namespace-claim denials use the canonical default namespace (`ferrum`) rather than an unvalidated `X-Ferrum-Namespace`. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
 
 This pipeline covers every Admin action that emits an ordinary mutation audit
 event: configuration-database mutations (CRUD, credentials, API specs, batch,

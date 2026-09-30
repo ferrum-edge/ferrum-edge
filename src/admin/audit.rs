@@ -69,7 +69,7 @@
 use crate::admin::audit_spool::{
     AuditSpool, RetainOutcome, SpoolError, SpoolErrorKind, SpooledAuditRecord,
 };
-use crate::admin::jwt_auth::{AdminClaims, AdminRole, VerifiedAdminToken};
+use crate::admin::jwt_auth::{AdminKeyTier, AdminRole, VerifiedAdminToken};
 use crate::config::db_backend::DatabaseBackend;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -483,7 +483,7 @@ impl AuditEvent {
         Self {
             id: Uuid::new_v4().to_string(),
             ts: Utc::now(),
-            actor: actor.sub.clone(),
+            actor: actor.audit_subject(),
             action: action.into(),
             resource_type: resource_type.into(),
             resource_id: resource_id.into(),
@@ -517,23 +517,20 @@ pub struct AuditActor {
     /// token); only *enforced* against `X-Ferrum-Namespace` when
     /// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`.
     pub allowed_namespaces: crate::grpc::auth::AllowedNamespaces,
+    /// Which verification key accepted the token. A viewer-key token's `sub`
+    /// and `ns` were chosen by whoever holds the viewer secret, so every log
+    /// line and audit record that names the actor also names the tier.
+    pub key_tier: AdminKeyTier,
 }
 
-impl AuditActor {
-    /// Actor for raw claims, with no verification-key role ceiling applied.
-    ///
-    /// Request authorization must use [`AuditActor::from_verified`], which
-    /// caps the role at the ceiling of the key that verified the token.
-    pub fn from_claims(claims: &AdminClaims) -> Result<Self, String> {
-        Ok(Self {
-            sub: claims.sub.clone(),
-            role: claims.admin_role()?,
-            allowed_namespaces: claims.allowed_namespaces()?,
-        })
-    }
+/// Prefix on the persisted audit `actor` of a viewer-key token, so a subject
+/// its holder chose can never pass for one minted with the primary key.
+pub const VIEWER_KEY_ACTOR_PREFIX: &str = "viewer-key:";
 
-    /// Actor for a signature-verified token. The role is the `role` claim
-    /// capped at [`VerifiedAdminToken::role_ceiling`], so a token verified by
+impl AuditActor {
+    /// Actor for a signature-verified token — the only constructor request
+    /// authorization uses. The role is the `role` claim capped at the ceiling
+    /// of the verifying key, so a token verified by
     /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` is a `viewer` even when it claims
     /// `admin`. Every route's role check reads this actor.
     pub fn from_verified(token: &VerifiedAdminToken) -> Result<Self, String> {
@@ -541,7 +538,17 @@ impl AuditActor {
             sub: token.claims.sub.clone(),
             role: token.effective_role()?,
             allowed_namespaces: token.claims.allowed_namespaces()?,
+            key_tier: token.key_tier,
         })
+    }
+
+    /// The actor string persisted on audit records: the `sub` for a primary-key
+    /// token, `viewer-key:<sub>` for a viewer-key token.
+    pub fn audit_subject(&self) -> String {
+        match self.key_tier {
+            AdminKeyTier::Primary => self.sub.clone(),
+            AdminKeyTier::Viewer => format!("{VIEWER_KEY_ACTOR_PREFIX}{}", self.sub),
+        }
     }
 }
 
@@ -1885,7 +1892,7 @@ pub fn note_request_actor(actor: &AuditActor, ctx: &AuditRequestContext) {
         return;
     };
     slot.with(|inner| {
-        inner.actor = Some(actor.sub.clone());
+        inner.actor = Some(actor.audit_subject());
         inner.source_address = ctx.source_address.clone();
         inner.request_id = ctx.request_id.clone();
     });

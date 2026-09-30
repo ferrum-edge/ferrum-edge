@@ -3429,6 +3429,7 @@ pub(crate) fn plugin_config_audit_body_with(
         crate::admin::plugin_config_projection::project_plugin_config_with(
             &resource.plugin_name,
             config,
+            "/config",
             rendering,
         );
     }
@@ -3441,7 +3442,8 @@ fn upstream_audit_body(resource: &Upstream) -> Value {
 
 /// The one redacted Upstream projection (non-admin reads and audit diffs),
 /// with an explicit [`RedactionRendering`] for the read-only configuration
-/// export.
+/// export: the Consul ACL token is withheld, and every URL-shaped string in the
+/// body (a Consul `address`, for example) has any userinfo removed.
 pub(crate) fn upstream_audit_body_with(
     resource: &Upstream,
     rendering: &dyn RedactionRendering,
@@ -3455,8 +3457,21 @@ pub(crate) fn upstream_audit_body_with(
     {
         let stored = std::mem::take(token);
         let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
-        *token = rendering.render(&stored, marker);
+        *token = rendering.render(UPSTREAM_CONSUL_TOKEN_POINTER, &stored, marker);
     }
+    crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
+    body
+}
+
+/// JSON pointer of the Consul ACL token inside an Upstream body.
+const UPSTREAM_CONSUL_TOKEN_POINTER: &str = "/service_discovery/consul/token";
+
+/// The one redacted Proxy projection (non-admin reads and audit diffs), with an
+/// explicit [`RedactionRendering`] for the read-only configuration export: any
+/// URL-shaped string carrying userinfo is stripped.
+pub(crate) fn proxy_audit_body_with(resource: &Proxy, rendering: &dyn RedactionRendering) -> Value {
+    let mut body = json!(resource);
+    crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
     body
 }
 
@@ -4601,6 +4616,18 @@ impl AdminResource for Proxy {
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
     const SUPPORTS_IF_MATCH: bool = true;
+
+    fn audit_body(resource: &Self) -> Value {
+        proxy_audit_body_with(resource, &PlaceholderRendering)
+    }
+
+    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+        if role == AdminRole::Admin {
+            Self::response_body(resource)
+        } else {
+            proxy_audit_body_with(resource, &PlaceholderRendering)
+        }
+    }
 
     fn etag_representation(resource: &Self) -> Result<Value, serde_json::Error> {
         // SQL backends read `proxy_plugins` without an ORDER BY, so two reads

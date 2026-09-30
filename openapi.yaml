@@ -2248,34 +2248,45 @@ paths:
         integrations (issue #5904). Allowed for **every** role, including
         `viewer` and tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`.
 
-        Every value that the ordinary non-admin projection withholds is
-        replaced by a keyed fingerprint `hmac-sha256:<64 lowercase hex>`
-        instead of `[REDACTED]`: Consumer `keyauth` keys, `jwt`/`hmac_auth`
-        secrets, the whole `basicauth` value (a single fingerprint, so
-        neither the hash nor the entry count is disclosed, as in audit
-        diffs), plugin-config secrets and credential-bearing URLs (per the
-        plugin sensitivity schema, name heuristics, and URL-userinfo sweep),
-        and upstream Consul tokens. Values that projection shows are shown
-        here verbatim; unknown/custom credential types are omitted exactly
-        as in ordinary Consumer reads.
+        The export is built from the same projections ordinary viewer reads
+        use. Every value those withhold is replaced by a keyed fingerprint
+        `hmac-sha256:<64 lowercase hex>` instead of `[REDACTED]`: Consumer
+        `keyauth` keys and `jwt`/`hmac_auth` secrets, plugin-config secrets
+        and credential-bearing URLs (per the plugin sensitivity schema, name
+        heuristics, and URL-userinfo sweep), URL userinfo anywhere in a Proxy
+        or Upstream (for example a Consul `address`), and upstream Consul
+        tokens. Values those projections show are shown here verbatim.
+        Consumer credential types ordinary reads omit (`basicauth` and
+        unknown/custom types) are omitted here too; instead every consumer
+        carries `hidden_credentials_fingerprint`, one fingerprint over those
+        omitted types. It is present even when there are none, so it shows
+        that hidden credentials changed without revealing whether any exist.
 
         Fingerprints are HMAC-SHA-256 under a subkey derived from
         `FERRUM_ADMIN_JWT_SECRET` (never from the viewer secret), bound to the
-        resource kind, namespace, and id, over a key-sorted canonical JSON of
-        the stored value. An unchanged credential fingerprints identically
-        across calls and across replicas sharing `FERRUM_ADMIN_JWT_SECRET`;
-        a changed one fingerprints differently; the value cannot be recovered
-        or offline-guessed from it. `redaction.fingerprint_key_id` changes when
+        resource kind, namespace, id, and the field's JSON pointer, over a
+        key-sorted canonical JSON of the stored value. Equal values in two
+        fields fingerprint differently, and each field is fingerprinted once.
+        An unchanged credential fingerprints identically across calls and
+        across replicas sharing `FERRUM_ADMIN_JWT_SECRET`; a changed one
+        fingerprints differently; the value cannot be recovered or
+        offline-guessed from it. `redaction.fingerprint_key_id` changes when
         the admin secret rotates, marking exports as not comparable. In
         `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET` the
         key is random per process, so fingerprints are stable only for that
-        process's lifetime.
+        process's lifetime; a CP and a DP with different admin secrets never
+        agree. A principal with write access to a field can confirm a guess
+        of its previous value by writing the guess and comparing fingerprints.
 
         The document is not restorable and is not accepted by
         `POST /restore` or `POST /batch`. API-spec documents and gateway
         trust bundles (Admin/Operator-gated) are not included, and
         `api_spec_id` ownership tags are stripped so a cached fallback
-        compares equal to a database read. Collections are sorted by `id`.
+        compares equal to a database read. Collections are sorted by `id`,
+        proxy plugin associations by config id, and the document carries no
+        timestamp, so exports of unchanged configuration are byte-identical.
+        At most two database-backed exports load concurrently per process;
+        later requests wait.
 
         Namespace-scoped via `X-Ferrum-Namespace`. A JWT `ns` claim, when
         present, must authorize the selected namespace (`403` otherwise) even
@@ -7945,11 +7956,16 @@ components:
         `FERRUM_ADMIN_JWT_VIEWER_SECRET` (and not under
         `FERRUM_ADMIN_JWT_SECRET`) is authorized as `viewer` whatever its
         `role` claim says — a token claiming `admin` gets `403` on
-        operator/admin routes. Both keys accept only `HS256`; tokens with any
+        operator/admin routes — and its `scope` claims grant nothing (no
+        `diagnostics:read`). Both keys accept only `HS256`; tokens with any
         other `alg` (including `none`) are rejected. Startup refuses identical
         values for the two secrets. Give read-only automation the viewer
         secret so it holds no material that can mint an `operator` or `admin`
-        token.
+        token. The viewer secret is a fleet-wide read credential: its holder
+        chooses the token's `sub` and `ns`, so neither is an identity or
+        tenancy boundary for it. Audit records name such an actor as
+        `viewer-key:<sub>`. Per-tenant readers should use tokens pre-minted
+        with the primary key and an `ns` claim.
 
     metricsBearerAuth:
       type: http
@@ -18492,7 +18508,6 @@ components:
         [
           version,
           ferrum_version,
-          exported_at,
           source,
           namespace,
           redaction,
@@ -18511,10 +18526,6 @@ components:
         ferrum_version:
           type: string
           description: Ferrum Edge binary version that produced this export
-        exported_at:
-          type: string
-          format: date-time
-          description: Export time; changes on every call, so compare resources rather than whole documents
         source:
           type: string
           enum: [database, cached]
@@ -18581,21 +18592,32 @@ components:
       pattern: "^hmac-sha256:[0-9a-f]{64}$"
       description: >-
         Keyed, non-reversible fingerprint of a withheld stored value, bound to
-        its resource kind, namespace, and id. Equal across calls and replicas
-        while the value (and `FERRUM_ADMIN_JWT_SECRET`) is unchanged.
+        its resource kind, namespace, id, and field JSON pointer. Equal across
+        calls and replicas while the value (and `FERRUM_ADMIN_JWT_SECRET`) is
+        unchanged.
       example: "hmac-sha256:3f1c9b0e5a7d2c4f8e6b1a0d9c7e5f3a2b4d6c8e0f1a3b5c7d9e1f2a4b6c8d0e"
 
     ConsumerExport:
       description: >-
-        Consumer item in a `GET /config/export` document: the audit-diff
-        credential projection with fingerprints in place of `[REDACTED]`.
+        Consumer item in a `GET /config/export` document: the ordinary viewer
+        credential projection with fingerprints in place of `[REDACTED]`, plus
+        one fingerprint of the credential types that projection omits.
       unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ConsumerBase"
         - type: object
+          required: [hidden_credentials_fingerprint]
           properties:
             credentials:
               $ref: "#/components/schemas/ConsumerCredentialsFingerprinted"
+            hidden_credentials_fingerprint:
+              allOf:
+                - $ref: "#/components/schemas/CredentialFingerprint"
+              description: >-
+                Fingerprint of every stored credential type ordinary viewer
+                reads omit (`basicauth`, unknown/custom types), over an empty
+                map when there are none. Always present, so it reveals changes
+                to hidden credentials but not whether any exist.
 
     ConsumerCredentialsFingerprinted:
       type: object
@@ -18603,10 +18625,10 @@ components:
       description: |
         Credential map in `GET /config/export` items. `keyauth` `key`, `jwt`
         `secret`, and `hmac_auth` `secret` fields carry a
-        `CredentialFingerprint` per entry; `basicauth`, when present, is one
-        fingerprint of the whole stored value; `mtls_auth.identity` stays
-        visible. Unknown/custom credential types and legacy extra fields are
-        omitted, as in ordinary Consumer responses.
+        `CredentialFingerprint` per entry; `mtls_auth.identity` stays
+        visible. `basicauth`, unknown/custom credential types, and legacy
+        extra fields are omitted, as in ordinary Consumer responses; see
+        `hidden_credentials_fingerprint`.
       properties:
         keyauth:
           type: array
@@ -18618,8 +18640,7 @@ components:
             properties:
               key:
                 $ref: "#/components/schemas/CredentialFingerprint"
-        basicauth:
-          $ref: "#/components/schemas/CredentialFingerprint"
+        basicauth: false
         jwt:
           type: array
           minItems: 1
