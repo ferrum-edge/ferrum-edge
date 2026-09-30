@@ -1167,6 +1167,13 @@ run_bench() {
             sleep "$window"
             sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$gpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            local bpid cpid
+            bpid=$(pgrep -f 'target/release/proto_backend' | head -1)
+            cpid=$(pgrep -f 'target/release/proto_bench' | head -1)
+            [ -n "$bpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$bpid" \
+                -o "$OUTPUT_DIR/perf/${gateway}_${payload}_backendproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            [ -n "$cpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$cpid" \
+                -o "$OUTPUT_DIR/perf/${gateway}_${payload}_clientproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             if [ "$gateway" = ferrum ]; then
                 sudo "$perf_bin" record -F 997 -p "$gpid" -o "/tmp/perf_${gateway}_${payload}.data" \
                     -- sleep "$window" >/dev/null 2>&1
@@ -1213,7 +1220,9 @@ run_bench() {
         sudo chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR/perf" || true
         local reqs
         reqs=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('total_requests',0))" "$out" 2>/dev/null || echo 0)
-        echo "total_requests_full_run=$reqs duration=$DURATION" >> "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt"
+        for f in "$OUTPUT_DIR/perf/${gateway}_${payload}"_*stat.txt; do
+            echo "total_requests_full_run=$reqs duration=$DURATION" >> "$f"
+        done
         if [ -f "/tmp/perf_${gateway}_${payload}.data" ]; then
             sudo "$perf_bin" report -i "/tmp/perf_${gateway}_${payload}.data" --no-children --sort symbol --stdio 2>/dev/null \
                 | grep -v '^#' | grep -v '^$' | head -150 | cut -c1-200 > "$OUTPUT_DIR/perf/${gateway}_${payload}_symbols.txt" || true
