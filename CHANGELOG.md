@@ -51,6 +51,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   normalizer-selected response status for the replacement it installed;
   `mcp_gateway` configs share the generated-config size/depth budget of
   `openapi_validator`.
+- **Read-only configuration export, `GET /config/export`** (#5904). Any
+  authenticated role, including `viewer`, can now take a whole-namespace
+  snapshot of proxies, consumers, plugin configs, and upstreams for drift
+  detection. It uses the same authoritative load as `GET /backup` and the same
+  `X-Data-Source: database|cached` signal. At most one export loads from the
+  database at a time, and a concurrent export serves the labelled cached
+  snapshot instead of waiting. At most four exports build at a time, off the
+  async workers. The export reuses the projections that
+  ordinary viewer reads use, so the two cannot disagree about which fields are
+  sensitive. Every value those withhold is replaced by a keyed fingerprint,
+  `hmac-sha256:<64 hex>`, instead of `[REDACTED]`. Credential types viewer
+  reads omit (`basicauth`, custom types) are summarized per consumer by one
+  always-present `hidden_credentials_fingerprint`, which does not reveal
+  whether any exist. Fingerprints are keyed from `FERRUM_ADMIN_JWT_SECRET` and
+  bound to the resource kind, namespace, id, and field JSON pointer. An
+  unchanged credential therefore compares equal across calls and replicas, and
+  the document of unchanged configuration is byte-identical. The export is
+  namespace-scoped and always honours a present `ns` claim. It is not
+  restorable, and `GET /backup` remains `admin`-only. **Stability caveat:**
+  without `FERRUM_ADMIN_JWT_SECRET` (the `file`/`mesh`/`node_agent` random-key
+  fallback), fingerprints are keyed per process and change on every restart.
+  A CP and a DP, or any two replicas, whose admin secrets differ never produce
+  comparable fingerprints; `redaction.fingerprint_key_id` shows when that is
+  the case.
+- **`FERRUM_ADMIN_JWT_VIEWER_SECRET` role ceiling** (#5904). This optional
+  second HS256 verification secret (at least 32 characters) authorizes every
+  token it verifies as `viewer`, whatever its `role` claim says, and ignores
+  its `scope` claims. A read-only process can hold this secret without holding
+  material that mints `operator` or `admin` tokens. It is a **fleet-wide read
+  credential**: its holder chooses the token's `sub` and `ns`, so it reads
+  every namespace. Per-tenant readers should use tokens pre-minted with the
+  primary key and an `ns` claim. A namespace ceiling for the viewer key is a
+  planned follow-up.
 - **`mcp_gateway` per-consumer tool grants** (#5907). In `aggregate_router`
   mode a `policy.tools` entry with `action: allow` can carry
   `allowed_groups` and `denied_groups`, matched against the request
@@ -749,6 +782,32 @@ outright with no deprecation period:
   finished exiting yet.
 
 ### Security
+
+- Admin JWT role ceiling (#5904). A token signed with
+  `FERRUM_ADMIN_JWT_VIEWER_SECRET` can never reach `operator` or `admin`,
+  including when it claims `admin`, and its `scope` claims grant nothing, so it
+  cannot use `diagnostics:read`. Authorization and audit log lines carry
+  `key_tier` next to the actor, and audit records name the actor
+  `viewer-key:<sub>`, so a subject chosen by the secret's holder cannot pass
+  for a primary-key identity. A viewer-key `sub` longer than 256 bytes or
+  containing a control character is rejected, so it cannot forge log lines. The ceiling is recorded from which key
+  verified the signature and applied where the request's actor is built,
+  which is where every route reads its role. Both keys accept only `HS256`, so
+  `none`, `HS384`/`HS512`, and asymmetric algorithms are refused. The viewer key
+  is tried only after the primary key reports a signature mismatch. Startup and
+  `validate` refuse a viewer secret equal to `FERRUM_ADMIN_JWT_SECRET` or
+  `FERRUM_CP_DP_GRPC_JWT_SECRET`, and refuse one shorter than 32 characters,
+  without echoing either value. FIPS enforce mode applies its HMAC key-length
+  floor to the new secret. `GET /config/export` fingerprints are keyed from the
+  primary secret only, so a viewer-secret holder cannot compute or offline-guess
+  them.
+- Proxy and Upstream `viewer` reads, audit diffs, and the configuration
+  export now strip URL userinfo anywhere in the body (for example a Consul
+  `address` of `http://user:pass@host`), the same structural sweep plugin
+  configs already had (#5904). `operator` and `admin` reads of proxies and
+  upstreams are unchanged, so an operator's GET-then-PUT keeps the stored
+  URL. A primary-key subject that starts with `viewer-key:` or `primary-key:`
+  is recorded as `primary-key:<sub>` in audit records.
 
 - `mcp_gateway` `aggregate_router` admission now holds on the final request
   (GHSA-3w98-6p32-8qm2). The message kind, method, selected upstream, mediated

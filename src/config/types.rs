@@ -135,6 +135,73 @@ pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] = &[
     ("jwt", "secret"),
     ("hmac_auth", "secret"),
 ];
+
+/// How a redacting projection renders a value it withholds or rewrites.
+///
+/// The credential-bearing projections (Consumer credentials, plugin `config`
+/// blobs, and upstream service-discovery tokens) decide *which* values are
+/// sensitive exactly once. At every point where a projection would replace or
+/// rewrite a stored value, it computes its ordinary redacted form and hands
+/// both the stored value and that redacted form to a renderer:
+///
+/// - [`PlaceholderRendering`] keeps the redacted form. Ordinary non-admin reads
+///   and audit diffs use it.
+/// - The read-only configuration export (`GET /config/export`) swaps in a keyed
+///   fingerprint renderer, so a credential change is still detectable without
+///   the value being disclosed.
+///
+/// Because the renderer never decides sensitivity, the two surfaces cannot
+/// drift apart: a field the ordinary projection redacts is fingerprinted by the
+/// export, and a field it leaves alone is left alone by both.
+pub trait RedactionRendering {
+    /// Render one withheld value. `pointer` is the RFC 6901 JSON pointer of the
+    /// site within the resource's response body (for example
+    /// `/credentials/keyauth/0/key` or `/config/headers/x-api-key`); `stored`
+    /// is the value as persisted; `redacted` is what the ordinary projection
+    /// would emit in its place.
+    fn render(
+        &self,
+        pointer: &str,
+        stored: &serde_json::Value,
+        redacted: serde_json::Value,
+    ) -> serde_json::Value;
+
+    /// Whether a value this renderer withheld is fully opaque, so a later
+    /// projection layer matching the same site has nothing left to hide and
+    /// must not render it again. The placeholder renderer is not: a URL
+    /// projection it emitted can still be narrowed to `[REDACTED]` by a
+    /// later name rule.
+    fn renders_opaque(&self) -> bool {
+        false
+    }
+}
+
+/// The ordinary rendering: emit the redacted form unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaceholderRendering;
+
+impl RedactionRendering for PlaceholderRendering {
+    fn render(
+        &self,
+        _pointer: &str,
+        _stored: &serde_json::Value,
+        redacted: serde_json::Value,
+    ) -> serde_json::Value {
+        redacted
+    }
+}
+
+/// Append one RFC 6901 reference token (`~` → `~0`, `/` → `~1`) to `pointer`.
+pub fn push_json_pointer_segment(pointer: &mut String, segment: &str) {
+    pointer.push('/');
+    for ch in segment.chars() {
+        match ch {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            other => pointer.push(other),
+        }
+    }
+}
 /// Maximum length of a credential type key.
 pub const MAX_CREDENTIAL_TYPE_LENGTH: usize = 64;
 /// Credential types whose entries must contain exactly one field, paired with
@@ -8978,28 +9045,55 @@ fn record_consumer_identity<'a>(
 }
 
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
+    redact_consumer_credentials_with(consumer, &PlaceholderRendering)
+}
+
+/// [`redact_consumer_credentials`] with an explicit [`RedactionRendering`].
+///
+/// This is the one Consumer credential projection; the ordinary response and
+/// audit forms call it with [`PlaceholderRendering`], and the read-only
+/// configuration export calls it with a keyed-fingerprint renderer.
+pub fn redact_consumer_credentials_with(
+    consumer: &Consumer,
+    rendering: &dyn RedactionRendering,
+) -> Consumer {
     let mut redacted = consumer.clone();
 
+    /// Object entries of one credential type, each with the index the
+    /// projection emits it at. Non-object entries are dropped before indexing,
+    /// and the legacy single-object form is index `0` (it is emitted as a
+    /// one-element array), so the index always names the emitted position.
     fn entry_objects(
         credential_value: &serde_json::Value,
-    ) -> Vec<&serde_json::Map<String, serde_json::Value>> {
+    ) -> Vec<(usize, &serde_json::Map<String, serde_json::Value>)> {
         match credential_value {
             serde_json::Value::Array(entries) => entries
                 .iter()
                 .filter_map(serde_json::Value::as_object)
+                .enumerate()
                 .collect(),
-            serde_json::Value::Object(object) => vec![object],
+            serde_json::Value::Object(object) => vec![(0, object)],
             _ => Vec::new(),
         }
     }
 
     fn secret_placeholders(
         credential_value: &serde_json::Value,
+        cred_type: &str,
         field: &str,
+        rendering: &dyn RedactionRendering,
     ) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
-            .map(|_| serde_json::json!({(field): CREDENTIAL_REDACTION_PLACEHOLDER}))
+            .map(|(index, entry)| {
+                let mut pointer = String::from("/credentials");
+                push_json_pointer_segment(&mut pointer, cred_type);
+                push_json_pointer_segment(&mut pointer, &index.to_string());
+                push_json_pointer_segment(&mut pointer, field);
+                let stored = entry.get(field).unwrap_or(&serde_json::Value::Null);
+                let marker = serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER);
+                serde_json::json!({(field): rendering.render(&pointer, stored, marker)})
+            })
             .collect();
         (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
@@ -9007,7 +9101,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     fn visible_mtls_identities(credential_value: &serde_json::Value) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
-            .filter_map(|entry| entry.get("identity").and_then(serde_json::Value::as_str))
+            .filter_map(|(_, entry)| entry.get("identity").and_then(serde_json::Value::as_str))
             .filter(|identity| {
                 !identity.trim().is_empty()
                     && identity.chars().count() <= MAX_CREDENTIAL_VALUE_LENGTH
@@ -9029,7 +9123,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         if let Some(entries) = consumer
             .credentials
             .get(cred_type)
-            .and_then(|value| secret_placeholders(value, field))
+            .and_then(|value| secret_placeholders(value, cred_type, field, rendering))
         {
             redacted.credentials.insert(cred_type.to_string(), entries);
         }

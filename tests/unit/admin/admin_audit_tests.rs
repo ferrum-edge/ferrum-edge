@@ -6,9 +6,17 @@ use ferrum_edge::admin::audit::{
     AuditActor, AuditEvent, AuditListFilter, create_diff, credential_update_diff, delete_diff,
     update_diff,
 };
-use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminRole};
+use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminKeyTier, AdminRole, VerifiedAdminToken};
 use serde_json::json;
 use uuid::Uuid;
+
+fn verified(claims: AdminClaims, key_tier: AdminKeyTier) -> VerifiedAdminToken {
+    VerifiedAdminToken {
+        header: jsonwebtoken::Header::default(),
+        claims,
+        key_tier,
+    }
+}
 
 fn claims_with_role(role: serde_json::Value) -> AdminClaims {
     let now = Utc::now();
@@ -27,10 +35,52 @@ fn claims_with_role(role: serde_json::Value) -> AdminClaims {
 fn test_audit_actor_from_claims_copies_subject_and_role() {
     let claims = claims_with_role(json!("operator"));
 
-    let actor = AuditActor::from_claims(&claims).unwrap();
+    let actor = AuditActor::from_verified(&verified(claims, AdminKeyTier::Primary)).unwrap();
 
     assert_eq!(actor.sub, "audit-user");
     assert_eq!(actor.role, AdminRole::Operator);
+    assert_eq!(actor.key_tier, AdminKeyTier::Primary);
+    assert_eq!(actor.audit_subject(), "audit-user");
+}
+
+#[test]
+fn test_audit_actor_from_viewer_key_is_capped_and_labelled() {
+    let mut claims = claims_with_role(json!("admin"));
+    claims.additional["scope"] = json!("diagnostics:read");
+    let token = verified(claims, AdminKeyTier::Viewer);
+    assert!(!token.grants_scope("diagnostics:read"));
+
+    let actor = AuditActor::from_verified(&token).unwrap();
+
+    assert_eq!(actor.role, AdminRole::Viewer);
+    assert_eq!(actor.key_tier, AdminKeyTier::Viewer);
+    assert_eq!(actor.audit_subject(), "viewer-key:audit-user");
+    let event = AuditEvent::new(&actor, "read", "config", "c1", "ferrum", json!({}));
+    assert_eq!(event.actor, "viewer-key:audit-user");
+}
+
+#[test]
+fn test_primary_subjects_cannot_impersonate_a_viewer_key_actor() {
+    let actor_for = |sub: &str, key_tier: AdminKeyTier| {
+        let mut claims = claims_with_role(json!("viewer"));
+        claims.sub = sub.to_string();
+        AuditActor::from_verified(&verified(claims, key_tier)).unwrap()
+    };
+
+    let viewer = actor_for("alice", AdminKeyTier::Viewer).audit_subject();
+    assert_eq!(viewer, "viewer-key:alice");
+    let lookalike = actor_for("viewer-key:alice", AdminKeyTier::Primary).audit_subject();
+    assert_eq!(lookalike, "primary-key:viewer-key:alice");
+    assert_ne!(lookalike, viewer);
+
+    // The escape is itself escaped, so the mapping stays injective.
+    let escaped = actor_for("primary-key:viewer-key:alice", AdminKeyTier::Primary);
+    assert_eq!(
+        escaped.audit_subject(),
+        "primary-key:primary-key:viewer-key:alice"
+    );
+    let plain = actor_for("alice", AdminKeyTier::Primary).audit_subject();
+    assert_eq!(plain, "alice");
 }
 
 #[test]
@@ -46,7 +96,7 @@ fn test_audit_actor_from_claims_rejects_missing_role() {
         additional: json!({}),
     };
 
-    let err = AuditActor::from_claims(&claims).unwrap_err();
+    let err = AuditActor::from_verified(&verified(claims, AdminKeyTier::Primary)).unwrap_err();
 
     assert!(err.contains("Missing admin role claim"));
 }
@@ -55,7 +105,7 @@ fn test_audit_actor_from_claims_rejects_missing_role() {
 fn test_audit_actor_from_claims_rejects_non_string_role() {
     let claims = claims_with_role(json!(["admin"]));
 
-    let err = AuditActor::from_claims(&claims).unwrap_err();
+    let err = AuditActor::from_verified(&verified(claims, AdminKeyTier::Primary)).unwrap_err();
 
     assert!(err.contains("Invalid admin role claim type"));
 }
@@ -66,6 +116,7 @@ fn test_audit_event_new_populates_metadata_and_preserves_diff() {
         sub: "admin-user".to_string(),
         role: AdminRole::Admin,
         allowed_namespaces: ferrum_edge::grpc::auth::AllowedNamespaces::empty(),
+        key_tier: AdminKeyTier::Primary,
     };
     let diff = update_diff(json!({ "enabled": false }), json!({ "enabled": true }));
     let before = Utc::now();

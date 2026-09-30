@@ -11,9 +11,38 @@
 //! it returns [`JwtError::NotConfigured`]; when the secret or a
 //! related setting (for example `FERRUM_ADMIN_JWT_MAX_TTL`) is present but
 //! invalid it returns [`JwtError::VerificationFailed`]. Read-only file/mesh/
-//! node_agent modes may generate a random secret only on `NotConfigured`; any
-//! other error must fail startup. That fallback lives at the admin-state call
-//! site, not here.
+//! node_agent modes may generate a random secret only on `NotConfigured`, via
+//! [`random_read_only_jwt_manager`]; any other error must fail startup.
+//!
+//! # Role ceiling (`FERRUM_ADMIN_JWT_VIEWER_SECRET`)
+//!
+//! An optional second HS256 verification secret whose tokens are capped at
+//! [`AdminRole::Viewer`] whatever their `role` claim says. A process that only
+//! needs to read configuration (drift detection, dashboards) is given this
+//! secret and can then mint nothing that reaches `operator` or `admin`.
+//!
+//! The ceiling is a property of *which key verified the signature*, recorded as
+//! [`VerifiedAdminToken::key_tier`] and applied when the request's
+//! [`crate::admin::audit::AuditActor`] is built — the single place every route
+//! reads its role from. A viewer-key token's `scope` claims grant nothing, and
+//! its `sub` and `ns` are whatever its holder chose: the viewer secret is a
+//! fleet-wide read credential, not a per-tenant or per-identity one. The tier
+//! is never derived from a token header or claim:
+//!
+//! - both keys are pinned to HS256 (`Validation::new` sets the only accepted
+//!   algorithm, so `none`, `HS384`/`HS512`, and asymmetric algorithms are
+//!   refused before any signature check);
+//! - the primary key is tried first, and the viewer key only when the primary
+//!   reports a signature mismatch, so a token is accepted by exactly the key
+//!   that signed it;
+//! - the two secrets must differ (enforced here and in `EnvConfig`), so no
+//!   signature can verify under both.
+//!
+//! A symmetric second secret was chosen over asymmetric (ES256/EdDSA or JWKS)
+//! verification because the existing admin plane is HS256 end to end and
+//! GitForgeOps-style clients already mint their own HS256 tokens: the ceiling
+//! reuses that exact verification path (claims, issuer, audience, max TTL)
+//! with no key parsing, JWKS fetching, or outbound HTTP on the admin plane.
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,
@@ -52,6 +81,49 @@ impl AdminRole {
 
     pub fn allows(self, required: Self) -> bool {
         self >= required
+    }
+
+    /// The lower of `self` and `ceiling`.
+    pub fn capped_at(self, ceiling: Self) -> Self {
+        self.min(ceiling)
+    }
+}
+
+/// Which verification key accepted an admin JWT's signature.
+///
+/// The tier, not any claim, bounds what the token may do. It is carried on
+/// [`crate::admin::audit::AuditActor`] into authorization, log lines, and audit
+/// records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminKeyTier {
+    /// `FERRUM_ADMIN_JWT_SECRET`: the `role` and `scope` claims are honoured.
+    Primary,
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET`: the role is capped at
+    /// [`AdminRole::Viewer`] and `scope` claims grant nothing. Its holder can
+    /// mint any `sub` and `ns`, so neither is an identity or tenancy boundary.
+    Viewer,
+}
+
+impl AdminKeyTier {
+    /// Stable log / audit label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    /// Highest role a token verified by this key may exercise.
+    pub fn role_ceiling(self) -> AdminRole {
+        match self {
+            Self::Primary => AdminRole::Admin,
+            Self::Viewer => AdminRole::Viewer,
+        }
+    }
+
+    /// Whether `scope` claims (for example `diagnostics:read`) are honoured.
+    pub fn honours_scopes(self) -> bool {
+        matches!(self, Self::Primary)
     }
 }
 
@@ -157,16 +229,98 @@ impl Default for JwtConfig {
     }
 }
 
+/// A signature-verified admin JWT.
+///
+/// `key_tier` records which verification key accepted the signature.
+/// Authorization must use [`VerifiedAdminToken::effective_role`] and
+/// [`VerifiedAdminToken::grants_scope`] (or
+/// [`crate::admin::audit::AuditActor::from_verified`]), never the raw `role` or
+/// `scope` claims.
+#[derive(Debug)]
+pub struct VerifiedAdminToken {
+    pub header: jsonwebtoken::Header,
+    pub claims: AdminClaims,
+    pub key_tier: AdminKeyTier,
+}
+
+impl VerifiedAdminToken {
+    /// Highest role the verifying key allows.
+    pub fn role_ceiling(&self) -> AdminRole {
+        self.key_tier.role_ceiling()
+    }
+
+    /// The role this token may exercise: its `role` claim capped at the
+    /// ceiling of the key that verified it. A missing or malformed `role`
+    /// claim still fails closed.
+    pub fn effective_role(&self) -> Result<AdminRole, String> {
+        Ok(self.claims.admin_role()?.capped_at(self.role_ceiling()))
+    }
+
+    /// Whether the token grants `scope`. A viewer-key token grants no scope,
+    /// whatever its `scope` claim says.
+    pub fn grants_scope(&self, scope: &str) -> bool {
+        self.key_tier.honours_scopes() && self.claims.grants_scope(scope)
+    }
+}
+
 /// JWT Manager for Admin API
 #[derive(Clone)]
 pub struct JwtManager {
     config: JwtConfig,
+    /// Optional `FERRUM_ADMIN_JWT_VIEWER_SECRET`: tokens it verifies are capped
+    /// at [`AdminRole::Viewer`].
+    viewer_secret: Option<String>,
 }
 
 impl JwtManager {
     /// Create new JWT manager
     pub fn new(config: JwtConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            viewer_secret: None,
+        }
+    }
+
+    /// Add a role-ceiling verification secret: tokens signed with it are
+    /// capped at [`AdminRole::Viewer`] whatever their `role` claim says.
+    ///
+    /// Refuses a secret shorter than
+    /// [`crate::config::types::MIN_JWT_SECRET_LENGTH`] and one equal to the
+    /// primary secret — identical keys would let a viewer-secret holder mint
+    /// tokens the primary key accepts uncapped. Error text never carries
+    /// either secret.
+    pub fn with_viewer_secret(mut self, viewer_secret: String) -> Result<Self, JwtError> {
+        if viewer_secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+            return Err(JwtError::VerificationFailed(format!(
+                "FERRUM_ADMIN_JWT_VIEWER_SECRET must be at least {} characters (got {})",
+                crate::config::types::MIN_JWT_SECRET_LENGTH,
+                viewer_secret.len()
+            )));
+        }
+        if viewer_secret == self.config.secret {
+            return Err(JwtError::VerificationFailed(
+                ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR.to_string(),
+            ));
+        }
+        self.viewer_secret = Some(viewer_secret);
+        Ok(self)
+    }
+
+    /// Whether a role-ceiling viewer secret is configured.
+    pub fn has_viewer_secret(&self) -> bool {
+        self.viewer_secret.is_some()
+    }
+
+    /// Key for `GET /config/export` credential fingerprints.
+    ///
+    /// Derived from the primary admin JWT secret only — never from
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` — so the viewer-tier credential that
+    /// the export is designed for cannot compute (and therefore cannot
+    /// dictionary-test) a fingerprint. `None` when no secret is configured.
+    pub(crate) fn config_export_fingerprint_key(
+        &self,
+    ) -> Option<crate::fips::approved::HmacSha256Key> {
+        crate::admin::config_export::fingerprint_key(&self.config.secret)
     }
 
     /// Key for admin resource `ETag`s, derived from the admin JWT secret so
@@ -176,12 +330,65 @@ impl JwtManager {
         crate::admin::preconditions::etag_key(&self.config.secret)
     }
 
-    /// Verify and decode a JWT token
-    pub fn verify_token(&self, token: &str) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
-        let key = DecodingKey::from_secret(self.config.secret.as_bytes());
+    /// Verify and decode a JWT token.
+    ///
+    /// The primary secret is tried first. Only when it reports a signature
+    /// mismatch is the optional viewer secret tried, and a token it verifies
+    /// carries [`AdminKeyTier::Viewer`]. Every other failure
+    /// (wrong algorithm, expired, bad claims) is final: the viewer key is
+    /// never a second chance for a token the primary key could parse.
+    pub fn verify_token(&self, token: &str) -> Result<VerifiedAdminToken, JwtEncodeError> {
+        let primary = self.verify_with_key(token, &self.config.secret, self.config.algorithm);
+        let primary_error = match primary {
+            Ok(data) => {
+                return Ok(VerifiedAdminToken {
+                    header: data.header,
+                    claims: data.claims,
+                    key_tier: AdminKeyTier::Primary,
+                });
+            }
+            Err(error) => error,
+        };
+        let Some(viewer_secret) = self.viewer_secret.as_deref() else {
+            return Err(primary_error);
+        };
+        if !matches!(
+            primary_error.kind(),
+            jsonwebtoken::errors::ErrorKind::InvalidSignature
+        ) {
+            return Err(primary_error);
+        }
+        // Pinned to HS256 regardless of the primary configuration: the ceiling
+        // key must never accept another algorithm.
+        let data = self.verify_with_key(token, viewer_secret, Algorithm::HS256)?;
+        // The viewer secret's holder chooses `sub`, and it is rendered into
+        // log lines next to `key_tier`. Refuse subjects that could forge or
+        // flood those lines.
+        if !is_acceptable_viewer_key_subject(&data.claims.sub) {
+            return Err(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidToken,
+            ));
+        }
+        Ok(VerifiedAdminToken {
+            header: data.header,
+            claims: data.claims,
+            key_tier: AdminKeyTier::Viewer,
+        })
+    }
 
-        // Configure validation with required claims
-        let mut validation = Validation::new(self.config.algorithm);
+    /// Full verification of `token` under one HMAC key and one algorithm.
+    fn verify_with_key(
+        &self,
+        token: &str,
+        secret: &str,
+        algorithm: Algorithm,
+    ) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
+        let key = DecodingKey::from_secret(secret.as_bytes());
+
+        // Configure validation with required claims. `Validation::new` makes
+        // `algorithm` the only accepted `alg`, so the header cannot select a
+        // different verifier.
+        let mut validation = Validation::new(algorithm);
         validation.validate_exp = true; // Enable expiration check
         validation.validate_nbf = true; // Enable not-before check
 
@@ -332,7 +539,7 @@ impl JwtManager {
     pub fn verify_request(
         &self,
         auth_header: Option<&str>,
-    ) -> Result<TokenData<AdminClaims>, JwtError> {
+    ) -> Result<VerifiedAdminToken, JwtError> {
         let auth_header = auth_header.ok_or(JwtError::MissingHeader)?;
         let token =
             Self::extract_token_from_header(auth_header).ok_or(JwtError::InvalidHeaderFormat)?;
@@ -455,5 +662,54 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
         algorithm: Algorithm::HS256,
     };
 
-    Ok(JwtManager::new(config))
+    with_viewer_secret_from_env(JwtManager::new(config))
+}
+
+/// Longest `sub` a viewer-key token may carry, in bytes.
+pub const MAX_VIEWER_KEY_SUBJECT_BYTES: usize = 256;
+
+/// Whether a viewer-key token's `sub` is acceptable: at most
+/// [`MAX_VIEWER_KEY_SUBJECT_BYTES`] bytes and free of control characters.
+/// Primary-key tokens are not subject to this rule; their subjects come from
+/// whoever holds the primary secret.
+pub fn is_acceptable_viewer_key_subject(sub: &str) -> bool {
+    sub.len() <= MAX_VIEWER_KEY_SUBJECT_BYTES && !sub.chars().any(char::is_control)
+}
+
+/// Message for a viewer secret equal to the primary admin secret. Names both
+/// settings and neither value.
+pub const ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR: &str = "FERRUM_ADMIN_JWT_VIEWER_SECRET must differ from FERRUM_ADMIN_JWT_SECRET; identical values \
+     would let a viewer-secret holder mint tokens the primary key accepts without the viewer \
+     role ceiling";
+
+/// Attach `FERRUM_ADMIN_JWT_VIEWER_SECRET` (from env/`ferrum.conf`) when set.
+fn with_viewer_secret_from_env(manager: JwtManager) -> Result<JwtManager, JwtError> {
+    use crate::config::conf_file::resolve_ferrum_var;
+
+    match resolve_ferrum_var("FERRUM_ADMIN_JWT_VIEWER_SECRET").filter(|s| !s.is_empty()) {
+        Some(viewer_secret) => manager.with_viewer_secret(viewer_secret),
+        None => Ok(manager),
+    }
+}
+
+/// The read-only-mode fallback for an unset `FERRUM_ADMIN_JWT_SECRET`
+/// (`file`, `mesh`, `node_agent`): a random, unguessable primary secret, so no
+/// externally minted token reaches `operator` or `admin`, plus
+/// `FERRUM_ADMIN_JWT_VIEWER_SECRET` when configured so viewer-tier readers
+/// still work. Call only on [`JwtError::NotConfigured`].
+pub fn random_read_only_jwt_manager() -> Result<JwtManager, JwtError> {
+    use crate::config::conf_file::resolve_ferrum_var;
+
+    let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let issuer =
+        resolve_ferrum_var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|| "ferrum-edge".to_string());
+    let audience = resolve_ferrum_var("FERRUM_ADMIN_JWT_AUDIENCE").filter(|s| !s.is_empty());
+    let manager = JwtManager::new(JwtConfig {
+        secret: random_secret,
+        issuer,
+        audience,
+        max_ttl_seconds: admin_jwt_max_ttl_from_env()?,
+        algorithm: Algorithm::HS256,
+    });
+    with_viewer_secret_from_env(manager)
 }

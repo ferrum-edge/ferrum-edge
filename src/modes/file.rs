@@ -1074,19 +1074,19 @@ pub async fn serve(
         // `FERRUM_ADMIN_JWT_*` globals.
         jm
     } else {
-        match create_jwt_manager_from_env() {
-            Ok(jm) => jm,
-            Err(crate::admin::jwt_auth::JwtError::NotConfigured) => {
+        let jwt_manager = create_jwt_manager_from_env().or_else(|error| match error {
+            crate::admin::jwt_auth::JwtError::NotConfigured => {
                 warn!(
                     "Admin JWT not configured, generating a random read-only secret; \
-                     admin endpoints will reject externally minted tokens"
+                     admin endpoints will reject externally minted tokens other than \
+                     FERRUM_ADMIN_JWT_VIEWER_SECRET viewer tokens"
                 );
-                let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-                crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
-                    secret: random_secret,
-                    ..Default::default()
-                })
+                crate::admin::jwt_auth::random_read_only_jwt_manager()
             }
+            other => Err(other),
+        });
+        match jwt_manager {
+            Ok(jm) => jm,
             Err(e) => {
                 let startup_err = anyhow::anyhow!("Invalid admin JWT configuration: {}", e);
                 shutdown_file_background_startup_tasks(

@@ -1281,11 +1281,8 @@ async fn start_node_agent_admin_listeners(
                 "Admin JWT not configured for node_agent mode, generating a random read-only secret; \
                  authenticated admin endpoints will reject operator tokens"
             );
-            let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-            crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
-                secret: random_secret,
-                ..Default::default()
-            })
+            crate::admin::jwt_auth::random_read_only_jwt_manager()
+                .map_err(|err| anyhow::anyhow!("Invalid admin JWT configuration: {}", err))?
         }
         Err(err) => {
             return Err(anyhow::anyhow!("Invalid admin JWT configuration: {}", err));

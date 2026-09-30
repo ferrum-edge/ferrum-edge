@@ -1244,6 +1244,7 @@ jobs:
               integration::db_proxy_plugin_association_fail_closed_tests
               integration::admin_audit_rbac_tests
               integration::admin_backup_audit_tests
+              integration::admin_config_export_tests
               integration::audit_retention_tests
               integration::admin_backend_capabilities_tests
               integration::admin_batch_atomicity_tests

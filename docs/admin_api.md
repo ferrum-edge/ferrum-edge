@@ -48,7 +48,7 @@ Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/export` also checks a present `ns` claim when enforcement is off. `/config/apply-status` is not namespace-scoped.
 - The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, `GET /namespaces` is **filtered** to the JWT `ns` claim — a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
 - Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected: `X-Ferrum-Namespace` does not select a tenant there. Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
@@ -57,11 +57,79 @@ With enforcement off — the flag unset and the CP scope single-namespace — th
 
 | Role | Access |
 | --- | --- |
-| `viewer` | Ordinary read endpoints: proxies, consumers (redacted), plugin configs, upstreams, namespaces, API spec metadata listing, metrics, cluster, backend capabilities, and mesh introspection |
+| `viewer` | Ordinary read endpoints: proxies, consumers (redacted), plugin configs, upstreams, namespaces, API spec metadata listing, the fingerprinted configuration export (`GET /config/export`), metrics, cluster, backend capabilities, and mesh introspection |
 | `operator` | Viewer access plus proxy, upstream, and plugin config writes; gateway trust bundle reads and status; TLS store reads, inventory, events, validation, and forced rotation; `GET /config/apply-status`; backend capability refresh; mesh egress-scope test and config-revision reset |
 | `admin` | Full access, including consumers, credentials, namespace create/rename/delete, raw API spec retrieval and mutations, gateway trust bundle writes, TLS material and ACME state management, batch/backup/restore, and audit logs |
 
 Tokens without a valid `role` claim are rejected.
+
+### Read-only credentials (`FERRUM_ADMIN_JWT_VIEWER_SECRET`)
+
+`FERRUM_ADMIN_JWT_SECRET` is a symmetric key: whoever holds it can mint any
+role. For a process that only needs to read configuration (drift detection,
+dashboards, audit tooling), set a second secret, `FERRUM_ADMIN_JWT_VIEWER_SECRET`
+(at least 32 characters), and give that process only the viewer secret. A token
+whose signature verifies under the viewer secret is authorized as `viewer`
+**whatever its `role` claim says**: a viewer-secret token claiming `admin` still
+gets `403` on operator and admin routes such as `POST /proxies` and
+`GET /backup`.
+
+| Verified by | Effective role |
+| --- | --- |
+| `FERRUM_ADMIN_JWT_SECRET` | the `role` claim (`viewer`, `operator`, or `admin`) |
+| `FERRUM_ADMIN_JWT_VIEWER_SECRET` | `viewer`, even if the claim says `operator` or `admin` |
+
+- The ceiling comes from which key verified the signature, never from a token
+  header or claim. It is applied when the request's actor is built, the single
+  place every route reads its role from.
+- Both keys accept only `HS256`. A token with any other `alg`, including
+  `none`, `HS384`, `HS512`, or an asymmetric algorithm, is rejected. The
+  primary key is tried first, and the viewer key only after a signature
+  mismatch. A token rejected by the primary key for any other reason (wrong
+  algorithm, expired, bad claims) is not retried under the viewer key.
+- Viewer-secret tokens go through the same checks as primary tokens: required
+  claims, issuer, audience, `FERRUM_ADMIN_JWT_MAX_TTL`, and `ns` claim parsing.
+- Startup and `ferrum-edge validate` refuse a viewer secret equal to
+  `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_CP_DP_GRPC_JWT_SECRET`, or one shorter
+  than 32 characters. The error names the settings and never the values.
+- In `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET`, the
+  random read-only primary secret still applies and the viewer secret keeps
+  working.
+- **`scope` claims grant nothing.** A viewer-secret token cannot obtain
+  `diagnostics:read` (or any later scope) from its own claim, so diagnostic
+  reference lookups answer `403`.
+
+**The viewer secret is a fleet-wide read credential.** Whoever holds it can
+mint a token with any `sub` and any `ns` claim, so for these tokens neither is
+an identity or tenancy boundary:
+
+- With `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` off, a viewer-secret token reads
+  every namespace. With it on, the holder can still write whatever `ns` claim
+  it likes.
+- Log lines that name an actor also carry `key_tier` (`primary` or `viewer`),
+  and audit records name a viewer-secret actor as `viewer-key:<sub>`. A chosen
+  subject can therefore never pass for one minted with the primary key.
+- For per-tenant or per-identity readers, pre-mint short-lived `viewer` tokens
+  with `FERRUM_ADMIN_JWT_SECRET` and an explicit `ns` claim instead, and hand
+  out the tokens, not the secret.
+
+- **Denied attempts are still audited under the chosen subject.** Security
+  audit records for refused attempts, such as a `GET /backup` refused with
+  `403`, are written as `DENIED` or `VALIDATION_FAILED` rows. A viewer-secret
+  holder can therefore add such rows under any subject it chooses. They are
+  labelled `viewer-key:<sub>` and grant nothing, but they can add noise to the
+  audit log. This is accepted: suppressing them would hide real probing.
+- A viewer-key token whose `sub` is longer than 256 bytes or contains a
+  control character is rejected with `401`, so a chosen subject cannot forge
+  or flood log lines. Primary-key subjects are unchanged.
+- A primary-key token whose `sub` itself starts with `viewer-key:` or
+  `primary-key:` is recorded as `primary-key:<sub>`, so no primary subject can
+  render the same as a viewer-key actor.
+
+A namespace ceiling for the viewer key (a `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`
+that intersects the `ns` claim and is enforced on every namespace-scoped route
+and on the `/namespaces` registry) is a planned follow-up. It is not
+implemented yet.
 
 Generate a token:
 ```bash
@@ -1554,9 +1622,105 @@ Repair or deliberately remove the offending document and re-run the restore.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
+### Read-only configuration export (`GET /config/export`)
+
+`GET /backup` is `admin`-only because it releases raw credentials.
+`GET /config/export` returns the namespace's proxies, consumers, plugin configs,
+and upstreams for **any** authenticated role, including viewer-secret tokens.
+It uses the same authoritative load as `/backup`, but every credential is
+replaced by a keyed fingerprint. Drift detection can tell *that* a credential
+changed without ever seeing it.
+
+```bash
+curl -H "Authorization: Bearer $VIEWER_TOKEN" \
+  -H "X-Ferrum-Namespace: prod" \
+  -D - http://localhost:9000/config/export
+```
+
+- **What is fingerprinted.** The export does not decide on its own which
+  fields are sensitive. It runs the same projections that ordinary viewer
+  reads use, and puts a fingerprint wherever those would put `[REDACTED]` or a
+  masked URL:
+  - Consumer `keyauth` `key` and `jwt`/`hmac_auth` `secret` get one fingerprint
+    per entry.
+  - In plugin configs, fingerprints replace secrets and credential-bearing
+    URLs, including URLs whose path or query would otherwise be masked.
+  - Upstream `service_discovery.consul.token` gets a fingerprint, and any URL
+    carrying userinfo anywhere in a Proxy or Upstream (a Consul `address`,
+    for example) is fingerprinted. `viewer` reads and audit diffs strip that
+    userinfo to `redacted@` as well. `operator` and `admin` reads of proxies
+    and upstreams keep it verbatim: both roles write those resources, and a
+    GET-then-PUT must not replace stored userinfo with `redacted@`.
+
+  A value the viewer projection shows is shown verbatim.
+- **Hidden credential types.** Ordinary Consumer reads omit `basicauth` and
+  unknown/custom credential types entirely, and so does the export's
+  `credentials` map. Instead, every exported consumer carries
+  `hidden_credentials_fingerprint`, one fingerprint over those omitted types.
+  It is present even when a consumer has none, so it shows that hidden
+  credentials changed without revealing whether any exist.
+- **Fingerprint format.** `hmac-sha256:<64 lowercase hex>`, computed as
+  HMAC-SHA-256 under a subkey derived from `FERRUM_ADMIN_JWT_SECRET`
+  (`HMAC-SHA-256(secret, "ferrum-edge/admin-config-export-fingerprint/v1")`).
+  The subkey is never derived from the viewer secret, so the reader cannot
+  compute or dictionary-test a fingerprint.
+  - The MAC input binds the resource kind, namespace, id, and the field's JSON
+    pointer (for example `/credentials/keyauth/0/key` or
+    `/config/headers/x-api-key`) to a key-sorted canonical JSON of the stored
+    value.
+  - Equal secrets in two fields, or on two resources, therefore fingerprint
+    differently.
+  - Each JSON pointer is fingerprinted once, even when more than one
+    projection rule matches it (a schema rule and the name heuristic). A
+    fingerprint of an ancestor, such as a whole value that fails closed, may
+    still cover fingerprints of its children.
+  - A legacy single-object credential is emitted as a one-element array, and
+    its pointer uses index `0` (for example `/credentials/keyauth/0/key`), so
+    the pointer always names the emitted position.
+- **Stable.** An unchanged credential fingerprints identically across calls and
+  across replicas that share `FERRUM_ADMIN_JWT_SECRET`. Rotating that secret
+  changes every fingerprint and `redaction.fingerprint_key_id`. Two caveats:
+  - In `file`/`mesh`/`node_agent` mode without `FERRUM_ADMIN_JWT_SECRET`, the
+    key is random per process, so fingerprints change on every restart.
+  - A CP and a DP (or any two replicas) whose admin secrets differ never
+    produce comparable fingerprints.
+- **Residual oracle.** A principal that can *write* a field (an operator for
+  plugin configs, upstreams, and proxies; an admin for consumers) can confirm
+  a guess of that field's previous value by writing the guess and comparing
+  the new fingerprint with the old one. That needs write access to the exact
+  field, which already allows replacing the secret, and it destroys the stored
+  value.
+- **Byte-stable.** Collections are sorted by `id`, proxy plugin associations
+  by config id, and object keys are sorted. The document carries no timestamp,
+  so two exports of unchanged configuration under one key are byte-identical.
+  `api_spec_id` ownership tags are stripped so a cached fallback compares equal
+  to a database read.
+- **Data source.** Like `/backup`, the export falls back to the cached
+  configuration when the database is unavailable and says so with
+  `X-Data-Source: cached`. It returns `503` when there is neither.
+- **Concurrency limits.** Each process bounds export work so parallel exports
+  cannot tie up the admin plane:
+  - At most one export loads from the database at a time. A concurrent export
+    does not wait for it: it serves the labelled cached snapshot
+    (`X-Data-Source: cached`), exactly as on a database error. When there is
+    no cached snapshot yet, it gets `503` with `Retry-After: 1` instead.
+  - At most four exports are in flight at a time, from either source. The
+    document is built and serialized on the blocking pool, not on an async
+    admin worker. A request that cannot start within 5 seconds gets `503`
+    with `Retry-After: 1`.
+- **Scope.** The export is namespace-scoped through `X-Ferrum-Namespace`. A
+  present `ns` claim must authorize the namespace (`403` otherwise), even with
+  `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` off. API-spec documents (Admin-gated)
+  and gateway trust bundles (Operator-gated) are not included.
+- **Not a backup.** The document cannot be restored and is not accepted by
+  `POST /restore`. It needs a valid admin JWT; a metrics bearer token or a
+  metrics CIDR allowlist does not grant it. It is a read, so it writes no audit
+  record, but each export logs one INFO line with the actor, `key_tier`,
+  namespace, data source, and size, and no configuration content.
+
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing, so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. The `namespace` field is the authorization-scoping key `GET /audit` filters on. Namespace-scoped mutations (after the `ns`-claim gate, when that flag is on) use the validated request namespace. Fleet-global mutations, invalid-header backup attempts, and namespace-claim denials use the canonical default namespace (`ferrum`) rather than an unvalidated `X-Ferrum-Namespace`. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing, so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim, or `viewer-key:<sub>` for a token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. The `namespace` field is the authorization-scoping key `GET /audit` filters on. Namespace-scoped mutations (after the `ns`-claim gate, when that flag is on) use the validated request namespace. Fleet-global mutations, invalid-header backup attempts, and namespace-claim denials use the canonical default namespace (`ferrum`) rather than an unvalidated `X-Ferrum-Namespace`. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
 
 This pipeline covers every Admin action that emits an ordinary mutation audit
 event: configuration-database mutations (CRUD, credentials, API specs, batch,

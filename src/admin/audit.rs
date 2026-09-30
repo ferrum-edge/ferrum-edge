@@ -69,7 +69,7 @@
 use crate::admin::audit_spool::{
     AuditSpool, RetainOutcome, SpoolError, SpoolErrorKind, SpooledAuditRecord,
 };
-use crate::admin::jwt_auth::{AdminClaims, AdminRole};
+use crate::admin::jwt_auth::{AdminKeyTier, AdminRole, VerifiedAdminToken};
 use crate::config::db_backend::DatabaseBackend;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -483,7 +483,7 @@ impl AuditEvent {
         Self {
             id: Uuid::new_v4().to_string(),
             ts: Utc::now(),
-            actor: actor.sub.clone(),
+            actor: actor.audit_subject(),
             action: action.into(),
             resource_type: resource_type.into(),
             resource_id: resource_id.into(),
@@ -517,17 +517,60 @@ pub struct AuditActor {
     /// token); only *enforced* against `X-Ferrum-Namespace` when
     /// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`.
     pub allowed_namespaces: crate::grpc::auth::AllowedNamespaces,
+    /// Which verification key accepted the token. A viewer-key token's `sub`
+    /// and `ns` were chosen by whoever holds the viewer secret, so every log
+    /// line and audit record that names the actor also names the tier.
+    pub key_tier: AdminKeyTier,
 }
 
+/// Prefix on the persisted audit `actor` of a viewer-key token, so a subject
+/// its holder chose can never pass for one minted with the primary key.
+pub const VIEWER_KEY_ACTOR_PREFIX: &str = "viewer-key:";
+
 impl AuditActor {
-    pub fn from_claims(claims: &AdminClaims) -> Result<Self, String> {
+    /// Actor for a signature-verified token — the only constructor request
+    /// authorization uses. The role is the `role` claim capped at the ceiling
+    /// of the verifying key, so a token verified by
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` is a `viewer` even when it claims
+    /// `admin`. Every route's role check reads this actor.
+    pub fn from_verified(token: &VerifiedAdminToken) -> Result<Self, String> {
         Ok(Self {
-            sub: claims.sub.clone(),
-            role: claims.admin_role()?,
-            allowed_namespaces: claims.allowed_namespaces()?,
+            sub: token.claims.sub.clone(),
+            role: token.effective_role()?,
+            allowed_namespaces: token.claims.allowed_namespaces()?,
+            key_tier: token.key_tier,
         })
     }
+
+    /// The actor string persisted on audit records.
+    ///
+    /// - A viewer-key token renders as `viewer-key:<sub>`.
+    /// - A primary-key token renders as its bare `sub`, unless that `sub`
+    ///   itself starts with `viewer-key:` or `primary-key:`; then it is escaped
+    ///   as `primary-key:<sub>`.
+    ///
+    /// The mapping is injective, so a primary-key subject can never render the
+    /// same as a viewer-key actor (the audit record has no separate tier
+    /// column; the tier is carried in this string).
+    pub fn audit_subject(&self) -> String {
+        match self.key_tier {
+            AdminKeyTier::Primary => {
+                let reserved = self.sub.starts_with(VIEWER_KEY_ACTOR_PREFIX)
+                    || self.sub.starts_with(PRIMARY_KEY_ACTOR_ESCAPE_PREFIX);
+                if reserved {
+                    format!("{PRIMARY_KEY_ACTOR_ESCAPE_PREFIX}{}", self.sub)
+                } else {
+                    self.sub.clone()
+                }
+            }
+            AdminKeyTier::Viewer => format!("{VIEWER_KEY_ACTOR_PREFIX}{}", self.sub),
+        }
+    }
 }
+
+/// Escape prefix for a primary-key subject that would otherwise look like a
+/// tier-labelled actor. See [`AuditActor::audit_subject`].
+pub const PRIMARY_KEY_ACTOR_ESCAPE_PREFIX: &str = "primary-key:";
 
 #[derive(Debug, Clone, Default)]
 pub struct AuditListFilter {
@@ -1869,7 +1912,7 @@ pub fn note_request_actor(actor: &AuditActor, ctx: &AuditRequestContext) {
         return;
     };
     slot.with(|inner| {
-        inner.actor = Some(actor.sub.clone());
+        inner.actor = Some(actor.audit_subject());
         inner.source_address = ctx.source_address.clone();
         inner.request_id = ctx.request_id.clone();
     });
