@@ -148,6 +148,14 @@ proxies:
     backend_port: {backend_port}
     strip_listen_path: true
     pool_enable_http2: false
+  - id: "params"
+    listen_path: "/params"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: false
+    pool_enable_http2: false
+    allow_path_parameters: true
 
 consumers: []
 plugin_configs:
@@ -609,11 +617,131 @@ const CASES: &[Case] = &[
         backend_target: Backend::Never,
         why: "an escaped `;` delimiter decodes and forms the same dot segment",
     },
+    // A `;` path parameter on an ordinary segment is refused unless the
+    // routed proxy opts in (GHSA-fcqw-793q-wg5x): Tomcat and Spring strip
+    // `;…` from every segment, so `/canon/admin;x/users` would execute
+    // `/canon/admin/users` while routing and policy read another path. `%3B`
+    // decodes to the same `;` and is refused the same way.
     Case {
         target: "/canon/v1;version=2",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a path parameter is refused on a proxy that has not opted in",
+    },
+    Case {
+        target: "/canon/admin;x/users",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a parameter-stripping backend would execute /canon/admin/users",
+    },
+    Case {
+        target: "/canon/admin%3Bx/users",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "an escaped `;` decodes to the same refused path parameter",
+    },
+    Case {
+        target: "/canon/admin;/users",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "an empty path parameter is still a path parameter",
+    },
+    // The `allow_path_parameters: true` proxy keeps matrix parameters, and
+    // forwards them unchanged so routing, policy, and the backend agree.
+    Case {
+        target: "/params/v1;version=2",
         status: 200,
-        backend_target: Backend::Exact("/canon/v1;version=2"),
-        why: "a path parameter on an ordinary segment is forwarded unchanged",
+        backend_target: Backend::Exact("/params/v1;version=2"),
+        why: "an opted-in proxy forwards a path parameter unchanged",
+    },
+    Case {
+        target: "/params/admin;x/users",
+        status: 200,
+        backend_target: Backend::Exact("/params/admin;x/users"),
+        why: "an opted-in proxy forwards a mid-path parameter unchanged",
+    },
+    Case {
+        target: "/params/admin%3Bx/users",
+        status: 200,
+        backend_target: Backend::Exact("/params/admin;x/users"),
+        why: "an opted-in proxy forwards the decoded parameter, one coordinate",
+    },
+    // Empty segments are refused on every proxy, opted in or not: backends
+    // that collapse `//` (after stripping `;…`) would resolve another path.
+    Case {
+        target: "//admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a leading empty segment collapses on the backend",
+    },
+    Case {
+        target: "//canon/admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a leading empty segment would skip segment-aware routing",
+    },
+    Case {
+        target: "/canon//admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a mid-path empty segment collapses on the backend",
+    },
+    Case {
+        target: "/;x/admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a segment empty before its `;` collapses after parameter stripping",
+    },
+    Case {
+        target: "/canon/;x/admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a mid-path segment empty before its `;` is an empty segment",
+    },
+    Case {
+        target: "/canon/%3Bx/admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "an escaped `;` leading a segment is the same empty segment",
+    },
+    Case {
+        target: "/params//admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "the path-parameter opt-in does not admit empty segments",
+    },
+    Case {
+        target: "/params/;x/admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "the path-parameter opt-in does not admit a parameter-only segment",
+    },
+    Case {
+        target: "/params/public/..;/admin",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "the path-parameter opt-in does not admit a parameter dot segment",
+    },
+    Case {
+        target: "/canon/admin/",
+        status: 200,
+        backend_target: Backend::Exact("/canon/admin/"),
+        why: "a trailing slash is not an empty segment",
+    },
+    // A final parameter-only segment (Tomcat's `;jsessionid=` on directory
+    // URLs) resolves to the trailing-slash path, so only the per-proxy rule
+    // applies to it.
+    Case {
+        target: "/params/;jsessionid=abc",
+        status: 200,
+        backend_target: Backend::Exact("/params/;jsessionid=abc"),
+        why: "a final parameter-only segment is forwarded on an opted-in proxy",
+    },
+    Case {
+        target: "/canon/;jsessionid=abc",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a final parameter-only segment is still a path parameter",
     },
     // A literal backslash is rejected as well as `%5C`. All three senders can
     // carry it verbatim: the raw H1 socket writes the request line byte for
@@ -751,17 +879,158 @@ async fn functional_path_parameter_dot_segment_is_refused_like_a_dot_segment() {
         );
     }
 
-    // Control: a path parameter on an ordinary segment is still served, so
-    // the refusals above are the dot-segment rule rather than a `;` ban.
-    let (status, body) = send_h1_full(proxy_port, "/canon/v1;version=2").await;
+    // The `allow_path_parameters` opt-in never relaxes the dot-segment rule:
+    // the same spellings are refused with the same body on an opted-in proxy.
+    for target in [
+        "/params/public/..;/blocked/thing",
+        "/params/public/.;x/blocked/thing",
+    ] {
+        let (status, body) = send_h1_full(proxy_port, target).await;
+        assert_eq!(status, 400, "{target}");
+        assert_eq!(body, DOT_SEGMENT_BODY, "{target}");
+    }
+    assert!(backend.take_targets().is_empty());
+
+    // Control: a path parameter on an ordinary segment is served on the
+    // opted-in proxy, so the refusals above are the dot-segment rule rather
+    // than the per-proxy `;` rule (GHSA-fcqw-793q-wg5x).
+    let (status, body) = send_h1_full(proxy_port, "/params/v1;version=2").await;
     assert_eq!(
         status, 200,
-        "ordinary path parameter must be served: {body:?}"
+        "ordinary path parameter must be served on an opted-in proxy: {body:?}"
     );
     assert_eq!(
         backend.take_targets(),
-        vec!["/canon/v1;version=2".to_string()]
+        vec!["/params/v1;version=2".to_string()]
     );
+
+    gateway.shutdown();
+}
+
+/// A path parameter on a proxy that has not opted in, and an empty segment on
+/// any proxy, are refused with their own fixed, non-echoing bodies and never
+/// reach a backend (GHSA-fcqw-793q-wg5x).
+#[ignore]
+#[tokio::test]
+async fn functional_path_parameters_and_empty_segments_are_refused_with_fixed_bodies() {
+    const PATH_PARAMETER_BODY: &str = r#"{"error":"Request path contains a path parameter"}"#;
+    const EMPTY_SEGMENT_BODY: &str = r#"{"error":"Request path contains an empty path segment"}"#;
+
+    let backend = RecordingBackend::start().await;
+    let (mut gateway, _https_port) = spawn_gateway(backend.port, None).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .expect("proxy port ready");
+    let proxy_port = gateway.proxy_port;
+    let _ = backend.take_targets();
+
+    for (target, expected_body) in [
+        ("/canon/admin;x/users", PATH_PARAMETER_BODY),
+        ("/canon/admin%3Bx/users", PATH_PARAMETER_BODY),
+        ("/strip/tail;x", PATH_PARAMETER_BODY),
+        ("//admin", EMPTY_SEGMENT_BODY),
+        ("/canon//admin", EMPTY_SEGMENT_BODY),
+        ("/;x/admin", EMPTY_SEGMENT_BODY),
+        ("/params//admin", EMPTY_SEGMENT_BODY),
+    ] {
+        let (status, body) = send_h1_full(proxy_port, target).await;
+        assert_eq!((status, body.as_str()), (400, expected_body), "{target}");
+    }
+    assert!(
+        backend.take_targets().is_empty(),
+        "no refused spelling may reach the backend"
+    );
+
+    gateway.shutdown();
+}
+
+/// The path-parameter opt-in never routes a request past another proxy
+/// (GHSA-fcqw-793q-wg5x). The router splits only on `/`, so `/admin;x/users`
+/// misses the `/admin` proxy and lands on an opted-in `/` catch-all; a
+/// parameter-stripping backend would then execute `/admin/users` without the
+/// `/admin` proxy's policy. The gateway re-resolves the stripped path and
+/// refuses the request because it belongs to a different proxy.
+#[ignore]
+#[tokio::test]
+async fn functional_path_parameter_opt_in_does_not_leak_across_proxies() {
+    const PATH_PARAMETER_BODY: &str = r#"{"error":"Request path contains a path parameter"}"#;
+
+    let backend = RecordingBackend::start().await;
+    let port = backend.port;
+    let config = format!(
+        r#"version: "1"
+proxies:
+  - id: "catch-all"
+    listen_path: "/"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {port}
+    strip_listen_path: false
+    pool_enable_http2: false
+    allow_path_parameters: true
+  - id: "admin"
+    listen_path: "/admin"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {port}
+    strip_listen_path: false
+    pool_enable_http2: false
+    plugins:
+      - plugin_config_id: "admin-termination"
+
+consumers: []
+plugin_configs:
+  - id: "admin-termination"
+    plugin_name: request_termination
+    scope: proxy
+    proxy_id: "admin"
+    enabled: true
+    config:
+      status_code: 403
+      content_type: application/json
+      message: "blocked by policy"
+      trigger:
+        path_prefix: "/admin"
+"#
+    );
+    let (mut gateway, https_port) = spawn_path_gateway(&config, None).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .expect("proxy port ready");
+    let proxy_port = gateway.proxy_port;
+    let _ = backend.take_targets();
+
+    let (status, body) = send_h1_full(proxy_port, "/admin;x/users").await;
+    assert_eq!(status, 400, "leaking spelling: {body:?}");
+    assert_eq!(body, PATH_PARAMETER_BODY);
+
+    let h3 = Http3Client::insecure().expect("H3 client");
+    for (target, expected_status, expected_backend) in [
+        // Stripped `/admin/users` belongs to the `/admin` proxy: refused.
+        ("/admin;x/users", 400, None),
+        ("/admin%3Bx/users", 400, None),
+        ("/admin;/users", 400, None),
+        // The protected route itself still runs its policy.
+        ("/admin/users", 403, None),
+        // Stripped `/other/y` routes to the same catch-all: forwarded as sent.
+        ("/other;x/y", 200, Some("/other;x/y")),
+    ] {
+        for protocol in ["H1", "H2", "H3"] {
+            let status = match protocol {
+                "H1" => send_h1(proxy_port, target).await,
+                "H2" => send_h2(proxy_port, target).await,
+                _ => send_h3(&h3, https_port, target).await,
+            };
+            assert_eq!(status, expected_status, "{protocol} {target}");
+            let observed = backend.take_targets();
+            match expected_backend {
+                Some(expected) => assert_eq!(observed, vec![expected.to_string()]),
+                None => assert!(observed.is_empty(), "{protocol} {target}: {observed:?}"),
+            }
+        }
+    }
 
     gateway.shutdown();
 }
@@ -837,7 +1106,7 @@ fn assert_grpc_web_path_rejection(
         "{protocol}: canonical-path rejection is INVALID_ARGUMENT: {trailer:?}"
     );
     assert!(
-        !trailer.contains("%2F"),
+        !trailer.contains("%2F") && !trailer.contains("a;x"),
         "{protocol}: response must not echo attacker-controlled target bytes"
     );
 }
@@ -845,7 +1114,10 @@ fn assert_grpc_web_path_rejection(
 #[ignore]
 #[tokio::test]
 async fn functional_policy_path_rejection_preserves_rpc_wire_shapes() {
-    const TARGET: &str = "/canon/a%2Fb";
+    // `/canon/a%2Fb` is refused before routing; `/canon/a;x` after route
+    // lookup, by the per-proxy path-parameter rule (GHSA-fcqw-793q-wg5x).
+    // Both must keep the RPC wire shape.
+    const TARGETS: [&str; 2] = ["/canon/a%2Fb", "/canon/a;x"];
     const GRPC: &str = "application/grpc";
     const GRPC_WEB: &str = "application/grpc-web+proto";
 
@@ -857,43 +1129,60 @@ async fn functional_policy_path_rejection_preserves_rpc_wire_shapes() {
         .expect("proxy port ready");
     let proxy_port = gateway.proxy_port;
     let _ = backend.take_targets();
-
-    let h1_web = send_h1_rpc(proxy_port, TARGET, GRPC_WEB).await;
-    assert_grpc_web_path_rejection("H1 gRPC-Web", h1_web.status, &h1_web.headers, &h1_web.body);
-
-    let h2_grpc = send_h2_rpc(proxy_port, TARGET, GRPC).await;
-    assert_native_grpc_path_rejection("H2 gRPC", h2_grpc.status, &h2_grpc.headers, &h2_grpc.body);
-    let h2_web = send_h2_rpc(proxy_port, TARGET, GRPC_WEB).await;
-    assert_grpc_web_path_rejection("H2 gRPC-Web", h2_web.status, &h2_web.headers, &h2_web.body);
-
     let h3 = Http3Client::insecure().expect("H3 client");
-    let h3_grpc = send_h3_rpc(&h3, https_port, TARGET, GRPC).await;
-    assert_native_grpc_path_rejection(
-        "H3 gRPC",
-        h3_grpc.status,
-        &h3_grpc.headers,
-        &h3_grpc.body_bytes,
-    );
-    assert!(
-        h3_grpc.trailers.is_none(),
-        "H3 gRPC rejection is trailers-only initial headers"
-    );
-    let h3_web = send_h3_rpc(&h3, https_port, TARGET, GRPC_WEB).await;
-    assert_grpc_web_path_rejection(
-        "H3 gRPC-Web",
-        h3_web.status,
-        &h3_web.headers,
-        &h3_web.body_bytes,
-    );
-    assert!(
-        h3_web.trailers.is_none(),
-        "H3 gRPC-Web must not emit native trailers"
-    );
 
-    assert!(
-        backend.take_targets().is_empty(),
-        "canonical-path RPC rejects must never reach a backend"
-    );
+    for target in TARGETS {
+        let h1_web = send_h1_rpc(proxy_port, target, GRPC_WEB).await;
+        assert_grpc_web_path_rejection(
+            &format!("H1 gRPC-Web {target}"),
+            h1_web.status,
+            &h1_web.headers,
+            &h1_web.body,
+        );
+
+        let h2_grpc = send_h2_rpc(proxy_port, target, GRPC).await;
+        assert_native_grpc_path_rejection(
+            &format!("H2 gRPC {target}"),
+            h2_grpc.status,
+            &h2_grpc.headers,
+            &h2_grpc.body,
+        );
+        let h2_web = send_h2_rpc(proxy_port, target, GRPC_WEB).await;
+        assert_grpc_web_path_rejection(
+            &format!("H2 gRPC-Web {target}"),
+            h2_web.status,
+            &h2_web.headers,
+            &h2_web.body,
+        );
+
+        let h3_grpc = send_h3_rpc(&h3, https_port, target, GRPC).await;
+        assert_native_grpc_path_rejection(
+            &format!("H3 gRPC {target}"),
+            h3_grpc.status,
+            &h3_grpc.headers,
+            &h3_grpc.body_bytes,
+        );
+        assert!(
+            h3_grpc.trailers.is_none(),
+            "H3 gRPC rejection is trailers-only initial headers: {target}"
+        );
+        let h3_web = send_h3_rpc(&h3, https_port, target, GRPC_WEB).await;
+        assert_grpc_web_path_rejection(
+            &format!("H3 gRPC-Web {target}"),
+            h3_web.status,
+            &h3_web.headers,
+            &h3_web.body_bytes,
+        );
+        assert!(
+            h3_web.trailers.is_none(),
+            "H3 gRPC-Web must not emit native trailers: {target}"
+        );
+
+        assert!(
+            backend.take_targets().is_empty(),
+            "canonical-path RPC rejects must never reach a backend: {target}"
+        );
+    }
     gateway.shutdown();
 }
 

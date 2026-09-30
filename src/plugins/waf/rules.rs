@@ -210,7 +210,24 @@ impl CompiledConditions {
         let path_matchers = raw
             .paths
             .iter()
-            .map(|pattern| {
+            .enumerate()
+            .map(|(index, pattern)| {
+                // Conditions are matched against the canonical request path,
+                // so a non-canonical exact or prefix value never matches and
+                // silently leaves the rule inactive. Refuse it at admission
+                // with the full canonical-path rules (GHSA-fcqw-793q-wg5x): no
+                // `//`, no dot segment, no escape. A `~regex` is left alone:
+                // `%`, `\`, `.`, and `//` are regex text there and can still
+                // describe canonical paths (`~^[^%]*$`).
+                if !pattern.starts_with('~') {
+                    let literal = pattern.strip_suffix('*').unwrap_or(pattern.as_str());
+                    let reason = crate::policy_path::non_canonical_policy_path_reason(literal);
+                    if let Some(reason) = reason {
+                        return Err(format!(
+                            "waf: `conditions.paths[{index}]` is not a canonical path: {reason}"
+                        ));
+                    }
+                }
                 if let Some(regex) = pattern.strip_prefix('~') {
                     // Rule path conditions scope when a rule is active. Keep
                     // `~regex` conditions as operator-authored, unanchored

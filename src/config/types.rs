@@ -2837,6 +2837,17 @@ pub struct Proxy {
     pub strip_listen_path: bool,
     #[serde(default)]
     pub preserve_host_header: bool,
+    /// Accept RFC 3986 `;` path parameters (matrix parameters) in request
+    /// paths routed to this proxy. Default `false`: a request whose canonical
+    /// path contains a `;` (literal or `%3B`) is refused with `400`
+    /// (`path_parameter`) after route lookup and before any plugin runs, because
+    /// backends such as Tomcat and Spring strip `;…` from every segment and
+    /// would execute a different path than routing and policy evaluated
+    /// (GHSA-fcqw-793q-wg5x). Set it only for backends that use matrix
+    /// parameters; dot segments with parameters (`..;`) and segments empty
+    /// before their `;` are still refused. HTTP-family proxies only.
+    #[serde(default)]
+    pub allow_path_parameters: bool,
     #[serde(default = "default_connect_timeout")]
     pub backend_connect_timeout_ms: u64,
     #[serde(default = "default_read_timeout")]
@@ -3877,7 +3888,7 @@ fn has_unescaped_trailing_dollar(pattern: &str) -> bool {
 /// `None` when it is usable as written.
 ///
 /// Route lookup runs on the canonical request path
-/// (`crate::policy_path::canonicalize_policy_path`), so a `listen_path` that
+/// (`crate::policy_path::canonicalize_request_path`), so a `listen_path` that
 /// is not itself canonical can never match: either the runtime would reject
 /// every request that spelled it that way (`/api%2Fadmin`, an encoded
 /// separator) or the runtime path would canonicalize to different bytes
@@ -3906,6 +3917,19 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
         crate::policy_path::non_canonical_policy_path_reason(path)
     }
 }
+
+/// Whether a literal (prefix or `=` exact) `listen_path` can only match a
+/// request path that carries a `;` path parameter.
+///
+/// Such a request is refused unless the proxy sets `allow_path_parameters`
+/// (GHSA-fcqw-793q-wg5x), so without the opt-in the route is unreachable. A
+/// `~regex` value is a pattern, where `;` is ordinary regex text that need not
+/// require one.
+pub(crate) fn listen_path_requires_path_parameters(path: &str) -> bool {
+    !path.starts_with('~') && path.contains(';')
+}
+
+const LISTEN_PATH_PARAMETER_ERROR: &str = "listen_path with `;` requires `allow_path_parameters`";
 
 /// Return the stable logical identity used by H1 pending-admission scopes.
 ///
@@ -4287,6 +4311,12 @@ impl GatewayConfig {
                 errors.push(format!(
                     "Proxy {:?}: listen_path {:?} is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
                     proxy.id, path, reason
+                ));
+            }
+            if listen_path_requires_path_parameters(path) && !proxy.allow_path_parameters {
+                errors.push(format!(
+                    "Proxy {:?}: {LISTEN_PATH_PARAMETER_ERROR}",
+                    proxy.id
                 ));
             }
         }
@@ -7996,6 +8026,28 @@ impl Proxy {
         errors
     }
 
+    /// Warn when a `~regex` `listen_path` mentions `;` on a proxy without
+    /// `allow_path_parameters`. Any request carrying a `;` path parameter is
+    /// refused after route lookup (GHSA-fcqw-793q-wg5x), so the part of the
+    /// pattern that needs one is unreachable. The pattern is not rejected,
+    /// because `;` in a regex need not require a parameter. Never fails the
+    /// load.
+    pub fn warn_unreachable_regex_path_parameters(&self) {
+        let Some(path) = self.listen_path.as_deref() else {
+            return;
+        };
+        if self.allow_path_parameters || !path.starts_with('~') || !path.contains(';') {
+            return;
+        }
+        tracing::warn!(
+            proxy = %crate::startup::sanitize_startup_scalar(&self.id),
+            namespace = %crate::startup::sanitize_startup_scalar(&self.namespace),
+            "regex `listen_path` contains `;` on a proxy without `allow_path_parameters`; \
+             requests carrying a `;` path parameter are refused, so that part of the \
+             pattern is unreachable"
+        );
+    }
+
     /// Warn once when a loaded proxy still carries the CORS-style `"*"`
     /// footgun or a non-origin `allowed_ws_origins` entry. Never fails the load.
     pub fn warn_legacy_allowed_ws_origins(&self) {
@@ -8212,6 +8264,9 @@ impl Proxy {
                              request paths are canonicalized before route lookup, so a \
                              non-canonical listen_path is unreachable and creates a routing/auth bypass"
                         ));
+                    }
+                    if listen_path_requires_path_parameters(path) && !self.allow_path_parameters {
+                        errors.push(LISTEN_PATH_PARAMETER_ERROR.to_string());
                     }
                 }
             }
@@ -8706,6 +8761,14 @@ impl Proxy {
             errors.push(
                 "Stream proxies (TCP/UDP) carry no WebSocket upgrade; \
                  `websocket_permessage_deflate` must be 'strip'"
+                    .into(),
+            );
+        }
+
+        if is_stream_proxy && self.allow_path_parameters {
+            errors.push(
+                "Stream proxies (TCP/UDP) have no request path; \
+                 `allow_path_parameters` must be false"
                     .into(),
             );
         }
@@ -10784,6 +10847,7 @@ impl GatewayConfig {
             // file/database/CP/DP load for this (issue #5454). Admission
             // rejects the same values through `validate_fields`.
             proxy.warn_legacy_allowed_ws_origins();
+            proxy.warn_unreachable_regex_path_parameters();
         }
         for consumer in &self.consumers {
             if let Err(errs) = consumer.validate_fields() {

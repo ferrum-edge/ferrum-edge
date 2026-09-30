@@ -305,13 +305,32 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
         "GET should reuse the HEAD-populated cache"
     );
 
-    // The double-slash alias is deliberately ordinary backend traffic.
+    // The double-slash alias never reaches the plugin or a backend: a
+    // non-final empty segment is refused at the frontend boundary
+    // (GHSA-fcqw-793q-wg5x), because backends that collapse `//` would
+    // resolve a different path than routing and policy evaluated.
     let alias = h1
         .get(gateway.proxy_url("/api//specz"))
         .send()
         .await
         .expect("H1 double-slash alias");
-    assert_eq!(alias.text().await.expect("alias body"), "ordinary backend");
+    assert_eq!(alias.status(), reqwest::StatusCode::BAD_REQUEST);
+    let alias_body = alias.text().await.expect("alias body");
+    assert!(!alias_body.contains("\"openapi\""));
+    assert_eq!(origin.hits(), 1);
+    assert_eq!(backend.hits(), 0);
+
+    // A sibling path that is not the plugin-owned resource is still ordinary
+    // backend traffic.
+    let sibling = h1
+        .get(gateway.proxy_url("/api/other"))
+        .send()
+        .await
+        .expect("H1 ordinary sibling");
+    assert_eq!(
+        sibling.text().await.expect("sibling body"),
+        "ordinary backend"
+    );
     assert_eq!(backend.hits(), 1);
 
     // Encoded separators do not become the plugin-owned resource. Since the

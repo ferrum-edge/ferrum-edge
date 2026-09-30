@@ -22,6 +22,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to literal `listen_path` values, plugin path triggers, `request_termination`
   prefixes, OpenAPI server base paths, mesh `extensionProviders[].pathPrefix`,
   and mesh rewrite composition, so configuration cannot contain `..;` either.
+- **The canonical request path refuses empty segments, and `;` path parameters
+  unless a proxy opts in** (GHSA-fcqw-793q-wg5x). Backends that collapse `//`
+  or strip `;…` from segments could otherwise execute a different path than
+  routing and policy evaluated. This changes which request shapes are accepted:
+  - A non-final empty segment (`//admin`, `/a//b`) and a non-final segment
+    that is empty before its first `;` (`/;x/admin`, `/%3Bx/admin`) are refused
+    with `400` (`empty_segment`) on every proxy. A trailing slash is still
+    accepted, and so is a final parameter-only segment
+    (`/ctx/;jsessionid=abc`), which the path-parameter rule then governs.
+  - A `;` in the request path, literal or `%3B` (`/admin;x/users`,
+    `/v1;version=2`), is refused with `400` (`path_parameter`) unless the
+    proxy it routes to sets the new `allow_path_parameters: true` (default
+    `false`). The check runs right after route lookup and before any plugin,
+    on HTTP/1.1, HTTP/2, and HTTP/3. With the opt-in, the `;` is routed,
+    evaluated, and forwarded unchanged, and the dot-segment and empty-segment
+    rules still apply; the request is also refused when its
+    parameter-stripped path routes to a different proxy, so an opted-in
+    catch-all cannot serve `/admin;x/users` past an `/admin` proxy.
+    Gateway API routes whose literal path match contains `;` are translated
+    with the opt-in; mesh-materialized proxies cannot opt in yet.
+  - Admission applies the same rules: literal `listen_path` values, plugin path
+    triggers, `request_termination` prefixes, and mesh rewrite targets may not
+    contain an empty segment; a literal `listen_path` containing `;` requires
+    `allow_path_parameters: true`; WAF exact and `prefix*` `conditions.paths`
+    are now validated as canonical paths; and every OpenAPI server base
+    segment must be a canonical request path segment.
+  - `allow_path_parameters` is stored in the `proxies` table of the SQL `V001`
+    baseline (recreate development databases) and through serde on MongoDB.
+    The ConfigSync protocol revision is bumped, so CP and DP must run the same
+    build.
+
+- **Provider override paths no longer decode the query they carry**
+  (GHSA-653r-wc8x-4fch). `ai_stream_router` and `ai_federation` can place the
+  endpoint and client query in the backend path override, and the whole
+  string, query included, was canonicalized. That decoded `%26`, `%3D`, and
+  `%2B` inside client query values after the duplicate-name strip had run, so
+  a client could inject provider query parameters (for example a second
+  `api-version`) and break query-string signatures. Only the path component is
+  canonicalized now; the query reaches the provider byte-identical.
 
 ### Added
 
@@ -141,11 +180,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second HS256 verification secret (at least 32 characters) authorizes every
   token it verifies as `viewer`, whatever its `role` claim says, and ignores
   its `scope` claims. A read-only process can hold this secret without holding
-  material that mints `operator` or `admin` tokens. It is a **fleet-wide read
+  material that mints `operator` or `admin` tokens. Unless capped by
+  `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` (#5929), it is a **fleet-wide read
   credential**: its holder chooses the token's `sub` and `ns`, so it reads
-  every namespace. Per-tenant readers should use tokens pre-minted with the
-  primary key and an `ns` claim. A namespace ceiling for the viewer key is a
-  planned follow-up.
+  every namespace. Per-tenant readers can also use tokens pre-minted with the
+  primary key and an `ns` claim.
+- **`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` namespace ceiling for viewer-key
+  admin JWTs** (#5929). An optional comma-separated list of the only
+  namespaces a token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` may read,
+  whatever its `ns` claim or `X-Ferrum-Namespace` header says. Like the role
+  ceiling it is a property of the verifying key, applied when the request's
+  actor is built and enforced by the admin dispatcher, independently of
+  `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`: every namespace-scoped route
+  (proxies, consumers, upstreams, plugin configs, API specs, trust bundles,
+  batch, backup, restore, audit) and `GET /config/export` answer `403` for a
+  namespace outside it, `GET /namespaces/{name}` answers the same `403`, and
+  `GET /namespaces` is filtered to it. Namespace matching is exact and
+  case-sensitive. Ceiling-bound viewer-key tokens are denied with `403` on all
+  other global routes except the filtered namespace registry, `GET /plugins`
+  (plugin type catalog), and health/liveness/readiness probes (`GET /health`,
+  `/live`, `/status`, `/overload`). Health and status return only `status` and
+  `ready`, overload returns only `{level}`, and detailed `/metrics` routes
+  return `403`. Other denied routes include `/charges`, `/admin/metrics`,
+  `/metrics/runtime`, `/cluster`, `/backend-capabilities`, mesh introspection,
+  and future global routes by default. A present `ns` claim is narrowed to
+  `claim ∩ ceiling`. Primary-key
+  tokens and viewer-key tokens without a ceiling are unaffected; unset keeps
+  today's fleet-wide behaviour. Namespace refusal logs carry `namespace_ceiling = outside`,
+  global-route refusals log `global_route_denied`, and
+  `GET /backup` security audit records for a ceiling-bound token record the
+  decision in their `diff`. Startup and `validate` refuse an empty value, an
+  empty entry, `*`, or an invalid namespace name.
 - **`mcp_gateway` per-consumer tool grants** (#5907). In `aggregate_router`
   mode a `policy.tools` entry with `action: allow` can carry
   `allowed_groups` and `denied_groups`, matched against the request
@@ -877,6 +942,12 @@ outright with no deprecation period:
 
 ### Security
 
+- Admin JWT namespace ceiling for the viewer key (#5929).
+  `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` bounds which tenants a
+  `FERRUM_ADMIN_JWT_VIEWER_SECRET` holder can read, which its own `ns` claim
+  never could, because the holder chooses that claim. The refusal is a `403`
+  that depends only on the credential and the requested namespace, so it
+  reveals nothing about resources in another tenant.
 - Admin JWT role ceiling (#5904). A token signed with
   `FERRUM_ADMIN_JWT_VIEWER_SECRET` can never reach `operator` or `admin`,
   including when it claims `admin`, and its `scope` claims grant nothing, so it

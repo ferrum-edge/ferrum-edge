@@ -253,3 +253,66 @@ fn distinct_viewer_secret_is_accepted() {
         );
     });
 }
+
+// ── FERRUM_ADMIN_JWT_VIEWER_NAMESPACES (issue #5929) ────────────────────
+
+fn with_viewer_namespaces(raw: &str) -> Vec<(&str, &str)> {
+    let mut vars = database_mode_env(ADMIN_SECRET, VIEWER_SECRET);
+    vars.push(("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES", raw));
+    vars
+}
+
+#[test]
+fn viewer_namespace_ceiling_is_accepted_and_kept_raw() {
+    with_env_vars(&with_viewer_namespaces(" staging, analytics "), || {
+        let config = EnvConfig::from_env().expect("a valid ceiling is accepted");
+        assert_eq!(
+            config.admin_jwt_viewer_namespaces.as_deref(),
+            Some(" staging, analytics ")
+        );
+    });
+}
+
+#[test]
+fn unset_viewer_namespace_ceiling_keeps_the_default() {
+    with_env_vars(&database_mode_env(ADMIN_SECRET, VIEWER_SECRET), || {
+        let config = EnvConfig::from_env().expect("no ceiling is valid");
+        assert_eq!(config.admin_jwt_viewer_namespaces, None);
+    });
+}
+
+#[test]
+fn malformed_viewer_namespace_ceilings_are_refused_at_startup() {
+    for (raw, expected) in [
+        ("", "lists no namespace"),
+        ("   ", "lists no namespace"),
+        ("staging,,prod", "entry 2 is empty"),
+        ("staging,", "entry 2 is empty"),
+        (",staging", "entry 1 is empty"),
+        ("staging, ,prod", "entry 2 is empty"),
+        ("*", "wildcards are not supported"),
+        (
+            "staging,Bad Namespace!",
+            "Invalid FERRUM_ADMIN_JWT_VIEWER_NAMESPACES entry 2",
+        ),
+    ] {
+        with_env_vars(&with_viewer_namespaces(raw), || {
+            let error = EnvConfig::from_env().expect_err("a malformed ceiling must fail closed");
+            assert!(
+                error.contains("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES"),
+                "{raw:?}: {error}"
+            );
+            assert!(error.contains(expected), "{raw:?}: {error}");
+        });
+    }
+}
+
+#[test]
+fn over_long_viewer_namespace_entry_is_refused_at_startup() {
+    let long = "a".repeat(255);
+    with_env_vars(&with_viewer_namespaces(&long), || {
+        let error = EnvConfig::from_env().expect_err("a 255-character name must fail");
+        assert!(error.contains("entry 1"), "{error}");
+        assert!(error.contains("1-254 characters"), "{error}");
+    });
+}

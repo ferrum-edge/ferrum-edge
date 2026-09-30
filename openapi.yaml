@@ -5,7 +5,9 @@ info:
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
     `/live`, `/health`, `/status`, and `/overload` expose minimal unauthenticated
-    observations. Exact `/metrics` requires a valid admin JWT, a matching
+    observations. A viewer-key token with a namespace ceiling receives these
+    same minimal health/status and overload responses; it receives `403` on
+    detailed metrics routes. Exact `/metrics` requires a valid admin JWT, a matching
     `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within
     `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401 Unauthorized`.
     All other endpoints require JWT bearer token authentication via the
@@ -44,8 +46,17 @@ info:
     effectively read-only on the wire). Process/runtime surfaces such as
     observability, cluster state, backend capabilities, TLS management, and mesh
     topology reflect the current node or control-plane state and are not
-    namespace-filtered unless their operation explicitly declares the namespace
-    header. Both `/gateway-trust-bundles` and `/gateway-trust` (including
+    selected by the namespace header. However, when a viewer-key token carries
+    `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, every global route is denied with
+    `403` unless it is the filtered `/namespaces` registry, `GET /plugins`
+    (plugin type catalog), or a health/liveness/readiness probe (`GET /health`,
+    `/live`, `/status`, `/overload`). Health and status return only `status`
+    and `ready`, overload returns only `{level}`, and detailed `/metrics`
+    routes return `403`. Other denied routes include `/charges`,
+    `/admin/metrics`, `/metrics/runtime`, `/cluster`, `/backend-capabilities`,
+    mesh introspection, and new global routes by default. Primary-key tokens and viewer-key tokens without a namespace
+    ceiling retain existing access. Both `/gateway-trust-bundles` and
+    `/gateway-trust` (including
     `GET /gateway-trust/status`) are namespace-scoped. Audit events for those
     fleet-global mutations (TLS/ACME management
     and `POST /mesh/config-revision/reset`) are stored under the canonical
@@ -285,7 +296,8 @@ paths:
         aggregate — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
-        `FERRUM_METRICS_ALLOWED_CIDRS`.
+        `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT bound by
+        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` never adds detail.
 
         Returns `503 Service Unavailable` while the gateway is still in
         startup (`status: "starting"`, `ready: false`). Once startup is
@@ -1827,7 +1839,8 @@ paths:
         diagnostics, `request_buffer` (aggregate buffered-request budget
         pressure), and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
-        source IP.
+        source IP. A namespace-ceiling-bound viewer-key JWT receives only
+        `{level}`.
 
         Returns `503 Service Unavailable` when the overload level is `critical`
         (for both tiers).
@@ -1900,6 +1913,8 @@ paths:
         `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Otherwise the endpoint
         returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header.
         Unauthenticated scraping is an explicit operator opt-in (token or CIDR).
+        A viewer-key JWT bound by `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is
+        refused with `403`.
 
         TLS source watcher telemetry includes certificate expiry gauges,
         certificate rotation counters, source refresh outcomes, source fetch
@@ -2297,7 +2312,10 @@ paths:
         Namespace-scoped via `X-Ferrum-Namespace`. A JWT `ns` claim, when
         present, must authorize the selected namespace (`403` otherwise) even
         when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is off; with that flag on
-        (or on a multi-namespace CP) the claim is required. Falls back to the
+        (or on a multi-namespace CP) the claim is required. A token verified
+        by `FERRUM_ADMIN_JWT_VIEWER_SECRET` gets `403` for a namespace outside
+        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` when that ceiling is set,
+        whatever its `ns` claim says. Falls back to the
         in-memory cached configuration when the database is unavailable,
         indicated by `X-Data-Source: cached`. Requires a valid admin JWT;
         metrics bearer tokens and metrics CIDR allowlists do not grant it.
@@ -6849,7 +6867,9 @@ paths:
         Viewer and operator roles may call this endpoint. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, results are filtered to
         the JWT `ns` claim; a token with no claim receives an empty list
-        rather than `403`.
+        rather than `403`. A token verified by
+        `FERRUM_ADMIN_JWT_VIEWER_SECRET` is always filtered to
+        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` when that ceiling is set.
       tags: [Namespaces]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
@@ -6969,7 +6989,9 @@ paths:
         Viewer and operator
         roles may call this endpoint. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, a token that cannot
-        address `name` receives `403`.
+        address `name` receives `403`. A token verified by
+        `FERRUM_ADMIN_JWT_VIEWER_SECRET` receives the same `403` for a `name`
+        outside `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` when that ceiling is set.
       tags: [Namespaces]
       responses:
         "200":
@@ -7975,6 +7997,7 @@ components:
         |----------|---------|-------------|
         | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key (minimum 32 characters) |
         | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | *(unset)* | Optional second signing key (minimum 32 characters, distinct from `FERRUM_ADMIN_JWT_SECRET`) whose tokens are capped at `viewer` |
+        | `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` | *(unset: fleet-wide)* | Optional comma-separated, exact and case-sensitive namespace ceiling for tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`; denies global routes except filtered namespaces, plugin type catalog, and minimal health/overload probes |
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
         | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds); `0` disables the cap |
 
@@ -8003,11 +8026,28 @@ components:
         other `alg` (including `none`) are rejected. Startup refuses identical
         values for the two secrets. Give read-only automation the viewer
         secret so it holds no material that can mint an `operator` or `admin`
-        token. The viewer secret is a fleet-wide read credential: its holder
-        chooses the token's `sub` and `ns`, so neither is an identity or
-        tenancy boundary for it. Audit records name such an actor as
-        `viewer-key:<sub>`. Per-tenant readers should use tokens pre-minted
-        with the primary key and an `ns` claim.
+        token. Its holder chooses the token's `sub` and `ns`, so neither is an
+        identity or tenancy boundary for it. Audit records name such an actor
+        as `viewer-key:<sub>`.
+
+        Namespace ceiling: when `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is set, a
+        viewer-secret token may read only the listed namespaces, matched exactly
+        and case-sensitively, whatever its `ns` claim or `X-Ferrum-Namespace`
+        says, independently of
+        `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`. Every namespace-scoped route and
+        `GET /config/export` answer `403` for a namespace outside it (the
+        answer depends only on the credential and the requested name), as does
+        `GET /namespaces/{name}`, and `GET /namespaces` is filtered to it. A
+        present `ns` claim is narrowed to `claim ∩ ceiling`. Every global route
+        is denied with `403` by default for a ceiling-bound token except the
+        filtered namespace registry, `GET /plugins` (plugin type catalog), and
+        health/liveness/readiness probes (`GET /health`, `/live`, `/status`,
+        `/overload`). Health/status return only `status` and `ready`, overload
+        returns only `{level}`, and detailed `/metrics` routes return `403`.
+        Tokens verified by `FERRUM_ADMIN_JWT_SECRET` are never
+        affected. Unset, the viewer secret is a fleet-wide read credential;
+        per-tenant readers can also use tokens
+        pre-minted with the primary key and an `ns` claim.
 
     metricsBearerAuth:
       type: http
@@ -8018,7 +8058,9 @@ components:
         trimming when nonempty; unset or blank disables token auth). Startup
         and validation reject shorter tokens. Accepted only by observability
         scrape/detail surfaces such as exact `/metrics` and detailed
-        `/health`/`/status`/`/overload`. CIDR-based metrics access is configured
+        `/health`/`/status`/`/overload`. Ceiling-bound viewer-key tokens receive
+        only minimal health/overload projections and cannot scrape metrics.
+        CIDR-based metrics access is configured
         separately with `FERRUM_METRICS_ALLOWED_CIDRS` and cannot be represented
         as an OpenAPI security scheme.
 
@@ -9723,9 +9765,14 @@ components:
             dot segments and reads `\` as a separator. A segment whose text
             before the first `;` is `.` or `..` (`..;`, `.;x`, `%2e%2e;`,
             `..%3B`) is a dot segment too, because backends that strip path
-            parameters resolve it as one. A `.` inside a segment
-            (`/v1.0/users`) and a `;` on an ordinary segment (`/v1;version=2`)
-            are ordinary path characters.
+            parameters resolve it as one. A non-final empty segment (`//`,
+            `/a//b`) and a segment that is empty before its first `;`
+            (`/;x/a`) are rejected too, because backends that collapse `//`
+            would resolve a different path; a trailing slash is allowed. A `.`
+            inside a segment (`/v1.0/users`) is an ordinary path character. A
+            `;` on an ordinary segment (`/v1;version=2`) is refused after route
+            lookup unless the matched proxy sets `allow_path_parameters`, so a
+            literal `listen_path` containing `;` requires that opt-in.
 
 
             A literal `listen_path` containing any of the above is unreachable,
@@ -9839,6 +9886,24 @@ components:
           type: boolean
           default: false
           description: Forward the original Host header to the backend
+        allow_path_parameters:
+          type: boolean
+          default: false
+          description: >-
+            Accept RFC 3986 `;` path parameters (matrix parameters) in request
+            paths routed to this proxy. With the default `false`, a request
+            whose canonical path contains a `;` (literal or `%3B`, for example
+            `/admin;x/users`) is refused with `400` (`path_parameter`) after
+            route lookup and before any plugin runs, because backends such as
+            Tomcat and Spring strip `;…` from every segment and would execute a
+            different path than routing and policy evaluated. Enable it only
+            for backends that use matrix parameters: routing, policy, and the
+            backend request line then carry the `;` unchanged, so policy keyed
+            on a parameter-free path does not match those requests. Dot
+            segments with a parameter (`..;`) and segments that are empty
+            before their `;` (`/;x/admin`) are refused either way. A literal
+            `listen_path` containing `;` requires `true`. HTTP-family proxies
+            only; stream proxies must leave it `false`.
         backend_connect_timeout_ms:
           type: integer
           format: uint64
@@ -10397,6 +10462,8 @@ components:
                 const: stream
               websocket_permessage_deflate:
                 const: strip
+              allow_path_parameters:
+                const: false
           else:
             anyOf:
               - required: [hosts]
@@ -10464,6 +10531,17 @@ components:
             properties:
               backend_scheme:
                 type: string
+        - if:
+            required: [listen_path]
+            properties:
+              listen_path:
+                type: string
+                pattern: "^[^~].*;"
+          then:
+            required: [allow_path_parameters]
+            properties:
+              allow_path_parameters:
+                const: true
 
     ProxyCreate:
       description: |

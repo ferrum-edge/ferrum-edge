@@ -396,6 +396,60 @@ async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex(
     assert!(matches!(result, PluginResult::Reject { .. }));
 }
 
+#[test]
+fn rule_path_conditions_must_be_canonical_policy_paths() {
+    // Conditions are matched against the canonical request path, so a value
+    // that cannot appear in one would leave its rule silently inactive
+    // (GHSA-fcqw-793q-wg5x). Exact and `prefix*` values are held to the full
+    // contract; a `~regex` is regex text and is not canonicalized.
+    let with_paths = |paths: serde_json::Value| {
+        json!({
+            "include_default_rules": false,
+            "custom_rules": [{
+                "id": "CUSTOM-SCOPED",
+                "name": "scoped marker",
+                "category": "custom",
+                "severity": "high",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "conditions": { "paths": paths },
+                "action": "enforce"
+            }]
+        })
+    };
+    for (path, reason) in [
+        ("/admin//users", "empty_segment"),
+        ("//admin*", "empty_segment"),
+        ("/admin/;x/y", "empty_segment"),
+        ("/admin/../users", "literal_dot_segment"),
+        ("/%61dmin", "percent-escapes"),
+        ("/admin%2F*", "encoded_separator"),
+    ] {
+        let error = waf(with_paths(json!([path])))
+            .err()
+            .unwrap_or_else(|| panic!("{path:?} must be refused"));
+        assert!(
+            error.contains("conditions.paths[0]") && error.contains(reason),
+            "{path:?}: {error}"
+        );
+    }
+    for path in [
+        "/admin",
+        "/admin/*",
+        "/admin;v=1",
+        "~^/admin//x",
+        "~^[^%]*$",
+        "~/admin%2F.*",
+        "*",
+    ] {
+        assert!(
+            waf(with_paths(json!([path]))).is_ok(),
+            "{path:?} must stay admissible"
+        );
+    }
+}
+
 #[tokio::test]
 async fn custom_rule_regex_path_conditions_remain_unanchored() {
     let plugin = waf(json!({

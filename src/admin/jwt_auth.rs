@@ -43,12 +43,26 @@
 //! GitForgeOps-style clients already mint their own HS256 tokens: the ceiling
 //! reuses that exact verification path (claims, issuer, audience, max TTL)
 //! with no key parsing, JWKS fetching, or outbound HTTP on the admin plane.
+//!
+//! # Namespace ceiling (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`)
+//!
+//! An optional comma-separated list that bounds which namespaces a viewer-key
+//! token may read, whatever its `ns` claim or the `X-Ferrum-Namespace` header
+//! says. Like the role ceiling it is a property of the verifying key: it is
+//! attached to [`VerifiedAdminToken::namespace_ceiling`] only for
+//! [`AdminKeyTier::Viewer`] tokens and carried on
+//! [`crate::admin::audit::AuditActor`], where the admin dispatcher enforces it
+//! on every namespace-scoped route, `GET /config/export`, and the
+//! `/namespaces` registry, independently of
+//! `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`. Primary-key tokens are never
+//! affected. Unset keeps the viewer key fleet-wide.
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -241,6 +255,10 @@ pub struct VerifiedAdminToken {
     pub header: jsonwebtoken::Header,
     pub claims: AdminClaims,
     pub key_tier: AdminKeyTier,
+    /// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, attached only to
+    /// [`AdminKeyTier::Viewer`] tokens when it is configured. `None` for every
+    /// primary-key token and whenever the ceiling is unset.
+    pub namespace_ceiling: Option<ViewerNamespaceCeiling>,
 }
 
 impl VerifiedAdminToken {
@@ -261,6 +279,122 @@ impl VerifiedAdminToken {
     pub fn grants_scope(&self, scope: &str) -> bool {
         self.key_tier.honours_scopes() && self.claims.grants_scope(scope)
     }
+
+    /// Namespaces the token is authorized for: its `ns` claim, narrowed to
+    /// [`Self::namespace_ceiling`] when one applies. Claim presence is kept
+    /// as the token carried it, so a claim-less viewer-key token still reads
+    /// as "no `ns` claim"; the ceiling itself is enforced separately. A
+    /// malformed claim still fails closed.
+    pub fn allowed_namespaces(&self) -> Result<crate::grpc::auth::AllowedNamespaces, String> {
+        let claimed = self.claims.allowed_namespaces()?;
+        Ok(match &self.namespace_ceiling {
+            Some(ceiling) => ceiling.narrow(&claimed),
+            None => claimed,
+        })
+    }
+}
+
+/// Name of the viewer-key namespace ceiling setting.
+pub const ADMIN_JWT_VIEWER_NAMESPACES_ENV: &str = "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES";
+
+/// The namespaces a viewer-key token may read
+/// (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`).
+///
+/// Cheap to clone: the set is shared behind an `Arc`, because it is attached
+/// to every verified viewer-key token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewerNamespaceCeiling {
+    names: Arc<HashSet<String>>,
+}
+
+impl ViewerNamespaceCeiling {
+    /// Parse the comma-separated setting.
+    ///
+    /// Fails closed: an empty value, an empty or whitespace-only entry (for
+    /// example a doubled or trailing comma), a `*` wildcard, or a name that
+    /// breaks the namespace naming rules is refused rather than skipped, since
+    /// a silently dropped entry would change a security boundary without any
+    /// signal. Entries are trimmed; duplicates collapse. Diagnostics carry the
+    /// entry's 1-based position and the key-aware quoted entry, never the whole
+    /// value.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        if raw.trim().is_empty() {
+            return Err(format!(
+                "{ADMIN_JWT_VIEWER_NAMESPACES_ENV} is set but lists no namespace; list at least \
+                 one namespace, or unset it to leave viewer-key tokens fleet-wide"
+            ));
+        }
+        let mut names = HashSet::new();
+        for (index, segment) in raw.split(',').enumerate() {
+            let position = index + 1;
+            let entry = segment.trim();
+            if entry.is_empty() {
+                return Err(format!(
+                    "{ADMIN_JWT_VIEWER_NAMESPACES_ENV} entry {position} is empty; remove the \
+                     extra comma"
+                ));
+            }
+            if entry == "*" {
+                return Err(format!(
+                    "{ADMIN_JWT_VIEWER_NAMESPACES_ENV} entry {position} is `*`; wildcards are \
+                     not supported, unset the setting to leave viewer-key tokens fleet-wide"
+                ));
+            }
+            if crate::config::types::validate_namespace(entry).is_err() {
+                return Err(format!(
+                    "Invalid {ADMIN_JWT_VIEWER_NAMESPACES_ENV} entry {position} {}: a namespace \
+                     must be 1-{} characters, start with an alphanumeric character, and contain \
+                     only alphanumerics, dots, underscores, or hyphens",
+                    crate::startup::quoted_config_value(ADMIN_JWT_VIEWER_NAMESPACES_ENV, entry),
+                    crate::config::types::MAX_NAMESPACE_LENGTH
+                ));
+            }
+            names.insert(entry.to_string());
+        }
+        Ok(Self {
+            names: Arc::new(names),
+        })
+    }
+
+    /// Whether `namespace` is inside the ceiling.
+    pub fn allows(&self, namespace: &str) -> bool {
+        self.names.contains(namespace)
+    }
+
+    /// How many distinct namespaces the ceiling admits.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether the ceiling admits no namespace. [`Self::parse`] never builds
+    /// one, so this is `false` for every configured ceiling.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Narrow a parsed `ns` claim to this ceiling.
+    ///
+    /// A present claim becomes `claim ∩ ceiling` (possibly empty, which
+    /// authorizes nothing); an absent claim stays absent, because presence
+    /// records what the token carried. The ceiling is enforced on its own for
+    /// claim-less tokens, see [`crate::admin::audit::AuditActor`].
+    pub fn narrow(
+        &self,
+        claimed: &crate::grpc::auth::AllowedNamespaces,
+    ) -> crate::grpc::auth::AllowedNamespaces {
+        if !claimed.is_present() {
+            return claimed.clone();
+        }
+        let Some(claimed_names) = claimed.effective_namespaces() else {
+            return crate::grpc::auth::AllowedNamespaces::claimed(HashSet::new());
+        };
+        let narrowed = claimed_names
+            .iter()
+            .filter(|name| self.allows(name))
+            .cloned()
+            .collect();
+        crate::grpc::auth::AllowedNamespaces::claimed(narrowed)
+    }
 }
 
 /// JWT Manager for Admin API
@@ -270,6 +404,9 @@ pub struct JwtManager {
     /// Optional `FERRUM_ADMIN_JWT_VIEWER_SECRET`: tokens it verifies are capped
     /// at [`AdminRole::Viewer`].
     viewer_secret: Option<String>,
+    /// Optional `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`: the namespaces tokens
+    /// verified by `viewer_secret` may read.
+    viewer_namespace_ceiling: Option<ViewerNamespaceCeiling>,
 }
 
 impl JwtManager {
@@ -278,6 +415,7 @@ impl JwtManager {
         Self {
             config,
             viewer_secret: None,
+            viewer_namespace_ceiling: None,
         }
     }
 
@@ -309,6 +447,20 @@ impl JwtManager {
     /// Whether a role-ceiling viewer secret is configured.
     pub fn has_viewer_secret(&self) -> bool {
         self.viewer_secret.is_some()
+    }
+
+    /// Bound the namespaces viewer-key tokens may read
+    /// (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`). Primary-key tokens are never
+    /// affected. Without a viewer secret there are no viewer-key tokens, so
+    /// the ceiling has nothing to bound.
+    pub fn with_viewer_namespace_ceiling(mut self, ceiling: ViewerNamespaceCeiling) -> Self {
+        self.viewer_namespace_ceiling = Some(ceiling);
+        self
+    }
+
+    /// The configured viewer-key namespace ceiling, if any.
+    pub fn viewer_namespace_ceiling(&self) -> Option<&ViewerNamespaceCeiling> {
+        self.viewer_namespace_ceiling.as_ref()
     }
 
     /// Key for `GET /config/export` credential fingerprints.
@@ -345,6 +497,7 @@ impl JwtManager {
                     header: data.header,
                     claims: data.claims,
                     key_tier: AdminKeyTier::Primary,
+                    namespace_ceiling: None,
                 });
             }
             Err(error) => error,
@@ -373,6 +526,7 @@ impl JwtManager {
             header: data.header,
             claims: data.claims,
             key_tier: AdminKeyTier::Viewer,
+            namespace_ceiling: self.viewer_namespace_ceiling.clone(),
         })
     }
 
@@ -682,12 +836,35 @@ pub const ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR: &str = "FERRUM_ADMIN_JWT
      would let a viewer-secret holder mint tokens the primary key accepts without the viewer \
      role ceiling";
 
-/// Attach `FERRUM_ADMIN_JWT_VIEWER_SECRET` (from env/`ferrum.conf`) when set.
+/// Attach `FERRUM_ADMIN_JWT_VIEWER_SECRET` and
+/// `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` (from env/`ferrum.conf`) when set.
 fn with_viewer_secret_from_env(manager: JwtManager) -> Result<JwtManager, JwtError> {
     use crate::config::conf_file::resolve_ferrum_var;
 
-    match resolve_ferrum_var("FERRUM_ADMIN_JWT_VIEWER_SECRET").filter(|s| !s.is_empty()) {
-        Some(viewer_secret) => manager.with_viewer_secret(viewer_secret),
+    let viewer_secret =
+        resolve_ferrum_var("FERRUM_ADMIN_JWT_VIEWER_SECRET").filter(|s| !s.is_empty());
+    let manager = match viewer_secret {
+        Some(viewer_secret) => manager.with_viewer_secret(viewer_secret)?,
+        None => manager,
+    };
+    match resolve_ferrum_var(ADMIN_JWT_VIEWER_NAMESPACES_ENV) {
+        Some(raw) => {
+            let parsed = ViewerNamespaceCeiling::parse(&raw);
+            let ceiling = parsed.map_err(JwtError::VerificationFailed)?;
+            if manager.has_viewer_secret() {
+                tracing::info!(
+                    namespaces = ceiling.len(),
+                    "Admin viewer-key tokens are limited to FERRUM_ADMIN_JWT_VIEWER_NAMESPACES"
+                );
+            } else {
+                tracing::warn!(
+                    "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES is set without \
+                     FERRUM_ADMIN_JWT_VIEWER_SECRET; it has no effect until a viewer secret \
+                     is configured"
+                );
+            }
+            Ok(manager.with_viewer_namespace_ceiling(ceiling))
+        }
         None => Ok(manager),
     }
 }

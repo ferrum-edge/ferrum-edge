@@ -631,6 +631,16 @@ operator-authored regex. Regex conditions are evaluated with Rust regex
 anchored (for example `~^/api/`). This preserves existing scoped protections
 such as `~api` matching `/api/v1` and `/v1/api-keys`.
 
+Conditions are matched against the canonical request path
+([request_path_canonicalization.md](request_path_canonicalization.md)), so a
+value that is not itself canonical could never match and would leave its rule
+silently inactive. Construction therefore rejects one: an exact or `prefix*`
+value may not contain a percent escape, a `\`, a `.`/`..` segment, or a
+non-final empty segment (`/api//admin`). A `~regex` value is regex text and is
+not checked this way (`~^[^%]*$` is a valid condition). A request whose path carries a `;` parameter only reaches the
+WAF on a proxy with `allow_path_parameters: true`; there the parameter is part
+of the path conditions see (`/admin;x/users` is not `/admin/users`).
+
 `global_exemptions` short-circuits the entire WAF for matching requests, so keep
 the entries tight — an over-broad `paths` entry silently disables the WAF on
 unintended routes:

@@ -2709,8 +2709,7 @@ fn validate_safe_server_pathname(
     // Normalize trailing slash on non-root bases so joins use a single slash boundary.
     let trimmed = pathname.trim_end_matches('/');
     // Dot-segment input is rejected before URL parsing so parser normalization
-    // cannot silently change the matcher. Empty segments remain literal and
-    // safe because the generated operation regex is fully anchored.
+    // cannot silently change the matcher.
     for segment in trimmed.split('/').skip(1) {
         if is_url_dot_segment(segment) {
             return Err(ExtractError::MalformedExtension {
@@ -2720,8 +2719,34 @@ fn validate_safe_server_pathname(
                 ),
             });
         }
+        // Operation matchers are compared against the canonical request path,
+        // so a base segment the canonicalizer would refuse or rewrite (an
+        // empty segment, a leading `;`, a surviving percent escape the URL
+        // parser introduced) can never match any request.
+        if let Some(reason) = non_canonical_server_segment_reason(segment) {
+            return Err(ExtractError::MalformedExtension {
+                which: error_surface,
+                error: format!(
+                    "{location} pathname contains a segment that is not a canonical request path segment ({reason})"
+                ),
+            });
+        }
     }
     Ok(trimmed.to_string())
+}
+
+/// Why one server-base pathname segment can never appear in a canonical
+/// request path, or `None` when it can.
+///
+/// Held to the same rule as the request boundary
+/// (`crate::policy_path::non_canonical_policy_path_reason`). A segment is
+/// checked on its own, so the empty segment of `/v1//api` is refused here
+/// explicitly: the canonical request path never contains `//`.
+fn non_canonical_server_segment_reason(segment: &str) -> Option<&'static str> {
+    if segment.is_empty() {
+        return Some(crate::policy_path::PolicyPathRejection::EmptySegment.reason());
+    }
+    crate::policy_path::non_canonical_policy_path_reason(segment)
 }
 
 /// Join a server/base pathname with an OpenAPI Paths key.

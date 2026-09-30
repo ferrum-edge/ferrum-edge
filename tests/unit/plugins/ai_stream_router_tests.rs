@@ -2071,6 +2071,33 @@ async fn test_endpoint_query_merged_with_client_query() {
 }
 
 #[tokio::test]
+async fn test_endpoint_query_keeps_encoded_client_delimiters_encoded() {
+    // An encoded `&` / `=` inside a client query value must reach the provider
+    // still encoded: decoding it after the duplicate-name strip would inject
+    // a second `api-version` parameter (GHSA-653r-wc8x-4fch).
+    use ferrum_edge::_test_support::run_before_proxy_hooks_for_test;
+
+    let plugin: Arc<dyn Plugin> = Arc::new(build(azure_style_config()));
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string("x=a%26api-version%3Devil&u=https://a//b".to_string());
+    let mut headers = json_headers();
+    let result = run_before_proxy_hooks_for_test(&[plugin], &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let path = ctx.route_override_path.as_deref().expect("override path");
+    assert_eq!(
+        path,
+        "/openai/deployments/gpt/chat/completions?api-version=2024-02-01\
+         &x=a%26api-version%3Devil&u=https://a//b"
+    );
+    assert_eq!(
+        path.matches("api-version=").count(),
+        1,
+        "no provider parameter may be injected: {path}"
+    );
+}
+
+#[tokio::test]
 async fn test_endpoint_query_omits_previously_stripped_client_credentials() {
     let plugin = build(azure_style_config());
     let body = json!({"model": "gpt-4o", "stream": true, "messages": []});

@@ -1938,6 +1938,15 @@ pub struct EnvConfig {
     /// `FERRUM_CP_DP_GRPC_JWT_SECRET`. The admin plane reads it through
     /// `create_jwt_manager_from_env()`; this field is the startup validation.
     pub admin_jwt_viewer_secret: Option<String>,
+    /// Optional namespace ceiling for tokens verified by
+    /// `FERRUM_ADMIN_JWT_VIEWER_SECRET` (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`),
+    /// kept as the raw comma-separated value. When set, a viewer-key token may
+    /// read only these namespaces whatever its `ns` claim or
+    /// `X-Ferrum-Namespace` says. Every entry must be a valid namespace name;
+    /// an empty value or empty entry fails startup. The admin plane reads it
+    /// through `create_jwt_manager_from_env()`; this field is the startup
+    /// validation.
+    pub admin_jwt_viewer_namespaces: Option<String>,
     /// JWT issuer claim (iss) for Admin API tokens. Tokens with a different issuer
     /// are rejected during verification. Default: "ferrum-edge".
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs` for use sites
@@ -4043,6 +4052,7 @@ impl Default for EnvConfig {
             allow_insecure_admin_http: false,
             admin_jwt_secret: None,
             admin_jwt_viewer_secret: None,
+            admin_jwt_viewer_namespaces: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
             admin_jwt_audience: None,
@@ -4533,6 +4543,7 @@ impl EnvConfig {
             admin_jwt_secret: Option<String> = "FERRUM_ADMIN_JWT_SECRET"
                 => required_for(["database", "cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_viewer_secret: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_SECRET";
+            admin_jwt_viewer_namespaces: Option<String> = "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES";
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
@@ -5593,6 +5604,7 @@ impl EnvConfig {
             allow_insecure_admin_http,
             admin_jwt_secret,
             admin_jwt_viewer_secret,
+            admin_jwt_viewer_namespaces,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
             admin_jwt_audience,
@@ -7934,6 +7946,13 @@ impl EnvConfig {
                         .into(),
                 );
             }
+        }
+
+        // The viewer-key namespace ceiling bounds a security boundary, so a
+        // malformed list fails startup instead of dropping entries. The parser
+        // is the one the admin plane uses, so `validate` and `run` agree.
+        if let Some(raw) = self.admin_jwt_viewer_namespaces.as_deref() {
+            crate::admin::jwt_auth::ViewerNamespaceCeiling::parse(raw)?;
         }
 
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN

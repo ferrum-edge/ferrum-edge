@@ -76,7 +76,7 @@
 //!    refused. No escape survives canonicalization, so there is no retained
 //!    `%3B` a decoding backend could turn into `..;` after policy ran. A `;`
 //!    that does not follow a bare `.`/`..` (`/v1;version=2`, `/a;b`,
-//!    `/..a;b`) is an ordinary segment byte and is accepted.
+//!    `/..a;b`) is not a dot segment; whether it is accepted at all is rule 10.
 //! 6. **No `\` survives, literal or escaped.** An encoded `\` is
 //!    [`PolicyPathRejection::EncodedBackslash`] and a literal one is
 //!    [`PolicyPathRejection::LiteralBackslash`]. The `url` crate treats a
@@ -89,6 +89,40 @@
 //!    (RFC 3986 `pchar` = `unreserved` / `sub-delims` / `:` / `@`), so
 //!    `/%61dmin` canonicalizes to `/admin` and an operator's literal rule
 //!    matches.
+//! 9. **No empty segment survives except a trailing one.** A non-final empty
+//!    segment (`//admin`, `/a//b`) and a non-final segment that is empty
+//!    before its first `;` (`/;x/admin`, `/a/;/b`) are
+//!    [`PolicyPathRejection::EmptySegment`]. A trailing slash (`/a/`) and the
+//!    root path (`/`) are unaffected, and so is a final parameter-only segment
+//!    (`/ctx/;jsessionid=1`, which Tomcat emits for directory URLs and which
+//!    resolves to the trailing-slash path); rule 10 still decides whether its
+//!    `;` is accepted. Common backends collapse `//` (Tomcat,
+//!    Spring, nginx `merge_slashes`) and strip `;…` before doing so, so
+//!    `//admin/users` and `/;x/admin/users` would execute `/admin/users`
+//!    while routing and policy read a different path. Collapsing here instead
+//!    would be a second reading, so the target is refused.
+//! 10. **A `;` path parameter is refused unless the matched proxy opts in.**
+//!     Tomcat and Spring strip `;…` from every segment, so `/admin;x/users`
+//!     executes `/admin/users` while policy reads `/admin;x/users`. Stripping
+//!     the parameter here as well would forward a different request than the
+//!     client sent, and forwarding one path while evaluating another is the
+//!     two-coordinate model this module exists to remove. So `;` — literal or
+//!     decoded from `%3B` — is refused with
+//!     [`PolicyPathRejection::PathParameter`] unless the proxy sets
+//!     `allow_path_parameters`. That decision needs the routed proxy, which
+//!     does not exist yet when the target is canonicalized, so
+//!     [`canonicalize_request_path`] only *reports* whether a `;` is present
+//!     (folded into the same scan) and the frontend applies
+//!     [`check_path_parameters`] right after route lookup and before any
+//!     plugin runs. Route lookup itself is a literal match on the canonical
+//!     path, not policy, so letting it see the `;` cannot grant anything: a
+//!     request routed to a proxy that has not opted in is refused before any
+//!     policy runs. Rules 5 and 9 still apply on an opted-in proxy, and the
+//!     frontend also re-resolves the route with every parameter removed
+//!     ([`strip_path_parameters`]) and refuses the request when that path
+//!     belongs to a different proxy: the router splits only on `/`, so
+//!     `/admin;x/users` would otherwise miss an `/admin` proxy and reach an
+//!     opted-in catch-all whose backend executes `/admin/users`.
 //!
 //! Rules 4 and 8 together mean **no percent escape survives canonicalization**:
 //! an escape is either decoded to the literal byte it names or the request is
@@ -126,14 +160,18 @@
 //! # Fast path
 //!
 //! The normal path is allocation-free but not unvalidated. A single scan
-//! proves the target carries no percent escape, no literal `\`, and no literal
-//! `.`/`..` segment (with or without a `;` parameter); only then is it
-//! returned borrowed and unmodified. That covers the overwhelming majority of
-//! production traffic, so the hot path never allocates — the `;` form is a
-//! fixed-length slice match on the segment, not a second scan — but a target is accepted because the scan cleared it, not
-//! because it happened to contain no `%`. The scan hands off to the decoding
-//! pass as soon as it sees a `%`, and that pass re-validates from the start, so
-//! the two cannot disagree about what is accepted.
+//! proves the target carries no percent escape, no literal `\`, no literal
+//! `.`/`..` segment (with or without a `;` parameter), and no non-final empty
+//! segment; only then is it returned borrowed and unmodified. That covers the
+//! overwhelming majority of production traffic, so the hot path never
+//! allocates. Each segment is classified once, when its `/` or the end of the
+//! target is reached, by a fixed-length slice match (the empty-segment check
+//! is one comparison per `/`), and noting a `;` for rule 10 is one more arm
+//! of the same byte match, not a second scan. A target is accepted because the
+//! scan cleared it, not because it happened to contain no `%`. The scan hands
+//! off to the decoding pass as soon as it sees a `%`, and that pass
+//! re-validates from the start, so the two cannot disagree about what is
+//! accepted.
 //!
 //! The result's ownership is still a reliable signal: because no escape
 //! survives, a borrowed result means the target contained no escape at all, and
@@ -198,6 +236,15 @@ pub enum PolicyPathRejection {
     /// forwarded request line resolves `/protected`; a backend that strips
     /// path parameters first resolves `/a/..;/protected` the same way.
     LiteralDotSegment,
+    /// A non-final empty path segment (`//a`, `/a//b`), or a segment that is
+    /// empty before its first `;` (`/;x/a`). Backends that collapse `//` and
+    /// strip path parameters would resolve a different path than policy read.
+    /// A trailing slash is not an empty segment in this sense.
+    EmptySegment,
+    /// A `;` path parameter (literal or `%3B`) on a proxy that has not set
+    /// `allow_path_parameters`. Never returned by the canonicalizer itself:
+    /// the frontend applies [`check_path_parameters`] once the route is known.
+    PathParameter,
 }
 
 impl PolicyPathRejection {
@@ -213,6 +260,8 @@ impl PolicyPathRejection {
             Self::UnrepresentableEscape => "unrepresentable_escape",
             Self::AmbiguousDotSegment => "ambiguous_dot_segment",
             Self::LiteralDotSegment => "literal_dot_segment",
+            Self::EmptySegment => "empty_segment",
+            Self::PathParameter => "path_parameter",
         }
     }
 
@@ -240,6 +289,8 @@ impl PolicyPathRejection {
                 r#"{"error":"Request path contains an encoded dot segment"}"#
             }
             Self::LiteralDotSegment => r#"{"error":"Request path contains a dot segment"}"#,
+            Self::EmptySegment => r#"{"error":"Request path contains an empty path segment"}"#,
+            Self::PathParameter => r#"{"error":"Request path contains a path parameter"}"#,
         }
     }
 
@@ -255,6 +306,8 @@ impl PolicyPathRejection {
             Self::UnrepresentableEscape => "Unrepresentable percent-escape in request path",
             Self::AmbiguousDotSegment => "Encoded dot segment in request path",
             Self::LiteralDotSegment => "Dot segment in request path",
+            Self::EmptySegment => "Empty path segment in request path",
+            Self::PathParameter => "Path parameter in request path",
         }
     }
 }
@@ -308,7 +361,8 @@ enum LiteralStructure {
     /// Full contract. Used for request targets and for every operator value
     /// that is compared literally against one.
     Enforced,
-    /// Escape rules only: a literal `\` or `.`/`..` segment is left alone.
+    /// Escape rules only: a literal `\`, a `.`/`..` segment, or an empty
+    /// segment (`//` is ordinary regex text) is left alone.
     ///
     /// Used for operator-authored *patterns* (`~regex` listen paths), where
     /// `\` and `.` are regex syntax rather than path bytes — `~^/v1\.0/.*`
@@ -350,38 +404,101 @@ pub fn is_literal_dot_segment(segment: &str) -> bool {
     dot_segment_len(segment.as_bytes()).is_some()
 }
 
-/// Reject a completed dot segment, naming whether an escape helped build it.
+/// Where a completed segment sits in the target, for rule 9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentPosition {
+    /// The text before the first `/`: empty for every absolute path.
+    Leading,
+    /// Any segment followed by a `/`.
+    Inner,
+    /// The last segment of a target that contains a `/`.
+    Final,
+}
+
+/// Reject a completed segment that rule 5 or rule 9 of the module contract
+/// refuses.
+///
+/// `segment` is the segment's canonical bytes, without its `/` delimiters.
+/// Only an [`SegmentPosition::Inner`] segment may not be empty, so the root
+/// path and a trailing slash stay legal while every other empty segment (`//`,
+/// `/a//b`) is refused: one comparison per `/`. A segment that is empty before
+/// its first `;` is refused unless it is [`SegmentPosition::Final`]: a final
+/// `;jsessionid=…` (which Tomcat emits for directory URLs) resolves to the
+/// trailing-slash path, not to a collapsed one, and whether any `;` is
+/// accepted at all is decided per proxy by rule 10.
 ///
 /// `first_escape` is the offset, within the segment, of the first byte that
-/// was decoded from a percent escape. The segment is ambiguous when that byte
+/// was decoded from a percent escape. A dot segment is ambiguous when that byte
 /// is one of the dots or the `;` delimiter that make it a dot segment; an
 /// escape inside the trailing parameter (`..;%61`) does not change that the
 /// dot segment itself was written literally.
 #[inline]
 fn check_segment(
-    canonical: &[u8],
-    segment_start: usize,
+    segment: &[u8],
+    position: SegmentPosition,
     first_escape: Option<usize>,
-    structure: LiteralStructure,
 ) -> Result<(), PolicyPathRejection> {
-    if structure == LiteralStructure::PatternOnly {
-        return Ok(());
+    match segment {
+        [] if position != SegmentPosition::Inner => Ok(()),
+        [b';', ..] if position == SegmentPosition::Final => Ok(()),
+        // A segment that is empty, or empty before its first `;`, collapses
+        // into its neighbour on a backend that merges `//` after stripping
+        // path parameters.
+        [] | [b';', ..] => Err(PolicyPathRejection::EmptySegment),
+        _ => match dot_segment_len(segment) {
+            Some(dot_len) if first_escape.is_some_and(|offset| offset < dot_len) => {
+                Err(PolicyPathRejection::AmbiguousDotSegment)
+            }
+            Some(_) => Err(PolicyPathRejection::LiteralDotSegment),
+            None => Ok(()),
+        },
     }
-    if let Some(dot_len) = dot_segment_len(&canonical[segment_start..]) {
-        return Err(if first_escape.is_some_and(|offset| offset < dot_len) {
-            PolicyPathRejection::AmbiguousDotSegment
-        } else {
-            PolicyPathRejection::LiteralDotSegment
-        });
+}
+
+/// Classify a completed segment. `segment_start` is 0 only for the text
+/// before the first `/`; `at_end` is true for the segment the end of the
+/// target completed.
+#[inline]
+fn segment_position(segment_start: usize, at_end: bool) -> SegmentPosition {
+    if segment_start == 0 {
+        SegmentPosition::Leading
+    } else if at_end {
+        SegmentPosition::Final
+    } else {
+        SegmentPosition::Inner
     }
-    Ok(())
+}
+
+/// `path` with every `;` path parameter removed from its segment: the path a
+/// backend that strips RFC 3986 path parameters resolves (`/admin;x/users`
+/// becomes `/admin/users`). Borrowed, and allocation-free, when `path` has no
+/// `;`.
+///
+/// Used to re-resolve a request that carries parameters on a proxy that opted
+/// in, so the opt-in cannot route a request past a more specific proxy that
+/// the stripped path belongs to.
+pub fn strip_path_parameters(path: &str) -> Cow<'_, str> {
+    if !path.contains(';') {
+        return Cow::Borrowed(path);
+    }
+    let mut stripped = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            stripped.push('/');
+        }
+        let name = segment.split_once(';').map_or(segment, |(name, _)| name);
+        stripped.push_str(name);
+    }
+    Cow::Owned(stripped)
 }
 
 /// What the allocation-free pre-scan concluded about a target.
 enum Prescan {
-    /// No percent escape, no literal backslash, and no literal dot segment:
-    /// the input is already canonical and can be returned borrowed.
-    AlreadyCanonical,
+    /// No percent escape, no literal backslash, no literal dot segment, and no
+    /// non-final empty segment: the input is already canonical and can be
+    /// returned borrowed. `has_path_parameter` records whether it contains a
+    /// `;` (rule 10).
+    AlreadyCanonical { has_path_parameter: bool },
     /// A `%` was reached. The decoding pass re-validates from the first byte,
     /// so the scan stops here rather than duplicating its rules.
     NeedsDecoding,
@@ -390,22 +507,27 @@ enum Prescan {
 /// Prove a target needs neither decoding nor rejection, without allocating.
 ///
 /// This is the hot path for essentially all production traffic. It is a
-/// validating scan, not a "no `%` means accept" shortcut: a literal `\` or a
-/// literal `.`/`..` segment (including `..;` and `.;x`) is refused here exactly
-/// as the decoding pass refuses it.
+/// validating scan, not a "no `%` means accept" shortcut: a literal `\`, a
+/// literal `.`/`..` segment (including `..;` and `.;x`), or a non-final empty
+/// segment (including `;x`) is refused here exactly as the decoding pass
+/// refuses it.
 fn prescan(bytes: &[u8], structure: LiteralStructure) -> Result<Prescan, PolicyPathRejection> {
     let enforced = structure == LiteralStructure::Enforced;
     let mut segment_start = 0usize;
+    let mut has_path_parameter = false;
     let mut index = 0usize;
 
     while index < bytes.len() {
         match bytes[index] {
             b'%' => return Ok(Prescan::NeedsDecoding),
             b'\\' if enforced => return Err(PolicyPathRejection::LiteralBackslash),
+            b';' => has_path_parameter = true,
             b'/' if enforced => {
-                if dot_segment_len(&bytes[segment_start..index]).is_some() {
-                    return Err(PolicyPathRejection::LiteralDotSegment);
-                }
+                check_segment(
+                    &bytes[segment_start..index],
+                    segment_position(segment_start, false),
+                    None,
+                )?;
                 segment_start = index + 1;
             }
             _ => {}
@@ -413,27 +535,84 @@ fn prescan(bytes: &[u8], structure: LiteralStructure) -> Result<Prescan, PolicyP
         index += 1;
     }
 
-    if enforced && dot_segment_len(&bytes[segment_start..]).is_some() {
-        return Err(PolicyPathRejection::LiteralDotSegment);
+    if enforced {
+        check_segment(
+            &bytes[segment_start..],
+            segment_position(segment_start, true),
+            None,
+        )?;
     }
-    Ok(Prescan::AlreadyCanonical)
+    Ok(Prescan::AlreadyCanonical { has_path_parameter })
+}
+
+/// A canonical request path, and whether it carries a `;` path parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalRequestPath<'a> {
+    /// The canonical policy path. Borrowed when the target contained no
+    /// percent escape, owned when at least one escape was decoded.
+    pub path: Cow<'a, str>,
+    /// Whether the canonical path contains a `;` (literal, or decoded from
+    /// `%3B`). The frontend passes this to [`check_path_parameters`] once the
+    /// route is known (rule 10 of the module contract).
+    pub has_path_parameter: bool,
+}
+
+/// Build the canonical request path for `raw` at the frontend boundary, or
+/// reject the request target.
+///
+/// Applies every rule of the module contract that does not depend on the
+/// routed proxy, and reports whether the path carries a `;` so the frontend
+/// can apply the per-proxy rule 10 through [`check_path_parameters`] right
+/// after route lookup, before any plugin runs. `raw` is the path component
+/// only — the query string is never part of the policy path.
+pub fn canonicalize_request_path(
+    raw: &str,
+) -> Result<CanonicalRequestPath<'_>, PolicyPathRejection> {
+    let (path, has_path_parameter) = canonicalize(raw, LiteralStructure::Enforced)?;
+    Ok(CanonicalRequestPath {
+        path,
+        has_path_parameter,
+    })
 }
 
 /// Build the canonical policy path for `raw`, or reject the request target.
 ///
 /// See the module documentation for the full contract. `raw` is the path
-/// component only — the query string is never part of the policy path.
+/// component only — the query string is never part of the policy path. This
+/// does not apply the per-proxy `;` rule (rule 10): a path parameter is
+/// accepted here, because this is also the re-check that runs on already
+/// admitted paths (mesh authorization, route overrides) and on operator
+/// configuration. Frontends use [`canonicalize_request_path`] instead.
 pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRejection> {
-    canonicalize(raw, LiteralStructure::Enforced)
+    canonicalize(raw, LiteralStructure::Enforced).map(|(path, _)| path)
+}
+
+/// Apply rule 10 of the module contract for a routed request.
+///
+/// `has_path_parameter` comes from [`canonicalize_request_path`];
+/// `allow_path_parameters` is the matched proxy's opt-in. A `;` on a proxy
+/// that has not opted in is [`PolicyPathRejection::PathParameter`].
+#[inline]
+pub fn check_path_parameters(
+    has_path_parameter: bool,
+    allow_path_parameters: bool,
+) -> Result<(), PolicyPathRejection> {
+    if has_path_parameter && !allow_path_parameters {
+        Err(PolicyPathRejection::PathParameter)
+    } else {
+        Ok(())
+    }
 }
 
 fn canonicalize(
     raw: &str,
     structure: LiteralStructure,
-) -> Result<Cow<'_, str>, PolicyPathRejection> {
+) -> Result<(Cow<'_, str>, bool), PolicyPathRejection> {
     let bytes = raw.as_bytes();
     match prescan(bytes, structure)? {
-        Prescan::AlreadyCanonical => return Ok(Cow::Borrowed(raw)),
+        Prescan::AlreadyCanonical { has_path_parameter } => {
+            return Ok((Cow::Borrowed(raw), has_path_parameter));
+        }
         Prescan::NeedsDecoding => {}
     }
     let enforced = structure == LiteralStructure::Enforced;
@@ -445,13 +624,20 @@ fn canonicalize(
     let mut segment_start = 0usize;
     // Offset within the current segment of its first escape-decoded byte.
     let mut segment_first_escape: Option<usize> = None;
+    let mut has_path_parameter = false;
     let mut index = 0usize;
 
     while index < bytes.len() {
         let byte = bytes[index];
 
         if byte == b'/' {
-            check_segment(&canonical, segment_start, segment_first_escape, structure)?;
+            if enforced {
+                check_segment(
+                    &canonical[segment_start..],
+                    segment_position(segment_start, false),
+                    segment_first_escape,
+                )?;
+            }
             canonical.push(b'/');
             segment_start = canonical.len();
             segment_first_escape = None;
@@ -468,6 +654,7 @@ fn canonicalize(
         }
 
         if byte != b'%' {
+            has_path_parameter |= byte == b';';
             canonical.push(byte);
             index += 1;
             continue;
@@ -503,15 +690,24 @@ fn canonicalize(
 
         // `;` is a `sub-delims` byte, so `%3B` decodes here like any other
         // `pchar` escape and the segment check below sees the real delimiter:
-        // `..%3B` is refused exactly like `..;`.
+        // `..%3B` is refused exactly like `..;`, `/%3Bx/a` exactly like
+        // `/;x/a`, and a decoded `;` is a path parameter for rule 10 exactly
+        // like a literal one.
         if segment_first_escape.is_none() {
             segment_first_escape = Some(canonical.len() - segment_start);
         }
+        has_path_parameter |= value == b';';
         canonical.push(value);
         index += 3;
     }
 
-    check_segment(&canonical, segment_start, segment_first_escape, structure)?;
+    if enforced {
+        check_segment(
+            &canonical[segment_start..],
+            segment_position(segment_start, true),
+            segment_first_escape,
+        )?;
+    }
 
     // Reaching here means at least one `%` was consumed (the pre-scan handled
     // the escape-free case) and every escape collapsed from three bytes to one,
@@ -522,7 +718,7 @@ fn canonicalize(
     // is valid UTF-8 by construction. The fallible form keeps that a documented
     // invariant instead of a panic.
     String::from_utf8(canonical)
-        .map(Cow::Owned)
+        .map(|canonical| (Cow::Owned(canonical), has_path_parameter))
         .map_err(|_| PolicyPathRejection::UnrepresentableEscape)
 }
 
@@ -548,15 +744,15 @@ pub fn non_canonical_policy_path_reason(path: &str) -> Option<&'static str> {
 /// `~^/v1\.0/.*` matches the entirely reachable canonical path `/v1.0/x`.
 /// Applying the literal rules to a pattern would reject working routes without
 /// closing anything, because the canonical path a pattern is matched against
-/// already cannot contain a dot segment or a backslash.
+/// already cannot contain a dot segment, an empty segment, or a backslash.
 pub fn non_canonical_policy_path_pattern_reason(pattern: &str) -> Option<&'static str> {
     reason_for(canonicalize(pattern, LiteralStructure::PatternOnly))
 }
 
-fn reason_for(result: Result<Cow<'_, str>, PolicyPathRejection>) -> Option<&'static str> {
+fn reason_for(result: Result<(Cow<'_, str>, bool), PolicyPathRejection>) -> Option<&'static str> {
     match result {
-        Ok(Cow::Borrowed(_)) => None,
-        Ok(Cow::Owned(_)) => Some("percent-escapes that canonicalize to a different path"),
+        Ok((Cow::Borrowed(_), _)) => None,
+        Ok((Cow::Owned(_), _)) => Some("percent-escapes that canonicalize to a different path"),
         Err(rejection) => Some(rejection.reason()),
     }
 }

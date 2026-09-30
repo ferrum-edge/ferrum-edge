@@ -394,8 +394,9 @@ enum ExportInput {
     Cached(std::sync::Arc<GatewayConfig>),
 }
 
-/// `GET /config/export`. Authorization (any authenticated role, `ns` claim)
-/// is enforced by the dispatcher before this runs.
+/// `GET /config/export`. Authorization (any authenticated role, `ns` claim,
+/// and the viewer-key namespace ceiling) is enforced by the dispatcher before
+/// this runs.
 pub(crate) async fn handle_config_export(
     state: &AdminState,
     actor: &AuditActor,
@@ -456,6 +457,7 @@ pub(crate) async fn handle_config_export(
         actor = %actor.sub,
         key_tier = actor.key_tier.as_str(),
         namespace = %namespace,
+        namespace_ceiling = actor.namespace_ceiling_decision(namespace).as_str(),
         source,
         bytes = body.len(),
         "Configuration export served"

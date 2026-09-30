@@ -2042,8 +2042,10 @@ rewritten into one of them:
 | `/admin%252Fsecret`, any `%25` | `400` | `double_encoding` |
 | `/api%20name`, any escape of a non-`pchar` byte | `400` | `unrepresentable_escape` |
 | `/admin\secret`, `/admin%5Csecret` | `400` | `literal_backslash` / `encoded_backslash` |
+| `//admin`, `/a//b`, `/;x/admin`, `/%3Bx/admin` | `400` | `empty_segment` |
+| `/admin;x/users`, `/v1;version=2`, `/admin%3Bx/users` | `400` | `path_parameter` (mesh-materialized routes cannot set `allow_path_parameters`; there is no mesh-level opt-in yet) |
 | `/%61dmin` | served as `/admin` | — (escape of a `pchar` byte is decoded) |
-| `/a..b`, `/...`, `/v1.0/x`, `/v1;version=2` | served unchanged | — (dots inside a segment NAME are not dot segments; a `;` parameter only matters after a bare `.`/`..`) |
+| `/a..b`, `/...`, `/v1.0/x`, `/a/` | served unchanged | — (dots inside a segment NAME are not dot segments; a trailing slash is not an empty segment) |
 
 **Divergence from Istio, deliberate.** Istio/Envoy applies
 `meshConfig.pathNormalization: DEFAULT` (RFC 3986 `remove_dot_segments`) and

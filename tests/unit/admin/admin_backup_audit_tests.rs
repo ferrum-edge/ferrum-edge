@@ -91,6 +91,7 @@ fn admin_actor() -> AuditActor {
         role: AdminRole::Admin,
         allowed_namespaces: ferrum_edge::grpc::auth::AllowedNamespaces::empty(),
         key_tier: ferrum_edge::admin::jwt_auth::AdminKeyTier::Primary,
+        namespace_ceiling: None,
     }
 }
 

@@ -31101,14 +31101,76 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     // All transports and deferred passes converge here before rebasing or
     // evaluating the backend path. Provider overrides share the same path
     // contract as mesh rewrites; retain the client path for policy/logging.
+    //
+    // Only the path component is canonicalized. A provider override may carry
+    // the endpoint's and the client's query (`ai_stream_router`,
+    // `ai_federation`), and that query must reach the provider byte-identical:
+    // decoding it in place would turn a client's `%26` / `%3D` into new
+    // provider parameters after the name-based strip ran
+    // (GHSA-653r-wc8x-4fch), and would break query signatures. The path rules
+    // (for example the empty-segment rule) do not apply to query text either.
     if let Some(path) = ctx.route_override_path.as_mut() {
-        match crate::policy_path::canonicalize_policy_path(path) {
+        let path_end = path.find('?').unwrap_or(path.len());
+        match crate::policy_path::canonicalize_policy_path(&path[..path_end]) {
             Ok(std::borrow::Cow::Borrowed(_)) => {}
-            Ok(std::borrow::Cow::Owned(canonical)) => *path = canonical,
+            Ok(std::borrow::Cow::Owned(canonical)) => path.replace_range(..path_end, &canonical),
             Err(rejection) => return reject_route_override_path(rejection),
         }
     }
     PluginResult::Continue
+}
+
+/// The route-lookup inputs a request was routed with, so a request carrying
+/// `;` path parameters can be re-resolved against the same host, frontend
+/// port, and listener.
+pub(crate) struct RouteLookupScope<'a> {
+    pub(crate) host: Option<&'a str>,
+    pub(crate) frontend_port: Option<u16>,
+    pub(crate) frontend_is_tls: bool,
+    pub(crate) gateway_listener: Option<&'a gateway_listener::GatewayListenerIdentity>,
+}
+
+/// Rule 10 of the canonical request path contract (`src/policy_path.rs`) for a
+/// routed request (GHSA-fcqw-793q-wg5x).
+///
+/// A `;` is refused unless the routed proxy set `allow_path_parameters`. On an
+/// opted-in proxy the request is also re-resolved with its parameters removed
+/// (the path a parameter-stripping backend executes) and refused when that
+/// path routes to a *different* proxy. The router splits only on `/`, so
+/// `/admin;x/users` misses an `/admin` route and can land on an opted-in `/`
+/// or `/api` catch-all whose backend then runs `/admin/users` without the
+/// `/admin` proxy's plugins. A stripped path that routes nowhere cannot skip
+/// another proxy's policy, so it is allowed: that keeps a proxy whose literal
+/// `listen_path` itself contains `;` reachable. The re-resolve allocates, but
+/// only for a request that carries a `;` and reached an opted-in proxy.
+pub(crate) fn check_routed_path_parameters(
+    state: &ProxyState,
+    epoch: &crate::request_epoch::RequestEpoch,
+    path: &str,
+    has_path_parameter: bool,
+    proxy: &Proxy,
+    scope: RouteLookupScope<'_>,
+) -> Result<(), crate::policy_path::PolicyPathRejection> {
+    crate::policy_path::check_path_parameters(has_path_parameter, proxy.allow_path_parameters)?;
+    if !has_path_parameter {
+        return Ok(());
+    }
+    let stripped = crate::policy_path::strip_path_parameters(path);
+    let Some(stripped_route) = state.router_cache.find_proxy_in_epoch(
+        epoch,
+        scope.host,
+        &stripped,
+        scope.frontend_port,
+        scope.frontend_is_tls,
+        scope.gateway_listener,
+    ) else {
+        return Ok(());
+    };
+    if stripped_route.proxy.namespace == proxy.namespace && stripped_route.proxy.id == proxy.id {
+        Ok(())
+    } else {
+        Err(crate::policy_path::PolicyPathRejection::PathParameter)
+    }
 }
 
 pub(crate) fn reject_route_override_path(
@@ -32499,9 +32561,11 @@ async fn handle_proxy_request_inner(
     // path.
     // `None` means the target was already canonical, so nothing is rebound and
     // nothing is allocated — the case for the overwhelming majority of traffic.
-    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
-        Ok(std::borrow::Cow::Borrowed(_)) => None,
-        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+    // Whether the path carries a `;` is recorded here, in the same scan, and
+    // enforced against the matched proxy's `allow_path_parameters` right after
+    // route lookup (GHSA-fcqw-793q-wg5x).
+    let canonical_request = match crate::policy_path::canonicalize_request_path(&path) {
+        Ok(canonical) => canonical,
         Err(rejection) => {
             // The raw target is attacker-controlled: log only the fixed reason
             // token, never the bytes.
@@ -32529,6 +32593,11 @@ async fn handle_proxy_request_inner(
                 rejection.client_error_body(),
             ));
         }
+    };
+    let request_path_has_parameter = canonical_request.has_path_parameter;
+    let canonicalized_path = match canonical_request.path {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(canonical) => Some(canonical),
     };
     let path = match canonicalized_path {
         Some(canonical) => {
@@ -33222,6 +33291,51 @@ async fn handle_proxy_request_inner(
             }
         }
     };
+
+    // A `;` path parameter is refused unless the routed proxy opted in with
+    // `allow_path_parameters`, and the parameter-stripped path routes to that
+    // same proxy (GHSA-fcqw-793q-wg5x). Canonicalization could only record
+    // the `;`, because the proxy was not known yet; route lookup is a literal
+    // match and grants nothing, and this runs before every plugin phase and
+    // backend dispatch, so no policy surface is skipped by a path a
+    // parameter-stripping backend would resolve differently.
+    if let Err(rejection) = check_routed_path_parameters(
+        &state,
+        &epoch,
+        &path,
+        request_path_has_parameter,
+        &proxy,
+        RouteLookupScope {
+            host: request_host.as_deref(),
+            frontend_port: ctx.frontend_listen_port,
+            frontend_is_tls: is_tls,
+            gateway_listener: gateway_listener_identity.as_ref(),
+        },
+    ) {
+        warn!(
+            reason = rejection.reason(),
+            "Rejected request: path parameter not admitted for the routed proxy"
+        );
+        record_request(&state, 400);
+        if let Some(content_type) = grpc_web_response_content_type {
+            return Ok(build_grpc_web_error_response(
+                content_type,
+                grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                rejection.grpc_message(),
+                &[],
+            ));
+        }
+        if request_uses_grpc_content_type {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                rejection.grpc_message(),
+            ));
+        }
+        return Ok(build_response(
+            StatusCode::BAD_REQUEST,
+            rejection.client_error_body(),
+        ));
+    }
 
     ctx.matched_path_strip_len = strip_len;
     ctx.matched_proxy = Some(Arc::clone(&proxy));

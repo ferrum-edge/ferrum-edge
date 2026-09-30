@@ -5,14 +5,18 @@
 //! `viewer` whatever its `role` claim says. The ceiling comes from the key that
 //! verified the signature, both keys are pinned to HS256, and identical
 //! secrets are refused.
+//!
+//! `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` (issue #5929) adds a namespace ceiling
+//! for the same key; its parser, token/actor wiring, and env wiring are pinned
+//! at the bottom of this file.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
-use ferrum_edge::admin::audit::AuditActor;
+use ferrum_edge::admin::audit::{AuditActor, NamespaceCeilingDecision};
 use ferrum_edge::admin::jwt_auth::{
     ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR, AdminKeyTier, AdminRole, JwtConfig, JwtError,
-    JwtManager, MAX_VIEWER_KEY_SUBJECT_BYTES, create_jwt_manager_from_env,
+    JwtManager, MAX_VIEWER_KEY_SUBJECT_BYTES, ViewerNamespaceCeiling, create_jwt_manager_from_env,
     random_read_only_jwt_manager,
 };
 use ferrum_edge::fips::approved::HmacSha256;
@@ -385,5 +389,267 @@ fn random_read_only_fallback_keeps_the_viewer_secret() {
     assert!(
         random_read_only_jwt_manager().is_err(),
         "an invalid viewer secret must fail startup, not be dropped"
+    );
+}
+
+// ── FERRUM_ADMIN_JWT_VIEWER_NAMESPACES (issue #5929) ────────────────────
+
+fn ceiling(raw: &str) -> ViewerNamespaceCeiling {
+    ViewerNamespaceCeiling::parse(raw).expect("valid ceiling")
+}
+
+fn manager_with_namespace_ceiling(raw: &str) -> JwtManager {
+    manager_with_viewer_secret().with_viewer_namespace_ceiling(ceiling(raw))
+}
+
+fn claims_with_ns(ns: Option<Value>) -> Value {
+    let mut claims = claims("viewer");
+    if let Some(ns) = ns {
+        claims["ns"] = ns;
+    }
+    claims
+}
+
+fn actor_for(manager: &JwtManager, secret: &str, ns: Option<Value>) -> AuditActor {
+    let token = sign(&claims_with_ns(ns), secret, Algorithm::HS256);
+    let verified = manager.verify_token(&token).expect("token verifies");
+    AuditActor::from_verified(&verified).expect("actor builds")
+}
+
+#[test]
+fn viewer_namespace_ceiling_parser_trims_and_collapses_duplicates() {
+    let parsed = ceiling(" staging ,analytics,staging");
+    assert_eq!(parsed.len(), 2);
+    assert!(!parsed.is_empty());
+    assert!(parsed.allows("staging"));
+    assert!(parsed.allows("analytics"));
+    assert!(!parsed.allows("prod"));
+    assert!(!parsed.allows(" staging "));
+    assert!(ceiling("a.b_c-1").allows("a.b_c-1"));
+}
+
+#[test]
+fn viewer_namespace_ceiling_parser_fails_closed_on_malformed_lists() {
+    for (raw, expected) in [
+        ("", "lists no namespace"),
+        (" \t ", "lists no namespace"),
+        ("staging,,prod", "entry 2 is empty"),
+        ("staging,", "entry 2 is empty"),
+        (",staging", "entry 1 is empty"),
+        ("*", "wildcards are not supported"),
+        ("staging,*", "entry 2 is `*`"),
+        ("-leading-hyphen", "entry 1"),
+        ("has space", "entry 1"),
+        ("slash/name", "entry 1"),
+    ] {
+        let error = ViewerNamespaceCeiling::parse(raw).expect_err("malformed list is refused");
+        assert!(
+            error.contains("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES"),
+            "{raw:?}: {error}"
+        );
+        assert!(error.contains(expected), "{raw:?}: {error}");
+    }
+    let too_long = "a".repeat(255);
+    let error = ViewerNamespaceCeiling::parse(&too_long).expect_err("255 characters is too long");
+    assert!(error.contains("1-254 characters"), "{error}");
+    assert!(ViewerNamespaceCeiling::parse(&"a".repeat(254)).is_ok());
+}
+
+#[test]
+fn viewer_namespace_ceiling_error_names_only_the_offending_entry() {
+    let error = ViewerNamespaceCeiling::parse("staging,Bad Name!,prod").expect_err("refused");
+    assert!(error.contains("entry 2"), "{error}");
+    assert!(error.contains("\"Bad Name!\""), "{error}");
+    assert!(!error.contains("staging"), "{error}");
+    assert!(!error.contains("prod"), "{error}");
+}
+
+#[test]
+fn viewer_key_tokens_carry_the_namespace_ceiling_and_primary_tokens_do_not() {
+    let manager = manager_with_namespace_ceiling("staging");
+    assert!(manager.viewer_namespace_ceiling().is_some());
+
+    let viewer = sign(&claims("admin"), VIEWER_SECRET, Algorithm::HS256);
+    let verified = manager
+        .verify_token(&viewer)
+        .expect("viewer-key token verifies");
+    assert_eq!(verified.key_tier, AdminKeyTier::Viewer);
+    assert_eq!(verified.namespace_ceiling, Some(ceiling("staging")));
+
+    let primary = sign(&claims("admin"), PRIMARY_SECRET, Algorithm::HS256);
+    let verified = manager
+        .verify_token(&primary)
+        .expect("primary token verifies");
+    assert_eq!(verified.key_tier, AdminKeyTier::Primary);
+    assert_eq!(verified.namespace_ceiling, None);
+
+    // Without a configured ceiling no viewer-key token carries one.
+    let unbounded = manager_with_viewer_secret();
+    let verified = unbounded.verify_token(&viewer).expect("verifies");
+    assert_eq!(verified.namespace_ceiling, None);
+}
+
+#[test]
+fn claim_less_viewer_key_actor_is_bounded_by_the_ceiling() {
+    let manager = manager_with_namespace_ceiling("staging,analytics");
+    let actor = actor_for(&manager, VIEWER_SECRET, None);
+
+    // Claim presence records what the token carried.
+    assert!(!actor.allowed_namespaces.is_present());
+    assert_eq!(
+        actor.namespace_ceiling_decision("staging"),
+        NamespaceCeilingDecision::Within
+    );
+    assert_eq!(
+        actor.namespace_ceiling_decision("analytics"),
+        NamespaceCeilingDecision::Within
+    );
+    assert_eq!(
+        actor.namespace_ceiling_decision("prod"),
+        NamespaceCeilingDecision::Outside
+    );
+    assert_eq!(
+        actor.namespace_ceiling_decision("ferrum"),
+        NamespaceCeilingDecision::Outside
+    );
+}
+
+#[test]
+fn viewer_key_ns_claim_is_narrowed_to_the_ceiling() {
+    let manager = manager_with_namespace_ceiling("staging");
+
+    let wide = actor_for(&manager, VIEWER_SECRET, Some(json!(["staging", "prod"])));
+    assert!(wide.allowed_namespaces.is_present());
+    assert!(wide.allowed_namespaces.allows("staging"));
+    assert!(
+        !wide.allowed_namespaces.allows("prod"),
+        "a viewer-key `ns` claim must not reach past the ceiling"
+    );
+
+    // A claim naming only namespaces outside the ceiling authorizes nothing.
+    let outside = actor_for(&manager, VIEWER_SECRET, Some(json!("prod")));
+    assert!(outside.allowed_namespaces.is_present());
+    assert!(!outside.allowed_namespaces.allows("prod"));
+    assert!(!outside.allowed_namespaces.allows("staging"));
+    assert_eq!(
+        outside.namespace_ceiling_decision("prod"),
+        NamespaceCeilingDecision::Outside
+    );
+
+    // A malformed claim still fails closed.
+    let token = sign(
+        &claims_with_ns(Some(json!(""))),
+        VIEWER_SECRET,
+        Algorithm::HS256,
+    );
+    let verified = manager.verify_token(&token).expect("signature verifies");
+    assert!(AuditActor::from_verified(&verified).is_err());
+}
+
+#[test]
+fn primary_key_actor_is_unaffected_by_the_ceiling() {
+    let manager = manager_with_namespace_ceiling("staging");
+
+    let unscoped = actor_for(&manager, PRIMARY_SECRET, None);
+    assert!(unscoped.namespace_ceiling.is_none());
+    assert_eq!(
+        unscoped.namespace_ceiling_decision("prod"),
+        NamespaceCeilingDecision::NotApplicable
+    );
+
+    let scoped = actor_for(&manager, PRIMARY_SECRET, Some(json!(["prod"])));
+    assert!(scoped.allowed_namespaces.allows("prod"));
+    assert_eq!(
+        scoped.namespace_ceiling_decision("prod"),
+        NamespaceCeilingDecision::NotApplicable
+    );
+}
+
+#[test]
+fn ceiling_decision_is_recorded_on_security_audit_diffs_only_when_it_applies() {
+    use ferrum_edge::admin::audit::with_namespace_ceiling_decision;
+
+    let manager = manager_with_namespace_ceiling("staging");
+    let base = json!({"failure_category": "namespace_denied", "resources": "all"});
+
+    let viewer = actor_for(&manager, VIEWER_SECRET, None);
+    let outside = with_namespace_ceiling_decision(base.clone(), &viewer, "prod");
+    assert_eq!(outside["namespace_ceiling"], "outside");
+    assert_eq!(outside["failure_category"], "namespace_denied");
+    let within = with_namespace_ceiling_decision(base.clone(), &viewer, "staging");
+    assert_eq!(within["namespace_ceiling"], "within");
+
+    let primary = actor_for(&manager, PRIMARY_SECRET, None);
+    let unchanged = with_namespace_ceiling_decision(base.clone(), &primary, "prod");
+    assert_eq!(unchanged, base, "primary-key records keep their shape");
+    assert_eq!(
+        NamespaceCeilingDecision::NotApplicable.as_str(),
+        "not_applicable"
+    );
+}
+
+#[test]
+fn create_jwt_manager_from_env_reads_and_validates_the_viewer_namespace_ceiling() {
+    let env = EnvGuard::new(&[]);
+    env.unset("FERRUM_ADMIN_JWT_ISSUER");
+    env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
+    env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
+    env.set("FERRUM_ADMIN_JWT_SECRET", PRIMARY_SECRET);
+    env.set("FERRUM_ADMIN_JWT_VIEWER_SECRET", VIEWER_SECRET);
+
+    env.unset("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES");
+    let manager = create_jwt_manager_from_env().expect("no ceiling is valid");
+    assert!(manager.viewer_namespace_ceiling().is_none());
+
+    for invalid in ["", "staging,", "*", "Bad Name!"] {
+        env.set("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES", invalid);
+        let Err(JwtError::VerificationFailed(message)) = create_jwt_manager_from_env() else {
+            panic!("{invalid:?} must fail startup, not be dropped");
+        };
+        assert!(
+            message.contains("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES"),
+            "{invalid:?}: {message}"
+        );
+    }
+
+    env.set("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES", "staging, analytics");
+    let manager = create_jwt_manager_from_env().expect("a valid ceiling is accepted");
+    assert_eq!(
+        manager.viewer_namespace_ceiling(),
+        Some(&ceiling("analytics,staging"))
+    );
+    let mut viewer_claims = claims("viewer");
+    viewer_claims["iss"] = json!("ferrum-edge");
+    let token = sign(&viewer_claims, VIEWER_SECRET, Algorithm::HS256);
+    let verified = manager
+        .verify_token(&token)
+        .expect("viewer-key token verifies");
+    let actor = AuditActor::from_verified(&verified).unwrap();
+    assert_eq!(
+        actor.namespace_ceiling_decision("prod"),
+        NamespaceCeilingDecision::Outside
+    );
+}
+
+#[test]
+fn random_read_only_fallback_keeps_the_viewer_namespace_ceiling() {
+    let env = EnvGuard::new(&[]);
+    env.unset("FERRUM_ADMIN_JWT_SECRET");
+    env.unset("FERRUM_ADMIN_JWT_ISSUER");
+    env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
+    env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
+    env.set("FERRUM_ADMIN_JWT_VIEWER_SECRET", VIEWER_SECRET);
+    env.set("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES", "staging");
+
+    let manager = random_read_only_jwt_manager().expect("fallback builds");
+    assert_eq!(
+        manager.viewer_namespace_ceiling(),
+        Some(&ceiling("staging"))
+    );
+
+    env.set("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES", "staging,,prod");
+    assert!(
+        random_read_only_jwt_manager().is_err(),
+        "an invalid ceiling must fail startup, not be dropped"
     );
 }

@@ -392,6 +392,7 @@ pub const NAMESPACE_RENAME_COPY_TABLES: &[(&str, &[&str])] = &[
             "tcp_idle_timeout_seconds",
             "websocket_idle_timeout_seconds",
             "websocket_permessage_deflate",
+            "allow_path_parameters",
             "allowed_methods",
             "allowed_ws_origins",
             "udp_max_response_amplification_factor",

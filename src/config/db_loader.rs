@@ -3351,7 +3351,7 @@ impl DatabaseStore {
     // column.  The `replace_api_spec_bundle` path uses UPDATE so it is out of scope.
     // ── Drift-prevention contract for proxy INSERT call sites ────────────────
     //
-    // The 53-column proxy column list is canonical and shared by THREE INSERT
+    // The 54-column proxy column list is canonical and shared by THREE INSERT
     // sites and ONE UPDATE site. When you add a new column to the `proxies`
     // table, it must be added — in the same position — to ALL of:
     //
@@ -3373,20 +3373,20 @@ impl DatabaseStore {
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 53 resource columns + `created_at` + `updated_at` = 55.
+    /// 54 resource columns + `created_at` + `updated_at` = 56.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 55;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 56;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
     /// `stream_match` and `created_at`).
-    /// 55 base + 1 (api_spec_id) = 56.
+    /// 56 base + 1 (api_spec_id) = 57.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 56;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 57;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -3410,14 +3410,14 @@ impl DatabaseStore {
          pool_http3_connections_per_backend, pool_max_requests_per_connection, \
          listen_port, frontend_tls, passthrough, \
          udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
-         websocket_permessage_deflate, \
+         websocket_permessage_deflate, allow_path_parameters, \
          allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
          stream_proxy_protocol, backend_proxy_protocol, stream_match, \
          upstream_subset, \
          created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -3525,6 +3525,7 @@ impl DatabaseStore {
             .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
             .bind(proxy.websocket_idle_timeout_seconds.map(|v| v as i64))
             .bind(proxy.websocket_permessage_deflate.as_str())
+            .bind(if proxy.allow_path_parameters { 1i32 } else { 0 })
             .bind(
                 proxy
                     .allowed_methods
@@ -3628,7 +3629,7 @@ impl DatabaseStore {
         let stream_match_json = serialize_stream_match(proxy)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, websocket_permessage_deflate=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, websocket_permessage_deflate=?, allow_path_parameters=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(serde_json::to_string(&proxy.labels)?)
         .bind(&proxy.name)
@@ -3675,6 +3676,7 @@ impl DatabaseStore {
         .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
         .bind(proxy.websocket_idle_timeout_seconds.map(|v| v as i64))
         .bind(proxy.websocket_permessage_deflate.as_str())
+        .bind(if proxy.allow_path_parameters { 1i32 } else { 0 })
         .bind(proxy.allowed_methods.as_ref().map(serde_json::to_string).transpose()?)
         .bind(if proxy.allowed_ws_origins.is_empty() { None } else { Some(serde_json::to_string(&proxy.allowed_ws_origins)?) })
         .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
@@ -7100,6 +7102,7 @@ impl DatabaseStore {
                 .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
                 .bind(proxy.websocket_idle_timeout_seconds.map(|v| v as i64))
                 .bind(proxy.websocket_permessage_deflate.as_str())
+                .bind(if proxy.allow_path_parameters { 1i32 } else { 0 })
                 .bind(
                     proxy
                         .allowed_methods
@@ -9653,13 +9656,13 @@ impl DatabaseStore {
                   pool_http3_connections_per_backend, pool_max_requests_per_connection, \
                   listen_port, frontend_tls, passthrough, \
                   udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
-                  websocket_permessage_deflate, \
+                  websocket_permessage_deflate, allow_path_parameters, \
                   allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
                   stream_proxy_protocol, backend_proxy_protocol, stream_match, \
                   api_spec_id, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(serde_json::to_string(&p.labels)?)
             .bind(&p.id)
             .bind(&p.namespace)
@@ -9723,6 +9726,7 @@ impl DatabaseStore {
             .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
             .bind(p.websocket_idle_timeout_seconds.map(|v| v as i64))
             .bind(p.websocket_permessage_deflate.as_str())
+            .bind(if p.allow_path_parameters { 1i32 } else { 0 })
             .bind(
                 p.allowed_methods
                     .as_ref()
@@ -10142,6 +10146,7 @@ impl DatabaseStore {
                  listen_port = ?, frontend_tls = ?, passthrough = ?, \
                  udp_idle_timeout_seconds = ?, tcp_idle_timeout_seconds = ?, \
                  websocket_idle_timeout_seconds = ?, websocket_permessage_deflate = ?, \
+                 allow_path_parameters = ?, \
                  allowed_methods = ?, allowed_ws_origins = ?, \
                  udp_max_response_amplification_factor = ?, \
                  stream_proxy_protocol = ?, backend_proxy_protocol = ?, stream_match = ?, \
@@ -10209,6 +10214,7 @@ impl DatabaseStore {
             .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
             .bind(p.websocket_idle_timeout_seconds.map(|v| v as i64))
             .bind(p.websocket_permessage_deflate.as_str())
+            .bind(if p.allow_path_parameters { 1i32 } else { 0 })
             .bind(
                 p.allowed_methods
                     .as_ref()
@@ -12532,6 +12538,7 @@ fn row_to_proxy_inner(
             .ok()
             .map(|v| v.max(0) as u64),
         websocket_permessage_deflate: decode_websocket_permessage_deflate(row, &pid)?,
+        allow_path_parameters: row.try_get::<i32, _>("allow_path_parameters").unwrap_or(0) != 0,
         allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
             Some(s) => Some(
                 config_decode::from_json_str::<Vec<String>>(&s).map_err(|e| {
@@ -13391,7 +13398,7 @@ mod proxy_insert_sql_drift_tests {
         // change there.
         let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         let placeholders = values_clause.matches('?').count();
         assert_eq!(
             placeholders,

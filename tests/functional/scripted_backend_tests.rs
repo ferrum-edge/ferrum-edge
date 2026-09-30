@@ -2242,16 +2242,9 @@ async fn a2a_policy_covers_request_shapes_before_any_upstream_connection() {
             "{\"jsonrpc\":\"2.0\",\"method\":\"message/send\"}",
         ),
         ("POST", "/a2a/message:send/", "application/json", "{}"),
-        ("POST", "/a2a//message:send", "application/json", "{}"),
         (
             "POST",
             "/a2a/tasks/t1/pushNotificationConfigs/",
-            "application/json",
-            "{}",
-        ),
-        (
-            "POST",
-            "/a2a/tasks/t1//pushNotificationConfigs",
             "application/json",
             "{}",
         ),
@@ -2274,6 +2267,22 @@ async fn a2a_policy_covers_request_shapes_before_any_upstream_connection() {
             .await
             .expect("policy response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    // Empty-segment spellings are refused at the frontend boundary before the
+    // policy runs (GHSA-fcqw-793q-wg5x), which is at least as strict.
+    for path in [
+        "/a2a//message:send",
+        "/a2a/tasks/t1//pushNotificationConfigs",
+    ] {
+        let response = client
+            .request(reqwest::Method::POST, &harness.proxy_url(path))
+            .header("content-type", "application/json")
+            .body("{}")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("empty-segment response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "POST {path}");
     }
     assert_eq!(
         backend.accepted_connections(),

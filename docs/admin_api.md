@@ -21,7 +21,7 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 | `/overload` | coarse `{level}` + status code (503 at critical) | full pressure/counter and sanitized listener-failure snapshots |
 | `/metrics` | **401** unless the client IP is in `FERRUM_METRICS_ALLOWED_CIDRS` | 200 Prometheus text |
 
-"Authenticated" here means **any** of: a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
+"Authenticated" here means **any** of: a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT with a namespace ceiling is not authorized for the detail tier: it receives the minimal health/status and overload projections, and `403` from detailed metrics routes. The token never adds detail; a source IP inside `FERRUM_METRICS_ALLOWED_CIDRS` still receives `/health` detail exactly as it would with no token. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
 
 The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
@@ -99,19 +99,20 @@ gets `403` on operator and admin routes such as `POST /proxies` and
   `diagnostics:read` (or any later scope) from its own claim, so diagnostic
   reference lookups answer `403`.
 
-**The viewer secret is a fleet-wide read credential.** Whoever holds it can
-mint a token with any `sub` and any `ns` claim, so for these tokens neither is
-an identity or tenancy boundary:
+**Unless capped by `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, the viewer secret is a
+fleet-wide read credential.** Whoever holds it can mint a token with any `sub`
+and any `ns` claim, so for these tokens neither is an identity or tenancy
+boundary:
 
 - With `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` off, a viewer-secret token reads
   every namespace. With it on, the holder can still write whatever `ns` claim
-  it likes.
+  it likes. Only the operator-set namespace ceiling below bounds it.
 - Log lines that name an actor also carry `key_tier` (`primary` or `viewer`),
   and audit records name a viewer-secret actor as `viewer-key:<sub>`. A chosen
   subject can therefore never pass for one minted with the primary key.
-- For per-tenant or per-identity readers, pre-mint short-lived `viewer` tokens
-  with `FERRUM_ADMIN_JWT_SECRET` and an explicit `ns` claim instead, and hand
-  out the tokens, not the secret.
+- For per-identity readers, or tenants that need different namespace sets,
+  pre-mint short-lived `viewer` tokens with `FERRUM_ADMIN_JWT_SECRET` and an
+  explicit `ns` claim instead, and hand out the tokens, not the secret.
 
 - **Denied attempts are still audited under the chosen subject.** Security
   audit records for refused attempts, such as a `GET /backup` refused with
@@ -126,10 +127,55 @@ an identity or tenancy boundary:
   `primary-key:` is recorded as `primary-key:<sub>`, so no primary subject can
   render the same as a viewer-key actor.
 
-A namespace ceiling for the viewer key (a `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`
-that intersects the `ns` claim and is enforced on every namespace-scoped route
-and on the `/namespaces` registry) is a planned follow-up. It is not
-implemented yet.
+#### Namespace ceiling (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`)
+
+Set `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` to a comma-separated list (for example
+`staging,analytics`) to cap which namespaces viewer-secret tokens may read,
+**whatever their `ns` claim or `X-Ferrum-Namespace` header says**. Unset keeps
+the fleet-wide behaviour above. Tokens verified by `FERRUM_ADMIN_JWT_SECRET`
+are never affected.
+
+- Like the role ceiling, it is a property of the verifying key, applied when the
+  request's actor is built and enforced by the admin dispatcher before any
+  route runs. It does not depend on `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`.
+- Every namespace-scoped route listed above (proxies, consumers and
+  credentials, plugin configs, upstreams, API specs, trust bundles and
+  `/gateway-trust/status`, `/batch`, `/backup`, `/restore`, `/audit`) and
+  `GET /config/export` answer `403` for a namespace outside the ceiling,
+  including the `ferrum` default when the header is omitted. The refusal
+  depends only on the credential and the requested namespace, never on whether
+  any resource exists there, so it reveals nothing about another tenant.
+- `GET /namespaces` is filtered to the ceiling (and, when claim enforcement is
+  on, to the `ns` claim as well). `GET /namespaces/{name}` answers `403` for a
+  name outside it, exactly as for an `ns`-claim denial.
+- A present `ns` claim is narrowed to `claim ∩ ceiling`; a claim naming only
+  namespaces outside the ceiling therefore authorizes nothing. With claim
+  enforcement on, a namespace must be inside the ceiling **and** the claim.
+  Diagnostic reference lookups use the narrowed claim, and viewer-key tokens
+  never hold `diagnostics:read` in any case.
+- Namespace matching is exact and case-sensitive.
+- For a ceiling-bound viewer-key token, global routes fail closed with `403`
+  unless they are `GET /namespaces`, `GET /namespaces/{name}`, `GET /plugins`
+  (plugin type catalog), or health/liveness/readiness probes (`GET /health`,
+  `/live`, `/status`, `/overload`). These tokens receive only the minimal
+  `status`/`ready` body from `/health` and `/status`, and only `{level}` from
+  `/overload`, matching an unauthenticated probe. Detailed `/metrics` routes
+  return `403`. Other denied routes include `/charges`, `/admin/metrics`,
+  `/metrics/runtime`, `/cluster`, `/backend-capabilities`, mesh introspection,
+  and all other global routes. The namespace registry remains filtered as
+  described above. Primary-key tokens and viewer-key tokens without a namespace
+  ceiling retain existing global-route access and observability detail.
+- Namespace refusals log `audit.event = "admin_namespace_authz"` with
+  `namespace_ceiling = "outside"` next to `actor` and `key_tier`; global-route
+  refusals use `namespace_ceiling = "global_route_denied"`. `ns`-claim
+  refusals and served exports also carry `namespace_ceiling`
+  (`within`, `outside`, or `not_applicable`). `GET /backup` security audit
+  records for a ceiling-bound token add `namespace_ceiling` to their `diff`.
+- Startup and `ferrum-edge validate` refuse an empty value, an empty entry (for
+  example `staging,,prod` or a trailing comma), `*`, and any name that breaks
+  the namespace naming rules. Entries are trimmed and duplicates collapse. Set
+  without `FERRUM_ADMIN_JWT_VIEWER_SECRET`, it has no effect and startup logs a
+  warning.
 
 Generate a token:
 ```bash
@@ -305,6 +351,7 @@ an omitted override inherits the process default.
 | Proxy `pool_idle_timeout_seconds`, `udp_idle_timeout_seconds` | 1–3600 |
 | Proxy `tcp_idle_timeout_seconds`, `websocket_idle_timeout_seconds` | 0–86400; 0 disables the idle bound |
 | Proxy `websocket_permessage_deflate` | `strip` (default), `passthrough`, or `terminate`; anything but `strip` is 400 on stream proxies, and `passthrough` is also 400 on proxies with an effective plugin that requires the parsed WebSocket relay |
+| Proxy `allow_path_parameters` | boolean, default `false`; `true` is 400 on stream proxies, and a literal `listen_path` containing `;` is 400 unless it is `true` |
 | Proxy H2 stream/connection window sizes | 65535–134217728 bytes |
 | Proxy H2 max frame size | 16384–1048576 bytes |
 | Proxy H2 max concurrent streams | 1–2147483647 |
