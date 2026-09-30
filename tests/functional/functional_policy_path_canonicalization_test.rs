@@ -754,7 +754,10 @@ async fn functional_path_parameter_dot_segment_is_refused_like_a_dot_segment() {
     // Control: a path parameter on an ordinary segment is still served, so
     // the refusals above are the dot-segment rule rather than a `;` ban.
     let (status, body) = send_h1_full(proxy_port, "/canon/v1;version=2").await;
-    assert_eq!(status, 200, "ordinary path parameter must be served: {body:?}");
+    assert_eq!(
+        status, 200,
+        "ordinary path parameter must be served: {body:?}"
+    );
     assert_eq!(
         backend.take_targets(),
         vec!["/canon/v1;version=2".to_string()]
