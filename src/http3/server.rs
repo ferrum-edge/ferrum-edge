@@ -2865,9 +2865,11 @@ async fn handle_h3_request(
     // read the context.
     // `None` means the target was already canonical, so nothing is rebound and
     // nothing is allocated — the case for the overwhelming majority of traffic.
-    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
-        Ok(std::borrow::Cow::Borrowed(_)) => None,
-        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+    // Whether the path carries a `;` is recorded here and enforced against the
+    // matched proxy right after route lookup, as on H1/H2
+    // (GHSA-fcqw-793q-wg5x).
+    let canonical_request = match crate::policy_path::canonicalize_request_path(&path) {
+        Ok(canonical) => canonical,
         Err(rejection) => {
             warn!(
                 reason = rejection.reason(),
@@ -2886,6 +2888,11 @@ async fn handle_h3_request(
             .await?;
             return Ok(());
         }
+    };
+    let request_path_has_parameter = canonical_request.has_path_parameter;
+    let canonicalized_path = match canonical_request.path {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(canonical) => Some(canonical),
     };
     let path = match canonicalized_path {
         Some(canonical) => {
@@ -3307,6 +3314,32 @@ async fn handle_h3_request(
             return Ok(());
         }
     };
+
+    // A `;` path parameter is refused unless the routed proxy opted in with
+    // `allow_path_parameters`, at the same point in the ordering as H1/H2:
+    // after route lookup, before every plugin phase and backend dispatch
+    // (GHSA-fcqw-793q-wg5x).
+    if let Err(rejection) = crate::policy_path::check_path_parameters(
+        request_path_has_parameter,
+        proxy.allow_path_parameters,
+    ) {
+        warn!(
+            reason = rejection.reason(),
+            "Rejected HTTP/3 request: path parameter on a proxy without allow_path_parameters"
+        );
+        record_h3_flavor_aware_reject(&state, http_flavor, 400);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::BAD_REQUEST,
+            rejection.client_error_body(),
+            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            rejection.grpc_message(),
+        )
+        .await?;
+        return Ok(());
+    }
 
     ctx.matched_path_strip_len = strip_len;
     ctx.matched_proxy = Some(Arc::clone(&proxy));

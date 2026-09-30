@@ -32485,9 +32485,11 @@ async fn handle_proxy_request_inner(
     // path.
     // `None` means the target was already canonical, so nothing is rebound and
     // nothing is allocated — the case for the overwhelming majority of traffic.
-    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
-        Ok(std::borrow::Cow::Borrowed(_)) => None,
-        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+    // Whether the path carries a `;` is recorded here, in the same scan, and
+    // enforced against the matched proxy's `allow_path_parameters` right after
+    // route lookup (GHSA-fcqw-793q-wg5x).
+    let canonical_request = match crate::policy_path::canonicalize_request_path(&path) {
+        Ok(canonical) => canonical,
         Err(rejection) => {
             // The raw target is attacker-controlled: log only the fixed reason
             // token, never the bytes.
@@ -32515,6 +32517,11 @@ async fn handle_proxy_request_inner(
                 rejection.client_error_body(),
             ));
         }
+    };
+    let request_path_has_parameter = canonical_request.has_path_parameter;
+    let canonicalized_path = match canonical_request.path {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(canonical) => Some(canonical),
     };
     let path = match canonicalized_path {
         Some(canonical) => {
@@ -33208,6 +33215,41 @@ async fn handle_proxy_request_inner(
             }
         }
     };
+
+    // A `;` path parameter is refused unless the routed proxy opted in with
+    // `allow_path_parameters` (GHSA-fcqw-793q-wg5x). Canonicalization could
+    // only record the `;`, because the proxy was not known yet; route lookup
+    // is a literal match and grants nothing, and this runs before every
+    // plugin phase and backend dispatch, so no policy surface ever evaluates
+    // a path a parameter-stripping backend would resolve differently.
+    if let Err(rejection) = crate::policy_path::check_path_parameters(
+        request_path_has_parameter,
+        proxy.allow_path_parameters,
+    ) {
+        warn!(
+            reason = rejection.reason(),
+            "Rejected request: path parameter on a proxy without allow_path_parameters"
+        );
+        record_request(&state, 400);
+        if let Some(content_type) = grpc_web_response_content_type {
+            return Ok(build_grpc_web_error_response(
+                content_type,
+                grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                rejection.grpc_message(),
+                &[],
+            ));
+        }
+        if request_uses_grpc_content_type {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                rejection.grpc_message(),
+            ));
+        }
+        return Ok(build_response(
+            StatusCode::BAD_REQUEST,
+            rejection.client_error_body(),
+        ));
+    }
 
     ctx.matched_path_strip_len = strip_len;
     ctx.matched_proxy = Some(Arc::clone(&proxy));

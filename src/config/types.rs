@@ -2837,6 +2837,17 @@ pub struct Proxy {
     pub strip_listen_path: bool,
     #[serde(default)]
     pub preserve_host_header: bool,
+    /// Accept RFC 3986 `;` path parameters (matrix parameters) in request
+    /// paths routed to this proxy. Default `false`: a request whose canonical
+    /// path contains a `;` (literal or `%3B`) is refused with `400`
+    /// (`path_parameter`) after route lookup and before any plugin runs, because
+    /// backends such as Tomcat and Spring strip `;…` from every segment and
+    /// would execute a different path than routing and policy evaluated
+    /// (GHSA-fcqw-793q-wg5x). Set it only for backends that use matrix
+    /// parameters; dot segments with parameters (`..;`) and segments empty
+    /// before their `;` are still refused. HTTP-family proxies only.
+    #[serde(default)]
+    pub allow_path_parameters: bool,
     #[serde(default = "default_connect_timeout")]
     pub backend_connect_timeout_ms: u64,
     #[serde(default = "default_read_timeout")]
@@ -3907,6 +3918,19 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether a literal (prefix or `=` exact) `listen_path` can only match a
+/// request path that carries a `;` path parameter.
+///
+/// Such a request is refused unless the proxy sets `allow_path_parameters`
+/// (GHSA-fcqw-793q-wg5x), so without the opt-in the route is unreachable. A
+/// `~regex` value is a pattern, where `;` is ordinary regex text that need not
+/// require one.
+fn listen_path_requires_path_parameters(path: &str) -> bool {
+    !path.starts_with('~') && path.contains(';')
+}
+
+const LISTEN_PATH_PARAMETER_ERROR: &str = "listen_path with `;` requires `allow_path_parameters`";
+
 /// Return the stable logical identity used by H1 pending-admission scopes.
 ///
 /// Ordinary upstreams retain their resource id: display names are not unique
@@ -4288,6 +4312,9 @@ impl GatewayConfig {
                     "Proxy {:?}: listen_path {:?} is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
                     proxy.id, path, reason
                 ));
+            }
+            if listen_path_requires_path_parameters(path) && !proxy.allow_path_parameters {
+                errors.push(format!("Proxy {:?}: {LISTEN_PATH_PARAMETER_ERROR}", proxy.id));
             }
         }
         if errors.is_empty() {
@@ -8213,6 +8240,9 @@ impl Proxy {
                              non-canonical listen_path is unreachable and creates a routing/auth bypass"
                         ));
                     }
+                    if listen_path_requires_path_parameters(path) && !self.allow_path_parameters {
+                        errors.push(LISTEN_PATH_PARAMETER_ERROR.to_string());
+                    }
                 }
             }
         }
@@ -8706,6 +8736,14 @@ impl Proxy {
             errors.push(
                 "Stream proxies (TCP/UDP) carry no WebSocket upgrade; \
                  `websocket_permessage_deflate` must be 'strip'"
+                    .into(),
+            );
+        }
+
+        if is_stream_proxy && self.allow_path_parameters {
+            errors.push(
+                "Stream proxies (TCP/UDP) have no request path; \
+                 `allow_path_parameters` must be false"
                     .into(),
             );
         }

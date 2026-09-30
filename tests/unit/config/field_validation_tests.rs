@@ -75,6 +75,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
         websocket_permessage_deflate: Default::default(),
+        allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
@@ -475,6 +476,105 @@ fn test_proxy_listen_path_rejects_non_canonical_policy_paths() {
             "did not expect a canonical-path rejection for `/v1.0/reports`, got {errs:?}"
         );
     }
+
+    // A non-final empty segment, or one empty before its first `;`, never
+    // survives request canonicalization (GHSA-fcqw-793q-wg5x). A trailing
+    // slash is still fine.
+    for path in ["//api", "/api//admin", "/api/;x/admin", "=/api//admin"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains(MARKER) && e.contains("empty_segment")),
+            "expected empty-segment rejection for {path:?}, got {errs:?}"
+        );
+    }
+    proxy.listen_path = Some("/api/".into());
+    assert!(
+        proxy.validate_fields().is_ok(),
+        "a trailing slash is not an empty segment: {:?}",
+        proxy.validate_fields()
+    );
+}
+
+#[test]
+fn test_proxy_listen_path_with_path_parameter_requires_opt_in() {
+    // A `;` in the request path is refused unless the routed proxy opts in
+    // (GHSA-fcqw-793q-wg5x), so a literal listen_path carrying one is
+    // unreachable without `allow_path_parameters`.
+    let mut proxy = make_proxy("test", "/api;v=1");
+    assert!(!proxy.allow_path_parameters, "the opt-in defaults to false");
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("allow_path_parameters")),
+        "expected an opt-in rejection, got {errs:?}"
+    );
+
+    proxy.allow_path_parameters = true;
+    assert!(
+        proxy.validate_fields().is_ok(),
+        "an opted-in proxy may route on a path parameter: {:?}",
+        proxy.validate_fields()
+    );
+
+    // A `~regex` is a pattern: `;` there need not require a parameter.
+    proxy.allow_path_parameters = false;
+    proxy.listen_path = Some("~^/api(;.*)?$".into());
+    if let Err(errs) = proxy.validate_fields() {
+        assert!(
+            !errs.iter().any(|e| e.contains("allow_path_parameters")),
+            "a regex listen_path must not require the opt-in: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn test_proxy_allow_path_parameters_rejected_on_stream_proxy() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.listen_path = None;
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.listen_port = Some(5432);
+    proxy.allow_path_parameters = true;
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("allow_path_parameters")),
+        "expected a stream-proxy rejection, got {errs:?}"
+    );
+
+    proxy.allow_path_parameters = false;
+    assert!(
+        proxy.validate_fields().is_ok(),
+        "the default stays valid on a stream proxy: {:?}",
+        proxy.validate_fields()
+    );
+}
+
+#[test]
+fn test_proxy_allow_path_parameters_serde_default_is_false() {
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "p",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .expect("proxy without the field deserializes");
+    assert!(!proxy.allow_path_parameters);
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "p",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080,
+        "allow_path_parameters": true
+    }))
+    .expect("proxy with the field deserializes");
+    assert!(proxy.allow_path_parameters);
+    assert_eq!(
+        serde_json::to_value(&proxy).expect("serialize")["allow_path_parameters"],
+        serde_json::json!(true)
+    );
 }
 
 #[test]

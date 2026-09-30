@@ -878,7 +878,7 @@ pub fn check_peer_version_compatibility(
 /// revision: bump it on every change to the ConfigSync messages, frame
 /// semantics, or the snapshot/delta JSON contract, even when the crate
 /// version stays the same.
-pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 1;
+pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 2;
 
 /// Leading text of every ConfigSync build-mismatch refusal. The DP recognises
 /// the CP's `FAILED_PRECONDITION` Subscribe status by this prefix.

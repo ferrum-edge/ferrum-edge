@@ -9696,9 +9696,14 @@ components:
             dot segments and reads `\` as a separator. A segment whose text
             before the first `;` is `.` or `..` (`..;`, `.;x`, `%2e%2e;`,
             `..%3B`) is a dot segment too, because backends that strip path
-            parameters resolve it as one. A `.` inside a segment
-            (`/v1.0/users`) and a `;` on an ordinary segment (`/v1;version=2`)
-            are ordinary path characters.
+            parameters resolve it as one. A non-final empty segment (`//`,
+            `/a//b`) and a segment that is empty before its first `;`
+            (`/;x/a`) are rejected too, because backends that collapse `//`
+            would resolve a different path; a trailing slash is allowed. A `.`
+            inside a segment (`/v1.0/users`) is an ordinary path character. A
+            `;` on an ordinary segment (`/v1;version=2`) is refused after route
+            lookup unless the matched proxy sets `allow_path_parameters`, so a
+            literal `listen_path` containing `;` requires that opt-in.
 
 
             A literal `listen_path` containing any of the above is unreachable,
@@ -9812,6 +9817,24 @@ components:
           type: boolean
           default: false
           description: Forward the original Host header to the backend
+        allow_path_parameters:
+          type: boolean
+          default: false
+          description: >-
+            Accept RFC 3986 `;` path parameters (matrix parameters) in request
+            paths routed to this proxy. With the default `false`, a request
+            whose canonical path contains a `;` (literal or `%3B`, for example
+            `/admin;x/users`) is refused with `400` (`path_parameter`) after
+            route lookup and before any plugin runs, because backends such as
+            Tomcat and Spring strip `;…` from every segment and would execute a
+            different path than routing and policy evaluated. Enable it only
+            for backends that use matrix parameters: routing, policy, and the
+            backend request line then carry the `;` unchanged, so policy keyed
+            on a parameter-free path does not match those requests. Dot
+            segments with a parameter (`..;`) and segments that are empty
+            before their `;` (`/;x/admin`) are refused either way. A literal
+            `listen_path` containing `;` requires `true`. HTTP-family proxies
+            only; stream proxies must leave it `false`.
         backend_connect_timeout_ms:
           type: integer
           format: uint64
@@ -10370,6 +10393,8 @@ components:
                 const: stream
               websocket_permessage_deflate:
                 const: strip
+              allow_path_parameters:
+                const: false
           else:
             anyOf:
               - required: [hosts]
@@ -10437,6 +10462,17 @@ components:
             properties:
               backend_scheme:
                 type: string
+        - if:
+            required: [listen_path]
+            properties:
+              listen_path:
+                type: string
+                pattern: "^[^~].*;"
+          then:
+            required: [allow_path_parameters]
+            properties:
+              allow_path_parameters:
+                const: true
 
     ProxyCreate:
       description: |

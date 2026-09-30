@@ -305,6 +305,7 @@ an omitted override inherits the process default.
 | Proxy `pool_idle_timeout_seconds`, `udp_idle_timeout_seconds` | 1–3600 |
 | Proxy `tcp_idle_timeout_seconds`, `websocket_idle_timeout_seconds` | 0–86400; 0 disables the idle bound |
 | Proxy `websocket_permessage_deflate` | `strip` (default), `passthrough`, or `terminate`; anything but `strip` is 400 on stream proxies, and `passthrough` is also 400 on proxies with an effective plugin that requires the parsed WebSocket relay |
+| Proxy `allow_path_parameters` | boolean, default `false`; `true` is 400 on stream proxies, and a literal `listen_path` containing `;` is 400 unless it is `true` |
 | Proxy H2 stream/connection window sizes | 65535–134217728 bytes |
 | Proxy H2 max frame size | 16384–1048576 bytes |
 | Proxy H2 max concurrent streams | 1–2147483647 |

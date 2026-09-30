@@ -928,6 +928,17 @@ origins in `allowed_ws_origins`. See
 [routing.md](routing.md#websocket-origin-admission) and
 [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh).
 
+**Per-proxy path parameters (`allow_path_parameters`).** Default `false`: a
+request whose canonical path contains a `;` (literal or `%3B`) is refused with
+`400` (`path_parameter`) after route lookup and before any plugin runs, because
+backends such as Tomcat and Spring strip `;…` from path segments and would
+execute a different path than routing and policy evaluated. Set it to `true`
+only on proxies whose backends use matrix parameters; the `;` is then routed,
+evaluated, and forwarded unchanged. Dot segments with a parameter (`..;`) and
+segments empty before their `;` are refused either way, a literal `listen_path`
+containing `;` requires `true`, and stream proxies must leave it `false`. See
+[request_path_canonicalization.md](request_path_canonicalization.md#path-parameters-require-a-per-proxy-opt-in).
+
 **Per-proxy WebSocket compression (`websocket_permessage_deflate`).** `strip`
 (default) keeps RFC 7692 `permessage-deflate` from being negotiated end to end.
 `passthrough` forwards only the `permessage-deflate` offer and answer unchanged on
@@ -1429,6 +1440,8 @@ proxies:
     backend_port: 3000
     strip_listen_path: true
     preserve_host_header: false
+    # Accept `;` path parameters (matrix parameters); default false
+    # allow_path_parameters: false
     backend_connect_timeout_ms: 5000
     backend_read_timeout_ms: 30000
     backend_write_timeout_ms: 30000

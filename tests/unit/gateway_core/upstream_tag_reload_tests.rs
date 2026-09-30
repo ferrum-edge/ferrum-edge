@@ -123,6 +123,7 @@ fn proxy_for_upstream(id: &str, upstream_id: &str, updated_at: DateTime<Utc>) ->
         tcp_idle_timeout_seconds: Some(300),
         websocket_idle_timeout_seconds: None,
         websocket_permessage_deflate: Default::default(),
+        allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,

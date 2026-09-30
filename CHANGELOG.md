@@ -22,6 +22,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to literal `listen_path` values, plugin path triggers, `request_termination`
   prefixes, OpenAPI server base paths, mesh `extensionProviders[].pathPrefix`,
   and mesh rewrite composition, so configuration cannot contain `..;` either.
+- **The canonical request path refuses empty segments, and `;` path parameters
+  unless a proxy opts in** (GHSA-fcqw-793q-wg5x). Backends that collapse `//`
+  or strip `;…` from segments could otherwise execute a different path than
+  routing and policy evaluated. This changes which request shapes are accepted:
+  - A non-final empty segment (`//admin`, `/a//b`) and a segment that is empty
+    before its first `;` (`/;x/admin`, `/%3Bx/admin`) are refused with `400`
+    (`empty_segment`) on every proxy. A trailing slash is still accepted.
+  - A `;` in the request path, literal or `%3B` (`/admin;x/users`,
+    `/v1;version=2`), is refused with `400` (`path_parameter`) unless the
+    proxy it routes to sets the new `allow_path_parameters: true` (default
+    `false`). The check runs right after route lookup and before any plugin,
+    on HTTP/1.1, HTTP/2, and HTTP/3. With the opt-in, the `;` is routed,
+    evaluated, and forwarded unchanged, and the dot-segment and empty-segment
+    rules still apply. This also applies to mesh and Kubernetes-translated
+    proxies, which do not set the opt-in.
+  - Admission applies the same rules: literal `listen_path` values, plugin path
+    triggers, `request_termination` prefixes, and mesh rewrite targets may not
+    contain an empty segment; a literal `listen_path` containing `;` requires
+    `allow_path_parameters: true`; WAF `conditions.paths` are now validated as
+    canonical paths (exact and `prefix*` values against the full rules, `~regex`
+    values against the escape rules); and every OpenAPI server base segment
+    must be a canonical request path segment.
+  - `allow_path_parameters` is stored in the `proxies` table of the SQL `V001`
+    baseline (recreate development databases) and through serde on MongoDB.
+    The ConfigSync protocol revision is bumped, so CP and DP must run the same
+    build.
 
 ### Added
 

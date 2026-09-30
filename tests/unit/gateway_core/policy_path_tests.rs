@@ -7,8 +7,8 @@
 use std::borrow::Cow;
 
 use ferrum_edge::policy_path::{
-    PolicyPathRejection, canonicalize_policy_path, non_canonical_policy_path_pattern_reason,
-    non_canonical_policy_path_reason,
+    PolicyPathRejection, canonicalize_policy_path, canonicalize_request_path, check_path_parameters,
+    non_canonical_policy_path_pattern_reason, non_canonical_policy_path_reason,
 };
 
 fn canonical(path: &str) -> String {
@@ -33,7 +33,8 @@ fn ordinary_paths_are_borrowed_unchanged() {
         "*",
         "/admin",
         "/api/v1/users/42",
-        "/api//double",
+        // A trailing slash is not an empty segment.
+        "/api/v1/",
         // A `.` inside a segment is an ordinary character; only a *complete*
         // `.` or `..` segment is a dot segment.
         "/a/.hidden/b",
@@ -88,7 +89,7 @@ fn every_unreserved_and_sub_delim_escape_is_decoded() {
         ("/%2Ax", "/*x"),
         ("/%2Bx", "/+x"),
         ("/%2Cx", "/,x"),
-        ("/%3Bx", "/;x"),
+        ("/a%3Bx", "/a;x"),
         ("/%3Dx", "/=x"),
         ("/%3Ax", "/:x"),
         ("/%40x", "/@x"),
@@ -139,7 +140,7 @@ fn no_percent_escape_survives_canonicalization() {
     for raw in [
         "/%61dmin",
         "/a/%2Ehidden",
-        "/%40user/%3Bmatrix",
+        "/%40user/m%3Bmatrix",
         "/api/%76%31/users",
     ] {
         let once = canonical(raw);
@@ -385,13 +386,12 @@ fn escaped_dot_segments_with_a_path_parameter_are_ambiguous() {
 fn a_path_parameter_on_an_ordinary_segment_is_still_accepted() {
     // Only a segment whose text before the first `;` is exactly `.` or `..`
     // is a dot segment. Matrix parameters on ordinary segments are legal
-    // `pchar`s and stay on the allocation-free fast path.
+    // `pchar`s and stay on the allocation-free fast path; whether a proxy
+    // accepts them is decided after routing (`check_path_parameters`).
     for path in [
         "/a;b",
         "/v1;version=2",
         "/api/v1;version=2/users",
-        "/a/;/b",
-        "/a/;x/b",
         "/a/..a;b/c",
         "/a/a..;b/c",
         "/a/...;x/c",
@@ -429,6 +429,128 @@ fn config_values_with_a_path_parameter_dot_segment_can_never_match() {
         Some("ambiguous_dot_segment")
     );
     assert_eq!(non_canonical_policy_path_reason("/api/v1;version=2"), None);
+}
+
+// ── Empty segments (GHSA-fcqw-793q-wg5x) ──────────────────────────────────
+
+#[test]
+fn non_final_empty_segments_are_rejected() {
+    // Tomcat, Spring, and nginx (`merge_slashes`) collapse `//`, and strip a
+    // `;` parameter first, so `//admin/users` and `/;x/admin/users` execute
+    // `/admin/users` while routing and policy would read another path. Every
+    // non-final empty segment, and every segment empty before its first `;`,
+    // is refused on the fast path and the decoding pass alike.
+    for path in [
+        "//",
+        "//admin",
+        "//admin/users",
+        "/a//b",
+        "/a//",
+        "/a///b",
+        "/;x/admin",
+        "/;/admin",
+        "/;",
+        "/;x",
+        "/a/;x/b",
+        "/a/;/b",
+        "/admin/;x",
+        ";x",
+        // The same targets reach the decoding pass when they carry an escape.
+        "//%61dmin",
+        "/%61//b",
+        "/%3Bx/admin",
+        "/a/%3B/b",
+        "/%3b",
+    ] {
+        assert_eq!(
+            rejection(path),
+            PolicyPathRejection::EmptySegment,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn the_root_path_and_a_trailing_slash_are_not_empty_segments() {
+    for path in ["", "/", "*", "/a/", "/a/b/", "=/", "=/api/"] {
+        let result = canonicalize_policy_path(path)
+            .unwrap_or_else(|rejection| panic!("{path:?} rejected: {rejection:?}"));
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "{path:?} must not allocate"
+        );
+    }
+    assert_eq!(canonical("/%61/"), "/a/");
+}
+
+#[test]
+fn config_values_with_an_empty_segment_can_never_match() {
+    assert_eq!(
+        non_canonical_policy_path_reason("/api//admin"),
+        Some("empty_segment")
+    );
+    assert_eq!(
+        non_canonical_policy_path_reason("//api"),
+        Some("empty_segment")
+    );
+    assert_eq!(
+        non_canonical_policy_path_reason("/api/;x"),
+        Some("empty_segment")
+    );
+    assert_eq!(non_canonical_policy_path_reason("/api/"), None);
+    // `//` is ordinary text in a `~regex` pattern.
+    assert_eq!(non_canonical_policy_path_pattern_reason("~^/a//b"), None);
+}
+
+// ── Path parameters are reported, then decided per proxy ───────────────────
+
+#[test]
+fn the_request_canonicalizer_reports_path_parameters() {
+    for (raw, expected, has_parameter, borrowed) in [
+        ("/admin/users", "/admin/users", false, true),
+        ("/admin;x/users", "/admin;x/users", true, true),
+        ("/admin;/users", "/admin;/users", true, true),
+        ("/v1;version=2", "/v1;version=2", true, true),
+        ("/admin%3Bx/users", "/admin;x/users", true, false),
+        ("/admin%3bx/users", "/admin;x/users", true, false),
+        ("/%61dmin/users", "/admin/users", false, false),
+        ("/%61dmin;x", "/admin;x", true, false),
+    ] {
+        let canonical = canonicalize_request_path(raw)
+            .unwrap_or_else(|rejection| panic!("{raw:?} rejected: {rejection:?}"));
+        assert_eq!(canonical.path, expected, "{raw:?}");
+        assert_eq!(canonical.has_path_parameter, has_parameter, "{raw:?}");
+        assert_eq!(
+            matches!(canonical.path, Cow::Borrowed(_)),
+            borrowed,
+            "{raw:?} ownership"
+        );
+    }
+
+    // The per-proxy rule never relaxes the structural ones: a dot segment or
+    // an empty segment carrying a parameter is refused before routing.
+    for (raw, expected) in [
+        ("/public/..;/admin", PolicyPathRejection::LiteralDotSegment),
+        ("/;x/admin", PolicyPathRejection::EmptySegment),
+        ("/%3Bx/admin", PolicyPathRejection::EmptySegment),
+    ] {
+        assert_eq!(
+            canonicalize_request_path(raw).err(),
+            Some(expected),
+            "{raw:?}"
+        );
+    }
+}
+
+#[test]
+fn path_parameters_are_refused_unless_the_proxy_opts_in() {
+    assert_eq!(
+        check_path_parameters(true, false),
+        Err(PolicyPathRejection::PathParameter)
+    );
+    assert_eq!(check_path_parameters(true, true), Ok(()));
+    assert_eq!(check_path_parameters(false, false), Ok(()));
+    assert_eq!(check_path_parameters(false, true), Ok(()));
 }
 
 // ── Backslash: literal as well as encoded ──────────────────────────────────
@@ -490,6 +612,8 @@ fn rejection_reasons_and_bodies_are_stable_and_echo_no_request_bytes() {
             PolicyPathRejection::LiteralDotSegment,
             "literal_dot_segment",
         ),
+        (PolicyPathRejection::EmptySegment, "empty_segment"),
+        (PolicyPathRejection::PathParameter, "path_parameter"),
     ];
     for (variant, reason) in variants {
         assert_eq!(variant.reason(), reason);
