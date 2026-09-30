@@ -1644,6 +1644,13 @@ impl CorrelationIdState {
             .any(|(header, generated)| header.eq_ignore_ascii_case(name) && generated == value)
     }
 
+    fn is_correlation_header(&self, name: &str) -> bool {
+        self.instances.keys().any(|key| {
+            key.strip_prefix(correlation_id::INSTANCE_METADATA_PREFIX)
+                .is_some_and(|header| header.eq_ignore_ascii_case(name))
+        })
+    }
+
     pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
         for (key, value) in &self.instances {
             metadata.insert(key.clone(), value.clone());
@@ -1700,6 +1707,10 @@ impl CanonicalClientIpCache {
 
     fn is_generated_header(&self, name: &str, value: &str) -> bool {
         self.correlation_ids.is_generated_header(name, value)
+    }
+
+    fn is_correlation_header(&self, name: &str) -> bool {
+        self.correlation_ids.is_correlation_header(name)
     }
 
     fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
@@ -4208,6 +4219,13 @@ impl RequestContext {
 
     pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {
         self.canonical_client_ip.correlation_id(instance_key)
+    }
+
+    /// Whether a `correlation_id` instance published a value for request
+    /// header `name` on this request. Private typed state, so a client cannot
+    /// make an arbitrary header look gateway-managed.
+    pub(crate) fn is_correlation_header(&self, name: &str) -> bool {
+        self.canonical_client_ip.is_correlation_header(name)
     }
 
     pub(crate) fn canonical_correlation_id(&self) -> Option<&str> {

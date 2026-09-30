@@ -4,9 +4,10 @@ use ferrum_edge::_test_support::{
     drop_mcp_sse_stream_for_test, enforce_late_final_response_policy_for_test,
     mark_synthetic_short_circuit_for_test, mcp_aggregate_sse_listener_is_staged_for_test,
     mcp_bridge_is_claimed_for_test, mcp_sse_publication_is_staged_for_test,
-    mcp_sse_stream_is_open_for_test, reject_headers_select_event_stream_for_test,
-    set_backend_method_override_for_test, settle_mcp_sse_publication_for_test,
-    settle_mcp_sse_publication_undelivered_for_test, take_mcp_aggregate_sse_listener_for_test,
+    mcp_sse_stream_is_open_for_test, record_backend_dispatch_outcome_for_test,
+    reject_headers_select_event_stream_for_test, set_backend_method_override_for_test,
+    settle_mcp_sse_publication_for_test, settle_mcp_sse_publication_undelivered_for_test,
+    take_mcp_aggregate_sse_listener_for_test,
 };
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::{
@@ -15124,6 +15125,14 @@ fn bridge_metadata<'a>(
     ctx.metadata.get(key).map(String::as_str)
 }
 
+/// The exact JSON-RPC envelope a bridged call was admitted from.
+fn admitted_envelope(ctx: &ferrum_edge::plugins::RequestContext) -> Vec<u8> {
+    ctx.request_body_bytes
+        .as_ref()
+        .expect("admitted envelope")
+        .to_vec()
+}
+
 fn bridge_invalid_arguments(result: PluginResult, request_id: i64) {
     let (status, body, _) = reject_json(result);
     assert_eq!(status, 200);
@@ -15213,6 +15222,10 @@ async fn openapi_bridge_call_builds_the_rest_request_for_the_proxy_backend() {
     let accept = headers.get("accept").map(String::as_str).unwrap_or("");
     assert!(accept.starts_with("application/json"), "{accept}");
     assert_eq!(
+        headers.get("accept-encoding").map(String::as_str),
+        Some("identity")
+    );
+    assert_eq!(
         bridge_metadata(&ctx, "mcp.bridge.operation"),
         Some("GET /pets/{petId}")
     );
@@ -15224,7 +15237,7 @@ async fn openapi_bridge_call_builds_the_rest_request_for_the_proxy_backend() {
     assert_eq!(bridge_metadata(&ctx, "mcp.schema_validation"), Some("pass"));
 
     // The JSON-RPC envelope never reaches the REST backend: a GET sends no body.
-    let envelope = serde_json::to_vec(&bridge_tool_call(11, "pets.getPet", json!({}))).unwrap();
+    let envelope = admitted_envelope(&ctx);
     let body = plugin
         .transform_request_body_with_context(
             &mut ctx,
@@ -15254,8 +15267,14 @@ async fn openapi_bridge_call_sends_the_admitted_json_body() {
         headers.get("content-type").map(String::as_str),
         Some("application/json")
     );
+    let envelope = admitted_envelope(&ctx);
     let body = plugin
-        .transform_request_body_with_context(&mut ctx, b"{}", Some("application/json"), &headers)
+        .transform_request_body_with_context(
+            &mut ctx,
+            &envelope,
+            Some("application/json"),
+            &headers,
+        )
         .await
         .expect("bridged calls replace the JSON-RPC body");
     let sent: Value = serde_json::from_slice(&body).unwrap();
@@ -15289,6 +15308,10 @@ async fn openapi_bridge_path_arguments_cannot_inject_separators_or_dot_segments(
         (25, "a%2Fb"),
         (26, "a b"),
         (27, ""),
+        (120, "..;"),
+        (121, ".;"),
+        (122, "a;b"),
+        (123, "..;jsessionid=x"),
     ] {
         let (result, ctx, _) =
             bridge_call(&plugin, id, "pets.getPet", json!({ "petId": pet_id })).await;
@@ -15405,6 +15428,8 @@ async fn bridge_response(
     mut headers: HashMap<String, String>,
     body: &[u8],
 ) -> (u16, HashMap<String, String>, Value) {
+    // A backend answered: the dispatch record, not a response header, says so.
+    record_backend_dispatch_outcome_for_test(ctx, None, true);
     if let PluginResult::Reject {
         status_code,
         body,
@@ -15514,8 +15539,8 @@ async fn openapi_bridge_non_2xx_becomes_bounded_is_error_result() {
     );
 }
 
-/// Drive `after_proxy` over one response head and return the gateway-authored
-/// tool result it answered with.
+/// Drive `after_proxy` over one backend response head and return the
+/// gateway-authored tool result it answered with.
 async fn bridge_head_only_result(
     plugin: &Arc<dyn Plugin>,
     request_id: i64,
@@ -15523,6 +15548,7 @@ async fn bridge_head_only_result(
     header: Option<(&str, &str)>,
 ) -> Value {
     let mut ctx = admitted_bridge_get(plugin, request_id).await;
+    record_backend_dispatch_outcome_for_test(&mut ctx, None, true);
     let mut headers = HashMap::new();
     if let Some((name, value)) = header {
         headers.insert(name.to_string(), value.to_string());
@@ -15547,28 +15573,92 @@ async fn openapi_bridge_head_only_responses_are_gateway_authored_results() {
     assert_eq!(result["isError"], json!(false));
     assert_eq!(tool_result_text(&result), "HTTP 204 No Content");
 
+    // A 2xx whose body the bridge cannot return stays `isError: false`: the
+    // operation ran, and an error would invite a retry of a call that may not
+    // be idempotent. The note says why the body is absent.
     let coded = Some(("content-encoding", "gzip"));
     let result = bridge_head_only_result(&plugin, 71, 200, coded).await;
-    assert_eq!(result["isError"], json!(true));
+    assert_eq!(result["isError"], json!(false));
     assert!(tool_result_text(&result).contains("content coding"));
+    assert!(tool_result_text(&result).contains("omitted"));
 
     let stream = Some(("content-type", "text/event-stream"));
     let result = bridge_head_only_result(&plugin, 72, 200, stream).await;
-    assert_eq!(result["isError"], json!(true));
+    assert_eq!(result["isError"], json!(false));
     assert!(tool_result_text(&result).contains("event-stream"));
 
     let oversized = Some(("content-length", "65"));
     let result = bridge_head_only_result(&plugin, 73, 200, oversized).await;
-    assert_eq!(result["isError"], json!(true));
+    assert_eq!(result["isError"], json!(false));
     assert!(tool_result_text(&result).contains("64 byte bridge bound"));
 
-    let breaker = Some(("x-gateway-error", "circuit_breaker_open"));
-    let result = bridge_head_only_result(&plugin, 74, 503, breaker).await;
+    let partial = Some(("content-range", "bytes 0-1/8"));
+    let result = bridge_head_only_result(&plugin, 75, 206, partial).await;
+    assert_eq!(result["isError"], json!(false));
+    assert!(tool_result_text(&result).contains("partial response"));
+
+    // The same representations on a non-2xx stay errors.
+    let coded = Some(("content-encoding", "gzip"));
+    let result = bridge_head_only_result(&plugin, 76, 500, coded).await;
     assert_eq!(result["isError"], json!(true));
-    let text = tool_result_text(&result);
+
+    // Nothing was dispatched (an open breaker): the gateway authored the
+    // response, and its own stamped class is reported.
+    let mut ctx = admitted_bridge_get(&plugin, 74).await;
+    let mut headers = HashMap::from([(
+        "x-gateway-error".to_string(),
+        "circuit_breaker_open".to_string(),
+    )]);
+    let result = plugin.after_proxy(&mut ctx, 503, &mut headers).await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["result"]["isError"], json!(true));
+    let text = tool_result_text(&body["result"]);
     assert!(
         text.contains("gateway error: circuit_breaker_open"),
         "{text}"
+    );
+}
+
+#[tokio::test]
+async fn openapi_bridge_gateway_error_class_comes_from_the_dispatch_outcome() {
+    let plugin = bridge_plugin_with(|_| {});
+    // A backend that sends `X-Gateway-Error` itself is still a backend
+    // response: the header is never read, and its body is excerpted.
+    let mut ctx = admitted_bridge_get(&plugin, 130).await;
+    let mut headers = json_headers(br#"{"error":"busy"}"#);
+    headers.insert(
+        "x-gateway-error".to_string(),
+        "circuit_breaker_open".to_string(),
+    );
+    let backend = br#"{"error":"busy"}"#;
+    let (status, _, body) = bridge_response(&plugin, &mut ctx, 503, headers, backend).await;
+    assert_eq!(status, 200);
+    let text = tool_result_text(&body["result"]);
+    assert!(
+        text.starts_with("HTTP 503 Service Unavailable (gateway error: backend_error)"),
+        "{text}"
+    );
+    assert!(!text.contains("circuit_breaker_open"), "{text}");
+    assert!(text.contains("busy"), "{text}");
+    assert_eq!(
+        bridge_metadata(&ctx, "mcp.bridge.gateway_error"),
+        Some("backend_error")
+    );
+
+    // A failure before the request reached the wire is a connection failure,
+    // answered from the status line alone.
+    let mut ctx = admitted_bridge_get(&plugin, 131).await;
+    let class = Some(ferrum_edge::retry::ErrorClass::ConnectionRefused);
+    record_backend_dispatch_outcome_for_test(&mut ctx, class, false);
+    let mut headers = HashMap::new();
+    let result = plugin.after_proxy(&mut ctx, 502, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(131));
+    let text = tool_result_text(&body["result"]);
+    assert_eq!(
+        text,
+        "HTTP 502 Bad Gateway (gateway error: connection_failure)"
     );
 }
 
@@ -15588,11 +15678,39 @@ async fn openapi_bridge_structured_content_and_text_are_bounded() {
         backend.as_bytes(),
     )
     .await;
-    assert_eq!(body["result"]["isError"], json!(true));
+    // Past the structured bound the body is never parsed: it is returned as
+    // text only, with a note, and the 2xx stays a success.
+    assert_eq!(body["result"]["isError"], json!(false));
     assert!(body["result"].get("structuredContent").is_none());
-    let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("structuredContent bound"), "{text}");
-    assert!(!text.contains(&"r".repeat(64)), "{text}");
+    assert_eq!(body["result"]["content"][0]["text"], backend.as_str());
+    let note = body["result"]["content"][1]["text"].as_str().unwrap();
+    assert!(note.contains("structuredContent bound"), "{note}");
+
+    // A 2xx body past the response bound, with no declared length (chunked),
+    // is omitted with a note rather than returned or reported as a failure.
+    let plugin = bridge_plugin_with(|config| {
+        config["servers"]["petstore"]["openapi"]["max_response_body_bytes"] = json!(16);
+    });
+    let mut ctx = admitted_bridge_get(&plugin, 82).await;
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("transfer-encoding".to_string(), "chunked".to_string()),
+    ]);
+    let backend = br#"{"id":"7","name":"a name that does not fit"}"#;
+    let (_, _, body) = bridge_response(&plugin, &mut ctx, 200, headers, backend).await;
+    assert_eq!(body["result"]["isError"], json!(false));
+    let text = tool_result_text(&body["result"]);
+    assert!(text.contains("16 byte bridge bound"), "{text}");
+    assert!(text.contains("omitted"), "{text}");
+    assert!(!text.contains("a name"), "{text}");
+
+    // Duplicate member names make the reading parser-dependent: omitted.
+    let mut ctx = admitted_bridge_get(&plugin, 83).await;
+    let backend = br#"{"a":1,"a":2}"#;
+    let (_, _, body) =
+        bridge_response(&plugin, &mut ctx, 200, json_headers(backend), backend).await;
+    assert_eq!(body["result"]["isError"], json!(false));
+    assert!(tool_result_text(&body["result"]).contains("repeats a member name"));
 
     // Plain text stays text, with no structured content.
     let mut ctx = admitted_bridge_get(&plugin, 81).await;
@@ -15607,6 +15725,7 @@ async fn openapi_bridge_structured_content_and_text_are_bounded() {
 async fn openapi_bridge_unconverted_backend_response_is_never_released() {
     let plugin = bridge_plugin_with(|_| {});
     let mut ctx = admitted_bridge_get(&plugin, 90).await;
+    record_backend_dispatch_outcome_for_test(&mut ctx, None, true);
     let backend = br#"{"id":"7"}"#;
     let mut headers = json_headers(backend);
     assert!(matches!(
@@ -15621,7 +15740,35 @@ async fn openapi_bridge_unconverted_backend_response_is_never_released() {
     let (status, body, _) = reject_json(result);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!(90));
-    assert_eq!(body["result"]["isError"], json!(true));
+    // The operation ran (a 2xx), so the replacement is not an error.
+    assert_eq!(body["result"]["isError"], json!(false));
+    let text = tool_result_text(&body["result"]);
+    assert!(text.contains("could not be converted"), "{text}");
+    assert!(
+        !text.contains(r#""id""#),
+        "the REST body never leaks: {text}"
+    );
+}
+
+#[tokio::test]
+async fn openapi_bridge_chunked_backend_response_is_converted() {
+    let plugin = bridge_plugin_with(|_| {});
+    let mut ctx = admitted_bridge_get(&plugin, 91).await;
+    // No declared length: the response head alone decides nothing, and the
+    // buffered body is converted like any other.
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("transfer-encoding".to_string(), "chunked".to_string()),
+    ]);
+    let backend = br#"{"id":"7","name":"Rex"}"#;
+    let (status, _, body) = bridge_response(&plugin, &mut ctx, 200, headers, backend).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(91));
+    assert_eq!(body["result"]["isError"], json!(false));
+    assert_eq!(
+        body["result"]["structuredContent"],
+        json!({"id": "7", "name": "Rex"})
+    );
 }
 
 #[tokio::test]
@@ -15655,6 +15802,293 @@ async fn openapi_bridge_maps_the_public_path_through_the_proxy_listen_prefix() {
     assert!(!ctx.route_override_path_is_absolute);
 }
 
+#[tokio::test]
+async fn openapi_bridge_listen_prefix_equal_to_the_operation_path_maps_to_the_backend_root() {
+    // The empty-replacement case: an operation served at exactly the proxy's
+    // listen prefix loses the whole prefix, and the backend sees `/`, never
+    // an empty or relative path.
+    let plugin = bridge_plugin_with(|config| {
+        config["endpoint"]["path"] = json!("/petstore/mcp");
+        bridge_operation(config, 1)["path"] = json!("/petstore");
+    });
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.listen_path = Some("/petstore".to_string());
+    proxy.strip_listen_path = true;
+    let proxy = Arc::new(proxy);
+    let session = {
+        let (mut ctx, mut headers) = mcp_ctx(initialize_request_body());
+        ctx.path = "/petstore/mcp".to_string();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let (_, _, response_headers) = reject_json(result);
+        response_headers.get("mcp-session-id").unwrap().clone()
+    };
+    let arguments = json!({ "body": { "name": "Rex" } });
+    let request = bridge_tool_call(96, "pets.createPet", arguments);
+    let (mut ctx, mut headers) = mcp_ctx(request);
+    ctx.path = "/petstore/mcp".to_string();
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    ctx.set_matched_path_strip_len("/petstore".len());
+    headers.insert("mcp-session-id".to_string(), session);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(ctx.route_override_path.as_deref(), Some("/"));
+    assert!(!ctx.route_override_path_is_absolute);
+}
+
+/// Admit one bridged `tools/call` like [`bridge_call`], after `prepare` has
+/// set up the request context and the client's request headers.
+async fn bridge_call_with(
+    plugin: &Arc<dyn Plugin>,
+    call: Value,
+    prepare: impl FnOnce(&mut ferrum_edge::plugins::RequestContext, &mut HashMap<String, String>),
+) -> (
+    PluginResult,
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+) {
+    let session = initialize(plugin).await;
+    let (mut ctx, mut headers) = mcp_ctx(call);
+    headers.insert("mcp-session-id".to_string(), session);
+    headers.insert("mcp-protocol-version".to_string(), "2025-11-25".to_string());
+    prepare(&mut ctx, &mut headers);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (result, ctx, headers)
+}
+
+#[tokio::test]
+async fn openapi_bridge_calls_obey_the_route_allowed_methods() {
+    let plugin = bridge_plugin_with(|_| {});
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.allowed_methods = Some(vec!["GET".to_string(), "POST".to_string()]);
+    let proxy = Arc::new(proxy);
+
+    // The route filter saw only the MCP `POST`; the bridged `DELETE` is
+    // refused against the same list before anything is dispatched.
+    let call = bridge_tool_call(140, "pets.deletePet", json!({ "petId": "7" }));
+    let (result, ctx, _) = bridge_call_with(&plugin, call, |ctx, _| {
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+    })
+    .await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(140), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+    assert!(!mcp_bridge_is_claimed_for_test(&ctx));
+    assert!(backend_method_override_for_test(&ctx).is_none());
+    assert!(ctx.route_override_path.is_none());
+    assert_eq!(policy_decision(&ctx), Some("method_not_allowed"));
+
+    let call = bridge_tool_call(141, "pets.getPet", json!({ "petId": "7" }));
+    let (result, ctx, _) = bridge_call_with(&plugin, call, |ctx, _| {
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+    })
+    .await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(backend_method_override_for_test(&ctx), Some("GET"));
+}
+
+const BRIDGE_TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+#[tokio::test]
+async fn openapi_bridge_forwards_only_allowlisted_client_headers() {
+    let plugin = bridge_plugin_with(|config| {
+        let forwarded = json!(["X-Api-Version"]);
+        config["servers"]["petstore"]["openapi"]["forward_request_headers"] = forwarded;
+    });
+    let correlation = create_plugin("correlation_id", &json!({}))
+        .unwrap()
+        .unwrap();
+    let client_headers = [
+        ("host", "api.example"),
+        ("user-agent", "agent/1"),
+        ("accept-language", "en"),
+        ("traceparent", BRIDGE_TRACEPARENT),
+        ("x-api-version", "2"),
+        ("authorization", "Bearer client-token"),
+        ("cookie", "session=abc"),
+        ("x-http-method-override", "DELETE"),
+        ("x-original-url", "/admin"),
+        ("range", "bytes=0-10"),
+        ("if-match", "\"v1\""),
+        ("x-custom-app", "1"),
+    ];
+    let call = bridge_tool_call(150, "pets.getPet", json!({ "petId": "7" }));
+    let session = initialize(&plugin).await;
+    let (mut ctx, mut headers) = mcp_ctx(call);
+    headers.insert("mcp-session-id".to_string(), session);
+    headers.insert("mcp-protocol-version".to_string(), "2025-11-25".to_string());
+    for (name, value) in client_headers {
+        headers.insert(name.to_string(), value.to_string());
+    }
+    // `correlation_id` (priority 50) publishes its id and places its header
+    // before `mcp_gateway` runs.
+    correlation.on_request_received(&mut ctx).await;
+    correlation.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    for name in [
+        "authorization",
+        "cookie",
+        "x-http-method-override",
+        "x-original-url",
+        "range",
+        "if-match",
+        "x-custom-app",
+        "mcp-session-id",
+        "mcp-protocol-version",
+    ] {
+        assert!(
+            !headers.contains_key(name),
+            "{name} must not reach the REST backend"
+        );
+    }
+    for (name, value) in [
+        ("host", "api.example"),
+        ("user-agent", "agent/1"),
+        ("accept-language", "en"),
+        ("traceparent", BRIDGE_TRACEPARENT),
+        ("x-api-version", "2"),
+    ] {
+        assert_eq!(headers.get(name).map(String::as_str), Some(value), "{name}");
+    }
+    let request_id = headers.get("x-request-id").map(String::as_str);
+    assert!(
+        request_id.is_some(),
+        "the gateway's correlation id is forwarded"
+    );
+    assert_eq!(request_id, bridge_metadata(&ctx, "request_id"));
+}
+
+#[tokio::test]
+async fn openapi_bridge_header_arguments_cannot_set_the_request_correlation_header() {
+    let plugin = bridge_plugin_with(|config| {
+        bridge_operation(config, 0)["parameters"][3]["name"] = json!("X-Request-Id");
+    });
+    let arguments = json!({ "petId": "7", "X-Request-Id": "forged" });
+    // Without a `correlation_id` instance the name is an ordinary header.
+    let call = bridge_tool_call(151, "pets.getPet", arguments.clone());
+    let (result, _, headers) = bridge_call_with(&plugin, call, |_, _| {}).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        headers.get("x-request-id").map(String::as_str),
+        Some("forged")
+    );
+
+    // With one on the request, a tool argument may never set it.
+    let correlation = create_plugin("correlation_id", &json!({}))
+        .unwrap()
+        .unwrap();
+    let call = bridge_tool_call(152, "pets.getPet", arguments);
+    let session = initialize(&plugin).await;
+    let (mut ctx, mut headers) = mcp_ctx(call);
+    headers.insert("mcp-session-id".to_string(), session);
+    correlation.on_request_received(&mut ctx).await;
+    correlation.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    bridge_invalid_arguments(result, 152);
+    assert!(!mcp_bridge_is_claimed_for_test(&ctx));
+}
+
+#[tokio::test]
+async fn openapi_bridge_request_body_transforms_are_carried_or_refused() {
+    let plugin = bridge_plugin_with(|_| {});
+    // A redaction inside the JSON body argument (as `ai_prompt_shield` or
+    // `ai_request_guard` would make) is re-validated and carried into the
+    // REST body the backend receives.
+    let arguments = json!({ "body": { "name": "Rex" } });
+    let (result, mut ctx, headers) = bridge_call(&plugin, 160, "pets.createPet", arguments).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let redacted = json!({ "body": { "name": "[REDACTED]" } });
+    let redacted = serde_json::to_vec(&bridge_tool_call(160, "pets.createPet", redacted)).unwrap();
+    let body = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &redacted,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("bridged calls replace the JSON-RPC body");
+    let sent: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(sent, json!({"name": "[REDACTED]"}));
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+
+    // A transformed envelope that no longer describes the admitted call, or
+    // whose change would alter the request line after routing, is refused.
+    let pet = |request_id: i64, name: &str, pet_id: Value| {
+        bridge_tool_call(request_id, name, json!({ "petId": pet_id }))
+    };
+    let cases = [
+        ("request_changed", pet(161, "pets.getPet", json!("8"))),
+        ("target_changed", pet(161, "pets.deletePet", json!("7"))),
+        ("request_id_changed", pet(999, "pets.getPet", json!("7"))),
+        ("arguments_invalid", pet(161, "pets.getPet", json!(7))),
+        ("arguments_invalid", pet(161, "pets.getPet", json!("a/b"))),
+    ];
+    for (reason, transformed) in cases {
+        let (result, mut ctx, headers) =
+            bridge_call(&plugin, 161, "pets.getPet", json!({ "petId": "7" })).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let transformed = serde_json::to_vec(&transformed).unwrap();
+        let body = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &transformed,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .expect("bridged calls replace the JSON-RPC body");
+        assert!(body.is_empty(), "{reason}: the admitted GET sends no body");
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await;
+        let (status, rejected, _) = reject_json(result);
+        assert_eq!(status, 200, "{reason}");
+        assert_eq!(
+            rejected["error"]["code"],
+            json!(-32014),
+            "{reason}: {rejected}"
+        );
+        assert_eq!(rejected["id"], json!(161), "{reason}");
+        assert_eq!(
+            bridge_metadata(&ctx, "mcp.admission_violation"),
+            Some(reason)
+        );
+    }
+
+    // An unparsable transformed envelope is refused the same way.
+    let (result, mut ctx, headers) =
+        bridge_call(&plugin, 162, "pets.getPet", json!({ "petId": "7" })).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let body = plugin
+        .transform_request_body_with_context(&mut ctx, b"not json", None, &headers)
+        .await
+        .expect("bridged calls replace the JSON-RPC body");
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    let (_, rejected, _) = reject_json(result);
+    assert_eq!(rejected["error"]["code"], json!(-32014), "{rejected}");
+}
+
+#[test]
+fn openapi_bridge_only_openapi_servers_get_the_generated_config_budget() {
+    use ferrum_edge::plugins::mcp_openapi_bridge::config_declares_openapi_server;
+    assert!(config_declares_openapi_server(&bridge_config()));
+    let upstream_only = json!({
+        "servers": { "echo": { "namespace": "echo", "upstream_url": "http://127.0.0.1:9/mcp" } }
+    });
+    assert!(!config_declares_openapi_server(&upstream_only));
+    assert!(!config_declares_openapi_server(&json!({})));
+    let null_openapi = json!({ "servers": { "echo": { "openapi": null } } });
+    assert!(!config_declares_openapi_server(&null_openapi));
+}
+
 #[test]
 fn openapi_bridge_header_names_reserve_transport_identity_and_ferrum_fields() {
     use ferrum_edge::plugins::mcp_openapi_bridge::bridge_header_name_is_reserved;
@@ -15683,6 +16117,25 @@ fn openapi_bridge_header_names_reserve_transport_identity_and_ferrum_fields() {
         "Mcp-Protocol-Version",
         "Last-Event-ID",
         "Expect",
+        "True-Client-IP",
+        "CF-Connecting-IP",
+        "X-Client-IP",
+        "X-HTTP-Method-Override",
+        "x_http_method",
+        "X-Method-Override",
+        "X-Original-URL",
+        "X-Rewrite-URL",
+        "X-Original-URI",
+        "traceparent",
+        "Tracestate",
+        "baggage",
+        "Range",
+        "If-Range",
+        "Early-Data",
+        "HTTP2-Settings",
+        "X-Envoy-Original-Path",
+        "x-istio-attributes",
+        "l5d-dst-override",
     ] {
         assert!(
             bridge_header_name_is_reserved(name),
@@ -15728,6 +16181,19 @@ fn openapi_bridge_config_rejections_are_clear() {
         config["sessions"] = json!({ "downstream_session_header": "x-trace-tag" });
     });
     assert!(error.contains("MCP session header"), "{error}");
+    for name in ["authorization", "cookie", "x-http-method-override", "range"] {
+        let error = bridge_config_error(|config| {
+            let forwarded = json!([name]);
+            config["servers"]["petstore"]["openapi"]["forward_request_headers"] = forwarded;
+        });
+        assert!(error.contains("reserved request header"), "{name}: {error}");
+    }
+    let error = bridge_config_error(|config| {
+        config["sessions"] = json!({ "downstream_session_header": "x-session" });
+        let forwarded = json!(["x-session"]);
+        config["servers"]["petstore"]["openapi"]["forward_request_headers"] = forwarded;
+    });
+    assert!(error.contains("forward_request_headers"), "{error}");
 
     let cases: Vec<(&str, BridgeConfigEdit)> = vec![
         (

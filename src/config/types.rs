@@ -10191,12 +10191,18 @@ impl PluginConfig {
         }
 
         // Config JSON size. Generated OpenAPI configs embed resolved operation
-        // schemas: the validator's operation table, and `mcp_gateway`'s
-        // OpenAPI bridge tool definitions (`servers.*.openapi`), share the
-        // larger generated-config budget.
+        // schemas: the validator's operation table, and an `mcp_gateway` that
+        // declares an OpenAPI bridge server (`servers.*.openapi`), share the
+        // larger generated-config budget. Every other `mcp_gateway` keeps the
+        // ordinary plugin budget.
         let config_json = serde_json::to_string(&self.config).unwrap_or_default();
-        let plugin_name = self.plugin_name.as_str();
-        let generated_openapi_config = matches!(plugin_name, "openapi_validator" | "mcp_gateway");
+        let generated_openapi_config = match self.plugin_name.as_str() {
+            "openapi_validator" => true,
+            "mcp_gateway" => {
+                crate::plugins::mcp_openapi_bridge::config_declares_openapi_server(&self.config)
+            }
+            _ => false,
+        };
         let max_config_size = if generated_openapi_config {
             MAX_OPENAPI_VALIDATOR_CONFIG_SIZE
         } else {

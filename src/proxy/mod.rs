@@ -26673,6 +26673,20 @@ pub(crate) fn request_method_is_allowed(allowed: &[String], method: &str) -> boo
         .any(|configured| configured.trim().eq_ignore_ascii_case(method))
 }
 
+/// The HTTP method a transaction log records: always the client's. A
+/// plugin-selected backend method (only `mcp_gateway`'s OpenAPI bridge sets
+/// one) changes what the backend receives, never what the client sent, so a
+/// bridged `POST` MCP call logs as `POST`. `method` is the dispatch binding,
+/// moved in so the common path allocates nothing extra.
+#[inline]
+pub(crate) fn logged_http_method(ctx: &RequestContext, method: String) -> String {
+    if ctx.backend_method_override.is_some() {
+        ctx.method.clone()
+    } else {
+        method
+    }
+}
+
 /// Comma-separated RFC 9110 `Allow` value for a route's configured methods.
 /// Uppercased in config order so the 405 is stable without sorting on the
 /// request path.
@@ -37927,7 +37941,7 @@ async fn handle_proxy_request_inner(
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
-                        http_method: method,
+                        http_method: logged_http_method(&ctx, method),
                         request_path: original_request_path.clone(),
                         proxy_id: Some(proxy.id.clone()),
                         proxy_name: proxy.name.clone(),
@@ -39059,7 +39073,7 @@ async fn handle_proxy_request_inner(
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
-                        http_method: method,
+                        http_method: logged_http_method(&ctx, method),
                         request_path: original_request_path.clone(),
                         proxy_id: Some(proxy.id.clone()),
                         proxy_name: proxy.name.clone(),
@@ -41908,7 +41922,7 @@ async fn handle_proxy_request_inner(
                 client_ip: ctx.client_ip.clone(),
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
-                http_method: method,
+                http_method: logged_http_method(&ctx, method),
                 request_path: original_request_path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),

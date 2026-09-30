@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{Plugin, PluginResult, RequestContext};
 
-const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
+pub(crate) const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
 /// `http::header::HeaderName` rejects names longer than this (`http` crate `MAX_LEN`).
 const MAX_HTTP_FIELD_NAME_LEN: usize = 65_535;
 

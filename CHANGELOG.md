@@ -25,32 +25,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never dialed. Generated tools use the aggregate `namespace.name` shape and
   go through the same catalog, policy, discovery, per-consumer grant,
   `validate_tool_arguments`, `validate_tool_results`, and `mcp.*` metadata
-  paths as upstream tools, plus `mcp.bridge.operation`,
-  `mcp.bridge.upstream_status`, and `mcp.bridge.gateway_error`. Path
-  arguments are percent-encoded per segment and must yield a canonical path
-  (no `/`, dot segment, `?`, or `#` can be injected); query values are
-  form-encoded; header parameters naming hop-by-hop, `Host`,
-  `Authorization`, `Cookie`, `Proxy-*`, `X-Forwarded-*`, MCP-transport, or
-  Ferrum-internal fields are refused at load and again per call. The
-  bridged method, path, query, and body are re-checked in the final
-  request-body hook (`-32014` on drift). The backend response is converted
-  in the buffered normalize phase into a `tools/call` result answered with
-  HTTP 200: a 2xx is `isError: false` with text content plus
-  `structuredContent` for a bounded JSON object; anything else, including
-  gateway errors with their `X-Gateway-Error` class, is `isError: true` with
-  the status line and a bounded body excerpt. Operation count, tool schema
-  size and depth, request body, response body, error excerpt, and
-  `structuredContent` are all bounded. `POST /api-specs` generates such a
+  paths as upstream tools, plus `mcp.bridge.operation`, and (always)
+  `mcp.bridge.upstream_status` and `mcp.bridge.gateway_error`. The proxy's
+  `allowed_methods` is applied to the bridged method (`-32001`); method- and
+  path-conditioned triggers, WAF rules, and path-keyed authorization see the
+  MCP request, so bridged operations are restricted through `mcp_gateway`
+  policy. Path arguments are percent-encoded per segment and must yield a
+  canonical path with no `;` (no `/`, dot segment, `..;`, `?`, or `#` can be
+  injected); query values are form-encoded; header parameters naming
+  hop-by-hop, `Host`, `Authorization`, `Cookie`, `Proxy-*`, `X-Forwarded-*`,
+  client-address, method/URL-override, `Range`, trace-context, correlation,
+  MCP-transport, service-mesh, or Ferrum-internal fields are refused at load
+  and again per call. Client request headers are an allowlist
+  (`User-Agent`, `Accept-Language`, `traceparent`, `tracestate`, the
+  gateway's correlation header, and `openapi.forward_request_headers`); the
+  bridged request sends `Accept-Encoding: identity`. The bridged method,
+  path, query, and body are re-checked in the final request-body hook
+  (`-32014` on drift); a request-body transform (for example a prompt-guard
+  redaction) that changed the admitted envelope is re-validated and carried
+  into the REST body, or refused when it would change the request line or
+  headers. The backend response is converted in the buffered normalize phase
+  into a `tools/call` result answered with HTTP 200: a 2xx is always
+  `isError: false` (text content plus `structuredContent` for a bounded JSON
+  object, or a note when the body is omitted as oversized, coded, streamed,
+  partial, or ambiguous); anything else is `isError: true` with the status
+  line, a gateway-error class derived from the typed dispatch outcome, and a
+  bounded body excerpt. Operation count, tool schema size and depth, request
+  body, response body, error excerpt, and `structuredContent` are all
+  bounded, and a bridge server's catalog entries and validators are built
+  once at load and shared across sessions. `POST /api-specs` generates such a
   proxy-scoped gateway from the new `x-ferrum-mcp` extension (`enabled`,
   `endpoint.path`, `namespace`, `include` / `exclude` by operationId or tag,
-  `limits`, and per-operation `expose` / `name` / `title` / `description` /
-  `annotations`), resolving `$ref`s with the `x-ferrum-validate` resolver and
-  budgets; OpenAPI 3.x only, and not combinable with `x-ferrum-validate` in
-  one document. Proxy core gains a private plugin-selected backend method
-  (read once after `before_proxy` on H1/H2 and native H3) and a
-  normalizer-selected response status for the replacement it installed;
-  `mcp_gateway` configs share the generated-config size/depth budget of
-  `openapi_validator`.
+  `limits`, `forward_request_headers`, and per-operation `expose` / `name` /
+  `title` / `description` / `annotations`), resolving `$ref`s with the
+  `x-ferrum-validate` resolver and budgets. Without `include` only `GET`
+  operations are published; a mutating operation needs `include` or a
+  per-operation `x-ferrum-mcp: true`, and one whose method
+  `allowed_methods` does not allow is rejected. OpenAPI 3.x only, and not
+  combinable with `x-ferrum-validate` in one document. Proxy core gains a
+  private plugin-selected backend method (read once after `before_proxy` on
+  H1/H2 and native H3; transaction logs keep the client's method) and a
+  normalizer-selected response status for the replacement it installed; an
+  `mcp_gateway` that declares an `openapi` server shares the
+  generated-config size/depth budget of `openapi_validator`.
 - **Read-only configuration export, `GET /config/export`** (#5904). Any
   authenticated role, including `viewer`, can now take a whole-namespace
   snapshot of proxies, consumers, plugin configs, and upstreams for drift

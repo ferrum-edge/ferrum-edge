@@ -265,11 +265,10 @@ async fn test_admin_sqlite_api_spec_mcp_bridge_end_to_end() {
     let created = admin_post_json(&client, &gateway, "/api-specs", &auth, spec).await;
     let spec_id = created["id"].as_str().expect("api spec id").to_string();
 
-    let generated = admin_get_json(&client, &gateway, "/plugins/config", &auth).await;
-    let gateway_plugin = generated["items"]
+    let generated = admin_get_json(&client, &gateway, "/plugins/config?limit=500", &auth).await;
+    let gateway_plugin = generated["data"]
         .as_array()
-        .or_else(|| generated.as_array())
-        .expect("plugin list")
+        .expect("plugin config list items")
         .iter()
         .find(|p| p["plugin_name"] == "mcp_gateway" && p["api_spec_id"] == spec_id)
         .cloned()
@@ -289,6 +288,8 @@ async fn test_admin_sqlite_api_spec_mcp_bridge_end_to_end() {
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     names.sort_unstable();
+    // Without `include`, only GET operations are published: `createPet` is
+    // opted in on the operation, `deletePet` is not.
     assert_eq!(names, vec!["pets.createPet", "pets.getPet"], "{listed}");
 
     let arguments = json!({ "petId": "7", "verbose": true, "X-Trace-Tag": "trace-1" });
@@ -331,10 +332,17 @@ async fn test_admin_sqlite_api_spec_mcp_bridge_end_to_end() {
             !request.url.path().contains("admin"),
             "a refused call must never reach the backend"
         );
-        assert!(
-            !request.headers.contains_key("mcp-session-id"),
-            "MCP transport headers never reach the REST backend"
-        );
+        for name in [
+            "mcp-session-id",
+            "authorization",
+            "x-http-method-override",
+            "x-original-url",
+        ] {
+            assert!(
+                !request.headers.contains_key(name),
+                "{name}: client headers of the MCP request never reach the REST backend"
+            );
+        }
     }
     let methods: Vec<&str> = received.iter().map(|r| r.method.as_str()).collect();
     assert_eq!(methods, vec!["GET", "POST", "GET"]);
@@ -2591,6 +2599,7 @@ fn mcp_bridge_spec(proxy_id: &str, listen_path: &str, backend_port: u16) -> Valu
             "/pets": {
                 "post": {
                     "operationId": "createPet",
+                    "x-ferrum-mcp": true,
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -2604,6 +2613,18 @@ fn mcp_bridge_spec(proxy_id: &str, listen_path: &str, backend_port: u16) -> Valu
                         }
                     },
                     "responses": { "201": { "description": "created" } }
+                }
+            },
+            "/pets/{petId}/owner": {
+                "delete": {
+                    "operationId": "deletePetOwner",
+                    "parameters": [{
+                        "name": "petId",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": { "204": { "description": "removed" } }
                 }
             }
         }
@@ -2625,12 +2646,17 @@ async fn mcp_bridge_post(
     session: &str,
     body: Value,
 ) -> (StatusCode, Value) {
+    // Client headers that describe nothing about the REST call and must never
+    // reach the backend of a bridged tool call.
     let response = client
         .post(endpoint)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .header("mcp-protocol-version", "2025-11-25")
         .header("mcp-session-id", session)
+        .header("authorization", "Bearer mcp-client-token")
+        .header("x-http-method-override", "DELETE")
+        .header("x-original-url", "/admin")
         .json(&body)
         .send()
         .await

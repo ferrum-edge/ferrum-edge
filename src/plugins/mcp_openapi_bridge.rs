@@ -33,11 +33,12 @@
 //! Nothing here logs an argument, a header value, or a response body.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 
+use crate::plugins::{BackendDispatchState, RequestContext};
 use crate::proxy::headers::X_GATEWAY_ERROR_HEADER;
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -69,6 +70,7 @@ const MAX_BRIDGE_ERROR_EXCERPT_LIMIT: usize = 64 * 1024;
 pub const BRIDGE_BODY_ARGUMENT: &str = "body";
 
 const OPENAPI_BRIDGE_KEYS: &[&str] = &[
+    "forward_request_headers",
     "max_error_excerpt_bytes",
     "max_request_body_bytes",
     "max_response_body_bytes",
@@ -118,33 +120,54 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b':')
     .remove(b'@');
 
-/// Request header names a bridged call may never set from a tool argument.
+/// Request header names a bridged call may never set from a tool argument:
+/// framing and hop-by-hop fields, credentials, client-address attribution,
+/// method and URL override families a backend framework may honor, range
+/// requests (a partial response cannot become a tool result), trace context,
+/// and MCP transport fields.
 const RESERVED_BRIDGE_HEADER_NAMES: &[&str] = &[
     "accept",
     "accept-encoding",
     "authorization",
+    "baggage",
+    "cf-connecting-ip",
     "connection",
     "content-encoding",
     "content-length",
     "content-type",
     "cookie",
     "cookie2",
+    "early-data",
     "expect",
     "forwarded",
     "host",
+    "http2-settings",
+    "if-range",
     "keep-alive",
     "last-event-id",
     "max-forwards",
+    "range",
     "set-cookie",
     "te",
+    "traceparent",
+    "tracestate",
     "trailer",
     "transfer-encoding",
+    "true-client-ip",
     "upgrade",
     "via",
+    "x-client-ip",
+    "x-http-method",
+    "x-http-method-override",
+    "x-method-override",
+    "x-original-uri",
+    "x-original-url",
     "x-real-ip",
+    "x-rewrite-url",
 ];
 /// Reserved header-name families: proxy control, forwarding identity, MCP
-/// transport, fetch metadata, and every Ferrum / gateway-owned namespace.
+/// transport, fetch metadata, service-mesh control, and every Ferrum /
+/// gateway-owned namespace.
 const RESERVED_BRIDGE_HEADER_PREFIXES: &[&str] = &[
     "proxy-",
     "x-forwarded-",
@@ -155,28 +178,80 @@ const RESERVED_BRIDGE_HEADER_PREFIXES: &[&str] = &[
     "x-path-param-",
     "mcp-",
     "sec-",
+    "x-envoy-",
+    "x-istio-",
+    "l5d-",
 ];
+
+/// Client request headers a bridged call forwards to the REST backend by
+/// default. Everything else the MCP client sent (credentials, cookies,
+/// conditional and range fields, method and URL override families, any
+/// application header) is dropped: the MCP request is a JSON-RPC exchange
+/// with the gateway, and only the tool arguments describe the REST call. The
+/// gateway still adds its own forwarding, identity, and correlation headers at
+/// dispatch, and `openapi.forward_request_headers` opts further names in.
+const DEFAULT_FORWARDED_CLIENT_HEADERS: &[&str] =
+    &["accept-language", "traceparent", "tracestate", "user-agent"];
+/// Maximum names `openapi.forward_request_headers` may list.
+const MAX_FORWARDED_REQUEST_HEADERS: usize = 32;
+
+/// One header-name byte lower-cased with `_` folded to `-`, the spelling
+/// every reserved-name comparison uses.
+fn fold_header_byte(byte: u8) -> u8 {
+    match byte {
+        b'_' => b'-',
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+fn normalized_header_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        normalized.push(char::from(fold_header_byte(byte)));
+    }
+    normalized
+}
+
+/// Whether two header names are the same field once `_` is folded to `-`,
+/// ASCII case-insensitively.
+pub(crate) fn bridge_header_names_match(left: &str, right: &str) -> bool {
+    left.len() == right.len()
+        && left
+            .bytes()
+            .zip(right.bytes())
+            .all(|(a, b)| fold_header_byte(a) == fold_header_byte(b))
+}
 
 /// Whether a tool argument may never set request header `name`.
 ///
 /// ASCII case-insensitive, with `_` treated as `-` so a backend that folds
 /// underscores (nginx, CGI) cannot be reached through an alternate spelling.
 /// Shared by plugin load, the `/api-specs` `x-ferrum-mcp` generator, and the
-/// call path.
+/// call path. The deployment-specific names (the configured
+/// `FERRUM_REAL_IP_HEADER`, the MCP session headers, and the request's
+/// `correlation_id` headers) are checked on top of this list by the plugin.
 pub fn bridge_header_name_is_reserved(name: &str) -> bool {
-    let normalized: String = name
-        .bytes()
-        .map(|byte| match byte {
-            b'_' => '-',
-            other => char::from(other.to_ascii_lowercase()),
-        })
-        .collect();
+    let normalized = normalized_header_name(name);
     RESERVED_BRIDGE_HEADER_NAMES.contains(&normalized.as_str())
         || RESERVED_BRIDGE_HEADER_PREFIXES
             .iter()
             .any(|prefix| normalized.starts_with(prefix))
         || crate::proxy::headers::is_gateway_assertion_header(&normalized)
         || crate::proxy::headers::is_backend_request_strip_header(&normalized)
+}
+
+/// Whether an `mcp_gateway` config declares at least one OpenAPI bridge server
+/// (`servers.*.openapi`), which alone admits the larger generated-config size
+/// and depth budget. A shape check only; the plugin validates the block.
+pub fn config_declares_openapi_server(config: &Value) -> bool {
+    config
+        .get("servers")
+        .and_then(Value::as_object)
+        .is_some_and(|servers| {
+            servers
+                .values()
+                .any(|server| server.get("openapi").is_some_and(Value::is_object))
+        })
 }
 
 /// HTTP methods a bridged operation may use.
@@ -303,6 +378,9 @@ pub struct McpOpenApiBridge {
     /// Serialized bytes of every published tool definition, for the catalog
     /// byte budget.
     tool_definition_bytes: usize,
+    /// Lower-cased client request headers forwarded to the backend on top of
+    /// [`DEFAULT_FORWARDED_CLIENT_HEADERS`].
+    forward_request_headers: Vec<String>,
 }
 
 /// The HTTP request one bridged `tools/call` becomes.
@@ -370,6 +448,7 @@ impl McpOpenApiBridge {
                 MAX_BRIDGE_BODY_LIMIT,
             )?,
         };
+        let forward_request_headers = parse_forward_request_headers(object)?;
         let Some(operations) = object.get("operations").and_then(Value::as_array) else {
             return Err(format!(
                 "mcp_gateway: server {server_id:?} `openapi.operations` must be a non-empty array"
@@ -414,17 +493,36 @@ impl McpOpenApiBridge {
             max_request_body_bytes,
             limits,
             tool_definition_bytes,
+            forward_request_headers,
         })
     }
 
-    /// The MCP tool definitions this bridge publishes, in the shape an
-    /// upstream `tools/list` page carries, so catalog construction treats them
-    /// exactly like discovered tools.
-    pub fn tool_definitions(&self) -> Vec<Value> {
+    /// Every published operation name with its MCP tool definition, in the
+    /// shape an upstream `tools/list` page carries, so catalog construction
+    /// treats them exactly like discovered tools.
+    pub fn tools(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.operations
-            .values()
-            .map(|operation| operation.tool.clone())
-            .collect()
+            .iter()
+            .map(|(name, operation)| (name.as_str(), &operation.tool))
+    }
+
+    /// Whether a client request header reaches the REST backend of a bridged
+    /// call: the fixed default set, or a name the operator listed in
+    /// `openapi.forward_request_headers`.
+    pub fn forwards_client_header(&self, name: &str) -> bool {
+        DEFAULT_FORWARDED_CLIENT_HEADERS
+            .iter()
+            .any(|forwarded| forwarded.eq_ignore_ascii_case(name))
+            || self
+                .forward_request_headers
+                .iter()
+                .any(|forwarded| bridge_header_names_match(forwarded, name))
+    }
+
+    /// Operator-listed forwarded client headers, for the configuration
+    /// cross-check against the deployment's own reserved names.
+    pub fn forwarded_header_names(&self) -> impl Iterator<Item = &str> {
+        self.forward_request_headers.iter().map(String::as_str)
     }
 
     pub fn tool_count(&self) -> usize {
@@ -473,12 +571,13 @@ impl BridgeOperation {
     ///
     /// Arguments outside the declared parameter set are refused whether or not
     /// `validation.validate_tool_arguments` ran, because they have no defined
-    /// place on the wire.
+    /// place on the wire. `deployment_reserved` names the header fields this
+    /// deployment reserves on top of [`bridge_header_name_is_reserved`].
     pub fn build_request(
         &self,
         arguments: Option<&Value>,
         max_request_body_bytes: usize,
-        reserved_headers: &[&str],
+        deployment_reserved: impl Fn(&str) -> bool,
     ) -> Result<BridgeRequest, BridgeArgumentError> {
         let empty = Map::new();
         let arguments = match arguments {
@@ -517,6 +616,15 @@ impl BridgeOperation {
                     }
                     if text == "." || text == ".." {
                         return Err(argument_error("a path parameter must not be a dot segment"));
+                    }
+                    // `;` starts RFC 3986 path-segment parameters. Servlet
+                    // containers (Tomcat, Jetty, Spring) strip them before
+                    // resolving dot segments, so `..;` would climb a segment
+                    // there while the gateway reads one opaque segment. The
+                    // bridge does not serialize matrix-style parameters, so a
+                    // `;` in a path argument has no legitimate meaning.
+                    if text.contains(';') {
+                        return Err(argument_error("a path parameter must not carry `;`"));
                     }
                     public_path.extend(utf8_percent_encode(&text, PATH_SEGMENT_ENCODE_SET));
                 }
@@ -562,9 +670,7 @@ impl BridgeOperation {
                     // path that skipped load validation can still never set a
                     // reserved field.
                     if bridge_header_name_is_reserved(&parameter.name)
-                        || reserved_headers
-                            .iter()
-                            .any(|reserved| reserved.eq_ignore_ascii_case(&parameter.name))
+                        || deployment_reserved(&parameter.name)
                     {
                         return Err(argument_error(
                             "a header parameter names a reserved request header",
@@ -647,6 +753,44 @@ fn scalar_or_array_texts(value: &Value) -> Result<Vec<String>, BridgeArgumentErr
         texts.push(text);
     }
     Ok(texts)
+}
+
+/// `openapi.forward_request_headers`: valid header names, at most
+/// [`MAX_FORWARDED_REQUEST_HEADERS`], none of them reserved.
+fn parse_forward_request_headers(object: &Map<String, Value>) -> Result<Vec<String>, String> {
+    let items = match object.get("forward_request_headers") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            return Err(
+                "mcp_gateway: `openapi.forward_request_headers` must be an array of header names"
+                    .to_string(),
+            );
+        }
+    };
+    if items.len() > MAX_FORWARDED_REQUEST_HEADERS {
+        return Err(format!(
+            "mcp_gateway: `openapi.forward_request_headers` must not list more than {MAX_FORWARDED_REQUEST_HEADERS} names"
+        ));
+    }
+    let mut names = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let valid = item
+            .as_str()
+            .filter(|name| http::HeaderName::from_bytes(name.as_bytes()).is_ok());
+        let Some(name) = valid else {
+            return Err(format!(
+                "mcp_gateway: `openapi.forward_request_headers[{index}]` must be a valid HTTP header name"
+            ));
+        };
+        if bridge_header_name_is_reserved(name) {
+            return Err(format!(
+                "mcp_gateway: `openapi.forward_request_headers[{index}]` names a reserved request header (hop-by-hop, Host, Authorization, Cookie, Range, a method or URL override, trace context, MCP transport, or a Ferrum-internal field) that a bridged call never forwards"
+            ));
+        }
+        names.push(name.to_ascii_lowercase());
+    }
+    Ok(names)
 }
 
 fn bounded_limit(
@@ -1093,14 +1237,65 @@ fn parameter_schema(
 /// Private and typed: forgeable `mcp.*` metadata can neither create, change,
 /// nor clear it. Re-checked over the FINAL backend-visible request so a later
 /// transform cannot change the method, path, query, or body the bridge built.
-/// `Debug` never renders the query or body.
+/// `Debug` never renders the query, the header values, or the body.
 pub struct McpBridgeClaim {
     pub(crate) owner: u64,
     pub(crate) method: BridgeMethod,
+    /// The operation's public request path, before listen-path mapping.
+    pub(crate) public_path: String,
     pub(crate) backend_path: String,
     pub(crate) query: String,
+    /// Header parameters the call set, lower-cased names.
+    pub(crate) headers: Vec<(String, String)>,
+    /// The JSON body built from the admitted arguments, empty for none.
     pub(crate) body: Vec<u8>,
     pub(crate) limits: BridgeResponseLimits,
+    /// SHA-256 of the JSON-RPC envelope the call was admitted from.
+    pub(crate) envelope_digest: [u8; 32],
+    /// What the request-body transform did to the admitted call, set at most
+    /// once. Interior so the H1/H2 hook-context clone shares it through the
+    /// `Arc`, exactly like the admission record's drift latch.
+    pub(crate) transformed: OnceLock<BridgeTransformOutcome>,
+    /// What a transformed envelope must still name, and what rebuilds the
+    /// REST call from it.
+    pub(crate) rebuild: BridgeRebuildContext,
+}
+
+/// The admitted identity a transformed envelope must still carry, plus the
+/// operation and the pinned validator that rebuild the REST call from it.
+pub(crate) struct BridgeRebuildContext {
+    pub(crate) bridge: Arc<McpOpenApiBridge>,
+    pub(crate) operation: String,
+    pub(crate) public_tool_name: String,
+    pub(crate) request_id: Option<Value>,
+    /// The admitted tool's `inputSchema` validator, when
+    /// `validation.validate_tool_arguments` is on.
+    pub(crate) input_validator: Option<Arc<jsonschema::Validator>>,
+}
+
+/// What the request-body transform decided for a bridged call whose
+/// JSON-RPC envelope an earlier transform changed.
+#[derive(Debug)]
+pub(crate) enum BridgeTransformOutcome {
+    /// Only the tool's JSON body changed (for example a prompt-guard
+    /// redaction): the REST body rebuilt from the transformed envelope, whose
+    /// arguments were validated again.
+    Rebuilt(Vec<u8>),
+    /// The transformed envelope no longer describes the admitted call. The
+    /// final request-body hook refuses the request with this reason.
+    Refused(&'static str),
+}
+
+impl McpBridgeClaim {
+    /// The REST body the backend must receive once request-body transforms
+    /// ran, or the refusal reason a transform latched.
+    pub(crate) fn expected_body(&self) -> Result<&[u8], &'static str> {
+        match self.transformed.get() {
+            None => Ok(&self.body),
+            Some(BridgeTransformOutcome::Rebuilt(body)) => Ok(body),
+            Some(BridgeTransformOutcome::Refused(reason)) => Err(reason),
+        }
+    }
 }
 
 impl std::fmt::Debug for McpBridgeClaim {
@@ -1109,9 +1304,21 @@ impl std::fmt::Debug for McpBridgeClaim {
             .debug_struct("McpBridgeClaim")
             .field("owner", &self.owner)
             .field("method", &self.method.as_str())
+            .field("operation", &self.rebuild.operation)
             .field("body_bytes", &self.body.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Where a bridged call's response came from, read from the typed
+/// backend-dispatch record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BridgeResponseOrigin {
+    /// The backend answered: the status and body are its own.
+    Backend,
+    /// The gateway authored the response (a failed dispatch, an open circuit
+    /// breaker, overload, a stale configuration): there is no backend body.
+    Gateway,
 }
 
 /// The backend response a bridged call received, recorded in `after_proxy`.
@@ -1121,8 +1328,8 @@ pub struct BridgeObservedResponse {
     /// The backend's own `Content-Type`, before the gateway relabels the
     /// client-visible representation as JSON.
     pub(crate) content_type: Option<String>,
-    /// Fixed low-cardinality `X-Gateway-Error` class for a gateway or backend
-    /// failure, never a backend-supplied string.
+    /// Fixed low-cardinality gateway-error class for a gateway or backend
+    /// failure, derived from the dispatch outcome, never a backend string.
     pub(crate) gateway_error: Option<&'static str>,
 }
 
@@ -1156,8 +1363,8 @@ impl McpBridgeState {
     }
 }
 
-/// `X-Gateway-Error` classes the bridge reports; anything else a response
-/// header claims is ignored rather than reflected.
+/// Gateway-error classes a gateway-authored rejection may carry; anything
+/// else is ignored rather than reflected.
 const KNOWN_GATEWAY_ERROR_CLASSES: &[&str] = &[
     crate::retry::OBS_CONNECTION_FAILURE,
     crate::retry::OBS_BACKEND_TIMEOUT,
@@ -1169,9 +1376,8 @@ const KNOWN_GATEWAY_ERROR_CLASSES: &[&str] = &[
     crate::retry::OBS_REQUEST_TIMEOUT,
 ];
 
-/// The gateway's own `X-Gateway-Error` class on a response it authored
-/// itself (an open circuit breaker, overload, a stale configuration), when the
-/// value is one of the known classes.
+/// The class a gateway rejection stamped on its own response. Read only when
+/// nothing was dispatched, so no backend can have supplied the header.
 fn stamped_gateway_error_class(headers: &HashMap<String, String>) -> Option<&'static str> {
     let value = header_value(headers, X_GATEWAY_ERROR_HEADER)?.trim();
     KNOWN_GATEWAY_ERROR_CLASSES
@@ -1180,15 +1386,36 @@ fn stamped_gateway_error_class(headers: &HashMap<String, String>) -> Option<&'st
         .find(|class| class.eq_ignore_ascii_case(value))
 }
 
-/// The gateway-error class of a bridged response: the gateway's own
-/// `X-Gateway-Error` token when one of the known classes is present, else the
-/// status-derived backend class for a 5xx.
-pub(crate) fn bridge_gateway_error_class(
+/// The gateway-error class and the origin of a bridged response, from the
+/// typed backend-dispatch record rather than a response header: a backend can
+/// send `X-Gateway-Error` itself, so its presence on a backend response
+/// proves nothing and is never read.
+pub(crate) fn bridge_response_provenance(
+    ctx: &RequestContext,
     status: u16,
     headers: &HashMap<String, String>,
-) -> Option<&'static str> {
-    stamped_gateway_error_class(headers)
-        .or_else(|| crate::retry::http_observability_error_class(false, status))
+) -> (Option<&'static str>, BridgeResponseOrigin) {
+    match ctx.backend_dispatch_state() {
+        BackendDispatchState::BackendResponse => (
+            crate::proxy::x_gateway_error_for_response(ctx, false, status),
+            BridgeResponseOrigin::Backend,
+        ),
+        BackendDispatchState::PreWireFailure => (
+            crate::proxy::x_gateway_error_for_response(ctx, true, status),
+            BridgeResponseOrigin::Gateway,
+        ),
+        BackendDispatchState::AmbiguousFailure => (
+            crate::proxy::x_gateway_error_for_response(ctx, false, status),
+            BridgeResponseOrigin::Gateway,
+        ),
+        // Nothing was dispatched, so no backend authored this response: it is
+        // a gateway rejection (open breaker, overload, a stale configuration,
+        // a concurrency limit) and its own stamped class is authoritative.
+        BackendDispatchState::NotDispatched => (
+            stamped_gateway_error_class(headers),
+            BridgeResponseOrigin::Gateway,
+        ),
+    }
 }
 
 fn media_type(content_type: Option<&str>) -> Option<String> {
@@ -1216,6 +1443,17 @@ fn text_result(text: String, is_error: bool) -> Value {
     })
 }
 
+/// A result whose backend body is not returned, saying why. A 2xx stays
+/// `isError: false`: the operation ran, and reporting its representation as
+/// a failure would invite an agent to retry a call that may not be
+/// idempotent.
+fn omitted_body_result(line: &str, reason: &str, is_error: bool) -> Value {
+    text_result(
+        format!("{line}: {reason}; the response body was omitted"),
+        is_error,
+    )
+}
+
 fn status_line(status: u16, gateway_error: Option<&str>) -> String {
     let reason = http::StatusCode::from_u16(status)
         .ok()
@@ -1237,58 +1475,54 @@ fn status_line(status: u16, gateway_error: Option<&str>) -> String {
 /// A `CallToolResult` decidable from the response head alone, or `None` when
 /// the body must be read.
 ///
-/// Status codes that forbid a body, partial responses (which the buffered
-/// normalization phase deliberately never rewrites), a coded or streamed
-/// representation, and a declared length past the response bound are all
-/// answered here, so the gateway never buffers a representation it cannot
-/// convert.
+/// Status codes that forbid a body, a gateway-authored failure, partial
+/// responses (which the buffered normalization phase deliberately never
+/// rewrites), a coded or streamed representation, and a declared length past
+/// the response bound are all answered here, so the gateway never buffers a
+/// representation it cannot convert.
 pub(crate) fn head_only_result(
     status: u16,
     headers: &HashMap<String, String>,
     limits: BridgeResponseLimits,
     gateway_error: Option<&'static str>,
+    origin: BridgeResponseOrigin,
 ) -> Option<Value> {
     let is_error = !(200..300).contains(&status);
     let line = status_line(status, gateway_error);
     if (100..200).contains(&status) || matches!(status, 204 | 205 | 304) {
         return Some(text_result(line, is_error));
     }
-    // A failure the gateway authored itself (open breaker, overload, ...)
-    // carries no backend body worth an excerpt, and on the rejection path no
-    // buffered body is converted at all: answer it from the status line.
-    if is_error && stamped_gateway_error_class(headers).is_some() {
+    // A failure the gateway authored itself (a failed dispatch, an open
+    // breaker, overload, ...) carries no backend body worth an excerpt, and
+    // on the rejection path no buffered body is converted at all: answer it
+    // from the status line.
+    if is_error && origin == BridgeResponseOrigin::Gateway {
         return Some(text_result(line, true));
     }
-    if matches!(status, 206 | 226) {
-        return Some(text_result(
-            format!("{line}: partial responses cannot be returned by an OpenAPI bridge tool"),
-            true,
-        ));
-    }
-    if header_value(headers, "content-encoding")
-        .is_some_and(|encoding| !encoding.trim().eq_ignore_ascii_case("identity"))
-    {
-        return Some(text_result(
-            format!("{line}: the bridge does not decode the backend content coding"),
-            true,
-        ));
-    }
-    if media_type(header_value(headers, "content-type")).as_deref() == Some("text/event-stream") {
-        return Some(text_result(
-            format!("{line}: event-stream responses cannot be returned by an OpenAPI bridge tool"),
-            true,
-        ));
+    let coded = header_value(headers, "content-encoding")
+        .is_some_and(|encoding| !encoding.trim().eq_ignore_ascii_case("identity"));
+    let streamed =
+        media_type(header_value(headers, "content-type")).as_deref() == Some("text/event-stream");
+    let reason = if matches!(status, 206 | 226) {
+        Some("a partial response cannot be returned by an OpenAPI bridge tool")
+    } else if coded {
+        Some("the bridge does not decode the backend content coding")
+    } else if streamed {
+        Some("an event-stream response cannot be returned by an OpenAPI bridge tool")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Some(omitted_body_result(&line, reason, is_error));
     }
     let declared = header_value(headers, "content-length")
         .and_then(|value| value.trim().parse::<usize>().ok());
     if declared.is_some_and(|length| length > limits.max_response_body_bytes) {
-        return Some(text_result(
-            format!(
-                "{line}: the response body exceeds the {} byte bridge bound and was not returned",
-                limits.max_response_body_bytes
-            ),
-            true,
-        ));
+        let reason = format!(
+            "the response body exceeds the {} byte bridge bound",
+            limits.max_response_body_bytes
+        );
+        return Some(omitted_body_result(&line, &reason, is_error));
     }
     None
 }
@@ -1317,9 +1551,11 @@ fn utf8_prefix(bytes: &[u8]) -> Option<&str> {
 ///
 /// A 2xx becomes `isError: false` with the body as text content, plus
 /// `structuredContent` when the body is a JSON object within the structured
-/// bound. Anything else becomes `isError: true` with the status line and a
-/// bounded excerpt. Every output is bounded; nothing is copied past the
-/// configured limits.
+/// bound; a 2xx body the bridge cannot return (past a bound, not text,
+/// ambiguous JSON) is omitted with a note, still `isError: false`. Anything
+/// else becomes `isError: true` with the status line and a bounded excerpt.
+/// Every output is bounded; nothing is copied or parsed past the configured
+/// limits.
 pub(crate) fn body_result(
     observed: &BridgeObservedResponse,
     body: &[u8],
@@ -1353,22 +1589,15 @@ pub(crate) fn body_result(
         return text_result(line, false);
     }
     if body.len() > limits.max_response_body_bytes {
-        return text_result(
-            format!(
-                "{line}: the response body exceeds the {} byte bridge bound and was not returned",
-                limits.max_response_body_bytes
-            ),
-            true,
+        let reason = format!(
+            "the response body exceeds the {} byte bridge bound",
+            limits.max_response_body_bytes
         );
+        return omitted_body_result(&line, &reason, false);
     }
     let Ok(text) = std::str::from_utf8(body) else {
-        return text_result(
-            format!(
-                "{line}: non-text response body of {} bytes omitted",
-                body.len()
-            ),
-            false,
-        );
+        let reason = format!("the response body is {} bytes of non-text data", body.len());
+        return omitted_body_result(&line, &reason, false);
     };
     let is_json = media_type.as_deref().is_some_and(media_type_is_json);
     if !is_json {
@@ -1377,32 +1606,49 @@ pub(crate) fn body_result(
     // Duplicate members make the document parser-dependent; the caller and
     // the gateway could read different `structuredContent`.
     if crate::util::json_dup_keys::slice_ambiguity(body).is_some() {
-        return text_result(
-            format!("{line}: the JSON response body is ambiguous and was not returned"),
-            true,
+        let reason = "the JSON response body repeats a member name, so its reading is ambiguous";
+        return omitted_body_result(&line, reason, false);
+    }
+    // Checked before parsing, so a document past the structured bound is
+    // never materialized: it is returned as text only.
+    if body.len() > limits.max_structured_content_bytes {
+        let note = format!(
+            "{line}: structuredContent omitted: the JSON response exceeds the {} byte structuredContent bound",
+            limits.max_structured_content_bytes
         );
+        return json!({
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "text", "text": note},
+            ],
+            "isError": false,
+        });
     }
     match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Object(object)) => {
-            if body.len() > limits.max_structured_content_bytes {
-                return text_result(
-                    format!(
-                        "{line}: the JSON response exceeds the {} byte structuredContent bound and was not returned",
-                        limits.max_structured_content_bytes
-                    ),
-                    true,
-                );
-            }
-            json!({
-                "content": [{"type": "text", "text": text}],
-                "structuredContent": Value::Object(object),
-                "isError": false,
-            })
-        }
+        Ok(Value::Object(object)) => json!({
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": Value::Object(object),
+            "isError": false,
+        }),
         // Arrays, scalars, and malformed JSON stay text: structuredContent is
         // a JSON object by definition.
         _ => text_result(text.to_string(), false),
     }
+}
+
+/// The result for a backend response that reached the final response phase
+/// without being converted (normalization skipped, or its replacement refused
+/// by the retained-response budget). The raw REST body is never released; a
+/// 2xx stays `isError: false`, because the operation ran.
+pub(crate) fn unconverted_result(observed: Option<&BridgeObservedResponse>) -> Value {
+    let Some(observed) = observed else {
+        let text = "The backend response could not be converted into a tool result";
+        return text_result(text.to_string(), true);
+    };
+    let line = status_line(observed.status, observed.gateway_error);
+    let is_error = !(200..300).contains(&observed.status);
+    let reason = "the response could not be converted into a tool result";
+    omitted_body_result(&line, reason, is_error)
 }
 
 /// Serialize a JSON-RPC success envelope carrying `result` for the request id

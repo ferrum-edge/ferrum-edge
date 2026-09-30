@@ -14,8 +14,14 @@
 //!     exactly the recorded session, so the overlay value never reaches the
 //!     upstream.
 //!
+//! The same harness drives an `mcp_gateway` OpenAPI bridge server (issue
+//! #5906) on all three frontends: a `tools/call` becomes the operation's own
+//! REST request (backend method, path, and query) and the backend answer,
+//! including a chunked one of unknown length, is returned as the JSON-RPC
+//! tool result.
+//!
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests
-//! functional_mcp_gateway_admission -- --ignored --nocapture`
+//! functional_mcp_gateway -- --ignored --nocapture`
 
 use crate::scaffolding::port_registry::TestSocket;
 
@@ -121,6 +127,52 @@ async fn serve_mcp_upstream(listener: TcpListener, captures: Captures) {
     }
 }
 
+/// A REST backend for the OpenAPI bridge: records each request head, answers
+/// `GET` with a chunked JSON body of unknown length and every other method
+/// with a `Content-Length` one.
+async fn serve_rest_backend(listener: TcpListener, captures: Captures) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let captures = Arc::clone(&captures);
+        tokio::spawn(async move {
+            let mut pending = Vec::new();
+            while let Some((head, _)) = read_one_http_request(&mut stream, &mut pending).await {
+                let method = head.split(' ').next().unwrap_or_default().to_string();
+                {
+                    let mut captured = captures.lock().expect("captures lock");
+                    captured.push(Captured {
+                        method: method.clone(),
+                        head,
+                    });
+                }
+                let written = if method == "GET" {
+                    write_chunked_json(&mut stream, r#"{"id":"7","name":"Rex"}"#).await
+                } else {
+                    write_http_response(&mut stream, 200, &[], r#"{"deleted":"7"}"#).await
+                };
+                if written.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// Answer 200 with `body` in two chunks and no `Content-Length`.
+async fn write_chunked_json(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
+    let (first, rest) = body.split_at(body.len() / 2);
+    let mut wire = String::from("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
+    wire.push_str("Transfer-Encoding: chunked\r\n\r\n");
+    for chunk in [first, rest] {
+        wire.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    wire.push_str("0\r\n\r\n");
+    stream.write_all(wire.as_bytes()).await?;
+    stream.flush().await
+}
+
 /// Answer every `pre_proxy` invocation with a header overlay that tries to
 /// replace the mediated upstream session.
 async fn serve_function(listener: TcpListener) {
@@ -215,6 +267,15 @@ async fn write_http_response(
 // Gateway harness
 // ===========================================================================
 
+/// Which backend the fixture serves behind the proxy.
+#[derive(Clone, Copy, PartialEq)]
+enum Backend {
+    /// A scripted MCP upstream (the aggregate router's `upstream_url`).
+    McpUpstream,
+    /// A REST API behind an OpenAPI bridge server.
+    Rest,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum LaterWriter {
     /// A `request_transformer` header rule replaces the session header.
@@ -234,6 +295,13 @@ struct Fixture {
 
 impl Fixture {
     async fn start(writer: LaterWriter) -> Self {
+        Self::start_with(Backend::McpUpstream, |upstream_port, function_port| {
+            admission_config(writer, upstream_port, function_port)
+        })
+        .await
+    }
+
+    async fn start_with(backend: Backend, config: impl FnOnce(u16, u16) -> GatewayConfig) -> Self {
         let upstream = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind MCP upstream");
@@ -243,10 +311,12 @@ impl Fixture {
             .expect("bind function");
         let function_port = function.local_addr().expect("function addr").port();
         let captures: Captures = Arc::new(Mutex::new(Vec::new()));
-        let tasks = vec![
-            tokio::spawn(serve_mcp_upstream(upstream, Arc::clone(&captures))),
-            tokio::spawn(serve_function(function)),
-        ];
+        let captured = Arc::clone(&captures);
+        let backend_task = match backend {
+            Backend::McpUpstream => tokio::spawn(serve_mcp_upstream(upstream, captured)),
+            Backend::Rest => tokio::spawn(serve_rest_backend(upstream, captured)),
+        };
+        let tasks = vec![backend_task, tokio::spawn(serve_function(function))];
 
         let http = reserve_port().await.expect("reserve http");
         let (https_tcp, https_udp) = reserve_colocated_tcp_udp().await.expect("reserve https");
@@ -288,7 +358,7 @@ impl Fixture {
         };
         drop(https_udp);
 
-        let config = admission_config(writer, upstream_port, function_port);
+        let config = config(upstream_port, function_port);
         let (shutdown_tx, _) = watch::channel(false);
         let handles =
             ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone())
@@ -319,6 +389,11 @@ impl Fixture {
             .filter(|captured| captured.method == ROUTED_METHOD)
             .cloned()
             .collect()
+    }
+
+    /// Every request the backend received.
+    fn received(&self) -> Vec<Captured> {
+        self.captures.lock().expect("captures lock").clone()
     }
 
     fn clear(&self) {
@@ -520,6 +595,77 @@ fn admission_config(writer: LaterWriter, upstream_port: u16, function_port: u16)
     .expect("MCP admission config is valid")
 }
 
+/// An `aggregate_router` gateway whose only server is an OpenAPI bridge over
+/// this proxy's own REST backend.
+fn bridge_config(backend_port: u16) -> GatewayConfig {
+    let pet_id = json!({
+        "name": "petId",
+        "in": "path",
+        "required": true,
+        "schema": {"type": "string"}
+    });
+    let verbose = json!({"name": "verbose", "in": "query", "schema": {"type": "boolean"}});
+    serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [{
+            "id": "mcp-bridge",
+            "namespace": TEST_NAMESPACE,
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "plugins": [{"plugin_config_id": "mcp-bridge-gw"}]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "mcp-bridge-gw",
+            "namespace": TEST_NAMESPACE,
+            "plugin_name": "mcp_gateway",
+            "scope": "proxy",
+            "proxy_id": "mcp-bridge",
+            "enabled": true,
+            "config": {
+                "mode": "aggregate_router",
+                "endpoint": {"path": "/mcp", "protocol_versions": [PROTOCOL_VERSION]},
+                "discovery": {"on_new_tool": "allow", "on_schema_change": "allow"},
+                "policy": {"default_action": "allow"},
+                "servers": {
+                    "petstore": {
+                        "namespace": "pets",
+                        "openapi": {"operations": [
+                            {
+                                "name": "getPet",
+                                "method": "GET",
+                                "path": "/pets/{petId}",
+                                "parameters": [pet_id.clone(), verbose]
+                            },
+                            {
+                                "name": "deletePet",
+                                "method": "DELETE",
+                                "path": "/pets/{petId}",
+                                "parameters": [pet_id]
+                            }
+                        ]}
+                    }
+                }
+            }
+        }]
+    }))
+    .expect("MCP bridge config is valid")
+}
+
+fn bridge_call_body(id: i64, name: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments}
+    })
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -573,6 +719,78 @@ async fn functional_mcp_gateway_admission_reasserts_session_over_a_function_over
             !routed[0].head.contains(FUNCTION_SESSION),
             "{protocol}: the function overlay value must not reach the upstream"
         );
+    }
+    fixture.shutdown().await;
+}
+
+/// An OpenAPI bridge `tools/call` on the HTTP/1.1, HTTP/2, and native HTTP/3
+/// frontends runs as the operation's own REST request: the backend sees the
+/// bridged method, path, and query (never the MCP `POST` or its transport
+/// headers), and the client gets the converted JSON-RPC result on HTTP 200,
+/// also when the backend answers with a chunked body of unknown length.
+#[ignore]
+#[tokio::test]
+async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
+    let config = |backend_port: u16, _: u16| bridge_config(backend_port);
+    let fixture = Fixture::start_with(Backend::Rest, config).await;
+    for protocol in ["HTTP/1.1", "HTTP/2", "HTTP/3"] {
+        fixture.clear();
+        let session = fixture.post(protocol, None, &initialize_body()).await;
+        assert_eq!(session.0, 200, "{protocol}: initialize must succeed");
+        let session_id = session.2.expect("initialize mints a downstream session");
+
+        let arguments = json!({"petId": "7", "verbose": true});
+        let call = bridge_call_body(8, "pets.getPet", arguments);
+        let (status, body, _) = fixture.post(protocol, Some(&session_id), &call).await;
+        assert_eq!(status, 200, "{protocol}: {body}");
+        assert_eq!(body["id"], json!(8), "{protocol}: {body}");
+        assert_eq!(
+            body["result"]["isError"],
+            json!(false),
+            "{protocol}: {body}"
+        );
+        assert_eq!(
+            body["result"]["structuredContent"],
+            json!({"id": "7", "name": "Rex"}),
+            "{protocol}: the chunked backend body is converted: {body}"
+        );
+
+        let call = bridge_call_body(9, "pets.deletePet", json!({"petId": "7"}));
+        let (status, body, _) = fixture.post(protocol, Some(&session_id), &call).await;
+        assert_eq!(status, 200, "{protocol}: {body}");
+        assert_eq!(body["id"], json!(9), "{protocol}: {body}");
+        assert_eq!(
+            body["result"]["structuredContent"],
+            json!({"deleted": "7"}),
+            "{protocol}: {body}"
+        );
+
+        let received = fixture.received();
+        let request_lines: Vec<&str> = received
+            .iter()
+            .map(|request| request.head.lines().next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            request_lines,
+            vec![
+                "GET /pets/7?verbose=true HTTP/1.1",
+                "DELETE /pets/7 HTTP/1.1"
+            ],
+            "{protocol}: the backend sees the bridged requests only"
+        );
+        for request in &received {
+            let head = request.head.to_ascii_lowercase();
+            assert!(
+                !head.contains("mcp-session-id") && !head.contains("mcp-protocol-version"),
+                "{protocol}: MCP transport headers never reach the REST backend:\n{}",
+                request.head
+            );
+            assert!(
+                head.contains("accept-encoding: identity"),
+                "{protocol}: the bridged request asks for an identity body:\n{}",
+                request.head
+            );
+        }
     }
     fixture.shutdown().await;
 }

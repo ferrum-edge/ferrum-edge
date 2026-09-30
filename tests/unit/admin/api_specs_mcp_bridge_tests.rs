@@ -140,12 +140,14 @@ fn operation_names(config: &Value) -> Vec<String> {
 
 #[test]
 fn x_ferrum_mcp_generates_a_constructible_proxy_scoped_gateway() {
-    let config = generated_gateway(&spec(json!({ "namespace": "pets" }), pet_paths()));
+    let extension = json!({ "namespace": "pets", "include": { "tags": ["read", "write"] } });
+    let config = generated_gateway(&spec(extension, pet_paths()));
     assert_eq!(config["mode"], "aggregate_router");
     assert_eq!(config["endpoint"]["path"], "/pets-api/mcp");
     assert_eq!(config["servers"]["openapi"]["namespace"], "pets");
     assert!(config["servers"]["openapi"].get("upstream_url").is_none());
-    // HEAD is not bridged; the invalid operationId is sanitized.
+    // HEAD is not selected (and never bridged); the invalid operationId is
+    // sanitized.
     assert_eq!(
         operation_names(&config),
         vec!["create_pet", "deletePet", "getPet"]
@@ -198,7 +200,8 @@ fn x_ferrum_mcp_selection_honours_include_exclude_and_operation_overrides() {
     });
     paths["/pets/{petId}"]["delete"]["x-ferrum-mcp"] = json!(false);
     let config = generated_gateway(&spec(json!(true), paths));
-    assert_eq!(operation_names(&config), vec!["create_pet", "fetch_pet"]);
+    // No `include`: only GET operations are published.
+    assert_eq!(operation_names(&config), vec!["fetch_pet"]);
     let fetch = operation(&config, "fetch_pet");
     assert_eq!(fetch["description"], "Fetch one pet");
     assert_eq!(fetch["annotations"], json!({ "openWorldHint": false }));
@@ -220,6 +223,12 @@ fn x_ferrum_mcp_refuses_reserved_header_parameters_at_generation() {
         "X-Forwarded-For",
         "x_consumer_role",
         "Mcp-Session-Id",
+        "X-HTTP-Method-Override",
+        "X-Original-URL",
+        "True-Client-IP",
+        "traceparent",
+        "Range",
+        "X-Envoy-Original-Path",
     ] {
         let mut paths = pet_paths();
         paths["/pets/{petId}"]["get"]["parameters"][1]["name"] = json!(name);
@@ -231,8 +240,9 @@ fn x_ferrum_mcp_refuses_reserved_header_parameters_at_generation() {
     let mut paths = pet_paths();
     paths["/pets/{petId}"]["get"]["parameters"][1]["name"] = json!("Authorization");
     paths["/pets/{petId}"]["get"]["x-ferrum-mcp"] = json!(false);
+    paths["/pets"]["post"]["x-ferrum-mcp"] = json!(true);
     let config = generated_gateway(&spec(json!(true), paths));
-    assert_eq!(operation_names(&config), vec!["create_pet", "deletePet"]);
+    assert_eq!(operation_names(&config), vec!["create_pet"]);
 }
 
 #[test]
@@ -274,6 +284,7 @@ fn x_ferrum_mcp_refuses_unserializable_operations_with_clear_errors() {
     }
 
     let mut paths = pet_paths();
+    paths["/pets"]["post"]["x-ferrum-mcp"] = json!(true);
     paths["/pets"]["post"]["requestBody"]["content"] =
         json!({ "application/xml": { "schema": { "type": "object" } } });
     let error = extract_error(&spec(json!(true), paths));
@@ -288,7 +299,7 @@ fn x_ferrum_mcp_refuses_unserializable_operations_with_clear_errors() {
     );
 
     let mut paths = pet_paths();
-    paths["/pets"]["post"]["x-ferrum-mcp"] = json!({ "name": "getPet" });
+    paths["/pets"]["post"]["x-ferrum-mcp"] = json!({ "name": "getPet", "expose": true });
     let error = extract_error(&spec(json!(true), paths));
     assert!(error.contains("another operation already uses"), "{error}");
 }
@@ -395,4 +406,73 @@ fn x_ferrum_mcp_merges_into_an_embedded_mcp_gateway() {
     document["x-ferrum-plugins"][0]["config"] = json!({ "mode": "transparent_proxy" });
     let error = extract_error(&document);
     assert!(error.contains("`aggregate_router`"), "{error}");
+}
+
+#[test]
+fn x_ferrum_mcp_publishes_only_get_operations_without_explicit_selection() {
+    // `true`, and an object with no `include`, publish GET operations only:
+    // route-level method and path policy sees the MCP request, never the
+    // bridged one, so a mutating operation needs an explicit opt-in.
+    for extension in [json!(true), json!({ "namespace": "pets" })] {
+        let config = generated_gateway(&spec(extension, pet_paths()));
+        assert_eq!(operation_names(&config), vec!["getPet"]);
+    }
+
+    let mut paths = pet_paths();
+    paths["/pets/{petId}"]["delete"]["x-ferrum-mcp"] = json!(true);
+    let config = generated_gateway(&spec(json!(true), paths));
+    assert_eq!(operation_names(&config), vec!["deletePet", "getPet"]);
+
+    let extension = json!({ "include": { "operations": ["create pet!"] } });
+    let config = generated_gateway(&spec(extension, pet_paths()));
+    assert_eq!(operation_names(&config), vec!["create_pet"]);
+
+    // The generated gateway still allows what it publishes.
+    let config = generated_gateway(&spec(json!(true), pet_paths()));
+    assert_eq!(config["policy"]["default_action"], "allow");
+}
+
+#[test]
+fn x_ferrum_mcp_refuses_operations_the_route_does_not_allow() {
+    let extension = json!({ "include": { "tags": ["read", "write"] } });
+    let mut document = spec(extension.clone(), pet_paths());
+    document["x-ferrum-proxy"]["allowed_methods"] = json!(["GET", "POST"]);
+    let error = extract_error(&document);
+    assert!(error.contains("allowed_methods"), "{error}");
+    assert!(error.contains("delete"), "names the operation: {error}");
+
+    let mut document = spec(extension.clone(), pet_paths());
+    document["x-ferrum-proxy"]["allowed_methods"] = json!(["GET", "DELETE"]);
+    let error = extract_error(&document);
+    assert!(error.contains("to allow POST"), "{error}");
+
+    let mut document = spec(extension, pet_paths());
+    document["x-ferrum-proxy"]["allowed_methods"] = json!(["get", "post", "delete"]);
+    let config = generated_gateway(&document);
+    assert_eq!(
+        operation_names(&config),
+        vec!["create_pet", "deletePet", "getPet"]
+    );
+}
+
+#[test]
+fn x_ferrum_mcp_forward_request_headers_reach_the_generated_bridge() {
+    let extension = json!({ "forward_request_headers": ["X-Api-Version"] });
+    let config = generated_gateway(&spec(extension, pet_paths()));
+    let bridge = &config["servers"]["openapi"]["openapi"];
+    assert_eq!(bridge["forward_request_headers"], json!(["X-Api-Version"]));
+    assert!(create_plugin("mcp_gateway", &config).unwrap().is_some());
+
+    // A reserved name is refused when the generated plugin is admitted.
+    let extension = json!({ "forward_request_headers": ["Authorization"] });
+    let config = generated_gateway(&spec(extension, pet_paths()));
+    let error = match create_plugin("mcp_gateway", &config) {
+        Err(error) => error,
+        Ok(_) => panic!("a reserved forwarded header must be refused"),
+    };
+    assert!(error.contains("reserved request header"), "{error}");
+
+    let extension = json!({ "forward_request_headers": "x-api-version" });
+    let error = extract_error(&spec(extension, pet_paths()));
+    assert!(error.contains("forward_request_headers"), "{error}");
 }

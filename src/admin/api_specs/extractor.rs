@@ -641,10 +641,20 @@ pub fn extract_with_external_refs(
                 ));
             }
         };
+        // The MCP endpoint itself is a `POST` endpoint on this proxy.
+        if let Some(allowed) = proxy.allowed_methods.as_deref()
+            && !crate::proxy::request_method_is_allowed(allowed, "POST")
+        {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp` requires `x-ferrum-proxy.allowed_methods` to allow POST, the MCP request method"
+                    .to_string(),
+            ));
+        }
         let operations = extract_mcp_bridge_operations(
             &root,
             &version,
             listen_prefix,
+            proxy.allowed_methods.as_deref(),
             &effective.document_base,
             &external_docs,
             &mcp_ext,
@@ -1135,6 +1145,7 @@ const X_FERRUM_MCP_KEYS: &[&str] = &[
     "enabled",
     "endpoint",
     "exclude",
+    "forward_request_headers",
     "include",
     "limits",
     "namespace",
@@ -1169,6 +1180,9 @@ struct McpBridgeExtension {
     exclude_operations: HashSet<String>,
     exclude_tags: HashSet<String>,
     limits: Map<String, Value>,
+    /// Client request headers the generated bridge forwards on top of its
+    /// fixed default set (`openapi.forward_request_headers`).
+    forward_request_headers: Vec<Value>,
 }
 
 /// Parsed per-operation `x-ferrum-mcp`.
@@ -1326,6 +1340,16 @@ fn parse_x_ferrum_mcp_extension(root: &Value) -> Result<Option<McpBridgeExtensio
             ));
         }
     };
+    let forward_request_headers = match object.get("forward_request_headers") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(names)) if names.iter().all(Value::is_string) => names.clone(),
+        Some(_) => {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp.forward_request_headers` must be an array of header names"
+                    .to_string(),
+            ));
+        }
+    };
     Ok(Some(McpBridgeExtension {
         endpoint_path,
         namespace,
@@ -1334,6 +1358,7 @@ fn parse_x_ferrum_mcp_extension(root: &Value) -> Result<Option<McpBridgeExtensio
         exclude_operations,
         exclude_tags,
         limits,
+        forward_request_headers,
     }))
 }
 
@@ -1423,13 +1448,20 @@ fn media_type_is_json(media_type: &str) -> bool {
     essence == "application/json" || essence.ends_with("+json")
 }
 
-/// Whether document selection admits an operation. A per-operation `expose`
-/// is authoritative; otherwise `include` (empty means every operation) and
-/// then `exclude` decide by `operationId` or tag.
+/// Whether document selection admits an operation.
+///
+/// A per-operation `expose` is authoritative. Otherwise an explicit `include`
+/// (by `operationId` or tag) selects and `exclude` then removes. With no
+/// explicit selection only `GET` operations are published: a mutating
+/// operation (`POST`, `PUT`, `PATCH`, `DELETE`) becomes a tool only when the
+/// document names it in `include` or sets `expose: true` on it, because the
+/// proxy's method- and path-conditioned policy sees the MCP request, never
+/// the bridged one. `method` is the lower-case OpenAPI method key.
 fn mcp_operation_selected(
     extension: &McpBridgeExtension,
     operation: &Map<String, Value>,
     operation_extension: &McpOperationExtension,
+    method: &str,
 ) -> bool {
     if let Some(expose) = operation_extension.expose {
         return expose;
@@ -1444,8 +1476,13 @@ fn mcp_operation_selected(
         operation_id.is_some_and(|id| operations.contains(id))
             || tags.iter().any(|tag| tag_set.contains(*tag))
     };
-    let include_all = extension.include_operations.is_empty() && extension.include_tags.is_empty();
-    let included = include_all || matches(&extension.include_operations, &extension.include_tags);
+    let explicit_include =
+        !extension.include_operations.is_empty() || !extension.include_tags.is_empty();
+    let included = if explicit_include {
+        matches(&extension.include_operations, &extension.include_tags)
+    } else {
+        method == "get"
+    };
     included && !matches(&extension.exclude_operations, &extension.exclude_tags)
 }
 
@@ -1478,6 +1515,7 @@ fn extract_mcp_bridge_operations(
     root: &Value,
     version: &str,
     listen_prefix: &str,
+    allowed_methods: Option<&[String]>,
     document_base: &Url,
     externals: &HashMap<String, LoadedExternalDocument>,
     extension: &McpBridgeExtension,
@@ -1523,7 +1561,7 @@ fn extract_mcp_bridge_operations(
             };
             let location = format!("paths.{path_template}.{method}");
             let operation_extension = parse_operation_mcp_extension(operation, &location)?;
-            if !mcp_operation_selected(extension, operation, &operation_extension) {
+            if !mcp_operation_selected(extension, operation, &operation_extension, method) {
                 continue;
             }
             let Some(bridge_method) = mcp_bridge::BridgeMethod::parse(method) else {
@@ -1536,6 +1574,17 @@ fn extract_mcp_bridge_operations(
                 }
                 continue;
             };
+            // The proxy's `allowed_methods` filter only ever sees the MCP
+            // `POST`, so an operation the route would refuse to a direct
+            // client is refused here rather than published as a tool that
+            // reaches the backend around it.
+            if let Some(allowed) = allowed_methods
+                && !crate::proxy::request_method_is_allowed(allowed, bridge_method.as_str())
+            {
+                return Err(mcp_extension_error(format!(
+                    "`{location}` is selected as an MCP tool but its method is not in `x-ferrum-proxy.allowed_methods`; exclude the operation or allow the method"
+                )));
+            }
             // Operation servers > Path Item servers > root servers, exactly
             // as the validator resolves them. The first effective base is the
             // one the bridge dispatches under.
@@ -1964,7 +2013,7 @@ fn auto_inject_mcp_gateway(
 ) -> Result<(), ExtractError> {
     if operations.is_empty() {
         return Err(mcp_extension_error(
-            "`x-ferrum-mcp` selected no bridgeable operations (GET, POST, PUT, PATCH, or DELETE)"
+            "`x-ferrum-mcp` selected no bridgeable operations; without `include` only GET operations are published, and POST, PUT, PATCH, and DELETE need `include` or `x-ferrum-mcp: true` on the operation"
                 .to_string(),
         ));
     }
@@ -1994,6 +2043,12 @@ fn auto_inject_mcp_gateway(
     }
 
     let mut bridge = extension.limits;
+    if !extension.forward_request_headers.is_empty() {
+        bridge.insert(
+            "forward_request_headers".to_string(),
+            Value::Array(extension.forward_request_headers),
+        );
+    }
     bridge.insert("operations".to_string(), Value::Array(operations));
     let mut servers = Map::new();
     servers.insert(
