@@ -3465,11 +3465,19 @@ directory. Because both registries hold identical platform descriptors, the GHCR
 attestations reuse the Docker Hub SBOMs. The verify step checks the signature,
 provenance, and SBOM attestations under the pinned identity
 (`https://github.com/ferrum-edge/ferrum-edge/.github/workflows/main-latest-image.yml@refs/heads/main`),
-issuer, repository, ref, and `workflow_run` trigger, and exports the
-`repo@sha256:` references it verified. `promote` creates `latest` only from
-those references, moves Docker Hub first and GHCR second, and checks each
-registry's `latest` digest right after its move. A mismatch fails the run before
-the next registry moves.
+issuer, repository, ref, and `workflow_run` trigger. It then checks that each
+verified reference names its fixed repository and exports only its bare
+`sha256:<64 hex>` digest. A full `repo@sha256:` reference must not cross the job
+boundary: GitHub withholds a job output that may contain a secret, and the
+Docker Hub reference can match the `DOCKERHUB_USERNAME` secret, so it would
+reach `promote` empty. `promote` fails before either registry moves when a
+digest is missing or malformed, rebuilds each reference from its fixed
+repository name (`ferrumedge/ferrum-edge`, `ghcr.io/<owner>/<repo>`), creates
+`latest` only from those references, moves Docker Hub first and GHCR second, and
+checks each registry's `latest` digest right after its move. A mismatch fails
+the run before the next registry moves. The step summary lists each registry's
+digest rather than a full reference or repository name, which GitHub could mask
+the same way.
 
 The identity pins the workflow **path and ref**
 (`main-latest-image.yml@refs/heads/main`), not the workflow file's commit:
@@ -3518,8 +3526,12 @@ built-image run in a credentialed job; no credential in `contract` or `smoke`;
 secrets (matched case-insensitively), action pins matching release.yml, build
 parity and the Git build context, the smoke run, the attest-then-sign order, the
 verify step's identity and issuer, the exact tag set per job, the invoked gate
-sequence in `promote`, `latest` created only from the verified references, and
-the absence of version or eBPF tags. Its `--self-test` mutates the checked-in
+sequence in `promote`, the exact outputs of every job (only bare digests cross
+from `attest` into `promote`, and every job output consumed through dot or
+bracket access, in any letter case, must be declared), `latest` created only
+from references rebuilt from those verified digests, a `promote` summary that
+prints only digests (no reference or repository name), and the absence of
+version or eBPF tags. Its `--self-test` mutates the checked-in
 workflow and requires each regression to be rejected, most of them for their own
 specific reason. `verify_required_ci.py` runs both modes, so the required
 `Tests` check and `Trusted Policy Candidate` enforce it; the publisher's

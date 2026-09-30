@@ -482,6 +482,22 @@ outright with no deprecation period:
 
 ### Fixed
 
+- **`main-latest-image.yml` now moves `latest` after a successful publisher
+  run** (#5893). GitHub withholds a job output that may contain a secret, and
+  the verified Docker Hub `repo@sha256:` reference matched the Docker Hub
+  username secret, so `promote` received it empty and stopped before either
+  `latest` tag moved. `attest` now exports only each verified bare
+  `sha256:<64 hex>` digest, after checking that its reference names the fixed
+  repository; `promote` fails closed on a missing or malformed digest, rebuilds
+  each reference from its fixed repository name, and keeps every existing
+  on-main, forward-only, and final-digest check. The `promote` step summary
+  lists each registry's digest instead of a full reference that GitHub could
+  mask. `verify_main_latest_image_workflow.py` now pins the exact outputs of
+  every job, rejects a full-reference job output, a consumed output its
+  producer does not declare (through dot or bracket access, in any letter
+  case), or a reference or repository name in the `promote` summary, and its
+  self-test covers each of those regressions.
+
 - **A trailing root dot in a received SNI no longer bypasses mesh
   `connection.sni` policy** (#5903). rustls accepts `admin.example.com.` and
   reported it with the dot, so on TLS-terminated HTTP/1.1, HTTP/2, HTTP/3, and
