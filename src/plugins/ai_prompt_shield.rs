@@ -14,10 +14,10 @@
 //! plugin is not registered for `ProxyProtocol::Grpc` and must not be treated
 //! as a fail-closed control for unary or streaming native gRPC traffic.
 //!
-//! gRPC-Web still rides the composed HTTP/gRPC-Web view. Its framed
-//! `application/grpc-web*` bodies (including `+json` variants) remain outside
-//! this bare-JSON policy: they are not buffered, decoded, or rewritten, so
-//! message framing is never double-decoded or corrupted.
+//! gRPC-Web still rides the composed HTTP/gRPC-Web view. Ordinary scan modes
+//! skip its framed `application/grpc-web*` bodies. In `mcp_arguments` mode,
+//! `application/grpc-web+json` is explicitly in scope as JSON and is parsed
+//! and rewritten under that mode's MCP contract.
 //!
 //! ## The final backend-visible body is authoritative
 //!
@@ -272,6 +272,10 @@ enum RedactionOutcome {
     /// the body-transform path, which cannot reject, still emits this
     /// best-effort body so it never forwards the *original* unredacted bytes.
     Incomplete(Value),
+    /// PII was detected, but rewriting the JSON-RPC id through `serde_json`
+    /// would change its wire representation. No rewritten document is safe to
+    /// forward because the peer may no longer correlate its response.
+    IdNotRoundTrippable,
     /// Redaction could not be completed inside the per-request output/work
     /// budget (see [`REDACTION_OUTPUT_EXPANSION_FACTOR`]), or a configured
     /// pattern produced a zero-width match that would amplify at every
@@ -1154,8 +1158,8 @@ impl AiPromptShield {
     /// `mcp_arguments` accepts exactly what `mcp_gateway` accepts — the MCP
     /// JSON media types (`application/json`, `application/json-rpc`, `+json`)
     /// or no `Content-Type` at all — so omitting the header cannot carry a
-    /// tool call past the shield. The other modes keep their JSON scope, and
-    /// framed gRPC is never in scope.
+    /// tool call past the shield. The other modes keep their JSON scope;
+    /// framed gRPC-Web stays out of scope except for `+json` in this mode.
     fn content_type_in_scope(&self, content_type: Option<&str>) -> bool {
         match content_type {
             None => self.scan_mode == ScanMode::McpArguments,
@@ -1383,7 +1387,7 @@ impl AiPromptShield {
                 return RedactionOutcome::NoChange;
             }
             if !mcp_ids_round_trip(body) {
-                return RedactionOutcome::Incomplete(json);
+                return RedactionOutcome::IdNotRoundTrippable;
             }
             mcp_jsonrpc::for_each_tool_call_arguments_mut(&mut json, |arguments| {
                 redact_json_strings(arguments, &self.patterns, false, &budget);
@@ -1707,7 +1711,8 @@ fn mcp_ids_round_trip(body: &str) -> bool {
                     .unwrap_or(false)
             })
         }
-        mcp_jsonrpc::RequestScan::NoToolCall | mcp_jsonrpc::RequestScan::Uninspectable(_) => true,
+        mcp_jsonrpc::RequestScan::NoToolCall => true,
+        mcp_jsonrpc::RequestScan::Uninspectable(_) => false,
     }
 }
 
@@ -1725,8 +1730,9 @@ impl Plugin for AiPromptShield {
         // Native gRPC protobuf/framed messages have no supported prompt-schema
         // contract here. Advertise HTTP only so operators cannot attach this
         // shield as an inert fail-closed control on ProxyProtocol::Grpc.
-        // gRPC-Web continues through the HTTP/gRPC-Web composed view, where
-        // framed bodies are explicitly skipped without decoding.
+        // gRPC-Web continues through the HTTP/gRPC-Web composed view. Framed
+        // bodies are skipped by the ordinary JSON modes; `mcp_arguments`
+        // explicitly accepts +json media types, including gRPC-Web +json.
         super::HTTP_ONLY_PROTOCOLS
     }
 
@@ -1758,11 +1764,10 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        // Check content-type. Framed native gRPC / gRPC-Web bodies (including
-        // `+json` variants) are length-prefixed wire formats, not bare JSON:
-        // they are skipped without buffering or decoding so gRPC-Web framing
-        // is preserved; native gRPC requests should already be excluded via
-        // HTTP_ONLY_PROTOCOLS.
+        // Check content-type. In `mcp_arguments` mode, `+json` media types
+        // (including `application/grpc-web+json`) are explicitly in scope.
+        // Other modes skip framed native gRPC / gRPC-Web bodies so framing is
+        // preserved; native gRPC requests are excluded via HTTP_ONLY_PROTOCOLS.
         if !self.content_type_in_scope(headers.get("content-type").map(String::as_str)) {
             return PluginResult::Continue;
         }
@@ -1947,6 +1952,25 @@ impl Plugin for AiPromptShield {
                                 "error": "PII detected in request",
                                 "detected_types": detected,
                                 "message": "Request blocked: sensitive data could not be redacted. Remove sensitive data before sending to AI provider."
+                            })
+                            .to_string(),
+                            headers: HashMap::new(),
+                        }
+                    }
+                    RedactionOutcome::IdNotRoundTrippable => {
+                        warn_sampled!(
+                            "ai_prompt_shield: MCP id does not round-trip; refusing redaction"
+                        );
+                        ctx.metadata.insert(
+                            "ai_shield_rejected".to_string(),
+                            "jsonrpc_id_not_round_trippable".to_string(),
+                        );
+                        PluginResult::Reject {
+                            status_code: 400,
+                            body: serde_json::json!({
+                                "error": "MCP JSON-RPC id cannot be preserved during redaction",
+                                "detected_types": detected,
+                                "message": "Request blocked because redacting the tool arguments would change the JSON-RPC id representation."
                             })
                             .to_string(),
                             headers: HashMap::new(),
@@ -2232,6 +2256,9 @@ impl AiPromptShield {
             RedactionOutcome::Redacted(json) | RedactionOutcome::Incomplete(json) => {
                 serde_json::to_vec(&json).ok()
             }
+            // Re-serializing the document could change an id the peer uses to
+            // correlate the response; never emit even a partially redacted body.
+            RedactionOutcome::IdNotRoundTrippable => None,
             // Redaction could not complete inside its output/work allowance. The
             // partially rewritten document is discarded rather than forwarded;
             // the wire bytes are left alone so `on_final_request_body` sees the

@@ -626,7 +626,7 @@ fn default_path_mode(mode: AuditMode) -> PathMode {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CaptureConfig {
     request: bool,
     response: bool,
@@ -3138,7 +3138,7 @@ impl AiTranscriptAudit {
         if self.grpc_capture_applies(ctx) {
             return self.capture.response;
         }
-        response_body_capture_allowed(self.capture, response_headers)
+        response_body_capture_allowed(&self.capture, response_headers)
     }
 
     /// Stage an enrolled native-gRPC candidate. Classification is enrollment,
@@ -4504,8 +4504,9 @@ impl AiTranscriptAudit {
     /// Whether a request `Content-Type` makes a `POST` a JSON capture
     /// candidate. With `capture.mcp_tool_calls` the media types `mcp_gateway`
     /// admits qualify too — `application/json-rpc` and any `+json`. A request
-    /// without `Content-Type` is scoped to `capture.mcp_endpoint_path` so other
-    /// POST routes do not incur MCP-specific buffering.
+    /// without `Content-Type` is recognized on every path by default; an
+    /// explicit `capture.mcp_endpoint_path` narrows that scope. A byte pre-scan
+    /// still keeps ordinary non-MCP POST bodies cheap.
     fn candidate_content_type(&self, ctx: &RequestContext, content_type: Option<&str>) -> bool {
         match content_type {
             Some(value) => {
@@ -4518,7 +4519,7 @@ impl AiTranscriptAudit {
                         .capture
                         .mcp_endpoint_path
                         .as_deref()
-                        .is_some_and(|path| ctx.path == path)
+                        .is_none_or(|path| ctx.path == path)
             }
         }
     }
@@ -4640,7 +4641,7 @@ impl AiTranscriptAudit {
             let entry = McpAuditCall {
                 tool,
                 tool_truncated,
-                id_key: mcp_correlation_key(member.id),
+                id_key: mcp_correlation_key_raw(member.id),
                 ..McpAuditCall::default()
             };
             staged.retained_bytes = staged
@@ -4971,6 +4972,17 @@ impl Plugin for AiTranscriptAudit {
         let candidate_shape = ctx.method.eq_ignore_ascii_case("POST")
             && self.candidate_content_type(ctx, headers.get("content-type").map(String::as_str));
         if !candidate_shape {
+            return PluginResult::Continue;
+        }
+        if headers.get("content-type").is_none()
+            && self.capture.mcp_tool_calls
+            && ctx.metadata.get("request_body").is_some_and(|body| {
+                matches!(
+                    mcp_jsonrpc::scan_request_bytes(body.as_bytes()),
+                    mcp_jsonrpc::RequestScan::NoToolCall
+                )
+            })
+        {
             return PluginResult::Continue;
         }
         // The stream marker is set inside `stage_candidate`, only once the body
@@ -6527,6 +6539,13 @@ fn mcp_correlation_key(id: Option<&Value>) -> Option<String> {
     (key.len() <= MAX_MCP_CORRELATION_ID_BYTES).then_some(key)
 }
 
+/// Canonicalize a raw request-side id through the same JSON value path used by
+/// response ids, so equivalent numeric and escaped-string tokens match.
+fn mcp_correlation_key_raw(id: Option<&serde_json::value::RawValue>) -> Option<String> {
+    let id = serde_json::from_str::<Value>(id?.get()).ok()?;
+    mcp_correlation_key(Some(&id))
+}
+
 /// Aggregate UTF-8 bytes of the retained tool-name set.
 fn tool_names_bytes(names: &[String]) -> usize {
     names.iter().map(String::len).sum()
@@ -7380,7 +7399,7 @@ fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> 
 }
 
 fn response_body_capture_allowed(
-    capture: CaptureConfig,
+    capture: &CaptureConfig,
     response_headers: &HashMap<String, String>,
 ) -> bool {
     response_headers

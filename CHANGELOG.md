@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recognizer (`plugins::utils::mcp_jsonrpc`) that decodes member names,
   refuses duplicate members, and reuses `mcp_gateway`'s default batch bounds:
   - `ai_transcript_audit` captures `tools/call` requests (singletons and
-    batches, including `application/json-rpc`; Content-Type-less POSTs require the
-    exact `capture.mcp_endpoint_path` scope) under `capture.mcp_tool_calls`
+    batches, including `application/json-rpc`; Content-Type-less POSTs are in
+    scope on all paths by default and `capture.mcp_endpoint_path` narrows that
+    scope) under `capture.mcp_tool_calls`
     (default `true`). Records gain an
     `mcp` section with, per call, the public tool name, a keyed
     `arguments_hash`, an optional redacted `arguments` excerpt
@@ -52,7 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `Content-Encoding` prevents inspection), which MCP clients surface.
   - `ai_prompt_shield` gains `scan_fields: mcp_arguments`, which scans (and
     redacts) only `params.arguments` of each `tools/call`, accepts the media
-    types `mcp_gateway` admits, and refuses bodies with duplicate member names.
+    types `mcp_gateway` admits (including `application/grpc-web+json`), refuses
+    duplicate member names, and rejects redaction when an id cannot round-trip.
   - `docs/plugins.md` documents the recommended plugin stack for an
     agent-facing MCP endpoint.
 
@@ -69,8 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_tool_arguments`, `validate_tool_results`, and `mcp.*` metadata
   paths as upstream tools, plus `mcp.bridge.operation`, and (always)
   `mcp.bridge.upstream_status` and `mcp.bridge.gateway_error`. The proxy's
-  `allowed_methods` is applied to the bridged method (`-32001`); method- and
-  path-conditioned triggers, WAF rules, and path-keyed authorization see the
+  `allowed_methods` is applied to the bridged method (`-32003` / "Unknown MCP
+  tool" when no grants are configured, `-32001` when grants are configured);
+  method- and path-conditioned triggers, WAF rules, and path-keyed authorization see the
   MCP request, so bridged operations are restricted through `mcp_gateway`
   policy. Path arguments are percent-encoded per segment and must yield a
   canonical path with no `;` (no `/`, dot segment, `..;`, `?`, or `#` can be
@@ -85,8 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, query, and body are re-checked in the final request-body hook
   (`-32014` on drift); a request-body transform (for example a prompt-guard
   redaction) that changed the admitted envelope is re-validated and carried
-  into the REST body, or refused when it would change the request line or
-  headers. The backend response is converted in the buffered normalize phase
+  into the REST request, including redacted path, query, and header arguments.
+  The backend response is converted in the buffered normalize phase
   into a `tools/call` result answered with HTTP 200: a 2xx is always
   `isError: false` (text content plus `structuredContent` for a bounded JSON
   object, or a note when the body is omitted as oversized, coded, streamed,

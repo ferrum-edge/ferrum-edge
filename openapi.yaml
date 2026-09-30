@@ -35934,8 +35934,10 @@ components:
         OpenAPI document is ever dialed. The proxy's allowed_methods applies to
         the bridged method too: a tool whose method the route does not allow is
         omitted from tools/list, and a call to it is refused with JSON-RPC
-        -32001 after the tool policy and per-consumer grant and before argument
-        validation. Method- or path-conditioned plugin
+        -32003 (Unknown MCP tool) when no grants are configured, or -32001
+        when grants are configured. The method check follows tool policy and
+        the per-consumer grant and precedes argument validation. Method- or
+        path-conditioned plugin
         triggers, WAF path and method rules, and authorization keyed on the
         request path see the client's POST to the MCP endpoint, never the
         bridged method and path; restrict a bridged operation through

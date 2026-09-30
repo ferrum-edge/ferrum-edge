@@ -1990,6 +1990,10 @@ fn the_capacity_refusal_is_attributed_from_the_decision_not_from_availability() 
         check_rate.contains("self.decide(key, limit_op, ctx).await"),
         "request admission must go through the shared decision"
     );
+    assert!(
+        !check_rate.contains("local_fallback_active()"),
+        "check_rate must use decision attribution"
+    );
     let body = source
         .split("    async fn decide(")
         .nth(1)

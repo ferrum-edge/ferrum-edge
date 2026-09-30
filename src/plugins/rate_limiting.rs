@@ -123,14 +123,15 @@ pub const MCP_TOOL_CALL_RATE_LIMITED: i64 = -32015;
 /// cannot be enforced (`redis_failure_policy: fail_closed` during an outage).
 pub const MCP_TOOL_CALL_RATE_LIMIT_UNAVAILABLE: i64 = -32016;
 
-/// JSON-RPC error code when a scoped MCP request uses a content coding the
-/// governance recognizer cannot inspect (`-32017`).
+/// JSON-RPC error code when an in-scope POST uses a non-identity content coding
+/// the governance recognizer cannot inspect (`-32017`). This applies whether
+/// or not the body contains `tools/call`; `endpoint_path` narrows the scope.
 pub const MCP_TOOL_CALL_UNINSPECTABLE_ENCODING: i64 = -32017;
 
 const MCP_TOOL_CALL_RATE_LIMITED_MESSAGE: &str = "MCP tool-call rate limit exceeded";
 const MCP_TOOL_CALL_RATE_LIMIT_UNAVAILABLE_MESSAGE: &str = "MCP tool-call rate limit unavailable";
 const MCP_TOOL_CALL_UNINSPECTABLE_ENCODING_MESSAGE: &str =
-    "MCP tool-call request content encoding cannot be inspected";
+    "MCP request content encoding cannot be inspected";
 
 /// Closed top-level key set for `rate_limiting` plugin config.
 ///
@@ -958,6 +959,10 @@ impl RateLimiting {
                 .map(str::trim)
                 .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
         }) {
+            ctx.metadata.insert(
+                "ratelimit_mcp_uninspectable".to_string(),
+                "true".to_string(),
+            );
             return mcp_jsonrpc_refusal(
                 &McpReplyShape::default(),
                 MCP_TOOL_CALL_UNINSPECTABLE_ENCODING,

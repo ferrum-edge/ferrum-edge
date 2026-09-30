@@ -4371,6 +4371,10 @@ async fn mcp_redaction_refuses_numeric_ids_that_cannot_round_trip() {
         let mut ctx = make_post_ctx_with_raw_body(&body);
         let mut headers = make_post_headers();
         assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_rejected"),
+            Some("jsonrpc_id_not_round_trippable")
+        );
         assert!(
             !shield_metadata(&ctx, "request_body")
                 .unwrap_or_default()
@@ -4378,6 +4382,48 @@ async fn mcp_redaction_refuses_numeric_ids_that_cannot_round_trip() {
             "a changed id token must not accompany a partial rewrite"
         );
     }
+
+    let body = concat!(
+        r#"{"jsonrpc":"2.0","id":1e3,"method":"tools/call","params":{"name":"#,
+        r#"crm.lookup","arguments":{"ssn":"#,
+        "123-45-6789",
+        r#""}}}"#,
+    );
+    let mut transform_headers = make_post_headers();
+    transform_headers.insert(":method".to_string(), "POST".to_string());
+    assert!(
+        plugin
+            .transform_request_body(
+                body.as_bytes(),
+                Some("application/json"),
+                &transform_headers,
+            )
+            .await
+            .is_none(),
+        "an id refusal must never emit a rewritten or original document"
+    );
+}
+
+#[tokio::test]
+async fn mcp_redaction_refuses_ids_when_the_request_scan_is_uninspectable() {
+    let padding = "x".repeat(300_000);
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1e3,"method":"tools/call","params":{{"name":"crm.lookup","arguments":{{"ssn":"123-45-6789","padding":"{padding}"}}}}}}"#
+    );
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "scan_fields": "mcp_arguments",
+        "patterns": ["ssn", "email"],
+        "max_scan_bytes": 400_000
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx_with_raw_body(&body);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("jsonrpc_id_not_round_trippable")
+    );
 }
 
 #[tokio::test]
