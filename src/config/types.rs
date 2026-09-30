@@ -10096,9 +10096,14 @@ impl PluginConfig {
             );
         }
 
-        // Config JSON size
+        // Config JSON size. Generated OpenAPI configs embed resolved operation
+        // schemas: the validator's operation table, and `mcp_gateway`'s
+        // OpenAPI bridge tool definitions (`servers.*.openapi`), share the
+        // larger generated-config budget.
         let config_json = serde_json::to_string(&self.config).unwrap_or_default();
-        let max_config_size = if self.plugin_name == "openapi_validator" {
+        let plugin_name = self.plugin_name.as_str();
+        let generated_openapi_config = matches!(plugin_name, "openapi_validator" | "mcp_gateway");
+        let max_config_size = if generated_openapi_config {
             MAX_OPENAPI_VALIDATOR_CONFIG_SIZE
         } else {
             MAX_PLUGIN_CONFIG_SIZE
@@ -10112,7 +10117,7 @@ impl PluginConfig {
         }
 
         // Config JSON nesting depth
-        let max_config_depth = if self.plugin_name == "openapi_validator" {
+        let max_config_depth = if generated_openapi_config {
             MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH
         } else {
             10

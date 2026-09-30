@@ -14,6 +14,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mcp_gateway` OpenAPI bridge and `x-ferrum-mcp`** (#5906). A
+  `servers.<id>` entry may carry an `openapi` block instead of `upstream_url`:
+  each configured OpenAPI operation (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`)
+  is published as one MCP tool and every `tools/call` runs as an HTTP request
+  to the proxy's OWN configured backend through ordinary backend dispatch
+  (upstreams, retries, circuit breaker, TLS, observability). Only the backend
+  method, path, query, headers, and body change; no tool argument can choose
+  the host, scheme, or port, and an OpenAPI document's `servers[]` URLs are
+  never dialed. Generated tools use the aggregate `namespace.name` shape and
+  go through the same catalog, policy, discovery, per-consumer grant,
+  `validate_tool_arguments`, `validate_tool_results`, and `mcp.*` metadata
+  paths as upstream tools, plus `mcp.bridge.operation`,
+  `mcp.bridge.upstream_status`, and `mcp.bridge.gateway_error`. Path
+  arguments are percent-encoded per segment and must yield a canonical path
+  (no `/`, dot segment, `?`, or `#` can be injected); query values are
+  form-encoded; header parameters naming hop-by-hop, `Host`,
+  `Authorization`, `Cookie`, `Proxy-*`, `X-Forwarded-*`, MCP-transport, or
+  Ferrum-internal fields are refused at load and again per call. The
+  bridged method, path, query, and body are re-checked in the final
+  request-body hook (`-32014` on drift). The backend response is converted
+  in the buffered normalize phase into a `tools/call` result answered with
+  HTTP 200: a 2xx is `isError: false` with text content plus
+  `structuredContent` for a bounded JSON object; anything else, including
+  gateway errors with their `X-Gateway-Error` class, is `isError: true` with
+  the status line and a bounded body excerpt. Operation count, tool schema
+  size and depth, request body, response body, error excerpt, and
+  `structuredContent` are all bounded. `POST /api-specs` generates such a
+  proxy-scoped gateway from the new `x-ferrum-mcp` extension (`enabled`,
+  `endpoint.path`, `namespace`, `include` / `exclude` by operationId or tag,
+  `limits`, and per-operation `expose` / `name` / `title` / `description` /
+  `annotations`), resolving `$ref`s with the `x-ferrum-validate` resolver and
+  budgets; OpenAPI 3.x only, and not combinable with `x-ferrum-validate` in
+  one document. Proxy core gains a private plugin-selected backend method
+  (read once after `before_proxy` on H1/H2 and native H3) and a
+  normalizer-selected response status for the replacement it installed;
+  `mcp_gateway` configs share the generated-config size/depth budget of
+  `openapi_validator`.
 - **`mcp_gateway` per-consumer tool grants** (#5907). In `aggregate_router`
   mode a `policy.tools` entry with `action: allow` can carry
   `allowed_groups` and `denied_groups`, matched against the request

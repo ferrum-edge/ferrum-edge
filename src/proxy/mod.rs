@@ -32069,7 +32069,7 @@ async fn handle_proxy_request_inner(
         .accepted_local_addr
         .map(|addr| addr.ip());
 
-    let method = req.method().as_str().to_owned();
+    let mut method = req.method().as_str().to_owned();
     let inbound_version = req.version();
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
     // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4) — disjoint from the
@@ -34755,6 +34755,17 @@ async fn handle_proxy_request_inner(
                 request_host.as_deref(),
             );
         }
+    }
+
+    // Backend method: every `before_proxy` pass is complete, so a plugin-selected
+    // backend method (only `mcp_gateway`'s OpenAPI bridge sets one, from a fixed
+    // set of static tokens that excludes HEAD/OPTIONS/TRACE/CONNECT) is final
+    // here. Retry eligibility and every backend dispatch below read this
+    // binding; `ctx.method` keeps the client's method for policy and logging.
+    // The common path pays one `Option` test and no allocation. Keep in sync
+    // with the native HTTP/3 ladder (`src/http3/server.rs`).
+    if let Some(backend_method) = ctx.backend_method_override {
+        method = backend_method.to_owned();
     }
 
     // Capture the backend-visible query only after every deferred before_proxy

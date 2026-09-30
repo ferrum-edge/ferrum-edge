@@ -219,6 +219,127 @@ async fn test_admin_sqlite_runtime_resource_crud_matrix() {
     run_concurrent_admin_mutations(&gateway, backend_a.port, "sqlite").await;
 }
 
+/// `x-ferrum-mcp` end to end (issue #5906): a spec provisioned through
+/// `POST /api-specs` publishes its operations as MCP tools on the proxy, and
+/// `tools/call` runs as a REST request to the proxy's own backend.
+#[tokio::test]
+#[ignore]
+async fn test_admin_sqlite_api_spec_mcp_bridge_end_to_end() {
+    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let backend = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/pets/7"))
+        .and(query_param("verbose", "true"))
+        .and(header("x-trace-tag", "trace-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "7", "name": "Rex"})))
+        .mount(&backend)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/pets"))
+        .and(body_json(json!({"name": "Rex"})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "8"})))
+        .mount(&backend)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pets/404"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "no such pet"})))
+        .mount(&backend)
+        .await;
+
+    let gateway = TestGateway::builder()
+        .mode_database_sqlite()
+        .log_level("warn")
+        .db_poll_interval_seconds(1)
+        .spawn()
+        .await
+        .expect("spawn sqlite gateway");
+    let client = Client::new();
+    let auth = gateway.auth_header();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let listen_path = format!("/mcp-bridge-{}", &suffix[..8]);
+    let proxy_id = format!("mcp-bridge-{}", &suffix[..8]);
+    let backend_port = backend.address().port();
+    let spec = mcp_bridge_spec(&proxy_id, &listen_path, backend_port);
+    let created = admin_post_json(&client, &gateway, "/api-specs", &auth, spec).await;
+    let spec_id = created["id"].as_str().expect("api spec id").to_string();
+
+    let generated = admin_get_json(&client, &gateway, "/plugins/config", &auth).await;
+    let gateway_plugin = generated["items"]
+        .as_array()
+        .or_else(|| generated.as_array())
+        .expect("plugin list")
+        .iter()
+        .find(|p| p["plugin_name"] == "mcp_gateway" && p["api_spec_id"] == spec_id)
+        .cloned()
+        .expect("POST /api-specs persists the generated mcp_gateway");
+    assert_eq!(gateway_plugin["proxy_id"], proxy_id);
+    assert_eq!(gateway_plugin["scope"], "proxy");
+
+    let endpoint = gateway.proxy_url(&format!("{listen_path}/mcp"));
+    let session = mcp_bridge_initialize(&client, &endpoint).await;
+
+    let request = mcp_bridge_request(2, "tools/list", json!({}));
+    let (_, listed) = mcp_bridge_post(&client, &endpoint, &session, request).await;
+    let mut names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools/list result")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["pets.createPet", "pets.getPet"], "{listed}");
+
+    let arguments = json!({ "petId": "7", "verbose": true, "X-Trace-Tag": "trace-1" });
+    let call = mcp_bridge_call(3, "pets.getPet", arguments);
+    let (status, body) = mcp_bridge_post(&client, &endpoint, &session, call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], json!(3), "{body}");
+    assert_eq!(body["result"]["isError"], json!(false), "{body}");
+    let structured = &body["result"]["structuredContent"];
+    assert_eq!(structured, &json!({"id": "7", "name": "Rex"}), "{body}");
+
+    let call = mcp_bridge_call(4, "pets.createPet", json!({ "body": { "name": "Rex" } }));
+    let (status, body) = mcp_bridge_post(&client, &endpoint, &session, call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], json!(false), "{body}");
+    let structured = &body["result"]["structuredContent"];
+    assert_eq!(structured, &json!({"id": "8"}), "{body}");
+
+    let call = mcp_bridge_call(5, "pets.getPet", json!({ "petId": "404" }));
+    let (status, body) = mcp_bridge_post(&client, &endpoint, &session, call).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a tool error rides HTTP 200: {body}"
+    );
+    assert_eq!(body["result"]["isError"], json!(true), "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.starts_with("HTTP 404 Not Found"), "{text}");
+    assert!(text.contains("no such pet"), "{text}");
+
+    // A path argument can never add a segment: refused before dispatch.
+    let call = mcp_bridge_call(6, "pets.getPet", json!({ "petId": "7/admin" }));
+    let (_, body) = mcp_bridge_post(&client, &endpoint, &session, call).await;
+    assert_eq!(body["error"]["code"], json!(-32602), "{body}");
+
+    let received = backend.received_requests().await.unwrap_or_default();
+    assert_eq!(received.len(), 3, "exactly the three dispatched calls");
+    for request in &received {
+        assert!(
+            !request.url.path().contains("admin"),
+            "a refused call must never reach the backend"
+        );
+        assert!(
+            !request.headers.contains_key("mcp-session-id"),
+            "MCP transport headers never reach the REST backend"
+        );
+    }
+    let methods: Vec<&str> = received.iter().map(|r| r.method.as_str()).collect();
+    assert_eq!(methods, vec!["GET", "POST", "GET"]);
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_admin_postgres_runtime_resource_crud_matrix() {
@@ -2429,4 +2550,136 @@ async fn mongodb_is_available(url: &str) -> bool {
         .unwrap_or("localhost:27017");
 
     tokio::net::TcpStream::connect(host_port).await.is_ok()
+}
+
+fn mcp_bridge_spec(proxy_id: &str, listen_path: &str, backend_port: u16) -> Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": { "title": "Pets bridge", "version": "1.0.0" },
+        "x-ferrum-mcp": { "namespace": "pets" },
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "listen_path": listen_path,
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true
+        },
+        "paths": {
+            "/pets/{petId}": {
+                "get": {
+                    "operationId": "getPet",
+                    "parameters": [
+                        {
+                            "name": "petId",
+                            "in": "path",
+                            "required": true,
+                            "schema": { "type": "string" }
+                        },
+                        { "name": "verbose", "in": "query", "schema": { "type": "boolean" } },
+                        { "name": "X-Trace-Tag", "in": "header", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "the pet",
+                            "content": {
+                                "application/json": { "schema": { "type": "object" } }
+                            }
+                        }
+                    }
+                }
+            },
+            "/pets": {
+                "post": {
+                    "operationId": "createPet",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["name"],
+                                    "properties": { "name": { "type": "string" } }
+                                }
+                            }
+                        }
+                    },
+                    "responses": { "201": { "description": "created" } }
+                }
+            }
+        }
+    })
+}
+
+fn mcp_bridge_request(id: i64, method: &str, params: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+fn mcp_bridge_call(id: i64, name: &str, arguments: Value) -> Value {
+    let params = json!({ "name": name, "arguments": arguments });
+    mcp_bridge_request(id, "tools/call", params)
+}
+
+async fn mcp_bridge_post(
+    client: &Client,
+    endpoint: &str,
+    session: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = client
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-11-25")
+        .header("mcp-session-id", session)
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|err| panic!("POST {endpoint}: {err}"));
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let value = serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("{status}: invalid JSON-RPC body ({err}): {text}"));
+    (status, value)
+}
+
+/// Initialize an MCP session once the spec-generated gateway is live (the
+/// database poller publishes it asynchronously).
+async fn mcp_bridge_initialize(client: &Client, endpoint: &str) -> String {
+    let params = json!({
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": { "name": "functional-mcp-bridge", "version": "1" }
+    });
+    let initialize = mcp_bridge_request(1, "initialize", params);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = String::from("no response yet");
+    while Instant::now() < deadline {
+        let response = client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&initialize)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let session = response
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned);
+                let body = response.text().await.unwrap_or_default();
+                if status == StatusCode::OK
+                    && let Some(session) = session
+                {
+                    return session;
+                }
+                last = format!("{status}: {body}");
+            }
+            Err(err) => last = err.to_string(),
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    panic!("timed out waiting for the MCP endpoint {endpoint}; last observation: {last}");
 }

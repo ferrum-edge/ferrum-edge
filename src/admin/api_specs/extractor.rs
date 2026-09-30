@@ -22,6 +22,7 @@ use crate::config::types::{
     OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES, json_depth, validate_resource_id,
 };
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
+use crate::plugins::mcp_openapi_bridge as mcp_bridge;
 use crate::util::media_type::is_concrete_http_media_type;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
@@ -598,7 +599,9 @@ pub fn extract_with_external_refs(
         Vec::new()
     };
 
-    if let Some(validate_ext) = parse_x_ferrum_validate_extension(&root)? {
+    let validate_ext = parse_x_ferrum_validate_extension(&root)?;
+    let validate_enabled = validate_ext.is_some();
+    if let Some(validate_ext) = validate_ext {
         let operations = extract_operation_schemas(
             &root,
             &version,
@@ -613,6 +616,46 @@ pub fn extract_with_external_refs(
             validate_ext,
             operations,
             &version,
+        )?;
+    }
+
+    // --- x-ferrum-mcp (optional): operations as mcp_gateway tools ----------
+    if let Some(mcp_ext) = parse_x_ferrum_mcp_extension(&root)? {
+        // A bridged call reaches the backend under the operation's path while
+        // the client request targets the MCP endpoint, so the generated
+        // validator would judge the endpoint as an unknown operation. The
+        // combination is refused rather than silently weakened.
+        if validate_enabled {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp` cannot be combined with `x-ferrum-validate` in one document"
+                    .to_string(),
+            ));
+        }
+        let listen_prefix = match proxy.listen_path.as_deref() {
+            None => "",
+            Some(path) if path.starts_with('/') => path.trim_end_matches('/'),
+            Some(_) => {
+                return Err(mcp_extension_error(
+                    "`x-ferrum-mcp` requires `x-ferrum-proxy.listen_path` to be a literal path prefix"
+                        .to_string(),
+                ));
+            }
+        };
+        let operations = extract_mcp_bridge_operations(
+            &root,
+            &version,
+            listen_prefix,
+            &effective.document_base,
+            &external_docs,
+            &mcp_ext,
+        )?;
+        auto_inject_mcp_gateway(
+            &mut plugins,
+            &proxy,
+            namespace,
+            mcp_ext,
+            operations,
+            listen_prefix,
         )?;
     }
 
@@ -1078,6 +1121,1022 @@ fn merge_bypass_config(
                 base_object.insert(key.clone(), value.clone());
             }
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// x-ferrum-mcp: OpenAPI operations as mcp_gateway tools (issue #5906)
+// ---------------------------------------------------------------------------
+
+/// Exhaustive `x-ferrum-mcp` document-level keys. A typo must fail admission
+/// rather than silently build a gateway with a weaker default in force.
+const X_FERRUM_MCP_KEYS: &[&str] = &[
+    "enabled",
+    "endpoint",
+    "exclude",
+    "include",
+    "limits",
+    "namespace",
+];
+const X_FERRUM_MCP_ENDPOINT_KEYS: &[&str] = &["path"];
+const X_FERRUM_MCP_SELECTOR_KEYS: &[&str] = &["operations", "tags"];
+const X_FERRUM_MCP_LIMIT_KEYS: &[&str] = &[
+    "max_error_excerpt_bytes",
+    "max_request_body_bytes",
+    "max_response_body_bytes",
+    "max_structured_content_bytes",
+];
+/// Exhaustive per-operation `x-ferrum-mcp` keys.
+const X_FERRUM_MCP_OPERATION_KEYS: &[&str] =
+    &["annotations", "description", "expose", "name", "title"];
+/// Server id of the generated bridge server inside the generated
+/// `mcp_gateway` config. Reserved: an operator-embedded `mcp_gateway` may not
+/// declare its own server under this id.
+const MCP_BRIDGE_SERVER_ID: &str = "openapi";
+/// Tool namespace when the document does not choose one.
+const DEFAULT_MCP_BRIDGE_NAMESPACE: &str = "api";
+const MAX_MCP_BRIDGE_NAMESPACE_BYTES: usize = 64;
+const MAX_MCP_BRIDGE_TEXT_BYTES: usize = 8 * 1024;
+const MAX_MCP_BRIDGE_TOOL_NAME_BYTES: usize = 128;
+
+/// Parsed document-level `x-ferrum-mcp`.
+struct McpBridgeExtension {
+    endpoint_path: Option<String>,
+    namespace: String,
+    include_operations: HashSet<String>,
+    include_tags: HashSet<String>,
+    exclude_operations: HashSet<String>,
+    exclude_tags: HashSet<String>,
+    limits: Map<String, Value>,
+}
+
+/// Parsed per-operation `x-ferrum-mcp`.
+#[derive(Default)]
+struct McpOperationExtension {
+    expose: Option<bool>,
+    name: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    annotations: Option<Value>,
+}
+
+fn mcp_extension_error(error: String) -> ExtractError {
+    ExtractError::MalformedExtension {
+        which: "x-ferrum-mcp",
+        error,
+    }
+}
+
+fn reject_unknown_mcp_extension_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), ExtractError> {
+    crate::util::unknown_keys::reject_unknown_keys(object, path, allowed, &format!("`{path}`: "))
+        .map_err(mcp_extension_error)
+}
+
+fn mcp_string_set(
+    object: &Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> Result<HashSet<String>, ExtractError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(HashSet::new()),
+        Some(Value::Array(items)) => {
+            let mut values = HashSet::with_capacity(items.len());
+            for item in items {
+                let Some(value) = item.as_str() else {
+                    return Err(mcp_extension_error(format!("`{path}.{key}` must hold strings")));
+                };
+                values.insert(value.to_string());
+            }
+            Ok(values)
+        }
+        Some(_) => Err(mcp_extension_error(format!("`{path}.{key}` must be an array of strings"))),
+    }
+}
+
+fn mcp_selector(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<(HashSet<String>, HashSet<String>), ExtractError> {
+    let path = format!("x-ferrum-mcp.{key}");
+    match object.get(key) {
+        None | Some(Value::Null) => Ok((HashSet::new(), HashSet::new())),
+        Some(Value::Object(selector)) => {
+            reject_unknown_mcp_extension_keys(selector, &path, X_FERRUM_MCP_SELECTOR_KEYS)?;
+            Ok((
+                mcp_string_set(selector, "operations", &path)?,
+                mcp_string_set(selector, "tags", &path)?,
+            ))
+        }
+        Some(_) => Err(mcp_extension_error(format!(
+            "`{path}` must be an object with `operations` and/or `tags`"
+        ))),
+    }
+}
+
+fn parse_x_ferrum_mcp_extension(root: &Value) -> Result<Option<McpBridgeExtension>, ExtractError> {
+    let object = match root.get("x-ferrum-mcp") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => return Ok(None),
+        Some(Value::Bool(true)) => Map::new(),
+        Some(Value::Object(object)) => object.clone(),
+        Some(_) => {
+            return Err(mcp_extension_error("expected true, false, or an object".to_string()));
+        }
+    };
+    reject_unknown_mcp_extension_keys(&object, "x-ferrum-mcp", X_FERRUM_MCP_KEYS)?;
+    match object.get("enabled") {
+        None | Some(Value::Null) | Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => return Ok(None),
+        Some(_) => {
+            return Err(mcp_extension_error("`x-ferrum-mcp.enabled` must be a boolean".to_string()));
+        }
+    }
+    let endpoint_path = match object.get("endpoint") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(endpoint)) => {
+            reject_unknown_mcp_extension_keys(
+                endpoint,
+                "x-ferrum-mcp.endpoint",
+                X_FERRUM_MCP_ENDPOINT_KEYS,
+            )?;
+            match endpoint.get("path") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(path)) => Some(path.clone()),
+                Some(_) => {
+                    return Err(mcp_extension_error(
+                        "`x-ferrum-mcp.endpoint.path` must be a string".to_string(),
+                    ));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp.endpoint` must be an object".to_string(),
+            ));
+        }
+    };
+    let namespace = match object.get("namespace") {
+        None | Some(Value::Null) => DEFAULT_MCP_BRIDGE_NAMESPACE.to_string(),
+        Some(Value::String(namespace)) => namespace.clone(),
+        Some(_) => {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp.namespace` must be a string".to_string(),
+            ));
+        }
+    };
+    // The namespace is the leading component of every public tool name, so
+    // it is held to the MCP tool-name alphabet.
+    if namespace.is_empty()
+        || namespace.len() > MAX_MCP_BRIDGE_NAMESPACE_BYTES
+        || !namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(mcp_extension_error(format!(
+            "`x-ferrum-mcp.namespace` must be 1-{MAX_MCP_BRIDGE_NAMESPACE_BYTES} characters of `A-Za-z0-9_-`"
+        )));
+    }
+    let (include_operations, include_tags) = mcp_selector(&object, "include")?;
+    let (exclude_operations, exclude_tags) = mcp_selector(&object, "exclude")?;
+    let limits = match object.get("limits") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(limits)) => {
+            reject_unknown_mcp_extension_keys(
+                limits,
+                "x-ferrum-mcp.limits",
+                X_FERRUM_MCP_LIMIT_KEYS,
+            )?;
+            limits.clone()
+        }
+        Some(_) => {
+            return Err(mcp_extension_error("`x-ferrum-mcp.limits` must be an object".to_string()));
+        }
+    };
+    Ok(Some(McpBridgeExtension {
+        endpoint_path,
+        namespace,
+        include_operations,
+        include_tags,
+        exclude_operations,
+        exclude_tags,
+        limits,
+    }))
+}
+
+fn mcp_operation_text(
+    object: &Map<String, Value>,
+    key: &str,
+    location: &str,
+) -> Result<Option<String>, ExtractError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(truncate_utf8(text, MAX_MCP_BRIDGE_TEXT_BYTES))),
+        Some(_) => Err(mcp_extension_error(format!(
+            "`{location}.x-ferrum-mcp.{key}` must be a string"
+        ))),
+    }
+}
+
+fn parse_operation_mcp_extension(
+    operation: &Map<String, Value>,
+    location: &str,
+) -> Result<McpOperationExtension, ExtractError> {
+    let object = match operation.get("x-ferrum-mcp") {
+        None | Some(Value::Null) => return Ok(McpOperationExtension::default()),
+        Some(Value::Bool(expose)) => {
+            return Ok(McpOperationExtension {
+                expose: Some(*expose),
+                ..McpOperationExtension::default()
+            });
+        }
+        Some(Value::Object(object)) => object,
+        Some(_) => {
+            return Err(mcp_extension_error(format!(
+                "`{location}.x-ferrum-mcp` must be a boolean or an object"
+            )));
+        }
+    };
+    reject_unknown_mcp_extension_keys(
+        object,
+        "paths.*.*.x-ferrum-mcp",
+        X_FERRUM_MCP_OPERATION_KEYS,
+    )?;
+    let expose = match object.get("expose") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(expose)) => Some(*expose),
+        Some(_) => {
+            return Err(mcp_extension_error(format!(
+                "`{location}.x-ferrum-mcp.expose` must be a boolean"
+            )));
+        }
+    };
+    let annotations = match object.get("annotations") {
+        None | Some(Value::Null) => None,
+        Some(annotations @ Value::Object(_)) => Some(annotations.clone()),
+        Some(_) => {
+            return Err(mcp_extension_error(format!(
+                "`{location}.x-ferrum-mcp.annotations` must be an object"
+            )));
+        }
+    };
+    Ok(McpOperationExtension {
+        expose,
+        name: mcp_operation_text(object, "name", location)?,
+        title: mcp_operation_text(object, "title", location)?,
+        description: mcp_operation_text(object, "description", location)?,
+        annotations,
+    })
+}
+
+/// The JSON media entry of a content map: `application/json` first, then any
+/// media type with the `+json` structured-syntax suffix.
+fn json_media_entry(content: &Map<String, Value>) -> Option<&Value> {
+    content.get("application/json").or_else(|| {
+        content
+            .iter()
+            .find(|(media_type, _)| media_type_is_json(media_type))
+            .map(|(_, media)| media)
+    })
+}
+
+fn media_type_is_json(media_type: &str) -> bool {
+    let essence = media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json" || essence.ends_with("+json")
+}
+
+/// Whether document selection admits an operation. A per-operation `expose`
+/// is authoritative; otherwise `include` (empty means every operation) and
+/// then `exclude` decide by `operationId` or tag.
+fn mcp_operation_selected(
+    extension: &McpBridgeExtension,
+    operation: &Map<String, Value>,
+    operation_extension: &McpOperationExtension,
+) -> bool {
+    if let Some(expose) = operation_extension.expose {
+        return expose;
+    }
+    let operation_id = operation.get("operationId").and_then(Value::as_str);
+    let tags: Vec<&str> = operation
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|tags| tags.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let matches = |operations: &HashSet<String>, tag_set: &HashSet<String>| {
+        operation_id.is_some_and(|id| operations.contains(id))
+            || tags.iter().any(|tag| tag_set.contains(*tag))
+    };
+    let include_all = extension.include_operations.is_empty() && extension.include_tags.is_empty();
+    let included = include_all || matches(&extension.include_operations, &extension.include_tags);
+    included && !matches(&extension.exclude_operations, &extension.exclude_tags)
+}
+
+/// A valid MCP tool name derived from free text: every character outside
+/// `A-Za-z0-9_.-` becomes `_`, runs collapse, and the result is bounded.
+fn mcp_tool_name_slug(text: &str) -> String {
+    let mut slug = String::with_capacity(text.len());
+    for character in text.chars() {
+        let mapped = if character.is_ascii_alphanumeric() || matches!(character, '.' | '-') {
+            character
+        } else {
+            '_'
+        };
+        if mapped == '_' && slug.ends_with('_') {
+            continue;
+        }
+        slug.push(mapped);
+    }
+    let slug = slug.trim_matches('_');
+    truncate_utf8(slug, MAX_MCP_BRIDGE_TOOL_NAME_BYTES)
+}
+
+/// Generate one `mcp_gateway` bridge operation per selected OpenAPI 3.x
+/// operation.
+///
+/// `$ref`s are resolved with the SAME resolver, depth limit, and
+/// document-scoped expansion budget the `x-ferrum-validate` generator uses,
+/// so the tool schemas cost no more to import than the validator's.
+fn extract_mcp_bridge_operations(
+    root: &Value,
+    version: &str,
+    listen_prefix: &str,
+    document_base: &Url,
+    externals: &HashMap<String, LoadedExternalDocument>,
+    extension: &McpBridgeExtension,
+) -> Result<Vec<Value>, ExtractError> {
+    if version == "2.0" {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp` requires an OpenAPI 3.x document; Swagger 2.0 is not supported"
+                .to_string(),
+        ));
+    }
+    let resolver = LocalSchemaResolver::build(root, version, document_base, externals)?;
+    let root = resolver.primary_root();
+    let Some(paths) = root.get("paths").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let root_server_bases = match openapi_server_bases(root.get("servers"), "servers")? {
+        None => vec![SERVER_BASE_ROOT.to_string()],
+        Some(bases) => bases,
+    };
+    let mut resolution_state = ResolutionState::new();
+    let mut operations = Vec::new();
+    let mut tool_names = HashSet::new();
+    for (path_template, path_item) in paths {
+        let resolved_path_item = resolve_path_item(
+            resolver.primary_root(),
+            path_item,
+            path_template,
+            MAX_SCHEMA_REF_DEPTH,
+            resolver.document_base(),
+            &resolver,
+            &mut resolution_state,
+        )?;
+        let Some(path_object) = resolved_path_item.as_object() else {
+            continue;
+        };
+        let path_item_bases = openapi_server_bases(
+            path_object.get("servers"),
+            &format!("paths.{path_template}.servers"),
+        )?;
+        for method in HTTP_METHODS {
+            let Some(operation) = path_object.get(*method).and_then(Value::as_object) else {
+                continue;
+            };
+            let location = format!("paths.{path_template}.{method}");
+            let operation_extension = parse_operation_mcp_extension(operation, &location)?;
+            if !mcp_operation_selected(extension, operation, &operation_extension) {
+                continue;
+            }
+            let Some(bridge_method) = mcp_bridge::BridgeMethod::parse(method) else {
+                // HEAD / OPTIONS / TRACE have body-less or diagnostic
+                // response semantics a JSON-RPC tool result cannot carry.
+                if operation_extension.expose == Some(true) {
+                    return Err(mcp_extension_error(format!(
+                        "`{location}` cannot be exposed as an MCP tool: only GET, POST, PUT, PATCH, and DELETE operations are bridged"
+                    )));
+                }
+                continue;
+            };
+            // Operation servers > Path Item servers > root servers, exactly
+            // as the validator resolves them. The first effective base is the
+            // one the bridge dispatches under.
+            let effective_bases = match openapi_server_bases(
+                operation.get("servers"),
+                &format!("{location}.servers"),
+            )? {
+                Some(bases) => bases,
+                None => path_item_bases
+                    .clone()
+                    .unwrap_or_else(|| root_server_bases.clone()),
+            };
+            let base = effective_bases
+                .first()
+                .map(String::as_str)
+                .unwrap_or(SERVER_BASE_ROOT);
+            let spec_path = join_server_base_and_path(base, path_template)?;
+            let public_path = if !listen_prefix.is_empty() && spec_path == "/" {
+                listen_prefix.to_string()
+            } else {
+                format!("{listen_prefix}{spec_path}")
+            };
+            let generated = generate_mcp_bridge_operation(
+                &resolver,
+                &mut resolution_state,
+                version,
+                McpBridgeOperationSource {
+                    location: &location,
+                    method: bridge_method,
+                    public_path,
+                    path_object,
+                    operation,
+                    extension: operation_extension,
+                },
+            )?;
+            let name = generated
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !tool_names.insert(name.clone()) {
+                return Err(mcp_extension_error(format!(
+                    "`{location}` produces the tool name {name:?}, which another operation already uses; set `x-ferrum-mcp.name` on one of them"
+                )));
+            }
+            operations.push(generated);
+        }
+    }
+    if operations.len() > mcp_bridge::MAX_BRIDGE_OPERATIONS {
+        return Err(mcp_extension_error(format!(
+            "`x-ferrum-mcp` selects {} operations; at most {} can be published as tools, so narrow the selection with `include` / `exclude`",
+            operations.len(),
+            mcp_bridge::MAX_BRIDGE_OPERATIONS
+        )));
+    }
+    Ok(operations)
+}
+
+/// One selected operation, as the bridge generator reads it.
+struct McpBridgeOperationSource<'a> {
+    location: &'a str,
+    method: mcp_bridge::BridgeMethod,
+    public_path: String,
+    path_object: &'a Map<String, Value>,
+    operation: &'a Map<String, Value>,
+    extension: McpOperationExtension,
+}
+
+fn generate_mcp_bridge_operation(
+    resolver: &LocalSchemaResolver,
+    state: &mut ResolutionState,
+    version: &str,
+    source: McpBridgeOperationSource<'_>,
+) -> Result<Value, ExtractError> {
+    let location = source.location;
+    let root = resolver.primary_root();
+    // A template expression must occupy a whole path segment so an argument
+    // can never merge into a literal and change how the path splits.
+    for segment in source.public_path.split('/') {
+        let whole = segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2;
+        if segment.contains(['{', '}']) && !whole {
+            return Err(mcp_extension_error(format!(
+                "`{location}` has a path template expression that does not occupy a whole path segment, which the MCP bridge cannot fill safely; exclude the operation"
+            )));
+        }
+    }
+
+    // Path Item parameters, overridden by operation parameters with the same
+    // `name` and `in`.
+    let mut declared: Vec<Value> = Vec::new();
+    let inherited = source.path_object.get("parameters");
+    let own = source.operation.get("parameters");
+    for parameters in [inherited, own].into_iter().flatten() {
+        let Some(parameters) = parameters.as_array() else {
+            return Err(mcp_extension_error(format!("`{location}` parameters must be an array")));
+        };
+        for parameter in parameters {
+            let resolved = resolve_refs(
+                root,
+                parameter,
+                location,
+                MAX_SCHEMA_REF_DEPTH,
+                resolver.document_base(),
+                resolver,
+                ResolveContext::ReferenceObject,
+                state,
+            )?;
+            let key = |value: &Value| {
+                (
+                    value.get("name").and_then(Value::as_str).map(str::to_owned),
+                    value.get("in").and_then(Value::as_str).map(str::to_owned),
+                )
+            };
+            let resolved_key = key(&resolved);
+            declared.retain(|existing| key(existing) != resolved_key);
+            declared.push(resolved);
+        }
+    }
+
+    let mut parameters = Vec::with_capacity(declared.len());
+    for parameter in &declared {
+        let Some(object) = parameter.as_object() else {
+            return Err(mcp_extension_error(format!(
+                "`{location}` has a parameter that is not a Parameter Object"
+            )));
+        };
+        let Some(name) = object.get("name").and_then(Value::as_str) else {
+            return Err(mcp_extension_error(format!(
+                "`{location}` has a parameter without a `name`"
+            )));
+        };
+        let location_in = object.get("in").and_then(Value::as_str).unwrap_or("");
+        let default_style = match location_in {
+            "path" | "header" => "simple",
+            "query" => "form",
+            _ => {
+                return Err(mcp_extension_error(format!(
+                    "`{location}` parameter {name:?} is `in: {location_in:?}`; the MCP bridge serializes only path, query, and header parameters (a tool argument can never set Cookie), so exclude the operation"
+                )));
+            }
+        };
+        if object.contains_key("content") {
+            return Err(mcp_extension_error(format!(
+                "`{location}` parameter {name:?} uses `content`; the MCP bridge serializes only `schema` parameters, so exclude the operation"
+            )));
+        }
+        if object
+            .get("style")
+            .and_then(Value::as_str)
+            .is_some_and(|style| style != default_style)
+        {
+            return Err(mcp_extension_error(format!(
+                "`{location}` parameter {name:?} uses a non-default `style`; the MCP bridge serializes only the default style, so exclude the operation"
+            )));
+        }
+        let explode = object.get("explode").and_then(Value::as_bool);
+        if location_in == "query" && explode == Some(false) {
+            return Err(mcp_extension_error(format!(
+                "`{location}` parameter {name:?} sets `explode: false`; the MCP bridge serializes query arrays exploded only, so exclude the operation"
+            )));
+        }
+        if object.get("allowReserved").and_then(Value::as_bool) == Some(true) {
+            return Err(mcp_extension_error(format!(
+                "`{location}` parameter {name:?} sets `allowReserved`, which the MCP bridge never honors (query values are always encoded), so exclude the operation"
+            )));
+        }
+        if location_in == "header" && mcp_bridge::bridge_header_name_is_reserved(name) {
+            return Err(mcp_extension_error(format!(
+                "`{location}` header parameter {name:?} names a reserved request header (hop-by-hop, Host, Authorization, Cookie, Proxy-*, X-Forwarded-*, MCP transport, or a Ferrum-internal field) that a tool argument may never set; exclude the operation"
+            )));
+        }
+        let Some(schema) = object.get("schema") else {
+            return Err(mcp_extension_error(format!(
+                "`{location}` parameter {name:?} has no `schema`"
+            )));
+        };
+        let schema = resolve_refs(
+            root,
+            schema,
+            location,
+            MAX_SCHEMA_REF_DEPTH,
+            resolver.document_base(),
+            resolver,
+            ResolveContext::Schema,
+            state,
+        )?;
+        let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Request);
+        let mut generated = Map::new();
+        generated.insert("name".to_string(), Value::String(name.to_string()));
+        generated.insert("in".to_string(), Value::String(location_in.to_string()));
+        let required = location_in == "path"
+            || object
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        generated.insert("required".to_string(), Value::Bool(required));
+        if let Some(description) = object.get("description").and_then(Value::as_str) {
+            generated.insert(
+                "description".to_string(),
+                Value::String(truncate_utf8(description, MAX_MCP_BRIDGE_TEXT_BYTES)),
+            );
+        }
+        generated.insert("schema".to_string(), schema);
+        parameters.push(Value::Object(generated));
+    }
+
+    let request_body = match source.operation.get("requestBody") {
+        None => None,
+        Some(request_body) => {
+            let resolved = resolve_refs(
+                root,
+                request_body,
+                location,
+                MAX_SCHEMA_REF_DEPTH,
+                resolver.document_base(),
+                resolver,
+                ResolveContext::ReferenceObject,
+                state,
+            )?;
+            let required = resolved
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let json_media = resolved
+                .get("content")
+                .and_then(Value::as_object)
+                .and_then(json_media_entry);
+            match json_media {
+                Some(media) => {
+                    let schema = match media.get("schema") {
+                        Some(schema) => {
+                            let schema = resolve_refs(
+                                root,
+                                schema,
+                                location,
+                                MAX_SCHEMA_REF_DEPTH,
+                                resolver.document_base(),
+                                resolver,
+                                ResolveContext::Schema,
+                                state,
+                            )?;
+                            normalize_schema_for_openapi(schema, version, SchemaDirection::Request)
+                        }
+                        None => json!({}),
+                    };
+                    let mut body = Map::new();
+                    body.insert("required".to_string(), Value::Bool(required));
+                    let description = resolved.get("description").and_then(Value::as_str);
+                    if let Some(description) = description {
+                        body.insert(
+                            "description".to_string(),
+                            Value::String(truncate_utf8(description, MAX_MCP_BRIDGE_TEXT_BYTES)),
+                        );
+                    }
+                    body.insert("schema".to_string(), schema);
+                    Some(Value::Object(body))
+                }
+                // A required body the bridge can only send as JSON cannot be
+                // satisfied; an optional one is simply not offered.
+                None if required => {
+                    return Err(mcp_extension_error(format!(
+                        "`{location}` requires a request body with no JSON media type; the MCP bridge sends JSON bodies only, so exclude the operation"
+                    )));
+                }
+                None => None,
+            }
+        }
+    };
+
+    let output_schema =
+        mcp_bridge_output_schema(resolver, state, version, source.operation, location)?;
+
+    let operation_id = source.operation.get("operationId").and_then(Value::as_str);
+    let name = match (&source.extension.name, operation_id) {
+        (Some(name), _) => {
+            if !mcp_bridge::is_valid_bridge_tool_name(name) {
+                return Err(mcp_extension_error(format!(
+                    "`{location}.x-ferrum-mcp.name` must be 1-{MAX_MCP_BRIDGE_TOOL_NAME_BYTES} characters of `A-Za-z0-9_.-`"
+                )));
+            }
+            name.clone()
+        }
+        (None, Some(operation_id)) => mcp_tool_name_slug(operation_id),
+        (None, None) => mcp_tool_name_slug(&format!(
+            "{}_{}",
+            source.method.as_str().to_ascii_lowercase(),
+            source.public_path
+        )),
+    };
+    if !mcp_bridge::is_valid_bridge_tool_name(&name) {
+        return Err(mcp_extension_error(format!(
+            "`{location}` does not yield a valid MCP tool name; set `x-ferrum-mcp.name`"
+        )));
+    }
+
+    let summary = source
+        .operation
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(|summary| truncate_utf8(summary, MAX_MCP_BRIDGE_TEXT_BYTES));
+    let operation_description = source
+        .operation
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|description| truncate_utf8(description, MAX_MCP_BRIDGE_TEXT_BYTES));
+    let title = source.extension.title.clone().or_else(|| summary.clone());
+    let description = source
+        .extension
+        .description
+        .clone()
+        .or(operation_description)
+        .or(summary);
+
+    let mut generated = Map::new();
+    generated.insert("name".to_string(), Value::String(name));
+    generated.insert(
+        "method".to_string(),
+        Value::String(source.method.as_str().to_string()),
+    );
+    generated.insert("path".to_string(), Value::String(source.public_path));
+    if let Some(title) = title {
+        generated.insert("title".to_string(), Value::String(title));
+    }
+    if let Some(description) = description {
+        generated.insert("description".to_string(), Value::String(description));
+    }
+    if !parameters.is_empty() {
+        generated.insert("parameters".to_string(), Value::Array(parameters));
+    }
+    if let Some(request_body) = request_body {
+        generated.insert("request_body".to_string(), request_body);
+    }
+    if let Some(output_schema) = output_schema {
+        generated.insert("output_schema".to_string(), output_schema);
+    }
+    if let Some(annotations) = source.extension.annotations {
+        generated.insert("annotations".to_string(), annotations);
+    }
+    let generated = Value::Object(generated);
+    let bytes = serde_json::to_vec(&generated)
+        .map_err(|_| mcp_extension_error(format!("`{location}` could not be serialized")))?
+        .len();
+    if bytes > mcp_bridge::MAX_BRIDGE_TOOL_DEFINITION_BYTES {
+        return Err(ExtractError::SchemaTooLarge {
+            location: location.to_string(),
+        });
+    }
+    Ok(generated)
+}
+
+/// The `outputSchema` of a bridged operation: the JSON schema of its first 2xx
+/// response (exact codes before `2XX`), published only when it describes an
+/// object — `structuredContent` is always a JSON object.
+fn mcp_bridge_output_schema(
+    resolver: &LocalSchemaResolver,
+    state: &mut ResolutionState,
+    version: &str,
+    operation: &Map<String, Value>,
+    location: &str,
+) -> Result<Option<Value>, ExtractError> {
+    let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let mut statuses: Vec<&String> = responses
+        .keys()
+        .filter(|status| {
+            status.len() == 3
+                && status.starts_with('2')
+                && status[1..].bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .collect();
+    statuses.sort();
+    if responses.contains_key("2XX") {
+        statuses.extend(responses.keys().filter(|status| status.as_str() == "2XX"));
+    }
+    let root = resolver.primary_root();
+    for status in statuses {
+        let Some(response) = responses.get(status.as_str()) else {
+            continue;
+        };
+        let resolved = resolve_refs(
+            root,
+            response,
+            location,
+            MAX_SCHEMA_REF_DEPTH,
+            resolver.document_base(),
+            resolver,
+            ResolveContext::ReferenceObject,
+            state,
+        )?;
+        let Some(content) = resolved.get("content").and_then(Value::as_object) else {
+            continue;
+        };
+        let schema = json_media_entry(content).and_then(|media| media.get("schema"));
+        let Some(schema) = schema else {
+            continue;
+        };
+        let schema = resolve_refs(
+            root,
+            schema,
+            location,
+            MAX_SCHEMA_REF_DEPTH,
+            resolver.document_base(),
+            resolver,
+            ResolveContext::Schema,
+            state,
+        )?;
+        let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
+        let is_object = schema.get("type").and_then(Value::as_str) == Some("object");
+        return Ok(is_object.then_some(schema));
+    }
+    Ok(None)
+}
+
+/// Build (or merge into an operator-embedded `mcp_gateway`) the generated
+/// proxy-scoped gateway serving the bridged operations.
+fn auto_inject_mcp_gateway(
+    plugins: &mut Vec<PluginConfig>,
+    proxy: &Proxy,
+    namespace: &str,
+    extension: McpBridgeExtension,
+    operations: Vec<Value>,
+    listen_prefix: &str,
+) -> Result<(), ExtractError> {
+    if operations.is_empty() {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp` selected no bridgeable operations (GET, POST, PUT, PATCH, or DELETE)"
+                .to_string(),
+        ));
+    }
+    let endpoint_path = extension
+        .endpoint_path
+        .unwrap_or_else(|| format!("{listen_prefix}/mcp"));
+    // The endpoint is served by this proxy, so it must sit under the proxy's
+    // literal listen prefix, and it reserves its whole subtree, so no bridged
+    // operation may live there.
+    if !listen_prefix.is_empty()
+        && endpoint_path != listen_prefix
+        && !endpoint_path.starts_with(&format!("{listen_prefix}/"))
+    {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp.endpoint.path` must be under the proxy's `listen_path`".to_string(),
+        ));
+    }
+    let endpoint_scope = endpoint_path.trim_end_matches('/');
+    for operation in &operations {
+        let path = operation.get("path").and_then(Value::as_str).unwrap_or("");
+        if path == endpoint_scope || path.starts_with(&format!("{endpoint_scope}/")) {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp.endpoint.path` overlaps a bridged operation path; the MCP endpoint reserves its whole path subtree"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let mut bridge = extension.limits;
+    bridge.insert("operations".to_string(), Value::Array(operations));
+    let mut servers = Map::new();
+    servers.insert(
+        MCP_BRIDGE_SERVER_ID.to_string(),
+        json!({
+            "namespace": extension.namespace,
+            "expose_tools": true,
+            "openapi": Value::Object(bridge),
+        }),
+    );
+    let mut config = Map::new();
+    config.insert(
+        "mode".to_string(),
+        Value::String("aggregate_router".to_string()),
+    );
+    config.insert("endpoint".to_string(), json!({ "path": endpoint_path }));
+    // The published document IS the operator's decision to expose these
+    // operations, so the generated catalog is visible and callable by default.
+    // An embedded `mcp_gateway` entry overrides any of these blocks (for
+    // example to add per-consumer grants or `default_action: deny`).
+    config.insert(
+        "discovery".to_string(),
+        json!({
+            "aggregate_tools": true,
+            "aggregate_resources": false,
+            "aggregate_prompts": false,
+            "on_new_tool": "allow",
+            "on_schema_change": "allow"
+        }),
+    );
+    config.insert(
+        "capabilities".to_string(),
+        json!({ "advertise_resources": false, "advertise_prompts": false }),
+    );
+    config.insert("policy".to_string(), json!({ "default_action": "allow" }));
+    config.insert("servers".to_string(), Value::Object(servers));
+    let auto_config = Value::Object(config);
+
+    let mut embedded = plugins
+        .iter_mut()
+        .filter(|plugin| plugin.plugin_name == "mcp_gateway");
+    if let Some(existing) = embedded.next() {
+        if embedded.next().is_some() {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp` can merge into at most one `mcp_gateway` entry in `x-ferrum-plugins`"
+                    .to_string(),
+            ));
+        }
+        let merged = merge_mcp_gateway_config(auto_config, &existing.config)?;
+        validate_generated_config_budget("x-ferrum-mcp", "mcp_gateway", &merged)?;
+        existing.config = merged;
+        return Ok(());
+    }
+
+    validate_generated_config_budget("x-ferrum-mcp", "mcp_gateway", &auto_config)?;
+    let now = Utc::now();
+    plugins.push(PluginConfig {
+        labels: Default::default(),
+        id: String::new(),
+        plugin_name: "mcp_gateway".to_string(),
+        namespace: namespace.to_string(),
+        config: auto_config,
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy.id.clone()),
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    });
+    Ok(())
+}
+
+/// Merge an operator-embedded `mcp_gateway` config over the generated one.
+///
+/// Operator blocks replace the generated block of the same name, except
+/// `servers`, which is merged (the generated `openapi` server id is reserved),
+/// and `mode`, which must stay `aggregate_router`.
+fn merge_mcp_gateway_config(
+    auto_config: Value,
+    operator_config: &Value,
+) -> Result<Value, ExtractError> {
+    let Value::Object(mut base) = auto_config else {
+        return Err(mcp_extension_error(
+            "generated mcp_gateway config was not an object".to_string(),
+        ));
+    };
+    let operator = operator_config.as_object().ok_or_else(|| {
+        mcp_extension_error("the embedded `mcp_gateway` config must be an object".to_string())
+    })?;
+    for (key, value) in operator {
+        match key.as_str() {
+            "mode" => {
+                if value.as_str() != Some("aggregate_router") {
+                    return Err(mcp_extension_error(
+                        "the embedded `mcp_gateway` must use mode `aggregate_router` to serve `x-ferrum-mcp` tools"
+                            .to_string(),
+                    ));
+                }
+            }
+            "servers" => {
+                let Some(operator_servers) = value.as_object() else {
+                    return Err(mcp_extension_error(
+                        "the embedded `mcp_gateway` `servers` must be an object".to_string(),
+                    ));
+                };
+                if operator_servers.contains_key(MCP_BRIDGE_SERVER_ID) {
+                    return Err(mcp_extension_error(format!(
+                        "the embedded `mcp_gateway` may not declare server {MCP_BRIDGE_SERVER_ID:?}; that id is reserved for the `x-ferrum-mcp` generated tools"
+                    )));
+                }
+                if let Some(Value::Object(servers)) = base.get_mut("servers") {
+                    for (server_id, server) in operator_servers {
+                        servers.insert(server_id.clone(), server.clone());
+                    }
+                }
+            }
+            _ => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok(Value::Object(base))
+}
+
+/// Size and depth budget for a generated plugin config, shared by the
+/// `x-ferrum-mcp` generator and bounded like the validator's.
+fn validate_generated_config_budget(
+    which: &'static str,
+    plugin_name: &str,
+    config: &Value,
+) -> Result<(), ExtractError> {
+    let size = serde_json::to_vec(config)
+        .map_err(|error| ExtractError::MalformedExtension {
+            which,
+            error: format!("generated {plugin_name} config could not be serialized: {error}"),
+        })?
+        .len();
+    if size > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
+        return Err(ExtractError::MalformedExtension {
+            which,
+            error: format!(
+                "generated {plugin_name} config must not exceed {MAX_OPENAPI_VALIDATOR_CONFIG_SIZE} bytes (got {size})"
+            ),
+        });
+    }
+    let depth = json_depth(config);
+    if depth > MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH {
+        return Err(ExtractError::MalformedExtension {
+            which,
+            error: format!(
+                "generated {plugin_name} config depth must not exceed {MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH} (got {depth})"
+            ),
+        });
     }
     Ok(())
 }

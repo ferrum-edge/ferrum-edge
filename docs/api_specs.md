@@ -99,6 +99,9 @@ x-ferrum-plugins:        # OPTIONAL — array (all must be proxy-scoped)
           max_requests: 100
 
 x-ferrum-validate: true  # OPTIONAL — auto-generate openapi_validator
+# x-ferrum-mcp: true     # OPTIONAL — auto-generate an mcp_gateway serving the
+#                        # operations as MCP tools (not combinable with
+#                        # x-ferrum-validate in one document)
 
 paths:
   /:
@@ -208,6 +211,57 @@ Runtime validation supports JSON and `+json`, XML and `+xml` with OpenAPI `xml` 
 If `x-ferrum-plugins` already includes an `openapi_validator`, the importer merges it with the generated config: operator scalar fields win, `bypass.paths` / `bypass.methods` / `bypass.consumers` are unioned, `bypass.header_present` maps are merged with operator entries overriding spec entries on header-name conflicts, and `operations` is always regenerated from the spec. Malformed spec-side bypass shapes are rejected during extraction instead of being silently dropped.
 
 For full runtime settings and metadata keys, see [openapi_validator.md](openapi_validator.md).
+
+### `x-ferrum-mcp` (optional)
+
+Set `x-ferrum-mcp: true` (or an object) to publish the document's operations as **MCP tools**. The importer generates a proxy-scoped `mcp_gateway` in `aggregate_router` mode whose single `openapi` server (server id `openapi`) carries one tool per selected operation. Each `tools/call` then runs as an ordinary HTTP request to **this proxy's own configured backend** — through the same upstream selection, retries, circuit breaker, backend TLS, and observability as a direct request — and the backend response is returned as the MCP tool result. An API published once is callable by AI agents with no MCP server to write or host. See [plugins.md → OpenAPI bridge](plugins.md#openapi-bridge-generated-tools) for the runtime contract.
+
+```yaml
+x-ferrum-mcp:
+  enabled: true                 # default true for the object form
+  endpoint:
+    path: /pets/mcp             # default: listen_path + "/mcp"
+  namespace: pets               # tool-name prefix; default "api" (A-Za-z0-9_-, 1-64)
+  include:                      # empty/absent = every operation
+    tags: [public]
+    operations: [getPet]        # by operationId
+  exclude:
+    operations: [deletePet]
+  limits:                       # copied into the generated server; see plugins.md
+    max_request_body_bytes: 1048576
+    max_response_body_bytes: 1048576
+    max_error_excerpt_bytes: 2048
+    max_structured_content_bytes: 262144
+
+paths:
+  /pets/{petId}:
+    get:
+      operationId: getPet
+      x-ferrum-mcp:             # per operation: true / false, or an object
+        name: get_pet           # tool name (default: sanitized operationId, else method_path)
+        title: Get a pet
+        description: Fetch one pet by id
+        annotations: { openWorldHint: false }
+```
+
+`x-ferrum-mcp` accepts `true`, `false` / `null` (no generation), or a **closed** object with exactly the keys `enabled`, `endpoint` (`path`), `namespace`, `include` / `exclude` (`operations`, `tags`), and `limits` (`max_request_body_bytes`, `max_response_body_bytes`, `max_error_excerpt_bytes`, `max_structured_content_bytes`); anything else is rejected with HTTP 400 and a spelling suggestion. A per-operation `x-ferrum-mcp` is `true` / `false` or a closed object with `expose`, `name`, `title`, `description`, and `annotations`.
+
+**Selection.** A per-operation `expose` (or boolean) is authoritative. Otherwise an operation is selected when `include` is empty or names its `operationId` or one of its `tags`, and `exclude` does not. Only `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` operations are bridged; `HEAD` / `OPTIONS` / `TRACE` are skipped (an explicit `expose: true` on one is an error). Selecting no bridgeable operation, or more than 256, is an error.
+
+**Generated tools.** For each selected operation:
+
+- **`name`** — `x-ferrum-mcp.name`, else the `operationId` with every character outside `A-Za-z0-9_.-` replaced by `_`, else `method_path`. The public name is `namespace` + `.` + name, exactly like an aggregate tool, so `policy.tools` keys and per-consumer grants address generated tools the same way (`pets.get_pet`). Two operations producing one name is an error naming both.
+- **`title` / `description`** — the per-operation override, else `summary` / `description`.
+- **`inputSchema`** — a closed object with one property per path, query, and header parameter (keyed by the parameter name; Path Item parameters are overridden by operation parameters with the same `name` and `in`) plus `body` for the JSON request body. Path parameters are always required; `body` is required when `requestBody.required` is true. `$ref`s are resolved with the **same resolver, depth ceiling, and document-scoped expansion budget as `x-ferrum-validate`**, and OpenAPI 3.0 schemas get the same direction-aware normalization.
+- **`outputSchema`** — the JSON schema of the first 2xx response (exact codes in order, then `2XX`), published only when it is `type: object` (structured content is always an object).
+- **`annotations`** — `readOnlyHint: true` for `GET`, `destructiveHint: true` for `DELETE`, `idempotentHint: true` for `PUT`; the per-operation `annotations` override any of them.
+- **`path`** — the operation's **public** path on this proxy: the literal `listen_path` prefix, then the first effective server pathname (operation → Path Item → root `servers`, as for `x-ferrum-validate`), then the Paths key. The document's `servers[]` URLs contribute only a pathname and are **never dialed**.
+
+**Rejected (HTTP 400 `MalformedExtension`, naming the operation — exclude it to proceed):** header parameters named after a hop-by-hop field, `Host`, `Authorization`, `Cookie`, `Proxy-*`, `X-Forwarded-*`, `Forwarded`, an MCP transport field (`Mcp-*`, `Last-Event-ID`), or a Ferrum-internal field (`X-Ferrum-*`, `Ferrum-*`, `X-Gateway-*`, `X-Consumer-*`), compared case-insensitively with `_` treated as `-`; `in: cookie` parameters; parameters described by `content`; non-default `style`; query `explode: false`; `allowReserved: true`; a parameter with no `schema`; object-typed parameters and array path parameters (the plugin rejects those at load); a path template expression that does not occupy a whole segment; a *required* request body with no JSON media type (an optional one is simply not offered); and any Swagger 2.0 document. The same header-name rule is enforced again when the generated plugin loads and when each call is built.
+
+**Generated plugin.** The generated config sets `discovery.on_new_tool` / `on_schema_change` to `allow` and `policy.default_action` to `allow` (publishing the document is the decision to expose these operations), turns resource and prompt aggregation off, and stays **proxy-scoped** like every spec plugin. If `x-ferrum-plugins` already embeds one `mcp_gateway`, the generated config is merged into it: the operator's blocks win (for example `policy` with `default_action: deny` plus per-tool `allowed_groups`), `servers` are merged (the `openapi` id is reserved), and `mode` must stay `aggregate_router`. The embedded config is still walked for forbidden credential/consumer keys like every `x-ferrum-plugins` entry; the generated tool schemas are not (a schema property named `consumer` is ordinary document data). Generated configs share the `openapi_validator` budget (14 MiB, nesting depth 64); each tool definition is bounded at 256 KiB.
+
+**Constraints.** `x-ferrum-mcp` requires an OpenAPI 3.x document and a literal-prefix `x-ferrum-proxy.listen_path` (or none). The endpoint must sit under that prefix and must not overlap a bridged operation path (the MCP endpoint reserves its whole subtree). It cannot be combined with `x-ferrum-validate` in one document in this version: the client request targets the MCP endpoint while the backend receives the operation's path, so the generated validator would refuse the endpoint as an unknown operation. Argument validation for bridged calls is the gateway's own `validation.validate_tool_arguments` against the generated `inputSchema`.
 
 ## What is NOT allowed in specs
 
@@ -648,7 +702,54 @@ paths:
 
 Submitting this spec creates one generated `openapi_validator` plugin attached to `orders-contract` for `POST /orders`. A request body missing `id` is rejected with HTTP 400 in `block` mode.
 
-### 5. Updating a spec via PUT — what survives
+### 5. Proxy exposed to AI agents as MCP tools
+
+```yaml
+openapi: 3.1.0
+info:
+  title: Pets API
+  version: 1.0.0
+
+x-ferrum-mcp:
+  namespace: pets
+
+x-ferrum-proxy:
+  id: pets
+  listen_path: /pets-api
+  backend_host: pets.internal
+  backend_port: 8080
+
+paths:
+  /pets/{petId}:
+    get:
+      operationId: getPet
+      summary: Get a pet
+      parameters:
+        - { name: petId, in: path, required: true, schema: { type: string } }
+        - { name: verbose, in: query, schema: { type: boolean } }
+      responses:
+        "200":
+          description: the pet
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { id: { type: string }, name: { type: string } }
+  /pets:
+    post:
+      operationId: createPet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string } } }
+      responses:
+        "201": { description: created }
+```
+
+Submitting this spec creates the proxy plus a generated `mcp_gateway` at `/pets-api/mcp` publishing `pets.getPet` and `pets.createPet`. An MCP client calls `initialize`, then `tools/call` `pets.getPet` with `{"petId": "7", "verbose": true}`; the gateway sends `GET /pets/7?verbose=true` to `pets.internal:8080` (the listen path is stripped exactly as for a direct request) and answers with `{"content": [{"type": "text", "text": "…"}], "structuredContent": {…}, "isError": false}`.
+
+### 6. Updating a spec via PUT — what survives
 
 Assume the spec from example 3 was submitted. Then a plugin was added manually:
 

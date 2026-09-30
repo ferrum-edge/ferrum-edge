@@ -89,6 +89,7 @@ pub mod load_testing;
 pub mod loki_logging;
 pub mod mcp_aggregate_sse;
 pub mod mcp_gateway;
+pub mod mcp_openapi_bridge;
 pub mod mesh;
 pub mod mesh_route_dispatch;
 pub mod mtls_auth;
@@ -3044,6 +3045,30 @@ pub struct RequestContext {
     /// POST-attached response retained privately until final response policy
     /// and the authoritative authorization gate have accepted it.
     pub(crate) mcp_sse_publication: Option<mcp_aggregate_sse::AggregateSsePublication>,
+    /// The backend request an `mcp_gateway` OpenAPI bridge `tools/call` was
+    /// committed to, and the backend response it received. Private so no
+    /// forgeable metadata key can start, redirect, or skip the conversion of
+    /// a bridged call, and so its query and body never reach transaction
+    /// metadata. The claim is an `Arc`, shared by the request-body hook clone.
+    pub(crate) mcp_bridge: Option<mcp_openapi_bridge::McpBridgeState>,
+    /// Backend request method selected by a plugin for this request, or
+    /// `None` to forward the client's own method.
+    ///
+    /// Only `mcp_gateway`'s OpenAPI bridge sets it (a `POST` MCP `tools/call`
+    /// becomes, for example, `GET /pets/7`), and only to a static token from a
+    /// fixed set that excludes `HEAD`, `OPTIONS`, `TRACE`, and `CONNECT`, so
+    /// client response framing never changes. The H1/H2 and native H3
+    /// ladders read it once, after every `before_proxy` pass; the common path
+    /// pays one `Option` test and no allocation. `ctx.method` keeps the
+    /// client's method for policy and logging.
+    pub(crate) backend_method_override: Option<&'static str>,
+    /// Client-visible HTTP status a response normalizer selected for the
+    /// representation it just produced, consumed by
+    /// [`normalize_response_body_for_inspection`] only when that same
+    /// normalizer's replacement was installed. `mcp_gateway`'s OpenAPI bridge
+    /// uses it to answer a converted backend response (any status) as the
+    /// JSON-RPC result it now is, which always rides HTTP 200.
+    pub(crate) normalized_response_status: Option<u16>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -4069,6 +4094,9 @@ impl RequestContext {
             mcp_aggregate_sse: None,
             mcp_sse_stream: None,
             mcp_sse_publication: None,
+            mcp_bridge: None,
+            backend_method_override: None,
+            normalized_response_status: None,
             waf_metadata_initialized: false,
             mesh_request_auth_audiences: Vec::new(),
             mesh_request_auth_claims: HashMap::new(),
@@ -5653,6 +5681,9 @@ impl RequestContext {
             // live request's identity when the copy dropped.
             mcp_sse_stream: None,
             mcp_sse_publication: None,
+            mcp_bridge: self.mcp_bridge.clone(),
+            backend_method_override: self.backend_method_override,
+            normalized_response_status: None,
             waf_metadata_initialized: self.waf_metadata_initialized,
             mesh_request_auth_audiences: self.mesh_request_auth_audiences.clone(),
             mesh_request_auth_claims: self.mesh_request_auth_claims.clone(),
@@ -7912,6 +7943,10 @@ pub async fn normalize_response_body_for_inspection(
                 break;
             }
         };
+        // A status selected by this normalizer applies only to the replacement
+        // it produced, so it is consumed on every pass and honored only below,
+        // once that replacement is installed.
+        let selected_status = ctx.normalized_response_status.take();
         if let Some(body) = body {
             // A normalizer installs a DIFFERENT allocation than the one the
             // collector charged, so the replacement carries its OWN charge,
@@ -7950,6 +7985,9 @@ pub async fn normalize_response_body_for_inspection(
             };
             response_headers.insert("content-length".to_string(), body_len.to_string());
             *response_body = charged;
+            if let Some(status) = selected_status {
+                *response_status = status;
+            }
             normalized = true;
         }
         ctx.record_deadline_response_header_mutations(response_headers);

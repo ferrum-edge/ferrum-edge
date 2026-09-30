@@ -803,6 +803,28 @@ pub mod _test_support {
         ctx.mcp_sse_stream.is_some()
     }
 
+    /// The backend method a plugin selected for this request, as the H1/H2
+    /// and native H3 dispatch ladders read it after `before_proxy`.
+    pub fn backend_method_override_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<&'static str> {
+        ctx.backend_method_override
+    }
+
+    /// Replace the plugin-selected backend method, standing in for a later
+    /// plugin that tampers with a bridged call after admission.
+    pub fn set_backend_method_override_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        method: Option<&'static str>,
+    ) {
+        ctx.backend_method_override = method;
+    }
+
+    /// Whether this request carries an `mcp_gateway` OpenAPI bridge claim.
+    pub fn mcp_bridge_is_claimed_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.mcp_bridge.is_some()
+    }
+
     /// Run the proxy pipeline's POST-attached SSE retention boundary over a
     /// finalized response.
     ///

@@ -2687,7 +2687,7 @@ async fn handle_h3_request(
     // Track this request for overload monitoring and graceful drain.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
-    let method = req.method().to_string();
+    let mut method = req.method().to_string();
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
 
@@ -5389,6 +5389,15 @@ async fn handle_h3_request(
                 &selected_base_proxy.id,
             );
         }
+    }
+
+    // Backend method, final once every `before_proxy` pass is complete (only
+    // `mcp_gateway`'s OpenAPI bridge selects one, from a fixed set of static
+    // tokens that excludes HEAD/OPTIONS/TRACE/CONNECT, so client response
+    // framing is unchanged). The common path pays one `Option` test and no
+    // allocation. Keep in sync with `handle_proxy_request_inner`.
+    if let Some(backend_method) = ctx.backend_method_override {
+        method = backend_method.to_owned();
     }
 
     // Capture the backend-visible query only after every deferred before_proxy
