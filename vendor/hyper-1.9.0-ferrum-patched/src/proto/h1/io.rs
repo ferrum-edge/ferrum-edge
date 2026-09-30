@@ -33,6 +33,7 @@ pub(crate) struct Buffered<T, B> {
     flush_pipeline: bool,
     io: T,
     partial_len: Option<usize>,
+    pending_read_error: Option<io::Error>,
     read_blocked: bool,
     read_buf: BytesMut,
     read_buf_strategy: ReadStrategy,
@@ -73,6 +74,7 @@ where
             flush_pipeline: false,
             io,
             partial_len: None,
+            pending_read_error: None,
             read_blocked: false,
             read_buf: BytesMut::with_capacity(0),
             read_buf_strategy: ReadStrategy::default(),
@@ -228,6 +230,9 @@ where
 
     pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         self.read_blocked = false;
+        if let Some(error) = self.pending_read_error.take() {
+            return Poll::Ready(Err(error));
+        }
         let next = self.read_buf_strategy.next();
         if self.read_buf_remaining_mut() < next {
             self.read_buf.reserve(next);
@@ -256,9 +261,13 @@ where
                     let before = buf.filled().len();
                     match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
                         Poll::Ready(Ok(())) => last = buf.filled().len() - before,
-                        // Pending registered the waker; the error recurs on the
-                        // next read. Either way, hand over what was read.
-                        Poll::Pending | Poll::Ready(Err(_)) => break,
+                        // Pending registered the waker. Preserve a read error
+                        // so it is delivered after the bytes already read.
+                        Poll::Pending => break,
+                        Poll::Ready(Err(error)) => {
+                            self.pending_read_error = Some(error);
+                            break;
+                        }
                     }
                     rounds += 1;
                 }
@@ -753,6 +762,28 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(n, 2000);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn ferrum_greedy_read_preserves_read_ahead_error() {
+        let full = vec![b'a'; GREEDY_READ_MIN];
+        let mock = Mock::new()
+            .read(&full)
+            .read_error(io::Error::from(io::ErrorKind::ConnectionReset))
+            .build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_read_buf_exact_size(64 * 1024);
+
+        let bytes = futures_util::future::poll_fn(|cx| buffered.read_mem(cx, GREEDY_READ_MIN))
+            .await
+            .expect("buffered bytes must be returned before the read error");
+        assert_eq!(bytes.len(), GREEDY_READ_MIN);
+
+        let error = futures_util::future::poll_fn(|cx| buffered.read_mem(cx, GREEDY_READ_MIN))
+            .await
+            .expect_err("the read-ahead error must be delivered on the next read");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     }
 
     #[cfg(not(miri))]

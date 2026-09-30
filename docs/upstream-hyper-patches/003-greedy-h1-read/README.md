@@ -41,7 +41,9 @@ After a successful read, if that read returned at least `GREEDY_READ_MIN`
 `poll_read_from_io` reads again into the same buffer, up to
 `GREEDY_READ_MAX_ROUNDS` (16) extra reads. It stops at the first read that is
 short, returns `Pending`, or fails, and hands over everything read so far. A
-`Pending` has already registered the waker; an error recurs on the next read.
+`Pending` has already registered the waker. A read error is retained and
+delivered after the bytes already buffered, because the `Read` contract does
+not guarantee that a transport error will recur on the next read.
 
 - A read shorter than 16 KiB never triggers another, so small messages (a
   10 KiB request) cost no extra `recv`.
@@ -66,7 +68,9 @@ interleaved rounds each:
 `proto::h1::io::tests::ferrum_greedy_read_after_full_records` hands `Buffered`
 two full 16 KiB reads and a short one in a single `poll_read_from_io` (and
 fails with 16,384 bytes without the patch);
-`ferrum_greedy_read_skips_short_reads` proves a short first read returns alone.
+`ferrum_greedy_read_skips_short_reads` proves a short first read returns alone;
+and `ferrum_greedy_read_preserves_read_ahead_error` proves a one-shot error
+during read-ahead is delivered after the successfully read bytes.
 The `Vendored Patch Regressions` CI job runs them with
 
 ```bash
