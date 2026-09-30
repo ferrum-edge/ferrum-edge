@@ -283,7 +283,7 @@ Manual Start Production Release on main (version input, e.g. v0.2.0)
 
 **Connect BoringCache** links GitHub Actions' existing OIDC identity for
 `ferrum-edge/ferrum-edge` to the BoringCache Workspace `jeremy-j/ferrum-edge`.
-The enrollment workflow installs the SHA-256-verified v1.32.0 Linux CLI and
+The enrollment workflow installs the SHA-256-verified v1.33.0 Linux CLI and
 grants `id-token: write` only to its manual enrollment job. It needs no
 BoringCache repository secret and runs only in the upstream repository on `main`.
 
@@ -300,13 +300,62 @@ After merging the workflow:
    BoringCache's **Machine connections**. If the browser approval expires,
    rerun the workflow and use its new verification URL.
 
-Enrollment is a one-time operation. It establishes the Machine connection;
-cache integration is a separate change tracked in
-[PR #5885](https://github.com/ferrum-edge/ferrum-edge/pull/5885). Once that
-integration is configured, `boringcache/one` starts and renews its OIDC session
-for each supported CI job. See the
+Enrollment is a one-time operation. It establishes the Machine connection.
+The Rust CI integration derives from
+[PR #5885](https://github.com/ferrum-edge/ferrum-edge/pull/5885).
+`boringcache/one` starts and renews its OIDC session for each supported CI job. See the
 [BoringCache enrollment reference](https://boringcache.com/docs/cli) and
 [GitHub Actions guide](https://boringcache.com/docs/github-actions).
+
+### BoringCache Rust CI rollout
+
+The full rollout uses the pinned v1.33.0 action and CLI for unit and ACME
+precompilation, secret/backend and service integration, PKCS#11, native test
+archives, conformance, dependency audit, vendored patches, Lint, Fuzz Smoke,
+eBPF builds and live tests, network-namespace and two-cluster tests, and native
+platform binaries. Integration and functional shards reuse the native archives
+produced by the cached test-artifact build. Existing test selection, compiler
+profiles, warnings, artifact handoffs, and all seven fuzz targets and bounds
+remain in force. FIPS and production-release caching have separate contracts.
+
+`.boringcache.toml` names each lane's target archive and Cargo download profiles;
+reusable Rust/C/C++ compiler objects share the `rust` sccache tag. The fuzz
+target archive excludes sanitizer release output, whose previous 79 GiB archive
+exhausted runner disk; those compiler objects use the remote sccache store.
+Only a push to upstream `main` may write caches. Target archives save after a
+successful Cargo command; the setup action saves downloads after job success.
+Pull requests, merge
+groups, and manual runs restore only, including manual runs on `main`.
+
+**Fallback and rollback.** Fork pull requests, Dependabot, and jobs without
+both GitHub OIDC request capabilities skip BoringCache entirely. They restore
+the existing GitHub Rust caches where available and execute the same native
+Cargo commands and gates. To switch every integrated lane back to the legacy
+GitHub Rust cache without changing YAML, set the repository Actions variable
+`BORINGCACHE_ENABLED` to `false` (Settings → Secrets and variables → Actions →
+Variables) and rerun the affected jobs. Delete it or set it to `true` to return
+to BoringCache. CI's top-level `env` maps the variable into each job because
+composite actions cannot read `vars`; the trusted policy admits exactly that one
+line. The job summary records the selected backend without printing
+credentials. A selected BoringCache session uses strict cache-error handling;
+authentication/backend errors fail visibly and never switch to static tokens.
+
+**Activation and evidence.** The trusted policy prerequisite admits the current
+main Fuzz Smoke generation and the complete cached generation side by side;
+the integration cannot approve its own verifier. Adopt the reviewed policy
+through the repository's trusted policy process first, then validate and merge
+the integration against that base. Confirm the active upstream Machine
+connection and the agreed pilot allowance before activation.
+
+The first successful main push populates the new target/download/compiler
+caches. A restore-only PR or manual run cannot seed them. Record the main run's
+SHA, run ID/attempt, per-job wall time, restore hit/miss, transfer volume, and
+compiler hits/misses from BoringCache's command logs and Workspace reports.
+Then record at least three ordinary warm PR runs and subsequent successful
+main runs, using the same job/shard/profile and comparable changes. Compare
+medians and total runner-minutes with the GitHub-cache baseline, including
+restore/publish overhead, storage/request usage, and retries. A cache hit alone
+does not establish time saved. Expand or tune profiles from these measurements.
 
 ## CI runtime caching (production images and FIPS)
 
@@ -2428,6 +2477,10 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 | `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
 | `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
+| `build-binaries` | `534903aafb65c6bea0c86403c0fff124b81df1fd32beef6d26e91fa06ff01d93` | `17d18101b1884531cee7f2c67b971af12cac602dcc8b1136b3d5781cf9ab5cfb` | PR #5890 (BoringCache) |
+| `ebpf-live` | `a7beefbb4947bb9cf547a6844e6d1777a6ed7089767c3de8d05894ed5d77f856` | `82160c597497bd83d1c7b3f389d589ce426ec3a13c91cfaf3befaded8c81f68c` | PR #5890 (BoringCache) |
+| `netns-capture-live` | `9f18ade4733a936d93c249c63dc6695eaf04b1ba381297a3af76f93c6c64029b` | `20aa57cfa51d30132350f702f3752f1dfd016c0bd9eee091b8b1a55d95218471` | PR #5890 (BoringCache) |
+| `two-cluster-mesh-live` | `d52ce1dd7c8abd4852a5720fa3bdb02e7ac8eeb5b0358da83d4ce64d8279ae9b` | `0304fa5876b7377d3650e242299d48c03e512055602fc4bfc5eacc0f500f943d` | PR #5890 (BoringCache) |
 
 The three `#3915` pairs admit the per-suite planner-gate split (the union
 `run_ebpf_live` output becomes `run_ebpf_kernel_live` /
@@ -2439,6 +2492,13 @@ does not read as Cross-sensitive, so those need no pair here. The
 `performance-regression` job has since moved out of `ci.yml` into
 `performance-regression.yml`, so its pair can no longer match and should be
 retired.
+
+The four #5890 pairs admit BoringCache with an equivalent native Cargo and
+GitHub-cache fallback in the Cross-sensitive cached jobs. The same policy admits
+one exact trailing top-level `env` line,
+`BORINGCACHE_ENABLED: ${{ vars.BORINGCACHE_ENABLED }}` (with its comment), so a
+repository variable can switch every lane back to the legacy cache; the ARM64
+job never reads it, and any other env edit is still refused.
 
 PR #3916's `build-binaries` pair is retired: its destination is main's live
 value, so the tuple admitted a transition between two states `main` is not in

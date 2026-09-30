@@ -1,0 +1,53 @@
+name: BoringCache Cargo
+description: Restore Cargo downloads and install BoringCache for target and compiler caching.
+inputs:
+  cache-profiles:
+    description: Comma-separated archive cache profiles to restore and save
+    required: false
+    default: dependencies
+runs:
+  using: composite
+  steps:
+    - name: Select cache backend
+      id: backend
+      shell: bash
+      env:
+        CACHE_DISABLED: ${{ env.BORINGCACHE_ENABLED == 'false' }}
+        OIDC_ELIGIBLE: ${{ github.repository == 'ferrum-edge/ferrum-edge' && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      run: |
+        set -euo pipefail
+        enabled=false
+        if [ "$CACHE_DISABLED" != true ] && [ "$OIDC_ELIGIBLE" = true ] && \
+           [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          enabled=true
+        fi
+        echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+        echo "CI_BORINGCACHE_ENABLED=$enabled" >> "$GITHUB_ENV"
+        if [ "$enabled" = true ]; then
+          echo 'Cache backend: BoringCache (OIDC)' >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo 'Cache backend: GitHub Rust cache / plain Cargo (BoringCache disabled or OIDC unavailable)' >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: BoringCache Cargo
+      if: steps.backend.outputs.enabled == 'true'
+      uses: boringcache/one@f0fb9b2d926a32b10c543e92093ba00c5a291b79 # v1.33.0
+      with:
+        cli-version: v1.33.0
+        mode: archive
+        cache-profiles: ${{ inputs.cache-profiles }}
+        trust-policy: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'auto' || 'restore' }}
+        save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'on-success' || 'never' }}
+        diagnostics: summary
+        fail-on-cache-error: true
+
+    - name: Expose the verified compiler cache
+      if: steps.backend.outputs.enabled == 'true' && env.FERRUM_SCCACHE_BIN != ''
+      shell: bash
+      run: |
+        dirname "$FERRUM_SCCACHE_BIN" >> "$GITHUB_PATH"
+        # Keep cc-rs fingerprints identical in precompile and later test steps.
+        if [ "$RUNNER_OS" != Windows ]; then
+          echo 'CC=sccache cc' >> "$GITHUB_ENV"
+          echo 'CXX=sccache c++' >> "$GITHUB_ENV"
+        fi

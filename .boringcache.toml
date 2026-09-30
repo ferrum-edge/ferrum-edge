@@ -1,0 +1,178 @@
+workspace = "jeremy-j/ferrum-edge"
+
+[entries.unit-target]
+kind = "cargo-target"
+tag = "unit-target"
+path = "target"
+
+[entries.unit-lib-target]
+kind = "cargo-target"
+tag = "unit-target-lib"
+path = "target"
+
+[entries.unit-plugins-a-target]
+kind = "cargo-target"
+tag = "unit-target-plugins-a"
+path = "target"
+
+[entries.unit-plugins-b-target]
+kind = "cargo-target"
+tag = "unit-target-plugins-b"
+path = "target"
+
+[entries.unit-gateway-core-target]
+kind = "cargo-target"
+tag = "unit-target-gateway-core"
+path = "target"
+
+[entries.acme-target]
+kind = "cargo-target"
+tag = "acme-target"
+path = "target"
+
+[entries.secrets-target]
+kind = "cargo-target"
+tag = "secrets-target"
+path = "target"
+
+[entries.service-integration-target]
+kind = "cargo-target"
+tag = "service-integration-target"
+path = "target"
+
+[entries.pkcs11-target]
+kind = "cargo-target"
+tag = "pkcs11-target"
+path = "target"
+
+[entries.artifacts-target]
+kind = "cargo-target"
+tag = "artifacts-target"
+path = "target"
+
+[entries.conformance-target]
+kind = "cargo-target"
+tag = "conformance-target"
+path = "target"
+
+[entries.lint-target]
+kind = "cargo-target"
+tag = "lint-target"
+path = "target"
+
+[entries.fuzz-target]
+kind = "cargo-target"
+tag = "fuzz-property-target"
+path = "target"
+# Sanitizer release artifacts expanded the previous archive to 79 GiB and left
+# too little runner disk for the next link. Keep the deterministic property
+# target here; sccache owns reusable sanitizer compiler output.
+exclude = ["x86_64-unknown-linux-gnu/release/"]
+
+[entries.ebpf-target]
+kind = "cargo-target"
+tag = "ebpf-target"
+path = "target"
+
+[entries.ebpf-userspace-target]
+kind = "cargo-target"
+tag = "ebpf-userspace-target"
+path = "target"
+
+[entries.ebpf-live-target]
+kind = "cargo-target"
+tag = "ebpf-live-target"
+path = "target"
+
+[entries.netns-live-target]
+kind = "cargo-target"
+tag = "netns-live-target"
+path = "target"
+
+[entries.two-cluster-live-target]
+kind = "cargo-target"
+tag = "two-cluster-live-target"
+path = "target"
+
+[entries.binaries-target]
+kind = "cargo-target"
+tag = "binaries-target"
+path = "target"
+
+[profiles.unit-core]
+entries = ["unit-target", "cargo-git-db"]
+
+[profiles.unit-lib]
+entries = ["unit-lib-target", "cargo-git-db"]
+
+[profiles.unit-plugins-a]
+entries = ["unit-plugins-a-target", "cargo-git-db"]
+
+[profiles.unit-plugins-b]
+entries = ["unit-plugins-b-target", "cargo-git-db"]
+
+[profiles.unit-gateway-core]
+entries = ["unit-gateway-core-target", "cargo-git-db"]
+
+[profiles.acme]
+entries = ["acme-target", "cargo-git-db"]
+
+[profiles.secrets]
+entries = ["secrets-target", "cargo-git-db"]
+
+[profiles.service-integration]
+entries = ["service-integration-target", "cargo-git-db"]
+
+[profiles.pkcs11]
+entries = ["pkcs11-target", "cargo-git-db"]
+
+[profiles.artifacts]
+entries = ["artifacts-target", "cargo-git-db"]
+
+[profiles.conformance]
+entries = ["conformance-target", "cargo-git-db"]
+
+[profiles.vendor-patches]
+# Standalone vendor tests generate their own lockfiles; reuse compiler objects.
+entries = ["cargo-git-db"]
+
+[profiles.lint]
+entries = ["lint-target", "cargo-git-db"]
+
+[profiles.fuzz]
+entries = ["fuzz-target", "cargo-git-db"]
+
+[profiles.ebpf]
+entries = ["ebpf-target", "cargo-git-db"]
+
+[profiles.ebpf-userspace]
+entries = ["ebpf-userspace-target", "cargo-git-db"]
+
+[profiles.ebpf-live]
+entries = ["ebpf-live-target", "cargo-git-db"]
+
+[profiles.netns-live]
+entries = ["netns-live-target", "cargo-git-db"]
+
+[profiles.two-cluster-live]
+entries = ["two-cluster-live-target", "cargo-git-db"]
+
+[profiles.binaries]
+entries = ["binaries-target", "cargo-git-db"]
+
+[profiles.dependencies]
+entries = ["cargo-registry-cache", "cargo-registry-index"]
+
+[profiles.tools]
+entries = ["cargo-git-db"]
+
+[profiles.audit]
+entries = ["cargo-registry-cache", "cargo-registry-index"]
+
+[adapters.cargo]
+profiles = ["unit-core"]
+compiler-cache = "sccache"
+fail-on-cache-error = true
+
+[adapters.sccache]
+tag = "rust"

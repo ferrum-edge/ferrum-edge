@@ -408,7 +408,9 @@ class ReportTests(unittest.TestCase):
 class CacheBackendTests(unittest.TestCase):
     def test_disabled_and_unavailable_identity_never_select_remote_cache(self):
         action = Path('.github/actions/setup-boringcache/action.yml').read_text()
-        self.assertIn("        CACHE_DISABLED: ${{ vars.BORINGCACHE_ENABLED == 'false' }}\n", action)
+        self.assertIn("        CACHE_DISABLED: ${{ env.BORINGCACHE_ENABLED == 'false' }}\n", action)
+        workflow = Path('.github/workflows/ci.yml').read_text()
+        self.assertIn("\n  BORINGCACHE_ENABLED: ${{ vars.BORINGCACHE_ENABLED }}\n\njobs:\n", workflow)
         self.assertIn(
             "        OIDC_ELIGIBLE: ${{ github.repository == 'ferrum-edge/ferrum-edge' "
             "&& github.actor != 'dependabot[bot]' "
