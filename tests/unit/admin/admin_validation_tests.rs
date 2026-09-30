@@ -1987,7 +1987,9 @@ fn role_projected_resources_refuse_writing_their_placeholders_back() {
         "the role response and placeholder detection must not be trait methods"
     );
     let free_fn = |signature: &str| {
-        let start = crud.find(signature).expect("shared projection function must exist");
+        let start = crud
+            .find(signature)
+            .expect("shared projection function must exist");
         let body = &crud[start..];
         &body[..body.find("\n}\n").expect("function must end")]
     };
