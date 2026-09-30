@@ -6352,7 +6352,7 @@ fn materialize_sidecar_inbound_proxies(
                 // an operator proxy still serves HTTP on this port, not raw
                 // TCP).
                 http_inbound_backend_ports.insert(backend_port);
-                let proxy = mesh_inbound_loopback_proxy(
+                let mut proxy = mesh_inbound_loopback_proxy(
                     &mesh_inbound_proxy_id(&service.namespace, &service.name, service_port.port),
                     mesh_service_host_variants(
                         &service.name,
@@ -6363,6 +6363,9 @@ fn materialize_sidecar_inbound_proxies(
                     backend_port,
                     now,
                 );
+                // Per-service `;` path-parameter opt-in (issue #5937). Every
+                // per-port sibling of the service carries the same value.
+                proxy.allow_path_parameters = service.allow_path_parameters;
                 // Don't collide with or shadow an explicit operator proxy (e.g. the
                 // documented file-mode pre-materialization workaround) already
                 // routing this host. Our route is the greediest HTTP match for the
@@ -6767,6 +6770,7 @@ fn materialize_sidecar_ingress_listener_proxies(
         materialize_sidecar_ingress_dedicated_bind_proxies(
             config,
             runtime,
+            mesh_slice,
             &listeners,
             &bind_overrides,
             local_spiffe,
@@ -6790,6 +6794,7 @@ fn materialize_sidecar_ingress_listener_proxies(
         materialize_sidecar_ingress_dedicated_bind_proxies(
             config,
             runtime,
+            mesh_slice,
             &listeners,
             &bind_overrides,
             local_spiffe,
@@ -6830,7 +6835,7 @@ fn materialize_sidecar_ingress_listener_proxies(
             listener.port,
         );
         let mut unix_upstream: Option<Upstream> = None;
-        let proxy = match &backend {
+        let mut proxy = match &backend {
             crate::modes::mesh::config::MeshIngressBackend::Loopback { host, port } => {
                 mesh_inbound_loopback_proxy_to(
                     &proxy_id,
@@ -6877,6 +6882,7 @@ fn materialize_sidecar_ingress_listener_proxies(
                 proxy
             }
         };
+        proxy.allow_path_parameters = ingress_owner_allows_path_parameters(mesh_slice, listener);
         // Yield to an explicit operator proxy already routing this host/path,
         // exactly like the default inbound path. Exclude this workload's OWN
         // ingress siblings (grouped by the router); another proxy still wins
@@ -6936,6 +6942,7 @@ fn materialize_sidecar_ingress_listener_proxies(
     materialize_sidecar_ingress_dedicated_bind_proxies(
         config,
         runtime,
+        mesh_slice,
         &listeners,
         &bind_overrides,
         local_spiffe,
@@ -6952,6 +6959,30 @@ fn mesh_ingress_bind_proxy_id(namespace: &str, name: &str, port: u16) -> String 
         sanitize_egress_host_id_part(namespace),
         sanitize_egress_host_id_part(name)
     )
+}
+
+/// Whether the local service that owns a Sidecar `ingress[]` listener opted in
+/// to `;` path parameters (`MeshService.allow_path_parameters`, issue #5937).
+///
+/// The listener's route forwards to that service's `defaultEndpoint`, so the
+/// owner's opt-in is the one that governs it. The owner is looked up in the
+/// same local-inbound service view the inbound materializer reads (the
+/// narrowed `local_inbound_services` when the slice resolved one, else
+/// `services`). An owner that cannot be found keeps the default refusal.
+fn ingress_owner_allows_path_parameters(
+    mesh_slice: &MeshSlice,
+    listener: &crate::modes::mesh::config::ResolvedIngressListener,
+) -> bool {
+    let services = if mesh_slice.local_inbound_workloads.is_some() {
+        mesh_slice.local_inbound_services.as_slice()
+    } else {
+        mesh_slice.services.as_slice()
+    };
+    services.iter().any(|service| {
+        service.allow_path_parameters
+            && service.namespace == listener.owner_namespace
+            && service.name == listener.owner_service
+    })
 }
 
 /// Ports already owned by Gateway/stream proxies or the fixed mesh listener
@@ -6985,6 +7016,7 @@ fn sidecar_ingress_claimed_ports(
 fn materialize_sidecar_ingress_dedicated_bind_proxies(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
     listeners: &[&crate::modes::mesh::config::ResolvedIngressListener],
     bind_overrides: &std::collections::BTreeMap<u16, std::net::IpAddr>,
     local_spiffe: &str,
@@ -7042,6 +7074,8 @@ fn materialize_sidecar_ingress_dedicated_bind_proxies(
             );
             proxy.listen_port = Some(listener.port);
             proxy.name = Some(format!("mesh ingress bind {bind_ip} {}", listener.port));
+            proxy.allow_path_parameters =
+                ingress_owner_allows_path_parameters(mesh_slice, listener);
             proxy
         } else {
             continue;
@@ -7624,7 +7658,7 @@ fn materialize_mesh_outbound_proxies(
             }
             let upstream_id =
                 mesh_outbound_upstream_id(&service.namespace, &service.name, service_port.port);
-            let proxy = mesh_outbound_route_proxy(
+            let mut proxy = mesh_outbound_route_proxy(
                 &mesh_outbound_proxy_id(&service.namespace, &service.name, service_port.port),
                 mesh_service_host_variants(
                     &service.name,
@@ -7635,6 +7669,9 @@ fn materialize_mesh_outbound_proxies(
                 &upstream_id,
                 now,
             );
+            // The destination service's `;` path-parameter opt-in (issue
+            // #5937), so the client side forwards what the destination accepts.
+            proxy.allow_path_parameters = service.allow_path_parameters;
             // Yield to any existing proxy already routing this host at an
             // overlapping path. That covers explicit operator proxies (the
             // operator's routing wins) AND — for Sidecar — the local workload's own
@@ -10082,6 +10119,10 @@ fn mesh_outbound_http_bywl_route_proxy(
     // Host routing. Preserve the application Host after that selection so the
     // backend does not see a synthetic pod-IP authority.
     proxy.preserve_host_header = true;
+    // The destination service's `;` path-parameter opt-in (issue #5937). The
+    // selection never reads the path, so the stripped path of an opted-in
+    // request selects this same route.
+    proxy.allow_path_parameters = spec.service.allow_path_parameters;
     proxy
 }
 
@@ -23048,6 +23089,7 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }
     }
 
@@ -23180,6 +23222,7 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         };
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
@@ -23238,6 +23281,7 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }
     }
 
@@ -26453,6 +26497,7 @@ mod tests {
                 }],
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             }],
             ..MeshSlice::default()
         };
@@ -30418,6 +30463,7 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             }],
             outbound_traffic_policy: Some(
                 crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
@@ -30582,6 +30628,7 @@ mod tests {
                     protocol_overrides: HashMap::new(),
                     cluster_ips: Vec::new(),
                     uid: None,
+                    allow_path_parameters: false,
                 }],
                 ..MeshSlice::default()
             };
@@ -30998,6 +31045,7 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             }],
             outbound_traffic_policy: None,
             ..MeshSlice::default()
@@ -31213,6 +31261,7 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             }],
             outbound_traffic_policy: None,
             ..MeshSlice::default()
@@ -32409,6 +32458,7 @@ mod tests {
                             }],
                             protocol_overrides: HashMap::new(),
                             uid: None,
+                            allow_path_parameters: false,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -32516,6 +32566,7 @@ mod tests {
                             }],
                             protocol_overrides: HashMap::new(),
                             uid: None,
+                            allow_path_parameters: false,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -32622,6 +32673,7 @@ mod tests {
                             }],
                             protocol_overrides: HashMap::new(),
                             uid: None,
+                            allow_path_parameters: false,
                         }],
                         workloads: vec![{
                             let mut wl = workload("reviews", "reviews");
@@ -32685,6 +32737,7 @@ mod tests {
                             }],
                             protocol_overrides: HashMap::new(),
                             uid: None,
+                            allow_path_parameters: false,
                         }],
                         // Workload exists but has no addresses (pod IP not yet assigned).
                         workloads: vec![workload("pending", "pending")],
@@ -32747,6 +32800,7 @@ mod tests {
                                 }],
                                 protocol_overrides: HashMap::new(),
                                 uid: None,
+                                allow_path_parameters: false,
                             },
                             MeshService {
                                 cluster_ips: Vec::new(),
@@ -32766,6 +32820,7 @@ mod tests {
                                 }],
                                 protocol_overrides: HashMap::new(),
                                 uid: None,
+                                allow_path_parameters: false,
                             },
                         ],
                         workloads: vec![
@@ -32856,6 +32911,7 @@ mod tests {
             ],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         };
 
         let targets =
@@ -33800,6 +33856,7 @@ mod tests {
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         };
 
         let targets = build_east_west_service_targets(&service, &service.ports[0], &[wl], None);
@@ -33830,6 +33887,7 @@ mod tests {
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         };
 
         let targets = build_east_west_service_targets(&service, &service.ports[0], &[legacy], None);
@@ -33894,6 +33952,7 @@ mod tests {
                             ],
                             protocol_overrides: HashMap::new(),
                             uid: None,
+                            allow_path_parameters: false,
                         }],
                         workloads: vec![local, remote, clusterless],
                         multi_cluster: Some(MultiClusterConfig {
@@ -33955,6 +34014,7 @@ mod tests {
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         };
 
         let workloads = vec![remote, local];
@@ -34390,6 +34450,7 @@ mod tests {
                 }],
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             }],
             multi_cluster: Some(multi_cluster),
             ..MeshSlice::default()
@@ -35087,6 +35148,7 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             }],
             ..MeshSlice::default()
         });
@@ -35859,6 +35921,7 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         };
         // The remote cluster's view of svc-b (refs the remote workload).
         let svc_remote = MeshService {

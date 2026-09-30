@@ -2137,6 +2137,7 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
             protocol_overrides: HashMap::new(),
             cluster_ips,
             uid: None,
+            allow_path_parameters: false,
         });
     }
 

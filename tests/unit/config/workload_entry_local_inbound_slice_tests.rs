@@ -70,6 +70,7 @@ fn mesh_service(namespace: &str, name: &str, workload_spiffe: Option<&str>) -> M
         protocol_overrides: HashMap::new(),
         cluster_ips: Vec::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 

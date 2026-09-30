@@ -67,6 +67,7 @@ fn local_echo(
         workloads: vec![WorkloadRef { spiffe_id: id }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     };
     (workload, service)
 }

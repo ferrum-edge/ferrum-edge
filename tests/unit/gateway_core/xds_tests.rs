@@ -67,6 +67,7 @@ fn mesh_config() -> MeshConfig {
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         mesh_policies: vec![
             MeshPolicy {

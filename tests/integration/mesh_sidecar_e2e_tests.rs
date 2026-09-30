@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ferrum_edge::modes::mesh::config::{
-    MeshSidecar, MeshSidecarEgress, OutboundTrafficPolicy, PolicyScope,
+    MeshConfig, MeshSidecar, MeshSidecarEgress, OutboundTrafficPolicy, PolicyScope,
 };
 use ferrum_edge::modes::mesh::{
     MESH_ACCESS_LOG_PLUGIN_ID, MESH_AUTHZ_PLUGIN_ID, MESH_SPIFFE_IDENTITY_PLUGIN_ID,
@@ -24,7 +24,8 @@ use ferrum_edge::modes::mesh::{
 use super::mesh_test_support::{
     build_mesh_proxy_state, capturing_backend_handler, default_mesh_runtime, echo_backend_handler,
     gateway_config_with_mesh, http_proxy, http_upstream, mesh_config_with, policy_allow_principal,
-    service_for, start_http_backend, start_mesh_gateway, workload_for,
+    service_for, start_http_backend, start_mesh_gateway, start_mesh_gateway_with_direction,
+    workload_for,
 };
 
 const REVIEWS_HOST: &str = "reviews.default.svc.cluster.local";
@@ -617,6 +618,129 @@ fn sidecar_allow_any_leaves_the_capture_path_ungated() {
             true,
         ),
         "and no HTTP-family gate is installed"
+    );
+}
+
+// ── Per-service `;` path-parameter opt-in (issue #5937) ──────────────────
+//
+// `MeshService.allow_path_parameters` sets `allow_path_parameters` on the
+// routes mesh mode materialises for that service. The re-route check of
+// GHSA-fcqw-793q-wg5x still applies: an opted-in `;` request is resolved again
+// with its parameters stripped, the same way the request was (mesh direction,
+// port sibling), and refused when that path belongs to another route on the
+// service's hosts. The functional suite proves the served path end to end over
+// mTLS (`functional_mesh_sidecar_inbound_*path_parameters*`).
+
+const RATINGS_HOST: &str = "ratings.default.svc.cluster.local";
+const REVIEWS_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/reviews";
+
+/// Two in-mesh services: `reviews` opts in to path parameters, `ratings` does
+/// not.
+fn path_parameter_mesh() -> MeshConfig {
+    let reviews = workload_for("reviews", "default", [("app", "reviews")], ["127.0.0.1"]);
+    let ratings = workload_for("ratings", "default", [("app", "ratings")], ["127.0.0.1"]);
+    let mut reviews_service = service_for("reviews", "default", &[&reviews]);
+    reviews_service.allow_path_parameters = true;
+    let ratings_service = service_for("ratings", "default", &[&ratings]);
+    mesh_config_with(
+        vec![reviews, ratings],
+        vec![reviews_service, ratings_service],
+        Vec::new(),
+    )
+}
+
+#[test]
+fn sidecar_materialised_routes_carry_the_service_path_parameter_opt_in() {
+    let opt_in = |runtime: &ferrum_edge::modes::mesh::MeshRuntimeConfig, id: &str| {
+        let config = gateway_config_with_mesh(Vec::new(), Vec::new(), path_parameter_mesh());
+        let prepared = prepare_gateway_config_for_mesh(config, runtime).expect("mesh-prepared");
+        prepared
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id == id)
+            .map(|proxy| proxy.allow_path_parameters)
+    };
+
+    // Client side: the outbound route to each destination carries that
+    // destination's opt-in.
+    let client = default_mesh_runtime();
+    assert_eq!(
+        opt_in(&client, "__mesh-outbound-default-reviews-8080"),
+        Some(true)
+    );
+    assert_eq!(
+        opt_in(&client, "__mesh-outbound-default-ratings-8080"),
+        Some(false)
+    );
+
+    // Server side: the local service's inbound route carries its own opt-in.
+    let mut server = default_mesh_runtime();
+    server.workload_spiffe_id = Some(REVIEWS_SPIFFE.to_string());
+    assert_eq!(
+        opt_in(&server, "__mesh-inbound-default-reviews-8080"),
+        Some(true)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sidecar_outbound_path_parameter_cannot_bypass_a_sibling_route_on_the_service_host() {
+    let (responder, captured) = capturing_backend_handler();
+    let (backend_addr, _backend_handle) = start_http_backend(responder).await;
+    let runtime = default_mesh_runtime();
+    // An explicit `/admin` route on the opted-in service's own host, next to
+    // the materialised outbound `/` route. `/admin;x/users` misses `/admin`
+    // (the router splits only on `/`) and reaches the opted-in mesh route,
+    // whose parameter-stripping backend would execute `/admin/users`.
+    let mut admin = http_proxy("reviews-admin", REVIEWS_HOST, backend_addr.port());
+    admin.listen_path = Some("/admin".to_string());
+    admin.strip_listen_path = false;
+    let state = build_mesh_proxy_state(&runtime, vec![admin], Vec::new(), path_parameter_mesh());
+    let (gateway_addr, shutdown_tx) =
+        start_mesh_gateway_with_direction(state, MeshTrafficDirection::Outbound).await;
+
+    let mut outcomes = Vec::new();
+    for path in [
+        "/admin;x/users",
+        "/admin;/users",
+        "/admin;x",
+        "/admin%3Bx/users",
+    ] {
+        let outcome = issue_get(gateway_addr, REVIEWS_HOST, path).await;
+        outcomes.push((REVIEWS_HOST, path, outcome));
+    }
+    // A service without the opt-in refuses `;` outright.
+    let path = "/app/;jsessionid=abc123";
+    let outcome = issue_get(gateway_addr, RATINGS_HOST, path).await;
+    outcomes.push((RATINGS_HOST, path, outcome));
+    // Control: the sibling route is live on this listener.
+    let (control_status, control_body) =
+        issue_get(gateway_addr, REVIEWS_HOST, "/admin/users").await;
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+
+    for (host, path, (status, body)) in &outcomes {
+        assert_eq!(
+            *status, 400,
+            "{host}{path} must be refused as a path parameter; body: {body:?}"
+        );
+        assert!(
+            body.contains("path parameter"),
+            "{host}{path} must be refused with the path_parameter body: {body:?}"
+        );
+    }
+    assert_eq!(
+        control_status, 200,
+        "the sibling /admin route must serve its own path; body: {control_body:?}"
+    );
+    let log = captured.lock().expect("captured log lock");
+    assert_eq!(
+        log.len(),
+        1,
+        "only the control request may reach the sibling backend: {log:?}"
+    );
+    assert!(
+        log[0].starts_with("GET /admin/users HTTP/1.1"),
+        "the sibling backend must see only the control request: {log:?}"
     );
 }
 

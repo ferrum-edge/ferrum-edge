@@ -300,6 +300,22 @@ pub struct MeshService {
     /// Kubernetes translation stamps it from `metadata.uid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
+    /// Opt this service in to RFC 3986 path parameters (`;jsessionid=…`,
+    /// matrix parameters) on the HTTP-family routes mesh mode materialises
+    /// for it: the outbound routes every client sidecar or node proxy builds
+    /// towards it, the local Sidecar inbound routes, and the Sidecar
+    /// `ingress[]` listener routes it owns. Each such proxy gets
+    /// `allow_path_parameters: true`. Default `false`: a `;` request to the
+    /// service is refused with `400 path_parameter` (GHSA-fcqw-793q-wg5x).
+    ///
+    /// The opt-in only lifts the per-proxy refusal. The re-route check still
+    /// applies unchanged: an opted-in request is re-resolved with its
+    /// parameters stripped, the same way the request was resolved (mesh
+    /// direction, port sibling, listener), and refused when that path
+    /// belongs to a different route. Kubernetes translation sets it from
+    /// the Service annotation `ferrum.io/allow-path-parameters: "true"`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_path_parameters: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

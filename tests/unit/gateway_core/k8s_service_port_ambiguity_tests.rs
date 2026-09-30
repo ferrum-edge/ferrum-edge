@@ -2,6 +2,10 @@
 //! once (HTTP plus raw TCP, or a Diameter-style `3868/TCP` plus `3868/SCTP`)
 //! still translates in full. Only the east-west materializers skip that port
 //! for cross-cluster routing; the translator never drops the Service.
+//!
+//! Also covers the Service-level `ferrum.io/allow-path-parameters` annotation
+//! (issue #5937), which the same Service translation carries onto
+//! `MeshService.allow_path_parameters`.
 
 use std::collections::HashMap;
 
@@ -129,4 +133,58 @@ fn udp_port_sharing_an_http_port_number_is_not_ambiguous() {
 
     assert!(names.iter().any(|name| name == "web"), "{names:?}");
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+// ── `ferrum.io/allow-path-parameters` (issue #5937) ─────────────────────────
+
+fn annotated_http_service(name: &str, annotation: Option<&str>) -> K8sObject {
+    let mut object = service(
+        name,
+        json!([{"name": "http", "port": 8080, "protocol": "TCP", "appProtocol": "http"}]),
+    );
+    if let Some(value) = annotation {
+        object.metadata.annotations.insert(
+            "ferrum.io/allow-path-parameters".to_string(),
+            value.to_string(),
+        );
+    }
+    object
+}
+
+#[test]
+fn service_annotation_opts_the_mesh_service_in_to_path_parameters() {
+    let objects = vec![
+        annotated_http_service("java-app", Some("true")),
+        annotated_http_service("upper-case", Some(" TRUE ")),
+        annotated_http_service("explicit-off", Some("false")),
+        annotated_http_service("malformed", Some("yes")),
+        annotated_http_service("plain", None),
+    ];
+    let (translation, skipped) =
+        translate_k8s_objects_collecting_skips(&objects, options()).expect("translation");
+    assert!(
+        skipped.is_empty(),
+        "nothing may be skipped, got {}",
+        skipped.len()
+    );
+    let mesh = translation.config.mesh.expect("mesh config");
+    let opt_in: HashMap<&str, bool> = mesh
+        .services
+        .iter()
+        .map(|svc| (svc.name.as_str(), svc.allow_path_parameters))
+        .collect();
+
+    assert_eq!(opt_in.get("java-app"), Some(&true));
+    assert_eq!(opt_in.get("upper-case"), Some(&true));
+    assert_eq!(opt_in.get("explicit-off"), Some(&false));
+    assert_eq!(
+        opt_in.get("malformed"),
+        Some(&false),
+        "a value other than true/false must fail closed"
+    );
+    assert_eq!(
+        opt_in.get("plain"),
+        Some(&false),
+        "no annotation keeps path parameters refused"
+    );
 }

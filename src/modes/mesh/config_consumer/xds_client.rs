@@ -1732,6 +1732,7 @@ fn reverse_translate(
                 // (preferred branch above) round-trips them via serde.
                 cluster_ips: Vec::new(),
                 uid: None,
+                allow_path_parameters: false,
             })
             .collect()
     };
@@ -4968,6 +4969,7 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             }],
             ..MeshSlice::default()
         };
@@ -5865,6 +5867,7 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         };
         MeshSlice {
             node_id: "node-a".to_string(),

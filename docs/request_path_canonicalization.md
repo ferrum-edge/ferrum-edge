@@ -183,8 +183,11 @@ hold:
   too;
 - the stripped route sits in a host tier no more specific than the one the
   proxy was found in (exact host, then a longer wildcard, then a shorter
-  wildcard, then no hosts);
-- the stripped route is not a direction-scoped mesh route.
+  wildcard, then no hosts).
+
+A direction-scoped mesh route counts like any other route here, because the
+re-resolve repeats the request's own mesh resolution (see
+[Mesh-materialised routes](#mesh-materialised-routes)).
 
 Every other different stripped route is refused. A sibling at the stripped
 prefix (`/api` next to `/api;v=1`), a more specific descendant
@@ -206,10 +209,6 @@ subtree (`/api/...` for `/api;v=1`) through the opted-in proxy and its plugins,
 not the ancestor's. Configure the opted-in proxy's own authentication and
 policy for that subtree, or give it a dedicated backend.
 
-The re-resolve does not yet repeat the mesh direction filtering of the original
-lookup, which only produces false refusals. It must mirror it once mesh routes
-can opt in (ferrum-edge#5937).
-
 **With the opt-in.** On a proxy with `allow_path_parameters: true`, the `;` is
 kept in the canonical path and forwarded unchanged, so routing, policy, and the
 backend read the same string. That keeps the earlier behaviour for backends that use
@@ -225,8 +224,55 @@ unreachable.
 
 Gateway API routes whose literal path match itself contains `;` are translated
 with `allow_path_parameters: true`, since the route declares the parameter
-explicitly; every other translated route keeps the default. Mesh-materialized
-routes cannot opt in yet and refuse `;`.
+explicitly; every other translated route keeps the default. Mesh-materialised
+routes follow their service's opt-in, described next.
+
+### Mesh-materialised routes
+
+Mesh mode builds its HTTP routes from the mesh slice, so it has no per-proxy
+field to set. The opt-in is per service instead: `MeshService`
+`allow_path_parameters: true`, or the Kubernetes Service annotation
+`ferrum.io/allow-path-parameters: "true"`, sets `allow_path_parameters` on every
+HTTP-family route mesh mode materialises for that service: the outbound routes
+each client sidecar or node proxy builds to it (including direct Pod-IP
+routes), its local Sidecar inbound routes, and the Sidecar `ingress[]`
+listener routes it owns. Default `false`, so a service without it still
+refuses `;` with `400 path_parameter`. Stock (non-Ferrum) xDS control planes
+cannot carry the field, so their services stay refused. See
+[mesh.md](mesh.md#path-parameters-and-the-per-service-opt-in).
+
+The re-resolve of an opted-in request repeats the request's own resolution,
+mesh steps included, before it compares routes:
+
+1. the same host, frontend port, TLS class, and Gateway listener;
+2. the same mesh direction filter: on a capture listener only the routes of
+   that listener's direction count (outbound on the outbound listener, inbound
+   and `ingress[]` on the inbound listener), and on every other listener, the
+   HTTP/3 frontend included, no direction-scoped mesh route counts;
+3. the same port-sibling selection: a multi-port service's routes share one
+   representative in the route table, so the request's captured original
+   destination or authority port picks the sibling again, and a dedicated
+   Sidecar ingress bind route must match the accepted frontend port;
+4. the direct Pod-IP HTTP egress decision is not repeated, because it reads
+   only the captured original destination, never the path, so the stripped
+   path takes the same route.
+
+So an opted-in mesh route re-resolves to itself, and the request is served.
+A stripped path that the mesh port selection would refuse (`502`) is refused
+here too. Every mesh-materialised route is a `/` prefix on its service's own
+hosts, so a different stripped route can only be a longer route on those
+hosts, such as an explicit `/admin` route next to the service's `/`. That
+route is never an ancestor of `/`, so `/admin;x/users` on the opted-in service
+is still refused. A `;` never changes the `Host` or the port signals, so it
+cannot move a request onto another service or another port sibling.
+
+The same trade-off as any opted-in proxy applies. `mesh_authz` evaluates
+`AuthorizationPolicy` `paths:` on the parameterised path, and a backend that
+strips parameters executes the stripped one. A DENY rule for `/admin/*`
+does not match `/admin;x/users`, which such a backend runs as `/admin/users`.
+Only exact and prefix `paths:` entries in ALLOW rules fail closed for a
+parameterised spelling; suffix patterns, `notPaths:` and DENY `paths:` rules are
+not reliable on an opted-in service (see [mesh.md](mesh.md) for examples).
 
 **Provider override queries are not canonicalized.** A plugin that rewrites
 the backend path (`ai_stream_router`, `ai_federation`) may put the endpoint and
@@ -400,8 +446,9 @@ must change:
   first `;` (`//a`, `/a//b`, `/;x/a`, `empty_segment`). Clients must send the
   collapsed path. A trailing slash is unaffected.
 - Targets with a `;` path parameter (`/a;x/b`, `/a%3Bx/b`, `path_parameter`)
-  on a proxy that has not set `allow_path_parameters: true`. This is the only
-  rule with a switch, and the switch is per proxy rather than per deployment:
+  on a proxy that has not set `allow_path_parameters: true` (in mesh mode, on
+  a service that has not opted in). This is the only rule with a switch, and
+  the switch is per proxy (or per mesh service) rather than per deployment:
   it keeps the `;` in the one canonical path instead of computing policy
   differently, and the structural rules above still apply with it on.
 

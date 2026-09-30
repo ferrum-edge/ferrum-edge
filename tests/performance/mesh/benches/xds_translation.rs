@@ -58,6 +58,7 @@ fn build_slice(n_workloads: usize) -> MeshSlice {
             protocol_overrides: HashMap::new(),
             cluster_ips: vec![],
             uid: None,
+            allow_path_parameters: false,
         });
     }
 

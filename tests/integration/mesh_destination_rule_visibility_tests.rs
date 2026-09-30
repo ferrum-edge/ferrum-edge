@@ -76,6 +76,7 @@ fn service_in(namespace: &str, name: &str) -> MeshService {
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 

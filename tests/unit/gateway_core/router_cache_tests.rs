@@ -1,9 +1,14 @@
 use chrono::Utc;
 use ferrum_edge::RouterCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::modes::mesh::MeshTrafficDirection;
+use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 use ferrum_edge::policy_path::strip_path_parameters;
 use ferrum_edge::proxy::build_backend_url;
-use ferrum_edge::router_cache::{HostRouteRank, host_route_rank, path_parameter_route_admitted};
+use ferrum_edge::router_cache::{
+    HostRouteRank, MeshRouteScope, MeshScopedResolution, host_route_rank,
+    path_parameter_route_admitted, path_parameter_scoped_route_admitted,
+};
 
 // This suite intentionally exercises the public RouterCache facade.
 // Request hot paths use epoch-loaded route snapshots and are covered by
@@ -2350,6 +2355,296 @@ fn path_parameter_reroute_refuses_a_direction_scoped_mesh_route() {
         ("versioned".to_string(), false),
         "the re-lookup does not filter mesh direction (ferrum-edge#5937)"
     );
+}
+
+// ============================================================
+// Mesh-scoped path-parameter re-route (issue #5937, N2 of #5938)
+// ============================================================
+
+const MESH_NAMESPACE: &str = "default";
+
+/// A mesh-materialised-style `/` route: the reserved id, the service's hosts,
+/// and the mesh namespace the router groups port siblings under.
+fn mesh_route(id: &str, hosts: Vec<&str>, allow_path_parameters: bool) -> Proxy {
+    let mut proxy = test_proxy_with_hosts(id, "/", hosts);
+    proxy.namespace = MESH_NAMESPACE.to_string();
+    proxy.allow_path_parameters = allow_path_parameters;
+    proxy
+}
+
+/// The mesh block the router derives per-port sibling groups from.
+fn mesh_services(services: &[(&str, &[u16])]) -> Option<Box<MeshConfig>> {
+    Some(Box::new(MeshConfig {
+        services: services
+            .iter()
+            .map(|(name, ports)| MeshService {
+                cluster_ips: Vec::new(),
+                name: name.to_string(),
+                namespace: MESH_NAMESPACE.to_string(),
+                ports: ports
+                    .iter()
+                    .map(|port| ServicePort {
+                        port: *port,
+                        protocol: AppProtocol::Http,
+                        name: None,
+                        target_port: None,
+                    })
+                    .collect(),
+                workloads: Vec::new(),
+                protocol_overrides: std::collections::HashMap::new(),
+                uid: None,
+                allow_path_parameters: true,
+            })
+            .collect(),
+        ..MeshConfig::default()
+    }))
+}
+
+fn outbound(orig_dst_port: Option<u16>) -> MeshRouteScope {
+    MeshRouteScope {
+        direction: Some(MeshTrafficDirection::Outbound),
+        orig_dst_port,
+        authority_port: None,
+    }
+}
+
+fn inbound(authority_port: Option<u16>) -> MeshRouteScope {
+    MeshRouteScope {
+        direction: Some(MeshTrafficDirection::Inbound),
+        orig_dst_port: None,
+        authority_port,
+    }
+}
+
+/// What the frontends decide for a `;` request, with both lookups resolved
+/// the way the request itself is (mesh direction filter and port-sibling
+/// selection included): the proxy the request reached, and whether it is
+/// served.
+fn mesh_reroute(
+    cache: &RouterCache,
+    host: Option<&str>,
+    path: &str,
+    mesh: MeshRouteScope,
+) -> (String, bool) {
+    let MeshScopedResolution::Routed(matched) =
+        cache.resolve_mesh_scoped_route(host, path, None, false, mesh)
+    else {
+        panic!("request {path} must route");
+    };
+    let matched = matched.route_match().proxy.clone();
+    if !matched.allow_path_parameters {
+        return (matched.id.clone(), false);
+    }
+    let stripped = strip_path_parameters(path);
+    let served = match cache.resolve_mesh_scoped_route(host, &stripped, None, false, mesh) {
+        MeshScopedResolution::NotFound => true,
+        MeshScopedResolution::Refused => false,
+        MeshScopedResolution::Routed(stripped_route) => {
+            path_parameter_scoped_route_admitted(&matched, &stripped_route, host)
+        }
+    };
+    (matched.id.clone(), served)
+}
+
+#[test]
+fn mesh_scoped_reroute_serves_an_opted_in_mesh_route_that_strips_to_itself() {
+    let route = mesh_route("__mesh-outbound-default-web-8080", vec!["web"], true);
+    let config = test_config(vec![route]);
+    let cache = RouterCache::new(&config, 100);
+
+    for path in ["/app/;jsessionid=x", "/app/page;jsessionid=x", "/a;x/b;y/c"] {
+        assert_eq!(
+            mesh_reroute(&cache, Some("web"), path, outbound(None)),
+            ("__mesh-outbound-default-web-8080".to_string(), true),
+            "{path} must re-resolve to the same opted-in mesh route"
+        );
+    }
+}
+
+#[test]
+fn mesh_scoped_reroute_refuses_a_mesh_route_without_the_opt_in() {
+    let route = mesh_route("__mesh-inbound-default-web-8080", vec!["web"], false);
+    let config = test_config(vec![route]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/app/;jsessionid=x", inbound(None)),
+        ("__mesh-inbound-default-web-8080".to_string(), false)
+    );
+}
+
+#[test]
+fn mesh_scoped_reroute_refuses_a_sibling_route_on_the_mesh_hosts() {
+    // An operator route on the service's own host, next to the opted-in mesh
+    // `/` route: `/admin;x/users` misses `/admin` and reaches the mesh route,
+    // whose parameter-stripping backend would execute `/admin/users`.
+    let mut admin = test_proxy_with_hosts("admin", "/admin", vec!["web"]);
+    admin.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-outbound-default-web-8080", vec!["web"], true),
+        admin,
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    for path in ["/admin;x/users", "/admin;/users", "/admin;x"] {
+        assert_eq!(
+            mesh_reroute(&cache, Some("web"), path, outbound(None)),
+            ("__mesh-outbound-default-web-8080".to_string(), false),
+            "{path} must be refused: its stripped path belongs to /admin"
+        );
+    }
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/other;x/y", outbound(None)),
+        ("__mesh-outbound-default-web-8080".to_string(), true)
+    );
+}
+
+#[test]
+fn mesh_scoped_reroute_selects_the_port_sibling_the_request_selected() {
+    // Two HTTP ports of one service: the tiers hold the lowest-port
+    // representative, and the captured original destination picks the
+    // sibling. A plain re-lookup names the representative, so it used to
+    // refuse the 90 sibling's own requests.
+    let mut config = test_config(vec![
+        mesh_route("__mesh-outbound-default-web-80", vec!["web"], true),
+        mesh_route("__mesh-outbound-default-web-90", vec!["web"], true),
+    ]);
+    config.mesh = mesh_services(&[("web", &[80, 90])]);
+    let cache = RouterCache::new(&config, 100);
+
+    for port in [80u16, 90] {
+        assert_eq!(
+            mesh_reroute(
+                &cache,
+                Some("web"),
+                "/app/;jsessionid=x",
+                outbound(Some(port))
+            ),
+            (format!("__mesh-outbound-default-web-{port}"), true)
+        );
+    }
+
+    let raw = cache
+        .find_proxy(Some("web"), "/app/")
+        .expect("representative routes");
+    assert_eq!(raw.proxy.id, "__mesh-outbound-default-web-80");
+    let MeshScopedResolution::Routed(sibling) =
+        cache.resolve_mesh_scoped_route(Some("web"), "/app/", None, false, outbound(Some(90)))
+    else {
+        panic!("the 90 sibling must route");
+    };
+    assert!(
+        !path_parameter_route_admitted(&sibling.route_match().proxy, &raw, Some("web")),
+        "the plain lookup cannot tell a port sibling from another route"
+    );
+
+    // Without an original destination a multi-port service is ambiguous:
+    // the frontend refuses it, and so does the re-resolve.
+    assert!(matches!(
+        cache.resolve_mesh_scoped_route(Some("web"), "/app/", None, false, outbound(None)),
+        MeshScopedResolution::Refused
+    ));
+}
+
+#[test]
+fn mesh_scoped_reroute_filters_the_other_direction() {
+    // The inbound and outbound capture listeners share one route table. On
+    // the outbound listener the local service's inbound route is dropped, so
+    // the stripped path of a request to an operator route resolves to no
+    // route rather than to the inbound loopback route.
+    let mut versioned = opted_in_hosted("versioned", "/api;v=1", vec!["web"]);
+    versioned.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-8080", vec!["web"], true),
+        versioned,
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert!(matches!(
+        cache.resolve_mesh_scoped_route(Some("web"), "/api/x", None, false, outbound(None)),
+        MeshScopedResolution::NotFound
+    ));
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/api;v=1/x", outbound(None)),
+        ("versioned".to_string(), true)
+    );
+    // A non-mesh listener sees no mesh route either.
+    assert!(matches!(
+        cache.resolve_mesh_scoped_route(
+            Some("web"),
+            "/api/x",
+            None,
+            false,
+            MeshRouteScope::default()
+        ),
+        MeshScopedResolution::NotFound
+    ));
+}
+
+#[test]
+fn mesh_scoped_reroute_admits_a_mesh_ancestor_of_a_literal_parameter_route() {
+    // An operator `/api;v=1` on a mesh service's host strips to `/api/...`,
+    // which the mesh `/` route owns on the inbound listener. That route is a
+    // less specific ancestor on the same host tier, so the request is served
+    // once the re-resolve is faithful. The plain decision still refuses it.
+    let mut versioned = opted_in_hosted("versioned", "/api;v=1", vec!["web"]);
+    versioned.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-8080", vec!["web"], false),
+        versioned,
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/api;v=1/x", inbound(None)),
+        ("versioned".to_string(), true)
+    );
+    let matched = cache
+        .find_proxy(Some("web"), "/api;v=1/x")
+        .expect("literal route");
+    let raw = cache
+        .find_proxy(Some("web"), "/api/x")
+        .expect("the mesh route owns the stripped path");
+    assert!(!path_parameter_route_admitted(
+        &matched.proxy,
+        &raw,
+        Some("web")
+    ));
+
+    // A mesh `/` route never outranks a sibling or descendant: the opted-in
+    // mesh route itself stays refused for a path an operator route owns.
+    let mut private = test_proxy_with_hosts("private", "/api/private", vec!["web"]);
+    private.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-8080", vec!["web"], true),
+        private,
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/api/private;x/y", inbound(None)),
+        ("__mesh-inbound-default-web-8080".to_string(), false)
+    );
+}
+
+#[test]
+fn mesh_scoped_reroute_refuses_an_ambiguous_inbound_port_signal() {
+    // A multi-port local service needs a port signal to pick its inbound
+    // sibling; the re-resolve applies the same selection.
+    let mut config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-80", vec!["web"], true),
+        mesh_route("__mesh-inbound-default-web-90", vec!["web"], true),
+    ]);
+    config.mesh = mesh_services(&[("web", &[80, 90])]);
+    let cache = RouterCache::new(&config, 100);
+
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/app/;jsessionid=x", inbound(Some(90))),
+        ("__mesh-inbound-default-web-90".to_string(), true)
+    );
+    assert!(matches!(
+        cache.resolve_mesh_scoped_route(Some("web"), "/app/", None, false, inbound(None)),
+        MeshScopedResolution::Refused
+    ));
 }
 
 #[test]

@@ -41,7 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     parameter-stripped path routes to a different proxy, so an opted-in
     catch-all cannot serve `/admin;x/users` past an `/admin` proxy.
     Gateway API routes whose literal path match contains `;` are translated
-    with the opt-in; mesh-materialized proxies cannot opt in yet.
+    with the opt-in; mesh-materialized proxies follow their service's opt-in
+    (`MeshService.allow_path_parameters`, see Added).
   - Admission applies the same rules: literal `listen_path` values, plugin path
     triggers, `request_termination` prefixes, and mesh rewrite targets may not
     contain an empty segment; a literal `listen_path` containing `;` requires
@@ -75,6 +76,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tier, and a direction-scoped mesh route all still refuse, as does
   `/admin;x/users` against an opted-in `/` when `/admin` exists. Regex and
   host-only proxies keep the previous rule.
+- **The path-parameter re-route check repeats the request's mesh resolution**
+  (#5937, N2 of #5938). The parameter-stripped re-lookup now applies the same
+  mesh direction filter and the same port-sibling and dedicated ingress bind
+  selection as the request's own resolution, from the same original
+  destination and authority port, on H1/H2 and H3. A stripped path the mesh
+  port selection would refuse is refused. With the lookup faithful, a
+  direction-scoped mesh route is judged like any other route instead of being
+  refused outright, so a `;` request on one port sibling of a multi-port
+  service is no longer refused because the table's representative is a
+  different sibling. A plain host-and-path re-lookup
+  (`path_parameter_route_admitted`) still refuses every direction-scoped mesh
+  route.
 
 ### Added
 
@@ -96,6 +109,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   roles. Before any session lists tools the list is empty with
   `refreshed_at: null`; a node that does not serve the proxy reports
   `catalog_state: not_served`.
+- **Per-service opt-in for `;` path parameters in mesh mode** (#5937). A
+  `MeshService` can set `allow_path_parameters: true` (default `false`), or a
+  Kubernetes Service can carry the annotation
+  `ferrum.io/allow-path-parameters: "true"`, so Java servlet applications that
+  rely on `;jsessionid=` work inside the mesh. The flag sets
+  `allow_path_parameters` on every HTTP-family route mesh mode materialises for
+  the service: client outbound routes (direct Pod-IP routes included), Sidecar
+  inbound routes, and the Sidecar `ingress[]` routes the service owns. It
+  rides the native slice and the xDS `ServicesCarrier`; stock xDS control
+  planes cannot carry it. The re-route check of GHSA-fcqw-793q-wg5x applies
+  unchanged, so a `;` still cannot reach a path that another route on the
+  service's hosts owns. `mesh_authz` evaluates `paths:` on the parameterised
+  path: on an opted-in service only exact and prefix ALLOW `paths:` fail
+  closed, while suffix patterns, `notPaths:` and DENY `paths:` rules can be
+  bypassed with a `;` segment. Default-off services still refuse `;`
+  with `400 path_parameter`. See `docs/mesh.md` and
+  `docs/request_path_canonicalization.md`.
 - **AI governance for MCP tool calls** (#5908). The AI governance plugins now
   treat MCP JSON-RPC `tools/call` traffic as AI traffic, through one shared
   recognizer (`plugins::utils::mcp_jsonrpc`) that decodes member names,

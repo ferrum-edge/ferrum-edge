@@ -1272,6 +1272,16 @@ matches captured original destinations against (see the raw-TCP egress bullet
 in the Sidecar/Ambient section); HTTP-family routing never consults it, and
 headless services simply omit it.
 
+`allow_path_parameters` (optional, default `false`) opts the service in to
+RFC 3986 path parameters such as `;jsessionid=`. It sets
+`allow_path_parameters: true` on every HTTP-family route mesh mode materialises
+for the service: the outbound routes each client builds to it, its Sidecar
+inbound routes, and the Sidecar `ingress[]` routes it owns. The Kubernetes
+translator sets it from the Service annotation
+`ferrum.io/allow-path-parameters: "true"`. Without it, a `;` request to the
+service is refused with `400 path_parameter`. See
+[Path parameters and the per-service opt-in](#path-parameters-and-the-per-service-opt-in).
+
 ```yaml
 name: "my-service"
 namespace: "default"
@@ -1281,6 +1291,7 @@ ports:
 workloads:
   - spiffe_id: "spiffe://cluster.local/ns/default/sa/my-service"
 cluster_ips: ["10.96.0.10"]
+# allow_path_parameters: true   # forward /app/page;jsessionid=abc (default false)
 ```
 
 ### MeshPolicy
@@ -2043,7 +2054,7 @@ rewritten into one of them:
 | `/api%20name`, any escape of a non-`pchar` byte | `400` | `unrepresentable_escape` |
 | `/admin\secret`, `/admin%5Csecret` | `400` | `literal_backslash` / `encoded_backslash` |
 | `//admin`, `/a//b`, `/;x/admin`, `/%3Bx/admin` | `400` | `empty_segment` |
-| `/admin;x/users`, `/v1;version=2`, `/admin%3Bx/users` | `400` | `path_parameter` (mesh-materialized routes cannot set `allow_path_parameters`; there is no mesh-level opt-in yet) |
+| `/admin;x/users`, `/v1;version=2`, `/admin%3Bx/users` | `400` | `path_parameter`, unless the destination service opts in (see [below](#path-parameters-and-the-per-service-opt-in)) |
 | `/%61dmin` | served as `/admin` | — (escape of a `pchar` byte is decoded) |
 | `/a..b`, `/...`, `/v1.0/x`, `/a/` | served unchanged | — (dots inside a segment NAME are not dot segments; a trailing slash is not an empty segment) |
 
@@ -2065,6 +2076,57 @@ matched literally.
 
 Full contract, reason tokens, and the operational impact on the rest of the
 gateway: [docs/request_path_canonicalization.md](request_path_canonicalization.md).
+
+#### Path parameters and the per-service opt-in
+
+A `;` in the canonical path (literal, or decoded from `%3B`) is refused with
+`400 path_parameter` by default, because backends such as Tomcat and Spring
+strip `;…` from path segments and would execute a different path than routing
+and `mesh_authz` evaluated (GHSA-fcqw-793q-wg5x). Java servlet applications
+that rely on URL-rewritten session ids (`/app/;jsessionid=…`,
+`/app/page;jsessionid=…`) need the opt-in:
+
+- **Native / file / Ferrum CP:** set `allow_path_parameters: true` on the
+  `MeshService`. It rides the slice and the xDS `ServicesCarrier`, so every
+  client sidecar and the service's own sidecar see it.
+- **Kubernetes:** annotate the Service with
+  `ferrum.io/allow-path-parameters: "true"`. Only `true` (any case) enables it.
+  `false` keeps the default, and any other value is warned about and ignored.
+- **Stock xDS control planes** cannot carry the field, so their services stay
+  refused.
+
+The opt-in applies to the routes mesh mode materialises for the service: the
+outbound routes on every client (direct Pod-IP routes included), which let the
+client forward the request, and the destination's Sidecar inbound and
+`ingress[]` routes, which deliver it. A service that has not opted in keeps
+refusing `;` on both legs.
+
+The re-route check still applies unchanged. An opted-in `;` request is
+resolved again with every parameter stripped, the same way it was resolved
+(same host, listener, mesh direction filter, and port-sibling selection from
+the same original destination or authority port), and refused when the
+stripped path belongs to another route on the service's hosts. Materialised
+routes are `/` prefixes on their own service's hosts, and a `;` changes
+neither the host nor the port, so it cannot move a request onto another
+service or another port sibling. It cannot skip an explicit, longer route on
+the same host either: `/admin;x/users` is refused when an `/admin` route
+exists there. Full rule:
+[request_path_canonicalization.md](request_path_canonicalization.md#mesh-materialised-routes).
+
+**Risk to account for.** On an opted-in service, `mesh_authz` evaluates
+`paths:` / `notPaths:` on the parameterised path, while a parameter-stripping
+backend executes the stripped path. A DENY rule for `/admin/*` does not match
+`/admin;x/users`, which Tomcat runs as `/admin/users`. Only exact and prefix
+`paths:` entries in ALLOW rules fail closed for a parameterised spelling. On an
+opted-in service, suffix patterns (`*.png` admits `/admin/users;x.png`),
+`notPaths:` inside an ALLOW rule (`/api/*` minus `/api/admin/*` admits
+`/api/admin;x/users`) and DENY `paths:` rules (`/api/admin/*` misses
+`/api;x/admin/users`) are not reliable, and a DENY pattern cannot cover a `;`
+in an earlier segment without blocking too much. Opt in only services whose
+backends need `;`, and review every AuthorizationPolicy that covers them,
+including mesh-wide DENY rules owned by the platform team. VirtualService
+`http[].match[].uri` matches on the service's routes read the same
+parameterised path.
 
 #### Condition keys
 
