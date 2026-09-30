@@ -2568,6 +2568,9 @@ fn mcp_bridge_spec(proxy_id: &str, listen_path: &str, backend_port: u16) -> Valu
         "x-ferrum-proxy": {
             "id": proxy_id,
             "listen_path": listen_path,
+            // The wiremock backend is plaintext; an HTTP-family proxy
+            // defaults to `https` when the scheme is omitted.
+            "backend_scheme": "http",
             "backend_host": "127.0.0.1",
             "backend_port": backend_port,
             "strip_listen_path": true
