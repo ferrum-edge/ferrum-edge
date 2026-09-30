@@ -432,7 +432,10 @@ fn a_mixed_case_path_condition_uses_the_path_spelling_for_each_pass() {
     condition.key = "request.headers[:PATH]".to_string();
     let deny_admin = path_condition("deny-admin-path", PolicyAction::Deny, condition);
     let mut request = request("/admin;x/users");
-    let raw_path = request.attributes.remove(PATH_KEY).expect("raw path attribute");
+    let raw_path = request
+        .attributes
+        .remove(PATH_KEY)
+        .expect("raw path attribute");
     request
         .attributes
         .insert("request.headers[:PATH]".to_string(), raw_path);

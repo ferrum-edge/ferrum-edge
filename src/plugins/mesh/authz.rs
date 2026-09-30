@@ -56,11 +56,10 @@ use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
     MAX_MESH_RULE_CONDITIONS, MeshPolicy, PolicyScope, WaypointAttachment,
-    bracketed_mesh_attribute_name,
-    normalize_mesh_condition_values, normalize_request_match_host_pattern,
-    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
-    policy_target_attachment_applies_to_service, resolve_target_port, validate_mesh_condition,
-    workload_selector_matches,
+    bracketed_mesh_attribute_name, normalize_mesh_condition_values,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
+    resolve_target_port, validate_mesh_condition, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{

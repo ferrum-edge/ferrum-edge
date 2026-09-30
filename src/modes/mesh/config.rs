@@ -2101,9 +2101,7 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
 }
 
 pub(crate) fn bracketed_mesh_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
-    let name = key
-        .strip_prefix(prefix)?
-        .strip_suffix(']')?;
+    let name = key.strip_prefix(prefix)?.strip_suffix(']')?;
     // Match Istio's validateMapKey shape exactly: the fixed first `[` and the
     // final `]` delimit one non-empty map key. Istio deliberately does not
     // validate the interior as an HTTP HeaderName here. Rejecting a shape it
