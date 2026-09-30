@@ -5638,7 +5638,7 @@ impl AdminResource for Consumer {
 }
 
 /// The `400` message for a write refused by
-/// [`AdminResource::masked_placeholder_sites`]. The pointers come from the
+/// [`masked_placeholder_sites`]. The pointers come from the
 /// caller's own body; no stored value is named.
 fn masked_placeholder_message<R: AdminResource>(role: AdminRole, sites: &[String]) -> String {
     const MAX_LISTED_SITES: usize = 16;
