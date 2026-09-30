@@ -21739,12 +21739,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_and_accept_gate(
-        addr,
-        state,
-        shutdown,
-        tls_config,
-        started_tx,
-        None,
+        addr, state, shutdown, tls_config, started_tx, None,
     )
     .await
 }

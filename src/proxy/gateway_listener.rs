@@ -823,18 +823,15 @@ impl GatewayListenerManager {
                 desired_listeners,
             } = self.reconcile_generation(&expected).await;
             let pending_accept_gates = self.pending_accept_gates().await;
-            if !self
-                .state
-                .publish_gateway_listener_admission(
-                    &expected,
-                    refused_route_ports,
-                    move || {
-                        for accept_gate_tx in pending_accept_gates {
-                            accept_gate_tx.send_replace(true);
-                        }
-                    },
-                )
-            {
+            if !self.state.publish_gateway_listener_admission(
+                &expected,
+                refused_route_ports,
+                move || {
+                    for accept_gate_tx in pending_accept_gates {
+                        accept_gate_tx.send_replace(true);
+                    }
+                },
+            ) {
                 // The config changed while this pass awaited socket/drain
                 // work. Its decision must never govern the newer route table;
                 // immediately reconcile the latest generation instead of
