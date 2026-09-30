@@ -193,10 +193,18 @@ absence, complete histories, or the cause of every client error.
 
 ## Hosted validation and dispatch
 
-Pull requests touching the assets run `H2 pinned guard regressions`, and so
-does every push to `main` that touches the assets or a pinned repository file
-(`src/admin/mod.rs`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`), so pin drift
-fails on the commit that causes it. The job
+Pull requests that touch a pinned repository file (`src/admin/mod.rs`,
+`Cargo.toml`, `Cargo.lock`, `Dockerfile`) or these H2 guard assets run the
+cheap `H2 guard pins` check. It calls
+`prepare.py --check-pins-only`: no archive download, copy, compile, or build.
+It verifies the h2 lock entry, the `[patch.crates-io]` table, both Dockerfile
+Cargo calls and the admin metrics anchor, then prints the exact `before` and
+`after` SHA-256 values to paste into `source.json` if the admin pin drifted.
+The pull request that changes a pinned input therefore carries its re-pin.
+
+Pull requests touching the observation harness assets run the heavier
+`H2 pinned guard regressions` job, as does every push to `main` that touches
+the assets or a pinned repository file. That job
 verifies/prepares the source, formats the generated dependency on the runner,
 compiles/lints it, exercises its real receive/poll/clear paths and existing
 budget tests, checks both dependency chains, and runs the harness tests.

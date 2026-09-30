@@ -12,9 +12,6 @@ on:
       - tests/performance/multi_protocol/run_gateway_protocol_bench.sh
       - tests/performance/multi_protocol/tests/test_h2_guard_observation.py
       - .github/workflows/h2-guard-observation.yml
-      - Cargo.toml
-      - Cargo.lock
-      - Dockerfile
   # prepare.py fails closed when a repository file it pins drifts: the
   # src/admin/mod.rs SHA-256 in h2_guard/source.json, the h2 entry in
   # Cargo.lock, the single [patch.crates-io] table in Cargo.toml, and the two

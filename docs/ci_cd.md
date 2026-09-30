@@ -88,6 +88,7 @@ adding, removing, or materially changing a workflow.
 | `h1-internal-profile.yml` | H1 Internal Profile | PRs on the H1 profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/cadence/trace-fixture checks; manual measurement campaign. Optional. |
 | `udp-internal-profile.yml` | UDP Internal Profile | PRs on the UDP profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual measurement campaign. Optional. |
 | `h2-guard-observation.yml` | H2 Guard Observation | PRs on its own paths, push to `main` on its own paths plus the repository files it pins, manual | Temporary [#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588) patched-`h2` guard regressions; manual dispatch can add the H2/gRPC campaign. `prepare.py` fails closed on pin drift, so a main push that stales a pin turns red on that commit; see [Optional lanes that pin files outside their own paths](#optional-lanes-that-pin-files-outside-their-own-paths). Not a required check. |
+| `h2-guard-pin-check.yml` | H2 Guard Pin Check | PRs on pinned H2 inputs and guard assets | Cheap, build-free verification of the H2 guard's admin pre/postimage hashes and Cargo/Docker anchors. Prints replacement hashes on drift; not a required check. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
@@ -938,6 +939,15 @@ run red on the commit that caused it. Its concurrency group follows
 | Workflow | Pin check | Pinned repository inputs (in its `push` paths) |
 |---|---|---|
 | `h2-guard-observation.yml` | `tests/performance/multi_protocol/h2_guard/prepare.py` | `src/admin/mod.rs` (`context_files` SHA-256 in `h2_guard/source.json`), the `h2` entry in `Cargo.lock`, the single `[patch.crates-io]` table in `Cargo.toml`, the two `cargo build` calls in `Dockerfile` |
+
+`h2-guard-pin-check.yml` runs the same pin and anchor validation on the pull
+request that changes one of those inputs or the H2 guard assets. Its
+`prepare.py --check-pins-only` mode uses only Python's standard library to read
+the checkout, hash the admin source and its prepared postimage, and validate
+the Cargo/Docker anchors. It does not download the crate or create a build
+context. A mismatch prints the exact replacement `context_files` object for
+`tests/performance/multi_protocol/h2_guard/source.json`; the heavier observation
+workflow remains responsible for build and regression validation.
 
 When a pinned file changes on purpose, refresh the pin in the same PR where
 possible (run the lane with `workflow_dispatch` on the PR branch); otherwise

@@ -122,10 +122,58 @@ def select_dependency(context, evidence, provenance):
         shutil.copy2(context / name, evidence / name.lstrip("."))
 
 
+def check_pins_only(provenance):
+    """Check pinned source anchors and print replacement context hashes."""
+    admin = (ROOT / "src/admin/mod.rs").read_bytes()
+    anchor = b"        let mut metrics_output = registry.render();\n"
+    if admin.count(anchor) != 1:
+        raise SystemExit("pin check failed: src/admin/mod.rs metrics anchor must occur once")
+    hook = (ASSETS / "metrics-hook.txt").read_bytes()
+    after = admin.replace(anchor, anchor + hook)
+    before_hash = sha(admin)
+    after_hash = sha(after)
+
+    lock = (ROOT / "Cargo.lock").read_text()
+    lock_anchor = ('name = "h2"\nversion = "0.4.19"\n'
+                   'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+                   f'checksum = "{SHA256}"\n')
+    if lock.count(lock_anchor) != 1:
+        raise SystemExit("pin check failed: approved h2 0.4.19 lock anchor must occur once")
+
+    manifest = (ROOT / "Cargo.toml").read_text()
+    patch_anchor = "[patch.crates-io]\n"
+    if manifest.count(patch_anchor) != 1:
+        raise SystemExit("pin check failed: Cargo.toml [patch.crates-io] anchor must occur once")
+
+    docker = (ROOT / "Dockerfile").read_text()
+    cargo_anchor = 'cargo build --features "${FEATURES}"'
+    if docker.count(cargo_anchor) != 2:
+        raise SystemExit("pin check failed: Dockerfile cargo build anchor must occur twice")
+
+    expected = provenance["context_files"]["src/admin/mod.rs"]
+    print("Computed source.json replacement values:")
+    print('"context_files": {')
+    print('  "src/admin/mod.rs": {')
+    print(f'    "before": "{before_hash}",')
+    print(f'    "after": "{after_hash}"')
+    print("  }")
+    print("}")
+    if (before_hash, after_hash) != (expected["before"], expected["after"]):
+        raise SystemExit("pin check failed: update source.json with the computed values above")
+    print("H2 guard pins match source.json and all pinned input anchors are present.")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--check-pins-only", action="store_true")
     args = parser.parse_args()
+    if args.check_pins_only:
+        provenance = json.loads((ASSETS / "source.json").read_text())
+        check_pins_only(provenance)
+        return
+    if args.output is None:
+        parser.error("--output is required unless --check-pins-only is selected")
     if (os.environ.get("GITHUB_ACTIONS") != "true"
             or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
             or os.environ.get("RUNNER_OS") != "Linux"):
