@@ -715,6 +715,11 @@ fn shielded_admission_config(upstream_port: u16) -> GatewayConfig {
         .as_array_mut()
         .expect("plugin configs");
     configs.retain(|plugin| plugin["id"] == "mcp-admission-gw");
+    // `discovery.on_new_tool` defaults to `hide_until_configured`: a tool the
+    // upstream advertises stays hidden, and its `tools/call` is denied `-32001`
+    // by gateway policy, until it is configured. Expose discovered tools so the
+    // call reaches admission with the shield's redacted arguments.
+    configs[0]["config"]["discovery"] = json!({"on_new_tool": "allow"});
     configs.push(json!({
         "id": "mcp-admission-shield",
         "namespace": TEST_NAMESPACE,
@@ -892,9 +897,22 @@ fn governed_bridge_config(backend_port: u16, collector_port: u16) -> GatewayConf
     .expect("governed MCP bridge config is valid")
 }
 
+/// [`governed_bridge_config`] with a redacting `ai_prompt_shield` in front of
+/// the gateway, and an optional `note` query parameter on `pets.getPet` so a
+/// shielded argument can reach the REST backend outside the path.
 fn shielded_governed_bridge_config(backend_port: u16, collector_port: u16) -> GatewayConfig {
     let mut config = serde_json::to_value(governed_bridge_config(backend_port, collector_port))
         .expect("serialize governed bridge config");
+    let gateway = config["plugin_configs"]
+        .as_array_mut()
+        .expect("plugin configs")
+        .iter_mut()
+        .find(|plugin| plugin["id"] == "governed-gw")
+        .expect("governed gateway config");
+    gateway["config"]["servers"]["petstore"]["openapi"]["operations"][0]["parameters"]
+        .as_array_mut()
+        .expect("getPet parameters")
+        .push(json!({"name": "note", "in": "query", "schema": {"type": "string"}}));
     config["proxies"][0]["plugins"]
         .as_array_mut()
         .expect("proxy plugin list")
@@ -1063,7 +1081,11 @@ async fn functional_mcp_gateway_forwards_shielded_upstream_tool_arguments() {
     let list = json!({"jsonrpc": "2.0", "id": 90, "method": "tools/list"});
     let (status, body, _) = fixture.post("HTTP/1.1", Some(&session), &list).await;
     assert_eq!(status, 200, "{body}");
-    assert!(body["result"]["tools"].is_array(), "{body}");
+    let tools = body["result"]["tools"].as_array().expect("tools array");
+    assert!(
+        tools.iter().any(|tool| tool["name"] == "echo.echo"),
+        "the discovered upstream tool must be exposed: {body}"
+    );
 
     let call = json!({
         "jsonrpc": "2.0",
@@ -1244,6 +1266,10 @@ async fn functional_mcp_gateway_governed_bridge_audits_and_limits_tool_calls() {
     collector_task.abort();
 }
 
+/// A lowercase `post` `tools/call` through the governed OpenAPI bridge is
+/// shielded and audited: a redacted query argument is forwarded redacted, and a
+/// redacted path argument makes the bridged call invalid (`-32602`) with no
+/// backend request.
 #[ignore]
 #[tokio::test]
 async fn functional_mcp_gateway_lowercase_post_is_shielded_and_audited() {
@@ -1262,33 +1288,83 @@ async fn functional_mcp_gateway_lowercase_post_is_shielded_and_audited() {
     assert_eq!(status, 200);
     let session = header_string(&headers).expect("initialize session");
 
-    let call = bridge_call_body(81, "pets.getPet", json!({"petId": "alice@example.com"}));
+    // A shielded argument the bridge forwards outside the path (a query
+    // parameter) reaches the REST backend redacted.
+    let arguments = json!({"petId": "7", "note": "alice@example.com"});
+    let call = bridge_call_body(81, "pets.getPet", arguments);
     let lower_post = http::Method::from_bytes(b"post").expect("lowercase HTTP method");
+    let (status, body, _) = fixture
+        .post_h1_method_with(lower_post.clone(), Some(&session), &call, &key)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], json!(81), "{body}");
+    assert_eq!(body["result"]["isError"], json!(false), "{body}");
+    let received = fixture.received();
+    assert_eq!(received.len(), 1, "one bridged request: {received:#?}");
+    let request_line = received[0].head.lines().next().unwrap_or_default();
+    let target = request_line
+        .strip_prefix("GET ")
+        .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+        .unwrap_or_else(|| panic!("unexpected bridged request line: {request_line}"));
+    let (path, query) = target
+        .split_once('?')
+        .unwrap_or_else(|| panic!("the bridged request carries no query: {request_line}"));
+    assert_eq!(path, "/pets/7", "{request_line}");
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![("note".to_string(), "[REDACTED:email]".to_string())],
+        "the bridge must receive only the shielded argument: {request_line}"
+    );
+    assert!(
+        received.iter().all(|request| {
+            !request.head.contains("alice")
+                && !String::from_utf8_lossy(&request.body).contains("alice")
+        }),
+        "the original argument must never reach the backend: {received:#?}"
+    );
+
+    // A shielded PATH argument cannot be forwarded: `[REDACTED:email]` is not
+    // a canonical path segment, so the bridged call is invalid (`-32602`) and
+    // nothing is dispatched.
+    fixture.clear();
+    let call = bridge_call_body(82, "pets.getPet", json!({"petId": "alice@example.com"}));
     let (status, body, _) = fixture
         .post_h1_method_with(lower_post, Some(&session), &call, &key)
         .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["id"], json!(81), "{body}");
+    assert_eq!(body["id"], json!(82), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32602), "{body}");
+    assert!(!body.to_string().contains("alice@example.com"), "{body}");
     let received = fixture.received();
     assert!(
-        received.iter().any(|request| {
-            request
-                .head
-                .starts_with("GET /pets/%5BREDACTED:email%5D HTTP/1.1")
-        }),
-        "the bridge must receive only the shielded argument: {received:#?}; response: {body}"
+        received.is_empty(),
+        "a redacted path argument must not reach the backend: {received:#?}"
     );
-    let audited = wait_for_audit_records(&records, 1).await;
+
+    // Both lowercase-POST calls are audited, and neither exports the
+    // original argument.
+    let audited = wait_for_audit_records(&records, 2).await;
     assert_eq!(
         audited.len(),
-        1,
+        2,
         "lowercase POST must be audited: {audited:#?}"
     );
-    assert_eq!(audited[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
-    assert!(
-        !audited[0].to_string().contains("alice@example.com"),
-        "the original argument must not be exported: {audited:#?}"
-    );
+    for record in &audited {
+        let entry = &record["mcp"]["calls"][0];
+        assert_eq!(entry["tool"], "pets.getPet", "{record}");
+        assert!(
+            !record.to_string().contains("alice@example.com"),
+            "the original argument must not be exported: {record}"
+        );
+    }
+    let invalid = audited
+        .iter()
+        .filter(|record| record["mcp"]["calls"][0]["error_code"] == json!(-32602))
+        .count();
+    assert_eq!(invalid, 1, "{audited:#?}");
 
     fixture.shutdown().await;
     collector_task.abort();

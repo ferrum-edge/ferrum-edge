@@ -2010,10 +2010,6 @@ impl Plugin for AiPromptShield {
                         ctx.metadata
                             .insert("ai_shield_redacted".to_string(), detected.join(","));
                         if let Ok(serialized) = serde_json::to_string(&json) {
-                            if self.scan_mode == ScanMode::McpArguments {
-                                ctx.mcp_shielded_request_body =
-                                    Some(bytes::Bytes::copy_from_slice(serialized.as_bytes()));
-                            }
                             ctx.metadata
                                 .insert("request_body".to_string(), serialized.clone());
                             ctx.request_body_bytes = Some(bytes::Bytes::from(serialized));

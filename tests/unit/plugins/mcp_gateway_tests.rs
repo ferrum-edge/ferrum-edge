@@ -13502,6 +13502,150 @@ async fn aggregate_final_body_refuses_method_argument_and_destination_drift() {
     );
 }
 
+/// An aggregate gateway over [`start_mcp_catalog_server`] that allows every
+/// tool by policy, with `discovery.on_new_tool` left at its default when
+/// `on_new_tool` is `None`.
+fn allow_all_aggregate_plugin(
+    server: &MockServer,
+    on_new_tool: Option<&str>,
+) -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["policy"] = json!({ "default_action": "allow" });
+    match on_new_tool {
+        Some(behavior) => config["discovery"] = json!({ "on_new_tool": behavior }),
+        None => {
+            config.as_object_mut().unwrap().remove("discovery");
+        }
+    }
+    create_plugin("mcp_gateway", &config).unwrap().unwrap()
+}
+
+/// `discovery.on_new_tool` defaults to `hide_until_configured`, whatever the
+/// policy's `default_action`: a tool the upstream newly advertises and no
+/// `policy.tools` entry names is neither listed nor callable, and its
+/// `tools/call` is denied `-32001` by gateway policy before any argument is
+/// looked at. Only `on_new_tool: allow` (or configuring the tool) admits it.
+#[tokio::test]
+async fn aggregate_default_discovery_denies_calls_to_unconfigured_new_tools() {
+    let server = start_mcp_catalog_server().await;
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 70,
+        "method": "tools/call",
+        "params": { "name": "github.merge_pr", "arguments": {} }
+    });
+
+    let plugin = allow_all_aggregate_plugin(&server, None);
+    let session_id = initialize(&plugin).await;
+    let names = aggregate_tool_names(&plugin, &session_id, 71).await;
+    assert!(
+        names.is_empty(),
+        "new tools stay hidden by default: {names:?}"
+    );
+    let (mut ctx, mut headers) = mcp_ctx(call.clone());
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(70), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+    assert_eq!(
+        body["error"]["message"], "MCP tool call denied by gateway policy",
+        "{body}"
+    );
+
+    let plugin = allow_all_aggregate_plugin(&server, Some("allow"));
+    let session_id = initialize(&plugin).await;
+    let names = aggregate_tool_names(&plugin, &session_id, 72).await;
+    assert!(
+        names.iter().any(|name| name == "github.merge_pr"),
+        "{names:?}"
+    );
+    let (mut ctx, mut headers) = mcp_ctx(call);
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let routed = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(routed, PluginResult::Continue), "{routed:?}");
+}
+
+/// A redacting `ai_prompt_shield` (`scan_fields: mcp_arguments`) runs before
+/// `mcp_gateway` and rewrites the buffered body views, so the gateway admits
+/// the redacted arguments, forwards exactly them, and accepts them at its
+/// final request-body check. A later plugin that changes the admitted
+/// arguments is still refused.
+#[tokio::test]
+async fn aggregate_admits_and_forwards_shield_redacted_arguments() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = allow_all_aggregate_plugin(&server, Some("allow"));
+    let shield_config = json!({
+        "action": "redact",
+        "scan_fields": "mcp_arguments",
+        "patterns": ["email"]
+    });
+    let shield = create_plugin("ai_prompt_shield", &shield_config)
+        .unwrap()
+        .unwrap();
+    assert!(shield.priority() < plugin.priority());
+    let session_id = initialize(&plugin).await;
+    let restore = body_transformer(json!([{
+        "operation": "update",
+        "target": "body",
+        "key": "params.arguments.contact",
+        "value": "alice@example.com"
+    }]));
+
+    for (request_id, later) in [(73, None), (74, Some(&restore))] {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "github.merge_pr",
+                "arguments": { "contact": "alice@example.com" }
+            }
+        });
+        let (mut ctx, mut headers) = mcp_ctx(request.clone());
+        headers.insert("mcp-session-id".to_string(), session_id.clone());
+        let shielded = shield.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(shielded, PluginResult::Continue), "{shielded:?}");
+        assert!(ctx.metadata.contains_key("ai_shield_redacted"));
+        let admitted = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(admitted, PluginResult::Continue),
+            "the shield-redacted call must be admitted: {admitted:?}"
+        );
+        let mut body = serde_json::to_vec(&request).unwrap();
+        for stage in [&shield, &plugin].into_iter().chain(later) {
+            let transformed = stage
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &headers,
+                )
+                .await;
+            if let Some(rewritten) = transformed {
+                body = rewritten;
+            }
+        }
+        let forwarded: Value = serde_json::from_slice(&body).unwrap();
+        let verdicts = final_body_verdicts(&plugin, &mut ctx, &headers, &body).await;
+        if later.is_some() {
+            assert_eq!(
+                forwarded["params"]["arguments"]["contact"], "alice@example.com",
+                "{forwarded}"
+            );
+            assert_admission_drift_refused(verdicts, request_id, "arguments restored");
+            continue;
+        }
+        assert_eq!(forwarded["params"]["name"], "merge_pr", "{forwarded}");
+        assert_eq!(
+            forwarded["params"]["arguments"],
+            json!({ "contact": "[REDACTED:email]" }),
+            "{forwarded}"
+        );
+        assert_admission_holds(verdicts, "shield-redacted arguments");
+    }
+}
+
 #[tokio::test]
 async fn aggregate_final_body_refuses_prompt_and_resource_target_drift() {
     let (_server, plugin) = aggregate_plugin_with_catalog().await;

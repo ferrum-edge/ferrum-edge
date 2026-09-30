@@ -94,6 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     redacts) only `params.arguments` of each `tools/call`, accepts the media
     types `mcp_gateway` admits (including `application/grpc-web+json`), refuses
     duplicate member names, and rejects redaction when an id cannot round-trip.
+    `mcp_gateway` admits and forwards the redacted arguments; through an
+    OpenAPI bridge, a redacted path argument fails the call with `-32602`.
   - `docs/plugins.md` documents the recommended plugin stack for an
     agent-facing MCP endpoint.
 
@@ -127,8 +129,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, query, and body are re-checked in the final request-body hook
   (`-32014` on drift); a request-body transform (for example a prompt-guard
   redaction) that changed the admitted envelope is re-validated and carried
-  into the REST request, including redacted path, query, and header arguments.
-  The backend response is converted in the buffered normalize phase
+  into the REST request, including redacted query, header, and body
+  arguments; a redacted path argument is not a canonical path segment, so that
+  call fails with `-32602` and nothing is dispatched. The backend response is converted in the buffered normalize phase
   into a `tools/call` result answered with HTTP 200: a 2xx is always
   `isError: false` (text content plus `structuredContent` for a bounded JSON
   object, or a note when the body is omitted as oversized, coded, streamed,

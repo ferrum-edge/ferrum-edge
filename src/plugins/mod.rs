@@ -2969,13 +2969,6 @@ pub struct RequestContext {
     /// under the public name only when the final wire name exactly matches
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
-    /// Exact MCP request bytes after `ai_prompt_shield` completed an
-    /// argument redaction. The shield also refreshes the public body views,
-    /// but this private snapshot preserves the redacted admission boundary if
-    /// another `before_proxy` hook mutates a general-purpose body view later.
-    /// `mcp_gateway` admits from this snapshot and its final-body check still
-    /// refuses any later change to the admitted arguments.
-    pub(crate) mcp_shielded_request_body: Option<bytes::Bytes>,
     /// What the owning `mcp_gateway` aggregate router admitted for a request it
     /// routes upstream — message kind and method, selected destination and
     /// upstream session, upstream item identity, and admitted arguments —
@@ -4104,7 +4097,6 @@ impl RequestContext {
             a2a_gateway_claim: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
-            mcp_shielded_request_body: None,
             mcp_admission: None,
             mcp_owner_instance: None,
             mcp_request_json_rpc_id: None,
@@ -5692,7 +5684,6 @@ impl RequestContext {
             }),
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
-            mcp_shielded_request_body: self.mcp_shielded_request_body.clone(),
             mcp_admission: self.mcp_admission.clone(),
             mcp_owner_instance: self.mcp_owner_instance,
             mcp_request_json_rpc_id: self.mcp_request_json_rpc_id.clone(),
