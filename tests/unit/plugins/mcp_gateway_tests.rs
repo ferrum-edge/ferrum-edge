@@ -14403,10 +14403,13 @@ async fn denied_groups_take_precedence_over_allowed_groups() {
 /// No mapped Consumer (an anonymous proxy, or an external identity without a
 /// Consumer mapping) is never granted a group-conditioned tool; ungated tools
 /// keep working for it.
+/// A named way of building a caller for a request body.
+type CallerCase = (&'static str, fn(Value) -> McpCaller);
+
 #[tokio::test]
 async fn group_conditioned_tools_fail_closed_without_a_consumer() {
     let (_server, plugin) = grant_plugin().await;
-    let callers: [(&str, fn(Value) -> McpCaller); 2] = [
+    let callers: [CallerCase; 2] = [
         ("anonymous", caller_unauthenticated),
         ("external identity", caller_as_alice),
     ];
