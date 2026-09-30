@@ -3475,7 +3475,8 @@ digest is missing or malformed, rebuilds each reference from its fixed
 repository name (`ferrumedge/ferrum-edge`, `ghcr.io/<owner>/<repo>`), creates
 `latest` only from those references, moves Docker Hub first and GHCR second, and
 checks each registry's `latest` digest right after its move. A mismatch fails
-the run before the next registry moves.
+the run before the next registry moves. The step summary lists each registry's
+digest rather than a full reference, which GitHub could mask the same way.
 
 The identity pins the workflow **path and ref**
 (`main-latest-image.yml@refs/heads/main`), not the workflow file's commit:
@@ -3525,8 +3526,9 @@ secrets (matched case-insensitively), action pins matching release.yml, build
 parity and the Git build context, the smoke run, the attest-then-sign order, the
 verify step's identity and issuer, the exact tag set per job, the invoked gate
 sequence in `promote`, the exact outputs of every job (only bare digests cross
-from `attest` into `promote`, and every consumed job output must be declared),
-`latest` created only from references rebuilt from those verified digests, and
+from `attest` into `promote`, and every job output consumed through dot or
+bracket access must be declared), `latest` created only from references rebuilt
+from those verified digests, a `promote` summary that prints only digests, and
 the absence of version or eBPF tags. Its `--self-test` mutates the checked-in
 workflow and requires each regression to be rejected, most of them for their own
 specific reason. `verify_required_ci.py` runs both modes, so the required

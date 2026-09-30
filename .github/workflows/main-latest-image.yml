@@ -1080,12 +1080,14 @@ jobs:
             fi
           }
 
+          # The summary prints only the digests: a full Docker Hub reference
+          # can match the Docker Hub username secret and would be masked.
           summarize() {
             {
               echo "\`latest\` now points to \`main-${SOURCE_SHA}\`:"
               echo ""
-              echo "- \`${docker_ref}\`"
-              echo "- \`${ghcr_ref}\`"
+              echo "- Docker Hub: \`${DOCKER_DIGEST}\`"
+              echo "- GHCR: \`${GHCR_DIGEST}\`"
             } >> "$GITHUB_STEP_SUMMARY"
           }
 

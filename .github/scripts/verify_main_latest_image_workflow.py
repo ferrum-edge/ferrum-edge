@@ -157,8 +157,11 @@ EXPECTED_JOB_OUTPUTS = {
 }
 JOB_OUTPUT_LINE = re.compile(r"^      (?P<name>[A-Za-z0-9_-]+):[ \t]*(?P<value>\S.*?)\s*$")
 # A consumed job output must be named, so the declared-output check sees it.
+# The job and `outputs` are matched through dot or bracket access alike.
 NEEDS_OUTPUT = re.compile(
-    r"\bneeds\s*\.\s*(?P<job>[A-Za-z0-9_-]+)\s*\.\s*outputs\b"
+    r"\bneeds\s*(?:\.\s*(?P<job>[A-Za-z0-9_-]+)"
+    r"|\[\s*['\"]?(?P<bracket_job>[A-Za-z0-9_-]+)['\"]?\s*\])"
+    r"\s*(?:\.\s*outputs\b|\[\s*['\"]?outputs['\"]?\s*\])"
     r"(?:\.(?P<name>[A-Za-z0-9_-]+)\b)?"
 )
 PROMOTE_ENV = (
@@ -570,6 +573,10 @@ PROMOTE_SOURCE_MESSAGE = (
 PROMOTE_INPUT_MESSAGE = (
     "jobs.promote must take only the bare digests jobs.attest exported, reject a "
     "missing or malformed one, and rebuild each reference from its fixed repository name"
+)
+PROMOTE_SUMMARY_MESSAGE = (
+    "jobs.promote must summarize only the verified digests, never a full image reference "
+    "that GitHub could mask"
 )
 PROMOTE_ON_MAIN_MESSAGE = (
     "jobs.promote must leave latest unchanged when the commit is no longer on main"
@@ -1134,6 +1141,13 @@ def validate_promote(block: str) -> list[str]:
         failures.append(PROMOTE_ORPHAN_MESSAGE)
     if not branch_contains(function("require_latest"), DIGEST_COMPARE, "exit 1"):
         failures.append(PROMOTE_DIGEST_MESSAGE)
+    summary = function("summarize")
+    if (
+        "_ref" in summary.lower()
+        or "${DOCKER_DIGEST}" not in summary
+        or "${GHCR_DIGEST}" not in summary
+    ):
+        failures.append(PROMOTE_SUMMARY_MESSAGE)
     verified_digest = function("require_verified_digest")
     if tuple(line.strip() for line in verified_digest.splitlines()) != REQUIRE_VERIFIED_DIGEST:
         failures.append(PROMOTE_INPUT_MESSAGE)
@@ -1255,7 +1269,8 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
             failures.append(f"jobs.{job_name} must not use cosign; only jobs.attest signs")
 
     for consumed in NEEDS_OUTPUT.finditer(active):
-        declared = EXPECTED_JOB_OUTPUTS.get(consumed.group("job"), {})
+        job = consumed.group("job") or consumed.group("bracket_job")
+        declared = EXPECTED_JOB_OUTPUTS.get(job, {})
         if consumed.group("name") not in declared:
             failures.append(f"workflow {CROSS_JOB_OUTPUT_MESSAGE}: {consumed.group(0)}")
 
@@ -1598,11 +1613,31 @@ def self_test() -> int:
             ),
             CROSS_JOB_OUTPUT_MESSAGE,
         ),
-        "verify step exports a full reference": (
+        "promote reads a job by bracket access": (
             replace_in_job(
-                "attest",
-                'echo "${registry}_digest=${digest}" >> "$GITHUB_OUTPUT"',
-                'echo "${registry}_ref=${image_ref}" >> "$GITHUB_OUTPUT"',
+                "promote",
+                "${{ needs.attest.outputs.docker_digest }}",
+                "${{ needs['attest'].outputs.docker_ref }}",
+            ),
+            CROSS_JOB_OUTPUT_MESSAGE,
+        ),
+        "promote reads outputs by bracket access": (
+            replace_in_job(
+                "promote",
+                "${{ needs.attest.outputs.docker_digest }}",
+                "${{ needs.attest['outputs'].docker_ref }}",
+            ),
+            CROSS_JOB_OUTPUT_MESSAGE,
+        ),
+        # Anchored on the whole export function: the images step writes the
+        # same `_digest` output line earlier in the job.
+        "verify step exports a full reference": (
+            replace_once(
+                EXPORT_VERIFIED_DIGEST,
+                EXPORT_VERIFIED_DIGEST.replace(
+                    'echo "${registry}_digest=${digest}" >> "$GITHUB_OUTPUT"',
+                    'echo "${registry}_ref=${image_ref}" >> "$GITHUB_OUTPUT"',
+                ),
             ),
             VERIFY_MESSAGE,
         ),
@@ -1634,6 +1669,14 @@ def self_test() -> int:
         "promote accepts a missing digest": (
             replace_in_job("promote", f"          {PROMOTE_DIGEST_CHECKS[0]}\n", ""),
             f"jobs.promote must run {PROMOTE_DIGEST_CHECKS[0]!r}",
+        ),
+        "promote summary prints a full reference": (
+            replace_in_job(
+                "promote",
+                'echo "- Docker Hub: \\`${DOCKER_DIGEST}\\`"',
+                'echo "- \\`${docker_ref}\\`"',
+            ),
+            PROMOTE_SUMMARY_MESSAGE,
         ),
         "promote takes its repository from outside the workflow": (
             replace_in_job(
