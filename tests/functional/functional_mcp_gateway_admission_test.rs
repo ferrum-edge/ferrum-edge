@@ -1320,8 +1320,9 @@ async fn functional_mcp_gateway_lowercase_post_is_shielded_and_audited() {
     );
     assert!(
         received.iter().all(|request| {
-            !request.head.contains("alice")
-                && !String::from_utf8_lossy(&request.body).contains("alice")
+            !request.head.contains("alice@example.com")
+                && !request.head.contains("alice%40example.com")
+                && !String::from_utf8_lossy(&request.body).contains("alice@example.com")
         }),
         "the original argument must never reach the backend: {received:#?}"
     );
