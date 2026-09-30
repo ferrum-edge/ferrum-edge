@@ -4974,15 +4974,14 @@ impl Plugin for AiTranscriptAudit {
         if !candidate_shape {
             return PluginResult::Continue;
         }
-        if headers.get("content-type").is_none()
-            && self.capture.mcp_tool_calls
-            && ctx.metadata.get("request_body").is_some_and(|body| {
-                matches!(
-                    mcp_jsonrpc::scan_request_bytes(body.as_bytes()),
-                    mcp_jsonrpc::RequestScan::NoToolCall
-                )
-            })
-        {
+        if skip_content_type_less_non_mcp(
+            headers.get("content-type").map(String::as_str),
+            self.capture.mcp_tool_calls,
+            ctx.metadata
+                .get("request_body")
+                .map(String::as_bytes)
+                .unwrap_or_default(),
+        ) {
             return PluginResult::Continue;
         }
         // The stream marker is set inside `stage_candidate`, only once the body
@@ -5090,6 +5089,14 @@ impl Plugin for AiTranscriptAudit {
         let is_json =
             self.candidate_content_type(ctx, headers.get("content-type").map(String::as_str));
         if !is_json {
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
+        }
+        if skip_content_type_less_non_mcp(
+            headers.get("content-type").map(String::as_str),
+            self.capture.mcp_tool_calls,
+            body,
+        ) {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
@@ -5887,6 +5894,22 @@ impl Plugin for AiTranscriptAudit {
         );
         let _ = self.enqueue(record, Some(&mut staging));
     }
+}
+
+/// Keep no-Content-Type POSTs available to the MCP audit path without staging
+/// ordinary uploads as possible AI requests. The bounded recognizer classifies
+/// bodies that do not contain a `tools/call` as `NoToolCall`.
+fn skip_content_type_less_non_mcp(
+    content_type: Option<&str>,
+    mcp_tool_calls: bool,
+    body: &[u8],
+) -> bool {
+    content_type.is_none()
+        && mcp_tool_calls
+        && matches!(
+            mcp_jsonrpc::scan_request_bytes(body),
+            mcp_jsonrpc::RequestScan::NoToolCall
+        )
 }
 
 /// Tees streaming (SSE) response bytes into a bounded, revocable accumulator

@@ -2681,6 +2681,10 @@ async fn mcp_tool_call_notification_is_charged_and_unsupported_encoding_fails_cl
         body["error"]["message"],
         "MCP tool-call request content encoding cannot be inspected"
     );
+    assert_eq!(
+        header(&ctx.metadata, "ratelimit_mcp_uninspectable"),
+        Some("unsupported_content_encoding")
+    );
 }
 
 #[tokio::test]

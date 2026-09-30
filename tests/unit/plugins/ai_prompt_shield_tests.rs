@@ -4383,12 +4383,12 @@ async fn mcp_redaction_refuses_numeric_ids_that_cannot_round_trip() {
         );
     }
 
-    let body = concat!(
-        r#"{"jsonrpc":"2.0","id":1e3,"method":"tools/call","params":{"name":"#,
-        r#"crm.lookup","arguments":{"ssn":"#,
-        "123-45-6789",
-        r#""}}}"#,
-    );
+    let body = r##"{
+        "jsonrpc":"2.0",
+        "id":1e3,
+        "method":"tools/call",
+        "params":{"name":"crm.lookup","arguments":{"ssn":"123-45-6789"}}
+    }"##;
     let mut transform_headers = make_post_headers();
     transform_headers.insert(":method".to_string(), "POST".to_string());
     assert!(
@@ -4405,11 +4405,10 @@ async fn mcp_redaction_refuses_numeric_ids_that_cannot_round_trip() {
 }
 
 #[tokio::test]
-async fn mcp_redaction_refuses_ids_when_the_request_scan_is_uninspectable() {
-    let padding = "x".repeat(300_000);
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1e3,"method":"tools/call","params":{{"name":"crm.lookup","arguments":{{"ssn":"123-45-6789","padding":"{padding}"}}}}}}"#
-    );
+async fn mcp_redaction_refuses_over_limit_batches_as_uninspectable() {
+    let mut members = vec![mcp_tool_call(1, json!({"ssn": "123-45-6789"})).to_string()];
+    members.extend((2..=33).map(|id| mcp_tool_call(id, json!({"q": "safe"})).to_string()));
+    let body = format!("[{}]", members.join(","));
     let plugin = AiPromptShield::new(&json!({
         "action": "redact",
         "scan_fields": "mcp_arguments",
@@ -4422,7 +4421,35 @@ async fn mcp_redaction_refuses_ids_when_the_request_scan_is_uninspectable() {
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
     assert_eq!(
         shield_metadata(&ctx, "ai_shield_rejected"),
-        Some("jsonrpc_id_not_round_trippable")
+        Some("jsonrpc_request_uninspectable")
+    );
+}
+
+#[tokio::test]
+async fn mcp_redaction_refuses_progress_tokens_that_would_change_on_serialize() {
+    let plugin = mcp_shield("redact");
+    let body = r##"{
+        "jsonrpc":"2.0",
+        "id":7,
+        "method":"tools/call",
+        "params":{
+            "_meta":{"progressToken":1e3},
+            "name":"crm.lookup",
+            "arguments":{"ssn":"123-45-6789"}
+        }
+    }"##;
+    let mut ctx = make_post_ctx_with_raw_body(body);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("jsonrpc_progress_token_not_round_trippable")
+    );
+    assert!(
+        !shield_metadata(&ctx, "request_body")
+            .unwrap_or_default()
+            .contains("REDACTED"),
+        "a changed progress token must not accompany a partial rewrite"
     );
 }
 

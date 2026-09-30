@@ -961,7 +961,7 @@ impl RateLimiting {
         }) {
             ctx.metadata.insert(
                 "ratelimit_mcp_uninspectable".to_string(),
-                "true".to_string(),
+                "unsupported_content_encoding".to_string(),
             );
             return mcp_jsonrpc_refusal(
                 &McpReplyShape::default(),

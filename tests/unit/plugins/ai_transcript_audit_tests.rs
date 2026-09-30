@@ -13374,7 +13374,11 @@ async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
         loopback_http_client(),
     )
     .expect("valid default MCP scope");
-    let mut ordinary = mcp_ctx(&json!({"ordinary": "json"}));
+    let ordinary_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "ordinary LLM prompt"}]
+    });
+    let mut ordinary = mcp_ctx(&ordinary_body);
     ordinary.headers.remove("content-type");
     let mut headers = ordinary.headers.clone();
     assert!(matches!(
@@ -13387,6 +13391,37 @@ async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
             .contains_key("ai_transcript_audit.candidate"),
         "a Content-Type-less body that cannot spell tools/call is skipped by the byte pre-scan"
     );
+}
+
+#[tokio::test]
+async fn mcp_audit_final_fallback_skips_large_content_type_less_uploads() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.headers.remove("content-type");
+    let mut headers = ctx.headers.clone();
+    headers.remove("content-type");
+    let body = vec![0xff; 1024 * 1024 + 1];
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_transcript_audit.candidate"),
+        "a large Content-Type-less binary upload is not staged as an AI request"
+    );
+    assert!(received_records(&server).await.is_empty());
 }
 
 #[test]
@@ -13445,30 +13480,49 @@ async fn mcp_batch_record_describes_every_call_and_matches_outcomes_by_id() {
 
 #[tokio::test]
 async fn mcp_batch_outcomes_canonicalize_raw_numeric_and_escaped_string_ids() {
-    let body = concat!(
-        r#"[{"jsonrpc":"2.0","id":1e3,"method":"tools/call","params":{"name":"#,
-        "search.web",
-        r#"","arguments":{}}},{"jsonrpc":"2.0","id":"a\u0062","method":"tools/call","params":{"name":"#,
-        "files.read",
-        r#"","arguments":{}}}]"#,
+    let body = format!(
+        r##"[
+            {{
+                "jsonrpc":"2.0",
+                "id":1e3,
+                "method":"tools/call",
+                "params":{{"name":"search.web","arguments":{{"padding":"{padding}"}}}}
+            }},
+            {{
+                "jsonrpc":"2.0",
+                "id":"a\u0062",
+                "method":"tools/call",
+                "params":{{"name":"files.read","arguments":{{}}}}
+            }}
+        ]"##,
+        padding = "x".repeat(5_000),
     );
     let mut ctx = mcp_ctx(&json!({}));
     ctx.metadata
         .insert("request_body".to_string(), body.to_string());
     let response = json!([
-        {"jsonrpc": "2.0", "id": 1000.0, "result": {"isError": false}},
+        {"jsonrpc": "2.0", "id": 1000.0, "error": {"code": -32009, "message": "denied"}},
         {"jsonrpc": "2.0", "id": "ab", "result": {"isError": false}}
     ]);
-    let records = mcp_roundtrip(json!({}), &mut ctx, body.as_bytes(), &response).await;
+    let records = mcp_roundtrip(
+        json!({"limits": {"max_redaction_scan_bytes": 4096}}),
+        &mut ctx,
+        body.as_bytes(),
+        &response,
+    )
+    .await;
     assert_eq!(records.len(), 1, "{records:?}");
     let calls = records[0]["mcp"]["calls"].as_array().expect("mcp.calls");
     assert_eq!(calls.len(), 2);
     assert_eq!(
-        calls[0]["result"], "result",
+        calls[0]["result"],
+        "error",
         "exponent id matches its value"
     );
+    assert_eq!(calls[0]["error_code"], json!(-32009));
     assert_eq!(
-        calls[1]["result"], "result",
+        calls[1]["result"],
+        "result",
         "escaped string id matches its value"
     );
 }

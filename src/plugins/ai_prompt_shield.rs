@@ -16,8 +16,9 @@
 //!
 //! gRPC-Web still rides the composed HTTP/gRPC-Web view. Ordinary scan modes
 //! skip its framed `application/grpc-web*` bodies. In `mcp_arguments` mode,
-//! `application/grpc-web+json` is explicitly in scope as JSON and is parsed
-//! and rewritten under that mode's MCP contract.
+//! `+json` gRPC-Web media types are in scope only when the body is bare JSON.
+//! Framed payloads fail JSON parsing and pass uninspected; `mcp_gateway`
+//! refuses those frames.
 //!
 //! ## The final backend-visible body is authoritative
 //!
@@ -63,7 +64,9 @@
 //! same request media types the gateway does, including a request with no
 //! `Content-Type`, and a body with duplicate member names is refused by
 //! enforcing actions instead of being read one way here and another way by the
-//! server that executes the call. Redaction rewrites argument values in place;
+//! server that executes the call. `+json` gRPC-Web media types are accepted
+//! only for bare JSON bodies; framed payloads fail parsing and pass uninspected
+//! (`mcp_gateway` refuses them). Redaction rewrites argument values in place;
 //! an OpenAPI bridge call carries the redacted arguments into its REST request
 //! or is refused by the gateway, never forwarded with the originals.
 //!
@@ -276,6 +279,12 @@ enum RedactionOutcome {
     /// would change its wire representation. No rewritten document is safe to
     /// forward because the peer may no longer correlate its response.
     IdNotRoundTrippable,
+    /// Redaction could not preserve JSON-RPC correlation metadata after
+    /// parsing and serialization.
+    ProgressTokenNotRoundTrippable,
+    /// PII was detected in an MCP request whose shape exceeds the shared
+    /// recognizer bounds, so its calls and ids cannot be preserved safely.
+    UninspectableMcpRequest,
     /// Redaction could not be completed inside the per-request output/work
     /// budget (see [`REDACTION_OUTPUT_EXPANSION_FACTOR`]), or a configured
     /// pattern produced a zero-width match that would amplify at every
@@ -1386,8 +1395,17 @@ impl AiPromptShield {
             if self.detect_pii_mcp_arguments(&json).is_empty() {
                 return RedactionOutcome::NoChange;
             }
+            if matches!(
+                mcp_jsonrpc::scan_request_bytes(body.as_bytes()),
+                mcp_jsonrpc::RequestScan::Uninspectable(_)
+            ) {
+                return RedactionOutcome::UninspectableMcpRequest;
+            }
             if !mcp_ids_round_trip(body) {
                 return RedactionOutcome::IdNotRoundTrippable;
+            }
+            if !mcp_progress_tokens_round_trip(body) {
+                return RedactionOutcome::ProgressTokenNotRoundTrippable;
             }
             mcp_jsonrpc::for_each_tool_call_arguments_mut(&mut json, |arguments| {
                 redact_json_strings(arguments, &self.patterns, false, &budget);
@@ -1716,6 +1734,67 @@ fn mcp_ids_round_trip(body: &str) -> bool {
     }
 }
 
+/// Redaction serializes the full JSON value, so a progress token must also
+/// retain its original JSON token or the peer may lose progress correlation.
+fn mcp_progress_tokens_round_trip(body: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Request<'a> {
+        #[serde(borrow)]
+        params: Option<&'a serde_json::value::RawValue>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Params<'a> {
+        #[serde(borrow, rename = "_meta")]
+        meta: Option<&'a serde_json::value::RawValue>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Meta<'a> {
+        #[serde(borrow, rename = "progressToken")]
+        progress_token: Option<&'a serde_json::value::RawValue>,
+    }
+
+    fn member_round_trips(raw: &serde_json::value::RawValue) -> bool {
+        let Ok(request) = serde_json::from_str::<Request>(raw.get()) else {
+            return false;
+        };
+        let Some(params) = request.params else {
+            return true;
+        };
+        let Ok(params) = serde_json::from_str::<Params>(params.get()) else {
+            return false;
+        };
+        let Some(meta) = params.meta else {
+            return true;
+        };
+        let Ok(meta) = serde_json::from_str::<Meta>(meta.get()) else {
+            return false;
+        };
+        let Some(token) = meta.progress_token else {
+            return true;
+        };
+        serde_json::from_str::<Value>(token.get())
+            .ok()
+            .is_some_and(|value| value.to_string() == token.get())
+    }
+
+    let first = body
+        .as_bytes()
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+    if first == Some(b'[') {
+        serde_json::from_str::<Vec<&serde_json::value::RawValue>>(body)
+            .ok()
+            .is_some_and(|members| members.iter().all(|member| member_round_trips(member)))
+    } else {
+        serde_json::from_str::<&serde_json::value::RawValue>(body)
+            .ok()
+            .is_some_and(member_round_trips)
+    }
+}
+
 #[async_trait]
 impl Plugin for AiPromptShield {
     fn name(&self) -> &str {
@@ -1732,7 +1811,7 @@ impl Plugin for AiPromptShield {
         // shield as an inert fail-closed control on ProxyProtocol::Grpc.
         // gRPC-Web continues through the HTTP/gRPC-Web composed view. Framed
         // bodies are skipped by the ordinary JSON modes; `mcp_arguments`
-        // explicitly accepts +json media types, including gRPC-Web +json.
+        // accepts +json media types only when their bodies are bare JSON.
         super::HTTP_ONLY_PROTOCOLS
     }
 
@@ -1971,6 +2050,38 @@ impl Plugin for AiPromptShield {
                                 "error": "MCP JSON-RPC id cannot be preserved during redaction",
                                 "detected_types": detected,
                                 "message": "Request blocked because redacting the tool arguments would change the JSON-RPC id representation."
+                            })
+                            .to_string(),
+                            headers: HashMap::new(),
+                        }
+                    }
+                    RedactionOutcome::ProgressTokenNotRoundTrippable => {
+                        ctx.metadata.insert(
+                            "ai_shield_rejected".to_string(),
+                            "jsonrpc_progress_token_not_round_trippable".to_string(),
+                        );
+                        PluginResult::Reject {
+                            status_code: 400,
+                            body: serde_json::json!({
+                                "error": "MCP progress token cannot be preserved during redaction",
+                                "detected_types": detected,
+                                "message": "Request blocked because redacting tool arguments would change the JSON-RPC progress token representation."
+                            })
+                            .to_string(),
+                            headers: HashMap::new(),
+                        }
+                    }
+                    RedactionOutcome::UninspectableMcpRequest => {
+                        ctx.metadata.insert(
+                            "ai_shield_rejected".to_string(),
+                            "jsonrpc_request_uninspectable".to_string(),
+                        );
+                        PluginResult::Reject {
+                            status_code: 400,
+                            body: serde_json::json!({
+                                "error": "MCP JSON-RPC request exceeds inspection bounds",
+                                "detected_types": detected,
+                                "message": "Request blocked because the tool-call batch cannot be inspected within the configured MCP bounds."
                             })
                             .to_string(),
                             headers: HashMap::new(),
@@ -2258,7 +2369,9 @@ impl AiPromptShield {
             }
             // Re-serializing the document could change an id the peer uses to
             // correlate the response; never emit even a partially redacted body.
-            RedactionOutcome::IdNotRoundTrippable => None,
+            RedactionOutcome::IdNotRoundTrippable
+            | RedactionOutcome::ProgressTokenNotRoundTrippable
+            | RedactionOutcome::UninspectableMcpRequest => None,
             // Redaction could not complete inside its output/work allowance. The
             // partially rewritten document is discarded rather than forwarded;
             // the wire bytes are left alone so `on_final_request_body` sees the
