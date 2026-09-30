@@ -7,17 +7,19 @@
 //! - `/metrics` returns `401` by default and succeeds with a valid admin JWT,
 //!   a matching metrics bearer token, or an allowlisted client CIDR.
 //!
-//! Detailed `/overload` tiering needs a live `ProxyState` and is covered E2E in
-//! `tests/functional/functional_admin_observability_test.rs`.
+//! Detailed `/overload` tiering is checked against a live `ProxyState` below.
 
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use ferrum_edge::admin::{
     AdminState, MetricsAuthPolicy,
-    jwt_auth::{JwtConfig, JwtManager},
+    jwt_auth::{JwtConfig, JwtManager, ViewerNamespaceCeiling},
     serve_admin_on_listener,
 };
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::{EnvConfig, OperatingMode};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -27,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const JWT_SECRET: &str = "observability-auth-test-secret-key-000000";
+const VIEWER_SECRET: &str = "observability-viewer-secret-key-0123456789";
 const JWT_ISSUER: &str = "ferrum-edge-obs-test";
 
 fn jwt_manager() -> JwtManager {
@@ -112,6 +115,74 @@ fn admin_state(metrics_auth: MetricsAuthPolicy) -> AdminState {
     }
 }
 
+fn proxy_state() -> ferrum_edge::proxy::ProxyState {
+    let mut config = GatewayConfig::default();
+    config.normalize_fields();
+    let env_config = EnvConfig {
+        mode: OperatingMode::Database,
+        namespace: "ferrum".to_string(),
+        ..Default::default()
+    };
+    let (state, _health_check_handles) = ferrum_edge::proxy::ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("ProxyState::new");
+    state
+}
+
+fn token_with_secret(role: &str, secret: &str) -> String {
+    let now = chrono::Utc::now();
+    let claims = json!({
+        "iss": JWT_ISSUER,
+        "sub": "obs-test",
+        "role": role,
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+async fn assert_observability_detail(base: &str, authorization: Option<&str>, expected: bool) {
+    let client = reqwest::Client::new();
+    for path in ["/health", "/status"] {
+        let mut request = client.get(format!("{base}{path}"));
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        let body: Value = request.send().await.unwrap().json().await.unwrap();
+        assert_eq!(
+            body.get("mode").is_some(),
+            expected,
+            "unexpected detail tier on {path}: {body}"
+        );
+    }
+
+    let mut request = client.get(format!("{base}/overload"));
+    if let Some(value) = authorization {
+        request = request.header("Authorization", value);
+    }
+    let body: Value = request.send().await.unwrap().json().await.unwrap();
+    assert_eq!(
+        body.get("active_requests").is_some(),
+        expected,
+        "unexpected detail tier on /overload: {body}"
+    );
+    if !expected {
+        assert_eq!(body, json!({"level": "normal"}));
+    }
+}
+
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -134,6 +205,71 @@ async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     (format!("http://{actual}"), shutdown_tx)
+}
+
+#[tokio::test]
+async fn namespace_ceiling_viewer_does_not_grant_observability_detail() {
+    let ceiling_jwt_manager = || {
+        jwt_manager()
+            .with_viewer_secret(VIEWER_SECRET.to_string())
+            .expect("distinct viewer secret")
+            .with_viewer_namespace_ceiling(
+                ViewerNamespaceCeiling::parse("staging").expect("valid namespace ceiling"),
+            )
+    };
+
+    let ceiling_viewer = token_with_secret("viewer", VIEWER_SECRET);
+    let ceiling_admin = token_with_secret("admin", JWT_SECRET);
+    let unbounded_viewer = token_with_secret("viewer", VIEWER_SECRET);
+
+    let mut ceiling_state = admin_state(MetricsAuthPolicy::default());
+    ceiling_state.jwt_manager = ceiling_jwt_manager();
+    ceiling_state.proxy_state = Some(proxy_state());
+    let (ceiling_base, _ceiling_sd) = start_admin(ceiling_state).await;
+    assert_observability_detail(
+        &ceiling_base,
+        Some(&format!("Bearer {ceiling_viewer}")),
+        false,
+    )
+    .await;
+    assert_observability_detail(
+        &ceiling_base,
+        Some(&format!("Bearer {ceiling_admin}")),
+        true,
+    )
+    .await;
+
+    let mut unbounded_state = admin_state(MetricsAuthPolicy::default());
+    unbounded_state.jwt_manager = jwt_manager()
+        .with_viewer_secret(VIEWER_SECRET.to_string())
+        .expect("distinct viewer secret");
+    unbounded_state.proxy_state = Some(proxy_state());
+    let (unbounded_base, _unbounded_sd) = start_admin(unbounded_state).await;
+    assert_observability_detail(
+        &unbounded_base,
+        Some(&format!("Bearer {unbounded_viewer}")),
+        true,
+    )
+    .await;
+
+    // A ceiling-bound token does not change the detail the allowlisted source
+    // IP already receives without a token.
+    let cidr_policy = MetricsAuthPolicy {
+        allowed_cidrs: TrustedProxies::parse_strict("127.0.0.1/32,::1", "test")
+            .expect("valid metrics CIDR list"),
+        bearer_token: None,
+    };
+    let mut cidr_state = admin_state(cidr_policy);
+    cidr_state.jwt_manager = ceiling_jwt_manager();
+    cidr_state.proxy_state = Some(proxy_state());
+    let (cidr_base, _cidr_sd) = start_admin(cidr_state).await;
+    assert_observability_detail(&cidr_base, None, true).await;
+    assert_observability_detail(
+        &cidr_base,
+        Some(&format!("Bearer {ceiling_viewer}")),
+        true,
+    )
+    .await;
 }
 
 #[tokio::test]

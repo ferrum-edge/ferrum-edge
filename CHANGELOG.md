@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Align observability detail authorization for namespace-ceiling viewer JWTs.**
+  Ceiling-bound viewer tokens alone now receive only the minimal `/health`,
+  `/status`, and `/overload` projections. A metrics bearer token or allowlisted
+  source IP continues to grant the same detail it would receive without that
+  JWT.
 - **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
   GHSA-7gcf-g7xr-8hxj and `cmov` 0.5.4 for GHSA-3rjw-m598-pq24).
 - **The canonical request path refuses dot segments that carry a `;` path
