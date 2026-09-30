@@ -1979,12 +1979,26 @@ fn role_projected_resources_refuse_writing_their_placeholders_back() {
         .expect("AdminResource implementations follow the trait")
         + trait_start;
     let trait_source = &crud[trait_start..trait_end];
+    // Both paths are free functions over the one overridable hook, so an
+    // implementation cannot customize the read or the write check alone.
     assert!(
-        trait_source.contains("Self::project_for_role_with(resource, role, &PlaceholderRendering)"),
+        !trait_source.contains("fn response_body_for_role(")
+            && !trait_source.contains("fn masked_placeholder_sites("),
+        "the role response and placeholder detection must not be trait methods"
+    );
+    let free_fn = |signature: &str| {
+        let start = crud.find(signature).expect("shared projection function must exist");
+        let body = &crud[start..];
+        &body[..body.find("\n}\n").expect("function must end")]
+    };
+    assert!(
+        free_fn("fn response_body_for_role<R: AdminResource>(")
+            .contains("R::project_for_role_with(resource, role, &PlaceholderRendering)"),
         "response reads must use the shared role projection"
     );
     assert!(
-        trait_source.contains("Self::project_for_role_with(resource, role, &recorder)"),
+        free_fn("fn masked_placeholder_sites<R: AdminResource>(")
+            .contains("R::project_for_role_with(resource, role, &recorder)"),
         "placeholder detection must use the shared role projection"
     );
 
