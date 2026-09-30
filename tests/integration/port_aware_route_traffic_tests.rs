@@ -1689,9 +1689,11 @@ async fn live_listener_scoped_routes_never_404_while_reloads_reconcile() {
             .collect();
 
         for revision in 1..=30 {
-            let outcome = handles
-                .proxy_state
-                .update_config(single_listener_revision(backend, listener_port, revision));
+            let outcome = handles.proxy_state.update_config(single_listener_revision(
+                backend,
+                listener_port,
+                revision,
+            ));
             assert!(
                 outcome.applied(),
                 "reload {revision} must apply: {outcome:?}"
