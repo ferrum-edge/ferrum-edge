@@ -157,12 +157,14 @@ EXPECTED_JOB_OUTPUTS = {
 }
 JOB_OUTPUT_LINE = re.compile(r"^      (?P<name>[A-Za-z0-9_-]+):[ \t]*(?P<value>\S.*?)\s*$")
 # A consumed job output must be named, so the declared-output check sees it.
-# The job and `outputs` are matched through dot or bracket access alike.
+# The job and `outputs` are matched through dot or bracket access alike, and
+# case-insensitively, as GitHub resolves context names.
 NEEDS_OUTPUT = re.compile(
     r"\bneeds\s*(?:\.\s*(?P<job>[A-Za-z0-9_-]+)"
     r"|\[\s*['\"]?(?P<bracket_job>[A-Za-z0-9_-]+)['\"]?\s*\])"
     r"\s*(?:\.\s*outputs\b|\[\s*['\"]?outputs['\"]?\s*\])"
-    r"(?:\.(?P<name>[A-Za-z0-9_-]+)\b)?"
+    r"(?:\.(?P<name>[A-Za-z0-9_-]+)\b)?",
+    re.IGNORECASE,
 )
 PROMOTE_ENV = (
     "          DOCKER_DIGEST: ${{ needs.attest.outputs.docker_digest }}\n",
@@ -576,7 +578,7 @@ PROMOTE_INPUT_MESSAGE = (
 )
 PROMOTE_SUMMARY_MESSAGE = (
     "jobs.promote must summarize only the verified digests, never a full image reference "
-    "that GitHub could mask"
+    "or repository name that GitHub could mask"
 )
 PROMOTE_ON_MAIN_MESSAGE = (
     "jobs.promote must leave latest unchanged when the commit is no longer on main"
@@ -1144,6 +1146,8 @@ def validate_promote(block: str) -> list[str]:
     summary = function("summarize")
     if (
         "_ref" in summary.lower()
+        or "ferrumedge/" in summary.lower()
+        or "github_repository" in summary.lower()
         or "${DOCKER_DIGEST}" not in summary
         or "${GHCR_DIGEST}" not in summary
     ):
@@ -1269,9 +1273,9 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
             failures.append(f"jobs.{job_name} must not use cosign; only jobs.attest signs")
 
     for consumed in NEEDS_OUTPUT.finditer(active):
-        job = consumed.group("job") or consumed.group("bracket_job")
+        job = (consumed.group("job") or consumed.group("bracket_job")).lower()
         declared = EXPECTED_JOB_OUTPUTS.get(job, {})
-        if consumed.group("name") not in declared:
+        if (consumed.group("name") or "").lower() not in declared:
             failures.append(f"workflow {CROSS_JOB_OUTPUT_MESSAGE}: {consumed.group(0)}")
 
     failures.extend(validate_resolve(jobs["resolve"], active))
@@ -1629,6 +1633,14 @@ def self_test() -> int:
             ),
             CROSS_JOB_OUTPUT_MESSAGE,
         ),
+        "promote reads outputs through mixed-case names": (
+            replace_in_job(
+                "promote",
+                "${{ needs.attest.outputs.docker_digest }}",
+                "${{ NEEDS.attest.OUTPUTS.docker_ref }}",
+            ),
+            CROSS_JOB_OUTPUT_MESSAGE,
+        ),
         # Anchored on the whole export function: the images step writes the
         # same `_digest` output line earlier in the job.
         "verify step exports a full reference": (
@@ -1675,6 +1687,22 @@ def self_test() -> int:
                 "promote",
                 'echo "- Docker Hub: \\`${DOCKER_DIGEST}\\`"',
                 'echo "- \\`${docker_ref}\\`"',
+            ),
+            PROMOTE_SUMMARY_MESSAGE,
+        ),
+        "promote summary hard-codes the Docker Hub repository": (
+            replace_in_job(
+                "promote",
+                'echo "- Docker Hub: \\`${DOCKER_DIGEST}\\`"',
+                'echo "- Docker Hub: \\`ferrumedge/ferrum-edge@${DOCKER_DIGEST}\\`"',
+            ),
+            PROMOTE_SUMMARY_MESSAGE,
+        ),
+        "promote summary names the GHCR repository": (
+            replace_in_job(
+                "promote",
+                'echo "- GHCR: \\`${GHCR_DIGEST}\\`"',
+                'echo "- GHCR: \\`ghcr.io/${GITHUB_REPOSITORY}@${GHCR_DIGEST}\\`"',
             ),
             PROMOTE_SUMMARY_MESSAGE,
         ),

@@ -3476,7 +3476,8 @@ repository name (`ferrumedge/ferrum-edge`, `ghcr.io/<owner>/<repo>`), creates
 `latest` only from those references, moves Docker Hub first and GHCR second, and
 checks each registry's `latest` digest right after its move. A mismatch fails
 the run before the next registry moves. The step summary lists each registry's
-digest rather than a full reference, which GitHub could mask the same way.
+digest rather than a full reference or repository name, which GitHub could mask
+the same way.
 
 The identity pins the workflow **path and ref**
 (`main-latest-image.yml@refs/heads/main`), not the workflow file's commit:
@@ -3527,9 +3528,10 @@ parity and the Git build context, the smoke run, the attest-then-sign order, the
 verify step's identity and issuer, the exact tag set per job, the invoked gate
 sequence in `promote`, the exact outputs of every job (only bare digests cross
 from `attest` into `promote`, and every job output consumed through dot or
-bracket access must be declared), `latest` created only from references rebuilt
-from those verified digests, a `promote` summary that prints only digests, and
-the absence of version or eBPF tags. Its `--self-test` mutates the checked-in
+bracket access, in any letter case, must be declared), `latest` created only
+from references rebuilt from those verified digests, a `promote` summary that
+prints only digests (no reference or repository name), and the absence of
+version or eBPF tags. Its `--self-test` mutates the checked-in
 workflow and requires each regression to be rejected, most of them for their own
 specific reason. `verify_required_ci.py` runs both modes, so the required
 `Tests` check and `Trusted Policy Candidate` enforce it; the publisher's

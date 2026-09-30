@@ -480,9 +480,9 @@ outright with no deprecation period:
   lists each registry's digest instead of a full reference that GitHub could
   mask. `verify_main_latest_image_workflow.py` now pins the exact outputs of
   every job, rejects a full-reference job output, a consumed output its
-  producer does not declare (through dot or bracket access), or a full
-  reference in the `promote` summary, and its self-test covers each of those
-  regressions.
+  producer does not declare (through dot or bracket access, in any letter
+  case), or a reference or repository name in the `promote` summary, and its
+  self-test covers each of those regressions.
 
 - **gRPC and HTTP/2 backend connections no longer die after 100 requests
   against h2 >= 0.4.16 peers** (#5588). A client that ends a request with a
