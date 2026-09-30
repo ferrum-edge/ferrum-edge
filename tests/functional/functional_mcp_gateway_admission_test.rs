@@ -130,7 +130,10 @@ async fn serve_function(listener: TcpListener) {
         };
         tokio::spawn(async move {
             let mut pending = Vec::new();
-            while read_one_http_request(&mut stream, &mut pending).await.is_some() {
+            while read_one_http_request(&mut stream, &mut pending)
+                .await
+                .is_some()
+            {
                 let payload = json!({ "headers": { "mcp-session-id": FUNCTION_SESSION } });
                 if write_http_response(&mut stream, 200, &[], &payload.to_string())
                     .await
@@ -231,9 +234,13 @@ struct Fixture {
 
 impl Fixture {
     async fn start(writer: LaterWriter) -> Self {
-        let upstream = TcpListener::bind_test("127.0.0.1:0").await.expect("bind MCP upstream");
+        let upstream = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind MCP upstream");
         let upstream_port = upstream.local_addr().expect("upstream addr").port();
-        let function = TcpListener::bind_test("127.0.0.1:0").await.expect("bind function");
+        let function = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind function");
         let function_port = function.local_addr().expect("function addr").port();
         let captures: Captures = Arc::new(Mutex::new(Vec::new()));
         let tasks = vec![

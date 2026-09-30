@@ -14030,7 +14030,9 @@ async fn aggregate_admission_refuses_an_envelope_mixing_method_and_reply() {
 /// by every provider.
 #[tokio::test]
 async fn jwks_mechanism_verify_path_never_yields_an_external_identity() {
-    use ferrum_edge::plugins::utils::auth_flow::{AuthMechanism, ExtractedCredential, VerifyOutcome};
+    use ferrum_edge::plugins::utils::auth_flow::{
+        AuthMechanism, ExtractedCredential, VerifyOutcome,
+    };
     let auth = two_issuer_jwks_auth();
     let claims = json!({ "iss": ISSUER_A, "sub": "alice" });
     let token = super::jwks_auth_support::create_rs256_token_with_kid(
