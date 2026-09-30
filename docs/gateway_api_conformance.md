@@ -464,9 +464,12 @@ without a restart. These bounds are deliberate and tested:
     process-global ownership, or plan refusal) is unchanged keeps its
     decision, so a live listener and the single-listener Service remap onto it
     keep serving through the reload;
-  - a new port is pending: its listener-scoped routes fail closed on exact,
+  - a new port is pending (or refused, if the plan itself refuses it, such as a
+    reserved port): its listener-scoped routes fail closed on exact,
     prefix, regex, cached, global-socket, and single-listener-remap lookups;
-  - a changed or withdrawn port that owns a Gateway listener socket is refused,
+  - a changed or withdrawn port that already had a decision and owns a Gateway
+    listener socket is refused (a changed port that is still pending stays
+    pending, since its socket's accept gate is closed),
     also as a frontend port, so its still-open socket never serves under the
     old identity or falls back to port-agnostic routes;
   - refusals held for retiring sockets are kept;
