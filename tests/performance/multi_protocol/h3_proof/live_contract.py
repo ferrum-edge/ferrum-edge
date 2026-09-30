@@ -10,7 +10,7 @@ from evidence import KINDS, LOSSES
 
 ARMS = ["direct", "ferrum", "envoy", "envoy-limit-4"]
 PAYLOADS = [10240, 71680, 512000, 1048576, 5242880]
-ENVOY = "docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb"
+ENVOY = "docker.io/envoyproxy/envoy@sha256:be87c8b52663c1164a5bdf3c5419017a269cb3d8c74be1ec93638a71f1ffbd4b"
 FAMILIES = ('tx', 'rx', 'attach', 'lifetime', 'destroy', 'group', 'process', 'classic')
 CLOCK_UNCERTAINTY_NS = 1_000_000
 

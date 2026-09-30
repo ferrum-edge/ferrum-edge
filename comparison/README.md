@@ -97,10 +97,10 @@ SKIP_BUILD=true ./comparison/run_comparison.sh
 | `WRK_THREADS` | `8` | wrk thread count |
 | `WRK_CONNECTIONS` | `100` | wrk concurrent connections |
 | `WARMUP_DURATION` | `5s` | Warm-up duration before each test (results discarded) |
-| `KONG_VERSION` | `3.14` | Kong Docker image tag |
-| `TYK_VERSION` | `v5.12` | Tyk Docker image tag |
-| `KRAKEND_VERSION` | `2.13.2` | KrakenD Docker image tag |
-| `ENVOY_VERSION` | `1.37-latest` | Envoy Docker image tag |
+| `KONG_VERSION` | `3.16` | Kong Docker image tag |
+| `TYK_VERSION` | `v5.15` | Tyk Docker image tag |
+| `KRAKEND_VERSION` | `2.13.11` | KrakenD Docker image tag |
+| `ENVOY_VERSION` | `1.39-latest` | Envoy Docker image tag |
 | `SKIP_GATEWAYS` | _(empty)_ | Comma-separated gateways to skip: `ferrum`, `kong`, `tyk`, `krakend`, `envoy` |
 | `SKIP_BUILD` | `false` | Skip Docker image builds for Ferrum (use cached images) |
 
@@ -110,7 +110,7 @@ To re-run benchmarks with newer Kong, Tyk, or KrakenD releases:
 
 ```bash
 # Test against specific versions
-KONG_VERSION=3.14 TYK_VERSION=v5.12 KRAKEND_VERSION=2.13.2 ENVOY_VERSION=1.37-latest ./comparison/run_comparison.sh
+KONG_VERSION=3.16 TYK_VERSION=v5.15 KRAKEND_VERSION=2.13.11 ENVOY_VERSION=1.39-latest ./comparison/run_comparison.sh
 ```
 
 The script pulls the specified Docker image tags automatically. Results are overwritten in `comparison/results/` — copy or rename the directory if you want to preserve previous runs.

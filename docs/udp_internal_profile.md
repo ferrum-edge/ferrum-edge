@@ -126,7 +126,9 @@ exercise controlled churn or establish a prescribed cache miss rate.
 
 ## Kong provenance and session comparability
 
-The baseline remains **`kong/kong-gateway:3.10.0.0` Enterprise**. Historical
+The baseline remains **`kong/kong-gateway:3.10.0.0` Enterprise**. The runner
+reads it from `udp_profile_manifest.json`, so it stays fixed when the general
+gateway benchmark's Kong pin moves. Historical
 hosted jobs [35071334026](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35071334026/job/104713326026)
 and [35195212169](https://github.com/ferrum-edge/ferrum-edge/actions/runs/35195212169/job/105116713056)
 record the following index digest on x86_64 and image ID prefix `68e9b130e6bd`.

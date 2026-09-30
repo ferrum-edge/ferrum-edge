@@ -162,7 +162,7 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
           sudo apt-get install -y --no-install-recommends libbpf1 python3-yaml binutils
           docker load -i "$RUNNER_TEMP/h3-build/ferrum-image.tar"
-          docker pull docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb
+          docker pull docker.io/envoyproxy/envoy@sha256:be87c8b52663c1164a5bdf3c5419017a269cb3d8c74be1ec93638a71f1ffbd4b
       - name: Required short real gateway syscall and role smoke
         env:
           H3_LIVE_BUILD: ${{ runner.temp }}/h3-build
@@ -199,7 +199,7 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
           sudo apt-get install -y --no-install-recommends libbpf1 python3-yaml binutils
           docker load -i "$RUNNER_TEMP/h3-build/ferrum-image.tar"
-          docker pull docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb
+          docker pull docker.io/envoyproxy/envoy@sha256:be87c8b52663c1164a5bdf3c5419017a269cb3d8c74be1ec93638a71f1ffbd4b
       - name: Require actual positive and negative gateway behavior and retained retirement matrix
         env:
           H3_LIVE_BUILD: ${{ runner.temp }}/h3-build
@@ -242,7 +242,7 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-
           sudo apt-get install -y --no-install-recommends libbpf1 python3-yaml binutils
           docker load -i "$RUNNER_TEMP/h3-build/ferrum-image.tar"
-          docker pull docker.io/envoyproxy/envoy@sha256:79c4e987d386b176721638187b511fb4d7041695f7a78e422ed27edd707b3eeb
+          docker pull docker.io/envoyproxy/envoy@sha256:be87c8b52663c1164a5bdf3c5419017a269cb3d8c74be1ec93638a71f1ffbd4b
       - name: Calibrate and collect all four comparison pairs on one boot
         env:
           H3_LIVE_BUILD: ${{ runner.temp }}/h3-build

@@ -156,11 +156,11 @@ jobs:
         run: |
           # Pre-pulling lets the per-gateway lifecycle inside the bench script
           # avoid counting docker-pull time against startup readiness.
-          docker pull envoyproxy/envoy:v1.33.5 &
-          docker pull kong/kong-gateway:3.10.0.0 &
-          docker pull tykio/tyk-gateway:v5.3.0 &
-          docker pull krakend:2.13.2 &
-          docker pull redis:7.4.1-alpine &
+          docker pull envoyproxy/envoy:v1.39.1 &
+          docker pull kong/kong-gateway:3.16.0.0 &
+          docker pull tykio/tyk-gateway:v5.15.0 &
+          docker pull krakend:2.13.11 &
+          docker pull redis:8.4.7-alpine &
           wait
 
       - name: Build ferrum-edge release binary + bench tools
