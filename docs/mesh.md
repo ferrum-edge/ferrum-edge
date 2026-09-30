@@ -2114,7 +2114,9 @@ The suffix match requires the leading `.`, so it does not match the bare FQDN it
 
 - A single trailing `.` is stripped. A value ending in `..` is left as written; it never matches.
 - ASCII is lowercased.
-- A non-ASCII (U-label) name is converted to its A-label (`xn--…`) with IDNA, so `bücher.example` becomes `xn--bcher-kva.example`. In a wildcard value, only the whole labels after a leading `*.` or before a trailing `.*` are converted (`*.bücher.example` becomes `*.xn--bcher-kva.example`).
+- A non-ASCII (U-label) name is converted to its A-label (`xn--…`) with IDNA, so `bücher.example` becomes `xn--bcher-kva.example`. IDNA maps the ideographic and fullwidth full stops (`。`, `．`, `｡`) to `.`, and a trailing dot the conversion produces is stripped too. In a wildcard value, only the whole labels after a leading `*.` or before a trailing `.*` are converted (`*.bücher.example` becomes `*.xn--bcher-kva.example`).
+
+This makes Ferrum looser than Istio on Envoy for these spellings. Envoy compares the policy text as written, so a value with a trailing dot or a U-label never matches there. In Ferrum it matches the normalized SNI. For an ALLOW rule, that means Ferrum admits connections that Envoy would not; for a DENY rule, Ferrum enforces a rule that is inert on Envoy. Write the lowercase A-label without a trailing dot to get the same behavior on both.
 
 A non-ASCII value that cannot be converted is rejected with a field-specific validation error, in `values` and in `notValues`. Conversion fails when IDNA refuses the name, when the non-ASCII text sits in a label that a `*` only partly covers (`bü*`), or when the non-ASCII value also contains `%`. On Kubernetes, that error means the AuthorizationPolicy is not installed, so write such a name as its A-label. Other ASCII characters that DNS hostnames do not allow are not rejected either. A value containing a space or `/`, for example, is admitted and never matches.
 

@@ -11334,8 +11334,13 @@ components:
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         sni:
           description: >-
-            Frontend TLS/QUIC SNI hostname, when the client supplied one.
-            Available on HTTP and stream connections alike.
+            Frontend TLS/QUIC SNI hostname, when the client supplied one,
+            ASCII-lowercased with one trailing DNS dot removed. Available on HTTP
+            and stream connections alike. Exact entries are normalized at load
+            (one trailing dot dropped, lowercased, U-labels converted to
+            A-labels with IDNA); prefix entries are lowercased with whole labels
+            converted; regex patterns are left as written. Non-ASCII text that
+            cannot be converted is rejected.
           $ref: "#/components/schemas/PluginTriggerStringMatch"
         header:
           description: >-

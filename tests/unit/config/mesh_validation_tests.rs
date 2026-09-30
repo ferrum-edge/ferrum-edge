@@ -3886,6 +3886,10 @@ fn mesh_config_normalize_canonicalizes_connection_sni_condition_values() {
             "Admin.Example.COM.".into(),
             "*.Reviews.Default.SVC.Cluster.Local".into(),
             "Bücher.Example".into(),
+            // IDNA maps U+3002 (ideographic full stop) to `.`, so the trailing
+            // dot the conversion produces is stripped in the same pass.
+            "bücher\u{3002}".into(),
+            "*.Bücher\u{3002}".into(),
         ],
         not_values: vec![
             "P9080.Reviews.Default.SVC.Cluster.Local.".into(),
@@ -3917,6 +3921,8 @@ fn mesh_config_normalize_canonicalizes_connection_sni_condition_values() {
             "admin.example.com".to_string(),
             "*.reviews.default.svc.cluster.local".to_string(),
             "xn--bcher-kva.example".to_string(),
+            "xn--bcher-kva".to_string(),
+            "*.xn--bcher-kva".to_string(),
         ]
     );
     assert_eq!(

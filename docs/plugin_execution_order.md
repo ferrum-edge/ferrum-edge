@@ -1303,6 +1303,15 @@ escapes, but retain regex syntax such as `^/v1\.0/.*`. Host matchers containing
 uppercase ASCII require `case_insensitive: true`, including regex patterns;
 configuration is rejected rather than silently lowercased.
 
+The received SNI is ASCII-lowercased with one trailing root dot stripped, and
+`sni` `exact` / `prefix` entries are normalized to the same spelling at load,
+the same way mesh `connection.sni` values are. An `exact` entry drops one
+trailing dot, is lowercased, and has a non-ASCII (U-label) name converted to
+its A-label (`xn--…`) with IDNA. A `prefix` entry is lowercased and has whole
+labels before a trailing `.` converted; a trailing `.` in a prefix stays. An
+entry with non-ASCII text that cannot be converted is rejected. `sni` regexes
+are left as written.
+
 At startup and cache rebuild, a warning identifies each proxy/protocol whose
 effective authentication instances are all trigger-gated. Requests matching none
 of those triggers remain unauthenticated; include an unconditional authentication

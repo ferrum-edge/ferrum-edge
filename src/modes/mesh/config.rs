@@ -1939,9 +1939,8 @@ fn validate_mesh_condition_trust_domain(value: &str) -> Result<(), &'static str>
 /// Why a `connection.sni` value has no canonical spelling. Never echoes the
 /// value.
 const MESH_CONDITION_SNI_UNCONVERTIBLE: &str = "is not ASCII and cannot be converted to an \
-     A-label (connection.sni is compared with the ClientHello SNI, which carries an \
-     internationalized name as its A-label; write the A-label 'xn--...', and keep non-ASCII \
-     text out of a label that a '*' only partly covers)";
+     A-label (a received SNI carries an internationalized name as its A-label; write the \
+     A-label 'xn--...', and keep non-ASCII text out of a label that a '*' only partly covers)";
 
 /// Canonical spelling of one `connection.sni` condition value.
 ///
@@ -1957,8 +1956,12 @@ const MESH_CONDITION_SNI_UNCONVERTIBLE: &str = "is not ASCII and cannot be conve
 ///   kept as written so normalization stays idempotent);
 /// - ASCII is lowercased;
 /// - a non-ASCII (U-label) name is converted to its A-label with IDNA
-///   (UTS #46, through `url::Host::parse`). In a wildcard value only the whole
+///   (UTS #46, through `url::Host::parse`), and a trailing dot the conversion
+///   produces is stripped the same way. In a wildcard value only the whole
 ///   labels after a leading `*.` or before a trailing `.*` are converted.
+///
+/// Plugin trigger `sni` entries use the same spelling
+/// (`crate::config::plugin_trigger`).
 ///
 /// Returns an error only for a non-ASCII value that cannot be converted: IDNA
 /// refuses it, the result is not a domain name, or the non-ASCII text sits in
@@ -1967,13 +1970,7 @@ const MESH_CONDITION_SNI_UNCONVERTIBLE: &str = "is not ASCII and cannot be conve
 /// DENY, so validation rejects it. Other ASCII characters that DNS does not
 /// allow are left alone; a value containing them simply never matches.
 pub(crate) fn canonical_mesh_condition_sni_value(value: &str) -> Result<String, &'static str> {
-    // Strip one trailing dot, but only when that leaves a non-empty name that
-    // does not itself end with `.`, so normalization is idempotent: `x..` and
-    // `.` never match a received SNI either way and stay as written.
-    let value = match value.strip_suffix('.') {
-        Some(rest) if !rest.is_empty() && !rest.ends_with('.') => rest,
-        _ => value,
-    };
+    let value = strip_one_sni_trailing_dot(value);
     if value.is_ascii() {
         return Ok(value.to_ascii_lowercase());
     }
@@ -1988,16 +1985,31 @@ pub(crate) fn canonical_mesh_condition_sni_value(value: &str) -> Result<String, 
     mesh_condition_sni_idna_to_ascii(value)
 }
 
+/// Strip one trailing dot, but only when that leaves a non-empty name that
+/// does not itself end with `.`, so normalization is idempotent: `x..` and `.`
+/// never match a received SNI either way and stay as written.
+fn strip_one_sni_trailing_dot(value: &str) -> &str {
+    match value.strip_suffix('.') {
+        Some(rest) if !rest.is_empty() && !rest.ends_with('.') => rest,
+        _ => value,
+    }
+}
+
 /// IDNA `ToASCII` for the whole-label part of a `connection.sni` value.
 ///
 /// `url::Host::parse` percent-decodes before IDNA, so a `%` is refused up
-/// front rather than letting decoding change the name.
+/// front rather than letting decoding change the name. IDNA maps the
+/// ideographic and fullwidth full stops (U+3002, U+FF0E, U+FF61) to `.`, so
+/// the converted name gets the same one-trailing-dot strip; without it a
+/// second normalization pass would strip that dot and change the value.
 fn mesh_condition_sni_idna_to_ascii(name: &str) -> Result<String, &'static str> {
     if name.is_empty() || name.contains('*') || name.contains('%') {
         return Err(MESH_CONDITION_SNI_UNCONVERTIBLE);
     }
     match url::Host::parse(name) {
-        Ok(url::Host::Domain(ascii)) if !ascii.is_empty() && ascii.is_ascii() => Ok(ascii),
+        Ok(url::Host::Domain(ascii)) if !ascii.is_empty() && ascii.is_ascii() => {
+            Ok(strip_one_sni_trailing_dot(&ascii).to_string())
+        }
         _ => Err(MESH_CONDITION_SNI_UNCONVERTIBLE),
     }
 }

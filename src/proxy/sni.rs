@@ -690,14 +690,17 @@ impl ClientHelloKtlsFacts {
     /// re-parses the hello with [`extract_sni_from_client_hello`]. That
     /// validator is deliberately stricter than the `DnsName` rules rustls
     /// applies to a received SNI: it refuses underscore labels and a trailing
-    /// root dot, both of which rustls accepts and would surface from
-    /// `server_name()`. A present `server_name` extension that yields no
-    /// hostname here would therefore make a handed-off connection report `None`
-    /// where the buffered path reports a name, silently changing what stream
-    /// lifecycle plugins and transaction summaries observe. Declining the
-    /// handoff for those hellos keeps the two paths observationally identical;
-    /// the socket is still pristine, so the buffered accept surfaces rustls's
-    /// own value.
+    /// root dot, both of which rustls accepts. The buffered path passes
+    /// rustls's name through [`normalize_received_server_name`], which strips
+    /// a trailing root dot, so for a dotted name the difference is only that
+    /// the handoff is declined (a performance cost, not a different name). An
+    /// underscore label is the case that matters: the buffered path reports
+    /// it, while a handed-off connection would report `None`, silently
+    /// changing what stream lifecycle plugins, policy, and transaction
+    /// summaries observe. Declining the handoff whenever a present
+    /// `server_name` extension yields no hostname here keeps the two paths
+    /// observationally identical; the socket is still pristine, so the
+    /// buffered accept surfaces the normalized rustls value.
     pub fn sni_is_representable(&self, parsed_sni: Option<&str>) -> bool {
         !self.offers_server_name || parsed_sni.is_some()
     }

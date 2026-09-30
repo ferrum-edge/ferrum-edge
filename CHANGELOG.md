@@ -281,6 +281,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the warning suggests `*.<fqdn>` or the explicit aliases. Matching is
   unchanged: `connection.sni` stays Istio's plain string match.
 
+- **Plugin trigger `sni` entries are normalized the same way** (#5903). An
+  `exact` entry drops one trailing dot, is lowercased, and has a U-label
+  converted to its A-label; a `prefix` entry is lowercased and has whole
+  labels converted, keeping a trailing `.`. A trigger written as
+  `orders.internal.` keeps matching now that the received SNI has its
+  trailing dot stripped. An entry with non-ASCII text that cannot be
+  converted is rejected; `sni` regexes are unchanged.
+
 - **HTTP/1 over TLS moves bulk bodies in large reads** (#5588). tokio-rustls
   returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher used
   to carry bulk bodies 16 KiB at a time, paying its per-chunk path (decode,
