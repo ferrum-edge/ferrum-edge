@@ -25,7 +25,7 @@ use crate::admin::plugin_config_projection::redact_endpoint_url;
 use crate::config::db_backend::namespaced_runtime_key;
 use crate::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy, validate_resource_id};
 use crate::plugins::mcp_gateway::{
-    McpAdminCatalogSnapshot, McpAdminServerSnapshot, McpAdminToolSnapshot, McpGateway,
+    McpAdminCatalogSnapshot, McpAdminServerSnapshot, McpAdminToolSnapshot,
 };
 
 const MCP_GATEWAY_NOT_FOUND_MESSAGE: &str = "Proxy has no mcp_gateway plugin";

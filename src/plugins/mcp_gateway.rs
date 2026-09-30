@@ -974,7 +974,7 @@ struct CatalogCollisionTombstones {
     resources: HashSet<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct McpCatalog {
     tools: HashMap<String, ToolCatalogEntry>,
     prompts: HashMap<String, PromptCatalogEntry>,
@@ -1013,26 +1013,6 @@ struct McpCatalog {
     collision_tombstone_overflow: BTreeSet<&'static str>,
 }
 
-impl Default for McpCatalog {
-    fn default() -> Self {
-        Self {
-            tools: HashMap::new(),
-            prompts: HashMap::new(),
-            resources: HashMap::new(),
-            resource_templates: HashMap::new(),
-            version: 0,
-            last_refreshed_at: None,
-            resource_templates_refreshed_at: None,
-            resource_templates_last_attempted_at: HashMap::new(),
-            tools_refreshed_wall: None,
-            degraded: BTreeSet::new(),
-            last_good: BTreeSet::new(),
-            unavailable: BTreeSet::new(),
-            collision_tombstones: CatalogCollisionTombstones::default(),
-            collision_tombstone_overflow: BTreeSet::new(),
-        }
-    }
-}
 
 impl McpCatalog {
     fn is_stale(&self, ttl: Duration) -> bool {
