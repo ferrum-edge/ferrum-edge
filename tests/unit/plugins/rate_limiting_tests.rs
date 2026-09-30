@@ -2517,7 +2517,10 @@ fn jsonrpc_refusal(result: PluginResult) -> (Value, HashMap<String, String>) {
             body,
             headers,
         } => {
-            assert_eq!(status_code, 200, "a JSON-RPC refusal rides HTTP 200: {body}");
+            assert_eq!(
+                status_code, 200,
+                "a JSON-RPC refusal rides HTTP 200: {body}"
+            );
             let body = serde_json::from_str(&body).expect("JSON-RPC refusal body");
             (body, headers)
         }
@@ -2560,7 +2563,10 @@ async fn mcp_tool_calls_charge_only_tools_call() {
     assert_eq!(body["jsonrpc"], json!("2.0"));
     assert_eq!(body["id"], json!(12), "the refusal names the call: {body}");
     assert_eq!(body["error"]["code"], json!(MCP_TOOL_CALL_RATE_LIMITED));
-    assert_eq!(body["error"]["message"], "MCP tool-call rate limit exceeded");
+    assert_eq!(
+        body["error"]["message"],
+        "MCP tool-call rate limit exceeded"
+    );
     assert_eq!(header(&headers, "content-type"), Some("application/json"));
     assert_eq!(header(&headers, "x-ratelimit-limit"), Some("2"));
     assert_eq!(header(&headers, "x-ratelimit-remaining"), Some("0"));
@@ -2675,7 +2681,10 @@ async fn mcp_tool_calls_read_escaped_names_and_refuse_ambiguous_bodies() {
     let (body, _) = jsonrpc_refusal(result);
     assert_eq!(body["error"]["code"], json!(-32600), "{body}");
     assert_eq!(body["id"], Value::Null);
-    assert_eq!(header(&ctx.metadata, "ratelimit_mcp_uninspectable"), Some("true"));
+    assert_eq!(
+        header(&ctx.metadata, "ratelimit_mcp_uninspectable"),
+        Some("true")
+    );
 }
 
 #[tokio::test]

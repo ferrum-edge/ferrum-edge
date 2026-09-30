@@ -4071,8 +4071,8 @@ impl AiTranscriptAudit {
                     } else {
                         apply_metadata = false;
                         let prior_model_bytes = staged.request_model.as_deref().map_or(0, str::len);
-                        let prior_tool_bytes = tool_names_bytes(&staged.tool_names)
-                            .saturating_add(mcp_retained_bytes);
+                        let prior_tool_bytes =
+                            tool_names_bytes(&staged.tool_names).saturating_add(mcp_retained_bytes);
                         let prior_without_excerpt =
                             staged_retained_bytes(0, prior_model_bytes, prior_tool_bytes);
                         if prior_without_excerpt <= staged.retained_bytes {
@@ -4559,10 +4559,7 @@ impl AiTranscriptAudit {
     }
 
     /// The bounded `mcp_gateway` decisions recorded beside an MCP call.
-    fn mcp_gateway_metadata(
-        &self,
-        metadata: &HashMap<String, String>,
-    ) -> BTreeMap<String, String> {
+    fn mcp_gateway_metadata(&self, metadata: &HashMap<String, String>) -> BTreeMap<String, String> {
         let redact_names = self.mode != AuditMode::FullBody;
         let mut gateway = BTreeMap::new();
         for key in MCP_GATEWAY_METADATA_KEYS {

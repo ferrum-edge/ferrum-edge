@@ -115,7 +115,9 @@ impl<'a> RequestScan<'a> {
             Self::ToolCalls { members, .. } => members.as_slice(),
             _ => &[],
         };
-        members.iter().filter_map(|member| member.tool_call.as_ref())
+        members
+            .iter()
+            .filter_map(|member| member.tool_call.as_ref())
     }
 }
 

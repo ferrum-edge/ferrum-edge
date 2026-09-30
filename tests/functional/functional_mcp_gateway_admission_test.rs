@@ -220,7 +220,10 @@ async fn serve_audit_collector(listener: TcpListener, records: AuditRecords) {
                 if let Ok(Value::Array(batch)) = serde_json::from_slice::<Value>(&body) {
                     records.lock().expect("records lock").extend(batch);
                 }
-                if write_http_response(&mut stream, 200, &[], "{}").await.is_err() {
+                if write_http_response(&mut stream, 200, &[], "{}")
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1001,9 +1004,8 @@ async fn functional_mcp_gateway_governed_bridge_audits_and_limits_tool_calls() {
     let collector_port = collector.local_addr().expect("collector addr").port();
     let records: AuditRecords = Arc::new(Mutex::new(Vec::new()));
     let collector_task = tokio::spawn(serve_audit_collector(collector, Arc::clone(&records)));
-    let config = move |backend_port: u16, _: u16| {
-        governed_bridge_config(backend_port, collector_port)
-    };
+    let config =
+        move |backend_port: u16, _: u16| governed_bridge_config(backend_port, collector_port);
     let fixture = Fixture::start_with(Backend::Rest, config).await;
     let key = [("x-api-key", AGENT_KEY)];
 

@@ -135,17 +135,26 @@ fn batches_past_the_shared_bounds_are_uninspectable() {
         .collect();
     let body = to_body(&Value::Array(members));
     let scan = scan_request_bytes(&body);
-    assert!(matches!(scan, RequestScan::Uninspectable("batch_too_many_items")));
+    assert!(matches!(
+        scan,
+        RequestScan::Uninspectable("batch_too_many_items")
+    ));
 
     let large = "x".repeat(MAX_BATCH_ITEM_BYTES);
     let body = to_body(&json!([tool_call(json!(1), "a", json!({"blob": large}))]));
     let scan = scan_request_bytes(&body);
-    assert!(matches!(scan, RequestScan::Uninspectable("batch_item_too_large")));
+    assert!(matches!(
+        scan,
+        RequestScan::Uninspectable("batch_item_too_large")
+    ));
 
     let mut body = to_body(&json!([tool_call(json!(1), "a", json!({}))]));
     body.extend(std::iter::repeat_n(b' ', MAX_BATCH_BYTES));
     let scan = scan_request_bytes(&body);
-    assert!(matches!(scan, RequestScan::Uninspectable("batch_too_large")));
+    assert!(matches!(
+        scan,
+        RequestScan::Uninspectable("batch_too_large")
+    ));
 }
 
 #[test]
