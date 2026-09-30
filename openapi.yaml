@@ -5,8 +5,8 @@ info:
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
     `/live`, `/health`, `/status`, and `/overload` expose minimal unauthenticated
-    observations. A viewer-key token with a namespace ceiling receives these
-    same minimal health/status and overload responses; it receives `403` on
+    observations. A viewer-key token with a namespace ceiling never adds detail to these (the
+    caller gets what it would get with no token); it receives `403` on
     detailed metrics routes. Exact `/metrics` requires a valid admin JWT, a matching
     `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within
     `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401 Unauthorized`.
@@ -50,8 +50,8 @@ info:
     `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, every global route is denied with
     `403` unless it is the filtered `/namespaces` registry, `GET /plugins`
     (plugin type catalog), or a health/liveness/readiness probe (`GET /health`,
-    `/live`, `/status`, `/overload`). Health and status return only `status`
-    and `ready`, overload returns only `{level}`, and detailed `/metrics`
+    `/live`, `/status`, `/overload`). The token adds no detail to these probes
+    (the caller gets what it would get with no token), and detailed `/metrics`
     routes return `403`. Other denied routes include `/charges`,
     `/admin/metrics`, `/metrics/runtime`, `/cluster`, `/backend-capabilities`,
     mesh introspection, and new global routes by default. Primary-key tokens and viewer-key tokens without a namespace
@@ -1839,8 +1839,8 @@ paths:
         diagnostics, `request_buffer` (aggregate buffered-request budget
         pressure), and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
-        source IP. A namespace-ceiling-bound viewer-key JWT receives only
-        `{level}`.
+        source IP. A namespace-ceiling-bound viewer-key JWT adds no
+        detail (the caller gets what it would get with no token).
 
         Returns `503 Service Unavailable` when the overload level is `critical`
         (for both tiers).
@@ -8068,8 +8068,9 @@ components:
         is denied with `403` by default for a ceiling-bound token except the
         filtered namespace registry, `GET /plugins` (plugin type catalog), and
         health/liveness/readiness probes (`GET /health`, `/live`, `/status`,
-        `/overload`). Health/status return only `status` and `ready`, overload
-        returns only `{level}`, and detailed `/metrics` routes return `403`.
+        `/overload`). The token adds no detail to these probes (the
+        caller gets what it would get with no token), and detailed `/metrics`
+        routes return `403`.
         Tokens verified by `FERRUM_ADMIN_JWT_SECRET` are never
         affected. Unset, the viewer secret is a fleet-wide read credential;
         per-tenant readers can also use tokens
@@ -8084,8 +8085,8 @@ components:
         trimming when nonempty; unset or blank disables token auth). Startup
         and validation reject shorter tokens. Accepted only by observability
         scrape/detail surfaces such as exact `/metrics` and detailed
-        `/health`/`/status`/`/overload`. Ceiling-bound viewer-key tokens receive
-        only minimal health/overload projections and cannot scrape metrics.
+        `/health`/`/status`/`/overload`. Ceiling-bound viewer-key tokens add no
+        detail to health/overload and cannot scrape metrics.
         CIDR-based metrics access is configured
         separately with `FERRUM_METRICS_ALLOWED_CIDRS` and cannot be represented
         as an OpenAPI security scheme.

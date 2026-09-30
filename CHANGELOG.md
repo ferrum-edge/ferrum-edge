@@ -199,9 +199,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   case-sensitive. Ceiling-bound viewer-key tokens are denied with `403` on all
   other global routes except the filtered namespace registry, `GET /plugins`
   (plugin type catalog), and health/liveness/readiness probes (`GET /health`,
-  `/live`, `/status`, `/overload`). Health and status return only `status` and
-  `ready`, overload returns only `{level}`, and detailed `/metrics` routes
-  return `403`. Other denied routes include `/charges`, `/admin/metrics`,
+  `/live`, `/status`, `/overload`). The token never adds detail to those probes: the caller gets what it would
+  get with no token (minimal, unless a metrics bearer token or an allowlisted
+  source IP grants detail), and detailed `/metrics` routes return `403`. Other denied routes include `/charges`, `/admin/metrics`,
   `/metrics/runtime`, `/cluster`, `/backend-capabilities`, mesh introspection,
   and future global routes by default. A present `ns` claim is narrowed to
   `claim ∩ ceiling`. Primary-key

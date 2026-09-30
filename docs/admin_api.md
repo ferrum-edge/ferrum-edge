@@ -21,7 +21,7 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 | `/overload` | coarse `{level}` + status code (503 at critical) | full pressure/counter and sanitized listener-failure snapshots |
 | `/metrics` | **401** unless the client IP is in `FERRUM_METRICS_ALLOWED_CIDRS` | 200 Prometheus text |
 
-"Authenticated" here means **any** of: a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT with a namespace ceiling is not authorized for the detail tier: it receives the minimal health/status and overload projections, and `403` from detailed metrics routes. The token never adds detail; a source IP inside `FERRUM_METRICS_ALLOWED_CIDRS` still receives `/health` detail exactly as it would with no token. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
+"Authenticated" here means **any** of: a primary admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT with a namespace ceiling does not itself authorize detail: without another authorization method, it receives the minimal health/status and overload projections. The same rule applies on all three routes. A matching metrics bearer token or allowlisted source IP keeps the detail it would receive with no JWT; the ceiling-bound JWT never adds detail. Ceiling-bound viewer-key tokens receive `403` from detailed metrics routes. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
 
 The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
@@ -157,10 +157,13 @@ are never affected.
 - For a ceiling-bound viewer-key token, global routes fail closed with `403`
   unless they are `GET /namespaces`, `GET /namespaces/{name}`, `GET /plugins`
   (plugin type catalog), or health/liveness/readiness probes (`GET /health`,
-  `/live`, `/status`, `/overload`). These tokens receive only the minimal
-  `status`/`ready` body from `/health` and `/status`, and only `{level}` from
-  `/overload`, matching an unauthenticated probe. Detailed `/metrics` routes
-  return `403`. Other denied routes include `/charges`, `/admin/metrics`,
+  `/live`, `/status`, `/overload`). Without a separate metrics bearer token or
+  allowlisted source IP, these tokens receive only the minimal `status`/`ready`
+  body from `/health` and `/status`, and only `{level}` from `/overload`,
+  matching an unauthenticated probe. A metrics bearer token or allowlisted IP
+  retains the detail it would receive without the viewer token, consistently
+  across all three routes. Detailed `/metrics` routes return `403`. Other
+  denied routes include `/charges`, `/admin/metrics`,
   `/metrics/runtime`, `/cluster`, `/backend-capabilities`, mesh introspection,
   and all other global routes. The namespace registry remains filtered as
   described above. Primary-key tokens and viewer-key tokens without a namespace
