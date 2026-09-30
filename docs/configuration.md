@@ -941,7 +941,10 @@ refused when an `/admin` proxy exists. A less specific ancestor of the proxy's
 own literal `listen_path` does not count, so a catch-all `/` does not shadow
 `/api;v=1`. Dot segments with a parameter (`..;`) and
 segments empty before their `;` are refused either way, a literal `listen_path`
-containing `;` requires `true`, and stream proxies must leave it `false`. See
+containing `;` requires `true`, and stream proxies must leave it `false`. In
+mesh mode the opt-in is per service instead (`MeshService.allow_path_parameters`
+or the Service annotation `ferrum.io/allow-path-parameters: "true"`; see
+[mesh.md](mesh.md#path-parameters-and-the-per-service-opt-in)). See
 [request_path_canonicalization.md](request_path_canonicalization.md#path-parameters-require-a-per-proxy-opt-in).
 
 **Per-proxy WebSocket compression (`websocket_permessage_deflate`).** `strip`

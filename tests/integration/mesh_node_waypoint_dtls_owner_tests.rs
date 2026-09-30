@@ -117,6 +117,7 @@ fn dtls_service(name: &str, port: u16, workload: &Workload) -> MeshService {
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 

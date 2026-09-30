@@ -71,6 +71,7 @@ fn mesh_config_round_trips_through_serde() {
                 workloads: vec![WorkloadRef { spiffe_id: id }],
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             }],
             ..Default::default()
         })),
@@ -157,6 +158,36 @@ fn mesh_config_round_trips_custom_istio_root_namespace() {
 
     let json = serde_json::to_value(&mesh).unwrap();
     assert_eq!(json["istio_root_namespace"], "mesh-root");
+}
+
+#[test]
+fn mesh_service_path_parameter_opt_in_defaults_off_and_round_trips() {
+    // Issue #5937: absent means refused, and the default stays off the wire so
+    // existing slices and carriers are byte-identical.
+    let service: MeshService = serde_json::from_value(serde_json::json!({
+        "name": "java-app",
+        "namespace": "default"
+    }))
+    .unwrap();
+    assert!(!service.allow_path_parameters);
+    let json = serde_json::to_value(&service).unwrap();
+    assert!(
+        !json
+            .as_object()
+            .expect("service object")
+            .contains_key("allow_path_parameters"),
+        "the default opt-in must not be serialized"
+    );
+
+    let service: MeshService = serde_json::from_value(serde_json::json!({
+        "name": "java-app",
+        "namespace": "default",
+        "allow_path_parameters": true
+    }))
+    .unwrap();
+    assert!(service.allow_path_parameters);
+    let json = serde_json::to_value(&service).unwrap();
+    assert_eq!(json["allow_path_parameters"], true);
 }
 
 #[test]

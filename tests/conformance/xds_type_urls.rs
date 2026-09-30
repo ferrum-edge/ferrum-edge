@@ -71,6 +71,7 @@ fn slice_with_one_service() -> MeshSlice {
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     };
     let peer_auth = PeerAuthentication {
         name: "strict".to_string(),

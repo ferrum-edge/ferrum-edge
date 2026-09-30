@@ -37,9 +37,13 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, MeshTrafficDirection,
+    prepare_gateway_config_for_mesh,
 };
-use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
+use ferrum_edge::proxy::{
+    ProxyState, start_proxy_listener_with_bound_listener,
+    start_proxy_listener_with_bound_listener_and_mesh_direction,
+};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -180,6 +184,7 @@ pub fn service_for(name: &str, namespace: &str, workloads: &[&Workload]) -> Mesh
             .collect(),
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 
@@ -544,6 +549,33 @@ pub async fn start_mesh_gateway(state: ProxyState) -> (SocketAddr, watch::Sender
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         let _ = start_proxy_listener_with_bound_listener(listener, state, shutdown_rx, None).await;
+    });
+    // Give the accept loop a beat to install before tests start sending.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, shutdown_tx)
+}
+
+/// [`start_mesh_gateway`] as a mesh capture listener of `direction`, so the
+/// request path serves that direction's materialised mesh routes (a listener
+/// with no direction serves none of them).
+pub async fn start_mesh_gateway_with_direction(
+    state: ProxyState,
+    direction: MeshTrafficDirection,
+) -> (SocketAddr, watch::Sender<bool>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind mesh gateway");
+    let addr = listener.local_addr().expect("gateway local addr");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = start_proxy_listener_with_bound_listener_and_mesh_direction(
+            listener,
+            state,
+            shutdown_rx,
+            None,
+            Some(direction),
+        )
+        .await;
     });
     // Give the accept loop a beat to install before tests start sending.
     tokio::time::sleep(Duration::from_millis(50)).await;

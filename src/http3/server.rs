@@ -3316,11 +3316,11 @@ async fn handle_h3_request(
     };
 
     // A `;` path parameter is refused unless the routed proxy opted in with
-    // `allow_path_parameters` and the parameter-stripped path routes to that
-    // same proxy or to one `path_parameter_route_admitted` admits, at the
-    // same point in the ordering as H1/H2:
-    // after route lookup, before every plugin phase and backend dispatch
-    // (GHSA-fcqw-793q-wg5x).
+    // `allow_path_parameters` and the parameter-stripped path, resolved the
+    // same way as above, routes to that same proxy or to one
+    // `path_parameter_scoped_route_admitted` admits. This runs at the same
+    // point in the ordering as H1/H2: after route lookup, before every plugin
+    // phase and backend dispatch (GHSA-fcqw-793q-wg5x).
     if let Err(rejection) = crate::proxy::check_routed_path_parameters(
         &state,
         &epoch,
@@ -3332,6 +3332,14 @@ async fn handle_h3_request(
             frontend_port: ctx.frontend_listen_port,
             frontend_is_tls: true,
             gateway_listener: gateway_listener_identity.as_ref(),
+            // The H3 frontend runs only the direction filter above, never
+            // mesh port-sibling selection or the direct Pod-IP decision, so
+            // the replay carries no port signals.
+            mesh: crate::router_cache::MeshRouteScope {
+                direction: ctx.mesh_direction,
+                ..crate::router_cache::MeshRouteScope::default()
+            },
+            routed_by_direct_workload: false,
         },
     ) {
         warn!(

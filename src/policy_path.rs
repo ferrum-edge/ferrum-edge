@@ -125,7 +125,12 @@
 //!     opted-in catch-all whose backend executes `/admin/users`. A less
 //!     specific ancestor of a proxy's own literal `listen_path` does not
 //!     count as a different owner, so a catch-all `/` does not shadow
-//!     `/api;v=1` ([`crate::router_cache::path_parameter_route_admitted`]).
+//!     `/api;v=1` ([`crate::router_cache::path_parameter_scoped_route_admitted`]).
+//!     The re-resolve repeats the request's own resolution, mesh direction
+//!     filter and port-sibling selection included
+//!     ([`crate::router_cache::RouterCache::resolve_mesh_scoped_route_in_epoch`]),
+//!     so a mesh-materialised route that opted in (issue #5937) resolves to
+//!     itself.
 //!
 //! Rules 4 and 8 together mean **no percent escape survives canonicalization**:
 //! an escape is either decoded to the literal byte it names or the request is

@@ -56,6 +56,7 @@ fn build_gateway_config(n_workloads: usize) -> GatewayConfig {
             protocol_overrides: HashMap::new(),
             cluster_ips: vec![],
             uid: None,
+            allow_path_parameters: false,
         });
     }
 

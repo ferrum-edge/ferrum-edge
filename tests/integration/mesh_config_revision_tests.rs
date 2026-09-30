@@ -1820,6 +1820,7 @@ fn conversion_invalid_startup_slice(version: &str, sequence: u64) -> MeshSlice {
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         ..startup_slice(version, sequence)
     }

@@ -1042,6 +1042,7 @@ fn admitted_names_with_entries(
             workloads: Vec::new(),
             protocol_overrides: std::collections::HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         sidecars: vec![MeshSidecar {
             name: "default-sc".to_string(),

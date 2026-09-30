@@ -300,6 +300,7 @@ fn create_test_mesh_config() -> GatewayConfig {
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         ..MeshConfig::default()
     }));
@@ -1118,6 +1119,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             },
             MeshService {
                 cluster_ips: Vec::new(),
@@ -1132,6 +1134,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             },
         ],
         waypoint_bindings: vec![MeshWaypointBinding {

@@ -136,6 +136,7 @@ fn mesh_service(name: &str, spiffe_id: &str, port: u16) -> MeshService {
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 
@@ -2784,6 +2785,7 @@ fn mesh_service_with_ports(spiffe_id: &str, ports: Vec<ServicePort>) -> MeshServ
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 

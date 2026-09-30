@@ -566,6 +566,7 @@ pub(crate) fn materialize_listenerset_mesh_services(
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
+            allow_path_parameters: false,
         });
         if let Some(status) = acc
             .listenerset_statuses

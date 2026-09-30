@@ -433,6 +433,7 @@ fn native_target_refs_reject_over_limit_hostile_strings() {
             protocol_overrides: HashMap::new(),
             cluster_ips: Vec::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         mesh_policies: vec![MeshPolicy {
             name: "hostile".to_string(),

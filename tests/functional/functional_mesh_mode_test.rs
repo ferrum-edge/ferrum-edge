@@ -382,6 +382,7 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
             workloads: vec![WorkloadRef { spiffe_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         ..MeshSlice::default()
     }
@@ -1031,6 +1032,7 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener",
     "drive_waypoint_target_refs",
     "drive_inbound_relay_third_workload_refusal",
+    "drive_inbound_path_parameter_requests",
 ];
 
 /// Drivers that must void an attempt whose gateway died mid-run.
@@ -1049,6 +1051,7 @@ const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
     "functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener",
     "drive_waypoint_target_refs",
     "drive_inbound_relay_third_workload_refusal",
+    "drive_inbound_path_parameter_requests",
 ];
 
 /// Extract one top-level `async fn <name>` body from [`MESH_MODE_TEST_SOURCE`].
@@ -1131,6 +1134,7 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
         "start_xds_cp",
         "start_echo_backend_on",
         "start_labeled_echo_backend",
+        "start_request_line_echo_backend",
         "start_grpc_trailers_echo_backend_on",
         "start_websocket_echo_backend_on",
         "start_websocket_path_echo_backend_on",
@@ -3574,6 +3578,7 @@ fn inbound_authz_slice(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     };
     let policy = MeshPolicy {
         name: if allow { "allow-client" } else { "deny-client" }.to_string(),
@@ -3825,6 +3830,7 @@ fn cross_namespace_workload_entry_inbound_slice(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     };
     // Decoy: same service name in the WorkloadEntry identity namespace. Membership
     // includes the workload SPIFFE so a wrong-namespace host match would be a
@@ -3844,6 +3850,7 @@ fn cross_namespace_workload_entry_inbound_slice(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     };
     let policy = MeshPolicy {
         name: "allow-client".to_string(),
@@ -4193,6 +4200,271 @@ async fn functional_mesh_sidecar_inbound_multi_port_routes_by_authority_port() {
     );
 }
 
+// ── Per-service `;` path-parameter opt-in (issue #5937) ─────────────────────
+
+/// Backend that answers `200` with `{label} {request line}`, so a test can
+/// prove WHICH backend served a request and that the gateway forwarded the
+/// path byte-for-byte, `;` parameters included.
+async fn start_request_line_echo_backend(label: &'static str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind request-line echo backend");
+    let port = listener.local_addr().expect("echo backend addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let read = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]);
+                let body = format!("{label} {}", request.lines().next().unwrap_or(""));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    port
+}
+
+/// Drive `requests` (`(Host, path)` pairs) over mTLS into a production
+/// sidecar's inbound listener for its local `echo` service, whose
+/// `allow_path_parameters` opt-in is `opt_in`. With `multi_port`, `echo`
+/// declares two HTTP ports (8080 → `backend-a`, 9090 → `backend-b`), else one
+/// port served by `backend-a`. Returns each request's status and response
+/// text, in order. Spawn/bind flakes and a gateway that dies mid-run are
+/// retried with fresh ports; request outcomes are not.
+async fn drive_inbound_path_parameter_requests(
+    opt_in: bool,
+    multi_port: bool,
+    requests: &[(&'static str, &'static str)],
+) -> Result<Vec<(u16, String)>, String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+    let label = match (opt_in, multi_port) {
+        (true, true) => "opt-in-multi-port",
+        (true, false) => "opt-in",
+        (false, _) => "default",
+    };
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-inbound-path-parameters-{label}-{attempt}");
+        let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_a = start_request_line_echo_backend("backend-a").await;
+        let mut slice = if multi_port {
+            let second_backend = start_request_line_echo_backend("backend-b").await;
+            inbound_multi_port_slice(
+                &node_id,
+                server_spiffe,
+                client_spiffe,
+                backend_a,
+                second_backend,
+            )
+        } else {
+            inbound_authz_slice(&node_id, server_spiffe, client_spiffe, backend_a, true)
+        };
+        slice.services[0].allow_path_parameters = opt_in;
+
+        let cp = start_static_mesh_cp(slice).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let readiness = wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("sidecar inbound", inbound_port),
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let mut results = Vec::with_capacity(requests.len());
+        let mut request_error = None;
+        for (host, path) in requests {
+            match mesh_inbound_http_get(
+                inbound_port,
+                &peers.ca_pem,
+                server_spiffe,
+                Some((&peers.client_cert_pem, &peers.client_key_pem)),
+                host,
+                path,
+            )
+            .await
+            {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    request_error = Some(format!("inbound mTLS GET {host}{path} failed: {e}"));
+                    break;
+                }
+            }
+        }
+        let gateway_died = exited_gateway_diagnostic(&mut [("sidecar", &mut child)]);
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        // An attempt whose gateway died mid-run is VOID: its results describe a
+        // dead process, not the path-parameter decision.
+        if let Some(diagnostic) = gateway_died {
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{output}");
+            continue;
+        }
+        return match request_error {
+            None => Ok(results),
+            Some(error) => Err(format!("{error}\n{output}")),
+        };
+    }
+
+    Err(format!(
+        "production sidecar never served its inbound listener after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    ))
+}
+
+const ECHO_HOST: &str = "echo.ferrum.svc.cluster.local";
+
+/// A meshed service that opts in (`MeshService.allow_path_parameters`) is
+/// served `;jsessionid=` paths, both as a final parameter-only segment and on
+/// a named segment, and its backend receives the path unchanged.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_inbound_opted_in_service_forwards_path_parameters() {
+    let paths = ["/app/;jsessionid=abc123", "/app/page;jsessionid=abc123"];
+    let requests: Vec<_> = paths.iter().map(|path| (ECHO_HOST, *path)).collect();
+    let results = drive_inbound_path_parameter_requests(true, false, &requests)
+        .await
+        .expect("opted-in inbound case");
+    assert_eq!(results.len(), paths.len());
+    for (path, (status, body)) in paths.iter().zip(&results) {
+        assert_eq!(
+            *status, 200,
+            "an opted-in mesh service must serve {path}; body: {body:?}"
+        );
+        assert!(
+            body.contains(&format!("backend-a GET {path} HTTP/1.1")),
+            "the backend must receive {path} unchanged, got: {body:?}"
+        );
+    }
+}
+
+/// Without the opt-in, the same meshed service still refuses `;` with
+/// `400 path_parameter` before the request reaches its backend, while a plain
+/// path keeps working.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_inbound_service_without_opt_in_refuses_path_parameters() {
+    let requests = [
+        (ECHO_HOST, "/app/;jsessionid=abc123"),
+        (ECHO_HOST, "/app/page;jsessionid=abc123"),
+        (ECHO_HOST, "/app/page%3Bjsessionid=abc123"),
+        (ECHO_HOST, "/app/page"),
+    ];
+    let results = drive_inbound_path_parameter_requests(false, false, &requests)
+        .await
+        .expect("default inbound case");
+    assert_eq!(results.len(), requests.len());
+    for ((_, path), (status, body)) in requests[..3].iter().zip(&results) {
+        assert_eq!(
+            *status, 400,
+            "a mesh service without the opt-in must refuse {path}; body: {body:?}"
+        );
+        assert!(
+            body.contains("path parameter") && !body.contains("backend-a"),
+            "{path} must be refused as a path parameter before the backend: {body:?}"
+        );
+    }
+    let (status, body) = &results[3];
+    assert_eq!(*status, 200, "a plain path must still be served; body: {body:?}");
+    assert!(
+        body.contains("backend-a GET /app/page HTTP/1.1"),
+        "the plain path must reach the backend: {body:?}"
+    );
+}
+
+/// The stripped re-lookup repeats the request's own port-sibling selection
+/// (N2 of issue #5938): a `;` request addressed to the 9090 sibling of an
+/// opted-in multi-port service re-resolves to that same sibling, not to the
+/// lowest-port representative, so 9090's backend serves it and the `;` cannot
+/// move it onto the other sibling. A port the service does not declare still
+/// fails closed.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_inbound_path_parameters_stay_on_the_selected_port_sibling() {
+    let requests = [
+        ("echo.ferrum.svc.cluster.local:8080", "/app/;jsessionid=abc123"),
+        ("echo.ferrum.svc.cluster.local:9090", "/app/;jsessionid=abc123"),
+        ("echo.ferrum.svc.cluster.local:9090", "/app/page;jsessionid=abc123"),
+        ("echo.ferrum.svc.cluster.local:7777", "/app/;jsessionid=abc123"),
+    ];
+    let expected = [
+        (200, Some("backend-a GET /app/;jsessionid=abc123 HTTP/1.1")),
+        (200, Some("backend-b GET /app/;jsessionid=abc123 HTTP/1.1")),
+        (200, Some("backend-b GET /app/page;jsessionid=abc123 HTTP/1.1")),
+        (502, None),
+    ];
+    let results = drive_inbound_path_parameter_requests(true, true, &requests)
+        .await
+        .expect("opted-in multi-port inbound case");
+    assert_eq!(results.len(), requests.len());
+    for (((host, path), (status, body)), (want_status, want_body)) in
+        requests.iter().zip(&results).zip(expected)
+    {
+        assert_eq!(
+            *status, want_status,
+            "{host}{path} must answer {want_status}; body: {body:?}"
+        );
+        match want_body {
+            Some(want) => assert!(body.contains(want), "{host}{path}: {body:?}"),
+            None => assert!(
+                !body.contains("backend-"),
+                "{host}{path} must not reach a backend: {body:?}"
+            ),
+        }
+    }
+}
+
 // ── Live OUTBOUND (egress) datapath: point A → point B over the mesh ─────────
 //
 // These are the egress keystones: TWO real gateways on one host. Gateway A
@@ -4333,6 +4605,7 @@ fn egress_service_slice(
             workloads: vec![WorkloadRef { spiffe_id: b_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
@@ -6539,6 +6812,7 @@ fn cross_cluster_dest_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
@@ -6629,6 +6903,7 @@ fn cross_cluster_east_west_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         ..MeshSlice::default()
     }
@@ -6693,6 +6968,7 @@ fn cross_cluster_client_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         multi_cluster: Some(MultiClusterConfig {
             local_cluster: Some("cluster-a".to_string()),
@@ -7718,6 +7994,7 @@ fn cross_cluster_ambient_dest_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         // STRICT inbound: the HBONE listener requires + verifies the peer SVID.
         peer_authentications: vec![PeerAuthentication {
@@ -7798,6 +8075,7 @@ fn cross_cluster_ambient_east_west_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         ..MeshSlice::default()
     }
@@ -7868,6 +8146,7 @@ fn cross_cluster_ambient_client_slice(
             workloads: vec![WorkloadRef { spiffe_id: c_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         multi_cluster: Some(MultiClusterConfig {
             local_cluster: Some("cluster-a".to_string()),
@@ -9908,6 +10187,7 @@ fn udp_dest_slice(
             workloads: vec![WorkloadRef { spiffe_id: b_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
@@ -10635,6 +10915,7 @@ fn third_workload_refusal_slice(
                 workloads: vec![WorkloadRef { spiffe_id: b_id }],
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             },
             MeshService {
                 cluster_ips: Vec::new(),
@@ -10649,6 +10930,7 @@ fn third_workload_refusal_slice(
                 workloads: vec![WorkloadRef { spiffe_id: c_id }],
                 protocol_overrides: HashMap::new(),
                 uid: None,
+                allow_path_parameters: false,
             },
         ],
         peer_authentications: vec![PeerAuthentication {
@@ -11303,6 +11585,7 @@ fn sidecar_ingress_local_workload(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     };
     (workload, service)
 }
@@ -12069,6 +12352,7 @@ fn waypoint_destination_service(service: &str, port: u16) -> MeshService {
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 
@@ -13229,6 +13513,7 @@ fn live_source_capture_slice(
             workloads: vec![WorkloadRef { spiffe_id: b_id }],
             protocol_overrides: HashMap::new(),
             uid: None,
+            allow_path_parameters: false,
         }],
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
@@ -15300,6 +15585,7 @@ fn live_xc_service(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 
@@ -17547,6 +17833,7 @@ fn unix_ingress_mesh_document(server_spiffe: &str, entries: &[UnixIngressEntry])
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     };
     let sidecar = MeshSidecar {
         name: "echo-ingress".to_string(),

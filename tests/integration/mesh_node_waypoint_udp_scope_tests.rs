@@ -942,6 +942,7 @@ fn udp_service_in(
             .collect(),
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 

@@ -63,6 +63,41 @@ struct CoreService {
     /// Kubernetes `metadata.uid` for H1 pending-admission lane isolation
     /// across Service delete/recreate (issue #3778). Empty when absent.
     uid: String,
+    /// The Service's [`ALLOW_PATH_PARAMETERS_ANNOTATION`] opt-in, carried onto
+    /// `MeshService.allow_path_parameters` (issue #5937).
+    allow_path_parameters: bool,
+}
+
+/// Service annotation that opts a meshed service in to `;` path parameters
+/// (`MeshService.allow_path_parameters`, issue #5937). Only the value `true`
+/// (any ASCII case) enables it; `false` and anything else keep the default
+/// refusal, and a value other than `true` / `false` is warned about.
+pub(crate) const ALLOW_PATH_PARAMETERS_ANNOTATION: &str = "ferrum.io/allow-path-parameters";
+
+/// Read [`ALLOW_PATH_PARAMETERS_ANNOTATION`] from a Service. Fails closed: a
+/// malformed value leaves path parameters refused.
+fn service_allows_path_parameters(object: &K8sObject) -> bool {
+    let Some(value) = object
+        .metadata
+        .annotations
+        .get(ALLOW_PATH_PARAMETERS_ANNOTATION)
+    else {
+        return false;
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("true") {
+        return true;
+    }
+    if !value.eq_ignore_ascii_case("false") {
+        tracing::warn!(
+            namespace = %object.metadata.namespace,
+            service = %object.metadata.name,
+            annotation = ALLOW_PATH_PARAMETERS_ANNOTATION,
+            "Ignoring a Service path-parameter annotation that is neither \"true\" nor \"false\"; \
+             path parameters stay refused for this service"
+        );
+    }
+    false
 }
 
 #[derive(Debug)]
@@ -339,6 +374,7 @@ pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError
             protocol_overrides: HashMap::new(),
             cluster_ips: service.cluster_ips.clone(),
             uid: (!service.uid.is_empty()).then(|| service.uid.clone()),
+            allow_path_parameters: service.allow_path_parameters,
         });
     }
 
@@ -442,6 +478,7 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
             is_headless: service_spec_is_headless(&object.spec),
             cluster_ips,
             uid: object.metadata.uid.clone(),
+            allow_path_parameters: service_allows_path_parameters(object),
         },
     );
     Ok(())

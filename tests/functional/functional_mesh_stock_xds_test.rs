@@ -761,6 +761,7 @@ fn destination_local_service(
         }],
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     };
     (workload, service)
 }

@@ -91,6 +91,7 @@ fn service(name: &str, refs: &[&str]) -> MeshService {
             .collect(),
         protocol_overrides: HashMap::new(),
         uid: None,
+        allow_path_parameters: false,
     }
 }
 
