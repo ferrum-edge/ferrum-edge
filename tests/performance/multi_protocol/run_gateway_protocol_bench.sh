@@ -1165,11 +1165,11 @@ run_bench() {
         mkdir -p "$OUTPUT_DIR/perf"
         (
             sleep "$window"
-            sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$gpid" \
+            sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_futex,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_sched_yield -p "$gpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             local bpid cpid
-            bpid=$(pgrep -f 'target/release/proto_backend' | head -1)
-            cpid=$(pgrep -f 'target/release/proto_bench' | head -1)
+            bpid=$(pgrep -x proto_backend | head -1)
+            cpid=$(pgrep -x proto_bench | head -1)
             [ -n "$bpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$bpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_backendproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             [ -n "$cpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$cpid" \
