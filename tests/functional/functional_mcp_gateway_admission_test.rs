@@ -20,6 +20,12 @@
 //! including a chunked one of unknown length, is returned as the JSON-RPC
 //! tool result.
 //!
+//! The bridge fixture also runs under the AI governance stack (issue #5908):
+//! `key_auth`, `ai_transcript_audit`, and an `mcp_tool_calls` `rate_limiting`
+//! in front of the gateway, proving that only `tools/call` spends a consumer's
+//! budget and that every call is audited with the consumer, the public tool
+//! name, and its JSON-RPC outcome.
+//!
 //! Run: `cargo build --bin ferrum-edge && cargo test --test functional_tests
 //! functional_mcp_gateway -- --ignored --nocapture`
 
@@ -195,6 +201,42 @@ async fn serve_function(listener: TcpListener) {
                 }
             }
         });
+    }
+}
+
+/// Transcript-audit records received by [`serve_audit_collector`].
+type AuditRecords = Arc<Mutex<Vec<Value>>>;
+
+/// A transcript-audit sink: every POSTed batch is a JSON array of records.
+async fn serve_audit_collector(listener: TcpListener, records: AuditRecords) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let records = Arc::clone(&records);
+        tokio::spawn(async move {
+            let mut pending = Vec::new();
+            while let Some((_, body)) = read_one_http_request(&mut stream, &mut pending).await {
+                if let Ok(Value::Array(batch)) = serde_json::from_slice::<Value>(&body) {
+                    records.lock().expect("records lock").extend(batch);
+                }
+                if write_http_response(&mut stream, 200, &[], "{}").await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// Poll the collector until it holds at least `expected` records.
+async fn wait_for_audit_records(records: &AuditRecords, expected: usize) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let snapshot = records.lock().expect("records lock").clone();
+        if snapshot.len() >= expected || std::time::Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -444,6 +486,39 @@ impl Fixture {
         (status, parse_json(&text), session)
     }
 
+    /// One HTTP/1.1 JSON-RPC POST carrying `extra` request headers, returning
+    /// the status, the JSON body, and the response headers.
+    async fn post_h1_with(
+        &self,
+        session_id: Option<&str>,
+        body: &Value,
+        extra: &[(&str, &str)],
+    ) -> (u16, Value, http::HeaderMap) {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .http1_only()
+            .build()
+            .expect("build client");
+        let bytes = serde_json::to_vec(body).expect("serialize JSON-RPC body");
+        let mut request = client
+            .post(format!("http://127.0.0.1:{}/mcp", self.http_port))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", PROTOCOL_VERSION)
+            .body(bytes);
+        if let Some(session_id) = session_id {
+            request = request.header(SESSION_HEADER, session_id);
+        }
+        for (name, value) in extra {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().await.expect("JSON-RPC POST");
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let text = response.text().await.expect("JSON-RPC POST body");
+        (status, parse_json(&text), headers)
+    }
+
     async fn post_h3(
         &self,
         session_id: Option<&str>,
@@ -657,6 +732,109 @@ fn bridge_config(backend_port: u16) -> GatewayConfig {
     .expect("MCP bridge config is valid")
 }
 
+/// API key of the one agent Consumer in [`governed_bridge_config`].
+const AGENT_KEY: &str = "agent-alice-key";
+
+/// [`bridge_config`]'s OpenAPI bridge behind the AI governance stack:
+/// `key_auth`, `ai_transcript_audit` exporting to the collector on
+/// `collector_port`, and a consumer-keyed `rate_limiting` that counts only
+/// `tools/call` (three per minute).
+fn governed_bridge_config(backend_port: u16, collector_port: u16) -> GatewayConfig {
+    let plugin = |id: &str, plugin_name: &str, config: Value| {
+        json!({
+            "id": id,
+            "namespace": TEST_NAMESPACE,
+            "plugin_name": plugin_name,
+            "scope": "proxy",
+            "proxy_id": "mcp-governed",
+            "enabled": true,
+            "config": config
+        })
+    };
+    let pet_id = json!({
+        "name": "petId",
+        "in": "path",
+        "required": true,
+        "schema": {"type": "string"}
+    });
+    let audit = json!({
+        "mode": "redacted_body",
+        "sampling": {"rate": 1.0},
+        "privacy": {"include_consumer_username": true},
+        "sink": {
+            "type": "http",
+            "endpoint_url": format!("http://127.0.0.1:{collector_port}/ingest"),
+            "allow_insecure_loopback": true,
+            "batch_size": 1,
+            "flush_interval_ms": 100
+        }
+    });
+    let limit = json!({
+        "limit_by": "consumer",
+        "expose_headers": true,
+        "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 3}],
+        "mcp_tool_calls": {"endpoint_path": "/mcp"}
+    });
+    let gateway = json!({
+        "mode": "aggregate_router",
+        "endpoint": {"path": "/mcp", "protocol_versions": [PROTOCOL_VERSION]},
+        "discovery": {"on_new_tool": "allow", "on_schema_change": "allow"},
+        "policy": {"default_action": "allow"},
+        "servers": {
+            "petstore": {
+                "namespace": "pets",
+                "openapi": {"operations": [
+                    {
+                        "name": "getPet",
+                        "method": "GET",
+                        "path": "/pets/{petId}",
+                        "parameters": [pet_id.clone()]
+                    },
+                    {
+                        "name": "deletePet",
+                        "method": "DELETE",
+                        "path": "/pets/{petId}",
+                        "parameters": [pet_id]
+                    }
+                ]}
+            }
+        }
+    });
+    serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [{
+            "id": "mcp-governed",
+            "namespace": TEST_NAMESPACE,
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "plugins": [
+                {"plugin_config_id": "governed-auth"},
+                {"plugin_config_id": "governed-audit"},
+                {"plugin_config_id": "governed-limit"},
+                {"plugin_config_id": "governed-gw"}
+            ]
+        }],
+        "consumers": [{
+            "id": "agent-alice",
+            "namespace": TEST_NAMESPACE,
+            "username": "agent-alice",
+            "credentials": {"keyauth": [{"key": AGENT_KEY}]}
+        }],
+        "upstreams": [],
+        "plugin_configs": [
+            plugin("governed-auth", "key_auth", json!({})),
+            plugin("governed-audit", "ai_transcript_audit", audit),
+            plugin("governed-limit", "rate_limiting", limit),
+            plugin("governed-gw", "mcp_gateway", gateway)
+        ]
+    }))
+    .expect("governed MCP bridge config is valid")
+}
+
 fn bridge_call_body(id: i64, name: &str, arguments: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -793,4 +971,156 @@ async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
         }
     }
     fixture.shutdown().await;
+}
+
+fn response_header<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// The audit records whose single call named `tool`.
+fn audited_calls<'a>(records: &'a [Value], tool: &str) -> Vec<&'a Value> {
+    records
+        .iter()
+        .filter(|record| record["mcp"]["calls"][0]["tool"] == tool)
+        .collect()
+}
+
+/// The AI governance stack in front of an OpenAPI bridge (issue #5908): only
+/// `tools/call` spends the consumer's budget — `initialize` and `tools/list`
+/// never do, and each `tools/call` member of a batch is one charge — a refusal
+/// is a JSON-RPC `-32015` on HTTP 200 with `x-ratelimit-*` headers, nothing
+/// refused reaches the REST backend, and every call is audited with the
+/// consumer, the public tool name, and its JSON-RPC outcome (the converted
+/// `tools/call` result for a bridged call, never the REST body).
+#[ignore]
+#[tokio::test]
+async fn functional_mcp_gateway_governed_bridge_audits_and_limits_tool_calls() {
+    let collector = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind audit collector");
+    let collector_port = collector.local_addr().expect("collector addr").port();
+    let records: AuditRecords = Arc::new(Mutex::new(Vec::new()));
+    let collector_task = tokio::spawn(serve_audit_collector(collector, Arc::clone(&records)));
+    let config = move |backend_port: u16, _: u16| {
+        governed_bridge_config(backend_port, collector_port)
+    };
+    let fixture = Fixture::start_with(Backend::Rest, config).await;
+    let key = [("x-api-key", AGENT_KEY)];
+
+    let (status, body, headers) = fixture.post_h1_with(None, &initialize_body(), &key).await;
+    assert_eq!(status, 200, "initialize must succeed: {body}");
+    let session = header_string(&headers).expect("initialize mints a downstream session");
+    assert!(
+        response_header(&headers, "x-ratelimit-remaining").is_none(),
+        "initialize is not a tool call"
+    );
+
+    // Discovery is never charged, however often it is repeated.
+    for id in 20..25 {
+        let list = json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"});
+        let (status, body, headers) = fixture.post_h1_with(Some(&session), &list, &key).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body["result"]["tools"].is_array(), "{body}");
+        assert!(response_header(&headers, "x-ratelimit-remaining").is_none());
+    }
+
+    // Two admitted calls spend the budget of three down to one.
+    for (id, remaining) in [(30, "2"), (31, "1")] {
+        let call = bridge_call_body(id, "pets.getPet", json!({"petId": "7"}));
+        let (status, body, headers) = fixture.post_h1_with(Some(&session), &call, &key).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["id"], json!(id), "{body}");
+        assert_eq!(body["result"]["isError"], json!(false), "{body}");
+        let header = response_header(&headers, "x-ratelimit-remaining");
+        assert_eq!(header, Some(remaining), "call {id}");
+    }
+
+    // A batch of two calls needs two charges with one left: the whole batch
+    // is refused, one JSON-RPC error per member.
+    let batch = json!([
+        bridge_call_body(32, "pets.getPet", json!({"petId": "7"})),
+        bridge_call_body(33, "pets.getPet", json!({"petId": "8"}))
+    ]);
+    let (status, body, headers) = fixture.post_h1_with(Some(&session), &batch, &key).await;
+    assert_eq!(status, 200, "a JSON-RPC refusal rides HTTP 200: {body}");
+    let errors = body.as_array().expect("one error per batch member");
+    let ids: Vec<&Value> = errors.iter().map(|error| &error["id"]).collect();
+    assert_eq!(ids, vec![&json!(32), &json!(33)], "{body}");
+    for error in errors {
+        assert_eq!(error["error"]["code"], json!(-32015), "{body}");
+    }
+    let remaining = response_header(&headers, "x-ratelimit-remaining");
+    assert_eq!(remaining, Some("0"));
+
+    // The budget is spent: a single call is refused before any dispatch.
+    let call = bridge_call_body(34, "pets.deletePet", json!({"petId": "7"}));
+    let (status, body, headers) = fixture.post_h1_with(Some(&session), &call, &key).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], json!(34), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32015), "{body}");
+    assert_eq!(response_header(&headers, "x-ratelimit-limit"), Some("3"));
+    let remaining = response_header(&headers, "x-ratelimit-remaining");
+    assert_eq!(remaining, Some("0"));
+
+    // Discovery and session setup stay free after the budget is spent.
+    let list = json!({"jsonrpc": "2.0", "id": 35, "method": "tools/list"});
+    let (status, body, _) = fixture.post_h1_with(Some(&session), &list, &key).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["result"]["tools"].is_array(), "{body}");
+    let (status, body, _) = fixture.post_h1_with(None, &initialize_body(), &key).await;
+    assert_eq!(status, 200, "{body}");
+
+    // Only the two admitted calls reached the REST backend.
+    let received = fixture.received();
+    let request_lines: Vec<&str> = received
+        .iter()
+        .map(|request| request.head.lines().next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        request_lines,
+        vec!["GET /pets/7 HTTP/1.1", "GET /pets/7 HTTP/1.1"],
+        "refused calls are never dispatched"
+    );
+
+    // Four tool-call exchanges, four audit records; discovery and session
+    // setup produce none.
+    let audited = wait_for_audit_records(&records, 4).await;
+    assert_eq!(audited.len(), 4, "{audited:#?}");
+    for record in &audited {
+        assert_eq!(record["consumer_username"], "agent-alice", "{record}");
+        let calls = record["mcp"]["calls"].as_array().expect("mcp.calls");
+        for call in calls {
+            let hash = call["arguments_hash"].as_str().unwrap_or_default();
+            assert_eq!(hash.len(), 64, "keyed arguments hash: {record}");
+        }
+    }
+    let admitted = audited_calls(&audited, "pets.getPet");
+    let admitted: Vec<&Value> = admitted
+        .into_iter()
+        .filter(|record| record["mcp"]["batch"] == json!(false))
+        .collect();
+    assert_eq!(admitted.len(), 2, "{audited:#?}");
+    for record in admitted {
+        let call = &record["mcp"]["calls"][0];
+        assert_eq!(call["result"], "result", "{record}");
+        assert_eq!(call["is_error"], json!(false), "{record}");
+        let upstream_status = &record["mcp"]["gateway"]["mcp.bridge.upstream_status"];
+        assert_eq!(upstream_status, "200", "{record}");
+    }
+    let refused = audited_calls(&audited, "pets.deletePet");
+    assert_eq!(refused.len(), 1, "{audited:#?}");
+    assert_eq!(refused[0]["mcp"]["calls"][0]["error_code"], json!(-32015));
+    let batches: Vec<&Value> = audited
+        .iter()
+        .filter(|record| record["mcp"]["batch"] == json!(true))
+        .collect();
+    assert_eq!(batches.len(), 1, "{audited:#?}");
+    let calls = batches[0]["mcp"]["calls"].as_array().expect("batch calls");
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        assert_eq!(call["error_code"], json!(-32015), "{call}");
+    }
+
+    fixture.shutdown().await;
+    collector_task.abort();
 }

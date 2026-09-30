@@ -27,6 +27,7 @@ use url::Url;
 
 use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer};
 use crate::plugins::utils::auth_flow::ExternalIdentityRealm;
+use crate::plugins::utils::mcp_jsonrpc;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
@@ -59,9 +60,12 @@ const MAX_MCP_PAGINATION_PAGES: usize = 100;
 const DEFAULT_MAX_MCP_CATALOG_ITEMS_PER_LIST: usize = 10_000;
 const DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const DEFAULT_MAX_JSONRPC_BATCH_ITEMS: usize = 32;
-const DEFAULT_MAX_JSONRPC_BATCH_BYTES: usize = 1024 * 1024;
-const DEFAULT_MAX_JSONRPC_BATCH_ITEM_BYTES: usize = 256 * 1024;
+// The batch defaults are shared with the AI governance plugins'
+// `tools/call` recognizer, so a default gateway and those plugins bound one
+// batch identically.
+const DEFAULT_MAX_JSONRPC_BATCH_ITEMS: usize = mcp_jsonrpc::MAX_BATCH_ITEMS;
+const DEFAULT_MAX_JSONRPC_BATCH_BYTES: usize = mcp_jsonrpc::MAX_BATCH_BYTES;
+const DEFAULT_MAX_JSONRPC_BATCH_ITEM_BYTES: usize = mcp_jsonrpc::MAX_BATCH_ITEM_BYTES;
 /// Default aggregate serialized JSON-RPC batch *response* budget (array framing
 /// included). Kept aligned with the request-body default so operators size one
 /// knob pair coherently.
@@ -1941,26 +1945,8 @@ impl McpGateway {
                 operation.label().to_string(),
             );
         }
-        // The proxy's `allowed_methods` filter ran over the client's MCP
-        // `POST`, never over the method the bridge dispatches, so it is
-        // applied to the bridged method here: an operation the route would
-        // refuse to a direct client is refused to a tool call too.
-        if !bridge_method_allowed_on_route(ctx, operation.method().as_str()) {
-            if self.observability.emit_metadata {
-                ctx.metadata.insert(
-                    "mcp.policy_decision".to_string(),
-                    "method_not_allowed".to_string(),
-                );
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
-            }
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32001,
-                "OpenAPI bridge operation method is not allowed on this proxy",
-                None,
-            );
-        }
+        // The route's `allowed_methods` was already applied to the bridged
+        // method in `route_tool_call`, ahead of argument validation.
         let arguments = envelope
             .params
             .as_ref()
@@ -2088,6 +2074,24 @@ impl McpGateway {
                 .as_deref()
                 .is_some_and(|header| bridge_header_names_match(name, header))
             || ctx.is_correlation_header(name)
+    }
+
+    /// The backend method an OpenAPI bridge tool dispatches, or `None` for a
+    /// tool an upstream MCP server serves.
+    fn bridge_operation_method(&self, entry: &ToolCatalogEntry) -> Option<&'static str> {
+        self.servers
+            .get(&entry.server_id)?
+            .bridge()?
+            .operation(&entry.upstream_name)
+            .map(|operation| operation.method().as_str())
+    }
+
+    /// Whether the matched route's `allowed_methods` admits the method `entry`
+    /// dispatches. Always true for an upstream MCP tool: its call is the
+    /// client's own `POST`, which the proxy's method filter already admitted.
+    fn bridge_tool_allowed_on_route(&self, ctx: &RequestContext, entry: &ToolCatalogEntry) -> bool {
+        self.bridge_operation_method(entry)
+            .is_none_or(|method| bridge_method_allowed_on_route(ctx, method))
     }
 
     /// Pin what this instance admitted for a bridged `tools/call`, for the
@@ -4597,6 +4601,10 @@ impl McpGateway {
             .policy
             .has_grants()
             .then(|| self.policy.grant_view(ctx.identified_consumer.as_deref()));
+        // An OpenAPI bridge tool whose operation method this route's
+        // `allowed_methods` refuses can never be called, so it is not listed
+        // either.
+        let route_ctx: &RequestContext = ctx;
         let tools: Vec<Value> = catalog
             .tools
             .values()
@@ -4609,6 +4617,7 @@ impl McpGateway {
                             .grant_for_tool(&entry.public_name)
                             .is_none_or(|grant| grant.decide(view).is_ok())
                     })
+                    && self.bridge_tool_allowed_on_route(route_ctx, entry)
             })
             .map(tool_entry_to_public_value)
             .collect();
@@ -4869,6 +4878,28 @@ impl McpGateway {
                 }
                 return tool_call_denied(envelope.id.clone());
             }
+        }
+        // The proxy's `allowed_methods` filter ran over the client's MCP
+        // `POST`, never over the method an OpenAPI bridge tool dispatches, so
+        // it is applied to the bridged method here: an operation the route
+        // would refuse to a direct client is refused to a tool call too. It is
+        // decided before argument validation, so a granted caller learns the
+        // method refusal first and nothing about the operation's arguments.
+        if !self.bridge_tool_allowed_on_route(ctx, &entry) {
+            if self.observability.emit_metadata {
+                ctx.metadata.insert(
+                    "mcp.policy_decision".to_string(),
+                    "method_not_allowed".to_string(),
+                );
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32001,
+                "OpenAPI bridge operation method is not allowed on this proxy",
+                None,
+            );
         }
         if self.observability.emit_metadata {
             ctx.metadata
@@ -7606,12 +7637,7 @@ enum ResponseRewriteOutcome {
 }
 
 fn mcp_content_type_is_json(value: &str) -> bool {
-    let media_type = value.split(';').next().unwrap_or(value).trim();
-    media_type.eq_ignore_ascii_case("application/json")
-        || media_type.eq_ignore_ascii_case("application/json-rpc")
-        || media_type
-            .rsplit_once('+')
-            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
+    mcp_jsonrpc::content_type_is_json(value)
 }
 
 pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {

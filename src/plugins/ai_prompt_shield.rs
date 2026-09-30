@@ -54,6 +54,19 @@
 //! body to plaintext, enforcing actions reject the uninspectable request instead
 //! of silently forwarding it.
 //!
+//! ## MCP tool arguments
+//!
+//! `scan_fields: mcp_arguments` scans only the `params.arguments` of each MCP
+//! JSON-RPC `tools/call` request — a singleton or every `tools/call` member of
+//! a batch — and nothing else in the envelope (issue #5908). Recognition is
+//! shared with `mcp_gateway` (`utils::mcp_jsonrpc`), so the shield accepts the
+//! same request media types the gateway does, including a request with no
+//! `Content-Type`, and a body with duplicate member names is refused by
+//! enforcing actions instead of being read one way here and another way by the
+//! server that executes the call. Redaction rewrites argument values in place;
+//! an OpenAPI bridge call carries the redacted arguments into its REST request
+//! or is refused by the gateway, never forwarded with the originals.
+//!
 //! ## Bounded redaction output
 //!
 //! Redaction replaces each match with a configured placeholder, which can be
@@ -75,6 +88,7 @@ use tracing::debug;
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use super::utils::body_transform::is_json_content_type;
+use super::utils::mcp_jsonrpc;
 use super::{Plugin, PluginResult, RequestContext};
 
 /// JSON object keys that are structural metadata (model names, IDs, roles,
@@ -237,6 +251,8 @@ enum ScanMode {
     Content,
     /// Scan the entire request body as text.
     All,
+    /// Scan only `params.arguments` of MCP JSON-RPC `tools/call` requests.
+    McpArguments,
 }
 
 /// Result of attempting redaction on a request body.
@@ -495,9 +511,10 @@ impl AiPromptShield {
         let scan_mode = match optional_string(config, "scan_fields")?.unwrap_or("content") {
             "content" => ScanMode::Content,
             "all" => ScanMode::All,
+            "mcp_arguments" => ScanMode::McpArguments,
             other => {
                 return Err(format!(
-                    "ai_prompt_shield: `scan_fields` must be one of `content` or `all`, got: {other:?}"
+                    "ai_prompt_shield: `scan_fields` must be one of `content`, `all`, or `mcp_arguments`, got: {other:?}"
                 ));
             }
         };
@@ -652,7 +669,7 @@ impl AiPromptShield {
     /// Extract text segments to scan from the request body.
     fn extract_scan_text<'a>(&self, json: &'a Value) -> Vec<&'a str> {
         match self.scan_mode {
-            ScanMode::All => {
+            ScanMode::All | ScanMode::McpArguments => {
                 // We can't get &str from Value for the whole body easily,
                 // so we'll handle this differently in the caller.
                 vec![]
@@ -1071,6 +1088,93 @@ impl AiPromptShield {
             .collect()
     }
 
+    /// `ScanMode::McpArguments` detection: only the `params.arguments` of each
+    /// MCP `tools/call` in a singleton or batch.
+    ///
+    /// Two passes per call, unioned: the decoded walk (string values, object
+    /// keys, and numeric scalars after serde resolved every escape — the text
+    /// the tool receives) and a pass over the arguments' compact serialization,
+    /// so a contextual `custom_pattern` spanning a key and its value (such as
+    /// `"password"\s*:`) still matches. No structural exemption applies:
+    /// every argument is caller-supplied tool input. Other members, other
+    /// methods, and the rest of the envelope are not scanned.
+    fn detect_pii_mcp_arguments(&self, json: &Value) -> Vec<String> {
+        if self.patterns.is_empty() {
+            return Vec::new();
+        }
+        let mut hit = vec![false; self.patterns.len()];
+        for call in mcp_jsonrpc::tool_calls_in_value(json) {
+            let Some(arguments) = call.arguments else {
+                continue;
+            };
+            let mut texts: Vec<Cow<'_, str>> = Vec::new();
+            collect_json_strings(arguments, &mut texts, false);
+            for text in &texts {
+                for idx in self.detection_set.matches(text.as_ref()).into_iter() {
+                    hit[idx] = true;
+                }
+            }
+            let serialized = arguments.to_string();
+            for idx in self.detection_set.matches(&serialized).into_iter() {
+                hit[idx] = true;
+            }
+        }
+        hit.iter()
+            .enumerate()
+            .filter_map(|(idx, &h)| {
+                if h {
+                    self.patterns.get(idx).map(|p| p.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Whether a request `Content-Type` is in this instance's JSON scope.
+    ///
+    /// `mcp_arguments` accepts exactly what `mcp_gateway` accepts — the MCP
+    /// JSON media types (`application/json`, `application/json-rpc`, `+json`)
+    /// or no `Content-Type` at all — so omitting the header cannot carry a
+    /// tool call past the shield. The other modes keep their JSON scope, and
+    /// framed gRPC is never in scope.
+    fn content_type_in_scope(&self, content_type: Option<&str>) -> bool {
+        match content_type {
+            None => self.scan_mode == ScanMode::McpArguments,
+            Some(value) if is_framed_grpc_content_type(value) => false,
+            Some(value) if self.scan_mode == ScanMode::McpArguments => {
+                mcp_jsonrpc::content_type_is_json(value)
+            }
+            Some(value) => is_json_content_type(value),
+        }
+    }
+
+    /// Refuse (or, in warn mode, record) an MCP body whose member names are
+    /// duplicated: which `params.arguments` a server executes would then depend
+    /// on its JSON parser.
+    fn handle_ambiguous_mcp_body(&self, ctx: &mut RequestContext) -> PluginResult {
+        if self.action == ShieldAction::Warn {
+            ctx.metadata.insert(
+                "ai_shield_warnings".to_string(),
+                "ambiguous_json".to_string(),
+            );
+            return PluginResult::Continue;
+        }
+        ctx.metadata.insert(
+            "ai_shield_rejected".to_string(),
+            "ambiguous_json".to_string(),
+        );
+        PluginResult::Reject {
+            status_code: 400,
+            body: serde_json::json!({
+                "error": "Request body could not be inspected",
+                "message": "Request blocked because the MCP request body has duplicate member names."
+            })
+            .to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
     /// Whether the ORIGINAL request contains a raw-body match that token
     /// rewriting cannot remove — i.e. an individual match in the serialized body
     /// whose matched byte span is not fully contained inside the serialized span
@@ -1254,6 +1358,26 @@ impl AiPromptShield {
                 return RedactionOutcome::Incomplete(json);
             }
             return RedactionOutcome::Redacted(json);
+        }
+
+        if self.scan_mode == ScanMode::McpArguments {
+            if self.detect_pii_mcp_arguments(&json).is_empty() {
+                return RedactionOutcome::NoChange;
+            }
+            mcp_jsonrpc::for_each_tool_call_arguments_mut(&mut json, |arguments| {
+                redact_json_strings(arguments, &self.patterns, false, &budget);
+            });
+            if budget.is_exhausted() {
+                return RedactionOutcome::BudgetExceeded;
+            }
+            // Object keys are never rewritten and a contextual pattern can span
+            // tokens, so re-detect over the rewritten arguments and fail closed
+            // on anything left.
+            return if self.detect_pii_mcp_arguments(&json).is_empty() {
+                RedactionOutcome::Redacted(json)
+            } else {
+                RedactionOutcome::Incomplete(json)
+            };
         }
 
         // Content mode: only redact within messages
@@ -1574,10 +1698,7 @@ impl Plugin for AiPromptShield {
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         self.requires_request_body
             && ctx.method == "POST"
-            && ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|ct| is_json_content_type(ct) && !is_framed_grpc_content_type(ct))
+            && self.content_type_in_scope(ctx.headers.get("content-type").map(String::as_str))
     }
 
     async fn before_proxy(
@@ -1590,20 +1711,12 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        // Check content-type
-        let content_type = headers
-            .get("content-type")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        if !is_json_content_type(content_type) {
-            return PluginResult::Continue;
-        }
-
-        // Framed native gRPC / gRPC-Web bodies (including `+json` variants) are
-        // length-prefixed wire formats, not bare JSON. Skip without buffering
-        // or decoding so gRPC-Web framing is preserved; native gRPC requests
-        // should already be excluded via HTTP_ONLY_PROTOCOLS.
-        if is_framed_grpc_content_type(content_type) {
+        // Check content-type. Framed native gRPC / gRPC-Web bodies (including
+        // `+json` variants) are length-prefixed wire formats, not bare JSON:
+        // they are skipped without buffering or decoding so gRPC-Web framing
+        // is preserved; native gRPC requests should already be excluded via
+        // HTTP_ONLY_PROTOCOLS.
+        if !self.content_type_in_scope(headers.get("content-type").map(String::as_str)) {
             return PluginResult::Continue;
         }
 
@@ -1637,6 +1750,14 @@ impl Plugin for AiPromptShield {
             return self.handle_oversize_body(ctx, body_size);
         }
 
+        // An MCP body whose member names are duplicated is read one way here
+        // and possibly another way by the server that executes the call.
+        if self.scan_mode == ScanMode::McpArguments
+            && crate::util::json_dup_keys::slice_ambiguity(body.as_bytes()).is_some()
+        {
+            return self.handle_ambiguous_mcp_body(ctx);
+        }
+
         // Detect PII and capture streaming intent from the same parsed JSON.
         // Scan-all mode walks decoded JSON string values instead of raw bytes
         // so JSON escapes cannot hide PII or prompt-injection payloads from the
@@ -1644,8 +1765,8 @@ impl Plugin for AiPromptShield {
         //
         // The streaming flag is captured before mutating `ctx.metadata`
         // because `body` borrows from `ctx.metadata.get("request_body")`.
-        let (detected, is_streaming_request) = if self.scan_mode == ScanMode::All {
-            match serde_json::from_str::<Value>(body) {
+        let (detected, is_streaming_request) = match self.scan_mode {
+            ScanMode::All => match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
                     let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
                     (self.detect_pii_all_mode(&json, body), is_streaming)
@@ -1654,15 +1775,20 @@ impl Plugin for AiPromptShield {
                 // actions by falling back to a raw-body scan so PII in an
                 // unparseable body cannot fail open.
                 Err(_) => (self.detect_pii_raw_fallback(body), false),
-            }
-        } else {
-            match serde_json::from_str::<Value>(body) {
+            },
+            ScanMode::Content => match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
                     let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
                     (self.detect_pii_content_mode(&json), is_streaming)
                 }
                 Err(_) => return PluginResult::Continue,
-            }
+            },
+            // A JSON-RPC envelope carries no `stream` flag. A malformed body
+            // carries no call either (`mcp_gateway` refuses it).
+            ScanMode::McpArguments => match serde_json::from_str::<Value>(body) {
+                Ok(json) => (self.detect_pii_mcp_arguments(&json), false),
+                Err(_) => return PluginResult::Continue,
+            },
         };
 
         // `body` borrow released — safe to mutate ctx.metadata now.
@@ -1850,10 +1976,7 @@ impl Plugin for AiPromptShield {
         if ctx.method != "POST" {
             return false;
         }
-        let Some(content_type) = headers.get("content-type") else {
-            return false;
-        };
-        is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+        self.content_type_in_scope(headers.get("content-type").map(String::as_str))
     }
 
     /// The authoritative policy decision over the exact backend-visible request
@@ -1903,11 +2026,7 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        let content_type = headers
-            .get("content-type")
-            .map(String::as_str)
-            .unwrap_or("");
-        if !is_json_content_type(content_type) || is_framed_grpc_content_type(content_type) {
+        if !self.content_type_in_scope(headers.get("content-type").map(String::as_str)) {
             return PluginResult::Continue;
         }
 
@@ -1952,7 +2071,7 @@ impl Plugin for AiPromptShield {
                 // for non-redact actions, and Content mode continues.
                 let detected = match self.scan_mode {
                     ScanMode::All => self.detect_pii_raw_fallback(body_text),
-                    ScanMode::Content => Vec::new(),
+                    ScanMode::Content | ScanMode::McpArguments => Vec::new(),
                 };
                 return self.decide_final_request_body(ctx, detected);
             }
@@ -1966,6 +2085,7 @@ impl Plugin for AiPromptShield {
         let detected = match self.scan_mode {
             ScanMode::All => self.detect_pii_all_mode(&json, body_text),
             ScanMode::Content => self.detect_pii_content_mode(&json),
+            ScanMode::McpArguments => self.detect_pii_mcp_arguments(&json),
         };
         self.decide_final_request_body(ctx, detected)
     }
@@ -2035,7 +2155,7 @@ impl AiPromptShield {
 
         // Only transform JSON
         if let Some(ct) = content_type
-            && (!is_json_content_type(ct) || is_framed_grpc_content_type(ct))
+            && !self.content_type_in_scope(Some(ct))
         {
             return None;
         }

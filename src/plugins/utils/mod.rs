@@ -32,6 +32,7 @@ pub mod jwt_verifier;
 pub mod log_helpers;
 pub mod log_sampling;
 pub mod log_schema;
+pub mod mcp_jsonrpc;
 pub mod metadata_redaction;
 pub mod openai_error;
 pub mod policy_digest;

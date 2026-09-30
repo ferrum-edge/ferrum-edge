@@ -52,6 +52,20 @@
 //! short-circuits before routing never resolves a backend path at all, so its
 //! client-path method is the only, and therefore authoritative, view it has.
 //!
+//! MCP tool traffic is AI traffic too (issue #5908). With `capture.mcp_tool_calls`
+//! (the default) a JSON-RPC `tools/call` request — a singleton or any batch that
+//! carries one — is an audit candidate, and its record carries an `mcp` section:
+//! one entry per call with the public tool name, a keyed `arguments_hash`, the
+//! optional redacted `arguments` excerpt, and the call's JSON-RPC outcome
+//! (`result` / `error`, `isError`, the error code), plus the bounded `mcp.*`
+//! gateway decisions. The calls are read where the candidate is staged, from the
+//! body the client sent (this plugin runs before `mcp_gateway`), because the
+//! backend-visible body no longer names them publicly: the aggregate router
+//! rewrites the tool name, and an OpenAPI bridge call reaches the backend as a
+//! REST request. The outcome is read from the final client-visible response,
+//! which for a bridge call is the `tools/call` result `mcp_gateway` built in its
+//! normalize phase, never the raw REST body.
+//!
 //! This plugin is **not** a security boundary on its own — it observes and
 //! redacts, it does not enforce. Pair it with `ai_prompt_shield`,
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
@@ -87,6 +101,7 @@ use tracing::warn;
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::byte_budget::{ByteBudget, ByteLease};
+use super::utils::mcp_jsonrpc;
 use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
@@ -184,6 +199,8 @@ pub const AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS: &[&str] = &[
     "headers",
     "tool_calls",
     "stream_hash",
+    "mcp_tool_calls",
+    "mcp_arguments",
 ];
 
 /// Accepted keys under `sampling`.
@@ -254,6 +271,40 @@ pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
 /// outbound header. There is no generic `${NAME}` process-environment
 /// interpolation; any other `${...}` form is rejected at config parse.
 const SINK_SECRET_ENV_PREFIX: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_";
+
+/// Most MCP `tools/call` entries one record describes, matching the default
+/// JSON-RPC batch bound. Later calls of a larger batch are only counted in
+/// `mcp.calls_omitted`.
+pub const MAX_MCP_CALLS: usize = 32;
+
+/// Longest JSON-RPC id kept (privately, never exported) to match a batch
+/// response member with the call it answers.
+const MAX_MCP_CORRELATION_ID_BYTES: usize = 256;
+
+/// Retained bytes charged per staged MCP call on top of its strings: the
+/// fixed-size outcome fields and bookkeeping.
+const MCP_CALL_OVERHEAD_BYTES: usize = 128;
+
+/// `mcp_gateway` decision metadata copied into a record's `mcp.gateway` map.
+/// A closed, fixed-cardinality set; values are bounded like other harvested
+/// metadata. Never `mcp.arguments` (raw arguments) or a session identifier.
+const MCP_GATEWAY_METADATA_KEYS: &[&str] = &[
+    "mcp.mode",
+    "mcp.server_id",
+    "mcp.upstream_tool_name",
+    "mcp.policy_decision",
+    "mcp.route_decision",
+    "mcp.schema_validation",
+    "mcp.result_schema_validation",
+    "mcp.admission_violation",
+    "mcp.bridge.operation",
+    "mcp.bridge.upstream_status",
+    "mcp.bridge.gateway_error",
+];
+
+/// Gateway metadata values that are names rather than fixed tokens, redacted
+/// like tool names in the protected modes.
+const MCP_GATEWAY_NAME_METADATA_KEYS: &[&str] = &["mcp.upstream_tool_name", "mcp.bridge.operation"];
 
 /// Deployment-safe hard maximum for `limits.max_request_bytes` (1 MiB). Aligns
 /// with the shared logger entry ceiling so a single excerpt cannot exceed what
@@ -378,6 +429,9 @@ const OMIT_REASON_STREAM_TRUNCATION: &str = "stream_truncation_boundary";
 /// Body omitted because the instance's aggregate retained-byte budget could not
 /// admit the refreshed excerpt.
 const OMIT_REASON_RETAINED_BYTE_BUDGET: &str = "retained_byte_budget";
+/// The aggregate `limits.max_request_bytes` budget for MCP argument excerpts
+/// was already spent by earlier calls of the same request.
+const OMIT_REASON_MCP_ARGUMENTS_BUDGET: &str = "mcp_arguments_budget";
 /// Enrolled gRPC method whose descriptor dependency is unavailable on this node.
 const OMIT_REASON_GRPC_DESCRIPTOR_UNAVAILABLE: &str = "grpc_descriptor_unavailable";
 /// Framed gRPC body was malformed, truncated, or used an unsupported encoding.
@@ -579,6 +633,11 @@ struct CaptureConfig {
     headers: bool,
     tool_calls: bool,
     stream_hash: StreamHashScope,
+    /// Treat MCP JSON-RPC `tools/call` requests as audit candidates and record
+    /// their calls.
+    mcp_tool_calls: bool,
+    /// Include each MCP call's arguments excerpt (redacted per `mode`).
+    mcp_arguments: bool,
 }
 
 /// One enrolled gRPC method's capture contract after descriptor resolution.
@@ -907,9 +966,26 @@ struct AuditStaging {
     /// bounded frame decoder and nothing else. No other request header, and no
     /// header value, is stored. `None` on the HTTP JSON path.
     grpc_request_encoding: Option<GrpcMessageEncoding>,
+    /// The MCP `tools/call` summary read from the client's JSON-RPC body when
+    /// the candidate was staged. `Some` also marks an MCP candidate, which the
+    /// final backend-visible body (an upstream-named envelope, or an OpenAPI
+    /// bridge's REST body) must not reclassify away.
+    mcp: Option<McpAuditSection>,
+    /// Retained bytes the `mcp` summary holds, part of `retained_bytes`.
+    mcp_retained_bytes: usize,
+    /// Argument excerpt bytes the `mcp` summary holds. They share the
+    /// `limits.max_request_bytes` budget with the request excerpt.
+    mcp_arguments_bytes: usize,
 }
 
 impl AuditStaging {
+    /// `(argument excerpt bytes, retained bytes)` of the staged MCP summary,
+    /// or `None` for a candidate that is not an MCP one.
+    fn mcp_charges(&self) -> Option<(usize, usize)> {
+        let charges = (self.mcp_arguments_bytes, self.mcp_retained_bytes);
+        self.mcp.is_some().then_some(charges)
+    }
+
     /// Cancel the exact deadline before a normal consumer uses this staging
     /// capability. Returns false if expiry already claimed it, in which case
     /// the caller must drop the entry without emitting or transferring owners.
@@ -980,6 +1056,9 @@ struct ResponseCapture {
     hash: Option<String>,
     hash_scope: Option<&'static str>,
     hash_bytes: Option<u64>,
+    /// Outcome of each recorded MCP call, aligned with `mcp.calls`, when the
+    /// buffered response body was observed.
+    mcp_results: Option<Vec<McpCallResult>>,
 }
 
 struct StreamSlot {
@@ -1390,6 +1469,101 @@ struct AuditRecord {
     tool_names_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<BTreeMap<String, String>>,
+    /// MCP `tools/call` evidence, present only for an MCP candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp: Option<McpAuditSection>,
+}
+
+/// The `mcp` section of an audit record.
+#[derive(Serialize, Clone, Default)]
+struct McpAuditSection {
+    /// Whether the request was a JSON-RPC batch.
+    batch: bool,
+    /// One entry per `tools/call`, in request order, at most [`MAX_MCP_CALLS`].
+    calls: Vec<McpAuditCall>,
+    /// `tools/call` members past [`MAX_MCP_CALLS`], not described.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    calls_omitted: u32,
+    /// Bounded `mcp_gateway` decision metadata ([`MCP_GATEWAY_METADATA_KEYS`]).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    gateway: BTreeMap<String, String>,
+}
+
+/// One MCP `tools/call` in an audit record.
+#[derive(Serialize, Clone, Default)]
+struct McpAuditCall {
+    /// The public tool name the client called (`params.name`), bounded and,
+    /// in the protected modes, redacted. Absent in `hash_only`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    tool_truncated: bool,
+    /// Keyed HMAC-SHA256 of the call's `params.arguments` (an absent
+    /// `arguments` is hashed as `{}`, as `mcp_gateway` treats it). Empty when
+    /// no record could be exported for the candidate.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    arguments_hash: String,
+    /// The arguments excerpt (`capture.mcp_arguments`), redacted per `mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    arguments_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments_omitted_reason: Option<&'static str>,
+    /// `result`, `error`, or `no_response` (a batch answer without this
+    /// call's id). Absent when the response body was not observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'static str>,
+    /// The tool result's `isError` (`false` when the result omits it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+    /// The JSON-RPC error code of an `error` outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<i64>,
+    /// The call's compact JSON-RPC id, kept only to match a batch response
+    /// member. Never exported.
+    #[serde(skip)]
+    id_key: Option<String>,
+}
+
+/// The JSON-RPC outcome of one recorded call.
+#[derive(Clone, Copy, Default)]
+struct McpCallResult {
+    result: Option<&'static str>,
+    is_error: Option<bool>,
+    error_code: Option<i64>,
+}
+
+impl McpCallResult {
+    fn from_response(response: &Value) -> Self {
+        if let Some(error) = response.get("error") {
+            return Self {
+                result: Some("error"),
+                is_error: None,
+                error_code: error.get("code").and_then(Value::as_i64),
+            };
+        }
+        match response.get("result") {
+            Some(result) => Self {
+                result: Some("result"),
+                is_error: Some(result.get("isError").and_then(Value::as_bool) == Some(true)),
+                error_code: None,
+            },
+            None => Self::default(),
+        }
+    }
+
+    /// A JSON-RPC error, or a tool result that reports `isError: true`.
+    fn failed(&self) -> bool {
+        self.result == Some("error") || self.is_error == Some(true)
+    }
+}
+
+/// An MCP summary built at staging, with what it charges.
+struct StagedMcp {
+    section: McpAuditSection,
+    retained_bytes: usize,
+    arguments_bytes: usize,
 }
 
 /// One bounded, pre-serialized audit record retained by the batching queue.
@@ -1923,7 +2097,22 @@ impl AiTranscriptAudit {
             headers: cfg_bool(capture_obj, "headers", false, "capture")?,
             tool_calls: cfg_bool(capture_obj, "tool_calls", true, "capture")?,
             stream_hash,
+            mcp_tool_calls: cfg_bool(capture_obj, "mcp_tool_calls", true, "capture")?,
+            mcp_arguments: cfg_bool(capture_obj, "mcp_arguments", false, "capture")?,
         };
+        if capture.mcp_arguments && !capture.mcp_tool_calls {
+            return Err(
+                "ai_transcript_audit: `capture.mcp_arguments` requires `capture.mcp_tool_calls`"
+                    .to_string(),
+            );
+        }
+        if capture.mcp_arguments && !mode.captures_body() {
+            return Err(format!(
+                "ai_transcript_audit: `capture.mcp_arguments` exports tool-call argument \
+                 excerpts and requires mode `redacted_body` or `full_body` (got {:?})",
+                mode.as_str()
+            ));
+        }
         if !capture.request && !capture.response && streaming == StreamingCapture::Off {
             return Err(
                 "ai_transcript_audit: at least one of `capture.request`, `capture.response`, \
@@ -3038,6 +3227,9 @@ impl AiTranscriptAudit {
                 capture_skipped: capture.skipped,
                 rate_reservation: capture.rate_reservation,
                 grpc_request_encoding: Some(encoding),
+                mcp: None,
+                mcp_retained_bytes: 0,
+                mcp_arguments_bytes: 0,
             },
         );
 
@@ -3460,6 +3652,7 @@ impl AiTranscriptAudit {
         parsed: Option<&Value>,
         body: &[u8],
         sample_hit: bool,
+        excerpt_budget: usize,
     ) -> RequestCapture {
         let reservation = match self.capture_skip_reason(sample_hit) {
             Ok(reservation) => reservation,
@@ -3497,7 +3690,7 @@ impl AiTranscriptAudit {
             BoundedToolNames::default()
         };
         let shaped = if self.capture.request {
-            self.shape_body(body, self.limits.max_request_bytes)
+            self.shape_body(body, excerpt_budget)
         } else {
             ShapedBody::default()
         };
@@ -3569,7 +3762,9 @@ impl AiTranscriptAudit {
             serde_json::from_slice(body).ok()
         };
         let is_ai = scan_limited || parsed.as_ref().is_some_and(json_looks_like_ai_request);
-        if !is_ai {
+        let carries_tool_call = parsed.as_ref().is_some_and(mcp_jsonrpc::has_tool_call);
+        let is_mcp = self.capture.mcp_tool_calls && carries_tool_call;
+        if !is_ai && !is_mcp {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
@@ -3620,8 +3815,29 @@ impl AiTranscriptAudit {
         // would be discarded by the final-body refresh on any mutating chain and
         // duplicated on every non-mutating one, so all of that is deferred to
         // the single `Final` capture.
+        // The MCP calls are read here, from the body the client sent: on the
+        // provisional pass (before `mcp_gateway`) that is the only view that
+        // still names them publicly and carries their JSON-RPC arguments.
+        let exportable = self.commit_may_emit(sample_hit);
+        let staged_mcp = parsed
+            .as_ref()
+            .filter(|_| is_mcp)
+            .and_then(|json| self.mcp_section(json, exportable));
+        let mcp_retained_bytes = staged_mcp.as_ref().map_or(0, |mcp| mcp.retained_bytes);
+        let mcp_arguments_bytes = staged_mcp.as_ref().map_or(0, |mcp| mcp.arguments_bytes);
+        let mcp_section = staged_mcp.map(|mcp| mcp.section);
+        let max_request_bytes = self.limits.max_request_bytes;
         let capture = match phase {
-            BodyPhase::Final => self.capture_request(parsed.as_ref(), body, sample_hit),
+            // An MCP candidate's final body is an envelope (or a bridged REST
+            // body), not an LLM request: no model or tool definitions are read
+            // from it, and its excerpt shares the request budget with the
+            // argument excerpts.
+            BodyPhase::Final => self.capture_request(
+                parsed.as_ref().filter(|_| mcp_section.is_none()),
+                body,
+                sample_hit,
+                max_request_bytes.saturating_sub(mcp_arguments_bytes),
+            ),
             BodyPhase::Provisional => RequestCapture::default(),
         };
 
@@ -3629,8 +3845,9 @@ impl AiTranscriptAudit {
         // before it is published into the shared map or onto shared request
         // metadata. Provisional staging and deliberately skipped captures
         // charge zero; Final captures charge the measured excerpt + bounded
-        // model/tool bytes.
-        let staged_bytes = if capture.skipped.is_some() {
+        // model/tool bytes. The MCP summary is charged in every case because
+        // staging holds it until the record is emitted or discarded.
+        let capture_bytes = if capture.skipped.is_some() {
             0
         } else {
             staged_retained_bytes(
@@ -3639,6 +3856,7 @@ impl AiTranscriptAudit {
                 tool_names_bytes(&capture.tools.names),
             )
         };
+        let staged_bytes = capture_bytes.saturating_add(mcp_retained_bytes);
         let Some(retained_lease) = self.retained_budget.try_acquire(staged_bytes) else {
             // No local staging entry was installed, so discard must not clear a
             // peer-owned shared marker/hash. Dropping `staging_permit` and
@@ -3689,6 +3907,9 @@ impl AiTranscriptAudit {
                 rate_reservation: capture.rate_reservation,
                 // HTTP JSON path: there is no gRPC framing to witness.
                 grpc_request_encoding: None,
+                mcp: mcp_section,
+                mcp_retained_bytes,
+                mcp_arguments_bytes,
             },
         );
 
@@ -3749,7 +3970,19 @@ impl AiTranscriptAudit {
         } else {
             serde_json::from_slice(body).ok()
         };
-        if !scan_limited && !parsed.as_ref().is_some_and(json_looks_like_ai_request) {
+        // An MCP candidate was classified from the client's JSON-RPC body when
+        // it was staged. Its backend-visible body is the gateway's
+        // upstream-named envelope or an OpenAPI bridge's REST request, which
+        // is neither an LLM request nor, for a bridge, JSON-RPC at all, so it
+        // must not reclassify the candidate away.
+        let staged_mcp = self
+            .staging
+            .get(&record_id)
+            .and_then(|staging| staging.mcp_charges());
+        if !scan_limited
+            && staged_mcp.is_none()
+            && !parsed.as_ref().is_some_and(json_looks_like_ai_request)
+        {
             self.discard_staged_candidate(ctx);
             return;
         }
@@ -3786,7 +4019,17 @@ impl AiTranscriptAudit {
         if already_captured {
             return;
         }
-        let mut capture = self.capture_request(parsed.as_ref(), body, sample_hit);
+        let mcp_retained_bytes = staged_mcp.map_or(0, |(_, retained)| retained);
+        let max_request_bytes = self.limits.max_request_bytes;
+        let mut capture = match staged_mcp {
+            Some((mcp_arguments_bytes, _)) => self.capture_request(
+                None,
+                body,
+                sample_hit,
+                max_request_bytes.saturating_sub(mcp_arguments_bytes),
+            ),
+            None => self.capture_request(parsed.as_ref(), body, sample_hit, max_request_bytes),
+        };
         self.publish_request_capture(ctx, &capture);
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
             staged.captured = true;
@@ -3796,13 +4039,16 @@ impl AiTranscriptAudit {
             // zero; a skipped capture stays at zero. Growth re-acquires; a
             // refused growth withholds the excerpt rather than retaining
             // unaccounted bytes.
+            // A staged MCP summary stays resident until the record is emitted
+            // or discarded, so it remains charged whatever the capture did.
             let mut apply_metadata = true;
             if capture.skipped.is_some() {
-                staged.retained_lease.shrink_to(0);
-                staged.retained_bytes = 0;
+                staged.retained_lease.shrink_to(mcp_retained_bytes);
+                staged.retained_bytes = mcp_retained_bytes;
             } else {
                 let model_bytes = capture.model.value.as_deref().map_or(0, str::len);
-                let tool_bytes = tool_names_bytes(&capture.tools.names);
+                let tool_bytes =
+                    tool_names_bytes(&capture.tools.names).saturating_add(mcp_retained_bytes);
                 let captured_bytes = staged_retained_bytes(
                     capture.excerpt.as_deref().map_or(0, str::len),
                     model_bytes,
@@ -3825,7 +4071,8 @@ impl AiTranscriptAudit {
                     } else {
                         apply_metadata = false;
                         let prior_model_bytes = staged.request_model.as_deref().map_or(0, str::len);
-                        let prior_tool_bytes = tool_names_bytes(&staged.tool_names);
+                        let prior_tool_bytes = tool_names_bytes(&staged.tool_names)
+                            .saturating_add(mcp_retained_bytes);
                         let prior_without_excerpt =
                             staged_retained_bytes(0, prior_model_bytes, prior_tool_bytes);
                         if prior_without_excerpt <= staged.retained_bytes {
@@ -4168,6 +4415,20 @@ impl AiTranscriptAudit {
             None
         };
 
+        let mut mcp = staging.and_then(|staged| staged.mcp.clone());
+        if let Some(section) = mcp.as_mut() {
+            if let Some(results) = response.mcp_results.as_deref() {
+                for (call, result) in section.calls.iter_mut().zip(results) {
+                    call.result = result.result;
+                    call.is_error = result.is_error;
+                    call.error_code = result.error_code;
+                }
+            }
+            if harvests {
+                section.gateway = self.mcp_gateway_metadata(metadata);
+            }
+        }
+
         AuditRecord {
             version: RECORD_VERSION,
             record_id: record_id.to_string(),
@@ -4206,7 +4467,132 @@ impl AiTranscriptAudit {
             tool_names_omitted,
             tool_names_hash,
             headers,
+            mcp,
         }
+    }
+
+    /// Whether a request `Content-Type` makes a `POST` a JSON capture
+    /// candidate. With `capture.mcp_tool_calls` the media types `mcp_gateway`
+    /// admits qualify too — `application/json-rpc`, any `+json`, or no
+    /// `Content-Type` at all — so a `tools/call` sent without the header is
+    /// still audited.
+    fn candidate_content_type(&self, content_type: Option<&str>) -> bool {
+        match content_type {
+            Some(value) => {
+                is_json_content_type(value)
+                    || (self.capture.mcp_tool_calls && mcp_jsonrpc::content_type_is_json(value))
+            }
+            None => self.capture.mcp_tool_calls,
+        }
+    }
+
+    /// Summarize the MCP `tools/call` requests in a client JSON-RPC document,
+    /// or `None` when it carries none.
+    ///
+    /// Tool names are redacted over their full value in the protected modes
+    /// and bounded (per name and in aggregate) exactly like
+    /// [`extract_tool_names_bounded`]; `hash_only` exports no names. Each
+    /// call's arguments get a keyed HMAC (an absent `arguments` is hashed as
+    /// `{}`), and with `capture.mcp_arguments` an excerpt shaped like a body
+    /// excerpt, all of them together within `limits.max_request_bytes`. That
+    /// per-call work is skipped when no record can be exported for the
+    /// candidate (`exportable == false`): the summary then only marks the
+    /// candidate as an MCP one.
+    fn mcp_section(&self, document: &Value, exportable: bool) -> Option<StagedMcp> {
+        let calls = mcp_jsonrpc::tool_calls_in_value(document);
+        if calls.is_empty() {
+            return None;
+        }
+        let mut staged = StagedMcp {
+            section: McpAuditSection {
+                batch: document.is_array(),
+                ..McpAuditSection::default()
+            },
+            retained_bytes: 0,
+            arguments_bytes: 0,
+        };
+        if !exportable {
+            return Some(staged);
+        }
+        let harvests = self.mode.harvests_metadata();
+        let redact_names = self.mode != AuditMode::FullBody;
+        let max_request_bytes = self.limits.max_request_bytes;
+        let empty_arguments = Value::Object(serde_json::Map::new());
+        let mut name_bytes = 0usize;
+        for call in calls {
+            if staged.section.calls.len() >= MAX_MCP_CALLS {
+                staged.section.calls_omitted = staged.section.calls_omitted.saturating_add(1);
+                continue;
+            }
+            let serialized = call.arguments.unwrap_or(&empty_arguments).to_string();
+            let (tool, tool_truncated) = if harvests {
+                bound_mcp_tool_name(call.name, &self.redactor, redact_names, &mut name_bytes)
+            } else {
+                (None, false)
+            };
+            let mut entry = McpAuditCall {
+                tool,
+                tool_truncated,
+                arguments_hash: self.redactor.keyed_hash_hex(serialized.as_bytes()),
+                id_key: mcp_correlation_key(call.id),
+                ..McpAuditCall::default()
+            };
+            if self.capture.mcp_arguments {
+                let budget = max_request_bytes.saturating_sub(staged.arguments_bytes);
+                if budget == 0 {
+                    entry.arguments_truncated = true;
+                    entry.arguments_omitted_reason = Some(OMIT_REASON_MCP_ARGUMENTS_BUDGET);
+                } else {
+                    let shaped = self.shape_body(serialized.as_bytes(), budget);
+                    let excerpt_bytes = shaped.excerpt.as_deref().map_or(0, str::len);
+                    staged.arguments_bytes = staged.arguments_bytes.saturating_add(excerpt_bytes);
+                    entry.arguments = shaped.excerpt;
+                    entry.arguments_truncated = shaped.truncated;
+                    entry.arguments_omitted_reason = shaped.omitted_reason;
+                }
+            }
+            let entry_bytes = mcp_call_retained_bytes(&entry);
+            staged.retained_bytes = staged.retained_bytes.saturating_add(entry_bytes);
+            staged.section.calls.push(entry);
+        }
+        Some(staged)
+    }
+
+    /// The bounded `mcp_gateway` decisions recorded beside an MCP call.
+    fn mcp_gateway_metadata(
+        &self,
+        metadata: &HashMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let redact_names = self.mode != AuditMode::FullBody;
+        let mut gateway = BTreeMap::new();
+        for key in MCP_GATEWAY_METADATA_KEYS {
+            let Some(value) = metadata.get(*key) else {
+                continue;
+            };
+            let value = if is_sensitive_metadata_key(key) {
+                REDACTED_PLACEHOLDER.to_string()
+            } else if MCP_GATEWAY_NAME_METADATA_KEYS.contains(key) {
+                let bounded = bound_model_str(value, &self.redactor, redact_names);
+                bounded.value.unwrap_or_default()
+            } else {
+                bound_short_metadata(value)
+            };
+            gateway.insert((*key).to_string(), value);
+        }
+        gateway
+    }
+
+    /// The outcome of each call of a staged MCP candidate, read from the final
+    /// client-visible response body.
+    fn mcp_results_for(
+        &self,
+        staging: &AuditStaging,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> Option<Vec<McpCallResult>> {
+        let section = staging.mcp.as_ref()?;
+        let max_bytes = self.limits.max_redaction_scan_bytes;
+        Some(mcp_call_results(section, body, headers, max_bytes))
     }
 
     /// Shared per-request buffered-capture predicate used by both
@@ -4431,10 +4817,7 @@ impl Plugin for AiTranscriptAudit {
             return true;
         }
         ctx.method == "POST"
-            && ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|content_type| is_json_content_type(content_type))
+            && self.candidate_content_type(ctx.headers.get("content-type").map(String::as_str))
     }
 
     async fn before_proxy(
@@ -4496,9 +4879,7 @@ impl Plugin for AiTranscriptAudit {
             return self.request_phase_commit_admission(ctx);
         }
         let candidate_shape = ctx.method == "POST"
-            && headers
-                .get("content-type")
-                .is_some_and(|content_type| is_json_content_type(content_type));
+            && self.candidate_content_type(headers.get("content-type").map(String::as_str));
         if !candidate_shape {
             return PluginResult::Continue;
         }
@@ -4604,9 +4985,7 @@ impl Plugin for AiTranscriptAudit {
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
-        let is_json = headers
-            .get("content-type")
-            .is_some_and(|content_type| is_json_content_type(content_type));
+        let is_json = self.candidate_content_type(headers.get("content-type").map(String::as_str));
         if !is_json {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
@@ -4899,11 +5278,19 @@ impl Plugin for AiTranscriptAudit {
             return;
         };
         let sample_hit = staging.sample_hit;
+        // The final client-visible body: for an OpenAPI bridge call, the
+        // `tools/call` result `mcp_gateway` built in its normalize phase.
+        let mcp_results = self.mcp_results_for(&staging, body, response_headers);
+        let mcp_failed = mcp_results
+            .as_deref()
+            .is_some_and(|results| results.iter().any(McpCallResult::failed));
         // A native gRPC call normally fails under HTTP 200, so the transport
         // status alone would drop an ordinary RPC failure whenever the sampling
-        // roll lost — exactly the case `always_capture_on_error` covers.
-        let errored =
-            response_status >= 400 || grpc_call_failed(&ctx.metadata, Some(response_headers));
+        // roll lost — exactly the case `always_capture_on_error` covers. A
+        // JSON-RPC error or an `isError` tool result rides HTTP 200 too.
+        let errored = response_status >= 400
+            || grpc_call_failed(&ctx.metadata, Some(response_headers))
+            || mcp_failed;
         let (emit, reason) =
             self.emit_decision(sample_hit, guardrail_fired(&ctx.metadata), errored);
         ctx.metadata
@@ -4970,6 +5357,7 @@ impl Plugin for AiTranscriptAudit {
             hash_scope: response_hash.as_ref().map(|_| HASH_SCOPE_FULL),
             hash_bytes: response_hash.as_ref().map(|_| body.len() as u64),
             hash: response_hash,
+            mcp_results,
         };
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
@@ -5250,6 +5638,7 @@ impl Plugin for AiTranscriptAudit {
                     hash_scope: Some(captured.response_hash_scope),
                     hash_bytes: Some(captured.response_hash_bytes),
                     hash: Some(captured.response_hash),
+                    mcp_results: None,
                 },
                 // Abnormal end: on_end never ran.
                 ClaimedStreamCapture::Abnormal => ResponseCapture {
@@ -5898,6 +6287,153 @@ fn reject_audit_unavailable() -> PluginResult {
             .to_string(),
         headers,
     }
+}
+
+/// Bound one MCP tool name with the redact-then-bound ordering of
+/// [`extract_tool_names_bounded`]: protected modes redact the full name before
+/// the retained UTF-8 prefix is chosen. `aggregate` tracks the bytes already
+/// admitted for one record; a name past [`MAX_TOOL_NAMES_AGGREGATE_BYTES`] is
+/// omitted and marked truncated.
+fn bound_mcp_tool_name(
+    name: Option<&str>,
+    redactor: &PiiRedactor,
+    redact_before_bound: bool,
+    aggregate: &mut usize,
+) -> (Option<String>, bool) {
+    let Some(name) = name.filter(|name| !name.is_empty()) else {
+        return (None, false);
+    };
+    let redacted;
+    let candidate = if redact_before_bound {
+        redacted = redactor.redact(name);
+        redacted.as_str()
+    } else {
+        name
+    };
+    let truncated = name.len() > MAX_TOOL_NAME_BYTES || candidate.len() > MAX_TOOL_NAME_BYTES;
+    let admitted = truncate_str_ref(candidate, MAX_TOOL_NAME_BYTES);
+    if aggregate.saturating_add(admitted.len()) > MAX_TOOL_NAMES_AGGREGATE_BYTES {
+        return (None, true);
+    }
+    *aggregate = aggregate.saturating_add(admitted.len());
+    (Some(admitted.to_string()), truncated)
+}
+
+/// Retained bytes one staged MCP call holds.
+fn mcp_call_retained_bytes(call: &McpAuditCall) -> usize {
+    call.tool
+        .as_deref()
+        .map_or(0, str::len)
+        .saturating_add(call.arguments_hash.len())
+        .saturating_add(call.arguments.as_deref().map_or(0, str::len))
+        .saturating_add(call.id_key.as_deref().map_or(0, str::len))
+        .saturating_add(MCP_CALL_OVERHEAD_BYTES)
+}
+
+/// The JSON-RPC outcome of each recorded MCP call, aligned with
+/// `section.calls`, read from the final client-visible response body.
+///
+/// A singleton call answered by a singleton response needs no id match; a
+/// batch member is matched by its id, and one whose id no response member
+/// carries is `no_response`. A body past `max_bytes`, or one that is neither
+/// a JSON-RPC response document nor an event stream of them, reports no
+/// outcome: the parse is bounded exactly like request classification.
+fn mcp_call_results(
+    section: &McpAuditSection,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    max_bytes: usize,
+) -> Vec<McpCallResult> {
+    let mut results = vec![McpCallResult::default(); section.calls.len()];
+    if body.is_empty() || body.len() > max_bytes {
+        return results;
+    }
+    let event_stream = headers
+        .get("content-type")
+        .is_some_and(|content_type| is_event_stream(content_type));
+    let responses = if event_stream {
+        jsonrpc_event_stream_responses(body)
+    } else {
+        match serde_json::from_slice::<Value>(body) {
+            Ok(Value::Array(members)) => members,
+            Ok(response @ Value::Object(_)) => vec![response],
+            _ => Vec::new(),
+        }
+    };
+    if responses.is_empty() {
+        return results;
+    }
+    if !section.batch && section.calls.len() == 1 && responses.len() == 1 {
+        results[0] = McpCallResult::from_response(&responses[0]);
+        return results;
+    }
+    for (call, result) in section.calls.iter().zip(results.iter_mut()) {
+        let Some(id_key) = call.id_key.as_deref() else {
+            continue;
+        };
+        let answer = responses
+            .iter()
+            .find(|response| response_answers(response, id_key));
+        *result = match answer {
+            Some(response) => McpCallResult::from_response(response),
+            None => McpCallResult {
+                result: Some("no_response"),
+                ..McpCallResult::default()
+            },
+        };
+    }
+    results
+}
+
+/// The JSON-RPC messages carried by an event-stream body: each event's
+/// `data:` lines joined and parsed as one JSON value (an object, or a batch
+/// array). Events that are not JSON are skipped.
+fn jsonrpc_event_stream_responses(body: &[u8]) -> Vec<Value> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Vec::new();
+    };
+    let mut responses = Vec::new();
+    let mut data = String::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            push_event_stream_message(&mut data, &mut responses);
+        } else if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.strip_prefix(' ').unwrap_or(value));
+        }
+    }
+    push_event_stream_message(&mut data, &mut responses);
+    responses
+}
+
+/// Parse one event's joined `data` as JSON-RPC and clear it for the next.
+fn push_event_stream_message(data: &mut String, responses: &mut Vec<Value>) {
+    if data.is_empty() {
+        return;
+    }
+    match serde_json::from_str::<Value>(data) {
+        Ok(Value::Array(members)) => responses.extend(members),
+        Ok(message @ Value::Object(_)) => responses.push(message),
+        _ => {}
+    }
+    data.clear();
+}
+
+/// Whether a JSON-RPC response member carries the call id `id_key`.
+fn response_answers(response: &Value, id_key: &str) -> bool {
+    response
+        .get("id")
+        .and_then(|id| serde_json::to_string(id).ok())
+        .is_some_and(|key| key == id_key)
+}
+
+/// A call's compact JSON-RPC id for matching its batch response, when it has
+/// one short enough to keep.
+fn mcp_correlation_key(id: Option<&Value>) -> Option<String> {
+    let key = id?.to_string();
+    (key.len() <= MAX_MCP_CORRELATION_ID_BYTES).then_some(key)
 }
 
 /// Aggregate UTF-8 bytes of the retained tool-name set.

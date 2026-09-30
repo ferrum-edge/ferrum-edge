@@ -15887,6 +15887,126 @@ async fn openapi_bridge_calls_obey_the_route_allowed_methods() {
     assert_eq!(backend_method_override_for_test(&ctx), Some("GET"));
 }
 
+/// A bridged tool whose operation method the route's `allowed_methods`
+/// refuses can never be called, so `tools/list` does not advertise it; a
+/// route without a method restriction still lists every operation.
+#[tokio::test]
+async fn openapi_bridge_tools_list_hides_tools_the_route_methods_refuse() {
+    let plugin = bridge_plugin_with(|_| {});
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.allowed_methods = Some(vec!["GET".to_string(), "POST".to_string()]);
+    let proxy = Arc::new(proxy);
+    let session = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 142,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session.clone());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list result missing tools array: {body}"))
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"pets.getPet"), "{body}");
+    assert!(names.contains(&"pets.createPet"), "{body}");
+    assert!(
+        !names.contains(&"pets.deletePet"),
+        "a DELETE operation the route refuses must not be listed: {body}"
+    );
+
+    let names = aggregate_tool_names(&plugin, &session, 143).await;
+    assert!(
+        names.iter().any(|name| name == "pets.deletePet"),
+        "without a method restriction every operation is listed: {names:?}"
+    );
+}
+
+/// The route's method refusal is decided before argument validation, so a
+/// granted caller sending invalid arguments to a refused operation learns the
+/// method refusal, not the argument error, and no schema verdict is recorded.
+#[tokio::test]
+async fn openapi_bridge_method_refusal_precedes_argument_validation() {
+    let plugin = bridge_plugin_with(|_| {});
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.allowed_methods = Some(vec!["GET".to_string(), "POST".to_string()]);
+    let proxy = Arc::new(proxy);
+
+    // `petId` must be a string: this call fails `inputSchema` validation.
+    let call = bridge_tool_call(144, "pets.deletePet", json!({ "petId": 7 }));
+    let (result, ctx, _) = bridge_call_with(&plugin, call, |ctx, _| {
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+    })
+    .await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(144), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+    assert_eq!(policy_decision(&ctx), Some("method_not_allowed"));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
+        Some("skipped"),
+        "arguments of a refused operation are never validated"
+    );
+    assert!(!mcp_bridge_is_claimed_for_test(&ctx));
+
+    // With the method allowed, the same invalid call is an argument error.
+    let call = bridge_tool_call(145, "pets.deletePet", json!({ "petId": 7 }));
+    let (result, _, _) = bridge_call_with(&plugin, call, |_, _| {}).await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["error"]["code"], json!(-32602), "{body}");
+}
+
+/// A per-consumer grant is still decided first: an ungranted caller gets the
+/// ordinary denial whatever the route's methods are.
+#[tokio::test]
+async fn openapi_bridge_grant_denial_precedes_the_method_refusal() {
+    let plugin = bridge_plugin_with(|config| {
+        config["policy"]["tools"] = json!({
+            "pets.deletePet": { "action": "allow", "allowed_groups": ["pet-admins"] }
+        });
+    });
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.allowed_methods = Some(vec!["GET".to_string(), "POST".to_string()]);
+    let proxy = Arc::new(proxy);
+
+    for (consumer, request_id, expected_decision) in [
+        (
+            consumer_with_groups("outsider", &["readers"]),
+            146,
+            "deny_group",
+        ),
+        (
+            consumer_with_groups("admin", &["pet-admins"]),
+            147,
+            "method_not_allowed",
+        ),
+    ] {
+        let session = session_for(&plugin, &consumer).await;
+        let call = bridge_tool_call(request_id, "pets.deletePet", json!({ "petId": "7" }));
+        let (mut ctx, headers) = caller_with(call, &consumer);
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+        let (result, ctx) = send_on_session(&plugin, &session, (ctx, headers)).await;
+        assert_tool_call_refused(result, request_id);
+        assert_eq!(policy_decision(&ctx), Some(expected_decision));
+    }
+}
+
+fn assert_tool_call_refused(result: PluginResult, request_id: i64) {
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(request_id), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+}
+
 const BRIDGE_TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 
 #[tokio::test]

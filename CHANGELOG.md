@@ -25,6 +25,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AI governance for MCP tool calls** (#5908). The AI governance plugins now
+  treat MCP JSON-RPC `tools/call` traffic as AI traffic, through one shared
+  recognizer (`plugins::utils::mcp_jsonrpc`) that decodes member names,
+  refuses duplicate members, and reuses `mcp_gateway`'s default batch bounds:
+  - `ai_transcript_audit` captures `tools/call` requests (singletons and
+    batches, including `application/json-rpc` and `Content-Type`-less POSTs)
+    under the new `capture.mcp_tool_calls` (default `true`). Records gain an
+    `mcp` section with, per call, the public tool name, a keyed
+    `arguments_hash`, an optional redacted `arguments` excerpt
+    (`capture.mcp_arguments`, default `false`, redacted/full modes only), and
+    the JSON-RPC outcome (`result` / `error`, `error_code`, `isError`) read from
+    the final client-visible response — for an OpenAPI bridge call, the
+    converted `tools/call` result, not the REST body — plus a bounded map of
+    `mcp_gateway` decisions. `ai_tool_governor` decisions keep landing in
+    `guardrails`, and a JSON-RPC error or `isError: true` counts as an error for
+    `always_capture_on_error`.
+  - `rate_limiting` gains `mcp_tool_calls` (`endpoint_path`, `tools`,
+    `per_tool`): the limiter counts only `tools/call` (each batch member is one
+    charge; `initialize`, `tools/list`, and notifications are free), optionally
+    per tool, on the existing local and Redis budgets and `x-ratelimit-*`
+    headers. A refusal is a JSON-RPC error on HTTP `200` (`-32015`, or `-32016`
+    for a fail-closed Redis outage), which MCP clients surface.
+  - `ai_prompt_shield` gains `scan_fields: mcp_arguments`, which scans (and
+    redacts) only `params.arguments` of each `tools/call`, accepts the media
+    types `mcp_gateway` admits, and refuses bodies with duplicate member names.
+  - `docs/plugins.md` documents the recommended plugin stack for an
+    agent-facing MCP endpoint.
+
 - **`mcp_gateway` OpenAPI bridge and `x-ferrum-mcp`** (#5906). A
   `servers.<id>` entry may carry an `openapi` block instead of `upstream_url`:
   each configured OpenAPI operation (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`)
@@ -393,6 +421,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id need updating.
 
 ### Changed
+
+- **`mcp_gateway` applies a route's `allowed_methods` to bridged tools earlier**
+  (#5908). A hand-written OpenAPI bridge tool whose operation method the
+  route's `allowed_methods` refuses is no longer listed by `tools/list`, and a
+  call to it is refused with `-32001` right after the tool policy and
+  per-consumer grant, before argument validation, so a granted caller gets the
+  method refusal instead of an argument error.
 
 - **`mcp_gateway` aggregate `initialize` advertises `listChanged: false`**
   for tools, resources, and prompts (#5907). It advertised `true`, but the

@@ -39,6 +39,7 @@ mod unit {
         mod loki_logging_tests;
         mod mcp_aggregate_sse_tests;
         mod mcp_gateway_tests;
+        mod mcp_jsonrpc_tests;
         mod mesh_plugins_tests;
         mod mesh_route_dispatch_tests;
         mod mesh_telemetry_metric_families_tests;

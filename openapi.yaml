@@ -28422,6 +28422,51 @@ components:
           minContains: 1
           maxContains: 1
           description: "Rate-limit rules. Must include exactly one `scope: default` rule. `scope: consumers` rules are only valid when `limit_by` is `consumer`."
+        mcp_tool_calls:
+          type: [object, "null"]
+          additionalProperties: false
+          description: >-
+            Count MCP JSON-RPC tools/call requests instead of HTTP requests
+            (null or omitted counts requests). Only tools/call is charged: each
+            tools/call member of a JSON-RPC batch is one charge, and
+            initialize, tools/list, notifications, and every other method pass
+            uncounted. The charge runs in before_proxy over the buffered body,
+            with the media types mcp_gateway admits (application/json,
+            application/json-rpc, +json, or no Content-Type); a body with
+            duplicate member names, or a batch past 32 members / 1 MiB / 256 KiB
+            per member, is refused with JSON-RPC -32600. An exhausted budget is
+            answered on HTTP 200 with a JSON-RPC error (code -32015, one per
+            request-form batch member) plus x-ratelimit-* headers when
+            expose_headers is set; a fail-closed Redis outage answers -32016.
+            The mode is HTTP-only.
+          properties:
+            endpoint_path:
+              type: [string, "null"]
+              pattern: '^/[^?#\x00-\x1f\x7f-\x9f]*$'
+              description: "Inspect and buffer only requests to exactly this path (normally mcp_gateway endpoint.path). No query, fragment, or control character."
+            tools:
+              type: [array, "null"]
+              minItems: 1
+              maxItems: 256
+              uniqueItems: true
+              items:
+                type: string
+                minLength: 1
+                maxLength: 255
+                pattern: '^[^\x00-\x1f\x7f-\x9f]+$'
+              description: "Count only calls naming one of these public tool names. The per-name bound is enforced by the constructor in UTF-8 bytes (maxLength counts characters)."
+            per_tool:
+              type: [boolean, "null"]
+              default: false
+              description: "Keep one budget per listed tool instead of one shared by every counted call. Requires tools."
+          if:
+            required: [per_tool]
+            properties:
+              per_tool: {const: true}
+          then:
+            required: [tools]
+            properties:
+              tools: {type: array}
         sync_mode:
           type: string
           pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
@@ -32273,6 +32318,23 @@ components:
       required: [sink]
       additionalProperties: false
       allOf:
+        # capture.mcp_arguments exports argument excerpts, so it needs a
+        # body-capturing mode (an absent mode is the redacted_body default) and
+        # MCP tool-call capture itself.
+        - if:
+            required: [capture]
+            properties:
+              capture:
+                type: object
+                required: [mcp_arguments]
+                properties:
+                  mcp_arguments: {const: true}
+          then:
+            properties:
+              mode: {enum: [redacted_body, full_body, null]}
+              capture:
+                properties:
+                  mcp_tool_calls: {enum: [true, null]}
         # mode: full_body captures UNREDACTED payloads, so the constructor
         # requires the explicit allow_full_body opt-in.
         - if:
@@ -32363,6 +32425,14 @@ components:
               type: [boolean, "null"]
               default: true
               description: "Extract tool/function names from the request body."
+            mcp_tool_calls:
+              type: [boolean, "null"]
+              default: true
+              description: "Treat MCP JSON-RPC tools/call requests (a singleton, or a batch with a tools/call member) as audit candidates, including application/json-rpc and Content-Type-less POSTs, and add an mcp section to their records: per call the public tool name (bounded, redacted in protected modes, absent in hash_only), a keyed HMAC-SHA256 arguments_hash, the optional arguments excerpt, and the JSON-RPC outcome read from the final client-visible buffered response (result/error, error_code, isError), plus a bounded map of mcp_gateway decision metadata. At most 32 calls per record; later ones are counted in calls_omitted. A JSON-RPC error or isError=true result counts as an error for always_capture_on_error."
+            mcp_arguments:
+              type: [boolean, "null"]
+              default: false
+              description: "Add each MCP call's arguments excerpt, shaped like a body excerpt (redacted in redacted_body, raw in full_body) and sharing limits.max_request_bytes with the request excerpt. Requires mcp_tool_calls and mode redacted_body or full_body."
             stream_hash:
               type: [string, "null"]
               enum: [capped, full, null]
@@ -33992,9 +34062,9 @@ components:
           description: "Custom {name, regex} patterns. Each entry accepts exactly these two members; an unknown member is fatal at construction, like an unknown top-level field. `regex` must not match the empty string — a zero-width rule would insert the redaction placeholder at every position — and `name` is bounded (maxLength, in characters) because it is substituted into redaction_placeholder."
         scan_fields:
           type: string
-          enum: [content, all]
+          enum: [content, all, mcp_arguments]
           default: content
-          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, system, inputText, message, preamble, and inputs (completions/responses/embeddings/Anthropic-system/Bedrock-Titan/Cohere-v1/HuggingFace-TGI shapes), Google Gemini contents[].parts[].text and systemInstruction/system_instruction parts, Cohere chat_history[].message, Google Vertex legacy predict instances[].prompt, Bedrock Converse messages[].content[].toolResult content and guardContent text, Anthropic tool_result block content, and Azure On Your Data role_information — including content blocks that carry no type discriminator (Bedrock Converse) and matches split across adjacent text parts. Detection and redaction cover the same field set. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
+          description: "Which parts of the request to scan. 'mcp_arguments' scans only params.arguments of MCP JSON-RPC tools/call requests (a singleton or every tools/call member of a batch), accepts the media types mcp_gateway admits (application/json, application/json-rpc, +json, or no Content-Type), and refuses a body with duplicate member names under reject/redact (400, ai_shield_rejected=ambiguous_json). 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, system, inputText, message, preamble, and inputs (completions/responses/embeddings/Anthropic-system/Bedrock-Titan/Cohere-v1/HuggingFace-TGI shapes), Google Gemini contents[].parts[].text and systemInstruction/system_instruction parts, Cohere chat_history[].message, Google Vertex legacy predict instances[].prompt, Bedrock Converse messages[].content[].toolResult content and guardContent text, Anthropic tool_result block content, and Azure On Your Data role_information — including content blocks that carry no type discriminator (Bedrock Converse) and matches split across adjacent text parts. Detection and redaction cover the same field set. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
@@ -35851,8 +35921,10 @@ components:
         observability): only the backend method, path, query, headers, and body
         change, never the destination host, scheme, or port, and no URL from an
         OpenAPI document is ever dialed. The proxy's allowed_methods applies to
-        the bridged method too (a call whose method the route does not allow is
-        refused with JSON-RPC -32001), but method- or path-conditioned plugin
+        the bridged method too: a tool whose method the route does not allow is
+        omitted from tools/list, and a call to it is refused with JSON-RPC
+        -32001 after the tool policy and per-consumer grant and before argument
+        validation. Method- or path-conditioned plugin
         triggers, WAF path and method rules, and authorization keyed on the
         request path see the client's POST to the MCP endpoint, never the
         bridged method and path; restrict a bridged operation through
