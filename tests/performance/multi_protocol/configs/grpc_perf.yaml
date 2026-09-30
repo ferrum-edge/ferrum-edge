@@ -21,7 +21,7 @@ proxies:
     # HTTP/2 flow control tuning — critical for gRPC throughput
     pool_http2_initial_stream_window_size: 8388608       # 8 MiB (vs 64 KB default)
     pool_http2_initial_connection_window_size: 33554432   # 32 MiB
-    pool_http2_adaptive_window: true                     # BDP-based adaptive flow control
+    pool_http2_adaptive_window: false                    # shipped default: fixed 8 MiB / 32 MiB windows
     pool_http2_max_frame_size: 1048576                   # 1 MiB frame size
     pool_http2_max_concurrent_streams: 1000              # High concurrency limit
     plugins: []

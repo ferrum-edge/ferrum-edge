@@ -79,7 +79,7 @@ class H2ObservationTests(unittest.TestCase):
                 self.assertIn('backend_tls_server_ca_cert_path: "/etc/ferrum/tls/ca.pem"', rendered[1])
                 source = root / "changed.yaml"
                 source.write_text((ROOT / "configs" / config).read_text().replace(
-                    "pool_http2_adaptive_window: true", "pool_http2_adaptive_window: false"))
+                    "pool_http2_adaptive_window: false", "pool_http2_adaptive_window: true"))
                 with self.assertRaises(ValueError):
                     materialize_h2(plan, protocol, "ferrum", source, root / "bad.yaml", manifest)
 
