@@ -2039,7 +2039,9 @@ mod tests {
                 .await
                 .expect("connect to bound listener");
             stream
-                .write_all(b"GET /api/x HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"GET /api/x HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n",
+                )
                 .await
                 .expect("send request while accept gate is closed");
             let mut response = [0; 1];
@@ -2058,9 +2060,11 @@ mod tests {
             }
 
             let expected = state.request_epoch.load();
-            assert!(state.publish_gateway_listener_admission(&expected, BTreeSet::new(), || {
-                listener.accept_gate_tx.send_replace(true);
-            }));
+            assert!(
+                state.publish_gateway_listener_admission(&expected, BTreeSet::new(), || {
+                    listener.accept_gate_tx.send_replace(true);
+                })
+            );
             manager.listeners.lock().await.insert(port, listener);
 
             let mut response = Vec::new();
