@@ -26,6 +26,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::config::types::{BackendScheme, BackendTlsConfig, Consumer};
+use crate::plugins::utils::auth_flow::ExternalIdentityRealm;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
@@ -80,6 +81,11 @@ const MCP_INVALID_TOOL_RESULT: i64 = -32012;
 /// usable for POST JSON but never able to attach its event stream. Admission
 /// fails closed instead of returning a half-working session.
 const MCP_SSE_SESSION_UNAVAILABLE: i64 = -32013;
+/// JSON-RPC application error: the final backend-visible request no longer
+/// matches what the aggregate router admitted (method, selected upstream,
+/// target tool/prompt/resource, or validated arguments changed after
+/// admission), so it is refused before egress.
+const MCP_ADMISSION_DRIFT: i64 = -32014;
 /// Maximum nesting depth admitted for a discovered tool `outputSchema`.
 const MAX_OUTPUT_SCHEMA_DEPTH: usize = 32;
 /// Maximum JSON nodes admitted while auditing a discovered tool `outputSchema`.
@@ -868,6 +874,125 @@ enum McpCatalogError {
     Refresh(String),
 }
 
+/// Instance-owned record of what the aggregate router admitted for one request
+/// it routes upstream, re-checked over the FINAL backend-visible body
+/// (`GHSA-3w98-6p32-8qm2`).
+///
+/// Policy (catalog membership, per-tool allow/deny, `inputSchema` validation)
+/// is decided in `before_proxy` over the client's envelope, but later body
+/// transforms — `request_transformer` body rules, a serverless function, a
+/// custom plugin — run afterwards and could otherwise change the method, the
+/// target tool/prompt/resource, or the validated arguments the upstream
+/// receives. The final request-body hook refuses any such drift; the only
+/// permitted difference is this plugin's own recorded public→upstream rewrite.
+///
+/// Private and typed: forgeable `mcp.*` metadata cannot create, alter, or clear
+/// it. `Debug` never renders arguments or target values, which can carry
+/// secrets.
+#[derive(Clone)]
+pub(crate) struct McpAdmissionRecord {
+    /// The `mcp_gateway` instance that admitted the request.
+    owner: u64,
+    /// JSON-RPC method the request was admitted and routed as.
+    method: String,
+    /// Selected upstream server id.
+    server_id: String,
+    /// Backend destination the gateway selected for that server.
+    destination: McpAdmittedDestination,
+    /// Admitted item identity, absent for passthrough methods.
+    target: Option<McpAdmittedTarget>,
+}
+
+impl std::fmt::Debug for McpAdmissionRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpAdmissionRecord")
+            .field("owner", &self.owner)
+            .field("method", &self.method)
+            .field("server_id", &self.server_id)
+            .field("target", &self.target.as_ref().map(|target| target.param))
+            .finish_non_exhaustive()
+    }
+}
+
+/// The routed backend destination exactly as `set_route_to_server` left it.
+#[derive(Clone)]
+struct McpAdmittedDestination {
+    upstream_id: Option<String>,
+    scheme: Option<BackendScheme>,
+    host: Option<String>,
+    port: Option<u16>,
+    path: Option<String>,
+    path_is_absolute: bool,
+    authority: Option<String>,
+    resolved_tls: Option<BackendTlsConfig>,
+}
+
+impl McpAdmittedDestination {
+    fn capture(ctx: &RequestContext) -> Self {
+        Self {
+            upstream_id: ctx.route_override_upstream_id.clone(),
+            scheme: ctx.route_override_backend_scheme,
+            host: ctx.route_override_backend_host.clone(),
+            port: ctx.route_override_backend_port,
+            path: ctx.route_override_path.clone(),
+            path_is_absolute: ctx.route_override_path_is_absolute,
+            authority: ctx.route_override_authority.clone(),
+            resolved_tls: ctx.route_override_resolved_tls.clone(),
+        }
+    }
+
+    fn still_targets(&self, ctx: &RequestContext) -> bool {
+        self.upstream_id == ctx.route_override_upstream_id
+            && self.scheme == ctx.route_override_backend_scheme
+            && self.host == ctx.route_override_backend_host
+            && self.port == ctx.route_override_backend_port
+            && self.path == ctx.route_override_path
+            && self.path_is_absolute == ctx.route_override_path_is_absolute
+            && self.authority == ctx.route_override_authority
+            && self.resolved_tls == ctx.route_override_resolved_tls
+    }
+}
+
+/// The admitted `tools/call`, `prompts/get`, or `resources/read` item.
+#[derive(Clone)]
+struct McpAdmittedTarget {
+    /// `name` for tools and prompts, `uri` for resources.
+    param: &'static str,
+    /// The exact upstream value the backend must receive: the result of this
+    /// plugin's own public→upstream rewrite.
+    upstream_value: String,
+    /// Whether `params.arguments` is part of the admitted operation.
+    binds_arguments: bool,
+    /// `params.arguments` exactly as admitted (and, for `tools/call` with
+    /// `validation.validate_tool_arguments`, as validated). `None` when absent.
+    arguments: Option<Value>,
+}
+
+impl McpAdmittedTarget {
+    fn with_arguments(param: &'static str, upstream_value: &str, envelope: &McpEnvelope) -> Self {
+        Self {
+            param,
+            upstream_value: upstream_value.to_string(),
+            binds_arguments: true,
+            arguments: envelope
+                .params
+                .as_ref()
+                .and_then(|params| params.get("arguments"))
+                .cloned(),
+        }
+    }
+
+    fn without_arguments(param: &'static str, upstream_value: &str) -> Self {
+        Self {
+            param,
+            upstream_value: upstream_value.to_string(),
+            binds_arguments: false,
+            arguments: None,
+        }
+    }
+}
+
 /// Authenticated principal that minted a downstream MCP session.
 ///
 /// A downstream session is the gateway's per-user isolation boundary: it owns a
@@ -880,8 +1005,20 @@ enum McpSessionPrincipal {
     /// (falling back to the username when the record carries no id).
     Consumer { namespace: String, key: String },
     /// Externally authenticated identity with no `Consumer` mapping, as set by
-    /// plugins such as `jwks_auth`.
-    Identity(String),
+    /// plugins such as `jwks_auth`, bound to the verified realm (mechanism and
+    /// issuer / key source / directory) that vouched for it.
+    ///
+    /// A subject string only names a user inside the authority that verified
+    /// it: two accepted issuers can both assert `sub: alice` for different
+    /// people. Comparing the subject alone would let either reuse the other's
+    /// session, so the realm is part of the principal (`GHSA-wr96-j2c3-qh66`).
+    /// `realm` is `None` only for an identity that never crossed the
+    /// authentication commit boundary, and such an identity matches only
+    /// another realm-less identity.
+    Identity {
+        realm: Option<ExternalIdentityRealm>,
+        subject: String,
+    },
 }
 
 impl McpSessionPrincipal {
@@ -912,8 +1049,11 @@ impl McpSessionPrincipal {
                 key: Self::consumer_key(consumer).to_string(),
             });
         }
-        meaningful_identity(ctx.authenticated_identity.as_deref())
-            .map(|identity| Self::Identity(identity.to_string()))
+        let subject = meaningful_identity(ctx.authenticated_identity.as_deref())?;
+        Some(Self::Identity {
+            realm: ctx.authenticated_identity_realm,
+            subject: subject.to_string(),
+        })
     }
 
     /// Compare the bound principal against the current request without
@@ -926,8 +1066,13 @@ impl McpSessionPrincipal {
                 current.namespace == *namespace && Self::consumer_key(current) == key.as_str()
             }),
             // A Consumer-mapped caller is a different principal even when the
-            // mapped username equals the external identity string.
-            Self::Identity(bound) => consumer.is_none() && identity == Some(bound.as_str()),
+            // mapped username equals the external identity string, and an equal
+            // subject verified by a different realm is a different user.
+            Self::Identity { realm, subject } => {
+                consumer.is_none()
+                    && identity == Some(subject.as_str())
+                    && ctx.authenticated_identity_realm == *realm
+            }
         }
     }
 }
@@ -1459,6 +1604,27 @@ impl McpGateway {
             ctx.metadata
                 .insert("mcp.route_decision".to_string(), "forward".to_string());
         }
+    }
+
+    /// Pin what this instance admitted for a request it is about to route
+    /// upstream, for the final request-body re-check (`GHSA-3w98-6p32-8qm2`).
+    /// Must run after `set_route_to_server`, so the recorded destination is
+    /// the one the gateway selected.
+    fn record_admission(
+        &self,
+        ctx: &mut RequestContext,
+        method: &str,
+        server_id: &str,
+        target: Option<McpAdmittedTarget>,
+    ) {
+        let destination = McpAdmittedDestination::capture(ctx);
+        ctx.mcp_admission = Some(Arc::new(McpAdmissionRecord {
+            owner: self.instance_id,
+            method: method.to_string(),
+            server_id: server_id.to_string(),
+            destination,
+            target,
+        }));
     }
 
     fn mark_request_rewrite(
@@ -4055,6 +4221,12 @@ impl McpGateway {
                 validate_tool_results,
             },
         );
+        self.record_admission(
+            ctx,
+            "tools/call",
+            &server.server_id,
+            Some(McpAdmittedTarget::with_arguments("name", &entry.upstream_name, envelope)),
+        );
         PluginResult::Continue
     }
 
@@ -4156,6 +4328,12 @@ impl McpGateway {
                 response_resource_rewrite_possible,
                 validate_tool_results: false,
             },
+        );
+        self.record_admission(
+            ctx,
+            "prompts/get",
+            &server.server_id,
+            Some(McpAdmittedTarget::with_arguments("name", &entry.upstream_name, envelope)),
         );
         PluginResult::Continue
     }
@@ -4353,6 +4531,12 @@ impl McpGateway {
                     .resource_response_rewrite_possible(&server_id),
                 validate_tool_results: false,
             },
+        );
+        self.record_admission(
+            ctx,
+            "resources/read",
+            &server_id,
+            Some(McpAdmittedTarget::without_arguments("uri", &upstream_uri)),
         );
         PluginResult::Continue
     }
@@ -5099,6 +5283,7 @@ impl McpGateway {
         ctx.mcp_trusted_tool_name_rewrite = None;
         ctx.mcp_response_resource_binding = None;
         ctx.mcp_validate_tool_result = None;
+        ctx.mcp_admission = None;
         ctx.mcp_batch_forbids_upstream = false;
         ctx.metadata.remove("mcp.server_id");
         ctx.metadata.remove("mcp.item_type");
@@ -5430,6 +5615,7 @@ impl McpGateway {
                         );
                     }
                     self.set_route_to_server(ctx, headers, server, Some(&session_id));
+                    self.record_admission(ctx, method, &server.server_id, None);
                     PluginResult::Continue
                 } else {
                     json_rpc_error(
@@ -5449,6 +5635,82 @@ impl McpGateway {
             }
             _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
         }
+    }
+
+    /// Why the final backend-visible request no longer matches this
+    /// instance's admission record, or `None` when it still does.
+    ///
+    /// An owned aggregate request only reaches the final request-body phase
+    /// after this instance routed it upstream, and every such route records
+    /// its admission; a missing or foreign record is therefore itself a
+    /// violation. Reasons are fixed tokens.
+    fn final_admission_violation(&self, ctx: &RequestContext, body: &[u8]) -> Option<&'static str> {
+        let Some(record) = ctx.mcp_admission.as_deref() else {
+            return Some("missing_admission");
+        };
+        if record.owner != self.instance_id {
+            return Some("foreign_admission");
+        }
+        if !record.destination.still_targets(ctx) {
+            return Some("destination_changed");
+        }
+        // A duplicate member makes the upstream-visible operation
+        // parser-dependent, so an equality check against either copy proves
+        // nothing.
+        if crate::util::json_dup_keys::slice_ambiguity(body).is_some() {
+            return Some("ambiguous_body");
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return Some("invalid_body");
+        };
+        let Some(request) = value.as_object() else {
+            return Some("invalid_body");
+        };
+        if request.get("method").and_then(Value::as_str) != Some(record.method.as_str()) {
+            return Some("method_changed");
+        }
+        // A passthrough method has no admitted item beyond its method.
+        let target = record.target.as_ref()?;
+        let Some(params) = request.get("params").and_then(Value::as_object) else {
+            return Some("target_changed");
+        };
+        // Only the gateway's own recorded rewrite is admissible: the upstream
+        // must receive exactly the recorded upstream identity, never the public
+        // spelling and never a value a later transform substituted.
+        let final_target = params.get(target.param).and_then(Value::as_str);
+        if final_target != Some(target.upstream_value.as_str()) {
+            return Some("target_changed");
+        }
+        if target.binds_arguments && params.get("arguments") != target.arguments.as_ref() {
+            return Some("arguments_changed");
+        }
+        None
+    }
+
+    fn reject_admission_drift(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &'static str,
+    ) -> PluginResult {
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.policy_decision".to_string(), "deny".to_string());
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            ctx.metadata
+                .insert("mcp.admission_violation".to_string(), reason.to_string());
+        }
+        warn_sampled!(
+            reason,
+            "MCP gateway refusing a request that changed after admission"
+        );
+        let rejection = json_rpc_error(
+            None,
+            MCP_ADMISSION_DRIFT,
+            "MCP request changed after gateway admission",
+            None,
+        );
+        Self::correlate_gateway_terminal(ctx, rejection, &[])
     }
 
     /// Name the pending request on a gateway-authored terminal.
@@ -5657,6 +5919,56 @@ impl Plugin for McpGateway {
 
     fn needs_final_request_body_context(&self) -> bool {
         self.enabled && self.mode == McpGatewayMode::AggregateRouter
+    }
+
+    /// Aggregate admission is re-decided over the finalized request, so an
+    /// earlier-egressing plugin could send bytes this policy would refuse.
+    fn enforces_finalized_request_policy(&self) -> bool {
+        self.enabled && self.mode == McpGatewayMode::AggregateRouter
+    }
+
+    /// Claim exactly the requests this instance routed upstream, so the shared
+    /// representation gate decodes a content coding into the plaintext the
+    /// admission re-check reads — or fails the request closed.
+    fn enforces_final_request_body_policy(
+        &self,
+        ctx: &RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        self.mode == McpGatewayMode::AggregateRouter
+            && self.owns_request(ctx)
+            && ctx.mcp_admission.is_some()
+    }
+
+    /// Re-check aggregate MCP admission over the FINAL backend-visible body
+    /// (`GHSA-3w98-6p32-8qm2`).
+    ///
+    /// Runs after every `transform_request_body` hook, including this plugin's
+    /// own public→upstream rewrite and any later `request_transformer` body
+    /// rule, so `body` is exactly what the selected upstream would receive. The
+    /// request must still be the admitted method, aimed at the admitted
+    /// destination, naming the admitted item by its recorded upstream identity,
+    /// and carrying the admitted arguments. Every failure is fail-closed with a
+    /// fixed-cardinality reason; no body, name, URI, or argument is echoed or
+    /// logged.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if self.mode != McpGatewayMode::AggregateRouter || !self.owns_request(ctx) {
+            return PluginResult::Continue;
+        }
+        let violation = {
+            let body = ctx.inspectable_final_request_body(body);
+            self.final_admission_violation(ctx, body)
+        };
+        match violation {
+            None => PluginResult::Continue,
+            Some(reason) => self.reject_admission_drift(ctx, reason),
+        }
     }
 
     async fn before_proxy(

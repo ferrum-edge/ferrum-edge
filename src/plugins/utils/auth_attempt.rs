@@ -13,6 +13,10 @@ pub struct AuthenticationAttempt {
     mesh_request_auth_claims: HashMap<String, JwtAuthAttributeValue>,
     stripping_metadata: HashSet<String>,
     stripped_query_params: HashSet<String>,
+    /// Opaque digest of the authority that verified this attempt's external
+    /// identity (issuer, key source, directory). Committed together with that
+    /// identity as its [`super::auth_flow::ExternalIdentityRealm`].
+    identity_realm_authority: Option<[u8; 32]>,
 }
 
 impl AuthenticationAttempt {
@@ -43,6 +47,20 @@ impl AuthenticationAttempt {
     pub fn stage_query_param_strip(&mut self, key: String, name: String) {
         self.stripping_metadata.insert(key);
         self.stripped_query_params.insert(name);
+    }
+
+    /// Stage the verifying-authority digest for the external identity this
+    /// attempt may commit (see
+    /// [`super::auth_flow::external_identity_realm_authority`]). Mechanisms
+    /// that can accept the same subject string from more than one authority
+    /// must stage one, so equal subjects from different authorities never
+    /// name the same principal (`GHSA-wr96-j2c3-qh66`).
+    pub fn stage_identity_realm_authority(&mut self, authority: [u8; 32]) {
+        self.identity_realm_authority = Some(authority);
+    }
+
+    pub(super) fn identity_realm_authority(&self) -> Option<[u8; 32]> {
+        self.identity_realm_authority
     }
 
     /// Commit state tied to the selected request principal. The first accepted

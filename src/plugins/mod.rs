@@ -2423,6 +2423,17 @@ pub struct RequestContext {
     /// Human-readable identity for the `X-Consumer-Username` header sent to the
     /// backend. Falls back to `authenticated_identity` when not set separately.
     pub authenticated_identity_header: Option<String>,
+    /// Verified security realm of [`Self::authenticated_identity`]: the
+    /// mechanism and verifying authority (issuer, key source, directory) that
+    /// vouched for it. Committed atomically with the identity by
+    /// [`utils::auth_flow::commit_authentication_attempt`] and `None` whenever
+    /// no external identity was committed through that boundary.
+    ///
+    /// A subject string only names a user inside the authority that verified
+    /// it, so a decision that authorizes on the external identity must compare
+    /// this realm too (`GHSA-wr96-j2c3-qh66`). Private so a plugin that can
+    /// only write the public identity string cannot also claim a realm.
+    pub(crate) authenticated_identity_realm: Option<utils::auth_flow::ExternalIdentityRealm>,
     /// Authoritative GeoIP country assertion staged by `geo_restriction` for
     /// backend dispatch. Kept outside the mutable plugin header map and public
     /// metadata so later request hooks cannot replace or log a forged value.
@@ -2946,6 +2957,14 @@ pub struct RequestContext {
     /// under the public name only when the final wire name exactly matches
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
+    /// What the owning `mcp_gateway` aggregate router admitted for a request it
+    /// routes upstream — method, selected destination, upstream item identity,
+    /// and admitted arguments — re-checked over the FINAL backend-visible body
+    /// so a later body transform cannot swap the operation after admission
+    /// (`GHSA-3w98-6p32-8qm2`). Private for the same reason as the claims
+    /// around it: forgeable `mcp.*` metadata must not be able to mint, alter,
+    /// or clear it. `Arc` so the final-body hook context clone shares it.
+    pub(crate) mcp_admission: Option<Arc<mcp_gateway::McpAdmissionRecord>>,
     /// Identity of the `mcp_gateway` instance that admitted this request in
     /// `before_proxy`, and therefore the only instance whose response-phase
     /// policies may act on it.
@@ -3961,6 +3980,7 @@ impl RequestContext {
             identified_consumer: None,
             authenticated_identity: None,
             authenticated_identity_header: None,
+            authenticated_identity_realm: None,
             backend_geo_country: None,
             auth_method: None,
             credential_deadline_at: None,
@@ -4040,6 +4060,7 @@ impl RequestContext {
             a2a_gateway_claim: None,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
+            mcp_admission: None,
             mcp_owner_instance: None,
             mcp_request_json_rpc_id: None,
             mcp_validate_tool_result: None,
@@ -5450,6 +5471,7 @@ impl RequestContext {
             identified_consumer: self.identified_consumer.clone(),
             authenticated_identity: self.authenticated_identity.clone(),
             authenticated_identity_header: self.authenticated_identity_header.clone(),
+            authenticated_identity_realm: self.authenticated_identity_realm,
             backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
             credential_deadline_at: self.credential_deadline_at,
@@ -5615,6 +5637,7 @@ impl RequestContext {
             }),
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
+            mcp_admission: self.mcp_admission.clone(),
             mcp_owner_instance: self.mcp_owner_instance,
             mcp_request_json_rpc_id: self.mcp_request_json_rpc_id.clone(),
             mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
@@ -6798,6 +6821,13 @@ impl RequestContext {
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
+    }
+
+    /// Verified realm of the committed external identity, if one was committed
+    /// through the authentication boundary. See
+    /// [`utils::auth_flow::ExternalIdentityRealm`].
+    pub fn authenticated_identity_realm(&self) -> Option<utils::auth_flow::ExternalIdentityRealm> {
+        self.authenticated_identity_realm
     }
 
     /// Contribute an authorization deadline observed by an admitting

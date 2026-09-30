@@ -13095,3 +13095,544 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-3w98-6p32-8qm2: aggregate admission holds on the final request body
+// ---------------------------------------------------------------------------
+
+/// A `request_transformer` instance built from body rules only.
+fn body_transformer(rules: Value) -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    create_plugin("request_transformer", &json!({ "rules": rules }))
+        .unwrap()
+        .unwrap()
+}
+
+/// Admit one aggregate request, then run the request-body transform stage the
+/// proxy runs before its final request-body hook on every dispatch ladder: this
+/// plugin's own public→upstream rewrite, then the later body transformer.
+async fn admit_and_transform(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    later: Option<&Arc<dyn ferrum_edge::plugins::Plugin>>,
+    session_id: &str,
+    request: Value,
+) -> (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+    Vec<u8>,
+) {
+    let (mut ctx, mut headers) = mcp_ctx(request.clone());
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    let admitted = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(admitted, PluginResult::Continue),
+        "the call must be admitted and routed upstream: {admitted:?}"
+    );
+    let mut body = serde_json::to_vec(&request).unwrap();
+    for stage in std::iter::once(plugin).chain(later) {
+        let transformed = stage
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers,
+            )
+            .await;
+        if let Some(rewritten) = transformed {
+            body = rewritten;
+        }
+    }
+    (ctx, headers, body)
+}
+
+/// Run the final request-body hook the way both dispatch ladders do: on the
+/// short-lived hook-context clone HTTP/1.1 and HTTP/2 build, and on the live
+/// context native HTTP/3 hands the hook. Both must reach the same verdict.
+async fn final_body_verdicts(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    ctx: &mut ferrum_edge::plugins::RequestContext,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> [PluginResult; 2] {
+    let mut hook_ctx = ferrum_edge::_test_support::clone_for_final_request_body_hooks_for_test(ctx);
+    let h1_h2 = plugin
+        .on_final_request_body_with_context(&mut hook_ctx, headers, body)
+        .await;
+    let h3 = plugin
+        .on_final_request_body_with_context(ctx, headers, body)
+        .await;
+    [h1_h2, h3]
+}
+
+fn assert_admission_drift_refused(verdicts: [PluginResult; 2], request_id: i64, case: &str) {
+    for verdict in verdicts {
+        let (status, body, _) = reject_json(verdict);
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], json!(-32014), "{case}: {body}");
+        assert_eq!(
+            body["error"]["message"], "MCP request changed after gateway admission",
+            "{case}"
+        );
+        assert_eq!(body["id"], json!(request_id), "{case}: names the call");
+    }
+}
+
+fn assert_admission_holds(verdicts: [PluginResult; 2], case: &str) {
+    for verdict in verdicts {
+        assert!(
+            matches!(verdict, PluginResult::Continue),
+            "{case}: {verdict:?}"
+        );
+    }
+}
+
+async fn aggregate_plugin_with_catalog() -> (MockServer, Arc<dyn ferrum_edge::plugins::Plugin>) {
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    (server, plugin)
+}
+
+fn allowed_tool_call(request_id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/call",
+        "params": {
+            "name": "github.create_pr",
+            "alias": "merge_pr",
+            "arguments": { "repo": "payments-api" }
+        }
+    })
+}
+
+fn prompt_get(request_id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "prompts/get",
+        "params": { "name": "github.code_review", "arguments": { "focus": "security" } }
+    })
+}
+
+fn resource_read(request_id: i64, public_uri: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "resources/read",
+        "params": { "uri": public_uri }
+    })
+}
+
+/// The advisory's scenario: the client names an allowed tool, a later
+/// `request_transformer` rule moves a client-supplied alias into `params.name`,
+/// and the denied upstream tool would otherwise be dispatched.
+#[tokio::test]
+async fn aggregate_later_body_rename_to_denied_tool_is_refused_before_egress() {
+    let (_server, plugin) = aggregate_plugin_with_catalog().await;
+    assert!(plugin.enforces_finalized_request_policy());
+    let session_id = initialize(&plugin).await;
+    let rename = body_transformer(json!([
+        {"operation": "rename", "target": "body", "key": "params.alias", "new_key": "params.name"}
+    ]));
+
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&rename), &session_id, allowed_tool_call(51)).await;
+    let final_body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        final_body["params"]["name"], "merge_pr",
+        "precondition: the later transform replaced the admitted upstream name"
+    );
+    assert!(plugin.enforces_final_request_body_policy(&ctx, &headers, &body));
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        51,
+        "renamed to a denied tool",
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.admission_violation")
+            .map(String::as_str),
+        Some("target_changed")
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+        Some("deny")
+    );
+
+    // Control: the same allowed call without the later rename still reaches
+    // the upstream under the gateway's own recorded public→upstream rewrite.
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, None, &session_id, allowed_tool_call(52)).await;
+    let final_body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(final_body["params"]["name"], "create_pr");
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "the gateway's own rewrite",
+    );
+
+    // Control: the denied tool named directly is still refused at admission.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 53,
+        "method": "tools/call",
+        "params": { "name": "github.merge_pr", "arguments": {} }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (_, denied, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(denied["error"]["code"], json!(-32001));
+}
+
+#[tokio::test]
+async fn aggregate_final_body_refuses_method_argument_and_destination_drift() {
+    let (_server, plugin) = aggregate_plugin_with_catalog().await;
+    let session_id = initialize(&plugin).await;
+
+    let swap = body_transformer(json!([
+        {"operation": "update", "target": "body", "key": "method", "value": "prompts/get"}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&swap), &session_id, allowed_tool_call(61)).await;
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        61,
+        "method replaced",
+    );
+
+    let swap = body_transformer(json!([{
+        "operation": "update",
+        "target": "body",
+        "key": "params.arguments.repo",
+        "value": "billing-api"
+    }]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&swap), &session_id, allowed_tool_call(62)).await;
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        62,
+        "validated arguments replaced",
+    );
+
+    let swap = body_transformer(json!([
+        {"operation": "add", "target": "body", "key": "params.arguments.force", "value": true}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&swap), &session_id, allowed_tool_call(63)).await;
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        63,
+        "argument added after validation",
+    );
+
+    // A member outside the admitted operation may still be shaped.
+    let shape = body_transformer(json!([
+        {"operation": "add", "target": "body", "key": "params._meta.source", "value": "gateway"}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&shape), &session_id, allowed_tool_call(64)).await;
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "unrelated params member",
+    );
+
+    // Retargeting the selected upstream after admission is refused too.
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, None, &session_id, allowed_tool_call(65)).await;
+    ctx.route_override_backend_host = Some("unadmitted-mcp.example".to_string());
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        65,
+        "destination replaced",
+    );
+
+    // The public spelling reaching the upstream means the gateway's own rewrite
+    // did not happen, which is not the admitted operation either.
+    let (mut ctx, headers, _) =
+        admit_and_transform(&plugin, None, &session_id, allowed_tool_call(66)).await;
+    let public_body = serde_json::to_vec(&allowed_tool_call(66)).unwrap();
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &public_body).await,
+        66,
+        "public name forwarded unrewritten",
+    );
+
+    // A final body that stopped being one unambiguous JSON-RPC object.
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, None, &session_id, allowed_tool_call(67)).await;
+    let text = String::from_utf8(body).unwrap();
+    let method = "\"method\":\"tools/call\"";
+    let duplicated = text.replacen(method, &format!("{method},{method}"), 1);
+    assert_ne!(duplicated, text, "precondition: a duplicate was injected");
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, duplicated.as_bytes()).await,
+        67,
+        "duplicate member",
+    );
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, b"[]").await,
+        67,
+        "no longer a singleton request",
+    );
+}
+
+#[tokio::test]
+async fn aggregate_final_body_refuses_prompt_and_resource_target_drift() {
+    let (_server, plugin) = aggregate_plugin_with_catalog().await;
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, None, &session_id, prompt_get(71)).await;
+    let final_body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(final_body["params"]["name"], "code_review");
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "the gateway's own prompt rewrite",
+    );
+
+    let swap = body_transformer(json!([
+        {"operation": "update", "target": "body", "key": "params.name", "value": "internal_prompt"}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&swap), &session_id, prompt_get(72)).await;
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        72,
+        "prompts/get name replaced",
+    );
+
+    let swap = body_transformer(json!([
+        {"operation": "update", "target": "body", "key": "params.arguments.focus", "value": "none"}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&swap), &session_id, prompt_get(73)).await;
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        73,
+        "prompts/get arguments replaced",
+    );
+
+    let (status, listed, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 74, "resources/list", json!({}))
+            .await;
+    assert_eq!(status, 200);
+    let public_uri = listed["result"]["resources"][0]["uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("resources/list returned no resource: {listed}"))
+        .to_string();
+    let read = resource_read(75, &public_uri);
+    let (mut ctx, headers, body) = admit_and_transform(&plugin, None, &session_id, read).await;
+    let final_body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(final_body["params"]["uri"], "file:///project/README.md");
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "the gateway's own resource rewrite",
+    );
+
+    let swap = body_transformer(json!([
+        {"operation": "update", "target": "body", "key": "params.uri", "value": "file:///etc/hosts"}
+    ]));
+    let read = resource_read(76, &public_uri);
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&swap), &session_id, read).await;
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        76,
+        "resources/read URI replaced",
+    );
+}
+
+/// The re-check is scoped to requests this instance routed: an unrelated
+/// request on the same proxy is never refused by it.
+#[tokio::test]
+async fn aggregate_final_body_check_ignores_requests_it_did_not_route() {
+    let (_server, plugin) = aggregate_plugin_with_catalog().await;
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/elsewhere".to_string();
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"merge_pr"}}"#;
+    assert!(!plugin.enforces_final_request_body_policy(&ctx, &headers, body));
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, body).await,
+        "request this instance never admitted",
+    );
+
+    // Transparent mode has no aggregate admission to re-check.
+    let transparent = create_plugin(
+        "mcp_gateway",
+        &transparent_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!transparent.enforces_finalized_request_policy());
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-wr96-j2c3-qh66: external session owners are bound to their identity realm
+// ---------------------------------------------------------------------------
+
+const ISSUER_A: &str = "https://issuer-a.example";
+const ISSUER_B: &str = "https://issuer-b.example";
+
+/// One `jwks_auth` instance accepting two issuers with distinct signing keys.
+fn two_issuer_jwks_auth() -> ferrum_edge::plugins::jwks_auth::JwksAuth {
+    use super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid;
+    let key_a = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let key_b = include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem");
+    let jwks_a = build_rsa_jwks_from_pem_with_kid(key_a, "issuer-a");
+    let jwks_b = build_rsa_jwks_from_pem_with_kid(key_b, "issuer-b");
+    ferrum_edge::plugins::jwks_auth::JwksAuth::new(
+        &json!({
+            "providers": [
+                { "issuer": ISSUER_A, "jwks": jwks_a.to_string() },
+                { "issuer": ISSUER_B, "jwks": jwks_b.to_string() }
+            ]
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("two-issuer jwks_auth")
+}
+
+/// Authenticate a caller through `jwks_auth` as `subject` from `issuer`, with
+/// no Consumer mapping, exactly as the authentication phase does before
+/// `mcp_gateway` runs.
+async fn authenticate_via_issuer(
+    auth: &ferrum_edge::plugins::jwks_auth::JwksAuth,
+    caller: McpCaller,
+    issuer: &str,
+    subject: &str,
+) -> McpCaller {
+    let (mut ctx, headers) = caller;
+    let (private_key, kid): (&[u8], &str) = if issuer == ISSUER_A {
+        (
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+            "issuer-a",
+        )
+    } else {
+        (
+            include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
+            "issuer-b",
+        )
+    };
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({ "iss": issuer, "sub": subject }),
+        private_key,
+        kid,
+    );
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    ctx.headers
+        .retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    let result = auth
+        .authenticate(&mut ctx, &ferrum_edge::ConsumerIndex::new(&[]))
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{issuer} must authenticate {subject}: {result:?}"
+    );
+    assert!(ctx.identified_consumer.is_none());
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some(subject));
+    (ctx, headers)
+}
+
+fn delete_session(session_id: &str) -> McpCaller {
+    let (mut ctx, headers) = sse_get_ctx(Some(session_id), None);
+    ctx.method = "DELETE".to_string();
+    (ctx, headers)
+}
+
+fn cancel_notification() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 99, "reason": "user" }
+    })
+}
+
+fn create_pr_call(request_id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/call",
+        "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+    })
+}
+
+#[tokio::test]
+async fn external_identity_realm_is_committed_with_the_verifying_issuer() {
+    let auth = two_issuer_jwks_auth();
+    let (a, _) = authenticate_via_issuer(&auth, mcp_ctx(json!({})), ISSUER_A, "alice").await;
+    let (a_again, _) = authenticate_via_issuer(&auth, mcp_ctx(json!({})), ISSUER_A, "bob").await;
+    let (b, _) = authenticate_via_issuer(&auth, mcp_ctx(json!({})), ISSUER_B, "alice").await;
+
+    let realm_a = a.authenticated_identity_realm().expect("issuer A realm");
+    let realm_b = b.authenticated_identity_realm().expect("issuer B realm");
+    assert_eq!(realm_a.mechanism(), "jwks_auth");
+    assert_eq!(realm_b.mechanism(), "jwks_auth");
+    assert_ne!(
+        realm_a, realm_b,
+        "equal subjects from different issuers are different principals"
+    );
+    assert_eq!(
+        a_again.authenticated_identity_realm(), Some(realm_a),
+        "one issuer is one realm"
+    );
+    let rendered = format!("{realm_a:?}");
+    assert!(!rendered.contains("issuer-a.example"), "{rendered}");
+}
+
+#[tokio::test]
+async fn aggregate_session_is_not_reusable_by_an_equal_subject_from_another_issuer() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "sse_multiplexing": true });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let auth = two_issuer_jwks_auth();
+
+    let init = mcp_ctx(initialize_request_body());
+    let owner = authenticate_via_issuer(&auth, init, ISSUER_A, "alice").await;
+    let session_id = initialize_as(&plugin, owner).await;
+
+    // Issuer B's `alice` presents the same session id on every session surface.
+    let as_b = |caller: McpCaller| authenticate_via_issuer(&auth, caller, ISSUER_B, "alice");
+    let b_list = as_b(mcp_ctx(tools_list_body(2))).await;
+    assert_session_refused(reuse_session_as(&plugin, &session_id, b_list).await);
+    let b_call = as_b(mcp_ctx(create_pr_call(3))).await;
+    assert_session_refused(reuse_session_as(&plugin, &session_id, b_call).await);
+    let b_cancel = as_b(mcp_ctx(cancel_notification())).await;
+    assert_session_refused(reuse_session_as(&plugin, &session_id, b_cancel).await);
+    let b_sse = as_b(sse_get(&session_id)).await;
+    assert_session_refused(reuse_session_as(&plugin, &session_id, b_sse).await);
+    let b_delete = as_b(delete_session(&session_id)).await;
+    assert_session_refused(reuse_session_as(&plugin, &session_id, b_delete).await);
+
+    // Control: a different subject from the owning issuer is refused as well.
+    let stranger = mcp_ctx(tools_list_body(4));
+    let stranger = authenticate_via_issuer(&auth, stranger, ISSUER_A, "mallory").await;
+    assert_session_refused(reuse_session_as(&plugin, &session_id, stranger).await);
+
+    // The owning realm still reuses its session on every surface, and the
+    // refused DELETE above did not end it.
+    let as_a = |caller: McpCaller| authenticate_via_issuer(&auth, caller, ISSUER_A, "alice");
+    let a_list = as_a(mcp_ctx(tools_list_body(5))).await;
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, a_list).await);
+    let a_call = as_a(mcp_ctx(create_pr_call(6))).await;
+    assert!(matches!(
+        reuse_session_as(&plugin, &session_id, a_call).await,
+        PluginResult::Continue
+    ));
+    let a_sse = as_a(sse_get(&session_id)).await;
+    let (status, _, response_headers) =
+        reject_raw(reuse_session_as(&plugin, &session_id, a_sse).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("text/event-stream")
+    );
+    let a_delete = as_a(delete_session(&session_id)).await;
+    let (status, _, _) = reject_raw(reuse_session_as(&plugin, &session_id, a_delete).await);
+    assert_eq!(status, 200);
+    let a_after = as_a(mcp_ctx(tools_list_body(7))).await;
+    assert_session_refused(reuse_session_as(&plugin, &session_id, a_after).await);
+}

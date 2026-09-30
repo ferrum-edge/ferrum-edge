@@ -10,6 +10,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::plugins::{PluginResult, RequestContext};
 
 use super::auth_attempt::AuthenticationAttempt;
+use super::replay_partition::PartitionHasher;
 
 /// What an auth plugin extracted from the request.
 #[derive(Debug, Clone)]
@@ -139,6 +140,79 @@ fn identity_within_limit(identity: &str, field: &'static str) -> Result<(), Veri
          {MAX_AUTHENTICATED_IDENTITY_BYTES}-byte limit for an authenticated principal",
         identity.len()
     )))
+}
+
+/// Verified security realm of an external (non-`Consumer`) principal.
+///
+/// A raw external identity claim — a JWT `sub`, an introspected `sub` or
+/// `username`, an LDAP login — names a user only *within* the authority that
+/// verified it. Two accepted authorities can legitimately issue the same string
+/// for different people, so anything that authorizes on an external identity
+/// (`mcp_gateway` session ownership, for one) must compare the realm together
+/// with the subject (`GHSA-wr96-j2c3-qh66`).
+///
+/// The realm is the authentication mechanism that committed the principal plus,
+/// for mechanisms that can accept more than one authority, an opaque
+/// construction-time digest of the verifying authority (issuer, key source,
+/// directory) from [`external_identity_realm_authority`]. It carries no token,
+/// claim, or credential material, and the digest does not reveal the configured
+/// issuer or URL. It is `Copy`, so committing it on the request path allocates
+/// nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExternalIdentityRealm {
+    mechanism: &'static str,
+    authority: Option<[u8; 32]>,
+}
+
+impl ExternalIdentityRealm {
+    pub fn new(mechanism: &'static str, authority: Option<[u8; 32]>) -> Self {
+        Self {
+            mechanism,
+            authority,
+        }
+    }
+
+    /// Authentication mechanism that committed the principal.
+    pub fn mechanism(&self) -> &'static str {
+        self.mechanism
+    }
+
+    /// Opaque verifying-authority digest, when the mechanism supplied one.
+    pub fn authority(&self) -> Option<&[u8; 32]> {
+        self.authority.as_ref()
+    }
+}
+
+impl fmt::Debug for ExternalIdentityRealm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalIdentityRealm")
+            .field("mechanism", &self.mechanism)
+            .field("authority", &self.authority.map(hex::encode))
+            .finish()
+    }
+}
+
+/// Derive the opaque verifying-authority digest for an
+/// [`ExternalIdentityRealm`].
+///
+/// Computed once at plugin construction from the configuration that decides
+/// which authority vouches for a principal, never on the request path. Fields
+/// are length-framed and presence-tagged, so an absent value can never collide
+/// with a present one and no field can forge another's boundary. The result is
+/// deterministic, so an equivalent reload and every replica derive the same
+/// realm.
+pub fn external_identity_realm_authority(
+    mechanism: &'static str,
+    fields: &[(&str, Option<&str>)],
+) -> [u8; 32] {
+    let mut hasher = PartitionHasher::new("ferrum-edge/auth/external-identity-realm/v1");
+    hasher.text("mechanism", mechanism);
+    hasher.count("fields", fields.len());
+    for (label, value) in fields {
+        hasher.optional_text(label, *value);
+    }
+    hasher.digest()
 }
 
 /// Shared auth verification result, mapped to PluginResult by the dispatcher.
@@ -505,6 +579,13 @@ pub trait AuthMechanism: Send + Sync {
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential;
 
+    /// Verifying-authority digest for the external principals this mechanism
+    /// commits ([`ExternalIdentityRealm`]). `None` when the mechanism name
+    /// alone identifies the realm.
+    fn identity_realm_authority(&self) -> Option<[u8; 32]> {
+        None
+    }
+
     async fn verify(
         &self,
         credential: ExtractedCredential,
@@ -544,26 +625,32 @@ async fn run_auth_impl<M: AuthMechanism>(
         ExtractedCredential::InvalidFormat(body) => {
             reject(401, body, mechanism.authentication_challenge())
         }
-        credential => match commit_authentication_attempt(
-            ctx,
-            AuthenticationAttempt::new(),
-            mechanism.verify(credential, consumer_index).await,
-            mechanism.mechanism_name(),
-            allow_external_identity,
-        ) {
-            Ok(_) => PluginResult::Continue,
-            Err(VerifyOutcome::InvalidFormat(body))
-            | Err(VerifyOutcome::Invalid(body))
-            | Err(VerifyOutcome::ConsumerNotFound(body))
-            | Err(VerifyOutcome::VerificationFailed(body)) => {
-                reject(401, body, mechanism.authentication_challenge())
+        credential => {
+            let mut attempt = AuthenticationAttempt::new();
+            if let Some(authority) = mechanism.identity_realm_authority() {
+                attempt.stage_identity_realm_authority(authority);
             }
-            Err(VerifyOutcome::Forbidden(body)) => reject(403, body, None),
-            Err(VerifyOutcome::Internal(body)) => reject(500, body, None),
-            Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
-                PluginResult::Continue
+            match commit_authentication_attempt(
+                ctx,
+                attempt,
+                mechanism.verify(credential, consumer_index).await,
+                mechanism.mechanism_name(),
+                allow_external_identity,
+            ) {
+                Ok(_) => PluginResult::Continue,
+                Err(VerifyOutcome::InvalidFormat(body))
+                | Err(VerifyOutcome::Invalid(body))
+                | Err(VerifyOutcome::ConsumerNotFound(body))
+                | Err(VerifyOutcome::VerificationFailed(body)) => {
+                    reject(401, body, mechanism.authentication_challenge())
+                }
+                Err(VerifyOutcome::Forbidden(body)) => reject(403, body, None),
+                Err(VerifyOutcome::Internal(body)) => reject(500, body, None),
+                Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
+                    PluginResult::Continue
+                }
             }
-        },
+        }
     }
 }
 
@@ -639,6 +726,12 @@ pub fn commit_authentication_attempt(
             );
             ctx.identified_consumer = Some(consumer);
         }
+        // The realm is committed with the identity, never separately: a
+        // subject string is only meaningful inside the authority that verified
+        // it (`GHSA-wr96-j2c3-qh66`).
+        ctx.authenticated_identity_realm = external_identity
+            .as_ref()
+            .map(|_| ExternalIdentityRealm::new(auth_method, attempt.identity_realm_authority()));
         ctx.authenticated_identity = external_identity;
         ctx.authenticated_identity_header = external_identity_header;
         if ctx.auth_method.is_none() {

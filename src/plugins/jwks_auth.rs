@@ -17,7 +17,7 @@ use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::auth_flow::{
     AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
-    credential_deadline_from_claims, nonblank_identity,
+    credential_deadline_from_claims, external_identity_realm_authority, nonblank_identity,
 };
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
@@ -245,6 +245,11 @@ struct JwksProvider {
     jwks_source: JwksSource,
     /// Outbound hosts used by direct JWKS or discovery URLs.
     warmup_hostnames: Vec<String>,
+    /// Verifying-authority digest committed with every external principal
+    /// this provider vouches for (`GHSA-wr96-j2c3-qh66`): its pinned issuer
+    /// and its key source. Two providers that can each accept the same `sub`
+    /// therefore never commit the same principal.
+    identity_realm_authority: [u8; 32],
 }
 
 enum JwksSource {
@@ -788,6 +793,16 @@ impl JwksAuth {
                 ));
             };
 
+            let identity_realm_authority = external_identity_realm_authority(
+                "jwks_auth",
+                &[
+                    ("provider.issuer", issuer.as_deref()),
+                    ("provider.jwks_uri", jwks_uri.as_deref()),
+                    ("provider.discovery_url", discovery_url.as_deref()),
+                    ("provider.jwks", inline_jwks.as_deref()),
+                ],
+            );
+
             providers.push(JwksProvider {
                 issuer,
                 audiences,
@@ -813,6 +828,7 @@ impl JwksAuth {
                 late_active: Arc::new(Mutex::new(None)),
                 jwks_source,
                 warmup_hostnames,
+                identity_realm_authority,
             });
         }
 
@@ -1413,6 +1429,7 @@ impl JwksAuth {
                 // to the victim's JWK thumbprint and an attacker cannot mint one
                 // for a key it does not hold.
                 let mut attempt = AuthenticationAttempt::new();
+                attempt.stage_identity_realm_authority(provider.identity_realm_authority);
                 if self.emit_mesh_request_principal_metadata {
                     stage_mesh_request_principal_metadata(&claims, &mut attempt);
                 }
