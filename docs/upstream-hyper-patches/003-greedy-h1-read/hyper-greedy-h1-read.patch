@@ -123,7 +123,7 @@ index 5daeb5e..012d571 100644
  
      /// Run this dispatcher until HTTP says this connection is done,
 diff --git a/src/proto/h1/io.rs b/src/proto/h1/io.rs
-index 6a30d73..6f76ae9 100644
+index 6a30d73..73d1343 100644
 --- a/src/proto/h1/io.rs
 +++ b/src/proto/h1/io.rs
 @@ -33,6 +33,7 @@ pub(crate) struct Buffered<T, B> {
@@ -213,7 +213,7 @@ index 6a30d73..6f76ae9 100644
      }
  
      pub(crate) fn io_mut(&mut self) -> &mut T {
-@@ -682,6 +723,320 @@ mod tests {
+@@ -682,6 +723,341 @@ mod tests {
          // io_buf.flush().await.expect("should short-circuit flush");
      }
  
@@ -329,14 +329,16 @@ index 6a30d73..6f76ae9 100644
 +
 +    /// FERRUM PATCH 003: a transport that plays scripted reads once the first
 +    /// write has arrived (or at once, when built with `written: true`), then
-+    /// reports EOF, and accepts every write. The client and server upgrade
-+    /// tests below share it, and this module only builds with one of those
-+    /// features enabled, so it needs no feature gate of its own.
++    /// reports EOF, and accepts every write. It sets `error_read` when it
++    /// hands out a scripted error. The client and server upgrade tests below
++    /// share it, and this module only builds with one of those features
++    /// enabled, so it needs no feature gate of its own.
 +    #[cfg(not(miri))]
 +    struct ScriptedIo {
 +        reads: std::collections::VecDeque<io::Result<Vec<u8>>>,
 +        written: bool,
 +        read_waker: Option<std::task::Waker>,
++        error_read: std::sync::Arc<std::sync::atomic::AtomicBool>,
 +    }
 +
 +    #[cfg(not(miri))]
@@ -352,7 +354,10 @@ index 6a30d73..6f76ae9 100644
 +            }
 +            match self.reads.pop_front() {
 +                None => Poll::Ready(Ok(())),
-+                Some(Err(error)) => Poll::Ready(Err(error)),
++                Some(Err(error)) => {
++                    self.error_read.store(true, std::sync::atomic::Ordering::SeqCst);
++                    Poll::Ready(Err(error))
++                }
 +                Some(Ok(mut data)) => {
 +                    let n = cmp::min(data.len(), buf.remaining());
 +                    buf.put_slice(&data[..n]);
@@ -404,10 +409,12 @@ index 6a30d73..6f76ae9 100644
 +        let mut first = head.to_vec();
 +        first.extend_from_slice(&[b't'; GREEDY_READ_MIN]);
 +        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
++        let error_read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 +        let transport = ScriptedIo {
 +            reads: vec![Ok(first), Err(reset)].into(),
 +            written: false,
 +            read_waker: None,
++            error_read: error_read.clone(),
 +        };
 +
 +        let (mut sender, conn) = crate::client::conn::http1::Builder::new()
@@ -427,6 +434,12 @@ index 6a30d73..6f76ae9 100644
 +        assert_eq!(res.status(), http::StatusCode::SWITCHING_PROTOCOLS);
 +        let upgraded = crate::upgrade::on(res).await.expect("upgrade");
 +        conn.await.expect("connection task").expect("connection");
++        // The connection, not the tunnel, took the reset: it was met while
++        // reading ahead, before the upgrade.
++        assert!(
++            error_read.load(std::sync::atomic::Ordering::SeqCst),
++            "the reset was not read ahead before the upgrade"
++        );
 +
 +        // Every byte read behind the 101 head reaches the tunnel first.
 +        let mut tunnel = Compat::new(upgraded);
@@ -478,11 +491,13 @@ index 6a30d73..6f76ae9 100644
 +        let rest = head.split_off(INIT_BUFFER_SIZE);
 +        let tunnel_bytes = vec![b't'; GREEDY_READ_MIN];
 +        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
++        let error_read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 +        let transport = ScriptedIo {
 +            reads: vec![Ok(head), Ok(rest), Ok(tunnel_bytes), Err(reset)].into(),
 +            // A server reads first.
 +            written: true,
 +            read_waker: None,
++            error_read: error_read.clone(),
 +        };
 +
 +        let (upgrade_tx, mut upgrade_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -504,6 +519,12 @@ index 6a30d73..6f76ae9 100644
 +        let on_upgrade = upgrade_rx.recv().await.expect("upgrade request");
 +        let upgraded = on_upgrade.await.expect("upgrade");
 +        conn.await.expect("connection task").expect("connection");
++        // The connection, not the tunnel, took the reset: it was met while
++        // reading ahead, before the upgrade.
++        assert!(
++            error_read.load(std::sync::atomic::Ordering::SeqCst),
++            "the reset was not read ahead before the upgrade"
++        );
 +
 +        // Every byte read behind the request head reaches the tunnel first.
 +        let mut tunnel = Compat::new(upgraded);

@@ -106,9 +106,12 @@ and proves the tunnel reads every buffered byte, then the reset, then EOF; and
 `ferrum_greedy_read_error_reaches_a_server_upgraded_tunnel` proves the same on
 the server, for a client that sends 16 KiB of tunnel bytes right behind its
 upgrade request and then resets
-([#5920](https://github.com/ferrum-edge/ferrum-edge/issues/5920)). The client
-test builds only with hyper's `client` feature and the server test only with
-`server`.
+([#5920](https://github.com/ferrum-edge/ferrum-edge/issues/5920)). Both
+upgrade tests also assert that the scripted reset was read by the connection
+before the upgrade, so neither can pass without exercising the read-ahead. The
+client test builds with hyper's `http1,http2,client` features and the server
+test with `http1,http2,server`; `http2` is needed because the upstream test
+module imports `Compat`, which hyper builds only with `http2`.
 The `Vendored Patch Regressions` CI job runs them with
 
 ```bash
