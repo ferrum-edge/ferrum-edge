@@ -487,7 +487,11 @@ async fn viewer_secret_scope_claims_do_not_reach_diagnostic_lookups() {
     let capped = scoped_token(VIEWER_SECRET);
     let refused = get(&base, path, Some(&capped), None).await;
     assert_eq!(refused.status, 403, "{}", refused.text);
-    assert!(refused.text.contains("diagnostics:read"), "{}", refused.text);
+    assert!(
+        refused.text.contains("diagnostics:read"),
+        "{}",
+        refused.text
+    );
 
     // Control: the same claims under the primary key pass the scope check and
     // reach the (empty) reference store.
