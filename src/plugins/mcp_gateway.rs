@@ -8796,12 +8796,17 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
 }
 
 /// Refuse a group-conditioned `policy.tools` key that no catalog tool can
-/// have: one that is not an enabled, tool-exposing server's `namespace`
-/// followed by `discovery.namespace_separator` and a non-empty name.
+/// have: one that is not a configured server's `namespace` followed by
+/// `discovery.namespace_separator` and a non-empty name.
 ///
 /// Such a grant (a typo, a missing namespace, the wrong separator) would never
 /// apply, and under `default_action: allow` or `on_new_tool: allow` the real
 /// tool it was meant to restrict would stay open to every caller.
+///
+/// Every configured server counts, whatever its `enabled` / `expose_tools`
+/// setting: a disabled or tool-less server publishes no tools, so its grant
+/// entries are inert and safe, and an operator switching an upstream off
+/// during an incident must not have to delete them. That case only warns.
 fn validate_grant_keys(
     policy: &McpPolicy,
     servers: &HashMap<String, McpServerConfig>,
@@ -8811,18 +8816,23 @@ fn validate_grant_keys(
         if tool.grant.is_none() {
             continue;
         }
-        let publishable = servers.values().any(|server| {
-            server.enabled
-                && server.expose_tools
-                && tool_name
-                    .strip_prefix(server.namespace.as_str())
-                    .and_then(|rest| rest.strip_prefix(separator))
-                    .is_some_and(|name| !name.is_empty())
+        let mut owners = servers.values().filter(|server| {
+            tool_name
+                .strip_prefix(server.namespace.as_str())
+                .and_then(|rest| rest.strip_prefix(separator))
+                .is_some_and(|name| !name.is_empty())
         });
-        if !publishable {
+        let Some(first) = owners.next() else {
             return Err(format!(
-                "mcp_gateway: `policy.tools` key {tool_name:?} carries `allowed_groups` / `denied_groups` but is not an enabled, tool-exposing server's `namespace` followed by `discovery.namespace_separator` and a tool name, so the grant could never apply"
+                "mcp_gateway: `policy.tools` key {tool_name:?} carries `allowed_groups` / `denied_groups` but is not a configured server's `namespace` followed by `discovery.namespace_separator` and a tool name, so the grant could never apply"
             ));
+        };
+        let publishing = |server: &McpServerConfig| server.enabled && server.expose_tools;
+        if !publishing(first) && !owners.any(publishing) {
+            warn!(
+                tool = %tool_name,
+                "mcp_gateway tool grant names a server that is disabled or does not expose tools; the grant is inert until that server publishes tools"
+            );
         }
     }
     Ok(())

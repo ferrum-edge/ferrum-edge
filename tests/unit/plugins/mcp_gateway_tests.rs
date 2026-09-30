@@ -14766,24 +14766,28 @@ fn tool_grant_config_errors_are_clear_and_withhold_group_names() {
         },
         "off": { "upstream_url": "http://127.0.0.1:11/mcp", "namespace": "off", "enabled": false }
     });
-    for key in [
-        "thing",
-        "demo_thing",
-        "other.thing",
-        "demo.",
-        "docs.thing",
-        "off.thing",
-    ] {
-        let config = schema_fixture(json!({
+    let config_with_grant_on = |key: &str| {
+        schema_fixture(json!({
             "servers": servers.clone(),
             "policy": { "tools": { (key): grant.clone() } }
-        }));
-        let error = create_plugin("mcp_gateway", &config)
+        }))
+    };
+    for key in ["thing", "demo_thing", "other.thing", "demo."] {
+        let error = create_plugin("mcp_gateway", &config_with_grant_on(key))
             .err()
             .unwrap_or_else(|| panic!("{key} must be rejected"));
         assert!(
             error.contains("so the grant could never apply"),
             "{key}: {error}"
+        );
+    }
+    // A disabled or tool-less server publishes no tools, so a grant on its
+    // namespace is inert and admitted: switching an upstream off must not
+    // require deleting its grants.
+    for key in ["docs.thing", "off.thing", "demo.thing"] {
+        assert!(
+            create_plugin("mcp_gateway", &config_with_grant_on(key)).is_ok(),
+            "{key}"
         );
     }
     let custom_separator = |key: &str| {

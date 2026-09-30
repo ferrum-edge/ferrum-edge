@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mcp.policy_decision` records `deny_group` or `deny_no_consumer`. Empty
   lists, group lists on `deny` / `hide_from_discovery` entries, a group in
   both lists, more than 512 distinct groups per policy, and a
-  group-conditioned key outside every enabled tool server's namespace are
+  group-conditioned key outside every configured server's namespace are
   rejected at config load. Grants cover `tools/list` and `tools/call` only.
   Tool-name-only policies behave exactly as before.
   `notifications/tools/list_changed` is not yet sent when grants change.
