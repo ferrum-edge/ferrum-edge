@@ -514,9 +514,11 @@ outright with no deprecation period:
   bound in the same pass, so new connections got 404 until the next reconcile,
   up to 30 s later. Each accepted connection now carries the identity of the
   listener that accepted it. Retiring a listener retires that identity, and
-  requests on its connections are refused for as long as they drain, so the
-  replacement is admitted by the reconcile that binds it and old connections
-  are never served under the new decision.
+  requests on its connections are answered `421 Misdirected Request` for as
+  long as they drain (gRPC `UNAVAILABLE`; HTTP/1 also closes the connection),
+  so clients retry on a new connection. The replacement is admitted by the
+  reconcile that binds it, and old connections are never served under the new
+  decision.
 
 - **A wrong-class route on the process-global port no longer blacks out that
   frontend** (#5922). A route whose `listen_port` is `FERRUM_PROXY_HTTP_PORT`
@@ -526,9 +528,10 @@ outright with no deprecation period:
   config validation: file load and reload, `ferrum-edge validate`, database
   startup and poll, and the database-mode Admin API (`409`). A control plane
   skips the check, since it cannot know each data plane's ports. Where the
-  route still arrives (a data plane or mesh proxy warns and applies it), only
-  the routes scoped to that port are refused, and the frontend keeps serving
-  its port-agnostic routes.
+  route still arrives (a data plane warns and applies it), only the routes
+  scoped to that port are refused, and the frontend keeps serving its
+  port-agnostic routes. A mesh proxy owns no process-global frontend and does
+  not check.
 
 - **Config reloads no longer 404 live Gateway listener routes** (#5914). Every
   config publication used to reset listener route admission to pending, so

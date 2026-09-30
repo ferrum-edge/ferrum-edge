@@ -3172,6 +3172,34 @@ async fn handle_h3_request(
     ctx.lb_generation = epoch.lb_generation;
     ctx.config_generation = epoch.config_generation;
 
+    // A stream on a connection whose Gateway listener was retired is never
+    // routed again (issue #5921). `421` sends the client to a new connection,
+    // which reaches the replacement listener; gRPC gets `UNAVAILABLE`, which
+    // clients retry. Checked after the epoch load, as on H1/H2.
+    if crate::proxy::gateway_listener::is_retired_connection(gateway_listener_identity.as_ref()) {
+        crate::diagnostic_ref::record_admission_fence(
+            ctx.diagnostic_slot(),
+            crate::diagnostic_ref::RETIRED_GATEWAY_LISTENER_PHASE,
+            h3_error_head_status(
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::MISDIRECTED_REQUEST,
+            ),
+        );
+        record_h3_flavor_aware_reject(&state, http_flavor, 421);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::MISDIRECTED_REQUEST,
+            r#"{"error":"Misdirected Request"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+            "Gateway listener retired; retry on a new connection",
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Route: host + longest prefix match via router cache
     let route_match = state.router_cache.find_proxy_in_epoch(
         &epoch,

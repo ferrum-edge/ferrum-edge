@@ -32,8 +32,9 @@
 //! - **Connection identity.** Every accepted connection carries the
 //!   [`GatewayListenerIdentity`] of the listener that accepted it. Retiring a
 //!   listener whose identity left the plan retires that identity before the
-//!   pass publishes, and the route lookup refuses every request on a retired
-//!   identity (issue #5921). A class, bind, or direction flip therefore needs
+//!   pass publishes. The request paths answer every request on a retired
+//!   identity `421 Misdirected Request`, and the route lookup refuses it as a
+//!   backstop (issue #5921). A class, bind, or direction flip therefore needs
 //!   no port-wide refusal once the replacement binds: new connections are
 //!   served as soon as that pass opens the replacement's accept gate, and old
 //!   connections are never served under the new decision, however long they
@@ -349,8 +350,8 @@ pub fn validate_process_global_frontend_conflicts(
 /// clone of its listener's identity. When reconcile retires the listener
 /// because its class, bind address, or mesh direction changed, or because
 /// the config withdrew it, the identity is retired **before** the pass
-/// publishes its admission decision. From then on the route lookup refuses
-/// every request on those old connections, however long they keep draining,
+/// publishes its admission decision. From then on every request on those old
+/// connections is answered `421`, however long they keep draining,
 /// while the replacement socket's connections are served as soon as its
 /// accept gate opens. Because the fence is per connection, a replacement
 /// that bound in the same pass needs no port-wide refusal.
@@ -376,6 +377,17 @@ impl GatewayListenerIdentity {
     pub fn is_retired(&self) -> bool {
         self.retired.load(Ordering::Acquire)
     }
+}
+
+/// Whether a connection accepted under `identity` belongs to a retired Gateway
+/// listener. A connection on any other frontend (`None`) never does.
+///
+/// The request paths check this right after loading their request epoch and
+/// answer `421 Misdirected Request`, so the client retries on a new
+/// connection, which reaches the replacement listener (issue #5921).
+#[inline]
+pub fn is_retired_connection(identity: Option<&GatewayListenerIdentity>) -> bool {
+    identity.is_some_and(GatewayListenerIdentity::is_retired)
 }
 
 /// What a Gateway listener's accept loop is started with: the gate it parks

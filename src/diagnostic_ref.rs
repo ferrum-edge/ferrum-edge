@@ -191,6 +191,10 @@ pub const ROUTE_NOT_FOUND_PHASE: &str = "route_not_found";
 /// `REGISTRY_ONLY` policy.
 pub const MESH_REGISTRY_ONLY_PHASE: &str = "mesh_registry_only";
 
+/// Rejection phase of a request on a connection whose Gateway listener was
+/// retired (`421`, issue #5921).
+pub const RETIRED_GATEWAY_LISTENER_PHASE: &str = "gateway_listener_retired";
+
 /// Plugin hook phases. A rejection recorded in one of them is a plugin
 /// rejection even when the rejecting plugin's name is not known.
 const PLUGIN_HOOK_PHASES: [&str; 9] = [
@@ -211,6 +215,7 @@ const PLUGIN_HOOK_PHASES: [&str; 9] = [
 const GATEWAY_REJECTION_PHASES: &[&str] = &[
     ROUTE_NOT_FOUND_PHASE,
     MESH_REGISTRY_ONLY_PHASE,
+    RETIRED_GATEWAY_LISTENER_PHASE,
     BACKEND_ADMISSION_PHASE,
     "h1_framing_unverified",
     "config_stale",

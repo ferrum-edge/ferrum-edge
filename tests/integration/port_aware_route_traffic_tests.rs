@@ -1638,16 +1638,21 @@ async fn open_keep_alive(port: u16) -> KeepAliveSender {
 }
 
 /// `Some(status)` for a request on the kept-alive connection, or `None` when
-/// the gateway has closed it.
+/// the gateway has closed it. Bounded, so a hung connection fails the test.
 async fn keep_alive_get(sender: &mut KeepAliveSender, host: &str) -> Option<u16> {
-    sender.ready().await.ok()?;
-    let request = Request::builder()
-        .uri("/api/x")
-        .header("host", host)
-        .body(Full::new(Bytes::new()))
-        .expect("request");
-    let response = sender.send_request(request).await.ok()?;
-    Some(response.status().as_u16())
+    let exchange = async {
+        sender.ready().await.ok()?;
+        let request = Request::builder()
+            .uri("/api/x")
+            .header("host", host)
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let response = sender.send_request(request).await.ok()?;
+        Some(response.status().as_u16())
+    };
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("the keep-alive request neither answered nor closed within 5 s")
 }
 
 /// Issue #5921: a class flip whose replacement binds in the same reconcile
@@ -1689,6 +1694,19 @@ async fn class_flip_serves_the_new_class_within_one_reconcile_and_never_the_old_
             keep_alive_get(&mut old_connection, ANY_HOST).await,
             Some(200)
         );
+        // A second plaintext connection whose first request is still
+        // incomplete when the listener retires. Retirement disables keep-alive
+        // on it, but an unfinished first request still completes, so this
+        // request is routed after the retirement, deterministically.
+        let mut pending_connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect the pending-request client");
+        pending_connection
+            .write_all(b"GET /api/x HTTP/1.1\r\n")
+            .await
+            .expect("write the request line");
+        // Let the gateway read the request line and settle on HTTP/1.1.
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let outcome = harness.state.update_config(config_for(port, true));
         assert!(outcome.applied(), "class flip must apply: {outcome:?}");
@@ -1766,12 +1784,36 @@ async fn class_flip_serves_the_new_class_within_one_reconcile_and_never_the_old_
                 );
             }
         }
+        // The request that completes on the old connection after retirement
+        // is answered 421, so the client retries on a new connection, even
+        // though a port-agnostic route matches its host.
+        pending_connection
+            .write_all(format!("Host: {ANY_HOST}\r\n\r\n").as_bytes())
+            .await
+            .expect("finish the pending request");
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            pending_connection.read_to_end(&mut raw),
+        )
+        .await
+        .expect("the retired connection must answer and close within 5 s");
+        let raw = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(
+            raw.starts_with("http/1.1 421 "),
+            "the old connection must get 421 Misdirected Request: {raw:?}"
+        );
+        assert!(
+            raw.contains("\r\nconnection: close\r\n"),
+            "a 421 must close the old connection: {raw:?}"
+        );
+        // Retirement closes an idle keep-alive connection. A request that
+        // reaches it before that close is answered 421. It is never served.
         for host in [HOST, ANY_HOST] {
             let status = keep_alive_get(&mut old_connection, host).await;
-            assert_ne!(
-                status,
-                Some(200),
-                "the old plaintext connection was served {host} after the flip"
+            assert!(
+                matches!(status, None | Some(421)),
+                "the idle old connection answered {status:?} for {host} after the flip"
             );
         }
 

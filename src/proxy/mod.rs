@@ -6927,9 +6927,11 @@ pub struct ProxyState {
     /// validation aligned with the sockets the process actually owns.
     pub reserved_gateway_ports: Arc<HashSet<u16>>,
     /// Process-global HTTP/HTTPS proxy frontends by port, for rejecting a
-    /// route `listen_port` that collides with one (issue #5922). Starts from
-    /// `EnvConfig`; the Gateway listener manager replaces it with the exact
-    /// set it plans with when it is built.
+    /// route `listen_port` that collides with one (issue #5922). Empty until
+    /// the Gateway listener manager publishes the exact set it plans with, so
+    /// a mode that builds no manager (mesh) never checks routes against
+    /// frontends it does not own. Startup validation, which runs before the
+    /// manager exists, checks against the env-derived set itself.
     pub process_global_frontends: Arc<ArcSwap<gateway_listener::ProcessGlobalFrontends>>,
     // Size limits
     pub max_header_size_bytes: usize,
@@ -10537,7 +10539,7 @@ impl ProxyState {
             )),
             early_data_methods: Arc::new(env_config_arc.tls_early_data_methods.clone()),
             process_global_frontends: Arc::new(ArcSwap::from_pointee(
-                crate::proxy::gateway_listener::env_process_global_frontends(&env_config_arc),
+                gateway_listener::ProcessGlobalFrontends::new(),
             )),
             env_config: env_config_arc,
             reserved_gateway_ports: Arc::new(reserved_gateway_ports),
@@ -12449,10 +12451,12 @@ impl ProxyState {
 
         // An HTTP-family route whose `listen_port` is a process-global proxy
         // frontend of the other class, or a dedicated Sidecar ingress bind on
-        // one, can never be served (issue #5922). Reject it, except where the
-        // config comes from a remote authority (DP, mesh): there one bad route
-        // must not block every other update, and the listener planner refuses
-        // only the routes scoped to that port.
+        // one, can never be served (issue #5922). Reject it, except on a DP:
+        // there the config comes from the CP, one bad route must not block
+        // every other update, and the listener planner refuses only the routes
+        // scoped to that port. The set is empty until a Gateway listener
+        // manager publishes the frontends it owns, so mesh mode, which builds
+        // none, never checks.
         if let Err(errs) = gateway_listener::validate_process_global_frontend_conflicts(
             config,
             &self.process_global_frontends.load(),
@@ -12460,11 +12464,10 @@ impl ProxyState {
             if matches!(
                 self.env_config.mode,
                 crate::config::env_config::OperatingMode::DataPlane
-                    | crate::config::env_config::OperatingMode::Mesh
             ) {
                 for msg in &errs {
                     warn!(
-                        "Gateway listener port conflict (non-fatal in DP/mesh mode): {}",
+                        "Gateway listener port conflict (non-fatal in DP mode): {}",
                         crate::startup::sanitize_startup_cause(msg, &[])
                     );
                 }
@@ -31921,6 +31924,43 @@ fn admission_fence_head_status(is_grpc: bool, status: StatusCode) -> u16 {
     }
 }
 
+/// The answer to a request on a connection whose Gateway listener reconcile
+/// has retired (issue #5921): `421 Misdirected Request`, which tells the client
+/// to retry on a new connection. That connection reaches the replacement
+/// listener. HTTP/1 closes this connection so the retry cannot reuse it, and
+/// gRPC gets `UNAVAILABLE`, which clients retry. The body is a compiled-in
+/// literal.
+fn retired_gateway_listener_response(
+    state: &ProxyState,
+    ctx: &RequestContext,
+    version: hyper::Version,
+    is_grpc: bool,
+) -> Response<ProxyBody> {
+    record_request(state, StatusCode::MISDIRECTED_REQUEST.as_u16());
+    crate::diagnostic_ref::record_admission_fence(
+        ctx.diagnostic_slot(),
+        crate::diagnostic_ref::RETIRED_GATEWAY_LISTENER_PHASE,
+        admission_fence_head_status(is_grpc, StatusCode::MISDIRECTED_REQUEST),
+    );
+    if is_grpc {
+        return grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::UNAVAILABLE,
+            "Gateway listener retired; retry on a new connection",
+        );
+    }
+    let mut response = build_response(
+        StatusCode::MISDIRECTED_REQUEST,
+        r#"{"error":"Misdirected Request"}"#,
+    );
+    if matches!(version, hyper::Version::HTTP_10 | hyper::Version::HTTP_11) {
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
 /// Connection-scoped and process-wide admission fences, then the routed
 /// request pipeline. Only [`handle_proxy_request_on_frontend_port`] calls this.
 #[allow(clippy::too_many_arguments)]
@@ -32700,6 +32740,16 @@ async fn handle_proxy_request_inner(
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
     ctx.config_generation = epoch.config_generation;
+
+    // A connection whose Gateway listener was retired (a class, bind, or mesh
+    // direction flip, or a withdrawal) is never routed again (issue #5921).
+    // Checked after the epoch load: reconcile retires the listener before it
+    // publishes the admission that could serve this port, so a request that
+    // loaded that admission always sees the retirement.
+    if gateway_listener::is_retired_connection(gateway_listener_identity.as_ref()) {
+        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        return Ok(retired_gateway_listener_response(&state, &ctx, inbound_version, is_grpc));
+    }
 
     // Direct Pod-IP HTTP mesh egress is selected by captured original
     // destination before Host routing. The client-controlled Host header cannot

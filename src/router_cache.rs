@@ -1878,8 +1878,9 @@ impl RouterCache {
     /// connection accepted by a listener that reconcile has since retired is
     /// refused outright, like a refused frontend port (issue #5921). The
     /// caller loads `epoch` first, so an admission published after the
-    /// retirement is never paired with a stale view of the flag.
-    #[allow(clippy::too_many_arguments)]
+    /// retirement is never paired with a stale view of the flag. The request
+    /// paths answer such a connection `421` before they get here; this is
+    /// the backstop that keeps the route table itself fail-closed.
     pub(crate) fn find_proxy_in_epoch(
         &self,
         epoch: &crate::request_epoch::RequestEpoch,
@@ -1889,7 +1890,7 @@ impl RouterCache {
         frontend_is_tls: bool,
         gateway_listener: Option<&GatewayListenerIdentity>,
     ) -> Option<RouteMatch> {
-        if gateway_listener.is_some_and(GatewayListenerIdentity::is_retired) {
+        if crate::proxy::gateway_listener::is_retired_connection(gateway_listener) {
             return None;
         }
         self.find_proxy_with_admission(

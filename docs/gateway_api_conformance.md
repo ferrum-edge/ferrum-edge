@@ -514,8 +514,9 @@ without a restart. These bounds are deliberate and tested:
   (file load and reload, `ferrum-edge validate`, database startup and poll,
   and the database-mode Admin API with `409`), so it cannot be published there.
   A control plane cannot know each data plane's frontend ports and skips the
-  check; a data plane or mesh proxy only warns and relies on the runtime
-  refusal above (issue #5922).
+  check; a data plane only warns and relies on the runtime refusal above, and
+  a mesh proxy owns no process-global frontend to check against (issue
+  #5922).
 - **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
   accept-loop task is awaited before the replacement binds, so extra
   accept workers sharing the exclusive listen socket never overlap a
@@ -527,8 +528,10 @@ without a restart. These bounds are deliberate and tested:
   replacement that binds in the same pass is admitted at once, so new
   connections are served under the new class as soon as that reconcile opens
   its accept gate, not on the next retry tick. A request on a connection the
-  old listener accepted is refused for as long as that connection drains
-  (issue #5921).
+  old listener accepted is answered `421 Misdirected Request` for as long as
+  that connection drains (gRPC `UNAVAILABLE`; HTTP/1 also closes the
+  connection), so the client retries on a new connection, which reaches the
+  replacement (issue #5921).
 - **A listener that stops serving is rebound.** A started listener whose accept
   loop later ends — cleanly, with an error, or by panic — is reaped on the next
   reconcile, surfaced as a bind failure, and rebound; finished drains are reaped
