@@ -74,6 +74,11 @@ struct CoreService {
 /// refusal, and a value other than `true` / `false` is warned about.
 pub(crate) const ALLOW_PATH_PARAMETERS_ANNOTATION: &str = "ferrum.io/allow-path-parameters";
 
+/// Set once the first malformed [`ALLOW_PATH_PARAMETERS_ANNOTATION`] value has
+/// been warned about.
+static MALFORMED_PATH_PARAMETER_ANNOTATION_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Read [`ALLOW_PATH_PARAMETERS_ANNOTATION`] from a Service. Fails closed: a
 /// malformed value leaves path parameters refused.
 fn service_allows_path_parameters(object: &K8sObject) -> bool {
@@ -89,15 +94,42 @@ fn service_allows_path_parameters(object: &K8sObject) -> bool {
         return true;
     }
     if !value.eq_ignore_ascii_case("false") {
+        report_malformed_path_parameter_annotation(object);
+    }
+    false
+}
+
+/// Report a malformed [`ALLOW_PATH_PARAMETERS_ANNOTATION`] value without
+/// steady-state log noise.
+///
+/// Translation re-runs on every reconcile and full sync, so a per-pass `warn!`
+/// would repeat for as long as the Service keeps the value. This emits one
+/// `debug!` per occurrence, naming the Service, and exactly one `warn!` per
+/// process, for the first malformed value seen. The annotation value itself is
+/// never logged.
+fn report_malformed_path_parameter_annotation(object: &K8sObject) {
+    use std::sync::atomic::Ordering;
+
+    tracing::debug!(
+        namespace = %object.metadata.namespace,
+        service = %object.metadata.name,
+        annotation = ALLOW_PATH_PARAMETERS_ANNOTATION,
+        "Ignoring a Service path-parameter annotation that is neither \"true\" nor \"false\"; \
+         path parameters stay refused for this service"
+    );
+    let first_in_process = MALFORMED_PATH_PARAMETER_ANNOTATION_WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    if first_in_process {
         tracing::warn!(
             namespace = %object.metadata.namespace,
             service = %object.metadata.name,
             annotation = ALLOW_PATH_PARAMETERS_ANNOTATION,
             "Ignoring a Service path-parameter annotation that is neither \"true\" nor \"false\"; \
-             path parameters stay refused for this service"
+             path parameters stay refused for this service. This warning is emitted once per \
+             process; enable debug logging to see every Service with a malformed value"
         );
     }
-    false
 }
 
 #[derive(Debug)]

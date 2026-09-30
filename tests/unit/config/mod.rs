@@ -47,6 +47,7 @@ mod k8s_mesh_overlay_withdrawal_tests;
 mod k8s_mesh_revision_binding_tests;
 mod l4_route_cross_namespace_parentref_tests;
 mod mesh_authz_l4_request_principal_tests;
+mod mesh_authz_path_parameter_spelling_tests;
 mod mesh_types_tests;
 mod mesh_validation_tests;
 mod migration_runner_tests;

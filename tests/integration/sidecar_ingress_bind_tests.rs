@@ -80,8 +80,32 @@ fn prepare_sidecar(
     listener_port: u16,
     endpoint_port: u16,
 ) -> GatewayConfig {
+    prepare_sidecar_with_path_parameters(
+        namespace,
+        service_name,
+        protocol,
+        bind,
+        listener_port,
+        endpoint_port,
+        false,
+    )
+}
+
+/// [`prepare_sidecar`] with the owner service's `;` path-parameter opt-in
+/// (`MeshService.allow_path_parameters`, issue #5937).
+fn prepare_sidecar_with_path_parameters(
+    namespace: &str,
+    service_name: &str,
+    protocol: AppProtocol,
+    bind: Option<&str>,
+    listener_port: u16,
+    endpoint_port: u16,
+    allow_path_parameters: bool,
+) -> GatewayConfig {
     let spiffe = format!("spiffe://cluster.local/ns/{namespace}/sa/{service_name}");
-    let (workload, service) = local_echo(namespace, service_name, &spiffe, endpoint_port, protocol);
+    let (workload, mut service) =
+        local_echo(namespace, service_name, &spiffe, endpoint_port, protocol);
+    service.allow_path_parameters = allow_path_parameters;
     let mut runtime = default_mesh_runtime();
     runtime.namespace = namespace.to_string();
     runtime.workload_spiffe_id = Some(spiffe.to_string());
@@ -302,4 +326,52 @@ fn unrepresentable_bind_fails_closed_at_prepare() {
             .iter()
             .any(|p| p.id.starts_with("__mesh-ingress-"))
     );
+}
+
+#[test]
+fn http_ingress_routes_carry_the_owner_service_path_parameter_opt_in() {
+    // Sidecar `ingress[]` routes forward to the owner service's
+    // `defaultEndpoint`, so they carry that service's opt-in: on the shared
+    // capture route, and on both routes of a dedicated bind.
+    const CAPTURE_ID: &str = "__mesh-ingress-default-echo-16379";
+    const BIND_ID: &str = "__mesh-ingress-bind:default-echo-16379";
+    for opt_in in [true, false] {
+        let shared = prepare_sidecar_with_path_parameters(
+            "default",
+            "echo",
+            AppProtocol::Http,
+            None,
+            16379,
+            6379,
+            opt_in,
+        );
+        let capture = shared
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id == CAPTURE_ID)
+            .expect("shared capture ingress route");
+        assert_eq!(capture.allow_path_parameters, opt_in);
+        assert!(dedicated_bind_ids(&shared).is_empty());
+
+        let dedicated = prepare_sidecar_with_path_parameters(
+            "default",
+            "echo",
+            AppProtocol::Http,
+            Some("127.0.0.1"),
+            16379,
+            6379,
+            opt_in,
+        );
+        for id in [CAPTURE_ID, BIND_ID] {
+            let route = dedicated
+                .proxies
+                .iter()
+                .find(|proxy| proxy.id == id)
+                .unwrap_or_else(|| panic!("{id} must be materialized"));
+            assert_eq!(
+                route.allow_path_parameters, opt_in,
+                "{id} must carry the owner service's opt-in"
+            );
+        }
+    }
 }

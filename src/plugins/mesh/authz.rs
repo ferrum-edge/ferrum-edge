@@ -3077,11 +3077,22 @@ impl Plugin for MeshAuthz {
             },
             &headers,
         );
+        // Issue #5948: on a proxy that admits `;` path parameters, a
+        // parameter-stripping backend (Tomcat, Spring) executes the path
+        // without them, so `paths:` / `notPaths:` are judged on both
+        // spellings. Without the opt-in a `;` never gets this far.
+        let stripped_path = crate::modes::mesh::policy::mesh_authz_stripped_path(
+            &authorization_path,
+            ctx.matched_proxy
+                .as_deref()
+                .is_some_and(|proxy| proxy.allow_path_parameters),
+        );
         let request = MeshAuthzRequest {
             source_principal,
             request_principal,
             method: Some(ctx.method.clone()),
             path: Some(authorization_path),
+            stripped_path,
             host,
             port,
             headers,
@@ -3562,13 +3573,22 @@ impl Plugin for MeshAuthz {
             Ok(canonical) => canonical,
             Err(_) => ctx.path.as_str(),
         };
+        // `authorize` also judges a CUSTOM rule on the parameter-stripped
+        // spelling of an opted-in `;` path (issue #5948), so the scan must too.
+        // Considering it whenever the path carries a `;` can only add buffering,
+        // never skip it.
+        let stripped = crate::policy_path::strip_path_parameters(path);
+        let stripped_spelling = (stripped != path).then_some(&*stripped);
+        let spellings = std::iter::once(path).chain(stripped_spelling);
         self.body_inspecting_custom_rules.iter().any(|rule| {
-            crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
-                rule,
-                &ctx.method,
-                path,
-                host.as_deref(),
-            )
+            spellings.clone().any(|spelling| {
+                crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
+                    rule,
+                    &ctx.method,
+                    spelling,
+                    host.as_deref(),
+                )
+            })
         })
     }
 

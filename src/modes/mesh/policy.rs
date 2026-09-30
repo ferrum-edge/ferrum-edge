@@ -56,6 +56,16 @@ pub struct MeshAuthzRequest {
     pub request_principal: Option<String>,
     pub method: Option<String>,
     pub path: Option<String>,
+    /// `path` with its `;` path parameters removed
+    /// ([`crate::policy_path::strip_path_parameters`]): the path a
+    /// parameter-stripping backend (Tomcat, Spring) executes. Set only when
+    /// the routed proxy opted in to path parameters (`allow_path_parameters`)
+    /// and `path` carries one; build it with [`mesh_authz_stripped_path`].
+    ///
+    /// When set, `paths:` / `notPaths:` are judged on both spellings
+    /// (issue #5948): a DENY, CUSTOM, or AUDIT rule matches when either
+    /// spelling matches it, and an ALLOW rule only when both do.
+    pub stripped_path: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub headers: BTreeMap<String, String>,
@@ -438,8 +448,96 @@ fn rule_matches(
         && matches_request_principals(&rule.request_principals, request, &rule.action)
         && matches_not_request_principals(&rule.not_request_principals, request, &rule.action)
         && matches_source_negation(&rule.source_negation, request)
-        && matches_requests(&rule.to, request, &rule.action, normalized_host)
+        && matches_requests_on_path_spellings(&rule.to, request, &rule.action, normalized_host)
         && matches_conditions(&rule.when, request, &rule.action, policy_namespace)
+}
+
+/// The parameter-stripped spelling of `path` that mesh authorization must also
+/// judge ([`MeshAuthzRequest::stripped_path`], issue #5948), or `None` when
+/// there is no second spelling.
+///
+/// `allow_path_parameters` is the routed proxy's opt-in. Without it a `;`
+/// never reaches authorization (the frontend refuses it with
+/// `400 path_parameter` right after routing), so there is nothing to judge
+/// twice. A path without a `;` has only one spelling.
+pub fn mesh_authz_stripped_path(path: &str, allow_path_parameters: bool) -> Option<String> {
+    if !allow_path_parameters {
+        return None;
+    }
+    match crate::policy_path::strip_path_parameters(path) {
+        std::borrow::Cow::Owned(stripped) => Some(stripped),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
+}
+
+/// Whether a `to:` entry constrains the request path at all.
+fn request_match_reads_path(match_: &RequestMatch) -> bool {
+    !match_.paths.is_empty() || !match_.not_paths.is_empty()
+}
+
+/// A rule's `to:` block, judged on every spelling of the request path a
+/// backend may execute (issue #5948).
+///
+/// On a proxy that admits `;` path parameters the request carries two
+/// spellings: the raw path (`/admin;x/users`), which a backend that keeps
+/// parameters executes, and the parameter-stripped path (`/admin/users`),
+/// which a Tomcat or Spring backend executes. The gateway cannot know which
+/// kind of backend it forwards to, so each rule is evaluated on both
+/// spellings and the results are combined by the rule's action:
+///
+/// | action | `to:` matches when |
+/// |--------|--------------------|
+/// | `DENY` | the raw path matches **or** the stripped path matches |
+/// | `CUSTOM` | the raw path matches **or** the stripped path matches |
+/// | `AUDIT` | the raw path matches **or** the stripped path matches |
+/// | `ALLOW` | the raw path matches **and** the stripped path matches |
+///
+/// "Matches" is the whole `to:` block for one spelling: some entry whose
+/// `paths:` (when set) contain the spelling and whose `notPaths:` (when set)
+/// do not. So a `notPaths:` exclusion lifts a DENY (or CUSTOM / AUDIT) rule
+/// only when it holds for both spellings, and excludes a request from an
+/// ALLOW rule when it holds for either one. A request can therefore neither
+/// escape a restriction nor earn a grant through the spelling the backend
+/// does not execute.
+///
+/// DENY and CUSTOM restrict (a matched CUSTOM rule sends the request to an
+/// external authorizer before anything else takes effect), and AUDIT only
+/// records, so matching more spellings is the safe direction for all three.
+/// ALLOW grants, so it must hold for every spelling.
+///
+/// Without a second spelling (`stripped_path` is `None`: the proxy did not
+/// opt in, or the path has no `;`), or when no entry reads the path, this is
+/// exactly [`matches_requests`] on the raw path.
+fn matches_requests_on_path_spellings(
+    matches: &[RequestMatch],
+    request: &MeshAuthzRequest,
+    action: &PolicyAction,
+    normalized_host: Option<&NormalizedHost>,
+) -> bool {
+    let raw = request.path.as_deref();
+    let raw_matches = matches_requests(matches, request, raw, action, normalized_host);
+    let Some(stripped) = request
+        .stripped_path
+        .as_deref()
+        .filter(|stripped| Some(*stripped) != raw)
+    else {
+        return raw_matches;
+    };
+    if !matches.iter().any(request_match_reads_path) {
+        return raw_matches;
+    }
+    let stripped_matches =
+        || matches_requests(matches, request, Some(stripped), action, normalized_host);
+    match action {
+        // A grant must hold for the spelling the backend executes, whichever
+        // one that is.
+        PolicyAction::Allow => raw_matches && stripped_matches(),
+        // A restriction, delegation, or audit record applies to any spelling
+        // the backend may execute.
+        PolicyAction::Deny | PolicyAction::Audit | PolicyAction::Custom { .. } => {
+            raw_matches || stripped_matches()
+        }
+    }
 }
 
 /// Enforce the conjunctive source-negative / IP-block matchers for one rule.
@@ -638,9 +736,13 @@ fn source_principal_pattern_matches(pattern: &str, source: &SpiffeId) -> bool {
         || wildcard_match(pattern, istio_source_principal(source))
 }
 
+/// `path` is the spelling of the request path being judged: the raw
+/// `request.path`, or its parameter-stripped `request.stripped_path` (see
+/// [`matches_requests_on_path_spellings`]).
 fn matches_requests(
     matches: &[RequestMatch],
     request: &MeshAuthzRequest,
+    path: Option<&str>,
     action: &PolicyAction,
     normalized_host: Option<&NormalizedHost>,
 ) -> bool {
@@ -649,12 +751,13 @@ fn matches_requests(
     }
     matches
         .iter()
-        .any(|match_| request_match(match_, request, action, normalized_host))
+        .any(|match_| request_match(match_, request, path, action, normalized_host))
 }
 
 fn request_match(
     match_: &RequestMatch,
     request: &MeshAuthzRequest,
+    path: Option<&str>,
     action: &PolicyAction,
     normalized_host: Option<&NormalizedHost>,
 ) -> bool {
@@ -685,7 +788,7 @@ fn request_match(
         }
     }
     if !match_.paths.is_empty() {
-        match request.path.as_ref() {
+        match path {
             Some(path)
                 if match_
                     .paths
@@ -696,7 +799,7 @@ fn request_match(
         }
     }
     if !match_.not_paths.is_empty() {
-        match request.path.as_ref() {
+        match path {
             Some(path)
                 if match_
                     .not_paths
