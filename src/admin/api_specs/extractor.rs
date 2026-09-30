@@ -1208,13 +1208,17 @@ fn mcp_string_set(
             let mut values = HashSet::with_capacity(items.len());
             for item in items {
                 let Some(value) = item.as_str() else {
-                    return Err(mcp_extension_error(format!("`{path}.{key}` must hold strings")));
+                    return Err(mcp_extension_error(format!(
+                        "`{path}.{key}` must hold strings"
+                    )));
                 };
                 values.insert(value.to_string());
             }
             Ok(values)
         }
-        Some(_) => Err(mcp_extension_error(format!("`{path}.{key}` must be an array of strings"))),
+        Some(_) => Err(mcp_extension_error(format!(
+            "`{path}.{key}` must be an array of strings"
+        ))),
     }
 }
 
@@ -1244,7 +1248,9 @@ fn parse_x_ferrum_mcp_extension(root: &Value) -> Result<Option<McpBridgeExtensio
         Some(Value::Bool(true)) => Map::new(),
         Some(Value::Object(object)) => object.clone(),
         Some(_) => {
-            return Err(mcp_extension_error("expected true, false, or an object".to_string()));
+            return Err(mcp_extension_error(
+                "expected true, false, or an object".to_string(),
+            ));
         }
     };
     reject_unknown_mcp_extension_keys(&object, "x-ferrum-mcp", X_FERRUM_MCP_KEYS)?;
@@ -1252,7 +1258,9 @@ fn parse_x_ferrum_mcp_extension(root: &Value) -> Result<Option<McpBridgeExtensio
         None | Some(Value::Null) | Some(Value::Bool(true)) => {}
         Some(Value::Bool(false)) => return Ok(None),
         Some(_) => {
-            return Err(mcp_extension_error("`x-ferrum-mcp.enabled` must be a boolean".to_string()));
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp.enabled` must be a boolean".to_string(),
+            ));
         }
     }
     let endpoint_path = match object.get("endpoint") {
@@ -1313,7 +1321,9 @@ fn parse_x_ferrum_mcp_extension(root: &Value) -> Result<Option<McpBridgeExtensio
             limits.clone()
         }
         Some(_) => {
-            return Err(mcp_extension_error("`x-ferrum-mcp.limits` must be an object".to_string()));
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp.limits` must be an object".to_string(),
+            ));
         }
     };
     Ok(Some(McpBridgeExtension {
@@ -1620,7 +1630,9 @@ fn generate_mcp_bridge_operation(
     let own = source.operation.get("parameters");
     for parameters in [inherited, own].into_iter().flatten() {
         let Some(parameters) = parameters.as_array() else {
-            return Err(mcp_extension_error(format!("`{location}` parameters must be an array")));
+            return Err(mcp_extension_error(format!(
+                "`{location}` parameters must be an array"
+            )));
         };
         for parameter in parameters {
             let resolved = resolve_refs(

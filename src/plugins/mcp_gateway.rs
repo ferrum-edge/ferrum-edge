@@ -2042,8 +2042,7 @@ impl McpGateway {
             upstream_session: None,
             upstream_session_drift: AtomicBool::new(false),
             target: Some(
-                McpAdmittedTarget::without_arguments("name", upstream_name)
-                    .with_grant(grant),
+                McpAdmittedTarget::without_arguments("name", upstream_name).with_grant(grant),
             ),
             bridge: Some(claim),
         }));

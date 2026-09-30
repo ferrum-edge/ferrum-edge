@@ -663,7 +663,9 @@ fn bounded_limit(
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| format!("mcp_gateway: `openapi.{key}` must be a positive integer"))?;
     if value == 0 || value > ceiling {
-        return Err(format!("mcp_gateway: `openapi.{key}` must be between 1 and {ceiling}"));
+        return Err(format!(
+            "mcp_gateway: `openapi.{key}` must be between 1 and {ceiling}"
+        ));
     }
     Ok(value)
 }
@@ -710,7 +712,9 @@ fn parse_path_template(path: &str, position: &str) -> Result<Vec<PathPart>, Stri
         ));
     }
     if path.contains(['?', '#']) {
-        return Err(format!("mcp_gateway: `{position}.path` must not carry a query or fragment"));
+        return Err(format!(
+            "mcp_gateway: `{position}.path` must not carry a query or fragment"
+        ));
     }
     let mut parts = Vec::new();
     let mut literal = String::new();
@@ -754,7 +758,9 @@ fn parse_path_template(path: &str, position: &str) -> Result<Vec<PathPart>, Stri
         })
         .collect();
     if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(&skeleton) {
-        return Err(format!("mcp_gateway: `{position}.path` is not canonical: {reason}"));
+        return Err(format!(
+            "mcp_gateway: `{position}.path` is not canonical: {reason}"
+        ));
     }
     Ok(parts)
 }
@@ -805,7 +811,9 @@ fn parse_operation(value: &Value, index: usize) -> Result<BridgeOperation, Strin
         None | Some(Value::Null) => &[][..],
         Some(Value::Array(items)) => items.as_slice(),
         Some(_) => {
-            return Err(format!("mcp_gateway: `{position}.parameters` must be an array"));
+            return Err(format!(
+                "mcp_gateway: `{position}.parameters` must be an array"
+            ));
         }
     };
     if declared.len() > MAX_BRIDGE_OPERATION_PARAMETERS {
@@ -924,7 +932,9 @@ fn parse_operation(value: &Value, index: usize) -> Result<BridgeOperation, Strin
             Some(body_required)
         }
         Some(_) => {
-            return Err(format!("mcp_gateway: `{position}.request_body` must be an object"));
+            return Err(format!(
+                "mcp_gateway: `{position}.request_body` must be an object"
+            ));
         }
     };
 
@@ -1042,7 +1052,9 @@ fn parameter_schema(
         None | Some(Value::Null) => json!({"type": "string"}),
         Some(schema @ Value::Object(_)) => schema.clone(),
         Some(_) => {
-            return Err(format!("mcp_gateway: `{position}.schema` must be a JSON Schema object"));
+            return Err(format!(
+                "mcp_gateway: `{position}.schema` must be a JSON Schema object"
+            ));
         }
     };
     let types: Vec<&str> = match schema.get("type") {
@@ -1065,7 +1077,9 @@ fn parameter_schema(
         .and_then(|items| items.get("type"))
         .and_then(Value::as_str);
     if item_type.is_some_and(|kind| matches!(kind, "object" | "array")) {
-        return Err(format!("mcp_gateway: `{position}.schema.items` must be a scalar schema"));
+        return Err(format!(
+            "mcp_gateway: `{position}.schema.items` must be a scalar schema"
+        ));
     }
     Ok(schema)
 }
