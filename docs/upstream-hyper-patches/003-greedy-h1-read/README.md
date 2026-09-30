@@ -43,7 +43,16 @@ After a successful read, if that read returned at least `GREEDY_READ_MIN`
 short, returns `Pending`, or fails, and hands over everything read so far. A
 `Pending` has already registered the waker. A read error is retained and
 delivered after the bytes already buffered, because the `Read` contract does
-not guarantee that a transport error will recur on the next read.
+not guarantee that a transport error will recur on the next read. (Over
+plain TCP a reset is reported once and later reads see EOF, which would end a
+close-delimited body as if the peer had closed it.)
+
+Known limitation: an upgrade (101 Switching Protocols or CONNECT) hands the
+tunnel only the IO and the buffered bytes (`Buffered::into_inner`), so an
+error still pending at that point is dropped with a `debug!` log, and the
+tunnel's next read may see EOF instead of the reset. Reaching it needs at least
+16 KiB right behind the upgrade head plus a transport error in the same read
+burst; tracked in [#5911](https://github.com/ferrum-edge/ferrum-edge/issues/5911).
 
 - A read shorter than 16 KiB never triggers another, so small messages (a
   10 KiB request) cost no extra `recv`.
@@ -69,8 +78,10 @@ interleaved rounds each:
 two full 16 KiB reads and a short one in a single `poll_read_from_io` (and
 fails with 16,384 bytes without the patch);
 `ferrum_greedy_read_skips_short_reads` proves a short first read returns alone;
-and `ferrum_greedy_read_preserves_read_ahead_error` proves a one-shot error
-during read-ahead is delivered after the successfully read bytes.
+`ferrum_greedy_read_preserves_read_ahead_error` proves a one-shot error
+during read-ahead is delivered once, after every buffered byte has drained
+through small reads; and `ferrum_greedy_read_error_fails_a_close_delimited_body`
+proves a close-delimited body cut by that error fails instead of ending cleanly.
 The `Vendored Patch Regressions` CI job runs them with
 
 ```bash

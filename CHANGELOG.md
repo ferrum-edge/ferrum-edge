@@ -272,7 +272,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to carry bulk bodies 16 KiB at a time, paying its per-chunk path (decode,
   body channel, wakeup, downstream write) for every record. Vendored hyper
   patch 003 keeps reading after a full-record read while the transport has more
-  ready; a short read still returns alone. On Linux, large HTTPS/1.1 proxied
+  ready; a short read still returns alone, and a read error met during that
+  read-ahead is kept and delivered after the bytes already read, so a
+  close-delimited body cut by a connection reset still fails (#5909). On
+  Linux, large HTTPS/1.1 proxied
   responses use 14–20% less CPU per request (+11% throughput at 70 KiB, +15% at
   1 MiB), with no change at 10 KiB.
 
