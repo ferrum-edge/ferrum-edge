@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
+  GHSA-7gcf-g7xr-8hxj and `cmov` 0.5.4 for GHSA-3rjw-m598-pq24).
+
 ### Added
 
 - **Read-only configuration export, `GET /config/export`** (#5904). Any
