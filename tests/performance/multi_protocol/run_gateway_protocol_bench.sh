@@ -1155,6 +1155,26 @@ run_bench() {
         python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
             --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation start
     fi
+    local perf_bg=""
+    local perf_bin=""
+    perf_bin=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
+    if [ -n "${PERF_PROFILE:-}" ] && [ "$target" = gateway ] && [ -n "$GATEWAY_CID" ] && [ -n "$perf_bin" ]; then
+        local gpid window
+        gpid=$(docker inspect -f '{{.State.Pid}}' "$GATEWAY_CID")
+        window=$(( DURATION / 3 > 3 ? DURATION / 3 : 3 ))
+        mkdir -p "$OUTPUT_DIR/perf"
+        (
+            sleep "$window"
+            sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$gpid" \
+                -o "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            if [ "$gateway" = ferrum ]; then
+                sudo "$perf_bin" record -F 997 -p "$gpid" -o "/tmp/perf_${gateway}_${payload}.data" \
+                    -- sleep "$window" >/dev/null 2>&1
+            fi
+            wait
+        ) &
+        perf_bg=$!
+    fi
     if [ "$H1_PROFILE" = diagnostic ]; then
         # Write directly to retained raw stdout so campaign termination during
         # the client/readers/logging cannot lose the original partial output.
@@ -1187,6 +1207,19 @@ run_bench() {
     if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
         python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
             --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation end --exit-code "$rc"
+    fi
+    if [ -n "$perf_bg" ]; then
+        wait "$perf_bg" || true
+        local reqs
+        reqs=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('total_requests',0))" "$out" 2>/dev/null || echo 0)
+        echo "total_requests_full_run=$reqs duration=$DURATION" >> "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt"
+        if [ -f "/tmp/perf_${gateway}_${payload}.data" ]; then
+            sudo "$perf_bin" report -i "/tmp/perf_${gateway}_${payload}.data" --no-children --sort symbol --stdio 2>/dev/null \
+                | grep -v '^#' | grep -v '^$' | head -150 | cut -c1-200 > "$OUTPUT_DIR/perf/${gateway}_${payload}_symbols.txt" || true
+            sudo "$perf_bin" report -i "/tmp/perf_${gateway}_${payload}.data" --no-children --sort dso --stdio 2>/dev/null \
+                | grep -v '^#' | grep -v '^$' | head -20 > "$OUTPUT_DIR/perf/${gateway}_${payload}_dso.txt" || true
+            sudo rm -f "/tmp/perf_${gateway}_${payload}.data"
+        fi
     fi
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
