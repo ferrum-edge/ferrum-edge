@@ -368,6 +368,10 @@ impl StreamingMetrics {
 pub struct TrackedBody {
     inner: Pin<Box<dyn http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + 'static>>,
     metrics: Arc<StreamingMetrics>,
+    /// DATA bytes still owed by a body with an exact size hint. hyper stops
+    /// polling a length-framed body once those bytes are written, before its
+    /// `Ready(None)`, so reaching zero is completion too (issue #5588).
+    remaining: Option<u64>,
 }
 
 impl TrackedBody {
@@ -375,7 +379,12 @@ impl TrackedBody {
         inner: Pin<Box<dyn http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + 'static>>,
         metrics: Arc<StreamingMetrics>,
     ) -> Self {
-        Self { inner, metrics }
+        let remaining = inner.size_hint().exact().filter(|len| *len > 0);
+        Self {
+            inner,
+            metrics,
+            remaining,
+        }
     }
 }
 
@@ -404,6 +413,12 @@ impl http_body::Body for TrackedBody {
                 this.metrics
                     .last_frame_nanos
                     .store(elapsed, Ordering::Release);
+                if let (Some(remaining), Some(data)) = (this.remaining.as_mut(), frame.data_ref()) {
+                    *remaining = remaining.saturating_sub(data.len() as u64);
+                    if *remaining == 0 {
+                        this.metrics.completed.store(true, Ordering::Release);
+                    }
+                }
                 Poll::Ready(Some(Ok(frame)))
             }
             other => other,

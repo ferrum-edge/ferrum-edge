@@ -498,25 +498,19 @@ async fn start_streaming_backend(hits: Arc<AtomicUsize>) -> u16 {
 }
 
 /// GHSA-xvr4-5p3r-h7cw residual: on an ordinary (non-`HEAD`) STREAMED response
-/// the gateway must publish no `Content-Length` at all, even when the value is
-/// a perfectly valid decimal.
+/// the only `Content-Length` the gateway may publish is the one its own
+/// HTTP/1.x backend decoder is framing the body with — never a value from the
+/// response header map, which plugins and hooks run over.
 ///
-/// The earlier repair covered the buffered writers (exact derived length) and
-/// hop-by-hop stripping, but the streaming arm preserved one syntactically valid
-/// value. Nothing on that arm can verify the claim against bytes not yet
-/// written, and `security_headers.set` / `opa.deny_headers` could author one in
-/// the response band — so a streamed response could ship a valid-but-false
-/// length. Removing it is lossless: H1 falls back to chunked transfer-coding and
-/// H2/H3 frame the body with END_STREAM / FIN, which is why every frontend below
-/// still receives the complete body.
-///
-/// Stripping the header alone is not sufficient on H1/H2: hyper reconstructs
-/// `Content-Length` from an exact `Body::size_hint()` whenever the header is
-/// absent, so the streaming body must not advertise the declared length either.
-/// A regression in *either* half fails this test.
+/// Issue #5588: re-framing every streamed H1 response as chunked cost a second
+/// TLS record per backend read on large downloads. The backend-decoded length
+/// is now advertised through the body's exact size hint; hyper enforces it on
+/// both legs (the client decoder yields exactly that many bytes or an error, the
+/// server encoder truncates or aborts), so a false length can never reach the
+/// wire. H3 keeps FIN framing.
 #[tokio::test]
 #[ignore]
-async fn functional_streamed_response_publishes_no_content_length_h1_h2_h3() {
+async fn functional_streamed_response_publishes_only_backend_verified_content_length_h1_h2_h3() {
     let hits = Arc::new(AtomicUsize::new(0));
     let backend_port = start_streaming_backend(Arc::clone(&hits)).await;
     let (gateway, https_port) = spawn_gateway(backend_port).await;
@@ -533,20 +527,26 @@ async fn functional_streamed_response_publishes_no_content_length_h1_h2_h3() {
         .expect("h1 client");
     let h1_resp = h1.get(&url).send().await.expect("H1 streamed");
     assert_eq!(h1_resp.status(), StatusCode::OK);
-    // `assert_no_protocol_managed` is deliberately NOT used on the H1 arm: with
-    // no `Content-Length`, hyper's own H1 writer frames the body with
-    // `Transfer-Encoding: chunked` and manages `Connection`. Those are
-    // gateway/transport-owned fields written after the plugin boundary, not
-    // backend- or plugin-authored leaks, so their presence here is correct.
+    // `assert_no_protocol_managed` is deliberately NOT used on the H1 arm:
+    // hyper's own H1 writer manages `Connection`, a gateway/transport-owned
+    // field written after the plugin boundary, not a backend- or
+    // plugin-authored leak, so its presence here is correct.
+    assert_eq!(
+        h1_resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(STREAMED_BODY_LEN.to_string().as_str()),
+        "H1 streamed: exactly the backend-decoded length frames the body"
+    );
     assert!(
-        h1_resp.headers().get(header::CONTENT_LENGTH).is_none(),
-        "H1 streamed: a valid backend Content-Length must not survive the final \
-         boundary — the gateway cannot verify it against bytes not yet written"
+        h1_resp.headers().get(header::TRANSFER_ENCODING).is_none(),
+        "H1 streamed: a length-framed body must not also be chunked"
     );
     assert_eq!(
         h1_resp.bytes().await.expect("H1 body").len(),
         STREAMED_BODY_LEN,
-        "H1 streamed: chunked framing must still deliver the complete body"
+        "H1 streamed: length framing must deliver the complete body"
     );
 
     // --- H2 (h2c prior knowledge on the plaintext proxy port) ---
@@ -559,10 +559,13 @@ async fn functional_streamed_response_publishes_no_content_length_h1_h2_h3() {
     assert_eq!(h2_resp.version(), reqwest::Version::HTTP_2);
     assert_eq!(h2_resp.status(), StatusCode::OK);
     assert_no_protocol_managed(h2_resp.headers(), "H2 streamed");
-    assert!(
-        h2_resp.headers().get(header::CONTENT_LENGTH).is_none(),
-        "H2 streamed: no Content-Length may reach the client; END_STREAM frames \
-         the body"
+    assert_eq!(
+        h2_resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(STREAMED_BODY_LEN.to_string().as_str()),
+        "H2 streamed: only the backend-decoded length may reach the client"
     );
     assert_eq!(
         h2_resp.bytes().await.expect("H2 body").len(),

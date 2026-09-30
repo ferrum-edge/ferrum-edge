@@ -2089,6 +2089,53 @@ pub(crate) fn streaming_response_requires_size_limit(
     max_response_body_size_bytes > 0 && trusted_backend_content_length.is_none()
 }
 
+/// The length an unmodified, streamed HTTP/1.x backend body may advertise to
+/// the client as its exact size hint (issue #5588).
+///
+/// Without one, every streamed response is re-framed: hyper's HTTP/1.1 writer
+/// falls back to `Transfer-Encoding: chunked`, and each backend read (one TLS
+/// record, 16 KiB, on a TLS backend) gains 8 bytes of chunk framing that spill
+/// into a second TLS record on a TLS frontend — roughly doubling the records
+/// the client decrypts on a large download.
+///
+/// The value is never taken from the response header map, which `after_proxy`
+/// hooks can author. It is the length hyper's HTTP/1.x client decoder is
+/// framing the backend body with (`decoder_length`, the body's exact size
+/// hint), and it must agree with the canonical header captured before any hook
+/// ran. Both ends then enforce it: the decoder yields exactly that many bytes or
+/// an error, and hyper's server encoder truncates an overlong body and aborts
+/// the connection on a short one, so the client can never be handed a framing
+/// claim that disagrees with the bytes written.
+///
+/// HTTP/1.x backends only: their `Content-Length` framing cannot carry
+/// trailers, so nothing the chunked writer could relay is lost. A client gRPC
+/// deadline disqualifies the body because its wrapper may append a terminal
+/// frame, and statuses that forbid a body keep their existing framing.
+#[inline]
+pub(crate) fn passthrough_streaming_content_length(
+    backend_version: http::Version,
+    decoder_length: Option<u64>,
+    trusted_backend_content_length: Option<u64>,
+    response_status: u16,
+    client_grpc_deadline: bool,
+) -> Option<u64> {
+    if client_grpc_deadline
+        || !matches!(
+            backend_version,
+            http::Version::HTTP_10 | http::Version::HTTP_11
+        )
+        || response_status < 200
+        || response_status == 204
+        || response_status == 304
+    {
+        return None;
+    }
+    match (decoder_length, trusted_backend_content_length) {
+        (Some(decoded), Some(declared)) if decoded == declared && decoded > 0 => Some(decoded),
+        _ => None,
+    }
+}
+
 /// Resolve the configured response-coalescing window against the proxy's
 /// per-frame idle read timeout (issue #5588).
 ///
@@ -41951,8 +41998,11 @@ async fn handle_proxy_request_inner(
     // `Body::size_hint()` whenever the header is absent (the same mechanism
     // `EmptyUnknownLengthBody` exists to defeat on 205), so stripping the header
     // alone would leave a hook-authored length reaching H1/H2 clients through
-    // the streaming body's hint. Only `Head` framing may advertise one, and
-    // there it matches the representation length the boundary preserved.
+    // the streaming body's hint. Only `Head` framing may advertise the
+    // declared one, and there it matches the representation length the
+    // boundary preserved. The reqwest streaming arm may additionally advertise
+    // an HTTP/1.x backend decoder's own length, which no hook can author
+    // (`passthrough_streaming_content_length`, issue #5588).
     let advertised_streaming_content_length = if is_head {
         declared_streaming_content_length
     } else {
@@ -42202,7 +42252,22 @@ async fn handle_proxy_request_inner(
                 } else {
                     trusted_backend_content_length
                 };
-                let advertised_cl = advertised_streaming_content_length;
+                // HEAD keeps its representation length. Otherwise only an
+                // unmodified HTTP/1.x backend body's decoder-enforced length
+                // may be advertised (issue #5588); see
+                // `passthrough_streaming_content_length`.
+                let passthrough_cl = if is_head {
+                    None
+                } else {
+                    passthrough_streaming_content_length(
+                        response.version(),
+                        response.content_length(),
+                        cl,
+                        response_status,
+                        ctx.grpc_deadline_at().is_some(),
+                    )
+                };
+                let advertised_cl = advertised_streaming_content_length.or(passthrough_cl);
                 // Build the base body from the shared protocol-agnostic builders
                 // first, THEN optionally wrap it in latency tracking via
                 // `into_tracked`. This guarantees the tracked path inherits the
@@ -42258,7 +42323,12 @@ async fn handle_proxy_request_inner(
                 } else {
                     base
                 };
-                let mut base = base.with_lb_connection_guard(lb_connection_guard);
+                // hyper stops polling a length-framed body once the declared
+                // bytes are written, before its `Ready(None)`: that is a
+                // completed response, not a client disconnect.
+                let mut base = base
+                    .with_lb_connection_guard(lb_connection_guard)
+                    .with_success_on_drop_after_response_bytes(passthrough_cl);
                 // Deferred backend-admission outcome (adaptive_concurrency): thread the
                 // permits into the streaming body so the limiter's latency/health
                 // signal fires and the in-flight slot is released at body completion.

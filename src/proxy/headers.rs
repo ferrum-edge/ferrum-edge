@@ -1009,6 +1009,13 @@ pub enum ClientResponseFraming {
     /// frame the body with END_STREAM / FIN. Only the trusted [`Self::Head`]
     /// case may keep a representation length, and only because the gateway —
     /// not a plugin — established that the response carries no body at all.
+    ///
+    /// The header map is still the only thing this variant governs. A streamed
+    /// body may separately report an exact size hint that hyper turns into the
+    /// wire length, but only a length the gateway's own HTTP/1.x backend
+    /// decoder frames the body with and hyper enforces on the way out
+    /// (`proxy::passthrough_streaming_content_length`, issue #5588) — never a
+    /// value from this map.
     Streaming,
     /// `HEAD`, or a gateway-selected status that forbids a message body: the
     /// wire body is empty *by protocol*, so a surviving `Content-Length`

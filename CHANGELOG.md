@@ -267,6 +267,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Streamed HTTP/1.x backend responses keep their `Content-Length`**
+  (#5588). A streamed response used to lose its length and go to HTTP/1.1
+  clients re-framed as `Transfer-Encoding: chunked`; every 16 KiB backend
+  read then spilled 8 bytes of chunk framing into a second TLS record on a TLS
+  frontend. When an HTTP/1.x backend body streams through unmodified, the
+  gateway now advertises the length its own backend decoder frames that body
+  with, never a value from the response header map (which plugins and hooks
+  can author), and hyper enforces it on both legs. H2/H3 backends, HEAD,
+  bodiless statuses, inspected or gRPC-deadline-wrapped bodies, and reframed
+  gRPC-Web bodies keep the previous framing.
+
 - **CP and DP must run the same build; CP/DP backward-compatibility shims are
   removed.** ConfigSync heartbeats are always on: the CP sends them on every
   `Subscribe` stream and the DP always arms its silence watchdog.

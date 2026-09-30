@@ -4,8 +4,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     canonical_header_content_length_from_map_for_test, coalesce_flush_window_for_test,
-    preserved_response_content_length_for_test, run_after_proxy_hooks_for_test,
-    should_bypass_h2_coalesce_for_large_response_for_test,
+    passthrough_streaming_content_length_for_test, preserved_response_content_length_for_test,
+    run_after_proxy_hooks_for_test, should_bypass_h2_coalesce_for_large_response_for_test,
     streaming_response_requires_size_limit_for_test,
     streaming_response_takes_direct_fast_path_for_test,
 };
@@ -481,4 +481,73 @@ fn a_configured_flush_window_keeps_the_body_off_the_direct_fast_path() {
     assert!(!takes_fast_path(1, 0, None));
     assert!(!takes_fast_path(0, 1, None));
     assert!(!takes_fast_path(1, 1, window));
+}
+
+/// Issue #5588: a streamed HTTP/1.x backend body advertises the length its own
+/// decoder frames it with, so the H1 frontend does not re-frame it as chunked.
+#[test]
+fn passthrough_content_length_is_the_http1_backend_decoder_length() {
+    use http::Version;
+    assert_eq!(
+        passthrough_streaming_content_length_for_test(
+            Version::HTTP_11,
+            Some(512_000),
+            Some(512_000),
+            200,
+            false
+        ),
+        Some(512_000)
+    );
+    assert_eq!(
+        passthrough_streaming_content_length_for_test(
+            Version::HTTP_10,
+            Some(7),
+            Some(7),
+            206,
+            false
+        ),
+        Some(7)
+    );
+}
+
+/// Anything that cannot be framed by that decoder-enforced length keeps the
+/// unknown-length framing: a header value the decoder disagrees with, a
+/// backend that may carry trailers, a gRPC deadline wrapper that may append a
+/// terminal frame, a status that forbids a body, or an empty body.
+#[test]
+fn passthrough_content_length_refuses_every_unverifiable_shape() {
+    use http::Version;
+    let refuse = |version, decoded, declared, status, deadline| {
+        passthrough_streaming_content_length_for_test(version, decoded, declared, status, deadline)
+    };
+    // The declared header and the decoder must agree.
+    assert_eq!(
+        refuse(Version::HTTP_11, Some(10), Some(11), 200, false),
+        None
+    );
+    assert_eq!(refuse(Version::HTTP_11, None, Some(10), 200, false), None);
+    assert_eq!(refuse(Version::HTTP_11, Some(10), None, 200, false), None);
+    // H2 and H3 backends can send trailers after a Content-Length body.
+    assert_eq!(
+        refuse(Version::HTTP_2, Some(10), Some(10), 200, false),
+        None
+    );
+    assert_eq!(
+        refuse(Version::HTTP_3, Some(10), Some(10), 200, false),
+        None
+    );
+    // A client gRPC deadline may append a terminal frame.
+    assert_eq!(
+        refuse(Version::HTTP_11, Some(10), Some(10), 200, true),
+        None
+    );
+    // Statuses that forbid a body, and informational ones.
+    for status in [101, 204, 304] {
+        assert_eq!(
+            refuse(Version::HTTP_11, Some(10), Some(10), status, false),
+            None
+        );
+    }
+    // An empty body gains nothing from a length.
+    assert_eq!(refuse(Version::HTTP_11, Some(0), Some(0), 200, false), None);
 }

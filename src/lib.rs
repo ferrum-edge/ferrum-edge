@@ -15010,6 +15010,24 @@ pub mod _test_support {
         )
     }
 
+    /// The length a streamed, unmodified HTTP/1.x backend body may advertise
+    /// to the client (issue #5588).
+    pub fn passthrough_streaming_content_length_for_test(
+        backend_version: http::Version,
+        decoder_length: Option<u64>,
+        trusted_backend_content_length: Option<u64>,
+        response_status: u16,
+        client_grpc_deadline: bool,
+    ) -> Option<u64> {
+        crate::proxy::passthrough_streaming_content_length(
+            backend_version,
+            decoder_length,
+            trusted_backend_content_length,
+            response_status,
+            client_grpc_deadline,
+        )
+    }
+
     /// Whether a streaming reqwest response may skip the coalescing adapter
     /// entirely (issue #5588). A configured aggregation window must count as a
     /// reason to coalesce, or the window is inert in the default configuration.
