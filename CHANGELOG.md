@@ -653,6 +653,31 @@ outright with no deprecation period:
   Changing a provider's issuer, key source, endpoint, or identity claim
   changes the realm, so existing external-identity MCP sessions under the old
   realm end and their clients must initialize again.
+- The `graphql` plugin now lexes documents exactly as the GraphQL
+  specification does and fails closed on anything it cannot measure
+  (GHSA-chqw-m79r-hgjx). Inside a block string the only escape is `\"""`,
+  which is content, and every other backslash is one byte of content; regular
+  strings keep their own escape rules. A block string could previously be
+  closed earlier than a conforming GraphQL server closes it, so the
+  introspection denial and the depth, complexity, and alias limits could be
+  measured over a different selection set from the one the backend executed.
+  A string at document level is now skipped as one token rather than read as
+  structure. The following are now refused with `400` instead of being
+  measured by a weaker scan or passed through: a string that does not lex (an
+  unterminated regular or block string, a line terminator inside a regular
+  string, an undefined escape); a character outside strings and comments that
+  is not part of a GraphQL token or ignored token (non-ASCII text such as a
+  non-breaking space, a form feed, a lone `.`) and a malformed number; an
+  unbalanced or incomplete document, which previously reached a
+  whole-document fallback scan that has been removed; a document with no
+  operation, an unexpected token between definitions, a duplicate operation or
+  fragment name, a nameless fragment, or an anonymous operation beside others;
+  a spread of a fragment the document does not define, which was previously
+  left unmeasured; and a JSON request body whose top-level object repeats
+  `query`, `operationName`, `variables`, or `extensions` (names compared after
+  JSON unescaping and ignoring ASCII case), where the gateway and the backend
+  could each read a different copy. The final request-body
+  recheck applies the same rules.
 - `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
   says (#5767): a backend or serverless-function copy, in the headers or the
   trailers, is stripped at every backend response boundary, as
