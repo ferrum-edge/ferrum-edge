@@ -567,6 +567,14 @@ impl BridgeOperation {
         self.method
     }
 
+    /// The configured operation path template (`/pets/{petId}`), without the
+    /// method prefix [`Self::label`] carries.
+    pub fn path_template(&self) -> &str {
+        self.label
+            .split_once(' ')
+            .map_or(self.label.as_str(), |(_, path)| path)
+    }
+
     /// Build the backend request for validated `tools/call` arguments.
     ///
     /// Arguments outside the declared parameter set are refused whether or not

@@ -10248,6 +10248,14 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Cold-path: this instance as an `mcp_gateway`, for the Admin API tool
+    /// catalog read (`GET /proxies/{id}/mcp/tools`). Only `mcp_gateway`
+    /// overrides it, and wrappers must delegate. Never called on a request
+    /// path.
+    fn mcp_gateway(&self) -> Option<&crate::plugins::mcp_gateway::McpGateway> {
+        None
+    }
+
     /// Returns the execution priority (lower = runs first).
     ///
     /// Plugins are sorted by priority within each lifecycle phase.

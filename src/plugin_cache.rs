@@ -1077,6 +1077,9 @@ impl Plugin for PluginInstanceWrapper {
     ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
         self.inner.mesh_bpf_metrics_exporter()
     }
+    fn mcp_gateway(&self) -> Option<&crate::plugins::mcp_gateway::McpGateway> {
+        self.inner.mcp_gateway()
+    }
     fn correlation_id_header_name(&self) -> Option<&str> {
         self.inner.correlation_id_header_name()
     }

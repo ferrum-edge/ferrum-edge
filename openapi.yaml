@@ -5523,6 +5523,73 @@ paths:
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
+  /proxies/{id}/mcp/tools:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
+
+    get:
+      operationId: getProxyMcpToolCatalog
+      summary: Read an mcp_gateway proxy's cached tool catalog (paginated)
+      description: |
+        Returns the tools an `mcp_gateway` proxy exposes, without speaking MCP
+        to it. Viewer role or above. Namespace-scoped like `GET /proxies/{id}`:
+        the `ns`-claim gate and the viewer-key namespace ceiling
+        (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`) apply, so a namespace outside
+        the caller's reach answers `403` and a proxy of another namespace
+        answers `404`.
+
+        The response reads only the catalog the running `mcp_gateway`
+        instances already cached. It never contacts an upstream and never
+        starts a refresh. Catalogs are cached per downstream MCP session, so
+        each instance reports its most recently refreshed session catalog.
+        `refreshed_at` is `null` and `stale` is `true` until a session has
+        listed tools. The catalog is node-local: on a control plane, or on a
+        data plane that does not serve the proxy's namespace, each instance
+        reports `catalog_state: not_served` and no tools.
+
+        `data` lists the tools of every effective `mcp_gateway` instance on
+        the proxy, ordered by instance then public name, and paginates with
+        the shared `limit` / `offset` bounds. The catalog itself stays within
+        the instance's `validation.max_catalog_items_per_list` and
+        `validation.max_catalog_bytes_per_list` caps.
+
+        Every role receives the same projection. A server's `upstream_url` is
+        always reduced to `scheme://host[:port]` plus redaction markers, and
+        no header, session id, or token is returned. Refresh failures are
+        reported as fixed text, never as upstream error bodies.
+      tags: [Proxies]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
+      responses:
+        "200":
+          description: Cached tool catalog
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/McpToolCatalogResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: |
+            The proxy does not exist in this namespace (`Proxy not found`), or
+            no enabled `mcp_gateway` applies to it
+            (`Proxy has no mcp_gateway plugin`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   # ── Consumers ───────────────────────────────────────────────────────
   /consumers:
     parameters:
@@ -18504,6 +18571,259 @@ components:
             connections.
 
     # ── Pagination envelope ────────────────────────────────────────────
+    McpToolCatalogResponse:
+      type: object
+      description: |
+        `GET /proxies/{id}/mcp/tools`. Top-level `refreshed_at` is the least
+        recent refresh across `catalogs`, `null` when any of them has never
+        been refreshed on this node. `stale` is `true` unless every catalog is
+        `fresh`.
+      required: [proxy_id, namespace, refreshed_at, stale, catalogs, data, pagination]
+      properties:
+        proxy_id:
+          type: string
+        namespace:
+          type: string
+        refreshed_at:
+          type: [string, "null"]
+          format: date-time
+        stale:
+          type: boolean
+        catalogs:
+          type: array
+          description: One entry per effective `mcp_gateway` instance on the proxy.
+          items:
+            $ref: "#/components/schemas/McpToolCatalog"
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/McpToolCatalogTool"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+    McpToolCatalog:
+      type: object
+      description: |
+        One `mcp_gateway` instance's cached catalog. An instance this node does
+        not run (`not_served`) carries only `plugin_config_id`,
+        `catalog_state`, `refreshed_at`, `stale`, `tool_count`, and an empty
+        `servers` list.
+      required: [plugin_config_id, catalog_state, refreshed_at, stale, tool_count, servers]
+      properties:
+        plugin_config_id:
+          type: string
+        catalog_state:
+          type: string
+          enum: [fresh, stale, not_refreshed, unmediated, not_served]
+          description: |
+            `fresh`: refreshed within `discovery.cache_ttl_seconds`. `stale`:
+            older than that; the next MCP request refreshes it. `not_refreshed`:
+            no session has listed tools yet. `unmediated`: a
+            `transparent_proxy` instance, which has no catalog. `not_served`:
+            this node runs no instance for the proxy (a control plane, another
+            namespace, or a change that is not live yet).
+        mode:
+          type: string
+          enum: [aggregate_router, transparent_proxy]
+        enabled:
+          type: boolean
+          description: The instance's own `config.enabled`.
+        endpoint_path:
+          type: string
+        refreshed_at:
+          type: [string, "null"]
+          format: date-time
+        stale:
+          type: boolean
+        cache_ttl_seconds:
+          type: integer
+          minimum: 1
+        catalog_version:
+          type: [integer, "null"]
+          minimum: 0
+        cached_sessions:
+          type: integer
+          minimum: 0
+          description: Downstream sessions currently holding a catalog.
+        tool_count:
+          type: integer
+          minimum: 0
+        tools_unavailable:
+          type: boolean
+          description: |
+            Every attempted upstream failed its `tools/list` with no last-good
+            state, so `tools/list` answers JSON-RPC `-32006` from this catalog.
+        discovery:
+          type: object
+          required: [on_new_tool, on_schema_change]
+          properties:
+            on_new_tool:
+              type: string
+              enum: [allow, hide_until_configured]
+            on_schema_change:
+              type: string
+              enum: [allow, hide_until_configured]
+        policy:
+          type: object
+          required: [default_action, hide_denied_tools]
+          properties:
+            default_action:
+              type: string
+              enum: [allow, deny]
+            hide_denied_tools:
+              type: boolean
+              description: |
+                Denied tools are left out of `tools/list`
+                (`discovery.hide_denied_items` or `policy.hide_denied_tools`).
+        limits:
+          type: object
+          required: [max_catalog_items_per_list, max_catalog_bytes_per_list]
+          properties:
+            max_catalog_items_per_list:
+              type: integer
+              minimum: 1
+            max_catalog_bytes_per_list:
+              type: integer
+              minimum: 1
+        servers:
+          type: array
+          items:
+            $ref: "#/components/schemas/McpToolCatalogServer"
+    McpToolCatalogServer:
+      type: object
+      required:
+        - server_id
+        - namespace
+        - kind
+        - upstream_url
+        - enabled
+        - expose_tools
+        - tools_refresh
+        - refresh_error
+      properties:
+        server_id:
+          type: string
+        namespace:
+          type: string
+          description: The server's public tool-name namespace.
+        kind:
+          type: string
+          enum: [mcp, openapi]
+        upstream_url:
+          type: [string, "null"]
+          description: |
+            Structural projection of `servers.*.upstream_url` for every role:
+            `scheme://host[:port]`, then `/[REDACTED_PATH]` when the URL has a
+            path. `null` for an `openapi` server.
+        enabled:
+          type: boolean
+        expose_tools:
+          type: boolean
+        tools_refresh:
+          type: string
+          enum: [ok, stale, failed, pending, not_listed, disabled]
+          description: |
+            Outcome of this server's most recent `tools/list` in the reported
+            catalog. `stale`: it failed and last-good tools are served.
+            `failed`: it failed with no last-good tools. `pending`: not listed
+            yet. `not_listed`: tools are not aggregated from this server.
+        refresh_error:
+          type: [string, "null"]
+          description: Fixed text for `stale` and `failed`; never an upstream error body.
+    McpToolCatalogTool:
+      type: object
+      required:
+        - name
+        - plugin_config_id
+        - title
+        - description
+        - annotations
+        - source
+        - policy
+        - allowed_groups
+        - denied_groups
+        - input_schema_hash
+        - discovered_at
+      properties:
+        name:
+          type: string
+          description: Public namespaced tool name, as `tools/list` publishes it.
+        plugin_config_id:
+          type: string
+        title:
+          type: [string, "null"]
+        description:
+          type: [string, "null"]
+          description: The source description, without the `[namespace]` prefix.
+        annotations:
+          type: [object, "null"]
+          additionalProperties: true
+        source:
+          type: object
+          required: [type, server_id, namespace]
+          properties:
+            type:
+              type: string
+              enum: [upstream, openapi]
+            server_id:
+              type: string
+            namespace:
+              type: string
+            upstream_name:
+              type: string
+              description: The tool name the upstream MCP server lists (`upstream`).
+            operation_name:
+              type: string
+              description: The generating OpenAPI operation's name (`openapi`).
+            method:
+              type: string
+              description: The generating operation's HTTP method (`openapi`).
+            path:
+              type: string
+              description: The generating operation's path template (`openapi`).
+        policy:
+          type: object
+          required: [action, configured, effective, listed, callable]
+          properties:
+            action:
+              type: string
+              enum: [allow, deny, hide_from_discovery]
+              description: The `policy.tools` entry's action, else `policy.default_action`.
+            configured:
+              type: boolean
+              description: Whether `policy.tools` names this tool.
+            effective:
+              type: string
+              enum: [allow, deny, hide_from_discovery, hidden_until_configured, hidden_schema_changed]
+              description: |
+                `hidden_until_configured`: hidden by `discovery.on_new_tool:
+                hide_until_configured` until `policy.tools` names it.
+                `hidden_schema_changed`: its `inputSchema` changed under
+                `discovery.on_schema_change: hide_until_configured`. Otherwise
+                the configured action.
+            listed:
+              type: boolean
+              description: Whether `tools/list` includes it for a consumer its grant admits.
+            callable:
+              type: boolean
+              description: Whether `tools/call` is admitted for a consumer its grant admits.
+        allowed_groups:
+          type: [array, "null"]
+          items:
+            type: string
+          description: |
+            `policy.tools.*.allowed_groups`, sorted; `null` when every consumer
+            is admitted subject to the action.
+        denied_groups:
+          type: array
+          items:
+            type: string
+        input_schema_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Lowercase hex SHA-256 of the serialized `inputSchema`.
+        discovered_at:
+          type: string
+          format: date-time
     Pagination:
       type: object
       description: |
