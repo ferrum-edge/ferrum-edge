@@ -1864,6 +1864,9 @@ jobs:
           # Patch 002: a body chunk is not cut into sliver DATA frames that h2
           # >= 0.4.16 peers GOAWAY on (issue #5588, hyperium/hyper#4211).
           cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_min_data_frame_capacity
+          # Patch 003: an HTTP/1 read that returned a full TLS record keeps
+          # reading while more is ready (issue #5588).
+          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

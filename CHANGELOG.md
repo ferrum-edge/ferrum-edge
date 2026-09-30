@@ -267,6 +267,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **HTTP/1 over TLS moves bulk bodies in large reads** (#5588). tokio-rustls
+  returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher used
+  to carry bulk bodies 16 KiB at a time, paying its per-chunk path (decode,
+  body channel, wakeup, downstream write) for every record. Vendored hyper
+  patch 003 keeps reading after a full-record read while the transport has more
+  ready; a short read still returns alone. On Linux, large HTTPS/1.1 proxied
+  responses use 14–20% less CPU per request (+11% throughput at 70 KiB, +15% at
+  1 MiB), with no change at 10 KiB.
+
 - **Streamed HTTP/1.x backend responses keep their `Content-Length`**
   (#5588). A streamed response used to lose its length and go to HTTP/1.1
   clients re-framed as `Transfer-Encoding: chunked`; every 16 KiB backend

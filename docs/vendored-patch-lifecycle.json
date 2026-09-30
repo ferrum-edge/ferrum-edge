@@ -786,6 +786,36 @@
       "regression_tests": [
         "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_min_data_frame_capacity_tests)"
       ]
+    },
+    {
+      "id": "hyper-003-greedy-h1-read",
+      "label": "hyper HTTP/1 reads past one TLS record while more is ready",
+      "crate": "hyper",
+      "vendored_version": "1.9.0",
+      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/003-greedy-h1-read/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "tokio-rustls returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher moved bulk bodies 16 KiB at a time and paid its per-chunk path for every record; after a full-record read, Buffered now keeps reading while the transport has more ready (#5588).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "hyper (or tokio-rustls, by filling the caller's buffer from every record already readable) stops handing HTTP/1 bodies over one TLS record per read, or the vendored hyper is retired.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h1::io::tests::ferrum_greedy_read_*)"
+      ]
     }
   ]
 }

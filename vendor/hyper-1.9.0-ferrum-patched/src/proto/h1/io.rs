@@ -51,6 +51,12 @@ where
     }
 }
 
+/// FERRUM PATCH 003: a read at least this large (one maximum TLS record's
+/// plaintext) suggests more is ready behind it.
+const GREEDY_READ_MIN: usize = 16 * 1024;
+/// FERRUM PATCH 003: bound on extra reads per `poll_read_from_io`.
+const GREEDY_READ_MAX_ROUNDS: usize = 16;
+
 impl<T, B> Buffered<T, B>
 where
     T: Read + Write + Unpin,
@@ -233,6 +239,29 @@ where
         let mut buf = ReadBuf::uninit(dst);
         match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
             Poll::Ready(Ok(_)) => {
+                // FERRUM PATCH 003: a userspace TLS stream (tokio-rustls)
+                // returns one decrypted record per read, so a bulk body moves
+                // through the dispatcher 16 KiB at a time, paying the whole
+                // per-chunk path (decode, body channel, wakeups, downstream
+                // write) for every record. After a read that returned a full
+                // record's worth, keep reading into the same buffer while the
+                // transport has more ready. A short read stops at once, so a
+                // small message never costs an extra read.
+                let mut last = buf.filled().len();
+                let mut rounds = 0;
+                while last >= GREEDY_READ_MIN
+                    && buf.unfilled().remaining() > 0
+                    && rounds < GREEDY_READ_MAX_ROUNDS
+                {
+                    let before = buf.filled().len();
+                    match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
+                        Poll::Ready(Ok(())) => last = buf.filled().len() - before,
+                        // Pending registered the waker; the error recurs on the
+                        // next read. Either way, hand over what was read.
+                        Poll::Pending | Poll::Ready(Err(_)) => break,
+                    }
+                    rounds += 1;
+                }
                 let n = buf.filled().len();
                 trace!("received {} bytes", n);
                 unsafe {
@@ -680,6 +709,50 @@ mod tests {
         // let mock = Mock::new().build();
         // let mut io_buf = Buffered::<_, Cursor<Vec<u8>>>::new(mock);
         // io_buf.flush().await.expect("should short-circuit flush");
+    }
+
+    // FERRUM PATCH 003: full-record reads keep reading while the transport
+    // has more ready; a short read stops at once.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn ferrum_greedy_read_after_full_records() {
+        let full = vec![b'a'; GREEDY_READ_MIN];
+        let mock = Mock::new()
+            .read(&full)
+            .read(&full)
+            .read(&[b'c'; 1000])
+            .read(b"not read until the next poll")
+            .wait(Duration::from_secs(1))
+            .build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_read_buf_exact_size(64 * 1024);
+        let n = futures_util::future::poll_fn(|cx| buffered.poll_read_from_io(cx))
+            .await
+            .expect("read");
+        assert_eq!(n, 2 * GREEDY_READ_MIN + 1000);
+        let n = futures_util::future::poll_fn(|cx| buffered.poll_read_from_io(cx))
+            .await
+            .expect("read");
+        assert_eq!(n, b"not read until the next poll".len());
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn ferrum_greedy_read_skips_short_reads() {
+        let mock = Mock::new()
+            .read(&[b'a'; 1000])
+            .read(&[b'b'; 2000])
+            .build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_read_buf_exact_size(64 * 1024);
+        let n = futures_util::future::poll_fn(|cx| buffered.poll_read_from_io(cx))
+            .await
+            .expect("read");
+        assert_eq!(n, 1000, "a short read must not trigger another read");
+        let n = futures_util::future::poll_fn(|cx| buffered.poll_read_from_io(cx))
+            .await
+            .expect("read");
+        assert_eq!(n, 2000);
     }
 
     #[cfg(not(miri))]
