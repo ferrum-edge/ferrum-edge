@@ -776,44 +776,6 @@ impl GatewayListenerManager {
             .collect()
     }
 
-    /// Publish an allowed admission decision for the current generation
-    /// without opening any listener gates.
-    #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this seam.
-    pub fn publish_allowed_admission_for_test(&self) -> bool {
-        let expected = self.state.request_epoch.load();
-        self.state
-            .publish_gateway_listener_admission(&expected, BTreeSet::new(), || {})
-    }
-
-    /// Bind and retain a listener with its accept gate closed so integration
-    /// tests can verify that a decided route still cannot serve before the
-    /// manager opens the gate.
-    #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this seam.
-    pub async fn bind_listener_with_closed_accept_gate_for_test(
-        &self,
-        port: u16,
-        desired: DesiredGatewayListener,
-    ) -> Result<watch::Sender<bool>, GatewayListenerBindFailure> {
-        match self.spawn_listener(port, desired).await {
-            Ok(listener) => {
-                let accept_gate_tx = listener.accept_gate_tx.clone();
-                self.listeners.lock().await.insert(port, listener);
-                Ok(accept_gate_tx)
-            }
-            Err(error) => {
-                let failure = GatewayListenerBindFailure::tcp(
-                    port,
-                    GatewayListenerFailureCategory::BindFailed,
-                    error,
-                );
-                self.bind_failures.store(Arc::new(vec![failure.clone()]));
-                Err(failure)
-            }
-        }
-    }
-
     /// `(port, bind_addr)` pairs currently owned by this manager.
     #[allow(dead_code)]
     pub async fn active_binds(&self) -> Vec<(u16, IpAddr)> {
@@ -2030,6 +1992,94 @@ mod tests {
             "could not bind gateway listener on 127.0.0.1:{last_port} after \
              {MAX_PORT_BIND_ATTEMPTS} attempts; last reconcile failures: {last_failures:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listener_accepts_only_after_its_generation_is_admitted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut used_ports = Vec::new();
+        let mut attempt = 0;
+        while attempt < MAX_PORT_BIND_ATTEMPTS {
+            let port = free_port().await;
+            if used_ports.contains(&port) {
+                continue;
+            }
+            used_ports.push(port);
+            attempt += 1;
+
+            let state = test_state(port_scoped_config(port));
+            let manager = GatewayListenerManager::new(
+                state.clone(),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                GatewayListenerTls::default(),
+            );
+            let listener = match manager
+                .spawn_listener(
+                    port,
+                    DesiredGatewayListener {
+                        class: GatewayListenerClass::Plaintext,
+                        bind_addr: std::net::IpAddr::from([127, 0, 0, 1]),
+                        mesh_direction: None,
+                    },
+                )
+                .await
+            {
+                Ok(listener) => listener,
+                Err(error) if error.contains("Address already in use") => {
+                    if attempt == MAX_PORT_BIND_ATTEMPTS {
+                        panic!("listener bind lost its port after {attempt} attempts: {error}");
+                    }
+                    continue;
+                }
+                Err(error) => panic!("listener bind failed: {error}"),
+            };
+
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect to bound listener");
+            stream
+                .write_all(b"GET /api/x HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("send request while accept gate is closed");
+            let mut response = [0; 1];
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                stream.read(&mut response),
+            )
+            .await
+            {
+                Err(_) => {}
+                Ok(Ok(read)) => panic!(
+                    "closed listener accept gate returned {read} response bytes: {:?}",
+                    &response[..read]
+                ),
+                Ok(Err(error)) => panic!("reading before admission gate opened failed: {error}"),
+            }
+
+            let expected = state.request_epoch.load();
+            assert!(state.publish_gateway_listener_admission(&expected, BTreeSet::new(), || {
+                listener.accept_gate_tx.send_replace(true);
+            }));
+            manager.listeners.lock().await.insert(port, listener);
+
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_to_end(&mut response),
+            )
+            .await
+            .expect("listener should respond after admission opens the accept gate")
+            .expect("read admitted listener response");
+            assert!(
+                String::from_utf8_lossy(&response).starts_with("HTTP/1.1 502"),
+                "expected the admitted route's backend failure after opening the accept gate"
+            );
+            manager.shutdown_all().await;
+            return;
+        }
+
+        panic!("listener could not bind a fresh port after {MAX_PORT_BIND_ATTEMPTS} attempts");
     }
 
     fn cumulative_series(
