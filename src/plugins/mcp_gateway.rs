@@ -1965,20 +1965,19 @@ impl McpGateway {
             .params
             .as_ref()
             .and_then(|params| params.get("arguments"));
-        let request = match operation.build_request(
-            arguments,
-            bridge.max_request_body_bytes(),
-            |name| self.bridge_header_reserved_for_deployment(ctx, name),
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                if self.observability.emit_metadata {
-                    ctx.metadata
-                        .insert("mcp.route_decision".to_string(), "deny".to_string());
+        let request =
+            match operation.build_request(arguments, bridge.max_request_body_bytes(), |name| {
+                self.bridge_header_reserved_for_deployment(ctx, name)
+            }) {
+                Ok(request) => request,
+                Err(error) => {
+                    if self.observability.emit_metadata {
+                        ctx.metadata
+                            .insert("mcp.route_decision".to_string(), "deny".to_string());
+                    }
+                    return json_rpc_error(envelope.id.clone(), -32602, error.message(), None);
                 }
-                return json_rpc_error(envelope.id.clone(), -32602, error.message(), None);
-            }
-        };
+            };
         let Some(backend_path) = bridge_backend_path(ctx, &request.public_path) else {
             if self.observability.emit_metadata {
                 ctx.metadata
@@ -2217,11 +2216,9 @@ impl McpGateway {
             .operation(&rebuild.operation)
             .ok_or("target_changed")?;
         let request = operation
-            .build_request(
-                arguments,
-                rebuild.bridge.max_request_body_bytes(),
-                |name| self.bridge_header_reserved_for_deployment(ctx, name),
-            )
+            .build_request(arguments, rebuild.bridge.max_request_body_bytes(), |name| {
+                self.bridge_header_reserved_for_deployment(ctx, name)
+            })
             .map_err(|_| "arguments_invalid")?;
         let same_request_line = request.method == claim.method
             && request.public_path == claim.public_path
