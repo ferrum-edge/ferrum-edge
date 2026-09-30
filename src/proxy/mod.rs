@@ -32748,7 +32748,12 @@ async fn handle_proxy_request_inner(
     // loaded that admission always sees the retirement.
     if gateway_listener::is_retired_connection(gateway_listener_identity.as_ref()) {
         let is_grpc = grpc_proxy::is_grpc_request(&req);
-        return Ok(retired_gateway_listener_response(&state, &ctx, inbound_version, is_grpc));
+        return Ok(retired_gateway_listener_response(
+            &state,
+            &ctx,
+            inbound_version,
+            is_grpc,
+        ));
     }
 
     // Direct Pod-IP HTTP mesh egress is selected by captured original
