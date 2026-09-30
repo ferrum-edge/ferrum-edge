@@ -397,7 +397,8 @@ of the vendor copy and must keep passing after retirement:
   that module run the step `Client::try_send_request` takes after queuing a
   request (`await_pooled_response`) against a real pooled HTTP/1 connection.
 - An HTTP/1 read that returned a full TLS record's worth keeps reading while
-  the transport has more ready, and a short read never triggers another
+  the transport has more ready, a short read never triggers another, and an
+  error from an additional read is delivered after the already-buffered bytes
   (issue #5588) — the vendored hyper regressions
   `proto::h1::io::tests::ferrum_greedy_read_*`, run with
   `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read`.

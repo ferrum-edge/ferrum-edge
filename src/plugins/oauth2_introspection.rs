@@ -24,7 +24,7 @@ use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
     ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
-    credential_deadline_from_unix_seconds, nonblank_identity,
+    credential_deadline_from_unix_seconds, external_identity_realm_authority, nonblank_identity,
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
@@ -128,6 +128,10 @@ struct IntrospectionProvider {
     warmup_hostnames: Vec<String>,
     introspection_limit: Arc<Semaphore>,
     in_flight: Arc<DashMap<TokenKey, Arc<InFlightCell>>>,
+    /// Verifying-authority digest (pinned issuer, introspection or discovery
+    /// endpoint, and the claim the identity is read from) committed with every
+    /// external principal this provider vouches for.
+    identity_realm_authority: [u8; 32],
 }
 
 /// An introspection endpoint together with the only rendering of it that may
@@ -263,6 +267,7 @@ impl Oauth2Introspection {
             None => consumer_identity_claim.clone(),
         };
 
+        let global_identity_claim = consumer_identity_claim.as_str();
         let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
         let Some(providers_arr) = providers_val.as_array() else {
             return Err("oauth2_introspection: `providers` must be a non-empty array".to_string());
@@ -415,6 +420,25 @@ impl Oauth2Introspection {
                 warmup_hostnames.push(discovery.hostname.clone());
             }
 
+            let identity_claim = consumer_identity_claim
+                .as_deref()
+                .unwrap_or(global_identity_claim);
+            let identity_realm_authority = external_identity_realm_authority(
+                "oauth2_introspection",
+                &[
+                    ("provider.issuer", issuer.as_deref()),
+                    (
+                        "provider.introspection_endpoint",
+                        endpoint.as_ref().map(|parsed| parsed.url.as_str()),
+                    ),
+                    (
+                        "provider.discovery_url",
+                        discovery.as_ref().map(|parsed| parsed.url.as_str()),
+                    ),
+                    ("provider.identity_claim", Some(identity_claim)),
+                ],
+            );
+
             providers.push(IntrospectionProvider {
                 assertion_audience: issuer.clone(),
                 issuer,
@@ -441,6 +465,7 @@ impl Oauth2Introspection {
                     MAX_PROVIDER_CONCURRENT_INTROSPECTIONS,
                 )),
                 in_flight: Arc::new(DashMap::with_shard_amount(shard_amount)),
+                identity_realm_authority,
             });
         }
 
@@ -549,6 +574,7 @@ impl Oauth2Introspection {
                     return reject(error.status_code, error.body.to_string());
                 }
                 let mut attempt = AuthenticationAttempt::new();
+                attempt.stage_identity_realm_authority(provider.identity_realm_authority);
                 self.stage_claim_headers(&mut attempt, &authorization, provider);
                 if !provider.forward_original_token {
                     self.stage_original_token_stripping(&mut attempt, ctx, &token, candidate);

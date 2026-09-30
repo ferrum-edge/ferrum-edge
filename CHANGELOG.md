@@ -272,12 +272,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Mesh `connection.sni` condition values are normalized at load** (#5903).
+  Every surface that loads a policy (Kubernetes translation, file and native
+  config, and `mesh_authz` construction) strips one trailing dot, lowercases
+  ASCII, and converts a non-ASCII (U-label) name to its A-label with IDNA
+  (`bücher.example` becomes `xn--bcher-kva.example`). A non-ASCII value that
+  cannot be converted is rejected with a validation error, in `values` and
+  `notValues`; on Kubernetes, the AuthorizationPolicy carrying it is not
+  installed. A mesh data plane also logs a one-time warning, naming the
+  policy, when an exact `connection.sni` value names a service's bare FQDN
+  (`<service>.<namespace>.svc.<cluster-domain>`). Cross-cluster traffic
+  carries the `p<port>[-udp].<fqdn>` alias, so such a value never matches it;
+  the warning suggests `*.<fqdn>` or the explicit aliases. Matching is
+  unchanged: `connection.sni` stays Istio's plain string match.
+
+- **Plugin trigger `sni` entries are normalized the same way** (#5903). An
+  `exact` entry drops one trailing dot, is lowercased, and has a U-label
+  converted to its A-label; a `prefix` entry is lowercased and has whole
+  labels converted, keeping a trailing `.`. A trigger written as
+  `orders.internal.` keeps matching now that the received SNI has its
+  trailing dot stripped. An entry with non-ASCII text that cannot be
+  converted is rejected; `sni` regexes are unchanged.
+  **Upgrade notes:** a `prefix` written with a trailing dot to catch the
+  dotted client spelling (`internal.example.`) no longer matches it, because
+  the received name now arrives without the dot; write the dotless name as an
+  `exact` entry instead. An `sni` regex that requires a trailing dot
+  (`…\.$`) no longer matches. A stored trigger whose `exact` or `prefix`
+  entry has non-ASCII text that cannot be converted now fails to load
+  instead of silently never matching.
+
 - **HTTP/1 over TLS moves bulk bodies in large reads** (#5588). tokio-rustls
   returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher used
   to carry bulk bodies 16 KiB at a time, paying its per-chunk path (decode,
   body channel, wakeup, downstream write) for every record. Vendored hyper
   patch 003 keeps reading after a full-record read while the transport has more
-  ready; a short read still returns alone. On Linux, large HTTPS/1.1 proxied
+  ready; a short read still returns alone, and a read error met during that
+  read-ahead is kept and delivered after the bytes already read, so a
+  close-delimited body cut by a connection reset still fails (#5909). On
+  Linux, large HTTPS/1.1 proxied
   responses use 14–20% less CPU per request (+11% throughput at 70 KiB, +15% at
   1 MiB), with no change at 10 KiB.
 
@@ -473,6 +505,10 @@ outright with no deprecation period:
 
 ### Fixed
 
+- **Gateway listeners wait for matching route admission** (#5913). Newly bound
+  listener sockets do not accept connections until their matching config
+  generation publishes admission, preventing brief 404 responses during reload.
+
 - **`main-latest-image.yml` now moves `latest` after a successful publisher
   run** (#5893). GitHub withholds a job output that may contain a secret, and
   the verified Docker Hub `repo@sha256:` reference matched the Docker Hub
@@ -488,6 +524,13 @@ outright with no deprecation period:
   producer does not declare (through dot or bracket access, in any letter
   case), or a reference or repository name in the `promote` summary, and its
   self-test covers each of those regressions.
+
+- **A trailing root dot in a received SNI no longer bypasses mesh
+  `connection.sni` policy** (#5903). rustls accepts `admin.example.com.` and
+  reported it with the dot, so on TLS-terminated HTTP/1.1, HTTP/2, HTTP/3, and
+  TCP connections a DENY written for `admin.example.com` (or
+  `*.example.com`) did not fire. Those read sites now strip exactly one
+  trailing dot and lowercase the name before plugins see it.
 
 - **gRPC and HTTP/2 backend connections no longer die after 100 requests
   against h2 >= 0.4.16 peers** (#5588). A client that ends a request with a
@@ -628,6 +671,61 @@ outright with no deprecation period:
 
 ### Security
 
+- `mcp_gateway` `aggregate_router` admission now holds on the final request
+  (GHSA-3w98-6p32-8qm2). The message kind, method, selected upstream, mediated
+  upstream session, tool or prompt name, resource URI, and arguments the
+  gateway admitted are recorded privately on the request and checked again
+  over the exact request the upstream will receive, after every request-body
+  transform. A routed `tools/call`, `prompts/get`, `resources/read`, or
+  passthrough message that a later plugin changed is refused before it is sent
+  upstream with JSON-RPC `-32014`; the gateway's own public-to-upstream name
+  rewrite is the only permitted difference. The mediated upstream session
+  header is re-asserted over the final backend headers, including after a
+  `serverless_function` `pre_proxy` header overlay, and an envelope carrying
+  both `method` and `result`/`error` is refused. A client-sent JSON-RPC response
+  forwarded through `passthrough_unknown_methods` is still admitted, bound to
+  the request `id` it answers. A later route rewrite of an MCP-routed request,
+  including a `mesh_route_dispatch` destination rewrite, is now refused. The
+  check runs on HTTP/1.1, HTTP/2, and HTTP/3.
+- `mcp_gateway` sessions owned by an external identity with no Consumer
+  mapping are now bound to the authentication realm that verified that
+  identity, not only to its subject string (GHSA-wr96-j2c3-qh66). `jwks_auth`,
+  `oidc_relying_party`, `oauth2_introspection`, and `ldap_auth` commit the
+  verifying authority (issuer, key source, introspection endpoint, or
+  directory, plus the claim the identity is read from) with the identity; a
+  `jwks_auth` provider that pins no issuer also binds each token's `iss`. The
+  same `sub` from two accepted issuers, tenants, or auth plugins therefore names
+  two different session owners, and neither can use the other's session for
+  catalog listing, routed calls, the SSE listener, cancellation, or `DELETE`.
+  Consumer-mapped ownership is still bound to namespace and record id.
+  Changing a provider's issuer, key source, endpoint, or identity claim
+  changes the realm, so existing external-identity MCP sessions under the old
+  realm end and their clients must initialize again.
+- The `graphql` plugin now lexes documents exactly as the GraphQL
+  specification does and fails closed on anything it cannot measure
+  (GHSA-chqw-m79r-hgjx). Inside a block string the only escape is `\"""`,
+  which is content, and every other backslash is one byte of content; regular
+  strings keep their own escape rules. A block string could previously be
+  closed earlier than a conforming GraphQL server closes it, so the
+  introspection denial and the depth, complexity, and alias limits could be
+  measured over a different selection set from the one the backend executed.
+  A string at document level is now skipped as one token rather than read as
+  structure. The following are now refused with `400` instead of being
+  measured by a weaker scan or passed through: a string that does not lex (an
+  unterminated regular or block string, a line terminator inside a regular
+  string, an undefined escape); a character outside strings and comments that
+  is not part of a GraphQL token or ignored token (non-ASCII text such as a
+  non-breaking space, a form feed, a lone `.`) and a malformed number; an
+  unbalanced or incomplete document, which previously reached a
+  whole-document fallback scan that has been removed; a document with no
+  operation, an unexpected token between definitions, a duplicate operation or
+  fragment name, a nameless fragment, or an anonymous operation beside others;
+  a spread of a fragment the document does not define, which was previously
+  left unmeasured; and a JSON request body whose top-level object repeats
+  `query`, `operationName`, `variables`, or `extensions` (names compared after
+  JSON unescaping and ignoring ASCII case), where the gateway and the backend
+  could each read a different copy. The final request-body
+  recheck applies the same rules.
 - `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
   says (#5767): a backend or serverless-function copy, in the headers or the
   trailers, is stripped at every backend response boundary, as

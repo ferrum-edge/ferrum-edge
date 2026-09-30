@@ -17,7 +17,7 @@ use crate::modes::mesh::config::{
     ServiceEntryLocation, ServicePort, SourceNegationMatch, TagOverrideOperation,
     TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
     admit_request_match_port_pattern, egress_host_is_unresolvable_wildcard,
-    validate_mesh_condition, validate_mesh_export_to,
+    normalize_mesh_condition_values, validate_mesh_condition, validate_mesh_export_to,
 };
 use crate::modes::mesh::metric_tag_cel::{
     parse_metric_tag_cel_expression, validate_metric_tag_cel_for_families,
@@ -1078,7 +1078,7 @@ fn condition_match(
     let key = string_field(value, "key").ok_or_else(|| {
         invalid_resource(object, format!("rules[].when[{index}].key is required"))
     })?;
-    let condition = ConditionMatch {
+    let mut condition = ConditionMatch {
         key: key.to_string(),
         values: string_array(value, "values"),
         not_values: string_array(value, "notValues"),
@@ -1102,6 +1102,11 @@ fn condition_match(
             ),
         ));
     }
+    // Normalize `connection.sni` values (one trailing dot stripped, ASCII
+    // lowercased, U-labels converted to A-labels), as every other load surface
+    // does, so the translated policy compares directly with the received SNI.
+    // Validation above admitted every value this can convert.
+    normalize_mesh_condition_values(&mut condition);
     Ok(condition)
 }
 

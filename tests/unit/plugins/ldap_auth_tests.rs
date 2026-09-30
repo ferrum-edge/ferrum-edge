@@ -3372,3 +3372,76 @@ async fn ca_bundle_admission_diagnostics_withhold_source_and_parser_payloads() {
         assert!(!rendered.contains("LDAP_DIAGNOSTIC_CANARY"), "{rendered}");
     }
 }
+
+/// The directory, bind/search base, and identity attribute that vouch for an
+/// LDAP login are its realm: the same username from a different directory is a
+/// different external principal.
+#[test]
+fn ldap_identity_realm_binds_the_directory_and_identity_attribute() {
+    use ferrum_edge::plugins::utils::auth_flow::AuthMechanism;
+    let realm = |extra: serde_json::Value| {
+        direct_bind_plugin(extra)
+            .identity_realm_authority()
+            .expect("ldap_auth stages a realm authority")
+    };
+    let base = realm(json!({}));
+    assert_eq!(base, realm(json!({})), "one directory is one realm");
+    for extra in [
+        json!({ "ldap_url": "ldaps://ldap-b.example.com:636" }),
+        json!({ "bind_dn_template": "uid={username},ou=staff,dc=example,dc=com" }),
+        json!({ "canonical_identity_attribute": "mail" }),
+    ] {
+        assert_ne!(base, realm(extra.clone()), "{extra}");
+    }
+}
+
+/// A mechanism's staged realm authority reaches the request with the identity
+/// through the shared external-identity runner `ldap_auth` uses.
+#[tokio::test]
+async fn external_identity_runner_commits_the_mechanism_realm() {
+    use ferrum_edge::plugins::utils::auth_flow::{
+        AuthMechanism, ExternalIdentityRealm, ExtractedCredential, VerifyOutcome,
+        run_auth_external_identity,
+    };
+
+    struct RealmProbe;
+
+    #[async_trait::async_trait]
+    impl AuthMechanism for RealmProbe {
+        fn mechanism_name(&self) -> &'static str {
+            "realm_probe"
+        }
+
+        fn extract(&self, _ctx: &ferrum_edge::plugins::RequestContext) -> ExtractedCredential {
+            ExtractedCredential::BearerToken("probe".to_string())
+        }
+
+        fn identity_realm_authority(&self) -> Option<[u8; 32]> {
+            Some([7; 32])
+        }
+
+        async fn verify(
+            &self,
+            _credential: ExtractedCredential,
+            _consumer_index: &ConsumerIndex,
+        ) -> VerifyOutcome {
+            VerifyOutcome::success(None, Some("alice".to_string()), None)
+        }
+    }
+
+    let mut ctx = ferrum_edge::plugins::RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/".to_string(),
+    );
+    let result = run_auth_external_identity(&RealmProbe, &mut ctx, &ConsumerIndex::new(&[])).await;
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+    assert_eq!(
+        ctx.authenticated_identity_realm(),
+        Some(ExternalIdentityRealm::new("realm_probe", Some([7; 32])))
+    );
+}

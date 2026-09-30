@@ -1303,6 +1303,16 @@ escapes, but retain regex syntax such as `^/v1\.0/.*`. Host matchers containing
 uppercase ASCII require `case_insensitive: true`, including regex patterns;
 configuration is rejected rather than silently lowercased.
 
+The received SNI is ASCII-lowercased with one trailing root dot stripped, and
+`sni` `exact` / `prefix` entries are normalized to the same spelling at load,
+the same way mesh `connection.sni` values are. An `exact` entry drops one
+trailing dot, is lowercased, and has a non-ASCII (U-label) name converted to
+its A-label (`xn--…`) with IDNA. A `prefix` entry is lowercased and has whole
+labels before a trailing `.` converted; a trailing `.` in a prefix stays. An
+entry with non-ASCII text that cannot be converted is rejected. `sni` regexes
+are left as written, so a regex that requires a trailing dot no longer matches:
+the received name arrives without it.
+
 At startup and cache rebuild, a warning identifies each proxy/protocol whose
 effective authentication instances are all trigger-gated. Requests matching none
 of those triggers remain unauthenticated; include an unconditional authentication
@@ -1603,7 +1613,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 `serverless_function` runs in the finalized-request-egress phase, not `before_proxy` (advisory `GHSA-4vr5-4wm3-x5xv`). With `forward_body: true` it receives the exact lossless **backend-visible** representation: request-body transforms have run and every final request-policy hook has accepted those bytes. It may therefore share a protocol chain with a body transformer. The capability-based refusal still applies — covering body transformers and final request-body policy plugins — to registered custom plugins that declare `egresses_request_body_before_finalization()`. Candidate admission derives the built-in serverless protocol, effective priority, `mode`, and `forward_body` capabilities without constructing its environment-bound HTTP/AWS client, and derives static protocol/`enforces_finalized_request_policy()` metadata for expensive final validators (`waf`, `openapi_validator`, `body_validator`, `request_size_limiting`, `ai_tool_governor`, `ai_semantic_firewall`) without compiling their rule sets, so a CP can validate composition without requiring credentials or schema packs that intentionally exist only on DPs. Runtime cache construction still resolves and validates those node-local values as a fail-closed backstop. Ferrum does not allow an external decision to govern bytes different from those ultimately dispatched. Non-identity encoded bodies fail closed before function egress. When a terminate-mode instance shares a protocol chain with `request_deduplication`, every deduplication instance must have a strictly lower effective priority so retry ownership exists before the function can execute; candidate admission and cache construction reject equal or reversed ordering. Deduplication runs after request-transformer header/query rules and built-in route dispatch so its fingerprint observes their effective output. Every same-protocol header/query/destination mutator must run before deduplication, including under priority overrides; a deferred request-body rewrite is likewise rejected when it cannot be fully observed during the earlier normalization phase.
 
-`mcp_gateway` sits at priority 2992: generic admission/auth/body validation runs first, then MCP JSON-RPC metadata is extracted and aggregate-router calls can set `RequestContext.route_override_*` before final route-dispatch plugins and request transformers. It is HTTP-only and does not implement generic auth, rate limiting, retry, timeout, tracing, WAF, DLP, or semantic safety behavior; those remain separate Ferrum plugins that can consume emitted `mcp.*` metadata.
+`mcp_gateway` sits at priority 2992: generic admission/auth/body validation runs first, then MCP JSON-RPC metadata is extracted and aggregate-router calls can set `RequestContext.route_override_*` before final route-dispatch plugins and request transformers. It is HTTP-only and does not implement generic auth, rate limiting, retry, timeout, tracing, WAF, DLP, or semantic safety behavior; those remain separate Ferrum plugins that can consume emitted `mcp.*` metadata. Because body transforms such as `request_transformer` (3000) run after it, aggregate admission is re-decided in `on_final_request_body` over the exact backend-visible body: a changed method, destination, tool/prompt name, resource URI, or arguments is refused before egress, and only the gateway's own recorded public→upstream rewrite is admissible.
 
 The plugin is also active on two response phases, which is where result policy and MCP Streamable HTTP response placement are decided. `after_proxy` refuses a `tools/call` whose response headers cannot yield a bounded, inspectable JSON representation for `validation.validate_tool_results`; `on_final_response_body` runs the authoritative fail-closed body enforcement and then delivers a request that was routed upstream as the POST's own `text/event-stream` response, carrying exactly the governed bytes an inline JSON answer would have carried. Both act only on requests the same `mcp_gateway` instance admitted in `before_proxy`, so instances with disjoint `endpoint.path` scopes on one proxy never apply their response policies to each other's traffic.
 
@@ -1677,7 +1687,7 @@ Given all built-in plugins enabled, the execution order is:
 | 42 | `ai_request_guard` | 2975 | before_proxy, transform_request_body, on_final_request_body |
 | 43 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 44 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, response_stream_inspector |
-| 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body, after_proxy, on_final_response_body |
+| 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, transform_response_body, after_proxy, on_final_response_body |
 | 46 | `a2a_gateway` | 2993 | before_proxy, on_final_request_body, after_proxy, normalize_response_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |

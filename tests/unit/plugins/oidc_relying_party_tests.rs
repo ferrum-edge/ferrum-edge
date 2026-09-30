@@ -4485,3 +4485,44 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+async fn oidc_session_realm(
+    config: serde_json::Value,
+    claims: serde_json::Value,
+) -> ferrum_edge::plugins::utils::auth_flow::ExternalIdentityRealm {
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let sealed = oidc_sealed_session_cookie_for_test(&plugin, claims, false);
+    let set_cookie = sealed.expect("session seals");
+    let mut ctx = session_ctx(&set_cookie);
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("oidc-subject"));
+    ctx.authenticated_identity_realm()
+        .expect("an OIDC external identity carries its realm")
+}
+
+/// The same subject from a different issuer, or read from a different claim,
+/// is a different external principal; one issuer is one realm.
+#[tokio::test]
+async fn external_identity_realm_binds_the_oidc_issuer_and_identity_claim() {
+    let claims = json!({ "sub": "oidc-subject", "email": "oidc-subject" });
+    let realm = oidc_session_realm(base_config(), claims.clone()).await;
+    assert_eq!(realm.mechanism(), "oidc_relying_party");
+    let same = oidc_session_realm(base_config(), claims.clone()).await;
+    assert_eq!(realm, same, "one issuer is one realm");
+
+    let mut other_issuer = base_config();
+    other_issuer["providers"][0]["issuer"] = json!("https://other-issuer.example.com");
+    let other = oidc_session_realm(other_issuer, claims.clone()).await;
+    assert_ne!(realm, other, "a different issuer is a different realm");
+
+    let mut by_email = base_config();
+    by_email["providers"][0]["consumer_identity_claim"] = json!("email");
+    let by_email = oidc_session_realm(by_email, claims).await;
+    assert_ne!(
+        realm, by_email,
+        "the identity claim path is part of the realm"
+    );
+}

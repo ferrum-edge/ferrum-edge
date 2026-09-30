@@ -4825,7 +4825,7 @@ async fn handle_tcp_connection_inner(
             .get_ref()
             .1
             .server_name()
-            .map(str::to_ascii_lowercase);
+            .and_then(crate::proxy::sni::normalize_received_server_name);
 
         // Register immediately after the handshake exposes its verified peer
         // certificate, before decrypted first-byte inspection or stream-connect

@@ -223,6 +223,10 @@ pub struct LdapAuth {
     /// Plaintext loopback endpoints are admitted without the development-only
     /// override, but their actual dial-time answers must remain loopback.
     plaintext_requires_loopback: bool,
+    /// Verifying-authority digest (directory URL, bind/search base, and
+    /// identity attribute) committed with every external principal this
+    /// instance vouches for.
+    identity_realm_authority: [u8; 32],
 }
 
 impl LdapAuth {
@@ -533,6 +537,19 @@ impl LdapAuth {
             None
         };
 
+        let identity_realm_authority = auth_flow::external_identity_realm_authority(
+            "ldap_auth",
+            &[
+                ("ldap_url", Some(ldap_url.as_str())),
+                ("bind_dn_template", bind_dn_template.as_deref()),
+                ("search_base_dn", search_base_dn.as_deref()),
+                (
+                    "canonical_identity_attribute",
+                    canonical_identity_attribute.as_deref(),
+                ),
+            ],
+        );
+
         Ok(Self {
             ldap_url,
             bind_dn_template,
@@ -566,6 +583,7 @@ impl LdapAuth {
             dns_cache,
             backend_egress_policy,
             plaintext_requires_loopback,
+            identity_realm_authority,
         })
     }
 
@@ -1852,6 +1870,10 @@ fn unescape_rdn_value(raw: &str) -> Option<String> {
 impl AuthMechanism for LdapAuth {
     fn mechanism_name(&self) -> &'static str {
         "ldap_auth"
+    }
+
+    fn identity_realm_authority(&self) -> Option<[u8; 32]> {
+        Some(self.identity_realm_authority)
     }
 
     /// `ldap_auth` consumes RFC 7617 `Authorization: Basic` credentials, so an

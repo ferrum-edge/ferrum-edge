@@ -936,6 +936,47 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
         "a control character in a condition value must fail closed: {control_char}"
     );
 
+    // `connection.sni` values are normalized rather than rejected: rejecting
+    // one drops the whole AuthorizationPolicy, which is fail-OPEN for a DENY.
+    // Only a non-ASCII value with no A-label spelling fails translation.
+    let unconvertible = condition_translation_error("connection.sni", json!(["bü example"]));
+    assert!(
+        unconvertible.contains("rules[].when[0].values[0]") && unconvertible.contains("A-label"),
+        "an unconvertible connection.sni value must fail closed: {unconvertible}"
+    );
+    let not_values_unconvertible = translate_k8s_objects(
+        &[authz_policy(json!({
+            "action": "DENY",
+            "rules": [{"when": [{"key": "connection.sni", "notValues": ["bü*"]}]}]
+        }))],
+        options(),
+    )
+    .expect_err("an unconvertible connection.sni notValues entry must fail closed")
+    .to_string();
+    assert!(
+        not_values_unconvertible.contains("rules[].when[0].notValues[0]")
+            && not_values_unconvertible.contains("cannot be converted to an A-label"),
+        "an unconvertible connection.sni notValues entry must fail closed: \
+         {not_values_unconvertible}"
+    );
+
+    // The translated values take the received SNI's spelling: one trailing dot
+    // stripped, ASCII lowercased, and a U-label converted to its A-label.
+    let normalized = condition_policy(
+        "DENY",
+        "connection.sni",
+        json!(["Admin.Example.COM.", "Bücher.Example"]),
+        json!(["*.Public.Example.COM.", "*.bücher.example"]),
+    );
+    assert_eq!(
+        normalized.rules[0].when[0].values,
+        vec!["admin.example.com", "xn--bcher-kva.example"]
+    );
+    assert_eq!(
+        normalized.rules[0].when[0].not_values,
+        vec!["*.public.example.com", "*.xn--bcher-kva.example"]
+    );
+
     let long_key = format!("request.headers[{}]", "a".repeat(300));
     let long = condition_translation_error(&long_key, json!(["x"]));
     assert!(

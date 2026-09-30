@@ -592,6 +592,21 @@ pub fn classify_client_hello(data: &[u8]) -> ClientHelloSni {
     }
 }
 
+/// Normalize the hostname a TLS stack reports for a received `server_name`.
+///
+/// rustls validates a received SNI with its `DnsName` rules, which accept a
+/// trailing root dot, and `ServerConnection::server_name()` (and quinn's
+/// `HandshakeData::server_name`) report the name with that dot kept. Consumers
+/// such as `mesh_authz`'s `connection.sni` compare the name as a string, so a
+/// client sending `admin.example.com.` would otherwise slip past a policy
+/// written for `admin.example.com`. This strips exactly one trailing dot and
+/// ASCII-lowercases the rest, giving every read site one spelling of the name.
+/// Returns `None` when nothing is left.
+pub fn normalize_received_server_name(name: &str) -> Option<String> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
 /// Extract the SNI hostname from a TLS ClientHello byte slice.
 ///
 /// Parses the TLS record layer and handshake message to find the
@@ -675,14 +690,17 @@ impl ClientHelloKtlsFacts {
     /// re-parses the hello with [`extract_sni_from_client_hello`]. That
     /// validator is deliberately stricter than the `DnsName` rules rustls
     /// applies to a received SNI: it refuses underscore labels and a trailing
-    /// root dot, both of which rustls accepts and would surface from
-    /// `server_name()`. A present `server_name` extension that yields no
-    /// hostname here would therefore make a handed-off connection report `None`
-    /// where the buffered path reports a name, silently changing what stream
-    /// lifecycle plugins and transaction summaries observe. Declining the
-    /// handoff for those hellos keeps the two paths observationally identical;
-    /// the socket is still pristine, so the buffered accept surfaces rustls's
-    /// own value.
+    /// root dot, both of which rustls accepts. The buffered path passes
+    /// rustls's name through [`normalize_received_server_name`], which strips
+    /// a trailing root dot, so for a dotted name the difference is only that
+    /// the handoff is declined (a performance cost, not a different name). An
+    /// underscore label is the case that matters: the buffered path reports
+    /// it, while a handed-off connection would report `None`, silently
+    /// changing what stream lifecycle plugins, policy, and transaction
+    /// summaries observe. Declining the handoff whenever a present
+    /// `server_name` extension yields no hostname here keeps the two paths
+    /// observationally identical; the socket is still pristine, so the
+    /// buffered accept surfaces the normalized rustls value.
     pub fn sni_is_representable(&self, parsed_sni: Option<&str>) -> bool {
         !self.offers_server_name || parsed_sni.is_some()
     }

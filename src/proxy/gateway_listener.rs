@@ -90,7 +90,10 @@
 //! A refusal — and any bind failure, such as `:80` without
 //! `CAP_NET_BIND_SERVICE` — is recorded in
 //! [`GatewayListenerManager::bind_failures`] and logged, then retried on a slow
-//! tick. It is deliberately never fatal: a Gateway listener port is
+//! tick. Reconcile can bind a socket before publishing its admission decision;
+//! accept gates open only after that decision, while the raw failure set is
+//! stored afterward and can briefly lag the listener state. Refusals are
+//! deliberately never fatal: a Gateway listener port is
 //! control-plane input, and killing the process over one unbindable port would
 //! take down every healthy listener with it.
 //!
@@ -512,8 +515,6 @@ struct ReconcileOutcome {
     h3_ports: Vec<u16>,
     /// Gateway listener ports this process must bind for this generation.
     desired_listeners: usize,
-    /// Gateway listener ports with a live TCP accept loop at the end of the pass.
-    active_listeners: usize,
 }
 
 type ListenerTask = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
@@ -533,6 +534,9 @@ struct LiveListener {
     /// ingress binds use `Inbound`; ordinary Gateway listeners use `None`.
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     shutdown_tx: watch::Sender<bool>,
+    /// Held until this listener's config generation has published its
+    /// admission decision. The socket is bound, but it cannot accept yet.
+    accept_gate_tx: watch::Sender<bool>,
     /// The TCP accept-loop task. Returns once every accept socket is closed;
     /// accepted connections drain in their own tasks.
     tcp: ListenerTask,
@@ -758,12 +762,18 @@ impl GatewayListenerManager {
         self
     }
 
-    /// Ports currently bound by this manager, for tests and diagnostics.
+    /// Ports with an active accept loop, for tests and diagnostics. Newly bound
+    /// listeners remain absent until their config generation is admitted.
     // The binary target re-declares these modules, so a `pub` item consumed
     // only by `tests/` reads as dead code there.
     #[allow(dead_code)]
     pub async fn active_ports(&self) -> Vec<u16> {
-        self.listeners.lock().await.keys().copied().collect()
+        self.listeners
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(port, listener)| (*listener.accept_gate_tx.borrow()).then_some(*port))
+            .collect()
     }
 
     /// `(port, bind_addr)` pairs currently owned by this manager.
@@ -814,12 +824,17 @@ impl GatewayListenerManager {
                 refused_route_ports,
                 h3_ports,
                 desired_listeners,
-                active_listeners,
             } = self.reconcile_generation(&expected).await;
-            if !self
-                .state
-                .publish_gateway_listener_admission(&expected, refused_route_ports)
-            {
+            let pending_accept_gates = self.pending_accept_gates().await;
+            if !self.state.publish_gateway_listener_admission(
+                &expected,
+                refused_route_ports,
+                move || {
+                    for accept_gate_tx in pending_accept_gates {
+                        accept_gate_tx.send_replace(true);
+                    }
+                },
+            ) {
                 // The config changed while this pass awaited socket/drain
                 // work. Its decision must never govern the newer route table;
                 // immediately reconcile the latest generation instead of
@@ -830,6 +845,13 @@ impl GatewayListenerManager {
                 );
                 continue;
             }
+            let active_listeners = self
+                .listeners
+                .lock()
+                .await
+                .values()
+                .filter(|listener| *listener.accept_gate_tx.borrow())
+                .count();
             self.state.publish_gateway_h3_alt_svc(&h3_ports);
             self.bind_failures.store(Arc::new(failures.clone()));
             // Publish the bounded operator-facing status last, and only after
@@ -1216,7 +1238,6 @@ impl GatewayListenerManager {
         // QUIC-only refusal is NOT counted here — its port is still in
         // `plan.ports` and its TCP half is expected to bind and serve.
         let desired_listeners = plan.ports.len() + plan.refused.len();
-        let active_listeners = live.len();
 
         let status_observations: Vec<GatewayListenerFailureObservation> = failures
             .iter()
@@ -1260,8 +1281,17 @@ impl GatewayListenerManager {
             refused_route_ports,
             h3_ports,
             desired_listeners,
-            active_listeners,
         }
+    }
+
+    /// Let newly bound listeners accept only after the matching route
+    /// admission snapshot has been committed to the request epoch.
+    async fn pending_accept_gates(&self) -> Vec<watch::Sender<bool>> {
+        let live = self.listeners.lock().await;
+        live.values()
+            .filter(|listener| !*listener.accept_gate_tx.borrow())
+            .map(|listener| listener.accept_gate_tx.clone())
+            .collect()
     }
 
     /// Drop finished drains so completed handles cannot accumulate for the life
@@ -1496,6 +1526,7 @@ impl GatewayListenerManager {
             client_ca_bundle_path: http3.client_ca_bundle_path.clone(),
             client_crls: http3.client_crls.clone(),
             started_tx: Some(started_tx),
+            accept_gate_rx: Some(listener.accept_gate_tx.subscribe()),
             frontend_tls_reload: http3.frontend_tls_reload(),
             // The listener arms this right after its UDP bind succeeds and
             // hands it to Quinn inside the socket, so the claim lasts exactly
@@ -1600,13 +1631,14 @@ impl GatewayListenerManager {
         let addr = SocketAddr::new(desired.bind_addr, port);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (started_tx, started_rx) = oneshot::channel();
+        let (accept_gate_tx, accept_gate_rx) = watch::channel(false);
         let state = self.state.clone();
         let tls = self.tls.clone();
         let task = tokio::spawn(async move {
             match desired.class {
                 GatewayListenerClass::Plaintext => match desired.mesh_direction {
                     Some(mesh_direction) => {
-                        crate::proxy::start_mesh_plaintext_listener_with_signal(
+                        crate::proxy::start_mesh_plaintext_listener_with_accept_gate(
                             addr,
                             state,
                             shutdown_rx,
@@ -1618,37 +1650,41 @@ impl GatewayListenerManager {
                             // host's default V6ONLY posture.
                             false,
                             Some(started_tx),
+                            Some(accept_gate_rx),
                         )
                         .await
                     }
                     None => {
-                        crate::proxy::start_proxy_listener_with_tls_and_signal(
+                        crate::proxy::start_proxy_listener_with_tls_and_accept_gate(
                             addr,
                             state,
                             shutdown_rx,
                             None,
                             Some(started_tx),
+                            Some(accept_gate_rx),
                         )
                         .await
                     }
                 },
                 GatewayListenerClass::Tls => {
                     if let Some(slot) = tls.reload_slot {
-                        crate::proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+                        crate::proxy::start_proxy_listener_with_dynamic_tls_and_accept_gate(
                             addr,
                             state,
                             shutdown_rx,
                             slot,
                             Some(started_tx),
+                            Some(accept_gate_rx),
                         )
                         .await
                     } else {
-                        crate::proxy::start_proxy_listener_with_tls_and_signal(
+                        crate::proxy::start_proxy_listener_with_tls_and_accept_gate(
                             addr,
                             state,
                             shutdown_rx,
                             tls.static_config,
                             Some(started_tx),
+                            Some(accept_gate_rx),
                         )
                         .await
                     }
@@ -1671,6 +1707,7 @@ impl GatewayListenerManager {
                     bind_addr: desired.bind_addr,
                     mesh_direction: desired.mesh_direction,
                     shutdown_tx,
+                    accept_gate_tx,
                     tcp: task,
                     quic: None,
                     quic_shutdown_tx: None,
@@ -1955,6 +1992,98 @@ mod tests {
             "could not bind gateway listener on 127.0.0.1:{last_port} after \
              {MAX_PORT_BIND_ATTEMPTS} attempts; last reconcile failures: {last_failures:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listener_accepts_only_after_its_generation_is_admitted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut used_ports = Vec::new();
+        let mut attempt = 0;
+        while attempt < MAX_PORT_BIND_ATTEMPTS {
+            let port = free_port().await;
+            if used_ports.contains(&port) {
+                continue;
+            }
+            used_ports.push(port);
+            attempt += 1;
+
+            let state = test_state(port_scoped_config(port));
+            let manager = GatewayListenerManager::new(
+                state.clone(),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                GatewayListenerTls::default(),
+            );
+            let listener = match manager
+                .spawn_listener(
+                    port,
+                    DesiredGatewayListener {
+                        class: GatewayListenerClass::Plaintext,
+                        bind_addr: std::net::IpAddr::from([127, 0, 0, 1]),
+                        mesh_direction: None,
+                    },
+                )
+                .await
+            {
+                Ok(listener) => listener,
+                Err(error) if error.contains("Address already in use") => {
+                    if attempt == MAX_PORT_BIND_ATTEMPTS {
+                        panic!("listener bind lost its port after {attempt} attempts: {error}");
+                    }
+                    continue;
+                }
+                Err(error) => panic!("listener bind failed: {error}"),
+            };
+
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect to bound listener");
+            stream
+                .write_all(
+                    b"GET /api/x HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("send request while accept gate is closed");
+            let mut response = [0; 1];
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                stream.read(&mut response),
+            )
+            .await
+            {
+                Err(_) => {}
+                Ok(Ok(read)) => panic!(
+                    "closed listener accept gate returned {read} response bytes: {:?}",
+                    &response[..read]
+                ),
+                Ok(Err(error)) => panic!("reading before admission gate opened failed: {error}"),
+            }
+
+            let expected = state.request_epoch.load();
+            assert!(
+                state.publish_gateway_listener_admission(&expected, BTreeSet::new(), || {
+                    listener.accept_gate_tx.send_replace(true);
+                })
+            );
+            manager.listeners.lock().await.insert(port, listener);
+
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read_to_end(&mut response),
+            )
+            .await
+            .expect("listener should respond after admission opens the accept gate")
+            .expect("read admitted listener response");
+            assert!(
+                String::from_utf8_lossy(&response).starts_with("HTTP/1.1 502"),
+                "expected the admitted route's backend failure after opening the accept gate"
+            );
+            manager.shutdown_all().await;
+            return;
+        }
+
+        panic!("listener could not bind a fresh port after {MAX_PORT_BIND_ATTEMPTS} attempts");
     }
 
     fn cumulative_series(

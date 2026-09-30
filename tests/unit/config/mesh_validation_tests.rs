@@ -3808,6 +3808,140 @@ fn mesh_policy_enforces_istio_source_trust_domain_value_grammar() {
     }
 }
 
+/// `connection.sni` values are normalized at load rather than rejected: a
+/// rejected value drops the whole policy, which is fail-OPEN for a DENY. Only a
+/// non-ASCII value with no A-label spelling is rejected, on `values` and
+/// `notValues`, and the diagnostic never echoes the value.
+#[test]
+fn mesh_policy_rejects_only_unconvertible_connection_sni_values() {
+    for rejected in [
+        // A space is not allowed in a domain name, so IDNA refuses it.
+        format!("{ECHO_PROBE} bücher.example"),
+        // The non-ASCII text sits in a label the `*` only partly covers.
+        format!("{ECHO_PROBE}bü*"),
+        format!("*{ECHO_PROBE}bücher.example"),
+        // `url::Host::parse` would percent-decode this first.
+        format!("{ECHO_PROBE}%41.bücher.example"),
+    ] {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("connection.sni", direction, &rejected);
+            assert!(
+                errors.iter().any(|e| {
+                    e.contains(&format!("rules[0].when[0].{direction}[0]"))
+                        && e.contains("cannot be converted to an A-label")
+                }),
+                "expected an A-label diagnostic on {direction} for '{rejected}', got: {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|e| e.contains(ECHO_PROBE)),
+                "a connection.sni diagnostic must not echo the value, got: {errors:?}"
+            );
+        }
+    }
+
+    for accepted in [
+        "xn--bcher-kva.example",
+        "bücher.example",
+        "*.Bücher.Example.",
+        "bücher.*",
+        "Admin.Example.COM.",
+        "*.reviews.default.svc.cluster.local",
+        "p9080.reviews.default.svc.cluster.local",
+        "api.*",
+        "*",
+        // Other ASCII that DNS does not allow is not rejected; such a value
+        // simply never matches.
+        "under_score.example",
+    ] {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("connection.sni", direction, accepted);
+            assert!(
+                errors.is_empty(),
+                "'{accepted}' is a valid connection.sni {direction} entry, got: {errors:?}"
+            );
+        }
+    }
+
+    // The A-label rule is specific to `connection.sni`: another string-matcher
+    // key keeps accepting non-ASCII text.
+    let errors = errors_for_condition("request.headers[x-host]", "values", "bücher example");
+    assert!(
+        errors.is_empty(),
+        "request.headers values keep the generic grammar, got: {errors:?}"
+    );
+}
+
+/// `connection.sni` values take the spelling of the normalized received SNI at
+/// load: one trailing dot stripped, ASCII lowercased, and a U-label converted
+/// to its A-label. Other condition keys keep their spelling.
+#[test]
+fn mesh_config_normalize_canonicalizes_connection_sni_condition_values() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".into(),
+        values: vec![
+            "Admin.Example.COM.".into(),
+            "*.Reviews.Default.SVC.Cluster.Local".into(),
+            "Bücher.Example".into(),
+            // IDNA maps U+3002 (ideographic full stop) to `.`, so the trailing
+            // dot the conversion produces is stripped in the same pass.
+            "bücher\u{3002}".into(),
+            "*.Bücher\u{3002}".into(),
+        ],
+        not_values: vec![
+            "P9080.Reviews.Default.SVC.Cluster.Local.".into(),
+            "*.bücher.example.".into(),
+            "bücher.*".into(),
+            // Only a single trailing dot is stripped, so normalization is
+            // idempotent; these never match a received SNI either way.
+            "Double.Dot..".into(),
+            ".".into(),
+        ],
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "request.headers[x-tenant]".into(),
+        values: vec!["Tenant-A.".into()],
+        not_values: Vec::new(),
+    });
+    let mut config = MeshConfig {
+        mesh_policies: vec![policy],
+        ..MeshConfig::default()
+    };
+    config.normalize();
+    // Idempotent: a second pass leaves the canonical values unchanged.
+    config.normalize();
+
+    let when = &config.mesh_policies[0].rules[0].when;
+    assert_eq!(
+        when[0].values,
+        vec![
+            "admin.example.com".to_string(),
+            "*.reviews.default.svc.cluster.local".to_string(),
+            "xn--bcher-kva.example".to_string(),
+            "xn--bcher-kva".to_string(),
+            "*.xn--bcher-kva".to_string(),
+        ]
+    );
+    assert_eq!(
+        when[0].not_values,
+        vec![
+            "p9080.reviews.default.svc.cluster.local".to_string(),
+            "*.xn--bcher-kva.example".to_string(),
+            "xn--bcher-kva.*".to_string(),
+            "double.dot..".to_string(),
+            ".".to_string(),
+        ]
+    );
+    assert_eq!(
+        when[1].values,
+        vec!["Tenant-A.".to_string()],
+        "only connection.sni values are normalized"
+    );
+}
+
 /// `source.namespace` keeps Istio's `srcNamespaceGenerator` grammar, where every
 /// `*` is an arbitrary substring. A mid-string or repeated star is therefore
 /// valid input and must not be rejected as it is for `source.trustDomain`.

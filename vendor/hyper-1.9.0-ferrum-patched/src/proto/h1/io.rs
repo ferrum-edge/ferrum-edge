@@ -33,6 +33,7 @@ pub(crate) struct Buffered<T, B> {
     flush_pipeline: bool,
     io: T,
     partial_len: Option<usize>,
+    pending_read_error: Option<io::Error>,
     read_blocked: bool,
     read_buf: BytesMut,
     read_buf_strategy: ReadStrategy,
@@ -73,6 +74,7 @@ where
             flush_pipeline: false,
             io,
             partial_len: None,
+            pending_read_error: None,
             read_blocked: false,
             read_buf: BytesMut::with_capacity(0),
             read_buf_strategy: ReadStrategy::default(),
@@ -228,6 +230,9 @@ where
 
     pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         self.read_blocked = false;
+        if let Some(error) = self.pending_read_error.take() {
+            return Poll::Ready(Err(error));
+        }
         let next = self.read_buf_strategy.next();
         if self.read_buf_remaining_mut() < next {
             self.read_buf.reserve(next);
@@ -256,9 +261,13 @@ where
                     let before = buf.filled().len();
                     match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
                         Poll::Ready(Ok(())) => last = buf.filled().len() - before,
-                        // Pending registered the waker; the error recurs on the
-                        // next read. Either way, hand over what was read.
-                        Poll::Pending | Poll::Ready(Err(_)) => break,
+                        // Pending registered the waker. Preserve a read error
+                        // so it is delivered after the bytes already read.
+                        Poll::Pending => break,
+                        Poll::Ready(Err(error)) => {
+                            self.pending_read_error = Some(error);
+                            break;
+                        }
                     }
                     rounds += 1;
                 }
@@ -282,6 +291,12 @@ where
     }
 
     pub(crate) fn into_inner(self) -> (T, Bytes) {
+        // An upgrade hands over only the IO and the buffered bytes, so a
+        // read-ahead error still pending here is lost: the tunnel's next read
+        // may see EOF instead (ferrum-edge issue #5911).
+        if let Some(_error) = &self.pending_read_error {
+            debug!("upgrade drops a pending read-ahead error: {}", _error);
+        }
         (self.io, self.read_buf.freeze())
     }
 
@@ -753,6 +768,72 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(n, 2000);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn ferrum_greedy_read_preserves_read_ahead_error() {
+        let full = vec![b'a'; GREEDY_READ_MIN];
+        let mock = Mock::new()
+            .read(&full)
+            .read_error(io::Error::from(io::ErrorKind::ConnectionReset))
+            .build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_read_buf_exact_size(64 * 1024);
+
+        // Small reads drain every buffered byte before the error surfaces.
+        let mut drained = 0;
+        while drained < GREEDY_READ_MIN {
+            let bytes = futures_util::future::poll_fn(|cx| buffered.read_mem(cx, 1000))
+                .await
+                .expect("buffered bytes must be returned before the read error");
+            assert!(!bytes.is_empty(), "EOF before the buffered bytes drained");
+            drained += bytes.len();
+        }
+        assert_eq!(drained, GREEDY_READ_MIN);
+
+        let error = futures_util::future::poll_fn(|cx| buffered.read_mem(cx, 1000))
+            .await
+            .expect_err("the read-ahead error must be delivered on the next read");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+
+        // Delivered once: the transport's own EOF follows.
+        let bytes = futures_util::future::poll_fn(|cx| buffered.read_mem(cx, 1000))
+            .await
+            .expect("the read after the error reaches the transport's EOF");
+        assert!(bytes.is_empty());
+    }
+
+    /// The motivating case: a close-delimited body whose connection resets
+    /// once during read-ahead must fail, not end as if the peer had closed it.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn ferrum_greedy_read_error_fails_a_close_delimited_body() {
+        use crate::proto::h1::decode::Decoder;
+
+        let full = vec![b'a'; GREEDY_READ_MIN];
+        let mock = Mock::new()
+            .read(&full)
+            .read_error(io::Error::from(io::ErrorKind::ConnectionReset))
+            .build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(Compat::new(mock));
+        buffered.set_read_buf_exact_size(64 * 1024);
+        let mut decoder = Decoder::eof();
+
+        let mut body = 0;
+        let error = loop {
+            match futures_util::future::poll_fn(|cx| decoder.decode(cx, &mut buffered)).await {
+                Ok(frame) => {
+                    let data = frame.into_data().expect("data frame");
+                    assert!(!data.is_empty(), "the body ended as if the peer closed it");
+                    body += data.len();
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(body, GREEDY_READ_MIN);
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(!decoder.is_eof());
     }
 
     #[cfg(not(miri))]

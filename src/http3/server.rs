@@ -372,6 +372,10 @@ pub struct Http3ListenerOptions {
     /// validity windows, retained unknown-status tolerance).
     pub client_crls: CrlList,
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Gateway listener accept gate. The UDP socket may bind before route
+    /// admission, but the H3 endpoint does not accept connections until it is
+    /// opened by the matching config-generation publication.
+    pub accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
     /// Optional opt-in frontend TLS live-reload inputs. When `Some`, the H3
     /// listener subscribes to `revision_rx` and, on a bump, reloads the latest
     /// `Arc<rustls::ServerConfig>` from `tls_slot`, rebuilds the
@@ -447,6 +451,7 @@ pub async fn start_http3_listener(
             client_ca_bundle_path,
             client_crls,
             started_tx: None,
+            accept_gate_rx: None,
             frontend_tls_reload: None,
             udp_port_hold: None,
         },
@@ -1093,6 +1098,7 @@ pub async fn start_http3_listener_with_signal(
         client_ca_bundle_path,
         client_crls,
         started_tx,
+        accept_gate_rx,
         frontend_tls_reload,
         udp_port_hold,
     } = options;
@@ -1260,6 +1266,30 @@ pub async fn start_http3_listener_with_signal(
     // Tie the sentinel sender's lifetime to the loop so a `None` reload
     // input cannot accidentally trigger `.changed()` via channel close.
     let _sentinel_tx_keep_alive = sentinel_tx;
+
+    if let Some(mut accept_gate_rx) = accept_gate_rx {
+        if *shutdown_rx.borrow() {
+            endpoint.close(0u32.into(), b"listener shutdown");
+            return Ok(());
+        }
+        while !*accept_gate_rx.borrow() {
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        endpoint.close(0u32.into(), b"listener shutdown");
+                        return Ok(());
+                    }
+                }
+                changed = accept_gate_rx.changed() => {
+                    if changed.is_err() {
+                        endpoint.close(0u32.into(), b"listener admission ended");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
 
     // The H3 client-trust scope is armed from the exact candidate this endpoint
     // installed (issue #3857), before the accept loop admits its first Initial.
@@ -2021,7 +2051,8 @@ async fn handle_h3_connection(
     let frontend_sni_hostname = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-        .and_then(|data| data.server_name.as_deref().map(str::to_ascii_lowercase));
+        .and_then(|data| data.server_name)
+        .and_then(|name| crate::proxy::sni::normalize_received_server_name(&name));
 
     // Keep a handle to the quinn connection so we can detect QUIC connection
     // migration (RFC 9000 §9). When a client migrates to a new IP (e.g., mobile

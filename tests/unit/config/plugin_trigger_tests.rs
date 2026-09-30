@@ -841,6 +841,45 @@ fn network_predicates_still_apply_on_a_stream_connection() {
     assert!(!trigger.evaluate(&facts));
 }
 
+/// `sni` entries take the spelling of the received SNI (lowercase, one trailing
+/// root dot stripped, A-labels), the same way mesh `connection.sni` values do.
+#[test]
+fn sni_entries_are_normalized_like_the_received_sni() {
+    let exact = compile(serde_json::json!({
+        "when": {"match": {"sni": {"exact": ["Orders.Internal.", "Bücher.Example"]}}}
+    }));
+    let prefix = compile(serde_json::json!({
+        "when": {"match": {"sni": {"prefix": ["API.", "bücher."]}}}
+    }));
+    let mut facts = Facts::stream();
+    for (sni, exact_hit, prefix_hit) in [
+        ("orders.internal", true, false),
+        ("xn--bcher-kva.example", true, true),
+        ("api.internal", false, true),
+        // A trailing `.` in a prefix is part of the prefix.
+        ("apix.internal", false, false),
+    ] {
+        facts.sni = Some(sni.to_string());
+        assert_eq!(exact.evaluate(&facts), exact_hit, "exact: {sni}");
+        assert_eq!(prefix.evaluate(&facts), prefix_hit, "prefix: {sni}");
+    }
+
+    let error = compile_error(serde_json::json!({
+        "when": {"match": {"sni": {"exact": ["bücher example"]}}}
+    }));
+    assert!(
+        error.contains("`sni` exact entry") && error.contains("A-label"),
+        "{error}"
+    );
+    let error = compile_error(serde_json::json!({
+        "when": {"match": {"sni": {"prefix": ["bü"]}}}
+    }));
+    assert!(
+        error.contains("`sni` prefix entry") && error.contains("A-label"),
+        "{error}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Round-trip
 // ---------------------------------------------------------------------------

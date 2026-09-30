@@ -1,7 +1,7 @@
 use ferrum_edge::proxy::sni::{
     DtlsSniResult, extract_sni_from_client_hello, extract_sni_from_dtls_client_hello,
     extract_sni_from_tcp_stream, initial_peek_capacity, next_peek_capacity,
-    no_deadline_peek_capacity, resolve_proxy_by_sni,
+    no_deadline_peek_capacity, normalize_received_server_name, resolve_proxy_by_sni,
 };
 
 fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
@@ -2233,4 +2233,28 @@ fn untyped_refused_substring_still_classifies_as_connection_refused() {
         classify_stream_error(&untyped),
         ErrorClass::ConnectionRefused
     );
+}
+
+/// rustls accepts a trailing root dot in a received SNI and reports it from
+/// `server_name()`. Every TLS-terminating read site (HTTP/1-2, HTTP/3, and TCP
+/// terminate) passes the name through this helper, so policy sees one
+/// lowercase, dotless spelling.
+#[test]
+fn normalize_received_server_name_strips_one_trailing_dot_and_lowercases() {
+    for (received, expected) in [
+        ("admin.example.com", Some("admin.example.com")),
+        ("Admin.Example.COM", Some("admin.example.com")),
+        ("svc.cluster.local.", Some("svc.cluster.local")),
+        ("P443.Svc.Local.", Some("p443.svc.local")),
+        // Exactly one dot is stripped.
+        ("a.example..", Some("a.example.")),
+        (".", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            normalize_received_server_name(received).as_deref(),
+            expected,
+            "received server_name {received:?}"
+        );
+    }
 }

@@ -10731,6 +10731,7 @@ impl ProxyState {
         &self,
         expected: &RequestEpoch,
         refused_ports: std::collections::BTreeSet<u16>,
+        activate_listeners: impl FnOnce(),
     ) -> bool {
         let admission = crate::router_cache::GatewayListenerAdmission::decided(refused_ports);
         self.request_epoch
@@ -10740,6 +10741,7 @@ impl ProxyState {
                     published.route_generation,
                     Arc::clone(&published.gateway_listener_admission),
                 );
+                activate_listeners();
             })
             .is_some()
     }
@@ -21736,8 +21738,35 @@ pub async fn start_proxy_listener_with_tls_and_signal(
     tls_config: Option<Arc<rustls::ServerConfig>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
-    start_global_proxy_listener_with_tls_and_signal(
-        addr, state, shutdown, tls_config, None, started_tx,
+    start_proxy_listener_with_tls_and_accept_gate(
+        addr, state, shutdown, tls_config, started_tx, None,
+    )
+    .await
+}
+
+/// Start a Gateway listener whose accept loop remains parked until its exact
+/// config generation has published listener admission.
+pub(crate) async fn start_proxy_listener_with_tls_and_accept_gate(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::Static {
+            tls_config,
+            record_mesh_mtls_metric: false,
+        },
+        None,
+        false,
+        None,
+        started_tx,
+        accept_gate_rx,
     )
     .await
 }
@@ -21767,6 +21796,7 @@ pub async fn start_global_proxy_listener_with_tls_and_signal(
         false,
         frontend_proxy_protocol,
         started_tx,
+        None,
     )
     .await
 }
@@ -21791,6 +21821,30 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
     dual_stack: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
+    start_mesh_plaintext_listener_with_accept_gate(
+        addr,
+        state,
+        shutdown,
+        tls_config,
+        mesh_direction,
+        dual_stack,
+        started_tx,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_mesh_plaintext_listener_with_accept_gate(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    dual_stack: bool,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
         addr,
         state,
@@ -21803,6 +21857,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
         dual_stack,
         None,
         started_tx,
+        accept_gate_rx,
     )
     .await
 }
@@ -21879,6 +21934,31 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
     .await
 }
 
+pub(crate) async fn start_proxy_listener_with_dynamic_tls_and_accept_gate(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::Dynamic {
+            slot: tls_slot,
+            record_mesh_mtls_metric: false,
+        },
+        None,
+        false,
+        None,
+        started_tx,
+        accept_gate_rx,
+    )
+    .await
+}
+
 /// [`start_proxy_listener_with_dynamic_tls_and_signal`] for the process-global
 /// HTTPS proxy listener with its inbound PROXY protocol policy (issue #5768).
 ///
@@ -21904,6 +21984,7 @@ pub async fn start_global_proxy_listener_with_dynamic_tls_and_signal(
         false,
         frontend_proxy_protocol,
         started_tx,
+        None,
     )
     .await
 }
@@ -21938,6 +22019,7 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
         dual_stack,
         None,
         started_tx,
+        None,
     )
     .await
 }
@@ -22453,12 +22535,13 @@ fn resolve_node_waypoint_accept_identity(
 async fn start_proxy_listener_with_tls_source_and_signal(
     addr: SocketAddr,
     state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
     tls_source: ListenerTlsSource,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     dual_stack: bool,
     frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
     let configured_accept_threads = state.env_config.accept_threads.max(1);
@@ -22524,6 +22607,30 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         };
     let state = Arc::new(state);
 
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
+    if let Some(mut accept_gate_rx) = accept_gate_rx {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        while !*accept_gate_rx.borrow() {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+                changed = accept_gate_rx.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
     if !listeners.is_empty() {
         // Extra accept workers share the exclusive listen socket via dup'd
         // fds. Spawn them before running the primary loop so a clone failure
@@ -22559,10 +22666,6 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             "Proxy listener started on {} (backlog={}, accept_threads={})",
             addr, backlog, accept_threads
         );
-        if let Some(started_tx) = started_tx {
-            let _ = started_tx.send(());
-        }
-
         // Run thread 0 on the current task (avoids an extra spawn)
         run_accept_loop(
             first_listener,
@@ -22585,10 +22688,6 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     } else {
         // Single-listener mode (FERRUM_ACCEPT_THREADS=1) — no extra spawns
         info!("Proxy listener started on {} (backlog={})", addr, backlog);
-        if let Some(started_tx) = started_tx {
-            let _ = started_tx.send(());
-        }
-
         run_accept_loop(
             first_listener,
             state,
@@ -23345,7 +23444,7 @@ async fn handle_tls_connection(
         .get_ref()
         .1
         .server_name()
-        .map(str::to_ascii_lowercase);
+        .and_then(crate::proxy::sni::normalize_received_server_name);
 
     #[cfg(feature = "bench-h1-profile")]
     let profile_layer = if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {

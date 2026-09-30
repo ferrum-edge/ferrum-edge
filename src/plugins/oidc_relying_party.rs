@@ -25,7 +25,7 @@ use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
     NumericDateBound, VerifyOutcome, authentication_attempt_can_commit,
     commit_authentication_attempt, constant_time_eq, credential_deadline_from_unix_seconds,
-    nonblank_identity, numeric_date_seconds,
+    external_identity_realm_authority, nonblank_identity, numeric_date_seconds,
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
@@ -215,6 +215,10 @@ fn oidc_jwks_requirement() -> JwksRefreshRequirement {
 
 struct ProviderRuntime {
     issuer: String,
+    /// Verifying-authority digest (the configured issuer and the claim the
+    /// identity is read from) committed with every external principal this
+    /// provider vouches for.
+    identity_realm_authority: [u8; 32],
     discovery: Arc<ArcSwap<Option<DiscoveryDoc>>>,
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     client_id: String,
@@ -1240,8 +1244,22 @@ impl OidcRelyingParty {
         let claim_header_destinations =
             ClaimHeaderDestinations::from_mapping_groups(std::iter::once(claim_headers.as_slice()));
 
+        let consumer_identity_claim =
+            optional_string(provider_obj, "consumer_identity_claim", "provider[0]")?
+                .unwrap_or_else(|| "sub".to_string());
+        let identity_realm_authority = external_identity_realm_authority(
+            "oidc_relying_party",
+            &[
+                ("provider.issuer", Some(issuer.as_str())),
+                (
+                    "provider.identity_claim",
+                    Some(consumer_identity_claim.as_str()),
+                ),
+            ],
+        );
         let provider = Arc::new(ProviderRuntime {
             issuer,
+            identity_realm_authority,
             discovery,
             jwks_store,
             client_id,
@@ -1253,12 +1271,7 @@ impl OidcRelyingParty {
             callback_path,
             logout_path,
             post_logout_redirect_uri,
-            consumer_identity_claim: optional_string(
-                provider_obj,
-                "consumer_identity_claim",
-                "provider[0]",
-            )?
-            .unwrap_or_else(|| "sub".to_string()),
+            consumer_identity_claim,
             consumer_header_claim: optional_string(
                 provider_obj,
                 "consumer_header_claim",
@@ -1664,7 +1677,12 @@ impl OidcRelyingParty {
         // rotation, nor published by a principal-less/rejected/later attempt.
         let preflight_outcome = self.resolve_identity(&payload.claims, consumer_index);
         if !authentication_attempt_can_commit(ctx, &preflight_outcome, true) {
-            return apply_verify_outcome(ctx, AuthenticationAttempt::new(), preflight_outcome);
+            return apply_verify_outcome(
+                ctx,
+                AuthenticationAttempt::new(),
+                preflight_outcome,
+                self.provider.identity_realm_authority,
+            );
         }
 
         if claims_expired_before_refresh && payload.refresh_token_b64.is_some() {
@@ -1762,7 +1780,12 @@ impl OidcRelyingParty {
             &self.provider.claim_headers,
             ",",
         );
-        apply_verify_outcome(ctx, attempt, outcome)
+        apply_verify_outcome(
+            ctx,
+            attempt,
+            outcome,
+            self.provider.identity_realm_authority,
+        )
     }
 
     fn check_session_authorization(&self, claims: &Value) -> Result<(), (u16, String)> {
@@ -3201,9 +3224,11 @@ where
 
 fn apply_verify_outcome(
     ctx: &mut RequestContext,
-    attempt: AuthenticationAttempt,
+    mut attempt: AuthenticationAttempt,
     outcome: VerifyOutcome,
+    identity_realm_authority: [u8; 32],
 ) -> PluginResult {
+    attempt.stage_identity_realm_authority(identity_realm_authority);
     match commit_authentication_attempt(ctx, attempt, outcome, "oidc_relying_party", true) {
         Ok(_) => PluginResult::Continue,
         Err(VerifyOutcome::Forbidden(body)) => reject(403, body),

@@ -750,6 +750,7 @@ pub async fn run(
                         client_ca_bundle_path: h3_client_ca,
                         client_crls: h3_client_crls,
                         started_tx: Some(h3_started_tx),
+                        accept_gate_rx: None,
                         frontend_tls_reload: h3_reload,
                         udp_port_hold: None,
                     },

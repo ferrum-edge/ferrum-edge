@@ -35,6 +35,8 @@ use std::net::IpAddr;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::modes::mesh::config::canonical_mesh_condition_sni_value;
+
 // ---------------------------------------------------------------------------
 // Bounds
 // ---------------------------------------------------------------------------
@@ -578,7 +580,8 @@ fn compile_match(
         return Ok(CompiledMatch::Host(compile_string_match(value, "host")?));
     }
     if let Some(value) = &leaf.sni {
-        return Ok(CompiledMatch::Sni(compile_string_match(value, "sni")?));
+        let value = normalize_sni_string_match(value)?;
+        return Ok(CompiledMatch::Sni(compile_string_match(&value, "sni")?));
     }
     if let Some(field) = &leaf.header {
         note_http_only_field(budget, "header");
@@ -727,6 +730,48 @@ fn compile_token_list(
         out.push(normalize(value).into_boxed_str());
     }
     Ok(out)
+}
+
+/// Rewrite `sni` `exact` / `prefix` entries into the spelling of the received
+/// SNI, which every read site lowercases and strips of one trailing root dot.
+///
+/// This is the mesh `connection.sni` value spelling
+/// ([`crate::modes::mesh::config::canonical_mesh_condition_sni_value`]), so a
+/// trigger and a mesh policy written for the same name match the same
+/// connections: an `exact` entry drops one trailing dot, is ASCII-lowercased,
+/// and has a U-label converted to its A-label with IDNA. A `prefix` entry is
+/// converted as the prefix it is (a trailing `.` there is part of the prefix and
+/// stays): ASCII is lowercased and whole labels before a trailing `.` are
+/// converted. `regex` is left as written. An entry with non-ASCII text that
+/// cannot be converted is rejected.
+fn normalize_sni_string_match(
+    value: &PluginTriggerStringMatch,
+) -> Result<PluginTriggerStringMatch, String> {
+    let mut value = value.clone();
+    for (field, entries) in [("exact", &mut value.exact), ("prefix", &mut value.prefix)] {
+        let Some(entries) = entries.as_mut() else {
+            continue;
+        };
+        if entries.len() > MAX_TRIGGER_LIST_LEN {
+            // `compile_string_match` reports the bound; skip the IDNA work.
+            continue;
+        }
+        for entry in entries.iter_mut() {
+            check_value_len(entry, "sni")?;
+            let canonical = if field == "exact" {
+                canonical_mesh_condition_sni_value(entry)
+            } else {
+                // A prefix is the wildcard value `<prefix>*` minus its `*`.
+                canonical_mesh_condition_sni_value(&format!("{entry}*"))
+                    .map(|pattern| pattern.strip_suffix('*').unwrap_or(&pattern).to_string())
+            };
+            *entry = match canonical {
+                Ok(canonical) => canonical,
+                Err(reason) => return Err(format!("trigger: `sni` {field} entry {reason}")),
+            };
+        }
+    }
+    Ok(value)
 }
 
 fn check_value_len(value: &str, label: &str) -> Result<(), String> {

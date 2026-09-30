@@ -2088,6 +2088,38 @@ Every key documented in Istio's [AuthorizationPolicy conditions](https://istio.i
 
 **`connection.sni` on cross-cluster traffic.** A destination sidecar or terminator reads the ClientHello SNI the client sent through the east-west gateway. That SNI is the per-port [east-west alias](#multi-port-cross-cluster-sni-aliases), `p<port>.<service>.<namespace>.svc.<cluster-domain>` (or `p<port>-udp.…` for UDP), for single-port and multi-port services alike. A `connection.sni` value written against the bare service FQDN therefore never matches cross-cluster traffic, and a DENY rule written that way does not apply to it. Match the alias instead, or use a suffix match such as `*.reviews.default.svc.cluster.local` to cover every port.
 
+The same holds for `notValues`: a bare-FQDN `notValues` entry does not exclude cross-cluster traffic, so a DENY rule with `notValues: ["reviews.default.svc.cluster.local"]` still denies it. To deny every port of a service to cross-cluster clients, match the aliases with a suffix:
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-reviews-sni
+  namespace: default
+spec:
+  action: DENY
+  rules:
+  - when:
+    - key: connection.sni
+      # Matches p9080.reviews.default.svc.cluster.local,
+      # p5353-udp.reviews.default.svc.cluster.local, and every other alias.
+      values: ["*.reviews.default.svc.cluster.local"]
+```
+
+The suffix match requires the leading `.`, so it does not match the bare FQDN itself. Add `reviews.default.svc.cluster.local` to `values` if a client also sends that SNI. To name one port, list its alias, for example `p9080.reviews.default.svc.cluster.local`.
+
+**Bare-FQDN warning.** When a data plane prepares a mesh slice, it logs a warning when an exact `connection.sni` value names a service's bare FQDN. This covers `values` and `notValues` under any action. The warning names the policy and the value and suggests `*.<fqdn>` or the explicit `p<port>[-udp].<fqdn>` aliases. It is logged once per policy and value. A value counts as a bare FQDN when it equals the base FQDN of a service in the slice, or when it has the Kubernetes Service FQDN shape `<service>.<namespace>.svc.<cluster-domain>` for the proxy's cluster domain. The shape check covers services outside the proxy's service view, such as those a Sidecar egress scope leaves out. Values containing `*` and the `p<port>[-udp].<fqdn>` aliases are never reported. The warning does not change matching.
+
+**`connection.sni` value spelling.** Values are compared as strings with the received ClientHello SNI. Ferrum lowercases every received SNI. On TLS-terminated HTTP/1.1, HTTP/2, HTTP/3, and TCP connections, rustls accepts a trailing root dot (`admin.example.com.`), and Ferrum strips exactly one before policy sees the name. Ferrum's own ClientHello parser, used where Ferrum reads a ClientHello without terminating TLS, refuses a trailing dot. Every configuration surface (Kubernetes translation, file and native config, and `mesh_authz` construction) normalizes `connection.sni` values at load to the same spelling:
+
+- A single trailing `.` is stripped. A value ending in `..` is left as written; it never matches.
+- ASCII is lowercased.
+- A non-ASCII (U-label) name is converted to its A-label (`xn--…`) with IDNA, so `bücher.example` becomes `xn--bcher-kva.example`. IDNA maps the ideographic and fullwidth full stops (`。`, `．`, `｡`) to `.`, and a trailing dot the conversion produces is stripped too. In a wildcard value, only the whole labels after a leading `*.` or before a trailing `.*` are converted (`*.bücher.example` becomes `*.xn--bcher-kva.example`).
+
+This makes Ferrum looser than Istio on Envoy for these spellings. Envoy compares the policy text as written, so a value with a trailing dot or a U-label never matches there. In Ferrum it matches the normalized SNI. For an ALLOW rule, that means Ferrum admits connections that Envoy would not; for a DENY rule, Ferrum enforces a rule that is inert on Envoy. Write the lowercase A-label without a trailing dot to get the same behavior on both.
+
+A non-ASCII value that cannot be converted is rejected with a field-specific validation error, in `values` and in `notValues`. Conversion fails when IDNA refuses the name, when the non-ASCII text sits in a label that a `*` only partly covers (`bü*`), or when the non-ASCII value also contains `%`. On Kubernetes, that error means the AuthorizationPolicy is not installed, so write such a name as its A-label. Other ASCII characters that DNS hostnames do not allow are not rejected either. A value containing a space or `/`, for example, is admitted and never matches.
+
 ##### Value grammars (per key)
 
 Istio does **not** compile every condition key to the same matcher, and Ferrum follows it key by key. Treating them uniformly is not a cosmetic simplification: a value that silently never matches is fail-OPEN for a DENY.
