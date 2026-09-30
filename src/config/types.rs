@@ -4314,7 +4314,10 @@ impl GatewayConfig {
                 ));
             }
             if listen_path_requires_path_parameters(path) && !proxy.allow_path_parameters {
-                errors.push(format!("Proxy {:?}: {LISTEN_PATH_PARAMETER_ERROR}", proxy.id));
+                errors.push(format!(
+                    "Proxy {:?}: {LISTEN_PATH_PARAMETER_ERROR}",
+                    proxy.id
+                ));
             }
         }
         if errors.is_empty() {

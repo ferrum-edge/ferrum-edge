@@ -2270,7 +2270,10 @@ async fn a2a_policy_covers_request_shapes_before_any_upstream_connection() {
     }
     // Empty-segment spellings are refused at the frontend boundary before the
     // policy runs (GHSA-fcqw-793q-wg5x), which is at least as strict.
-    for path in ["/a2a//message:send", "/a2a/tasks/t1//pushNotificationConfigs"] {
+    for path in [
+        "/a2a//message:send",
+        "/a2a/tasks/t1//pushNotificationConfigs",
+    ] {
         let response = client
             .request(reqwest::Method::POST, &harness.proxy_url(path))
             .header("content-type", "application/json")

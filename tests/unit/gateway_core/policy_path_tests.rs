@@ -7,8 +7,9 @@
 use std::borrow::Cow;
 
 use ferrum_edge::policy_path::{
-    PolicyPathRejection, canonicalize_policy_path, canonicalize_request_path, check_path_parameters,
-    non_canonical_policy_path_pattern_reason, non_canonical_policy_path_reason,
+    PolicyPathRejection, canonicalize_policy_path, canonicalize_request_path,
+    check_path_parameters, non_canonical_policy_path_pattern_reason,
+    non_canonical_policy_path_reason,
 };
 
 fn canonical(path: &str) -> String {
