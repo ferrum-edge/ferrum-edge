@@ -3808,6 +3808,112 @@ fn mesh_policy_enforces_istio_source_trust_domain_value_grammar() {
     }
 }
 
+/// A received ClientHello SNI is ASCII and never ends with `.`, so a
+/// `connection.sni` value with a trailing dot or a non-ASCII (U-label) spelling
+/// could never match. That is fail-OPEN for a DENY, so both are rejected on
+/// `values` and `notValues`, and the diagnostic never echoes the value.
+#[test]
+fn mesh_policy_rejects_connection_sni_trailing_dot_and_u_label_values() {
+    let rejected: Vec<(String, &str)> = vec![
+        (format!("{ECHO_PROBE}.example."), "must not end with '.'"),
+        (format!("*.{ECHO_PROBE}.example."), "must not end with '.'"),
+        (format!("{ECHO_PROBE}.bücher.example"), "must be ASCII"),
+    ];
+    for (value, reason) in &rejected {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("connection.sni", direction, value);
+            assert!(
+                errors.iter().any(|e| {
+                    e.contains(&format!("rules[0].when[0].{direction}[0]")) && e.contains(reason)
+                }),
+                "expected a '{reason}' diagnostic on {direction} for '{value}', got: {errors:?}"
+            );
+            assert!(
+                !errors.iter().any(|e| e.contains(ECHO_PROBE)),
+                "a connection.sni diagnostic must not echo the value, got: {errors:?}"
+            );
+        }
+    }
+    let u_label_errors = errors_for_condition("connection.sni", "values", "bücher.example");
+    assert!(
+        u_label_errors.iter().any(|e| e.contains("A-label")),
+        "the U-label diagnostic must point the operator at the A-label, got: {u_label_errors:?}"
+    );
+
+    for accepted in [
+        "xn--bcher-kva.example",
+        "Admin.Example.COM",
+        "*.reviews.default.svc.cluster.local",
+        "p9080.reviews.default.svc.cluster.local",
+        "api.*",
+        "*",
+    ] {
+        for direction in ["values", "not_values"] {
+            let errors = errors_for_condition("connection.sni", direction, accepted);
+            assert!(
+                errors.is_empty(),
+                "'{accepted}' is a valid connection.sni {direction} entry, got: {errors:?}"
+            );
+        }
+    }
+
+    // The SNI spelling rules are specific to `connection.sni`: another
+    // string-matcher key keeps accepting a trailing dot and non-ASCII text.
+    for value in ["example.com.", "bücher"] {
+        let errors = errors_for_condition("request.headers[x-host]", "values", value);
+        assert!(
+            errors.is_empty(),
+            "request.headers values keep the generic grammar for '{value}', got: {errors:?}"
+        );
+    }
+}
+
+/// `connection.sni` values are ASCII-lowercased at load, matching the
+/// lowercased received SNI; other condition keys keep their case.
+#[test]
+fn mesh_config_normalize_lowercases_connection_sni_condition_values() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".into(),
+        values: vec![
+            "Admin.Example.COM".into(),
+            "*.Reviews.Default.SVC.Cluster.Local".into(),
+        ],
+        not_values: vec!["P9080.Reviews.Default.SVC.Cluster.Local".into()],
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "request.headers[x-tenant]".into(),
+        values: vec!["Tenant-A".into()],
+        not_values: Vec::new(),
+    });
+    let mut config = MeshConfig {
+        mesh_policies: vec![policy],
+        ..MeshConfig::default()
+    };
+    config.normalize();
+
+    let when = &config.mesh_policies[0].rules[0].when;
+    assert_eq!(
+        when[0].values,
+        vec![
+            "admin.example.com".to_string(),
+            "*.reviews.default.svc.cluster.local".to_string(),
+        ]
+    );
+    assert_eq!(
+        when[0].not_values,
+        vec!["p9080.reviews.default.svc.cluster.local".to_string()]
+    );
+    assert_eq!(
+        when[1].values,
+        vec!["Tenant-A".to_string()],
+        "only connection.sni values are lowercased"
+    );
+}
+
 /// `source.namespace` keeps Istio's `srcNamespaceGenerator` grammar, where every
 /// `*` is an arbitrary substring. A mid-string or repeated star is therefore
 /// valid input and must not be rejected as it is for `source.trustDomain`.

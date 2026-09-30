@@ -1842,6 +1842,14 @@ pub fn validate_mesh_condition(
                         issues.push(MeshConditionIssue::value(field, index, reason));
                     }
                 }
+                // `connection.sni` keeps the generic string matcher below, but
+                // its values must be spelled the way a received ClientHello
+                // SNI is (see `validate_mesh_condition_sni`).
+                MeshConditionKeyKind::ConnectionSni => {
+                    if let Err(reason) = validate_mesh_condition_sni(value) {
+                        issues.push(MeshConditionIssue::value(field, index, reason));
+                    }
+                }
                 _ => {
                     // The remaining string-match keys follow Istio's
                     // `matcher.StringMatcherWithPrefix` grammar: exact / `*`
@@ -1924,6 +1932,52 @@ fn validate_mesh_condition_trust_domain(value: &str) -> Result<(), &'static str>
         1 if value.starts_with('*') || value.ends_with('*') => Ok(()),
         1 => Err("supports '*' only as a leading or trailing wildcard"),
         _ => Err("supports at most one '*', as a leading or trailing wildcard"),
+    }
+}
+
+/// `connection.sni` value spelling.
+///
+/// The value is compared with the received ClientHello SNI, which the listener
+/// ASCII-lowercases and refuses unless it is a representable DNS name
+/// (`crate::proxy::sni`): a received SNI is always ASCII and never ends with
+/// `.`. Case is normalized at load ([`normalize_mesh_condition_values`]). A
+/// trailing dot or a non-ASCII (U-label) value could never match, which is
+/// fail-OPEN for a DENY, so both are rejected. Diagnostics never echo the value.
+fn validate_mesh_condition_sni(value: &str) -> Result<(), &'static str> {
+    if !value.is_ascii() {
+        return Err(
+            "must be ASCII (connection.sni is compared with the ClientHello SNI, which carries \
+             an internationalized name as its A-label; write the A-label 'xn--...' instead of \
+             the U-label)",
+        );
+    }
+    if value.ends_with('.') {
+        return Err(
+            "must not end with '.' (connection.sni is compared with the ClientHello SNI, which \
+             never carries a trailing dot; remove it)",
+        );
+    }
+    Ok(())
+}
+
+/// Normalize one `when[]` entry's values at load so the request path compares
+/// them without re-normalizing.
+///
+/// `connection.sni` values are ASCII-lowercased, matching the received
+/// ClientHello SNI they are compared with. Every other key is left as written.
+/// Idempotent. Runs on every surface that loads a policy: Kubernetes
+/// translation, file/native `MeshConfig` normalization, and `mesh_authz`
+/// construction.
+pub(crate) fn normalize_mesh_condition_values(condition: &mut ConditionMatch) {
+    if condition.key != CONDITION_CONNECTION_SNI {
+        return;
+    }
+    for value in condition
+        .values
+        .iter_mut()
+        .chain(condition.not_values.iter_mut())
+    {
+        value.make_ascii_lowercase();
     }
 }
 
@@ -8506,6 +8560,9 @@ pub(crate) fn normalize_mesh_hostname_like(value: &str) -> String {
 fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
     for policy in policies {
         for rule in &mut policy.rules {
+            for condition in &mut rule.when {
+                normalize_mesh_condition_values(condition);
+            }
             for request in &mut rule.to {
                 for host in &mut request.hosts {
                     *host = normalize_request_match_host_pattern(host);

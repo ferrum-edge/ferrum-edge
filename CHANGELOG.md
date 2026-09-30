@@ -267,6 +267,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Mesh `connection.sni` condition values are normalized and checked at
+  load.** Values are lowercased on every surface that loads a policy
+  (Kubernetes translation, file and native config, and `mesh_authz`
+  construction), matching the lowercased ClientHello SNI they are compared
+  with. A value that ends in `.` or contains a non-ASCII character could never
+  match and is now a validation error, in `values` and `notValues`; write an
+  internationalized name as its A-label (`xn--…`). A mesh data plane also logs
+  a one-time warning, naming the policy, when an exact `connection.sni` value
+  names a service's bare FQDN (`<service>.<namespace>.svc.<cluster-domain>`).
+  Cross-cluster traffic carries the `p<port>[-udp].<fqdn>` alias, so such a
+  value never matches it; the warning suggests `*.<fqdn>` or the explicit
+  aliases. Matching is unchanged: `connection.sni` stays Istio's plain string
+  match.
+
 - **HTTP/1 over TLS moves bulk bodies in large reads** (#5588). tokio-rustls
   returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher used
   to carry bulk bodies 16 KiB at a time, paying its per-chunk path (decode,

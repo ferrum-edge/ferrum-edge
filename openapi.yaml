@@ -23608,11 +23608,15 @@ components:
         malformed values, non-numeric
         `destination.port` values, malformed IP CIDRs, a `source.serviceAccount`
         with a `*` or more than one `/`, a `source.trustDomain` with a `/` or a
-        repeated/mid-string `*`, and collections over 64 `when[]` entries per
+        repeated/mid-string `*`, a `connection.sni` value that ends in `.` or
+        contains a non-ASCII character (write the A-label `xn--...`), and
+        collections over 64 `when[]` entries per
         rule or 256 values per list (16 values of at most 320 bytes for
         `source.serviceAccount`) — are rejected during translation/config
         validation with a field-specific diagnostic, on both `values` and
         `notValues`, so DENY conditions cannot silently fail open.
+        `connection.sni` values are lowercased at load to match the lowercased
+        ClientHello SNI.
         An attribute the path CAN source but that this request lacks follows
         ordinary Istio semantics (a `values` check fails; a `notValues`-only
         check passes). An attribute the path can NEVER source — an HTTP-only key

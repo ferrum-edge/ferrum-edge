@@ -1644,6 +1644,7 @@ fn prepare_normalized_gateway_config_for_mesh(
         ));
     }
 
+    warn_connection_sni_bare_service_fqdn(mesh_slice, &runtime.cluster_domain);
     materialize_sidecar_l4_source_selectors(&mut config, runtime, mesh_slice);
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
@@ -4537,6 +4538,61 @@ fn warn_east_west_gateway_base_fqdn_only(
             "EastWestGateway sni_hosts names a local service's base FQDN but none of its \
              p<port> aliases; cross-cluster clients dial only the aliases, so this entry's \
              route is never used and the auto-materialized alias routes carry the traffic"
+        );
+    }
+}
+
+/// `connection.sni` condition values already warned about naming a service's
+/// bare FQDN, keyed by policy `<namespace>/<name>` plus the value, so the
+/// advisory fires once per value rather than on every slice. Bounded: past the
+/// cap the advisory is not repeated.
+static CONNECTION_SNI_BARE_FQDN_WARNED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+const CONNECTION_SNI_BARE_FQDN_WARN_MAX_KEYS: usize = 1024;
+
+/// Warn once per policy value when an exact `connection.sni` value (in
+/// `values` or `notValues`, under any action) names a mesh service's bare FQDN
+/// (see [`crate::modes::mesh::policy::find_bare_service_fqdn_sni_conditions`]).
+///
+/// Cross-cluster traffic arrives with the `p<port>.<fqdn>` /
+/// `p<port>-udp.<fqdn>` alias as its SNI, so that value never matches it: a
+/// DENY written that way does not apply to cross-cluster traffic, and a
+/// `notValues` exclusion does not exclude it. Matching is deliberately
+/// unchanged (Istio's plain string match); this only tells the operator.
+fn warn_connection_sni_bare_service_fqdn(mesh_slice: &MeshSlice, cluster_domain: &str) {
+    let findings = crate::modes::mesh::policy::find_bare_service_fqdn_sni_conditions(
+        &mesh_slice.mesh_policies,
+        &mesh_slice.services,
+        cluster_domain,
+    );
+    if findings.is_empty() {
+        return;
+    }
+    let warned =
+        CONNECTION_SNI_BARE_FQDN_WARNED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    for finding in findings {
+        let key = format!(
+            "{}/{}\n{}",
+            finding.policy_namespace, finding.policy_name, finding.value
+        );
+        let first = {
+            let mut warned = warned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            warned.len() < CONNECTION_SNI_BARE_FQDN_WARN_MAX_KEYS && warned.insert(key)
+        };
+        if !first {
+            continue;
+        }
+        warn!(
+            policy = %sanitize_startup_scalar(&finding.policy_name),
+            namespace = %sanitize_startup_scalar(&finding.policy_namespace),
+            sni_value = %sanitize_startup_scalar(&finding.value),
+            suggested_value = %sanitize_startup_scalar(format!("*.{}", finding.value)),
+            "Mesh policy connection.sni value names a service's bare FQDN; cross-cluster \
+             traffic arrives with the east-west alias SNI p<port>.<fqdn> (p<port>-udp.<fqdn> \
+             for UDP) and never matches it. To cover cross-cluster traffic, use \
+             `*.<fqdn>` or the explicit p<port>[-udp].<fqdn> aliases"
         );
     }
 }

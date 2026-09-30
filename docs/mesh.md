@@ -2088,6 +2088,30 @@ Every key documented in Istio's [AuthorizationPolicy conditions](https://istio.i
 
 **`connection.sni` on cross-cluster traffic.** A destination sidecar or terminator reads the ClientHello SNI the client sent through the east-west gateway. That SNI is the per-port [east-west alias](#multi-port-cross-cluster-sni-aliases), `p<port>.<service>.<namespace>.svc.<cluster-domain>` (or `p<port>-udp.…` for UDP), for single-port and multi-port services alike. A `connection.sni` value written against the bare service FQDN therefore never matches cross-cluster traffic, and a DENY rule written that way does not apply to it. Match the alias instead, or use a suffix match such as `*.reviews.default.svc.cluster.local` to cover every port.
 
+The same holds for `notValues`: a bare-FQDN `notValues` entry does not exclude cross-cluster traffic, so a DENY rule with `notValues: ["reviews.default.svc.cluster.local"]` still denies it. To deny every port of a service to cross-cluster clients, match the aliases with a suffix:
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-reviews-sni
+  namespace: default
+spec:
+  action: DENY
+  rules:
+  - when:
+    - key: connection.sni
+      # Matches p9080.reviews.default.svc.cluster.local,
+      # p5353-udp.reviews.default.svc.cluster.local, and every other alias.
+      values: ["*.reviews.default.svc.cluster.local"]
+```
+
+The suffix match requires the leading `.`, so it does not match the bare FQDN itself. Add `reviews.default.svc.cluster.local` to `values` if a client also sends that SNI. To name one port, list its alias, for example `p9080.reviews.default.svc.cluster.local`.
+
+**Bare-FQDN warning.** When a data plane prepares a mesh slice, it logs a warning when an exact `connection.sni` value names a service's bare FQDN. This covers `values` and `notValues` under any action. The warning names the policy and the value and suggests `*.<fqdn>` or the explicit `p<port>[-udp].<fqdn>` aliases. It is logged once per policy and value. A value counts as a bare FQDN when it equals the base FQDN of a service in the slice, or when it has the Kubernetes Service FQDN shape `<service>.<namespace>.svc.<cluster-domain>` for the proxy's cluster domain. The shape check covers services outside the proxy's service view, such as those a Sidecar egress scope leaves out. Values containing `*` and the `p<port>[-udp].<fqdn>` aliases are never reported. The warning does not change matching.
+
+**`connection.sni` value spelling.** Values are compared with the received ClientHello SNI, which Ferrum lowercases and refuses unless it is an ASCII DNS name without a trailing dot. Every configuration surface (Kubernetes translation, file and native config, and `mesh_authz` construction) lowercases `connection.sni` values at load. A value that ends in `.` or contains a non-ASCII character is rejected with a field-specific validation error, in `values` and in `notValues`. Remove the trailing dot, and write an internationalized name as its A-label (`xn--…`), not its U-label.
+
 ##### Value grammars (per key)
 
 Istio does **not** compile every condition key to the same matcher, and Ferrum follows it key by key. Treating them uniformly is not a cosmetic simplification: a value that silently never matches is fail-OPEN for a DENY.

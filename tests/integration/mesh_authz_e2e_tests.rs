@@ -45,9 +45,12 @@ use std::sync::Arc;
 
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, DEFAULT_TRUST_DOMAIN, default_mesh_runtime, mesh_config_with,
-    policy_allow_principal, policy_audit_principal, policy_deny_principal,
+    policy_allow_principal, policy_audit_principal, policy_deny_principal, service_for,
 };
 use ferrum_edge::modes::mesh::config::MeshConfig;
+use ferrum_edge::modes::mesh::policy::{
+    BareServiceFqdnSniCondition, find_bare_service_fqdn_sni_conditions,
+};
 use ferrum_edge::modes::mesh::{MESH_AUTHZ_PLUGIN_ID, prepare_gateway_config_for_mesh};
 
 const CLIENT_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/client";
@@ -3258,5 +3261,266 @@ async fn canonical_path_gate_does_not_disturb_the_allow_implicit_deny_floor() {
         deny_policy.map(String::as_str),
         Some("implicit-deny"),
         "an ordinary non-match must not be attributed to the canonical-path gate"
+    );
+}
+
+// ── connection.sni and east-west per-port aliases ──────────────────────────
+//
+// Cross-cluster traffic reaches the destination with the per-port east-west
+// alias `p<port>.<fqdn>` (`p<port>-udp.<fqdn>` for UDP) as its SNI, never the
+// bare service FQDN. `connection.sni` stays Istio's plain string match. These
+// tests pin that a bare-FQDN value never matches an alias on the HTTP, TCP, or
+// UDP path, that `*.<fqdn>` covers every alias, and that such a value is
+// reported for the load-time operator warning.
+
+const REVIEWS_FQDN: &str = "reviews.default.svc.cluster.local";
+const REVIEWS_TCP_ALIAS: &str = "p443.reviews.default.svc.cluster.local";
+const REVIEWS_UDP_ALIAS: &str = "p5353-udp.reviews.default.svc.cluster.local";
+const REVIEWS_WILDCARD: &str = "*.reviews.default.svc.cluster.local";
+
+/// A mesh-inbound stream whose ClientHello (TLS) or DTLS ClientHello carried
+/// `sni`.
+fn sni_stream_ctx(scheme: BackendScheme, sni: &str) -> StreamConnectionContext {
+    let mut ctx = StreamConnectionContext::new(
+        "10.0.0.7".to_string(),
+        "10.0.0.7".to_string(),
+        "__mesh-sni-under-test".to_string(),
+        None,
+        9443,
+        scheme,
+        Arc::new(ConsumerIndex::new(&[] as &[Consumer])),
+    );
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    ctx.insert_metadata("peer_spiffe_id".to_string(), CLIENT_SPIFFE.to_string());
+    ctx.sni_hostname = Some(sni.to_string());
+    ctx
+}
+
+fn rejected(result: PluginResult) -> bool {
+    matches!(result, PluginResult::Reject { .. })
+}
+
+/// Whether `plugin` rejects a connection carrying `sni` on the HTTP path, the
+/// TCP stream path, and the UDP stream path, in that order.
+async fn sni_rejections(plugin: &MeshAuthz, sni: &str) -> [bool; 3] {
+    let mut http = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    http.frontend_sni_hostname = Some(sni.to_string());
+    let mut tcp = sni_stream_ctx(BackendScheme::Tcp, sni);
+    let mut udp = sni_stream_ctx(BackendScheme::Udp, sni);
+    [
+        rejected(plugin.authorize(&mut http).await),
+        rejected(plugin.on_stream_connect(&mut tcp).await),
+        rejected(plugin.on_stream_connect(&mut udp).await),
+    ]
+}
+
+#[tokio::test]
+async fn connection_sni_bare_fqdn_deny_value_never_matches_east_west_aliases() {
+    let deny = condition_policy(
+        "deny-reviews-sni",
+        PolicyAction::Deny,
+        "connection.sni",
+        vec![REVIEWS_FQDN],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+    assert_eq!(
+        sni_rejections(&plugin, REVIEWS_FQDN).await,
+        [true; 3],
+        "an exact DENY value matches its own spelling on every path"
+    );
+    for alias in [REVIEWS_TCP_ALIAS, REVIEWS_UDP_ALIAS] {
+        assert_eq!(
+            sni_rejections(&plugin, alias).await,
+            [false; 3],
+            "an exact bare-FQDN DENY value is a plain string match and must not match {alias}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connection_sni_bare_fqdn_deny_not_values_still_fires_for_east_west_aliases() {
+    let deny = condition_policy(
+        "deny-except-reviews-sni",
+        PolicyAction::Deny,
+        "connection.sni",
+        Vec::new(),
+        vec![REVIEWS_FQDN],
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+    assert_eq!(
+        sni_rejections(&plugin, REVIEWS_FQDN).await,
+        [false; 3],
+        "the notValues entry excludes its own spelling"
+    );
+    for alias in [REVIEWS_TCP_ALIAS, REVIEWS_UDP_ALIAS] {
+        assert_eq!(
+            sni_rejections(&plugin, alias).await,
+            [true; 3],
+            "a bare-FQDN notValues entry does not exclude {alias}, so the DENY fires"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connection_sni_wildcard_suffix_deny_covers_every_east_west_alias() {
+    let deny = condition_policy(
+        "deny-reviews-aliases",
+        PolicyAction::Deny,
+        "connection.sni",
+        vec![REVIEWS_WILDCARD],
+        Vec::new(),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+    for alias in [REVIEWS_TCP_ALIAS, REVIEWS_UDP_ALIAS] {
+        assert_eq!(
+            sni_rejections(&plugin, alias).await,
+            [true; 3],
+            "`*.<fqdn>` must deny the east-west alias {alias} on every path"
+        );
+    }
+    assert_eq!(
+        sni_rejections(&plugin, REVIEWS_FQDN).await,
+        [false; 3],
+        "a suffix match requires the leading '.', so it does not match the bare FQDN"
+    );
+}
+
+#[tokio::test]
+async fn connection_sni_values_are_lowercased_when_mesh_authz_is_built() {
+    // Built straight from `mesh_policies`, bypassing `MeshConfig::normalize()`,
+    // the way an xDS / MeshSubscribe slice reaches the plugin.
+    let deny = condition_policy(
+        "deny-mixed-case-sni",
+        PolicyAction::Deny,
+        "connection.sni",
+        vec!["P443.Reviews.Default.SVC.Cluster.Local"],
+        Vec::new(),
+    );
+    let config = json!({ "mesh_policies": [deny] });
+    let plugin = MeshAuthz::new(&config).expect("plugin builds");
+
+    assert_eq!(
+        sni_rejections(&plugin, REVIEWS_TCP_ALIAS).await,
+        [true; 3],
+        "a mixed-case value must match the lowercased received SNI"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_connection_sni_trailing_dot_and_u_label_values() {
+    let trailing_dot = "reviews.default.svc.cluster.local.";
+    for (values, not_values, reason) in [
+        (vec![trailing_dot], Vec::new(), "must not end with '.'"),
+        (Vec::new(), vec!["bücher.example"], "A-label"),
+    ] {
+        let deny = condition_policy(
+            "deny-unmatchable-sni",
+            PolicyAction::Deny,
+            "connection.sni",
+            values,
+            not_values,
+        );
+        let config = json!({ "mesh_policies": [deny] });
+        let err = match MeshAuthz::new(&config) {
+            Ok(_) => panic!("an unmatchable connection.sni value must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("connection.sni") && err.contains(reason),
+            "expected a '{reason}' construction error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn bare_service_fqdn_sni_values_are_reported_for_the_load_time_warning() {
+    let services = vec![
+        service_for("reviews", DEFAULT_NAMESPACE, &[]),
+        // A native service name is not limited to one DNS label, so only the
+        // known-service comparison can recognize its base FQDN.
+        service_for("legacy.api", DEFAULT_NAMESPACE, &[]),
+    ];
+    let deny_values = condition_policy(
+        "deny-values",
+        PolicyAction::Deny,
+        "connection.sni",
+        vec![
+            "Reviews.Default.svc.cluster.local",
+            "legacy.api.default.svc.cluster.local",
+        ],
+        vec![REVIEWS_FQDN],
+    );
+    let allow_not_values = condition_policy(
+        "allow-not-values",
+        PolicyAction::Allow,
+        "connection.sni",
+        Vec::new(),
+        vec![REVIEWS_FQDN],
+    );
+    // Not in this proxy's service view: reported by the Kubernetes Service
+    // FQDN shape `<service>.<namespace>.svc.<cluster-domain>`.
+    let audit_unknown_service = condition_policy(
+        "audit-unknown-service",
+        PolicyAction::Audit,
+        "connection.sni",
+        vec!["ratings.prod.svc.cluster.local"],
+        Vec::new(),
+    );
+    let never_reported = condition_policy(
+        "never-reported",
+        PolicyAction::Deny,
+        "connection.sni",
+        vec![
+            REVIEWS_TCP_ALIAS,
+            REVIEWS_UDP_ALIAS,
+            REVIEWS_WILDCARD,
+            "reviews.default.svc.*",
+            "*",
+            "api.example.com",
+            "reviews.default.svc.other.domain",
+            "default.svc.cluster.local",
+        ],
+        vec![REVIEWS_TCP_ALIAS],
+    );
+    let other_key = condition_policy(
+        "other-key",
+        PolicyAction::Deny,
+        "request.headers[host]",
+        vec![REVIEWS_FQDN],
+        Vec::new(),
+    );
+    let policies = vec![
+        deny_values,
+        allow_not_values,
+        audit_unknown_service,
+        never_reported,
+        other_key,
+    ];
+
+    let finding = |policy: &str, value: &str| BareServiceFqdnSniCondition {
+        policy_namespace: DEFAULT_NAMESPACE.to_string(),
+        policy_name: policy.to_string(),
+        value: value.to_string(),
+    };
+    let expected = vec![
+        finding("deny-values", REVIEWS_FQDN),
+        finding("deny-values", "legacy.api.default.svc.cluster.local"),
+        finding("allow-not-values", REVIEWS_FQDN),
+        finding("audit-unknown-service", "ratings.prod.svc.cluster.local"),
+    ];
+    assert_eq!(
+        find_bare_service_fqdn_sni_conditions(&policies, &services, "cluster.local"),
+        expected,
+        "bare service FQDNs in values and notValues are reported once per policy, under any \
+         action; aliases, wildcards, other domains, and other keys are not"
+    );
+    assert_eq!(
+        find_bare_service_fqdn_sni_conditions(&policies, &services, "cluster.local."),
+        expected,
+        "a trailing dot on the cluster domain does not change the result"
     );
 }

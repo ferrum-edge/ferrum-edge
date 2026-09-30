@@ -56,9 +56,10 @@ use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
     MAX_MESH_RULE_CONDITIONS, MeshPolicy, PolicyScope, WaypointAttachment,
-    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
-    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
-    resolve_target_port, validate_mesh_condition, workload_selector_matches,
+    normalize_mesh_condition_values, normalize_request_match_host_pattern,
+    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    policy_target_attachment_applies_to_service, resolve_target_port, validate_mesh_condition,
+    workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -1590,6 +1591,12 @@ fn normalize_authz_policies(policies: &mut [MeshPolicy]) {
     for policy in policies {
         normalize_mesh_policy_header_names(policy);
         for rule in &mut policy.rules {
+            // A slice arriving over xDS / MeshSubscribe never passed
+            // `MeshConfig::normalize()`, so lowercase `connection.sni` values
+            // here too; the received SNI they are compared with is lowercase.
+            for condition in &mut rule.when {
+                normalize_mesh_condition_values(condition);
+            }
             for request in &mut rule.to {
                 for host in &mut request.hosts {
                     *host = normalize_request_match_host_pattern(host);

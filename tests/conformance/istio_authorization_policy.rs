@@ -936,6 +936,51 @@ fn authz_rejects_malformed_and_unbounded_when_conditions() {
         "a control character in a condition value must fail closed: {control_char}"
     );
 
+    // The received ClientHello SNI is ASCII and never ends with `.`, so these
+    // `connection.sni` spellings could never match and must fail closed.
+    let trailing_dot = condition_translation_error("connection.sni", json!(["admin.example."]));
+    assert!(
+        trailing_dot.contains("rules[].when[0].values[0]")
+            && trailing_dot.contains("must not end with '.'"),
+        "a trailing-dot connection.sni value must fail closed: {trailing_dot}"
+    );
+    let u_label = condition_translation_error("connection.sni", json!(["bücher.example"]));
+    assert!(
+        u_label.contains("rules[].when[0].values[0]") && u_label.contains("A-label"),
+        "a U-label connection.sni value must fail closed and name the A-label: {u_label}"
+    );
+    let not_values_u_label = translate_k8s_objects(
+        &[authz_policy(json!({
+            "action": "DENY",
+            "rules": [{"when": [{"key": "connection.sni", "notValues": ["bücher.example"]}]}]
+        }))],
+        options(),
+    )
+    .expect_err("a U-label connection.sni notValues entry must fail closed")
+    .to_string();
+    assert!(
+        not_values_u_label.contains("rules[].when[0].notValues[0]")
+            && not_values_u_label.contains("must be ASCII"),
+        "a U-label connection.sni notValues entry must fail closed: {not_values_u_label}"
+    );
+
+    // Case is normalized instead: the translated values are lowercase, so they
+    // compare directly with the lowercased received SNI.
+    let mixed_case = condition_policy(
+        "DENY",
+        "connection.sni",
+        json!(["Admin.Example.COM"]),
+        json!(["*.Public.Example.COM"]),
+    );
+    assert_eq!(
+        mixed_case.rules[0].when[0].values,
+        vec!["admin.example.com"]
+    );
+    assert_eq!(
+        mixed_case.rules[0].when[0].not_values,
+        vec!["*.public.example.com"]
+    );
+
     let long_key = format!("request.headers[{}]", "a".repeat(300));
     let long = condition_translation_error(&long_key, json!(["x"]));
     assert!(

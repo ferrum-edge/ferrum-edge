@@ -7,14 +7,14 @@
 //! request paths when they want dot-segment, slash, or percent-decoding policy.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use std::net::IpAddr;
 
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{
-    ConditionMatch, MeshConditionKeyKind, MeshPolicy, MeshRule, PolicyAction, PrincipalMatch,
-    RequestMatch, SourceNegationMatch, classify_mesh_condition_key,
+    ConditionMatch, MeshConditionKeyKind, MeshPolicy, MeshRule, MeshService, PolicyAction,
+    PrincipalMatch, RequestMatch, SourceNegationMatch, classify_mesh_condition_key,
     normalize_mesh_policy_header_map,
 };
 use crate::modes::mesh::slice::MeshSlice;
@@ -1304,6 +1304,119 @@ pub(crate) fn mesh_policies_have_header_rules(
     policies: &[crate::modes::mesh::config::MeshPolicy],
 ) -> bool {
     policies.iter().any(mesh_policy_has_header_rules)
+}
+
+/// An exact `connection.sni` condition value that names a mesh service's bare
+/// FQDN. Reported by [`find_bare_service_fqdn_sni_conditions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BareServiceFqdnSniCondition {
+    /// Namespace of the policy that carries the value.
+    pub policy_namespace: String,
+    /// Name of the policy that carries the value.
+    pub policy_name: String,
+    /// The value, ASCII-lowercased.
+    pub value: String,
+}
+
+/// Find the exact `connection.sni` values, in `values` or `notValues` under any
+/// action, that name a mesh service's bare FQDN
+/// (`<service>.<namespace>.svc.<cluster-domain>`).
+///
+/// Cross-cluster traffic never carries the bare FQDN as its SNI. It arrives
+/// with the per-port east-west alias `p<port>.<fqdn>` (`p<port>-udp.<fqdn>` for
+/// UDP). `connection.sni` stays a plain Istio string match, so such a value
+/// never matches cross-cluster traffic. This finder only feeds the operator
+/// warning logged when a mesh slice is prepared; it never changes matching.
+///
+/// A value is reported when it equals the base FQDN of one of `services`, or
+/// when it has the Kubernetes Service FQDN shape
+/// `<service>.<namespace>.svc.<cluster_domain>` for this proxy's cluster
+/// domain. The shape check covers services missing from this proxy's service
+/// view, which a Sidecar egress scope can narrow. Values containing `*`
+/// (presence, prefix, and suffix matches) are never reported, and neither are
+/// the `p<port>[-udp].<fqdn>` aliases, which have an extra label. Each
+/// `(policy, value)` pair is reported once, in policy order. Cold path.
+pub fn find_bare_service_fqdn_sni_conditions(
+    policies: &[MeshPolicy],
+    services: &[MeshService],
+    cluster_domain: &str,
+) -> Vec<BareServiceFqdnSniCondition> {
+    let cluster_domain = cluster_domain.trim_matches('.');
+    // Built only once a `connection.sni` value is seen, so a policy set
+    // without such conditions pays nothing per slice.
+    let mut service_fqdns: Option<HashSet<String>> = None;
+    let mut found: Vec<BareServiceFqdnSniCondition> = Vec::new();
+    for policy in policies {
+        let conditions = policy
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.when)
+            .filter(|condition| {
+                classify_mesh_condition_key(&condition.key)
+                    == Some(MeshConditionKeyKind::ConnectionSni)
+            });
+        for condition in conditions {
+            for value in condition.values.iter().chain(&condition.not_values) {
+                if value.contains('*') {
+                    continue;
+                }
+                let value = value.to_ascii_lowercase();
+                let known = service_fqdns
+                    .get_or_insert_with(|| {
+                        services
+                            .iter()
+                            .map(|service| {
+                                super::cross_cluster_service_base_fqdn(service, cluster_domain)
+                                    .to_ascii_lowercase()
+                            })
+                            .collect()
+                    })
+                    .contains(&value);
+                if !known && !has_kubernetes_service_fqdn_shape(&value, cluster_domain) {
+                    continue;
+                }
+                let duplicate = found.iter().any(|finding| {
+                    finding.value == value
+                        && finding.policy_name == policy.name
+                        && finding.policy_namespace == policy.namespace
+                });
+                if !duplicate {
+                    found.push(BareServiceFqdnSniCondition {
+                        policy_namespace: policy.namespace.clone(),
+                        policy_name: policy.name.clone(),
+                        value,
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether a lowercase `value` is `<service>.<namespace>.svc.<cluster_domain>`
+/// with exactly one non-empty label each for service and namespace.
+fn has_kubernetes_service_fqdn_shape(value: &str, cluster_domain: &str) -> bool {
+    const SVC: &str = ".svc.";
+    if cluster_domain.is_empty() {
+        return false;
+    }
+    let Some(split) = value.len().checked_sub(cluster_domain.len() + SVC.len()) else {
+        return false;
+    };
+    let (Some(head), Some(svc), Some(domain)) = (
+        value.get(..split),
+        value.get(split..split + SVC.len()),
+        value.get(split + SVC.len()..),
+    ) else {
+        return false;
+    };
+    if svc != SVC || !domain.eq_ignore_ascii_case(cluster_domain) {
+        return false;
+    }
+    let Some((service, namespace)) = head.split_once('.') else {
+        return false;
+    };
+    !service.is_empty() && !namespace.is_empty() && !namespace.contains('.')
 }
 
 #[cfg(test)]
