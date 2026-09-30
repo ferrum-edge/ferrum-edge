@@ -296,7 +296,8 @@ paths:
         aggregate — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
-        `FERRUM_METRICS_ALLOWED_CIDRS`.
+        `FERRUM_METRICS_ALLOWED_CIDRS`. A viewer-key JWT bound by
+        `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` never adds detail.
 
         Returns `503 Service Unavailable` while the gateway is still in
         startup (`status: "starting"`, `ready: false`). Once startup is
@@ -1838,7 +1839,8 @@ paths:
         diagnostics, `request_buffer` (aggregate buffered-request budget
         pressure), and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
-        source IP.
+        source IP. A namespace-ceiling-bound viewer-key JWT receives only
+        `{level}`.
 
         Returns `503 Service Unavailable` when the overload level is `critical`
         (for both tiers).
@@ -1911,6 +1913,8 @@ paths:
         `FERRUM_METRICS_ALLOWED_CIDRS` source IP. Otherwise the endpoint
         returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header.
         Unauthenticated scraping is an explicit operator opt-in (token or CIDR).
+        A viewer-key JWT bound by `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is
+        refused with `403`.
 
         TLS source watcher telemetry includes certificate expiry gauges,
         certificate rotation counters, source refresh outcomes, source fetch

@@ -1046,8 +1046,12 @@ async fn viewer_namespace_ceiling_composes_with_namespace_claim_enforcement() {
     assert_eq!(refused.status, 403, "{}", refused.text);
     assert!(!refused.text.contains(CEILING_REFUSAL), "{}", refused.text);
     // Inside the claim but outside the ceiling: the ceiling refuses.
-    let refused = get(&base, "/proxies", Some(&prod_only), Some("prod")).await;
-    assert_ceiling_refusal(&refused, "GET /proxies (prod) with ns=prod");
+    let refused = get(&base, "/proxies", Some(&scoped), Some("ferrum")).await;
+    assert_ceiling_refusal(&refused, "GET /proxies (ferrum) with ns=[staging, ferrum]");
+    // Inside the ceiling but outside this claim: the claim gate refuses.
+    let refused = get(&base, "/proxies", Some(&scoped), Some("prod")).await;
+    assert_eq!(refused.status, 403, "{}", refused.text);
+    assert!(!refused.text.contains(CEILING_REFUSAL), "{}", refused.text);
 
     // Claim enforcement still requires an explicit claim inside the ceiling.
     let claim_less = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
