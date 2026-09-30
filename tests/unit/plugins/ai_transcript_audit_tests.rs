@@ -13362,7 +13362,11 @@ async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
         &json!({"jsonrpc": "2.0", "id": 73, "result": {"isError": false}}),
     )
     .await;
-    assert_eq!(records.len(), 1, "default scope audits Content-Type-less calls");
+    assert_eq!(
+        records.len(),
+        1,
+        "default scope audits Content-Type-less calls"
+    );
     assert_eq!(records[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
 
     let plugin = AiTranscriptAudit::new(
@@ -13378,7 +13382,9 @@ async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
         PluginResult::Continue
     ));
     assert!(
-        !ordinary.metadata.contains_key("ai_transcript_audit.candidate"),
+        !ordinary
+            .metadata
+            .contains_key("ai_transcript_audit.candidate"),
         "a Content-Type-less body that cannot spell tools/call is skipped by the byte pre-scan"
     );
 }
@@ -13453,18 +13459,18 @@ async fn mcp_batch_outcomes_canonicalize_raw_numeric_and_escaped_string_ids() {
         {"jsonrpc": "2.0", "id": 1000.0, "result": {"isError": false}},
         {"jsonrpc": "2.0", "id": "ab", "result": {"isError": false}}
     ]);
-    let records = mcp_roundtrip(
-        json!({}),
-        &mut ctx,
-        body.as_bytes(),
-        &response,
-    )
-    .await;
+    let records = mcp_roundtrip(json!({}), &mut ctx, body.as_bytes(), &response).await;
     assert_eq!(records.len(), 1, "{records:?}");
     let calls = records[0]["mcp"]["calls"].as_array().expect("mcp.calls");
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0]["result"], "result", "exponent id matches its value");
-    assert_eq!(calls[1]["result"], "result", "escaped string id matches its value");
+    assert_eq!(
+        calls[0]["result"], "result",
+        "exponent id matches its value"
+    );
+    assert_eq!(
+        calls[1]["result"], "result",
+        "escaped string id matches its value"
+    );
 }
 
 #[tokio::test]
