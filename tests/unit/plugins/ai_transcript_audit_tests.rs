@@ -697,6 +697,7 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "stream_hash",
             "mcp_tool_calls",
             "mcp_arguments",
+            "mcp_endpoint_path",
         ]
     );
     assert_eq!(

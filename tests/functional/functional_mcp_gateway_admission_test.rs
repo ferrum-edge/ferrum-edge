@@ -1056,7 +1056,7 @@ async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
 #[tokio::test]
 async fn functional_mcp_gateway_forwards_shielded_upstream_tool_arguments() {
     let config = |upstream_port: u16, _| shielded_admission_config(upstream_port);
-    let fixture = Fixture::start_with(Backend::Mcp, config).await;
+    let fixture = Fixture::start_with(Backend::McpUpstream, config).await;
     let (status, _, session) = fixture.post("HTTP/1.1", None, &initialize_body()).await;
     assert_eq!(status, 200);
     let session = session.expect("downstream session");

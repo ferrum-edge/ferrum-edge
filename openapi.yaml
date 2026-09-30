@@ -32513,11 +32513,11 @@ components:
             mcp_tool_calls:
               type: [boolean, "null"]
               default: true
-              description: "Treat MCP JSON-RPC tools/call requests (a singleton, or a batch with a tools/call member) as audit candidates for JSON-ish content types. Content-Type-less MCP requests are captured only when capture.mcp_endpoint_path matches their exact path, preventing this mode from buffering unrelated POST traffic; add an mcp section to records with the public tool name, keyed arguments_hash, optional excerpt, outcome, and bounded gateway metadata. At most 32 calls per record; later ones are counted in calls_omitted."
+              description: "Treat MCP JSON-RPC tools/call requests (a singleton, or a batch with a tools/call member) as audit candidates for JSON-ish content types. Content-Type-less POSTs are buffered and captured when they carry a tools/call (a byte pre-scan skips parsing and staging for anything else); set capture.mcp_endpoint_path to limit this to one exact path; add an mcp section to records with the public tool name, keyed arguments_hash, optional excerpt, outcome, and bounded gateway metadata. At most 32 calls per record; later ones are counted in calls_omitted."
             mcp_endpoint_path:
               type: [string, "null"]
               pattern: '^/[^?#\x00-\x1f\x7f-\x9f]*$'
-              description: "Exact path on which Content-Type-less POSTs may be buffered and checked for MCP tools/call. Configure this to the mcp_gateway endpoint.path when clients omit Content-Type."
+              description: "Optional exact path that narrows Content-Type-less MCP capture. When unset, Content-Type-less POSTs on every path are buffered and checked for a tools/call; when set, only this path is. Set it to the mcp_gateway endpoint.path to avoid buffering other Content-Type-less uploads."
             mcp_arguments:
               type: [boolean, "null"]
               default: false
