@@ -915,8 +915,11 @@ async fn test_introspection_tokens_in_strings_and_comments_are_ignored() {
     assert_continue(result);
 }
 
+/// GraphQL names are ASCII, so a non-ASCII character outside a string or
+/// comment is a syntax error. It is refused (without panicking on the
+/// multi-byte character) rather than treated as a separator.
 #[tokio::test]
-async fn test_non_ascii_query_text_does_not_panic() {
+async fn test_non_ascii_query_text_is_rejected_without_panicking() {
     let config = json!({ "max_depth": 10 });
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
 
@@ -924,7 +927,7 @@ async fn test_non_ascii_query_text_does_not_panic() {
     let mut ctx = create_graphql_context(query, None);
     let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    assert_reject(result, Some(400));
 }
 
 #[tokio::test]
@@ -1769,10 +1772,8 @@ async fn every_ignored_token_class_keeps_the_operation_name() {
     }
 }
 
-/// A BOM must not hide the `mutation` keyword from the whole-document fallback
-/// scan either, which would downgrade the operation type and charge the wrong
-/// per-type budget. The unbalanced document is what forces the fallback: the
-/// structured parser finds no complete operation definition in it.
+/// A BOM must not hide the `mutation` keyword, which would downgrade the
+/// operation type and charge the wrong per-type budget.
 #[tokio::test]
 async fn bom_before_a_leading_mutation_keyword_keeps_the_operation_type() {
     let config = json!({
@@ -1780,28 +1781,22 @@ async fn bom_before_a_leading_mutation_keyword_keeps_the_operation_type() {
             "mutation": { "max_requests": 1, "window_seconds": 60 }
         }
     });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+    let query = "\u{feff}mutation { createUser { id } }";
 
-    for query in [
-        "\u{feff}mutation { createUser { id } }",
-        "\u{feff}mutation { createUser { id }",
-    ] {
-        // A fresh instance per spelling so each starts with an unspent budget.
-        let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata.get("graphql_operation_type").unwrap(),
+        "mutation",
+        "a leading BOM must not downgrade the operation to a query"
+    );
 
-        let mut ctx = create_graphql_context(query, None);
-        let mut headers = make_graphql_headers();
-        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-        assert_eq!(
-            ctx.metadata.get("graphql_operation_type").unwrap(),
-            "mutation",
-            "a leading BOM must not downgrade {query:?} to a query operation"
-        );
-
-        let mut ctx = create_graphql_context(query, None);
-        let mut headers = make_graphql_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-        assert_reject(result, Some(429));
-    }
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(429));
 }
 
 /// The BOM is ignored wherever the other ignored tokens are: before an alias
@@ -1853,11 +1848,11 @@ async fn ignored_tokens_after_the_directive_punctuator_do_not_add_complexity() {
     }
 }
 
-/// The same rule in the whole-document fallback scanner. An unbalanced document
-/// is what reaches it: the structured parser models no complete operation there
-/// and hands the document to the legacy scan.
+/// An unbalanced document has no complete operation for the gateway to
+/// measure, so it is refused. It used to reach a whole-document fallback scan
+/// that measured it with weaker rules than the structured parser.
 #[tokio::test]
-async fn fallback_scanner_does_not_count_spaced_directives_as_fields() {
+async fn unbalanced_documents_are_rejected_instead_of_scanned() {
     let config = json!({ "max_complexity": 100 });
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
 
@@ -1865,12 +1860,8 @@ async fn fallback_scanner_does_not_count_spaced_directives_as_fields() {
         let query = format!("{{ ok @{separator}skip(if: false)");
         let mut ctx = create_graphql_context(&query, None);
         let mut headers = make_graphql_headers();
-        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-        assert_eq!(
-            ctx.metadata.get("graphql_complexity").unwrap(),
-            "1",
-            "fallback separator {separator:?} must not turn the directive into a field"
-        );
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
     }
 }
 
@@ -2300,7 +2291,15 @@ fn unreachable_operation_key_shapes_are_rejected_before_shared_rate_bounds() {
 /// Pairing the backslashes ended the string early and analyzed `{ harmless }`
 /// in its place.
 fn block_string_hidden_selection(selection: &str) -> String {
-    let string_default = r##""""\\""") { harmless } #""""##;
+    block_string_hidden_selection_after(r"\\", selection)
+}
+
+/// [`block_string_hidden_selection`] with any run of backslashes before the
+/// escaped delimiter. Every non-empty run leaves the string open: a conforming
+/// lexer takes the run's last backslash with the `"""` as the escape and every
+/// earlier one as one byte of content.
+fn block_string_hidden_selection_after(backslashes: &str, selection: &str) -> String {
+    let string_default = format!(r##""""{backslashes}""") {{ harmless }} #""""##);
     format!("query Q($v: String = {string_default}\n) {selection}")
 }
 
@@ -2377,10 +2376,25 @@ async fn escaped_block_string_delimiter_after_a_backslash_does_not_hide_query_co
 
     for (config, selection, expected) in cases {
         let query = block_string_hidden_selection(selection);
-        let (result, _) = evaluate_graphql(config, &query, Some("Q")).await;
+        for operation_name in [Some("Q"), None] {
+            let (result, _) = evaluate_graphql(config.clone(), &query, operation_name).await;
+            let (status, message) = reject_status_and_message(result);
+            assert_eq!(status, 400, "{selection} with {operation_name:?}");
+            assert_eq!(message, expected, "{selection} with {operation_name:?}");
+        }
+
+        // The final request-body recheck measures the same selection.
+        let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+        let mut ctx = create_graphql_context("{ ok }", None);
+        let mut headers = make_graphql_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let transformed = json!({ "query": query }).to_string();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+            .await;
         let (status, message) = reject_status_and_message(result);
-        assert_eq!(status, 400, "{selection}");
-        assert_eq!(message, expected, "{selection}");
+        assert_eq!(status, 400, "final body: {selection}");
+        assert_eq!(message, expected, "final body: {selection}");
     }
 
     // Positive control: under limits that admit it, the measured operation is
@@ -2445,6 +2459,8 @@ async fn legitimate_block_strings_are_single_tokens() {
         ),
         // An escaped delimiter immediately before the closing delimiter.
         (r#"{ echo(v: """a\"""""") { id } }"#, "2", "2"),
+        // Four opening quotes: `"""` opens and the fourth is content.
+        (r#"{ echo(v: """"a""") { id } }"#, "2", "2"),
     ];
 
     for (query, expected_depth, expected_complexity) in cases {
@@ -2486,6 +2502,9 @@ async fn malformed_string_literals_fail_closed() {
         r#"query Q($v: String = """abc) { __schema { types { name } } }"#,
         // `"""` always opens a block string, never an empty string and a quote.
         r#"{ a(x: """) { id } }"#,
+        // Four closing quotes: `"""` closes and the fourth opens a regular
+        // string that never closes.
+        r#"{ a(x: """abc"""") { id } }"#,
         // A block string whose only closing delimiter is escaped never closes.
         r#"{ a(x: """abc\""") { __schema { types { name } } } }"#,
         // Unterminated regular string.
@@ -2526,13 +2545,192 @@ async fn document_level_string_contents_are_not_parsed_as_definitions() {
     }
 }
 
-/// The whole-document fallback scan (reached by an unbalanced document) lexes
-/// strings with the same scanner, so an escaped block-string delimiter cannot
-/// open a phantom string there that swallows the rest of the document.
+/// An unbalanced document whose block string holds an escaped delimiter is
+/// refused, not handed to a scan that could draw a different string boundary.
 #[tokio::test]
-async fn fallback_scanner_keeps_escaped_block_string_delimiters_as_content() {
+async fn unbalanced_document_with_an_escaped_block_string_delimiter_is_rejected() {
     let config = json!({ "introspection_allowed": false });
     let query = r#"{ a(x: """\""" """) { __schema { types { name } }"#;
     let (result, _) = evaluate_graphql(config, query, None).await;
-    assert_reject(result, Some(403));
+    let (status, message) = reject_status_and_message(result);
+    assert_eq!(status, 400);
+    assert!(
+        message.starts_with("Malformed GraphQL document"),
+        "{message}"
+    );
+}
+
+/// Any run of backslashes before `"""` keeps the block string open, since only
+/// the run's last backslash forms the escape. Odd and even runs must measure
+/// the same real selection.
+#[tokio::test]
+async fn every_backslash_run_before_an_escaped_delimiter_keeps_the_block_string_open() {
+    let selection = "{ __type(name: $v) { name } }";
+    for backslashes in [r"\", r"\\", r"\\\", r"\\\\"] {
+        let query = block_string_hidden_selection_after(backslashes, selection);
+        let config = json!({ "introspection_allowed": false });
+        let (result, _) = evaluate_graphql(config, &query, None).await;
+        assert_reject(result, Some(403));
+    }
+}
+
+/// A comment ends at a bare CR as well as at LF and CRLF, exactly as the
+/// `LineTerminator` production says, so the line after it is structure.
+#[tokio::test]
+async fn comments_end_at_every_line_terminator() {
+    let selection = "{ __schema { types { name } } }";
+    for terminator in ["\r", "\r\n", "\n"] {
+        let query = format!("query Q # {{ harmless }}{terminator}{selection}");
+        let config = json!({ "introspection_allowed": false });
+        let (result, _) = evaluate_graphql(config, &query, None).await;
+        assert_reject(result, Some(403));
+
+        let query = format!("{{ a # comment{terminator} b }}");
+        let config = json!({ "max_complexity": 2 });
+        let (result, ctx) = evaluate_graphql(config, &query, None).await;
+        assert_continue(result);
+        let complexity = ctx.metadata.get("graphql_complexity").cloned();
+        assert_eq!(complexity.as_deref(), Some("2"), "{terminator:?}");
+    }
+}
+
+/// Outside strings and comments only GraphQL tokens and `Ignored` are
+/// accepted. A character the structural scanners would treat as a separator
+/// but a conforming parser rejects (NBSP, U+2028, a form feed, a non-ASCII
+/// letter) could otherwise hide a fragment name or an alias.
+#[tokio::test]
+async fn invalid_characters_outside_strings_and_comments_are_rejected() {
+    for query in [
+        "query { ...F } fragment\u{a0}F on Query { __schema { types { name } } }",
+        "query { ...F } fragment\u{2028}F on Query { __schema { types { name } } }",
+        "query\u{c}Q { a }",
+        "{ a\u{b}b }",
+        "{ aé: f b: f }",
+        "{ a. }",
+        "{ a .. b }",
+        "{ a(x: 01) }",
+        "{ a(x: 1.) }",
+        "{ a(x: .5) }",
+        "{ a(x: 1e) }",
+        "{ a(x: 1x) }",
+        "{ a(x: 1.5.2) }",
+        "{ a(x: -) }",
+    ] {
+        let config = json!({ "introspection_allowed": false, "max_aliases": 5 });
+        let (result, _) = evaluate_graphql(config, query, None).await;
+        let (status, message) = reject_status_and_message(result);
+        assert_eq!(status, 400, "{query:?}");
+        assert!(
+            message.starts_with("Malformed GraphQL document"),
+            "{query:?}: {message}"
+        );
+    }
+
+    // Positive controls: every legal number form, punctuator, and ignored
+    // token is still accepted.
+    let query = "query Q($a: [Int!]! = [0, -1, 2.5, -3e10, 4E+2, 5.0e-1]) @d(x: $a) \
+                 { f(a: $a, o: { k: [true, null] }) { g } ... on T { h } }";
+    let config = json!({ "introspection_allowed": false, "max_depth": 2 });
+    let (result, ctx) = evaluate_graphql(config, query, None).await;
+    assert_continue(result);
+    let complexity = ctx.metadata.get("graphql_complexity").cloned();
+    assert_eq!(complexity.as_deref(), Some("3"));
+}
+
+/// A named spread with no matching fragment definition is refused. Skipping
+/// it left whatever the backend resolves for it unmeasured.
+#[tokio::test]
+async fn spreads_of_undefined_fragments_are_rejected() {
+    for query in [
+        "{ ...Missing }",
+        "query { a { ...Missing } }",
+        "query { ...A } fragment A on T { a ...Missing }",
+    ] {
+        let config = json!({ "introspection_allowed": false });
+        let (result, _) = evaluate_graphql(config, query, None).await;
+        let (status, message) = reject_status_and_message(result);
+        assert_eq!(status, 400, "{query}");
+        assert_eq!(
+            message, "Query spreads a fragment the document does not define",
+            "{query}"
+        );
+    }
+}
+
+/// A document that is not a sequence of complete executable definitions is
+/// refused rather than measured by a weaker scan: unbalanced definitions,
+/// tokens between definitions, nameless or duplicate fragments, duplicate
+/// operation names, and an anonymous operation beside others.
+#[tokio::test]
+async fn structurally_invalid_documents_are_rejected() {
+    for (query, operation_name) in [
+        ("{ a(x: 1 { __schema { types { name } } } }", None),
+        (r#""d" mutation { x"#, None),
+        ("query Q", None),
+        ("query Q { a } }", None),
+        ("foo { a }", None),
+        ("query A { a } query A { __schema { x } }", Some("A")),
+        ("{ a } query B { b }", Some("B")),
+        ("{ ...F } fragment F on T {a} fragment F on T {b}", None),
+        ("query { a } fragment on T { b }", None),
+        ("fragment F on T { a }", None),
+        ("# only a comment", None),
+    ] {
+        let config = json!({ "introspection_allowed": false });
+        let (result, _) = evaluate_graphql(config, query, operation_name).await;
+        let (status, message) = reject_status_and_message(result);
+        assert_eq!(status, 400, "{query}");
+        assert!(
+            message.starts_with("Malformed GraphQL document"),
+            "{query}: {message}"
+        );
+    }
+}
+
+fn create_raw_graphql_context(body: &str) -> RequestContext {
+    let mut ctx = create_graphql_context("{ ok }", None);
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    ctx
+}
+
+/// A top-level member that decides what the backend executes may appear only
+/// once. A JSON reader that keeps the first copy would run a different
+/// document from the last copy the gateway would otherwise measure.
+#[tokio::test]
+async fn repeated_graphql_envelope_members_are_rejected() {
+    let plugin = create_plugin("graphql", &json!({ "introspection_allowed": false }))
+        .unwrap()
+        .unwrap();
+    for body in [
+        r#"{"query":"{ __schema { types { name } } }","query":"{ ok }"}"#,
+        r#"{"query":"{ __schema { types { name } } }","query":"{ ok }"}"#,
+        r#"{"query":"query A { ok } query B { ok }","operationName":"A","operationName":"B"}"#,
+        r#"{"query":"{ ok }","variables":{},"variables":{}}"#,
+        r#"{"query":"{ ok }","extensions":{},"extensions":{}}"#,
+    ] {
+        let mut ctx = create_raw_graphql_context(body);
+        let mut headers = make_graphql_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let (status, message) = reject_status_and_message(result);
+        assert_eq!(status, 400, "{body}");
+        assert!(message.contains("repeats a top-level"), "{body}");
+
+        // The final request-body recheck applies the same rule.
+        let mut ctx = create_graphql_context("{ ok }", None);
+        let mut headers = make_graphql_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await;
+        let (status, message) = reject_status_and_message(result);
+        assert_eq!(status, 400, "final body: {body}");
+        assert!(message.contains("repeats a top-level"), "{body}");
+    }
+
+    // Positive control: a repeated member the plugin does not read is not a
+    // GraphQL envelope ambiguity.
+    let mut ctx = create_raw_graphql_context(r#"{"query":"{ ok }","trace":1,"trace":2}"#);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }

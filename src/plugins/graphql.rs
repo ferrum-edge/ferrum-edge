@@ -677,50 +677,53 @@ struct OperationDef<'a> {
 /// Parse a GraphQL query string and select the operation to analyze.
 ///
 /// This is a lightweight parser that handles the subset of GraphQL syntax
-/// needed for depth/complexity/alias analysis without a full AST. Unlike a raw
-/// text scan it (1) splits the document into individual operation and fragment
-/// definitions, (2) selects which operation is analyzed using `operation_name`
-/// (per the GraphQL spec: `operationName` is required when a document defines
-/// more than one operation), and (3) expands fragment spreads (`...Frag`) at
-/// their use sites when computing depth/complexity so those limits cannot be
-/// bypassed by hiding nesting/fields behind fragments. Fragment expansion is
-/// cycle-safe and byte-budgeted so the expansion itself cannot be turned into a
-/// DoS.
+/// needed for depth/complexity/alias analysis without a full AST. It (1) lexes
+/// the whole document with the spec's token rules, (2) splits it into
+/// individual operation and fragment definitions, (3) selects which operation
+/// is analyzed using `operation_name` (per the GraphQL spec: `operationName` is
+/// required when a document defines more than one operation), and (4) expands
+/// fragment spreads (`...Frag`) at their use sites when computing
+/// depth/complexity so those limits cannot be bypassed by hiding
+/// nesting/fields behind fragments. Fragment expansion is cycle-safe and
+/// byte-budgeted so the expansion itself cannot be turned into a DoS.
 ///
-/// Every string literal and comment is lexed first with the spec's token
-/// rules ([`validate_string_tokens`]). A document whose strings do not lex
-/// cleanly is rejected here, so every later scan runs over a document whose
-/// token boundaries a conforming backend would draw in the same places.
+/// Every stage fails closed. A document that does not lex
+/// ([`validate_document_tokens`]), is not a sequence of complete definitions,
+/// defines no operation, or spreads a fragment it does not define is rejected
+/// with a 400 rather than measured by a weaker scan, so the measured operation
+/// is always the one a conforming backend would execute.
 fn parse_graphql_query(query: &str, operation_name: Option<&str>) -> ParsedQuery {
-    if let Err(error) = validate_string_tokens(query.as_bytes()) {
-        return ParsedQuery::Reject {
-            status_code: 400,
-            message: format!("Malformed GraphQL document: {}", error.message()),
-        };
+    if let Err(error) = validate_document_tokens(query.as_bytes()) {
+        return malformed_document(error.message());
+    }
+    let document = match parse_document(query) {
+        Ok(document) => document,
+        Err(message) => return malformed_document(message),
+    };
+    let operations = &document.operations;
+    if operations.is_empty() {
+        return malformed_document("the document defines no operation");
     }
     let operation_name = operation_name.filter(|n| !n.is_empty());
-    let (operations, fragments) = parse_document(query);
 
     // Select the operation to analyze.
-    let selected: Option<&OperationDef> = match operation_name {
-        Some(name) => {
-            // Explicit operationName: it must match exactly one operation.
-            match operations.iter().find(|op| op.name == Some(name)) {
-                Some(op) => Some(op),
-                None if operations.is_empty() => None, // fall back to whole-document scan
-                None => {
-                    return ParsedQuery::Reject {
-                        status_code: 400,
-                        message: format!("Unknown operation named \"{name}\""),
-                    };
-                }
+    let selected = match operation_name {
+        // Explicit operationName: it must match exactly one operation.
+        Some(name) => match operations.iter().find(|op| op.name == Some(name)) {
+            Some(op) => op,
+            None => {
+                return ParsedQuery::Reject {
+                    status_code: 400,
+                    message: format!("Unknown operation named \"{name}\""),
+                };
             }
-        }
-        None => {
-            // No operationName: the GraphQL spec requires it for multi-operation
-            // documents. Reject those rather than silently analyzing the wrong
-            // operation (which would let per-type limits be bypassed).
-            if operations.len() > 1 {
+        },
+        // No operationName: the GraphQL spec requires it for multi-operation
+        // documents. Reject those rather than silently analyzing the wrong
+        // operation (which would let per-type limits be bypassed).
+        None => match operations.as_slice() {
+            [op] => op,
+            _ => {
                 return ParsedQuery::Reject {
                     status_code: 400,
                     message:
@@ -728,61 +731,17 @@ fn parse_graphql_query(query: &str, operation_name: Option<&str>) -> ParsedQuery
                             .to_string(),
                 };
             }
-            operations.first()
-        }
+        },
     };
 
-    match selected {
-        Some(op) => {
-            let op_name = operation_name
-                .map(String::from)
-                .or_else(|| op.name.map(String::from));
+    let op_name = operation_name
+        .map(String::from)
+        .or_else(|| selected.name.map(String::from));
 
-            match analyze_operation(op.selection_set, &fragments) {
-                Some((depth, complexity, alias_count, is_introspection)) => {
-                    ParsedQuery::Operation(GraphqlOperation {
-                        op_type: op.op_type,
-                        op_name,
-                        depth,
-                        complexity,
-                        alias_count,
-                        is_introspection,
-                    })
-                }
-                None => ParsedQuery::Reject {
-                    status_code: 400,
-                    message: "Query is too large to analyze (fragment expansion budget exceeded)"
-                        .to_string(),
-                },
-            }
-        }
-        None => {
-            // The structured parser found no operation (e.g. a non-standard or
-            // unparseable body). The legacy whole-document scan is
-            // fragment-blind, so fail closed when fragment syntax is present
-            // rather than enforcing weaker depth/complexity limits.
-            let trimmed = trim_leading_ignored(query);
-            if !fragments.is_empty() || contains_fragment_syntax(trimmed) {
-                return ParsedQuery::Reject {
-                    status_code: 400,
-                    message: "Query contains fragments but could not be structurally analyzed"
-                        .to_string(),
-                };
-            }
-            // Otherwise fall back to the legacy whole-document scan so we do
-            // not introduce false rejections for fragment-free non-standard
-            // bodies; op_type comes from the leading keyword as before.
-            let op_type = if strip_operation_keyword(trimmed, "mutation").is_some() {
-                "mutation"
-            } else if strip_operation_keyword(trimmed, "subscription").is_some() {
-                "subscription"
-            } else {
-                "query"
-            };
-            let op_name = operation_name.map(String::from);
-            let (depth, complexity, alias_count, is_introspection) = analyze_query(trimmed);
+    match analyze_operation(selected.selection_set, &document.fragments) {
+        Ok((depth, complexity, alias_count, is_introspection)) => {
             ParsedQuery::Operation(GraphqlOperation {
-                op_type,
+                op_type: selected.op_type,
                 op_name,
                 depth,
                 complexity,
@@ -790,31 +749,55 @@ fn parse_graphql_query(query: &str, operation_name: Option<&str>) -> ParsedQuery
                 is_introspection,
             })
         }
+        Err(error) => ParsedQuery::Reject {
+            status_code: 400,
+            message: error.message().to_string(),
+        },
     }
 }
 
-/// Split a GraphQL document into its top-level operation definitions and a
-/// `name -> selection-set body` map of its fragment definitions.
+fn malformed_document(detail: &str) -> ParsedQuery {
+    ParsedQuery::Reject {
+        status_code: 400,
+        message: format!("Malformed GraphQL document: {detail}"),
+    }
+}
+
+/// The document's operation definitions and a `name -> selection-set body`
+/// map of its fragment definitions.
+struct ParsedDocument<'a> {
+    operations: Vec<OperationDef<'a>>,
+    fragments: HashMap<&'a str, &'a str>,
+}
+
+/// Split an already-lexed GraphQL document into its top-level definitions.
 ///
 /// String literals, block strings, comments, and argument lists are respected
-/// so keywords/braces inside them are never mistaken for structure.
-fn parse_document(query: &str) -> (Vec<OperationDef<'_>>, HashMap<&str, &str>) {
+/// so keywords/braces inside them are never mistaken for structure. Anything
+/// that is not a complete executable definition is an error: an unbalanced or
+/// unterminated definition, a document-level token other than an operation
+/// keyword, `fragment`, a shorthand `{`, or a string (a description), a
+/// nameless or duplicate fragment, a duplicate operation name, or an anonymous
+/// operation that is not alone. A conforming server refuses every one of
+/// those, so refusing them here costs no valid traffic and leaves no document
+/// the gateway would measure differently from the backend.
+fn parse_document(query: &str) -> Result<ParsedDocument<'_>, &'static str> {
+    const INCOMPLETE_DEFINITION: &str = "unbalanced or incomplete definition";
+
     let bytes = query.as_bytes();
     let len = bytes.len();
     let mut operations: Vec<OperationDef<'_>> = Vec::new();
     let mut fragments: HashMap<&str, &str> = HashMap::new();
     let mut i = 0;
 
-    while i < len {
-        let c = bytes[i];
-
+    loop {
         // Skip the complete `Ignored` run (BOM, whitespace, line terminators,
         // commas, comments) through the shared lexer-level scanner.
-        let after_ignored = skip_ignored(bytes, i);
-        if after_ignored != i {
-            i = after_ignored;
-            continue;
+        i = skip_ignored(bytes, i);
+        if i >= len {
+            break;
         }
+        let c = bytes[i];
 
         // A document-level string (a description, where a backend accepts
         // one) is a single opaque token. Scanning its contents byte by byte
@@ -826,80 +809,73 @@ fn parse_document(query: &str) -> (Vec<OperationDef<'_>>, HashMap<&str, &str>) {
 
         // A bare selection set is an anonymous (shorthand) query operation.
         if c == b'{' {
-            if let Some(end) = find_matching_brace(bytes, i) {
-                operations.push(OperationDef {
-                    op_type: "query",
-                    name: None,
-                    selection_set: &query[i + 1..end],
-                });
-                i = end + 1;
-            } else {
-                // Unbalanced braces: stop structured parsing.
-                break;
-            }
-            continue;
-        }
-
-        // Identifier at the top level: an operation or fragment keyword.
-        if is_graphql_name_start(c) {
-            let (ident, after_ident) = read_name(bytes, i);
-            let op_type = match ident {
-                "query" => Some("query"),
-                "mutation" => Some("mutation"),
-                "subscription" => Some("subscription"),
-                _ => None,
+            let Some(end) = find_matching_brace(bytes, i) else {
+                return Err(INCOMPLETE_DEFINITION);
             };
-
-            if let Some(op_type) = op_type {
-                // Optional name, optional variable defs `(...)` and directives,
-                // then the selection-set `{ ... }`.
-                let (name, after_name) = read_optional_name(bytes, after_ident, query);
-                match find_next_top_level_brace(bytes, after_name) {
-                    Some(brace) => match find_matching_brace(bytes, brace) {
-                        Some(end) => {
-                            operations.push(OperationDef {
-                                op_type,
-                                name,
-                                selection_set: &query[brace + 1..end],
-                            });
-                            i = end + 1;
-                        }
-                        None => break,
-                    },
-                    None => break,
-                }
-                continue;
-            }
-
-            if ident == "fragment" {
-                // `fragment Name on Type { ... }`
-                let (name, after_name) = read_optional_name(bytes, after_ident, query);
-                match find_next_top_level_brace(bytes, after_name) {
-                    Some(brace) => match find_matching_brace(bytes, brace) {
-                        Some(end) => {
-                            if let Some(name) = name {
-                                // First definition wins on duplicate names.
-                                fragments.entry(name).or_insert(&query[brace + 1..end]);
-                            }
-                            i = end + 1;
-                        }
-                        None => break,
-                    },
-                    None => break,
-                }
-                continue;
-            }
-
-            // Unknown leading identifier: not something we model; advance past
-            // it to avoid an infinite loop and keep scanning.
-            i = after_ident;
+            operations.push(OperationDef {
+                op_type: "query",
+                name: None,
+                selection_set: &query[i + 1..end],
+            });
+            i = end + 1;
             continue;
         }
 
-        i += 1;
+        if !is_graphql_name_start(c) {
+            return Err("unexpected token between definitions");
+        }
+        let (ident, after_ident) = read_name(bytes, i);
+        let op_type = match ident {
+            "query" => Some("query"),
+            "mutation" => Some("mutation"),
+            "subscription" => Some("subscription"),
+            "fragment" => None,
+            _ => return Err("unexpected token between definitions"),
+        };
+
+        // Optional name, then (operations) variable definitions and
+        // directives or (fragments) the `on Type` condition and directives,
+        // then the selection set `{ ... }`.
+        let (name, after_name) = read_optional_name(bytes, after_ident, query);
+        let Some(brace) = find_next_top_level_brace(bytes, after_name) else {
+            return Err(INCOMPLETE_DEFINITION);
+        };
+        let Some(end) = find_matching_brace(bytes, brace) else {
+            return Err(INCOMPLETE_DEFINITION);
+        };
+        let selection_set = &query[brace + 1..end];
+
+        match op_type {
+            Some(op_type) => {
+                if name.is_some() && operations.iter().any(|op| op.name == name) {
+                    return Err("duplicate operation name");
+                }
+                operations.push(OperationDef {
+                    op_type,
+                    name,
+                    selection_set,
+                });
+            }
+            None => {
+                // `on` is the type-condition keyword, never a fragment name.
+                let Some(name) = name.filter(|name| *name != "on") else {
+                    return Err("fragment definition without a name");
+                };
+                if fragments.insert(name, selection_set).is_some() {
+                    return Err("duplicate fragment name");
+                }
+            }
+        }
+        i = end + 1;
     }
 
-    (operations, fragments)
+    if operations.len() > 1 && operations.iter().any(|op| op.name.is_none()) {
+        return Err("an anonymous operation must be the only operation in the document");
+    }
+    Ok(ParsedDocument {
+        operations,
+        fragments,
+    })
 }
 
 /// Read a GraphQL name starting at `start` (must be a name-start byte).
@@ -1024,9 +1000,9 @@ const BLOCK_STRING_DELIMITER: &[u8] = b"\"\"\"";
 /// quotes of content, not a delimiter.
 const ESCAPED_BLOCK_STRING_DELIMITER: &[u8] = b"\\\"\"\"";
 
-/// Why a string literal failed to lex under the GraphQL `StringValue` rules.
+/// Why a document failed to lex under the GraphQL token rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StringTokenError {
+enum TokenError {
     /// A regular string reached a line terminator or end-of-input unclosed.
     UnterminatedString,
     /// A block string reached end-of-input without its closing `"""`.
@@ -1034,45 +1010,114 @@ enum StringTokenError {
     /// A regular string holds a `\` that starts no `EscapedCharacter` or
     /// `EscapedUnicode`.
     InvalidEscape,
+    /// A byte outside strings and comments that starts no token and is not
+    /// `Ignored`.
+    InvalidCharacter,
+    /// A malformed `IntValue` or `FloatValue`.
+    InvalidNumber,
 }
 
-impl StringTokenError {
+impl TokenError {
     fn message(self) -> &'static str {
         match self {
             Self::UnterminatedString => "unterminated string",
             Self::UnterminatedBlockString => "unterminated block string",
             Self::InvalidEscape => "invalid escape sequence in string",
+            Self::InvalidCharacter => "invalid character outside a string or comment",
+            Self::InvalidNumber => "invalid number",
         }
     }
 }
 
-/// Lex every string literal and comment in the document with the GraphQL
-/// token rules, without interpreting anything else.
+/// Single-byte GraphQL `Punctuator`s (`...` is lexed separately).
+const PUNCTUATORS: &[u8] = b"!$&():=@[]{|}";
+
+/// Lex the whole document with the GraphQL token rules, without interpreting
+/// its structure.
 ///
-/// The structural scanners below locate strings with [`skip_string`] from many
-/// entry points and on sub-slices of the document. Lexing the whole document
-/// once up front, through the same [`scan_string`], means a malformed string
-/// is refused (fail closed) instead of silently running to end-of-input, and
-/// every later scan sees exactly the token boundaries a conforming parser
-/// draws.
-fn validate_string_tokens(bytes: &[u8]) -> Result<(), StringTokenError> {
+/// Outside strings and comments only the lexical grammar's tokens are
+/// accepted: `Ignored` (tab, space, LF, CR, comma, the UnicodeBOM), the
+/// punctuators, names (`[_A-Za-z][_0-9A-Za-z]*`), and numbers. Anything else
+/// (a non-ASCII character, a form feed, a lone `.`) would be a separator to the
+/// structural scanners below but a syntax error to a conforming parser, so it
+/// is refused rather than allowed to split or hide a name.
+///
+/// The structural scanners locate strings with [`skip_string`] from many entry
+/// points and on sub-slices of the document. Lexing every string up front
+/// through the same [`scan_string`] means a malformed string is refused (fail
+/// closed) instead of silently running to end-of-input, and every later scan
+/// sees exactly the token boundaries a conforming parser draws.
+fn validate_document_tokens(bytes: &[u8]) -> Result<(), TokenError> {
     let len = bytes.len();
     let mut i = 0;
     while i < len {
-        match bytes[i] {
-            b'#' => i = skip_line_comment(bytes, i),
-            b'"' => i = scan_string(bytes, i)?,
-            _ => i += 1,
-        }
+        let c = bytes[i];
+        i = match c {
+            b'\t' | b' ' | b'\n' | b'\r' | b',' => i + 1,
+            b'#' => skip_line_comment(bytes, i),
+            b'"' => scan_string(bytes, i)?,
+            _ if PUNCTUATORS.contains(&c) => i + 1,
+            b'.' if bytes[i..].starts_with(b"...") => i + 3,
+            b'-' | b'0'..=b'9' => scan_number(bytes, i)?,
+            _ if is_graphql_name_start(c) => read_name(bytes, i).1,
+            _ if is_unicode_bom(bytes, i) => i + UNICODE_BOM.len(),
+            _ => return Err(TokenError::InvalidCharacter),
+        };
     }
     Ok(())
+}
+
+/// Lex an `IntValue` or `FloatValue` starting at `bytes[i]` (`-` or a digit)
+/// and return the index just past it.
+fn scan_number(bytes: &[u8], i: usize) -> Result<usize, TokenError> {
+    let mut j = i;
+    if bytes[j] == b'-' {
+        j += 1;
+    }
+    let integer_start = j;
+    j = skip_digits(bytes, j);
+    let integer_digits = j - integer_start;
+    // `IntegerPart` is `0` or a non-zero digit followed by digits.
+    if integer_digits == 0 || (integer_digits > 1 && bytes[integer_start] == b'0') {
+        return Err(TokenError::InvalidNumber);
+    }
+    if bytes.get(j) == Some(&b'.') {
+        let fraction_start = j + 1;
+        j = skip_digits(bytes, fraction_start);
+        if j == fraction_start {
+            return Err(TokenError::InvalidNumber);
+        }
+    }
+    if matches!(bytes.get(j), Some(b'e' | b'E')) {
+        j += 1;
+        if matches!(bytes.get(j), Some(b'+' | b'-')) {
+            j += 1;
+        }
+        let exponent_start = j;
+        j = skip_digits(bytes, exponent_start);
+        if j == exponent_start {
+            return Err(TokenError::InvalidNumber);
+        }
+    }
+    // Neither numeric token may be followed directly by `.` or a `NameStart`.
+    if matches!(bytes.get(j), Some(&next) if next == b'.' || is_graphql_name_start(next)) {
+        return Err(TokenError::InvalidNumber);
+    }
+    Ok(j)
+}
+
+fn skip_digits(bytes: &[u8], mut j: usize) -> usize {
+    while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+        j += 1;
+    }
+    j
 }
 
 /// Skip a string literal (regular or block) starting at `bytes[i] == b'"'`.
 /// Returns the index just past the closing quote(s).
 ///
-/// [`parse_graphql_query`] refuses any document whose strings fail
-/// [`validate_string_tokens`] before a structural scan runs, so the
+/// [`parse_graphql_query`] refuses any document that fails
+/// [`validate_document_tokens`] before a structural scan runs, so the
 /// end-of-input result for a malformed string is only a scan terminator here.
 fn skip_string(bytes: &[u8], i: usize) -> usize {
     scan_string(bytes, i).unwrap_or(bytes.len())
@@ -1088,7 +1133,7 @@ fn skip_string(bytes: &[u8], i: usize) -> usize {
 /// string ends it early at `\\"""`, where a conforming parser keeps going, and
 /// the text the parser still reads as string content is then analyzed as the
 /// operation's selection set.
-fn scan_string(bytes: &[u8], i: usize) -> Result<usize, StringTokenError> {
+fn scan_string(bytes: &[u8], i: usize) -> Result<usize, TokenError> {
     if bytes[i..].starts_with(BLOCK_STRING_DELIMITER) {
         return scan_block_string(bytes, i + BLOCK_STRING_DELIMITER.len());
     }
@@ -1098,16 +1143,16 @@ fn scan_string(bytes: &[u8], i: usize) -> Result<usize, StringTokenError> {
         match bytes[j] {
             b'"' => return Ok(j + 1),
             // `StringCharacter` excludes `LineTerminator`.
-            b'\n' | b'\r' => return Err(StringTokenError::UnterminatedString),
+            b'\n' | b'\r' => return Err(TokenError::UnterminatedString),
             b'\\' => j = scan_string_escape(bytes, j + 1)?,
             _ => j += 1,
         }
     }
-    Err(StringTokenError::UnterminatedString)
+    Err(TokenError::UnterminatedString)
 }
 
 /// Lex a `BlockString` body starting just past its opening `"""`.
-fn scan_block_string(bytes: &[u8], mut j: usize) -> Result<usize, StringTokenError> {
+fn scan_block_string(bytes: &[u8], mut j: usize) -> Result<usize, TokenError> {
     let len = bytes.len();
     while j < len {
         match bytes[j] {
@@ -1121,16 +1166,16 @@ fn scan_block_string(bytes: &[u8], mut j: usize) -> Result<usize, StringTokenErr
             _ => j += 1,
         }
     }
-    Err(StringTokenError::UnterminatedBlockString)
+    Err(TokenError::UnterminatedBlockString)
 }
 
 /// Lex a regular-string escape whose `\` sits just before `bytes[j]`. Returns
 /// the index just past the escape.
-fn scan_string_escape(bytes: &[u8], j: usize) -> Result<usize, StringTokenError> {
+fn scan_string_escape(bytes: &[u8], j: usize) -> Result<usize, TokenError> {
     match bytes.get(j) {
         Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => Ok(j + 1),
         Some(b'u') => scan_unicode_escape(bytes, j + 1),
-        _ => Err(StringTokenError::InvalidEscape),
+        _ => Err(TokenError::InvalidEscape),
     }
 }
 
@@ -1140,7 +1185,7 @@ fn scan_string_escape(bytes: &[u8], j: usize) -> Result<usize, StringTokenError>
 /// Only the escape's extent is checked here, because that is what decides
 /// where the string ends. Code-point range and surrogate pairing are value
 /// rules the backend applies to a string whose boundaries are already fixed.
-fn scan_unicode_escape(bytes: &[u8], j: usize) -> Result<usize, StringTokenError> {
+fn scan_unicode_escape(bytes: &[u8], j: usize) -> Result<usize, TokenError> {
     if bytes.get(j) == Some(&b'{') {
         let digits_start = j + 1;
         let digits = bytes[digits_start..]
@@ -1149,13 +1194,13 @@ fn scan_unicode_escape(bytes: &[u8], j: usize) -> Result<usize, StringTokenError
             .count();
         let close = digits_start + digits;
         if digits == 0 || bytes.get(close) != Some(&b'}') {
-            return Err(StringTokenError::InvalidEscape);
+            return Err(TokenError::InvalidEscape);
         }
         return Ok(close + 1);
     }
     match bytes.get(j..j + 4) {
         Some(hex) if hex.iter().all(u8::is_ascii_hexdigit) => Ok(j + 4),
-        _ => Err(StringTokenError::InvalidEscape),
+        _ => Err(TokenError::InvalidEscape),
     }
 }
 
@@ -1183,20 +1228,22 @@ fn is_unicode_bom(bytes: &[u8], i: usize) -> bool {
 /// Skip GraphQL `Ignored` tokens starting at `i`.
 ///
 /// This is the plugin's single lexer-level `Ignored` scanner and it implements
-/// the complete production: `UnicodeBOM` (U+FEFF), `WhiteSpace`, `LineTerminator`,
-/// `Comment`, and `Comma`. Every name scan (operation and fragment names, alias
-/// colons, directive names) goes through it, so a document's parsed operation
+/// exactly the complete production: `UnicodeBOM` (U+FEFF), `WhiteSpace` (tab,
+/// space), `LineTerminator` (LF, CR), `Comment`, and `Comma`, and nothing
+/// else. Every name scan (operation and fragment names, alias colons,
+/// directive names) goes through it, so a document's parsed operation
 /// identity and its structural measurements stay invariant under insertion or
 /// removal of legal ignored tokens at token boundaries. Omitting a token class
 /// here silently reclassifies a named operation as anonymous and bypasses the
 /// named-operation budget (`GHSA-wr84-jm45-wrwp`), exactly as the omitted
 /// comma/comment classes once did for alias accounting
-/// (`GHSA-hpxh-qrx9-m7r5`).
+/// (`GHSA-hpxh-qrx9-m7r5`). Characters outside the production never reach
+/// here: [`validate_document_tokens`] refuses them first.
 fn skip_ignored(bytes: &[u8], mut i: usize) -> usize {
     let len = bytes.len();
     while i < len {
         let c = bytes[i];
-        if c.is_ascii_whitespace() || c == b',' {
+        if matches!(c, b'\t' | b' ' | b'\n' | b'\r' | b',') {
             i += 1;
         } else if c == b'#' {
             i = skip_line_comment(bytes, i);
@@ -1209,17 +1256,40 @@ fn skip_ignored(bytes: &[u8], mut i: usize) -> usize {
     i
 }
 
+/// Why a selected operation could not be measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnalysisError {
+    /// The fragment-expansion byte budget or the recursion bound was exceeded.
+    TooLarge,
+    /// A named fragment spread has no matching fragment definition.
+    UnknownFragment,
+    /// A selection set is structurally incomplete.
+    Malformed,
+}
+
+impl AnalysisError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::TooLarge => "Query is too large to analyze (fragment expansion budget exceeded)",
+            Self::UnknownFragment => "Query spreads a fragment the document does not define",
+            Self::Malformed => "Malformed GraphQL document: incomplete selection set",
+        }
+    }
+}
+
 /// Analyze a selected operation's selection set, expanding fragment spreads.
 ///
 /// Returns `(max_depth, complexity, alias_count, is_introspection)` measured
-/// over the operation with all reachable fragments expanded in place, or `None`
-/// if the byte-expansion budget was exceeded (which the caller turns into a
-/// 400). Cyclic fragment spreads are detected via a per-path visited set so the
-/// expansion always terminates.
+/// over the operation with all reachable fragments expanded in place, or an
+/// error the caller turns into a 400: the byte-expansion budget was exceeded,
+/// a spread names an undefined fragment (whose selections would otherwise be
+/// silently left unmeasured), or a selection set is incomplete. Cyclic
+/// fragment spreads are detected via a per-path visited set so the expansion
+/// always terminates.
 fn analyze_operation(
     selection_set: &str,
     fragments: &HashMap<&str, &str>,
-) -> Option<(u32, u32, u32, bool)> {
+) -> Result<(u32, u32, u32, bool), AnalysisError> {
     let mut acc = AnalysisAcc::default();
     let mut visited: Vec<&str> = Vec::new();
     let mut budget = MAX_FRAGMENT_EXPANSION_BYTES;
@@ -1234,7 +1304,7 @@ fn analyze_operation(
         &mut acc,
         &mut budget,
     )?;
-    Some((
+    Ok((
         acc.max_depth,
         acc.complexity,
         acc.alias_count,
@@ -1259,8 +1329,8 @@ struct AnalysisAcc {
 ///
 /// `call_depth` is the analyzer's recursion depth (independent of `base_depth`,
 /// since fragment spreads recurse without adding GraphQL nesting); it caps stack
-/// usage. Returns `None` if either the byte budget or the recursion bound is
-/// exceeded.
+/// usage. Exceeding either the byte budget or the recursion bound is
+/// [`AnalysisError::TooLarge`].
 fn analyze_selection_set<'a>(
     body: &'a str,
     base_depth: u32,
@@ -1269,11 +1339,14 @@ fn analyze_selection_set<'a>(
     visited: &mut Vec<&'a str>,
     acc: &mut AnalysisAcc,
     budget: &mut usize,
-) -> Option<()> {
+) -> Result<(), AnalysisError> {
     if call_depth >= MAX_ANALYSIS_RECURSION {
-        return None;
+        return Err(AnalysisError::TooLarge);
     }
-    *budget = budget.checked_sub(body.len())?;
+    let Some(remaining) = budget.checked_sub(body.len()) else {
+        return Err(AnalysisError::TooLarge);
+    };
+    *budget = remaining;
     if base_depth > acc.max_depth {
         acc.max_depth = base_depth;
     }
@@ -1302,7 +1375,9 @@ fn analyze_selection_set<'a>(
             }
             b'{' => {
                 // Nested selection set: recurse one level deeper.
-                let end = find_matching_brace(bytes, i)?;
+                let Some(end) = find_matching_brace(bytes, i) else {
+                    return Err(AnalysisError::Malformed);
+                };
                 analyze_selection_set(
                     &body[i + 1..end],
                     base_depth + 1,
@@ -1348,15 +1423,18 @@ fn analyze_selection_set<'a>(
                         let (name, after_name) = read_name(bytes, after_dots);
                         if name != "on" {
                             // Named fragment spread: expand the fragment body at
-                            // the current depth. A spread whose name is already on
-                            // the current path is a cycle (invalid GraphQL); we
+                            // the current depth. An undefined fragment is an
+                            // error, not an empty expansion, since skipping it
+                            // would leave whatever the backend resolves for it
+                            // unmeasured. A spread whose name is already on the
+                            // current path is a cycle (invalid GraphQL); we
                             // simply do not recurse into it, which guarantees the
                             // expansion terminates.
-                            if let Some(frag_body) = fragments.get(name)
-                                && !visited.contains(&name)
-                            {
+                            let Some(frag_body) = fragments.get(name).copied() else {
+                                return Err(AnalysisError::UnknownFragment);
+                            };
+                            if !visited.contains(&name) {
                                 visited.push(name);
-                                let frag_body = *frag_body;
                                 let result = analyze_selection_set(
                                     frag_body,
                                     base_depth,
@@ -1377,25 +1455,22 @@ fn analyze_selection_set<'a>(
                     // SAME depth (an inline fragment adds no nesting level). Skip
                     // any `on Type` / directives, then analyze the `{ ... }` body
                     // at the current base_depth.
-                    match find_next_top_level_brace(bytes, i + 3) {
-                        Some(brace) => {
-                            let end = find_matching_brace(bytes, brace)?;
-                            analyze_selection_set(
-                                &body[brace + 1..end],
-                                base_depth,
-                                call_depth + 1,
-                                fragments,
-                                visited,
-                                acc,
-                                budget,
-                            )?;
-                            i = end + 1;
-                        }
-                        None => {
-                            // No selection set found (malformed); skip the dots.
-                            i += 3;
-                        }
-                    }
+                    let Some(brace) = find_next_top_level_brace(bytes, i + 3) else {
+                        return Err(AnalysisError::Malformed);
+                    };
+                    let Some(end) = find_matching_brace(bytes, brace) else {
+                        return Err(AnalysisError::Malformed);
+                    };
+                    analyze_selection_set(
+                        &body[brace + 1..end],
+                        base_depth,
+                        call_depth + 1,
+                        fragments,
+                        visited,
+                        acc,
+                        budget,
+                    )?;
+                    i = end + 1;
                     continue;
                 }
                 i += 1;
@@ -1410,8 +1485,7 @@ fn analyze_selection_set<'a>(
             // Top-level `query`/`mutation`/`subscription`/`fragment` are
             // consumed by `parse_document`; inline-fragment `on` is consumed
             // by the `...` branch above; argument literals live inside
-            // `skip_parens`. The whole-document fallback scanner in
-            // `analyze_query` keeps a distinct keyword skip.
+            // `skip_parens`.
             let (ident, after_ident) = read_name(bytes, i);
 
             // Look past ignored tokens for an alias `:`.
@@ -1437,213 +1511,7 @@ fn analyze_selection_set<'a>(
         i += 1;
     }
 
-    Some(())
-}
-
-/// Character-level `Ignored` predicate for the whole-document fallback trim.
-/// Deliberately broader than the spec's `WhiteSpace`/`LineTerminator`: the
-/// fallback runs on documents the structured parser could not model, so
-/// trimming any Unicode whitespace stays as lenient as it has always been
-/// while still covering `Comma` and the `UnicodeBOM`.
-fn is_leading_ignored_char(c: char) -> bool {
-    c.is_whitespace() || c == ',' || c == '\u{feff}'
-}
-
-/// Trim the document's leading `Ignored` run before the whole-document fallback
-/// scan. Carries the same token classes as [`skip_ignored`] — including `Comma`
-/// and the `UnicodeBOM` — so a leading BOM cannot hide the `mutation` /
-/// `subscription` keyword and downgrade the operation type to `query`
-/// (`GHSA-wr84-jm45-wrwp`).
-fn trim_leading_ignored(mut query: &str) -> &str {
-    loop {
-        query = query.trim_start_matches(is_leading_ignored_char);
-        if !query.starts_with('#') {
-            return query;
-        }
-        match query.find(['\n', '\r']) {
-            Some(pos) => query = &query[pos + 1..],
-            None => return "",
-        }
-    }
-}
-
-fn strip_operation_keyword<'a>(query: &'a str, keyword: &str) -> Option<&'a str> {
-    let rest = query.strip_prefix(keyword)?;
-    if rest
-        .as_bytes()
-        .first()
-        .is_some_and(|b| is_graphql_name_continue(*b))
-    {
-        return None;
-    }
-    Some(rest)
-}
-
-fn contains_fragment_syntax(query: &str) -> bool {
-    let bytes = query.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        match bytes[i] {
-            b'#' => {
-                i = skip_line_comment(bytes, i);
-            }
-            b'"' => {
-                i = skip_string(bytes, i);
-            }
-            b'.' if i + 2 < len && bytes[i + 1] == b'.' && bytes[i + 2] == b'.' => {
-                return true;
-            }
-            c if is_graphql_name_start(c) => {
-                let (ident, after_ident) = read_name(bytes, i);
-                if ident == "fragment" {
-                    return true;
-                }
-                i = after_ident;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    false
-}
-
-/// Analyze a GraphQL query string for depth, complexity, and alias count.
-///
-/// - Depth: maximum nesting level of `{` `}` pairs
-/// - Complexity: approximate field count (identifiers followed by selection sets or at field positions)
-/// - Alias count: number of `identifier:` patterns (alias syntax)
-fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
-    let mut depth: u32 = 0;
-    let mut max_depth: u32 = 0;
-    let mut complexity: u32 = 0;
-    let mut alias_count: u32 = 0;
-    let mut paren_depth: u32 = 0; // Track parentheses for arguments
-    let mut is_introspection = false;
-    let bytes = query.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        let c = bytes[i];
-
-        // Comments and strings go through the same token scanners as the
-        // structured parser, so the fallback cannot draw a different string
-        // boundary (block-string `\"""` in particular) than the backend does.
-        if c == b'#' {
-            i = skip_line_comment(bytes, i);
-            continue;
-        }
-
-        if c == b'"' {
-            i = skip_string(bytes, i);
-            continue;
-        }
-
-        if c == b'(' {
-            paren_depth += 1;
-            i += 1;
-            continue;
-        }
-
-        if c == b')' {
-            paren_depth = paren_depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-
-        // Skip everything inside argument lists
-        if paren_depth > 0 {
-            i += 1;
-            continue;
-        }
-
-        if c == b'@' {
-            // Directive punctuator and directive name are distinct tokens; the
-            // name may follow legal ignored tokens and is never a selected
-            // field (#5130). Arguments are skipped by the paren tracking above.
-            let after_at = skip_ignored(bytes, i + 1);
-            if after_at < len && is_graphql_name_start(bytes[after_at]) {
-                let (_, after_name) = read_name(bytes, after_at);
-                i = after_name;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        if c == b'{' {
-            depth += 1;
-            if depth > max_depth {
-                max_depth = depth;
-            }
-            i += 1;
-            continue;
-        }
-
-        if c == b'}' {
-            depth = depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-
-        // Detect identifiers (potential fields or aliases)
-        if is_graphql_name_start(c) {
-            let start = i;
-            while i < len && is_graphql_name_continue(bytes[i]) {
-                i += 1;
-            }
-            let ident = &query[start..i];
-
-            // Whole-document fallback only: this scanner does not split
-            // operations from selection sets, so top-level keywords and the
-            // inline-fragment `on` Type condition would otherwise be counted
-            // as fields. `analyze_selection_set` must not share this skip.
-            if matches!(
-                ident,
-                "query"
-                    | "mutation"
-                    | "subscription"
-                    | "fragment"
-                    | "on"
-                    | "true"
-                    | "false"
-                    | "null"
-            ) {
-                continue;
-            }
-
-            // Skip ignored tokens after identifier
-            let j = skip_ignored(bytes, i);
-
-            // Check if this is an alias (identifier followed by ':')
-            if j < len && bytes[j] == b':' {
-                alias_count += 1;
-                // The aliased field name follows — it will be counted as a field
-                // on the next iteration
-                i = j + 1;
-                continue;
-            }
-
-            // If we're inside a selection set (depth > 0), count as a field.
-            // Directive names never reach here — the `@` arm above consumes
-            // them together with their punctuator.
-            if depth > 0 {
-                if ident == "__schema" || ident == "__type" {
-                    is_introspection = true;
-                }
-                complexity += 1;
-            }
-            continue;
-        }
-
-        i += 1;
-    }
-
-    (max_depth, complexity, alias_count, is_introspection)
+    Ok(())
 }
 
 fn is_graphql_name(value: &str) -> bool {
@@ -1885,6 +1753,60 @@ fn graphql_envelope_digest(envelope: &[u8]) -> [u8; 32] {
     crate::fips::approved::Sha256::digest(envelope)
 }
 
+/// Top-level envelope members whose value decides what the backend executes.
+const GRAPHQL_ENVELOPE_MEMBERS: [&str; 4] = ["query", "operationName", "variables", "extensions"];
+
+/// Whether the envelope's top-level JSON object names one of
+/// [`GRAPHQL_ENVELOPE_MEMBERS`] more than once (after JSON unescaping, so
+/// `"query"` is `query`). Only called on a body that already parsed as a
+/// JSON object; a body the audit cannot read is treated as repeating one.
+fn envelope_repeats_a_graphql_member(body: &[u8]) -> bool {
+    match serde_json::from_slice::<EnvelopeMemberAudit>(body) {
+        Ok(audit) => audit.repeated,
+        Err(_) => true,
+    }
+}
+
+/// Result of one pass over an envelope's top-level member names.
+struct EnvelopeMemberAudit {
+    repeated: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for EnvelopeMemberAudit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(EnvelopeMemberAuditVisitor)
+    }
+}
+
+struct EnvelopeMemberAuditVisitor;
+
+impl<'de> serde::de::Visitor<'de> for EnvelopeMemberAuditVisitor {
+    type Value = EnvelopeMemberAudit;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a GraphQL request envelope object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut seen = [false; GRAPHQL_ENVELOPE_MEMBERS.len()];
+        let mut repeated = false;
+        while let Some(key) = map.next_key::<String>()? {
+            map.next_value::<serde::de::IgnoredAny>()?;
+            let member = GRAPHQL_ENVELOPE_MEMBERS.iter().position(|m| *m == key);
+            if let Some(index) = member {
+                repeated |= std::mem::replace(&mut seen[index], true);
+            }
+        }
+        Ok(EnvelopeMemberAudit { repeated })
+    }
+}
+
 impl GraphqlPlugin {
     /// Parse one GraphQL envelope and apply the complete structural,
     /// introspection, alias, complexity, selection, and rate policy to the
@@ -1920,6 +1842,17 @@ impl GraphqlPlugin {
                 );
             }
         };
+
+        // `Value` keeps only the last of a repeated member, while other JSON
+        // readers keep the first or refuse the body. A repeated member that
+        // decides what the backend executes is therefore refused outright
+        // rather than enforced over a copy the backend may not read.
+        if envelope_repeats_a_graphql_member(body) {
+            return reject_uninspectable_transport(
+                "GraphQL request body repeats a top-level query, operationName, \
+                 variables, or extensions member",
+            );
+        }
 
         let operation_name = parsed.get("operationName").and_then(|n| n.as_str());
 
