@@ -13,21 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   services that allow path parameters** (#5948). On a route with
   `allow_path_parameters` (a mesh service opted in with
   `MeshService.allow_path_parameters` or `ferrum.io/allow-path-parameters`),
-  `mesh_authz` judged `AuthorizationPolicy` `paths:` / `notPaths:` only on the
-  parameterised path, while a parameter-stripping backend (Tomcat, Spring)
-  executes the stripped one. A DENY on `/admin/*` missed `/admin;x/users`, a
-  nested DENY on `/api/admin/*` missed `/api;x/admin/users`, an ALLOW on
-  `*.png` admitted `/admin/users;x.png`, and an ALLOW with
-  `notPaths: /api/admin/*` admitted `/api/admin;x/users`. Each rule's `to:`
-  block is now evaluated on both spellings: a DENY, CUSTOM, or AUDIT rule
-  matches when either spelling matches, and an ALLOW rule only when both do,
-  so a `notPaths:` exclusion lifts a DENY only when it holds for both
-  spellings and removes an ALLOW grant when it holds for either. The
-  body-buffering decision for body-inspecting CUSTOM providers considers both
-  spellings too. Routes without the opt-in are unchanged (they refuse `;`
-  before authorization). VirtualService `uri` matches need no change: they
-  compile to the `listen_path` of routes that never carry the opt-in, and the
-  re-route check refuses a `;` whose stripped path belongs to one.
+  `mesh_authz` judged `AuthorizationPolicy` `paths:` / `notPaths:` and
+  `when: request.headers[:path]` only on the parameterised path, while a
+  parameter-stripping backend (Tomcat, Spring) executes the stripped one. A
+  DENY on `/admin/*` missed `/admin;x/users`, a nested DENY on `/api/admin/*`
+  missed `/api;x/admin/users`, an ALLOW on `*.png` admitted
+  `/admin/users;x.png`, and an ALLOW excluding `/api/admin/*` admitted
+  `/api/admin;x/users`. Each rule is now evaluated once per spelling, with its
+  `to:` paths and any `:path` condition reading the same spelling: a DENY,
+  CUSTOM, or AUDIT rule matches when it matches on either spelling, and an
+  ALLOW rule only when it matches on both, so a `notPaths:` / `notValues:`
+  exclusion lifts a DENY only when it holds for both spellings and removes an
+  ALLOW grant when it holds for either. The combination is per rule: two ALLOW
+  rules that each match one spelling leave the request implicitly denied. The
+  second spelling is built whenever the path carries a `;`, and the
+  body-buffering decision for body-inspecting CUSTOM providers considers it
+  too. Routes without the opt-in are unchanged (they refuse `;` before
+  authorization). CUSTOM providers still receive the raw path only.
+  VirtualService routes never inherit the service's opt-in: a route whose own
+  `uri` literal contains `;` opts in by itself and is judged on both
+  spellings, any other refuses `;`, and the re-route check refuses a `;` whose
+  stripped path belongs to one.
 - **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
   GHSA-7gcf-g7xr-8hxj and `cmov` 0.5.4 for GHSA-3rjw-m598-pq24).
 - **The canonical request path refuses dot segments that carry a `;` path

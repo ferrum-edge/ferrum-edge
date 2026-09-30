@@ -2112,6 +2112,17 @@ fn bracketed_mesh_header_name(key: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
+/// Whether a `when:` condition key reads the `:path` pseudo-header
+/// (`request.headers[:path]`, any ASCII case). Mesh authorization sources it
+/// from the canonical request path, so it is judged on every spelling of that
+/// path, like `paths:` / `notPaths:` (issue #5948).
+pub(crate) fn mesh_condition_key_reads_path(key: &str) -> bool {
+    let Some(name) = bracketed_mesh_header_name(key) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(":path")
+}
+
 fn bracketed_mesh_claim_path(key: &str) -> Option<&str> {
     let path = key
         .strip_prefix(CONDITION_REQUEST_AUTH_CLAIMS_PREFIX)?

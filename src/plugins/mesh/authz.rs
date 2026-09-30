@@ -1000,7 +1000,10 @@ fn http_header_attribute(
         // matcher reads. Every caller runs after `authorize`'s canonical-path
         // gate has already proven `ctx.path` canonicalizes to itself, so a
         // `when: request.headers[:path]` condition and a `to.operation.paths`
-        // entry can never be evaluated against two different spellings.
+        // entry can never be evaluated against two different spellings. On a
+        // path with `;` parameters this is the raw spelling; the evaluator
+        // substitutes the parameter-stripped one when it judges the rule on
+        // that spelling (issue #5948).
         return Some(ctx.path.clone());
     }
     if name.eq_ignore_ascii_case(":scheme") {
@@ -3077,16 +3080,14 @@ impl Plugin for MeshAuthz {
             },
             &headers,
         );
-        // Issue #5948: on a proxy that admits `;` path parameters, a
-        // parameter-stripping backend (Tomcat, Spring) executes the path
-        // without them, so `paths:` / `notPaths:` are judged on both
-        // spellings. Without the opt-in a `;` never gets this far.
-        let stripped_path = crate::modes::mesh::policy::mesh_authz_stripped_path(
-            &authorization_path,
-            ctx.matched_proxy
-                .as_deref()
-                .is_some_and(|proxy| proxy.allow_path_parameters),
-        );
+        // Issue #5948: a parameter-stripping backend (Tomcat, Spring) executes
+        // the path without its `;` parameters, so `paths:` / `notPaths:` and
+        // `when: request.headers[:path]` are judged on both spellings. Only a
+        // proxy with `allow_path_parameters` lets a `;` get this far today;
+        // the second spelling is built whenever the path carries one, so an
+        // entry point that skipped that refusal would still fail closed.
+        let stripped_path =
+            crate::modes::mesh::policy::mesh_authz_stripped_path(&authorization_path);
         let request = MeshAuthzRequest {
             source_principal,
             request_principal,

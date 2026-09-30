@@ -4489,13 +4489,13 @@ async fn functional_mesh_sidecar_inbound_path_parameters_stay_on_the_selected_po
 
 /// A DENY on `/admin/*` also refuses `/admin;x/users` on an opted-in service
 /// (issue #5948). A parameter-stripping backend executes `/admin/users` for
-/// it, so `mesh_authz` judges `paths:` on both spellings and the request never
-/// reaches the backend. A `;jsessionid=` path the DENY does not cover is still
-/// served unchanged.
+/// it, so `mesh_authz` judges `paths:` and `when: request.headers[:path]` on
+/// both spellings and the request never reaches the backend. A `;jsessionid=`
+/// path neither DENY covers is still served unchanged.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_sidecar_inbound_deny_covers_the_parameter_stripped_path() {
-    use ferrum_edge::modes::mesh::config::RequestMatch;
+    use ferrum_edge::modes::mesh::config::{ConditionMatch, RequestMatch};
 
     let deny_admin = MeshPolicy {
         name: "deny-admin".to_string(),
@@ -4510,30 +4510,44 @@ async fn functional_mesh_sidecar_inbound_deny_covers_the_parameter_stripped_path
             ..MeshRule::default()
         }],
     };
+    // The same restriction written as a `:path` condition.
+    let deny_secret = MeshPolicy {
+        name: "deny-secret".to_string(),
+        namespace: "ferrum".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            when: vec![ConditionMatch {
+                key: "request.headers[:path]".to_string(),
+                values: vec!["/secret/*".to_string()],
+                not_values: Vec::new(),
+            }],
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    };
     let requests = [
         (ECHO_HOST, "/admin;x/users"),
         (ECHO_HOST, "/admin;jsessionid=abc123/users"),
         (ECHO_HOST, "/admin/users"),
+        (ECHO_HOST, "/secret;x/doc"),
         (ECHO_HOST, "/app/page;jsessionid=abc123"),
     ];
-    let results = drive_inbound_path_parameter_requests(true, false, &[deny_admin], &requests)
+    let policies = [deny_admin, deny_secret];
+    let results = drive_inbound_path_parameter_requests(true, false, &policies, &requests)
         .await
         .expect("opted-in inbound DENY case");
     assert_eq!(results.len(), requests.len());
-    for ((_, path), (status, body)) in requests[..3].iter().zip(&results) {
-        assert_eq!(
-            *status, 403,
-            "the DENY on /admin/* must refuse {path}; body: {body:?}"
-        );
+    for ((_, path), (status, body)) in requests[..4].iter().zip(&results) {
+        assert_eq!(*status, 403, "a DENY must refuse {path}; body: {body:?}");
         assert!(
             !body.contains("backend-a"),
             "{path} must not reach the backend: {body:?}"
         );
     }
-    let (status, body) = &results[3];
+    let (status, body) = &results[4];
     assert_eq!(
         *status, 200,
-        "a path outside the DENY must be served; body: {body:?}"
+        "a path outside both DENY rules must be served; body: {body:?}"
     );
     assert!(
         body.contains("backend-a GET /app/page;jsessionid=abc123 HTTP/1.1"),
