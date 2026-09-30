@@ -500,7 +500,8 @@ impl GatewayListenerAdmission {
     ///
     /// Runs under the request-epoch writer lock, once per config publication,
     /// never on the request path. Returns `self` unchanged when the listener
-    /// plan is identical, and never admits a port this admission does not.
+    /// plan is identical, and never admits a port this admission does not:
+    /// every port it refuses or leaves pending stays refused or pending.
     pub(crate) fn carry_forward(self: &Arc<Self>, config: &GatewayConfig) -> Arc<Self> {
         let Some(basis) = self.basis.as_ref().filter(|_| !self.pending) else {
             return Self::pending();
@@ -549,6 +550,13 @@ impl GatewayListenerAdmission {
                 .iter()
                 .filter(|port| !next_basis.ports().contains_key(*port)),
         );
+        // A port still waiting for its first decision stays pending when it
+        // leaves the plan, so no port is admitted without a reconcile.
+        for port in &self.pending_ports {
+            if !next_basis.ports().contains_key(port) && !refused_ports.contains(port) {
+                pending_ports.insert(*port);
+            }
+        }
         Arc::new(Self {
             pending: false,
             refused_ports,
@@ -562,8 +570,10 @@ impl GatewayListenerAdmission {
         !self.pending && !self.refused_ports.contains(&port) && !self.pending_ports.contains(&port)
     }
 
+    /// Whether `port` is refused as a frontend port, not only as a route
+    /// `listen_port`.
     #[inline]
-    fn explicitly_refuses(&self, port: u16) -> bool {
+    pub(crate) fn explicitly_refuses(&self, port: u16) -> bool {
         self.refused_ports.contains(&port)
     }
 }
