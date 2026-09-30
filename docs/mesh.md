@@ -2116,10 +2116,15 @@ exists there. Full rule:
 **Risk to account for.** On an opted-in service, `mesh_authz` evaluates
 `paths:` / `notPaths:` on the parameterised path, while a parameter-stripping
 backend executes the stripped path. A DENY rule for `/admin/*` does not match
-`/admin;x/users`, which Tomcat runs as `/admin/users`. Opt in only services
-whose backends need `;`, prefer ALLOW rules (they fail closed for a spelling
-they do not list), and write any DENY rule to cover the parameterised
-spellings as well (for example `/admin*` alongside `/admin/*`). VirtualService
+`/admin;x/users`, which Tomcat runs as `/admin/users`. Only exact and prefix
+`paths:` entries in ALLOW rules fail closed for a parameterised spelling. On an
+opted-in service, suffix patterns (`*.png` admits `/admin/users;x.png`),
+`notPaths:` inside an ALLOW rule (`/api/*` minus `/api/admin/*` admits
+`/api/admin;x/users`) and DENY `paths:` rules (`/api/admin/*` misses
+`/api;x/admin/users`) are not reliable, and a DENY pattern cannot cover a `;`
+in an earlier segment without blocking too much. Opt in only services whose
+backends need `;`, and review every AuthorizationPolicy that covers them,
+including mesh-wide DENY rules owned by the platform team. VirtualService
 `http[].match[].uri` matches on the service's routes read the same
 parameterised path.
 

@@ -270,9 +270,9 @@ The same trade-off as any opted-in proxy applies. `mesh_authz` evaluates
 `AuthorizationPolicy` `paths:` on the parameterised path, and a backend that
 strips parameters executes the stripped one. A DENY rule for `/admin/*`
 does not match `/admin;x/users`, which such a backend runs as `/admin/users`.
-On an opted-in service, prefer ALLOW rules, which fail closed for a spelling
-they do not list, or write DENY rules that also cover the parameterised
-spellings (for example `/admin*` in addition to `/admin/*`).
+Only exact and prefix `paths:` entries in ALLOW rules fail closed for a
+parameterised spelling; suffix patterns, `notPaths:` and DENY `paths:` rules are
+not reliable on an opted-in service (see [mesh.md](mesh.md) for examples).
 
 **Provider override queries are not canonicalized.** A plugin that rewrites
 the backend path (`ai_stream_router`, `ai_federation`) may put the endpoint and

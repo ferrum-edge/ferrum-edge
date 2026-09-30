@@ -103,8 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   planes cannot carry it. The re-route check of GHSA-fcqw-793q-wg5x applies
   unchanged, so a `;` still cannot reach a path that another route on the
   service's hosts owns. `mesh_authz` evaluates `paths:` on the parameterised
-  path, so on an opted-in service write DENY rules for the parameterised
-  spellings too, or prefer ALLOW rules. Default-off services still refuse `;`
+  path: on an opted-in service only exact and prefix ALLOW `paths:` fail
+  closed, while suffix patterns, `notPaths:` and DENY `paths:` rules can be
+  bypassed with a `;` segment. Default-off services still refuse `;`
   with `400 path_parameter`. See `docs/mesh.md` and
   `docs/request_path_canonicalization.md`.
 
