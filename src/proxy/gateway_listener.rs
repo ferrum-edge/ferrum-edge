@@ -29,6 +29,15 @@
 //!   Awaiting the accept-loop task closes every accept socket first; already
 //!   accepted connections keep draining in their own tasks through the cloned
 //!   shutdown receivers they hold.
+//! - **Connection identity.** Every accepted connection carries the
+//!   [`GatewayListenerIdentity`] of the listener that accepted it. Retiring a
+//!   listener whose identity left the plan retires that identity before the
+//!   pass publishes, and the route lookup refuses every request on a retired
+//!   identity (issue #5921). A class, bind, or direction flip therefore needs
+//!   no port-wide refusal once the replacement binds: new connections are
+//!   served as soon as that pass opens the replacement's accept gate, and old
+//!   connections are never served under the new decision, however long they
+//!   drain.
 //! - **Removal / withdrawal.** Routes are withdrawn by the atomic
 //!   `ArcSwap` config publish that *precedes* this reconcile, so from the
 //!   instant a listener leaves the config its port answers `404` — never stale
@@ -117,6 +126,14 @@
 //! widen its exposure. QUIC-only degradations do **not** enter the refused-route
 //! set, so an available H1/H2 half remains routable.
 //!
+//! A refusal on a process-global frontend port (`ProcessGlobalClassMismatch`,
+//! `DedicatedBindConflict`) refuses only the routes scoped to that port. The
+//! frontend itself has no stale identity, since this manager never owns its
+//! socket, so it keeps serving every port-agnostic route (issue #5922). Config
+//! validation rejects both collisions before publication
+//! ([`validate_process_global_frontend_conflicts`]); this runtime rule covers
+//! a config that reaches the planner anyway, for example on a data plane.
+//!
 //! # Observability
 //!
 //! Every pass also publishes a bounded, structured realization snapshot to the
@@ -141,11 +158,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{Mutex, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::config::types::{DispatchKind, GatewayConfig};
+use crate::config::types::{DispatchKind, GatewayConfig, Proxy};
 use crate::proxy::ProxyState;
 use crate::proxy::gateway_listener_status::{
     GatewayListenerFailureCategory, GatewayListenerFailureObservation, GatewayListenerProtocolHalf,
@@ -169,6 +187,204 @@ impl GatewayListenerClass {
             Self::Tls => "HTTPS",
         }
     }
+
+    /// The env var that sets the process-global frontend of this class.
+    fn global_port_env_var(self) -> &'static str {
+        match self {
+            Self::Plaintext => "FERRUM_PROXY_HTTP_PORT",
+            Self::Tls => "FERRUM_PROXY_HTTPS_PORT",
+        }
+    }
+}
+
+/// The process-global HTTP/HTTPS proxy frontends and their classes, by port.
+pub type ProcessGlobalFrontends = BTreeMap<u16, GatewayListenerClass>;
+
+/// The process-global HTTP/HTTPS proxy frontends, keyed by port.
+///
+/// `0` means the frontend is disabled and is left out. When both ports are the
+/// same, the TLS frontend wins, exactly as it does for the listener manager.
+pub fn process_global_frontends(
+    plaintext_port: Option<u16>,
+    tls_port: Option<u16>,
+) -> ProcessGlobalFrontends {
+    let mut frontends = BTreeMap::new();
+    if let Some(port) = plaintext_port.filter(|port| *port != 0) {
+        frontends.insert(port, GatewayListenerClass::Plaintext);
+    }
+    if let Some(port) = tls_port.filter(|port| *port != 0) {
+        frontends.insert(port, GatewayListenerClass::Tls);
+    }
+    frontends
+}
+
+/// [`process_global_frontends`] as `EnvConfig` configures them, for
+/// validation that runs before any listener exists. The HTTPS frontend
+/// counts only when frontend TLS is configured, as for the listener manager.
+pub fn env_process_global_frontends(
+    env_config: &crate::config::EnvConfig,
+) -> ProcessGlobalFrontends {
+    process_global_frontends(
+        Some(env_config.proxy_http_port),
+        env_config
+            .frontend_tls_cert_path
+            .is_some()
+            .then_some(env_config.proxy_https_port),
+    )
+}
+
+/// The Gateway listener class of an HTTP-family proxy's `listen_port`, from
+/// its own namespace-qualified `http_tls_listen_ports` entry.
+fn listener_class(config: &GatewayConfig, proxy: &Proxy, port: u16) -> GatewayListenerClass {
+    if config
+        .http_tls_listen_ports
+        .contains(&(proxy.namespace.clone(), port))
+    {
+        GatewayListenerClass::Tls
+    } else {
+        GatewayListenerClass::Plaintext
+    }
+}
+
+/// How a Gateway listener collides with a process-global frontend on the
+/// same port, if it does. Shared by the listener planner and by config
+/// validation, so both classify the collision the same way (issue #5922).
+fn process_global_frontend_conflict(
+    class: GatewayListenerClass,
+    dedicated_bind: bool,
+    frontend: GatewayListenerClass,
+) -> Option<GatewayListenerFailureCategory> {
+    if dedicated_bind {
+        // A dedicated Sidecar ingress bind claims exclusive OS ownership.
+        // Absorbing it into the process-global frontend would silently widen
+        // loopback-only traffic onto the shared socket (#3266).
+        Some(GatewayListenerFailureCategory::DedicatedBindConflict)
+    } else if frontend == class {
+        None
+    } else {
+        Some(GatewayListenerFailureCategory::ProcessGlobalClassMismatch)
+    }
+}
+
+/// The validation error for an HTTP-family proxy whose `listen_port` is a
+/// process-global proxy frontend it can never be served on (issue #5922).
+///
+/// `config` supplies the proxy's listener class (`http_tls_listen_ports`) and
+/// any dedicated Sidecar ingress bind. The rules are the listener planner's:
+/// a route of the other class on a process-global frontend
+/// (`ProcessGlobalClassMismatch`), or a dedicated bind on one
+/// (`DedicatedBindConflict`). A dedicated TLS bind is refused for its own
+/// reason before either applies, so it is not reported here.
+pub fn process_global_frontend_conflict_for_proxy(
+    config: &GatewayConfig,
+    proxy: &Proxy,
+    frontends: &ProcessGlobalFrontends,
+) -> Option<String> {
+    if proxy.dispatch_kind.is_stream() {
+        return None;
+    }
+    let port = proxy.listen_port.filter(|port| *port != 0)?;
+    let frontend = *frontends.get(&port)?;
+    let class = listener_class(config, proxy, port);
+    let dedicated_bind = sidecar_ingress_bind_for_port(config, port).is_some();
+    if dedicated_bind && class == GatewayListenerClass::Tls {
+        return None;
+    }
+    let message = match process_global_frontend_conflict(class, dedicated_bind, frontend)? {
+        GatewayListenerFailureCategory::DedicatedBindConflict => format!(
+            "HTTP-family proxy {:?} in namespace {:?} sets `listen_port` \"{}\", which has a \
+             dedicated Sidecar ingress bind but is the process-global {} proxy port (`{}`); a \
+             dedicated bind cannot share the process-global frontend",
+            proxy.id,
+            proxy.namespace,
+            port,
+            frontend.label(),
+            frontend.global_port_env_var()
+        ),
+        _ => format!(
+            "HTTP-family proxy {:?} in namespace {:?} sets `listen_port` \"{}\", the \
+             process-global {} proxy port (`{}`), but its Gateway listener class is {} \
+             (`http_tls_listen_ports`); a route scoped to a process-global frontend must match \
+             that frontend's class",
+            proxy.id,
+            proxy.namespace,
+            port,
+            frontend.label(),
+            frontend.global_port_env_var(),
+            class.label()
+        ),
+    };
+    Some(message)
+}
+
+/// Reject every HTTP-family proxy whose `listen_port` collides with a
+/// process-global proxy frontend (issue #5922). See
+/// [`process_global_frontend_conflict_for_proxy`].
+///
+/// Without this a conflicting route reaches the listener planner, which can
+/// only refuse it at runtime. The runtime refusal is limited to the routes
+/// scoped to that port, so the frontend keeps serving port-agnostic routes,
+/// but the conflicting route itself is never served.
+pub fn validate_process_global_frontend_conflicts(
+    config: &GatewayConfig,
+    frontends: &ProcessGlobalFrontends,
+) -> Result<(), Vec<String>> {
+    let mut errors: Vec<String> = Vec::new();
+    for proxy in &config.proxies {
+        if let Some(error) = process_global_frontend_conflict_for_proxy(config, proxy, frontends) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// The identity one Gateway listener socket accepts connections under
+/// (issue #5921).
+///
+/// Every connection a Gateway listener accepts, over TCP or QUIC, carries a
+/// clone of its listener's identity. When reconcile retires the listener
+/// because its class, bind address, or mesh direction changed, or because
+/// the config withdrew it, the identity is retired **before** the pass
+/// publishes its admission decision. From then on the route lookup refuses
+/// every request on those old connections, however long they keep draining,
+/// while the replacement socket's connections are served as soon as its
+/// accept gate opens. Because the fence is per connection, a replacement
+/// that bound in the same pass needs no port-wide refusal.
+///
+/// Process shutdown never retires an identity, so draining connections keep
+/// serving their in-flight work then.
+#[derive(Debug, Clone, Default)]
+pub struct GatewayListenerIdentity {
+    retired: Arc<AtomicBool>,
+}
+
+impl GatewayListenerIdentity {
+    fn retire(&self) {
+        // Pairs with the Acquire load in `is_retired`. Reconcile stores this
+        // before it publishes the admission that lifts the port's refusal,
+        // and a request loads its epoch before checking the flag, so a request
+        // routed under that admission always sees the retirement.
+        self.retired.store(true, Ordering::Release);
+    }
+
+    /// Whether the listener this connection was accepted on was retired.
+    #[inline]
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+}
+
+/// What a Gateway listener's accept loop is started with: the gate it parks
+/// on until its config generation is admitted, and the identity it stamps on
+/// every connection it accepts.
+#[derive(Debug, Clone)]
+pub struct GatewayListenerAcceptGate {
+    pub(crate) open_rx: watch::Receiver<bool>,
+    pub(crate) identity: GatewayListenerIdentity,
 }
 
 /// Protocol-scoped QUIC admission failure for a TLS-class listener that still
@@ -305,14 +521,7 @@ impl GatewayListenerPlan {
                 continue;
             }
             // TLS class comes from this proxy's own namespace-qualified entry.
-            let class = if config
-                .http_tls_listen_ports
-                .contains(&(proxy.namespace.clone(), port))
-            {
-                GatewayListenerClass::Tls
-            } else {
-                GatewayListenerClass::Plaintext
-            };
+            let class = listener_class(config, proxy, port);
             let bind_addr = desired_gateway_bind(config, port, default_bind_addr);
             let dedicated_bind = sidecar_ingress_bind_for_port(config, port).is_some();
             let mesh_direction =
@@ -331,37 +540,37 @@ impl GatewayListenerPlan {
                 continue;
             }
             if let Some(existing) = existing_frontends.get(&port) {
-                if dedicated_bind {
-                    // A dedicated Sidecar ingress bind claims exclusive OS
-                    // ownership. Absorbing it into the process-global
-                    // same-class frontend would silently widen loopback-only
-                    // traffic onto the shared socket (#3266).
-                    refused
-                        .entry(port)
-                        .or_insert_with(|| GatewayListenerRefusal {
-                            category: GatewayListenerFailureCategory::DedicatedBindConflict,
-                            message: format!(
-                                "port {port} has a dedicated Sidecar ingress bind but is already \
-                                 owned by a process-global {} proxy listener; the dedicated bind \
-                                 is not served",
-                                existing.label()
-                            ),
-                        });
-                } else if *existing == class {
-                    already_served.insert(port, class);
-                } else {
-                    refused
-                        .entry(port)
-                        .or_insert_with(|| GatewayListenerRefusal {
-                            category: GatewayListenerFailureCategory::ProcessGlobalClassMismatch,
-                            message: format!(
-                                "port {port} is already owned by a process-global {} proxy \
-                             listener, but this Gateway listener requires {}; the Gateway \
-                             listener is not served",
-                                existing.label(),
-                                class.label()
-                            ),
-                        });
+                match process_global_frontend_conflict(class, dedicated_bind, *existing) {
+                    None => {
+                        already_served.insert(port, class);
+                    }
+                    Some(GatewayListenerFailureCategory::DedicatedBindConflict) => {
+                        refused
+                            .entry(port)
+                            .or_insert_with(|| GatewayListenerRefusal {
+                                category: GatewayListenerFailureCategory::DedicatedBindConflict,
+                                message: format!(
+                                    "port {port} has a dedicated Sidecar ingress bind but is \
+                                     already owned by a process-global {} proxy listener; the \
+                                     dedicated bind is not served",
+                                    existing.label()
+                                ),
+                            });
+                    }
+                    Some(category) => {
+                        refused
+                            .entry(port)
+                            .or_insert_with(|| GatewayListenerRefusal {
+                                category,
+                                message: format!(
+                                    "port {port} is already owned by a process-global {} proxy \
+                                     listener, but this Gateway listener requires {}; the \
+                                     Gateway listener is not served",
+                                    existing.label(),
+                                    class.label()
+                                ),
+                            });
+                    }
                 }
                 continue;
             }
@@ -537,6 +746,14 @@ impl GatewayListenerAdmissionBasis {
     pub(crate) fn ports(&self) -> &BTreeMap<u16, PlannedListenerPort> {
         &self.ports
     }
+
+    /// Whether `port` is a process-global proxy frontend. This manager never
+    /// owns that socket, so no reconcile ever changes its identity: a
+    /// refusal there covers the routes scoped to the port, never the
+    /// frontend itself (issue #5922).
+    pub(crate) fn is_process_global_frontend(&self, port: u16) -> bool {
+        self.planner.existing_frontends.contains_key(&port)
+    }
 }
 
 /// A refusal or bind failure for one Gateway listener port (or protocol half).
@@ -647,6 +864,9 @@ struct LiveListener {
     /// Direction stamped on every accepted connection. Dedicated Sidecar
     /// ingress binds use `Inbound`; ordinary Gateway listeners use `None`.
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    /// Stamped on every connection either protocol half accepts, and retired
+    /// when this listener's identity leaves the plan (issue #5921).
+    identity: GatewayListenerIdentity,
     shutdown_tx: watch::Sender<bool>,
     /// Held until this listener's config generation has published its
     /// admission decision. The socket is bound, but it cannot accept yet.
@@ -664,6 +884,24 @@ struct LiveListener {
 }
 
 impl LiveListener {
+    /// Whether this listener is the one `desired` asks for: same class, bind
+    /// address, and mesh direction. `None` means the port left the plan.
+    fn matches(&self, desired: Option<&DesiredGatewayListener>) -> bool {
+        desired.is_some_and(|desired| {
+            desired.class == self.class
+                && desired.bind_addr == self.bind_addr
+                && desired.mesh_direction == self.mesh_direction
+        })
+    }
+
+    /// The gate and identity a protocol half of this listener starts with.
+    fn accept_gate(&self) -> GatewayListenerAcceptGate {
+        GatewayListenerAcceptGate {
+            open_rx: self.accept_gate_tx.subscribe(),
+            identity: self.identity.clone(),
+        }
+    }
+
     /// Whether the TCP accept loop has ended. A started listener whose accept
     /// loop has exited is not a healthy port, however it exited: the whole
     /// listener must be retired and rebound.
@@ -809,16 +1047,14 @@ impl GatewayListenerManager {
         let udp_ports = Arc::clone(state.stream_listener_manager.udp_port_handoff());
         // Before the readiness reconcile can run; see `stream_releases`.
         let stream_releases = udp_ports.subscribe_releases(UdpPortOwner::StreamDatagram);
-        let mut existing_frontends = BTreeMap::new();
-        if state.env_config.proxy_http_port != 0 {
-            existing_frontends.insert(
-                state.env_config.proxy_http_port,
-                GatewayListenerClass::Plaintext,
-            );
-        }
-        if tls.is_configured() && state.env_config.proxy_https_port != 0 {
-            existing_frontends.insert(state.env_config.proxy_https_port, GatewayListenerClass::Tls);
-        }
+        let existing_frontends = process_global_frontends(
+            Some(state.env_config.proxy_http_port),
+            tls.is_configured()
+                .then_some(state.env_config.proxy_https_port),
+        );
+        // Config validation checks route `listen_port`s against the same set
+        // this manager plans with (issue #5922).
+        state.publish_process_global_frontends(existing_frontends.clone());
         Self {
             state,
             bind_addr,
@@ -857,15 +1093,9 @@ impl GatewayListenerManager {
         plaintext_port: Option<u16>,
         tls_port: Option<u16>,
     ) -> Self {
-        self.existing_frontends.clear();
-        if let Some(port) = plaintext_port.filter(|port| *port != 0) {
-            self.existing_frontends
-                .insert(port, GatewayListenerClass::Plaintext);
-        }
-        if let Some(port) = tls_port.filter(|port| *port != 0) {
-            self.existing_frontends
-                .insert(port, GatewayListenerClass::Tls);
-        }
+        self.existing_frontends = process_global_frontends(plaintext_port, tls_port);
+        self.state
+            .publish_process_global_frontends(self.existing_frontends.clone());
         self
     }
 
@@ -888,6 +1118,18 @@ impl GatewayListenerManager {
             .iter()
             .filter_map(|(port, listener)| (*listener.accept_gate_tx.borrow()).then_some(*port))
             .collect()
+    }
+
+    /// The identity of the live listener on `port`, for tests that check a
+    /// connection accepted under one listener generation is never routed
+    /// under the next (issue #5921).
+    #[allow(dead_code)]
+    pub async fn listener_identity(&self, port: u16) -> Option<GatewayListenerIdentity> {
+        self.listeners
+            .lock()
+            .await
+            .get(&port)
+            .map(|listener| listener.identity.clone())
     }
 
     /// `(port, bind_addr)` pairs currently owned by this manager.
@@ -1054,6 +1296,13 @@ impl GatewayListenerManager {
             .collect();
         for port in dead_tcp {
             if let Some(listener) = live.remove(&port) {
+                // When the plan still matches, the replacement bound below has
+                // the same class, bind address, and direction, so connections
+                // this dead loop accepted may keep serving. If the plan changed
+                // too, they must not serve under the old identity.
+                if !listener.matches(plan.ports.get(&port)) {
+                    listener.identity.retire();
+                }
                 listener.signal_shutdown();
                 if listener.quic.is_some() {
                     quic_retired.insert(port);
@@ -1109,15 +1358,9 @@ impl GatewayListenerManager {
         let stale: Vec<u16> = live
             .iter()
             .filter_map(|(port, listener)| {
-                let drifted = !plan.ports.get(port).is_some_and(|desired| {
-                    desired.class == listener.class
-                        && desired.bind_addr == listener.bind_addr
-                        && desired.mesh_direction == listener.mesh_direction
-                });
-                drifted.then_some(*port)
+                (!listener.matches(plan.ports.get(port))).then_some(*port)
             })
             .collect();
-        let stale_route_ports: BTreeSet<u16> = stale.iter().copied().collect();
         // Ports whose retiring generation has not finished closing its accept
         // sockets. Rebinding them in this pass could co-serve two classes or
         // leave a wildcard socket claiming a more-specific replacement, so
@@ -1143,6 +1386,11 @@ impl GatewayListenerManager {
                 listener.class.label(),
                 retire_reason
             );
+            // Fence the old identity before anything this pass publishes: the
+            // replacement may be admitted without a port-wide refusal, and a
+            // connection this socket already accepted must never be routed
+            // under it (issue #5921).
+            listener.identity.retire();
             listener.signal_shutdown();
             if listener.quic.is_some() {
                 quic_retired.insert(port);
@@ -1215,16 +1463,23 @@ impl GatewayListenerManager {
         // Admission refusals suppress remapping. Start from plan.refused
         // (reserved / stream / TLS-class collisions) and every port whose old
         // accept loop is still draining, including a listener withdrawn from
-        // the current plan. A request already accepted by that old listener
-        // must not be remapped to the sole surviving listener. Extend this set
-        // for other reconcile-time decisions that likewise must not leak onto
-        // the process-global proxy. Every `spawn_listener` error is included;
-        // in particular, a failed dedicated Sidecar ingress bind must not widen
-        // its loopback-only route through single-listener remapping.
-        // QUIC-only collisions stay out of this set so H1/H2 routes remain
-        // reachable on the TCP half.
+        // the current plan. Extend this set for other reconcile-time decisions
+        // that likewise must not leak onto the process-global proxy. Every
+        // `spawn_listener` error is included; in particular, a failed
+        // dedicated Sidecar ingress bind must not widen its loopback-only route
+        // through single-listener remapping. QUIC-only collisions stay out of
+        // this set so H1/H2 routes remain reachable on the TCP half.
+        //
+        // A port whose old listener retired and whose replacement binds in
+        // this pass is not refused (issue #5921): the replacement serves as
+        // soon as this decision opens its accept gate. The old listener's
+        // already-accepted connections are fenced per connection instead, by
+        // the identity retired above, so they are never routed — nor remapped
+        // onto a surviving listener — under the new decision. Refusals on a
+        // process-global frontend port apply only to the routes scoped to it;
+        // `GatewayListenerAdmission::decided_for_plan` keeps that frontend
+        // serving its port-agnostic routes (issue #5922).
         let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
-        refused_route_ports.extend(stale_route_ports);
         refused_route_ports.extend(retiring_ports.iter().copied());
 
         for (port, desired) in &plan.ports {
@@ -1648,7 +1903,7 @@ impl GatewayListenerManager {
             client_ca_bundle_path: http3.client_ca_bundle_path.clone(),
             client_crls: http3.client_crls.clone(),
             started_tx: Some(started_tx),
-            accept_gate_rx: Some(listener.accept_gate_tx.subscribe()),
+            accept_gate: Some(listener.accept_gate()),
             frontend_tls_reload: http3.frontend_tls_reload(),
             // The listener arms this right after its UDP bind succeeds and
             // hands it to Quinn inside the socket, so the claim lasts exactly
@@ -1754,6 +2009,11 @@ impl GatewayListenerManager {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (started_tx, started_rx) = oneshot::channel();
         let (accept_gate_tx, accept_gate_rx) = watch::channel(false);
+        let identity = GatewayListenerIdentity::default();
+        let accept_gate = GatewayListenerAcceptGate {
+            open_rx: accept_gate_rx,
+            identity: identity.clone(),
+        };
         let state = self.state.clone();
         let tls = self.tls.clone();
         let task = tokio::spawn(async move {
@@ -1772,7 +2032,7 @@ impl GatewayListenerManager {
                             // host's default V6ONLY posture.
                             false,
                             Some(started_tx),
-                            Some(accept_gate_rx),
+                            Some(accept_gate),
                         )
                         .await
                     }
@@ -1783,7 +2043,7 @@ impl GatewayListenerManager {
                             shutdown_rx,
                             None,
                             Some(started_tx),
-                            Some(accept_gate_rx),
+                            Some(accept_gate),
                         )
                         .await
                     }
@@ -1796,7 +2056,7 @@ impl GatewayListenerManager {
                             shutdown_rx,
                             slot,
                             Some(started_tx),
-                            Some(accept_gate_rx),
+                            Some(accept_gate),
                         )
                         .await
                     } else {
@@ -1806,7 +2066,7 @@ impl GatewayListenerManager {
                             shutdown_rx,
                             tls.static_config,
                             Some(started_tx),
-                            Some(accept_gate_rx),
+                            Some(accept_gate),
                         )
                         .await
                     }
@@ -1828,6 +2088,7 @@ impl GatewayListenerManager {
                     class: desired.class,
                     bind_addr: desired.bind_addr,
                     mesh_direction: desired.mesh_direction,
+                    identity,
                     shutdown_tx,
                     accept_gate_tx,
                     tcp: task,
@@ -3769,6 +4030,9 @@ mod tests {
         Allowed,
         /// Listener-scoped routes fail closed; the frontend port still routes.
         Pending,
+        /// A process-global frontend: its scoped routes are refused, but the
+        /// frontend keeps routing port-agnostic routes (issue #5922).
+        RouteRefused,
         /// Refused as a route port and as a frontend port.
         Refused,
     }
@@ -3778,6 +4042,8 @@ mod tests {
             Admitted::Refused
         } else if admission.allows(port) {
             Admitted::Allowed
+        } else if admission.refuses_only_routes_on(port) {
+            Admitted::RouteRefused
         } else {
             Admitted::Pending
         }
@@ -3862,7 +4128,7 @@ mod tests {
 
     #[test]
     fn route_admission_carry_forward_table() {
-        use Admitted::{Allowed, Pending, Refused};
+        use Admitted::{Allowed, Pending, Refused, RouteRefused};
         let loopback = IpAddr::from([127, 0, 0, 1]);
         let loopback_v6 = IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
         let wildcard = IpAddr::from([0, 0, 0, 0]);
@@ -3933,13 +4199,33 @@ mod tests {
             )],
         );
 
+        // The process-global frontend is never refused as a frontend port:
+        // only the routes scoped to it are (issue #5922).
         assert_reload_sequence(
             "process-global port changes class",
             reconciled(&routes_on_ports(&[CARRY_GLOBAL]), &[]),
             vec![(
                 with_tls_port(routes_on_ports(&[CARRY_GLOBAL]), CARRY_GLOBAL),
-                vec![(CARRY_GLOBAL, Refused)],
+                vec![(CARRY_GLOBAL, RouteRefused)],
             )],
+        );
+
+        assert_reload_sequence(
+            "process-global class mismatch fixed before reconcile",
+            reconciled(
+                &with_tls_port(routes_on_ports(&[CARRY_GLOBAL, CARRY_A]), CARRY_GLOBAL),
+                &[CARRY_GLOBAL],
+            ),
+            vec![
+                (
+                    with_tls_port(routes_on_ports(&[CARRY_GLOBAL, CARRY_A]), CARRY_GLOBAL),
+                    vec![(CARRY_GLOBAL, RouteRefused), (CARRY_A, Allowed)],
+                ),
+                (
+                    routes_on_ports(&[CARRY_GLOBAL, CARRY_A]),
+                    vec![(CARRY_GLOBAL, RouteRefused), (CARRY_A, Allowed)],
+                ),
+            ],
         );
 
         assert_reload_sequence(
@@ -3995,6 +4281,23 @@ mod tests {
                 ),
             ],
         );
+
+        // A reconcile refusing a process-global frontend port refuses only
+        // its scoped routes, for either global-port collision (issue #5922).
+        let mismatch = with_tls_port(routes_on_ports(&[CARRY_GLOBAL, CARRY_A]), CARRY_GLOBAL);
+        let dedicated = with_sidecar_bind(routes_on_ports(&[CARRY_GLOBAL]), CARRY_GLOBAL, loopback);
+        for config in [&mismatch, &dedicated] {
+            let plan = carry_planner().plan(config);
+            let refused: Vec<u16> = plan.refused.keys().copied().collect();
+            assert_eq!(refused, vec![CARRY_GLOBAL], "{:?}", plan.refused);
+            let decided = reconciled(config, &refused);
+            assert_eq!(admitted(&decided, CARRY_GLOBAL), RouteRefused);
+        }
+        let decided = reconciled(&mismatch, &[CARRY_GLOBAL, CARRY_A]);
+        assert_eq!(admitted(&decided, CARRY_GLOBAL), RouteRefused);
+        assert_eq!(admitted(&decided, CARRY_A), Refused);
+        let fixed = reconciled(&routes_on_ports(&[CARRY_GLOBAL, CARRY_A]), &[]);
+        assert_eq!(admitted(&fixed, CARRY_GLOBAL), Allowed);
 
         // Only the exact generation's reconcile widens admission.
         let previous = reconciled(&routes_on_ports(&[CARRY_A]), &[]);

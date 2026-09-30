@@ -1467,6 +1467,19 @@ pub async fn run(
             "Stream proxy port conflicts with gateway reserved ports"
         ));
     }
+    // An HTTP-family route cannot claim a process-global proxy frontend of the
+    // other class, or put a dedicated Sidecar ingress bind on one (#5922).
+    let frontends = proxy::gateway_listener::env_process_global_frontends(&env_config);
+    if let Err(errors) =
+        proxy::gateway_listener::validate_process_global_frontend_conflicts(&config, &frontends)
+    {
+        for msg in &errors {
+            error!("{}", crate::startup::sanitize_startup_cause(msg, &[]));
+        }
+        return Err(anyhow::anyhow!(
+            "Gateway listener port conflicts with a process-global proxy frontend"
+        ));
+    }
 
     // DNS cache
     let dns_cache = DnsCache::new(DnsConfig {
@@ -1990,7 +2003,7 @@ pub async fn run(
                             client_ca_bundle_path: h3_client_ca,
                             client_crls: h3_client_crls,
                             started_tx: Some(h3_started_tx),
-                            accept_gate_rx: None,
+                            accept_gate: None,
                             frontend_tls_reload: h3_reload,
                             udp_port_hold: None,
                         },

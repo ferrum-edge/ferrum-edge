@@ -997,6 +997,14 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
         if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
             return Err(format!("Port conflict errors:\n  {}", errors.join("\n  ")));
         }
+        // HTTP-family routes on a process-global proxy frontend (issue #5922)
+        use crate::proxy::gateway_listener;
+        let frontends = gateway_listener::env_process_global_frontends(&env_config);
+        if let Err(errors) =
+            gateway_listener::validate_process_global_frontend_conflicts(&config, &frontends)
+        {
+            return Err(format!("Port conflict errors:\n  {}", errors.join("\n  ")));
+        }
 
         // `FERRUM_FILE_CONFIG_PATH` can itself be materialized from an external
         // secret source, and this `println!` bypasses the tracing sink's

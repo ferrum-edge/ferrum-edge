@@ -2011,6 +2011,18 @@ async fn validate_bundle(
             }
         }
 
+        // HTTP-family route on a process-global proxy frontend it can never be
+        // served on (issue #5922). Mirrors Proxy::after_validate in crud.rs.
+        if vctx.mode != "cp"
+            && let Some(error) = crate::admin::crud::process_global_frontend_conflict(state, proxy)
+        {
+            failures.push(ValidationFailure {
+                resource_type: "proxy",
+                id: proxy.id.clone(),
+                errors: vec![error],
+            });
+        }
+
         if proxy.dispatch_kind.is_stream() {
             // Stream-family: validate the exact post-replacement listener group,
             // reserved-port conflict, and OS-level port availability. Mirrors

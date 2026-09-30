@@ -374,8 +374,10 @@ pub struct Http3ListenerOptions {
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Gateway listener accept gate. The UDP socket may bind before route
     /// admission, but the H3 endpoint does not accept connections until it is
-    /// opened by the matching config-generation publication.
-    pub accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// opened by the matching config-generation publication. Its listener
+    /// identity is stamped on every accepted connection, so a request on a
+    /// connection whose listener was retired is refused (issue #5921).
+    pub accept_gate: Option<crate::proxy::gateway_listener::GatewayListenerAcceptGate>,
     /// Optional opt-in frontend TLS live-reload inputs. When `Some`, the H3
     /// listener subscribes to `revision_rx` and, on a bump, reloads the latest
     /// `Arc<rustls::ServerConfig>` from `tls_slot`, rebuilds the
@@ -451,7 +453,7 @@ pub async fn start_http3_listener(
             client_ca_bundle_path,
             client_crls,
             started_tx: None,
-            accept_gate_rx: None,
+            accept_gate: None,
             frontend_tls_reload: None,
             udp_port_hold: None,
         },
@@ -1098,7 +1100,7 @@ pub async fn start_http3_listener_with_signal(
         client_ca_bundle_path,
         client_crls,
         started_tx,
-        accept_gate_rx,
+        accept_gate,
         frontend_tls_reload,
         udp_port_hold,
     } = options;
@@ -1267,7 +1269,13 @@ pub async fn start_http3_listener_with_signal(
     // input cannot accidentally trigger `.changed()` via channel close.
     let _sentinel_tx_keep_alive = sentinel_tx;
 
-    if let Some(mut accept_gate_rx) = accept_gate_rx {
+    let mut gateway_listener_identity = None;
+    if let Some(accept_gate) = accept_gate {
+        let crate::proxy::gateway_listener::GatewayListenerAcceptGate {
+            open_rx: mut accept_gate_rx,
+            identity,
+        } = accept_gate;
+        gateway_listener_identity = Some(identity);
         if *shutdown_rx.borrow() {
             endpoint.close(0u32.into(), b"listener shutdown");
             return Ok(());
@@ -1313,6 +1321,7 @@ pub async fn start_http3_listener_with_signal(
                         let state = Arc::clone(&state);
                         let adopted_quic = Arc::clone(&adopted_quic);
                         let conn_shutdown = shutdown_rx.clone();
+                        let gateway_listener_identity = gateway_listener_identity.clone();
                         tokio::spawn(async move {
                             // Exactly one ConnectionGuard per spawned Incoming.
                             // `handle_h3_connection` never constructs another, so
@@ -1327,6 +1336,7 @@ pub async fn start_http3_listener_with_signal(
                                     handshake_timeout,
                                     frontend_listen_port,
                                     frontend_destination_ip,
+                                    gateway_listener_identity,
                                     client_auth_configured,
                                     adopted_quic,
                                     conn_shutdown,
@@ -1863,6 +1873,7 @@ async fn handle_h3_connection(
     handshake_timeout: Duration,
     frontend_listen_port: Option<u16>,
     frontend_destination_ip: Option<std::net::IpAddr>,
+    gateway_listener_identity: Option<crate::proxy::gateway_listener::GatewayListenerIdentity>,
     client_auth_configured: bool,
     adopted_quic: Arc<arc_swap::ArcSwap<Option<Arc<quinn::ServerConfig>>>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -2309,6 +2320,7 @@ async fn handle_h3_connection(
                 let peer_connection = peer_connection.clone();
                 let stream_client_trust = client_trust_session.clone();
                 let stream_shutdown = shutdown_rx.clone();
+                let stream_gateway_listener = gateway_listener_identity.clone();
                 tokio::spawn(async move {
                     // Issue #4537: bound the wait for this stream's HEADERS
                     // frame. See `await_h3_request_headers` for why dropping the
@@ -2343,6 +2355,7 @@ async fn handle_h3_connection(
                                 &socket_ip,
                                 frontend_listen_port,
                                 frontend_destination_ip,
+                                stream_gateway_listener,
                                 frontend_sni_hostname,
                                 cert,
                                 chain,
@@ -2440,6 +2453,7 @@ async fn handle_h3_request(
     socket_ip: &str,
     frontend_listen_port: Option<u16>,
     frontend_destination_ip: Option<std::net::IpAddr>,
+    gateway_listener_identity: Option<crate::proxy::gateway_listener::GatewayListenerIdentity>,
     frontend_sni_hostname: Option<String>,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
@@ -3165,6 +3179,7 @@ async fn handle_h3_request(
         &path,
         ctx.frontend_listen_port,
         true,
+        gateway_listener_identity.as_ref(),
     );
 
     // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are

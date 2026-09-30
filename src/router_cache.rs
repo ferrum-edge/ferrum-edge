@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, Upstream, wildcard_matches};
-use crate::proxy::gateway_listener::GatewayListenerAdmissionBasis;
+use crate::proxy::gateway_listener::{GatewayListenerAdmissionBasis, GatewayListenerIdentity};
 
 thread_local! {
     /// Thread-local buffer for router cache key construction.
@@ -449,13 +449,23 @@ pub(crate) struct HostRouteTable {
 /// These hold until the matching reconcile publishes its own decision. An
 /// admission with no recorded plan (startup, or a standalone harness) makes
 /// the next generation pending as a whole.
+///
+/// A refusal on a process-global proxy frontend port is a route refusal only
+/// (issue #5922). That socket is not a Gateway listener, so it never has a
+/// stale identity, and refusing it as a frontend port would 404 every
+/// port-agnostic route of every namespace it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GatewayListenerAdmission {
     /// No decision covers this generation yet. Every listener-scoped route is
     /// refused, but no frontend port is.
     pending: bool,
-    /// Ports refused both as a route `listen_port` and as a frontend port.
+    /// Ports refused both as a route `listen_port` and as a frontend port:
+    /// Gateway listener sockets that are retiring, withdrawn, changed, or
+    /// refused.
     refused_ports: BTreeSet<u16>,
+    /// Process-global frontend ports whose scoped routes are refused. The
+    /// frontend keeps serving its port-agnostic routes.
+    refused_route_ports: BTreeSet<u16>,
     /// Ports whose route admission waits for this generation's reconcile.
     /// Unlike `refused_ports` they do not refuse the frontend port.
     pending_ports: BTreeSet<u16>,
@@ -467,6 +477,7 @@ impl GatewayListenerAdmission {
         Arc::new(Self {
             pending: true,
             refused_ports: BTreeSet::new(),
+            refused_route_ports: BTreeSet::new(),
             pending_ports: BTreeSet::new(),
             basis: None,
         })
@@ -478,19 +489,25 @@ impl GatewayListenerAdmission {
         Arc::new(Self {
             pending: false,
             refused_ports,
+            refused_route_ports: BTreeSet::new(),
             pending_ports: BTreeSet::new(),
             basis: None,
         })
     }
 
-    /// The decision a listener reconcile made against `basis`.
+    /// The decision a listener reconcile made against `basis`. A refused
+    /// process-global frontend port refuses only its scoped routes.
     pub(crate) fn decided_for_plan(
-        refused_ports: BTreeSet<u16>,
+        refused: BTreeSet<u16>,
         basis: GatewayListenerAdmissionBasis,
     ) -> Arc<Self> {
+        let (refused_route_ports, refused_ports): (BTreeSet<u16>, BTreeSet<u16>) = refused
+            .into_iter()
+            .partition(|port| basis.is_process_global_frontend(*port));
         Arc::new(Self {
             pending: false,
             refused_ports,
+            refused_route_ports,
             pending_ports: BTreeSet::new(),
             basis: Some(basis),
         })
@@ -511,15 +528,24 @@ impl GatewayListenerAdmission {
             return Arc::clone(self);
         }
         let mut refused_ports = BTreeSet::new();
+        let mut refused_route_ports = BTreeSet::new();
         let mut pending_ports = BTreeSet::new();
         for (port, planned) in next_basis.ports() {
-            let was_refused = self.refused_ports.contains(port);
+            let was_refused =
+                self.refused_ports.contains(port) || self.refused_route_ports.contains(port);
             let was_pending = self.pending_ports.contains(port);
             let previous = basis.ports().get(port);
+            let refuse = if next_basis.is_process_global_frontend(*port) {
+                // The frontend socket is not ours and never goes stale; only
+                // the routes scoped to it can be refused (issue #5922).
+                &mut refused_route_ports
+            } else {
+                &mut refused_ports
+            };
             if was_refused || planned.is_refused() {
                 // A retiring socket keeps its refusal, and a plan refusal is
                 // known without waiting for reconcile.
-                refused_ports.insert(*port);
+                refuse.insert(*port);
             } else if previous == Some(planned) {
                 // Unchanged: keep this port's decision.
                 if was_pending {
@@ -528,7 +554,7 @@ impl GatewayListenerAdmission {
             } else if previous.is_some() && !was_pending {
                 // A decided port changed class, bind, or ownership. Its live
                 // socket keeps the old identity until reconcile retires it.
-                refused_ports.insert(*port);
+                refuse.insert(*port);
             } else {
                 // New to the plan, or still waiting for its first decision.
                 pending_ports.insert(*port);
@@ -544,30 +570,45 @@ impl GatewayListenerAdmission {
             }
         }
         // Refusals outside the new plan belong to retiring sockets. Keep them
-        // until reconcile sees those sockets drained.
+        // until reconcile sees those sockets drained. Route refusals outside
+        // the plan are kept too, so carry-forward never admits a port.
         refused_ports.extend(
             self.refused_ports
+                .iter()
+                .filter(|port| !next_basis.ports().contains_key(*port)),
+        );
+        refused_route_ports.extend(
+            self.refused_route_ports
                 .iter()
                 .filter(|port| !next_basis.ports().contains_key(*port)),
         );
         // A port still waiting for its first decision stays pending when it
         // leaves the plan, so no port is admitted without a reconcile.
         for port in &self.pending_ports {
-            if !next_basis.ports().contains_key(port) && !refused_ports.contains(port) {
+            if !next_basis.ports().contains_key(port)
+                && !refused_ports.contains(port)
+                && !refused_route_ports.contains(port)
+            {
                 pending_ports.insert(*port);
             }
         }
         Arc::new(Self {
             pending: false,
             refused_ports,
+            refused_route_ports,
             pending_ports,
             basis: Some(next_basis),
         })
     }
 
+    /// Whether routes scoped to `listen_port` `port` may serve. The sets
+    /// probed here are normally empty.
     #[inline]
     pub(crate) fn allows(&self, port: u16) -> bool {
-        !self.pending && !self.refused_ports.contains(&port) && !self.pending_ports.contains(&port)
+        !self.pending
+            && !self.refused_ports.contains(&port)
+            && !self.refused_route_ports.contains(&port)
+            && !self.pending_ports.contains(&port)
     }
 
     /// Whether `port` is refused as a frontend port, not only as a route
@@ -575,6 +616,13 @@ impl GatewayListenerAdmission {
     #[inline]
     pub(crate) fn explicitly_refuses(&self, port: u16) -> bool {
         self.refused_ports.contains(&port)
+    }
+
+    /// Whether `port` is a process-global frontend whose scoped routes are
+    /// refused while the frontend keeps routing (issue #5922).
+    #[cfg(test)]
+    pub(crate) fn refuses_only_routes_on(&self, port: u16) -> bool {
+        self.refused_route_ports.contains(&port)
     }
 }
 
@@ -1824,6 +1872,14 @@ impl RouterCache {
     /// Production lookup from one complete request epoch. Keeping the route
     /// table, cache generation, and listener admission behind this one
     /// parameter prevents HTTP/H3 callers from pairing different generations.
+    ///
+    /// `gateway_listener` is the identity of the Gateway listener that
+    /// accepted the request's connection, `None` on every other frontend. A
+    /// connection accepted by a listener that reconcile has since retired is
+    /// refused outright, like a refused frontend port (issue #5921). The
+    /// caller loads `epoch` first, so an admission published after the
+    /// retirement is never paired with a stale view of the flag.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn find_proxy_in_epoch(
         &self,
         epoch: &crate::request_epoch::RequestEpoch,
@@ -1831,7 +1887,11 @@ impl RouterCache {
         path: &str,
         frontend_port: Option<u16>,
         frontend_is_tls: bool,
+        gateway_listener: Option<&GatewayListenerIdentity>,
     ) -> Option<RouteMatch> {
+        if gateway_listener.is_some_and(GatewayListenerIdentity::is_retired) {
+            return None;
+        }
         self.find_proxy_with_admission(
             &epoch.route_table,
             epoch.route_generation,

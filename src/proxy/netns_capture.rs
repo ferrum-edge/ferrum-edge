@@ -1229,6 +1229,7 @@ impl NetnsBackend for ProxyNetnsBackend {
                 SourceIpOverride::Dynamic(source_ip_rx),
                 Some(expected_pod_uid),
                 None,
+                None,
             )
             .await;
         });

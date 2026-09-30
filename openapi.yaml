@@ -5215,7 +5215,7 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          description: Conflict — `listen_path` already exists, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
+          description: Conflict — `listen_path` already exists, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, an HTTP-family `listen_port` is a process-global proxy port it cannot be served on, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -5311,7 +5311,7 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          description: Conflict — `listen_path` already exists on another proxy, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
+          description: Conflict — `listen_path` already exists on another proxy, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, an HTTP-family `listen_port` is a process-global proxy port it cannot be served on, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -9915,7 +9915,11 @@ components:
             `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`). When omitted,
             the proxy remains port-agnostic and matches any HTTP-family frontend
             (manual / non-Kubernetes default). Distinct `listen_port` values do not
-            conflict on the same `hosts`+`listen_path`.
+            conflict on the same `hosts`+`listen_path`. A `listen_port` equal to
+            `FERRUM_PROXY_HTTP_PORT` or `FERRUM_PROXY_HTTPS_PORT` must match that
+            frontend's class (`http_tls_listen_ports`) and carry no dedicated
+            Sidecar ingress bind; in database mode the Admin API rejects either
+            conflict with `409`. CP mode skips this check.
         frontend_tls:
           type: boolean
           default: false

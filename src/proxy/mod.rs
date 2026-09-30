@@ -6926,6 +6926,11 @@ pub struct ProxyState {
     /// `EnvConfig`; storing the effective startup set here keeps later reload
     /// validation aligned with the sockets the process actually owns.
     pub reserved_gateway_ports: Arc<HashSet<u16>>,
+    /// Process-global HTTP/HTTPS proxy frontends by port, for rejecting a
+    /// route `listen_port` that collides with one (issue #5922). Starts from
+    /// `EnvConfig`; the Gateway listener manager replaces it with the exact
+    /// set it plans with when it is built.
+    pub process_global_frontends: Arc<ArcSwap<gateway_listener::ProcessGlobalFrontends>>,
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
@@ -7322,6 +7327,10 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// Identity of the Gateway listener that accepted this connection, so a
+    /// request on a connection whose listener was retired is refused
+    /// (issue #5921). `None` on every other frontend.
+    gateway_listener_identity: Option<crate::proxy::gateway_listener::GatewayListenerIdentity>,
     /// Raw HTTP/1 framing result captured before Hyper applied framing
     /// precedence. [`h1_framing_guard::H1FramingResult::NotObserved`] is the
     /// default and means no observer ran (H2/H3/tests). Only a completed
@@ -10527,6 +10536,9 @@ impl ProxyState {
                 env_config_arc.status_metrics_window_seconds,
             )),
             early_data_methods: Arc::new(env_config_arc.tls_early_data_methods.clone()),
+            process_global_frontends: Arc::new(ArcSwap::from_pointee(
+                crate::proxy::gateway_listener::env_process_global_frontends(&env_config_arc),
+            )),
             env_config: env_config_arc,
             reserved_gateway_ports: Arc::new(reserved_gateway_ports),
             max_header_size_bytes,
@@ -10724,6 +10736,16 @@ impl ProxyState {
         self.config_revision.subscribe()
     }
 
+    /// Record the process-global proxy frontends the Gateway listener manager
+    /// plans with, so config validation checks route `listen_port`s against
+    /// the same set (issue #5922).
+    pub(crate) fn publish_process_global_frontends(
+        &self,
+        frontends: gateway_listener::ProcessGlobalFrontends,
+    ) {
+        self.process_global_frontends.store(Arc::new(frontends));
+    }
+
     /// Publish the listener admission decision produced from `expected` only
     /// while that exact config generation remains current. Returns `false` for
     /// a stale reconcile so the manager can immediately process the newer one.
@@ -10765,7 +10787,31 @@ impl ProxyState {
     ) -> Option<crate::router_cache::RouteMatch> {
         let epoch = self.request_epoch.load();
         self.router_cache
-            .find_proxy_in_epoch(&epoch, host, path, frontend_port, frontend_is_tls)
+            .find_proxy_in_epoch(&epoch, host, path, frontend_port, frontend_is_tls, None)
+    }
+
+    /// [`Self::find_proxy_on_frontend_for_test`] for a request on a
+    /// connection that `listener` accepted, exactly as the H1/H2 and H3
+    /// request paths route it (issue #5921).
+    #[doc(hidden)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
+    pub fn find_proxy_on_gateway_listener_for_test(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        frontend_port: u16,
+        frontend_is_tls: bool,
+        listener: &crate::proxy::gateway_listener::GatewayListenerIdentity,
+    ) -> Option<crate::router_cache::RouteMatch> {
+        let epoch = self.request_epoch.load();
+        self.router_cache.find_proxy_in_epoch(
+            &epoch,
+            host,
+            path,
+            Some(frontend_port),
+            frontend_is_tls,
+            Some(listener),
+        )
     }
 
     /// The Alt-Svc value to advertise for the frontend port a request arrived
@@ -12393,6 +12439,32 @@ impl ProxyState {
         }
         if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
             errors.extend(errs);
+        }
+
+        // An HTTP-family route whose `listen_port` is a process-global proxy
+        // frontend of the other class, or a dedicated Sidecar ingress bind on
+        // one, can never be served (issue #5922). Reject it, except where the
+        // config comes from a remote authority (DP, mesh): there one bad route
+        // must not block every other update, and the listener planner refuses
+        // only the routes scoped to that port.
+        if let Err(errs) = gateway_listener::validate_process_global_frontend_conflicts(
+            config,
+            &self.process_global_frontends.load(),
+        ) {
+            if matches!(
+                self.env_config.mode,
+                crate::config::env_config::OperatingMode::DataPlane
+                    | crate::config::env_config::OperatingMode::Mesh
+            ) {
+                for msg in &errs {
+                    warn!(
+                        "Gateway listener port conflict (non-fatal in DP/mesh mode): {}",
+                        crate::startup::sanitize_startup_cause(msg, &[])
+                    );
+                }
+            } else {
+                errors.extend(errs);
+            }
         }
 
         // Stream proxy port conflicts — reject in non-DP modes, warn in DP
@@ -14549,6 +14621,7 @@ async fn handle_connection(
     orig_dst: Option<SocketAddr>,
     destination_ip: Option<std::net::IpAddr>,
     mesh_inbound_pre_handshake_app_port: Option<u16>,
+    gateway_listener_identity: Option<crate::proxy::gateway_listener::GatewayListenerIdentity>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -14641,6 +14714,7 @@ async fn handle_connection(
         };
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            gateway_listener_identity: gateway_listener_identity.clone(),
             http1_framing_result,
             accepted_local_addr,
             frontend_sni_hostname: None,
@@ -21416,6 +21490,7 @@ async fn run_bound_proxy_listener(
         SourceIpOverride::none(),
         None,
         frontend_proxy_protocol,
+        None,
     )
     .await;
     Ok(())
@@ -21758,7 +21833,7 @@ pub(crate) async fn start_proxy_listener_with_tls_and_accept_gate(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    accept_gate: Option<crate::proxy::gateway_listener::GatewayListenerAcceptGate>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
         addr,
@@ -21772,7 +21847,7 @@ pub(crate) async fn start_proxy_listener_with_tls_and_accept_gate(
         false,
         None,
         started_tx,
-        accept_gate_rx,
+        accept_gate,
     )
     .await
 }
@@ -21849,7 +21924,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_accept_gate(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     dual_stack: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    accept_gate: Option<crate::proxy::gateway_listener::GatewayListenerAcceptGate>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
         addr,
@@ -21863,7 +21938,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_accept_gate(
         dual_stack,
         None,
         started_tx,
-        accept_gate_rx,
+        accept_gate,
     )
     .await
 }
@@ -21946,7 +22021,7 @@ pub(crate) async fn start_proxy_listener_with_dynamic_tls_and_accept_gate(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_slot: crate::tls::SharedFrontendTls,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    accept_gate: Option<crate::proxy::gateway_listener::GatewayListenerAcceptGate>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
         addr,
@@ -21960,7 +22035,7 @@ pub(crate) async fn start_proxy_listener_with_dynamic_tls_and_accept_gate(
         false,
         None,
         started_tx,
-        accept_gate_rx,
+        accept_gate,
     )
     .await
 }
@@ -22453,6 +22528,8 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
 
 struct TlsConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// See [`RequestConnectionMetadata::gateway_listener_identity`].
+    gateway_listener_identity: Option<crate::proxy::gateway_listener::GatewayListenerIdentity>,
     /// See [`RequestConnectionMetadata::accepted_local_addr`].
     accepted_local_addr: Option<SocketAddr>,
     record_mesh_mtls_metric: bool,
@@ -22547,7 +22624,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     dual_stack: bool,
     frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    accept_gate_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    accept_gate: Option<crate::proxy::gateway_listener::GatewayListenerAcceptGate>,
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
     let configured_accept_threads = state.env_config.accept_threads.max(1);
@@ -22616,7 +22693,15 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     if let Some(started_tx) = started_tx {
         let _ = started_tx.send(());
     }
-    if let Some(mut accept_gate_rx) = accept_gate_rx {
+    // A Gateway listener parks until its generation is admitted, then stamps
+    // its identity on every connection it accepts (issue #5921).
+    let mut gateway_listener_identity = None;
+    if let Some(accept_gate) = accept_gate {
+        let crate::proxy::gateway_listener::GatewayListenerAcceptGate {
+            open_rx: mut accept_gate_rx,
+            identity,
+        } = accept_gate;
+        gateway_listener_identity = Some(identity);
         if *shutdown.borrow() {
             return Ok(());
         }
@@ -22650,6 +22735,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             let semaphore = conn_semaphore.clone();
             let shutdown_rx = shutdown.clone();
             let frontend_proxy_protocol = frontend_proxy_protocol.clone();
+            let gateway_listener_identity = gateway_listener_identity.clone();
 
             handles.push(tokio::spawn(async move {
                 run_accept_loop(
@@ -22663,6 +22749,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     SourceIpOverride::none(),
                     None,
                     frontend_proxy_protocol,
+                    gateway_listener_identity,
                 )
                 .await;
             }));
@@ -22684,6 +22771,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             SourceIpOverride::none(),
             None,
             frontend_proxy_protocol,
+            gateway_listener_identity,
         )
         .await;
 
@@ -22705,6 +22793,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             SourceIpOverride::none(),
             None,
             frontend_proxy_protocol,
+            gateway_listener_identity,
         )
         .await;
     }
@@ -22808,6 +22897,9 @@ async fn run_accept_loop(
     // process-global HTTP/HTTPS proxy listener that opted in; every other
     // listener passes `None` and pays nothing for it.
     frontend_proxy_protocol: Option<Arc<frontend_proxy_protocol::FrontendProxyProtocol>>,
+    // Identity stamped on every accepted connection of a Gateway listener
+    // (issue #5921); `None` on every other listener.
+    gateway_listener_identity: Option<crate::proxy::gateway_listener::GatewayListenerIdentity>,
 ) {
     let frontend_bound_addr = listener.local_addr().ok();
     let frontend_listen_port = frontend_bound_addr.map(|addr| addr.port());
@@ -23054,6 +23146,7 @@ async fn run_accept_loop(
                         // on H1) instead of letting it sit idle until the
                         // drain timeout fires.
                         let conn_shutdown_rx = shutdown_rx.clone();
+                        let gateway_listener_identity = gateway_listener_identity.clone();
 
                         tokio::spawn(async move {
                             // Hold the permit for the connection lifetime.
@@ -23272,6 +23365,7 @@ async fn run_accept_loop(
                             let result = if let Some(tls_config) = tls_config {
                                 let tls_connection_metadata = TlsConnectionMetadata {
                                     frontend_listen_port,
+                                    gateway_listener_identity,
                                     accepted_local_addr,
                                     record_mesh_mtls_metric,
                                     node_waypoint_identity,
@@ -23305,6 +23399,7 @@ async fn run_accept_loop(
                                     orig_dst,
                                     connection_destination_ip,
                                     mesh_inbound_pre_handshake_app_port,
+                                    gateway_listener_identity,
                                 )
                                 .await
                             };
@@ -23559,6 +23654,7 @@ async fn handle_tls_connection(
         };
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            gateway_listener_identity: tls_connection_metadata.gateway_listener_identity.clone(),
             http1_framing_result,
             accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
@@ -32065,6 +32161,7 @@ async fn handle_proxy_request_inner(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
     let http1_framing_result = connection_metadata.http1_framing_result;
+    let gateway_listener_identity = connection_metadata.gateway_listener_identity;
     let accepted_local_ip = connection_metadata
         .accepted_local_addr
         .map(|addr| addr.ip());
@@ -32651,6 +32748,7 @@ async fn handle_proxy_request_inner(
             &path,
             ctx.frontend_listen_port,
             is_tls,
+            gateway_listener_identity.as_ref(),
         ),
     };
 

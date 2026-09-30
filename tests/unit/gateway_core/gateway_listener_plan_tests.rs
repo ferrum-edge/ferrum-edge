@@ -13,7 +13,8 @@ use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayC
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::proxy::gateway_listener::{
     DesiredGatewayListener, GatewayListenerClass, GatewayListenerPlan,
-    GatewayListenerProtocolFailure,
+    GatewayListenerProtocolFailure, process_global_frontends,
+    validate_process_global_frontend_conflicts,
 };
 use ferrum_edge::proxy::gateway_listener_status::GatewayListenerFailureCategory;
 
@@ -481,5 +482,131 @@ fn dedicated_bind_cannot_be_absorbed_by_process_global_same_class_frontend() {
         reason.message.contains("dedicated Sidecar ingress bind"),
         "refusal must name dedicated-bind isolation: {}",
         reason.message
+    );
+}
+
+// ── Process-global frontend conflicts at config validation (#5922) ───────────
+
+const GLOBAL_HTTP: u16 = 8000;
+const GLOBAL_HTTPS: u16 = 8443;
+
+fn frontend_config(proxies: Vec<Proxy>, tls_ports: &[u16]) -> GatewayConfig {
+    let mut config = GatewayConfig {
+        proxies,
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_kind();
+    for port in tls_ports {
+        config
+            .http_tls_listen_ports
+            .insert((ferrum_edge::config::types::default_namespace(), *port));
+    }
+    config
+}
+
+fn frontend_conflicts(config: &GatewayConfig) -> Result<(), Vec<String>> {
+    let frontends = process_global_frontends(Some(GLOBAL_HTTP), Some(GLOBAL_HTTPS));
+    validate_process_global_frontend_conflicts(config, &frontends)
+}
+
+#[test]
+fn a_wrong_class_route_on_a_process_global_frontend_is_rejected() {
+    // TLS listener class on the plaintext frontend.
+    let config = frontend_config(vec![http_proxy("tls-on-http", GLOBAL_HTTP)], &[GLOBAL_HTTP]);
+    let errors = frontend_conflicts(&config).expect_err("wrong class must be rejected");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("\"tls-on-http\""), "{}", errors[0]);
+    assert!(
+        errors[0].contains("process-global HTTP proxy port (`FERRUM_PROXY_HTTP_PORT`)"),
+        "{}",
+        errors[0]
+    );
+    assert!(errors[0].contains("`http_tls_listen_ports`"), "{}", errors[0]);
+
+    // Plaintext listener class on the TLS frontend.
+    let config = frontend_config(vec![http_proxy("http-on-https", GLOBAL_HTTPS)], &[]);
+    let errors = frontend_conflicts(&config).expect_err("wrong class must be rejected");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("process-global HTTPS proxy port (`FERRUM_PROXY_HTTPS_PORT`)"),
+        "{}",
+        errors[0]
+    );
+
+    // The plan refuses the same port for the same reason.
+    let config = frontend_config(vec![http_proxy("tls-on-http", GLOBAL_HTTP)], &[GLOBAL_HTTP]);
+    let plan = plan_with_frontends(
+        config,
+        process_global_frontends(Some(GLOBAL_HTTP), Some(GLOBAL_HTTPS)),
+    );
+    let refusal = plan.refused.get(&GLOBAL_HTTP).expect("refusal");
+    assert_eq!(
+        refusal.category,
+        GatewayListenerFailureCategory::ProcessGlobalClassMismatch
+    );
+}
+
+#[test]
+fn a_dedicated_bind_on_a_process_global_frontend_is_rejected() {
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides
+        .insert(GLOBAL_HTTP, loopback);
+    let mut config = frontend_config(vec![http_proxy("dedicated", GLOBAL_HTTP)], &[]);
+    config.mesh = Some(Box::new(mesh));
+    let errors = frontend_conflicts(&config).expect_err("dedicated bind must be rejected");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("dedicated Sidecar ingress bind"),
+        "{}",
+        errors[0]
+    );
+}
+
+#[test]
+fn routes_that_can_serve_on_or_beside_a_process_global_frontend_are_accepted() {
+    // Same class as the frontend: already served by it.
+    let config = frontend_config(
+        vec![
+            http_proxy("http-on-http", GLOBAL_HTTP),
+            http_proxy("tls-on-https", GLOBAL_HTTPS),
+        ],
+        &[GLOBAL_HTTPS],
+    );
+    assert_eq!(frontend_conflicts(&config), Ok(()));
+
+    // Any class on a port that is not a process-global frontend.
+    let config = frontend_config(
+        vec![http_proxy("own-a", PORT), http_proxy("own-b", PORT + 1)],
+        &[PORT + 1],
+    );
+    assert_eq!(frontend_conflicts(&config), Ok(()));
+
+    // Stream proxies are validated against reserved ports elsewhere.
+    let config = frontend_config(
+        vec![stream_proxy("tcp-on-http", BackendScheme::Tcp, GLOBAL_HTTP)],
+        &[],
+    );
+    assert_eq!(frontend_conflicts(&config), Ok(()));
+
+    // A dedicated TLS bind is refused for its own reason, not this one.
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let mut mesh = MeshConfig::default();
+    mesh.sidecar_ingress_bind_overrides
+        .insert(GLOBAL_HTTPS, loopback);
+    let mut config = frontend_config(
+        vec![http_proxy("dedicated-tls", GLOBAL_HTTPS)],
+        &[GLOBAL_HTTPS],
+    );
+    config.mesh = Some(Box::new(mesh));
+    assert_eq!(frontend_conflicts(&config), Ok(()));
+
+    // A disabled frontend (port 0) is never a conflict.
+    let config = frontend_config(vec![http_proxy("tls-on-http", GLOBAL_HTTP)], &[GLOBAL_HTTP]);
+    let frontends = process_global_frontends(Some(0), None);
+    assert!(frontends.is_empty());
+    assert_eq!(
+        validate_process_global_frontend_conflicts(&config, &frontends),
+        Ok(())
     );
 }

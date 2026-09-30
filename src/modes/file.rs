@@ -521,6 +521,31 @@ pub(crate) async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeou
     }
 }
 
+/// The process-global HTTP/HTTPS proxy frontends this process will own, by
+/// the same pre-bound-first resolution as [`effective_reserved_ports`]. The
+/// HTTPS frontend counts only when frontend TLS is configured, because the
+/// HTTPS listener does not start without it.
+fn effective_process_global_frontends(
+    env_config: &EnvConfig,
+    prebound: &ServeOptions,
+) -> proxy::gateway_listener::ProcessGlobalFrontends {
+    let resolve = |listener: &Option<TcpListener>, env_port: u16| -> Option<u16> {
+        match listener {
+            Some(listener) => listener.local_addr().ok().map(|addr| addr.port()),
+            None => Some(env_port),
+        }
+    };
+    let tls_port = if env_config.frontend_tls_cert_path.is_some() {
+        resolve(&prebound.proxy_https, env_config.proxy_https_port)
+    } else {
+        None
+    };
+    proxy::gateway_listener::process_global_frontends(
+        resolve(&prebound.proxy_http, env_config.proxy_http_port),
+        tls_port,
+    )
+}
+
 /// Build the reserved-port set [`serve`] uses for stream-proxy conflict
 /// validation and for `AdminState::reserved_ports`.
 ///
@@ -824,6 +849,20 @@ pub async fn serve(
         }
         return Err(anyhow::anyhow!(
             "Stream proxy port conflicts with gateway reserved ports"
+        ));
+    }
+    // An HTTP-family route cannot claim a process-global proxy frontend of
+    // the other class, or put a dedicated Sidecar ingress bind on one (issue
+    // #5922). Checked against the frontends this process will actually own.
+    let frontends = effective_process_global_frontends(&env_config, &prebound);
+    if let Err(errors) =
+        proxy::gateway_listener::validate_process_global_frontend_conflicts(&config, &frontends)
+    {
+        for msg in &errors {
+            error!("{}", crate::startup::sanitize_startup_cause(msg, &[]));
+        }
+        return Err(anyhow::anyhow!(
+            "Gateway listener port conflicts with a process-global proxy frontend"
         ));
     }
 
@@ -1607,7 +1646,7 @@ pub async fn serve(
                             client_ca_bundle_path: h3_client_ca,
                             client_crls: h3_client_crls,
                             started_tx: Some(started_tx),
-                            accept_gate_rx: None,
+                            accept_gate: None,
                             frontend_tls_reload: h3_reload,
                             udp_port_hold: None,
                         },

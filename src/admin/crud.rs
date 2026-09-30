@@ -54,6 +54,29 @@ impl<'a> ValidationCtx<'a> {
     }
 }
 
+/// The error for an HTTP-family proxy whose `listen_port` is a
+/// process-global proxy frontend it can never be served on (issue #5922),
+/// checked against the frontends this node's listener manager plans with and
+/// the listener classes and binds of its published config.
+///
+/// `None` without a local proxy runtime. A CP cannot know each DP's
+/// frontends, so it skips this exactly as it skips the stream reserved-port
+/// check; a DP that receives such a route refuses only the routes scoped to
+/// that port.
+pub(crate) fn process_global_frontend_conflict(
+    state: &AdminState,
+    proxy: &Proxy,
+) -> Option<String> {
+    let proxy_state = state.proxy_state.as_ref()?;
+    let epoch = proxy_state.request_epoch.load();
+    let frontends = proxy_state.process_global_frontends.load();
+    crate::proxy::gateway_listener::process_global_frontend_conflict_for_proxy(
+        epoch.config(),
+        proxy,
+        &frontends,
+    )
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum WriteAction<'a> {
     Create,
@@ -5196,6 +5219,12 @@ impl AdminResource for Proxy {
             None,
         )
         .await?;
+
+        if ctx.mode != "cp"
+            && let Some(error) = process_global_frontend_conflict(state, resource)
+        {
+            return Err(AfterValidateError::Conflict(vec![error]));
+        }
 
         if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port

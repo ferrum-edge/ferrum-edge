@@ -508,6 +508,28 @@ outright with no deprecation period:
 
 ### Fixed
 
+- **A Gateway listener class, bind, or direction flip serves at once**
+  (#5921). When a listener's TLS class, bind address, or mesh direction
+  changed, reconcile refused the whole port even though the replacement socket
+  bound in the same pass, so new connections got 404 until the next reconcile,
+  up to 30 s later. Each accepted connection now carries the identity of the
+  listener that accepted it. Retiring a listener retires that identity, and
+  requests on its connections are refused for as long as they drain, so the
+  replacement is admitted by the reconcile that binds it and old connections
+  are never served under the new decision.
+
+- **A wrong-class route on the process-global port no longer blacks out that
+  frontend** (#5922). A route whose `listen_port` is `FERRUM_PROXY_HTTP_PORT`
+  or `FERRUM_PROXY_HTTPS_PORT` with the other listener class, or a dedicated
+  Sidecar ingress bind on one of those ports, made the global frontend answer
+  404 for every route of every namespace. Such a route is now rejected by
+  config validation: file load and reload, `ferrum-edge validate`, database
+  startup and poll, and the database-mode Admin API (`409`). A control plane
+  skips the check, since it cannot know each data plane's ports. Where the
+  route still arrives (a data plane or mesh proxy warns and applies it), only
+  the routes scoped to that port are refused, and the frontend keeps serving
+  its port-agnostic routes.
+
 - **Config reloads no longer 404 live Gateway listener routes** (#5914). Every
   config publication used to reset listener route admission to pending, so
   each reload briefly answered 404 on listener-scoped routes of listeners that

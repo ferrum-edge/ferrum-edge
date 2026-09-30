@@ -474,7 +474,12 @@ without a restart. These bounds are deliberate and tested:
     old identity or falls back to port-agnostic routes;
   - refusals held for retiring sockets are kept;
   - a route withdrawn from the process-global proxy port never refuses that
-    frontend, which keeps serving its port-agnostic routes.
+    frontend, which keeps serving its port-agnostic routes;
+  - a refusal on a process-global proxy port (a wrong-class route, or a
+    dedicated Sidecar ingress bind on it) refuses only the routes scoped to
+    that port. The frontend has no stale socket identity, so every
+    port-agnostic route it serves, in every namespace, keeps serving
+    (issue #5922).
 
   A generation with no prior decision (startup) is wholly pending. The carried
   admission is never less strict than the one it replaces: only a reconcile of
@@ -504,11 +509,26 @@ without a restart. These bounds are deliberate and tested:
   refused or bind-failed listener stay unreachable rather than being served
   somewhere else. Once the matching generation is acknowledged, both admission
   refusals and ordinary OS bind failures suppress the intentional
-  Service-fronted remap.
+  Service-fronted remap. A wrong-class route or a dedicated Sidecar ingress
+  bind on a process-global proxy port is also rejected by config validation
+  (file load and reload, `ferrum-edge validate`, database startup and poll,
+  and the database-mode Admin API with `409`), so it cannot be published there.
+  A control plane cannot know each data plane's frontend ports and skips the
+  check; a data plane or mesh proxy only warns and relies on the runtime
+  refusal above (issue #5922).
 - **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
   accept-loop task is awaited before the replacement binds, so extra
   accept workers sharing the exclusive listen socket never overlap a
   plaintext generation with a TLS replacement. Already accepted connections keep draining.
+- **A replacement serves in the reconcile that binds it.** Every accepted
+  connection carries the identity of the listener that accepted it, and
+  retiring a listener whose class, bind address, or mesh direction changed (or
+  that was withdrawn) retires that identity before the pass publishes. A
+  replacement that binds in the same pass is admitted at once, so new
+  connections are served under the new class as soon as that reconcile opens
+  its accept gate, not on the next retry tick. A request on a connection the
+  old listener accepted is refused for as long as that connection drains
+  (issue #5921).
 - **A listener that stops serving is rebound.** A started listener whose accept
   loop later ends — cleanly, with an error, or by panic — is reaped on the next
   reconcile, surfaced as a bind failure, and rebound; finished drains are reaped

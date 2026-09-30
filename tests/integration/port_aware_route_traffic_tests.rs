@@ -1584,6 +1584,314 @@ async fn class_flip_fails_closed_on_the_old_socket_before_reconcile() {
     harness.manager.shutdown_all().await;
 }
 
+/// `GET /api/x` over TLS with `Connection: close`, as `(status, body)`.
+async fn https_get(port: u16, path: &str) -> (u16, String) {
+    let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(ferrum_edge::tls::NoVerifier))
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    let server_name = rustls::pki_types::ServerName::try_from(HOST).expect("server name");
+    let mut tls = connector
+        .connect(server_name, stream)
+        .await
+        .expect("tls handshake");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf)).await;
+    let text = String::from_utf8_lossy(&buf);
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (status, body)
+}
+
+/// A keep-alive HTTP/1.1 client connection held open across a reload.
+type KeepAliveSender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
+
+async fn open_keep_alive(port: u16) -> KeepAliveSender {
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect keep-alive client");
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP/1.1 handshake");
+    tokio::spawn(connection);
+    sender
+}
+
+/// `Some(status)` for a request on the kept-alive connection, or `None` when
+/// the gateway has closed it.
+async fn keep_alive_get(sender: &mut KeepAliveSender, host: &str) -> Option<u16> {
+    sender.ready().await.ok()?;
+    let request = Request::builder()
+        .uri("/api/x")
+        .header("host", host)
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = sender.send_request(request).await.ok()?;
+    Some(response.status().as_u16())
+}
+
+/// Issue #5921: a class flip whose replacement binds in the same reconcile
+/// serves the new class as soon as that one reconcile has published, not on
+/// the next retry tick up to 30 s later. A connection the old plaintext
+/// socket accepted is never served again, not even by a port-agnostic route,
+/// while it drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn class_flip_serves_the_new_class_within_one_reconcile_and_never_the_old_connection() {
+    const ANY_HOST: &str = "any.example.com";
+    let (backend_a, _ba) = start_body_backend(b"listener-a").await;
+    let (backend_any, _bany) = start_body_backend(b"port-agnostic").await;
+    let config_for = move |port: u16, tls: bool| {
+        let mut any = port_scoped_proxy("any", backend_any, None);
+        any.hosts = vec![ANY_HOST.to_string()];
+        let mut config = config_with(vec![port_scoped_proxy("gw-a", backend_a, Some(port)), any]);
+        if tls {
+            config
+                .http_tls_listen_ports
+                .insert((ferrum_edge::config::types::default_namespace(), port));
+        }
+        config
+    };
+
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let plaintext = |ports: &[u16], _: u16| config_for(ports[0], false);
+        let harness = start_unreconciled_reload_harness(1, true, plaintext).await;
+        let port = harness.ports[0];
+        let old_identity = harness
+            .manager
+            .listener_identity(port)
+            .await
+            .expect("the plaintext listener is live");
+
+        // A keep-alive connection accepted under the plaintext class.
+        let mut old_connection = open_keep_alive(port).await;
+        assert_eq!(keep_alive_get(&mut old_connection, HOST).await, Some(200));
+        assert_eq!(
+            keep_alive_get(&mut old_connection, ANY_HOST).await,
+            Some(200)
+        );
+
+        let outcome = harness.state.update_config(config_for(port, true));
+        assert!(outcome.applied(), "class flip must apply: {outcome:?}");
+
+        // Exactly one reconcile.
+        let failures = harness.manager.reconcile().await;
+        if port_bind_lost_to_external_steal(&failures, port) {
+            harness.manager.shutdown_all().await;
+            assert!(
+                attempt < GATEWAY_LISTENER_STARTUP_ATTEMPTS,
+                "port {port} was stolen during the flip in every attempt: {failures:?}"
+            );
+            eprintln!(
+                "class flip attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} lost its port \
+                 to another test between retire and rebind"
+            );
+            continue;
+        }
+        assert!(
+            failures.is_empty(),
+            "the flip must rebind at once: {failures:?}"
+        );
+
+        // The new class serves now, with no further reconcile.
+        assert!(
+            routes_on(&harness.state, HOST, port, true),
+            "the TLS route must be admitted by the reconcile that bound its socket"
+        );
+        assert_eq!(
+            https_get(port, "/api/x").await,
+            (200, "listener-a".to_string()),
+            "a new connection must be served under the new class within one reconcile"
+        );
+        let new_identity = harness
+            .manager
+            .listener_identity(port)
+            .await
+            .expect("the TLS listener is live");
+        assert!(!new_identity.is_retired());
+        for host in [HOST, ANY_HOST] {
+            assert!(
+                harness
+                    .state
+                    .find_proxy_on_gateway_listener_for_test(
+                        Some(host),
+                        "/api/x",
+                        port,
+                        true,
+                        &new_identity,
+                    )
+                    .is_some(),
+                "the replacement listener's connections must route {host}"
+            );
+        }
+
+        // The old connection is fenced, whatever class or host it presents.
+        assert!(
+            old_identity.is_retired(),
+            "retiring the plaintext listener must retire its identity"
+        );
+        for host in [HOST, ANY_HOST] {
+            for tls in [false, true] {
+                assert!(
+                    harness
+                        .state
+                        .find_proxy_on_gateway_listener_for_test(
+                            Some(host),
+                            "/api/x",
+                            port,
+                            tls,
+                            &old_identity,
+                        )
+                        .is_none(),
+                    "an old-class connection must never route {host} (tls {tls})"
+                );
+            }
+        }
+        for host in [HOST, ANY_HOST] {
+            let status = keep_alive_get(&mut old_connection, host).await;
+            assert_ne!(
+                status,
+                Some(200),
+                "the old plaintext connection was served {host} after the flip"
+            );
+        }
+
+        harness.manager.shutdown_all().await;
+        return;
+    }
+    unreachable!("the retry loop returns or asserts");
+}
+
+/// Issue #5922: a route whose `listen_port` is the process-global plaintext
+/// frontend but whose listener class is TLS is rejected by validation, so a
+/// file or database reload cannot publish it. A data plane only warns, and
+/// there the planner refuses only the routes scoped to that port: every
+/// port-agnostic route on the global frontend keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_class_route_on_the_global_port_refuses_only_its_own_routes() {
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+    use ferrum_edge::proxy::gateway_listener::{
+        GatewayListenerManager, GatewayListenerTls, process_global_frontends,
+        validate_process_global_frontend_conflicts,
+    };
+
+    const ANY_HOST: &str = "any.example.com";
+    let port_agnostic = || {
+        let mut proxy = port_scoped_proxy("any", 1, None);
+        proxy.hosts = vec![ANY_HOST.to_string()];
+        proxy
+    };
+    let conflicting = |global: u16| {
+        let mut config = config_with(vec![
+            port_scoped_proxy("gw-global", 1, Some(global)),
+            port_agnostic(),
+        ]);
+        config
+            .http_tls_listen_ports
+            .insert((ferrum_edge::config::types::default_namespace(), global));
+        config
+    };
+    let global_proxy = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let global = global_proxy.local_addr().unwrap().port();
+    let admin = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
+    let admin_port = admin.local_addr().unwrap().port();
+
+    let frontends = process_global_frontends(Some(global), None);
+    let errors = validate_process_global_frontend_conflicts(&conflicting(global), &frontends)
+        .expect_err("validation must reject a wrong-class route on the global port");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+
+    for data_plane in [false, true] {
+        let mut env = test_env_config(global, admin_port);
+        if data_plane {
+            env.mode = OperatingMode::DataPlane;
+        }
+        let state = ProxyState::new(
+            config_with(vec![port_agnostic()]),
+            DnsCache::new(DnsConfig::default()),
+            env,
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = GatewayListenerManager::new(
+            state.clone(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls::default(),
+        );
+        let failures = manager.reconcile().await;
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(routes_on(&state, ANY_HOST, global, false));
+
+        let outcome = state.update_config(conflicting(global));
+        if !data_plane {
+            let reload_errors = match &outcome {
+                ferrum_edge::proxy::ConfigApplyOutcome::Rejected { errors } => errors.clone(),
+                _ => Vec::new(),
+            };
+            let rejected = reload_errors
+                .iter()
+                .any(|error| error.contains("`http_tls_listen_ports`"));
+            assert!(
+                rejected,
+                "a file-mode reload must reject the conflict: {outcome:?}"
+            );
+            assert!(routes_on(&state, ANY_HOST, global, false));
+            manager.shutdown_all().await;
+            continue;
+        }
+        assert!(
+            outcome.applied(),
+            "a data plane applies it and warns: {outcome:?}"
+        );
+
+        // Before and after the reconcile that refuses the port, only the
+        // route scoped to it is refused. The frontend keeps serving.
+        for reconciled in [false, true] {
+            if reconciled {
+                let failures = manager.reconcile().await;
+                let mismatch = GatewayListenerFailureCategory::ProcessGlobalClassMismatch;
+                let refused = failures
+                    .iter()
+                    .any(|failure| failure.port == global && failure.category == mismatch);
+                assert!(refused, "{failures:?}");
+            }
+            assert!(
+                routes_on(&state, ANY_HOST, global, false),
+                "reconciled {reconciled}: port-agnostic routes must keep serving on the \
+                 global frontend"
+            );
+            assert!(
+                !routes_on(&state, HOST, global, true),
+                "reconciled {reconciled}: the wrong-class route must not serve"
+            );
+            assert!(!routes_on(&state, HOST, global, false));
+        }
+        manager.shutdown_all().await;
+    }
+}
+
 /// Withdrawing a route scoped to the process-global proxy port must not refuse
 /// that frontend: it is not a Gateway listener socket, and it keeps serving
 /// every port-agnostic route through the reload.
