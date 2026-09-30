@@ -1090,7 +1090,10 @@ async fn gateway_listener_serves_after_its_generation_is_admitted() {
         backend,
         Some(listener_port),
     )]));
-    assert!(outcome.applied(), "listener config must publish: {outcome:?}");
+    assert!(
+        outcome.applied(),
+        "listener config must publish: {outcome:?}"
+    );
     assert!(
         state
             .find_proxy_on_frontend_for_test(Some(HOST), "/api/x", Some(listener_port), false)
@@ -1106,7 +1109,10 @@ async fn gateway_listener_serves_after_its_generation_is_admitted() {
             .is_some(),
         "reconcile must publish admission for the bound listener generation"
     );
-    assert_eq!(http_get(listener_port, "/api/x").await.1, "admitted-listener");
+    assert_eq!(
+        http_get(listener_port, "/api/x").await.1,
+        "admitted-listener"
+    );
 
     manager.shutdown_all().await;
 }
