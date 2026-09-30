@@ -952,7 +952,11 @@ validation.
 
 When `src/admin/mod.rs` changes on purpose, refresh its pin in the same PR
 using the replacement values printed by the automatic `H2 guard pins` check.
-Otherwise the post-merge run goes red and the next PR must refresh it. Any new
+Otherwise the post-merge run goes red and the next PR must refresh it. When the
+`h2` entry in `Cargo.lock`, the `[patch.crates-io]` table or the Dockerfile
+`cargo build` calls change on purpose, update the shared anchor constants at the
+top of `prepare.py` in the same PR; the heavy observation lane also runs on those
+PRs and fails if the prepared build no longer applies. Any new
 optional lane whose prepare script hashes files under `src/` (for example a
 `context_files` entry) must add those files to its `push` paths and a row here.
 Lanes that hash only their own assets or runtime evidence (the internal-profile
