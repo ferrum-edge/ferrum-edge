@@ -1965,3 +1965,69 @@ fn proxy_ws_origin_star_is_rejected_on_admin_and_validate_admission() {
         "ferrum-edge validate must reject '*' after loading the file spec"
     );
 }
+
+/// Issue #5925: role-specific reads and placeholder detection must both call
+/// the same projection helper, so their behavior cannot drift independently.
+#[test]
+fn role_projected_resources_refuse_writing_their_placeholders_back() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    let trait_start = crud
+        .find("trait AdminResource")
+        .expect("AdminResource trait must be found");
+    let trait_end = crud[trait_start..]
+        .find("impl AdminResource for Proxy")
+        .expect("AdminResource implementations follow the trait")
+        + trait_start;
+    let trait_source = &crud[trait_start..trait_end];
+    // Both paths are free functions over the one overridable hook, so an
+    // implementation cannot customize the read or the write check alone.
+    assert!(
+        !trait_source.contains("fn response_body_for_role(")
+            && !trait_source.contains("fn masked_placeholder_sites("),
+        "the role response and placeholder detection must not be trait methods"
+    );
+    let free_fn = |signature: &str| {
+        let start = crud
+            .find(signature)
+            .expect("shared projection function must exist");
+        let body = &crud[start..];
+        &body[..body.find("\n}\n").expect("function must end")]
+    };
+    assert!(
+        free_fn("fn response_body_for_role<R: AdminResource>(")
+            .contains("R::project_for_role_with(resource, role, &PlaceholderRendering)"),
+        "response reads must use the shared role projection"
+    );
+    assert!(
+        free_fn("fn masked_placeholder_sites<R: AdminResource>(")
+            .contains("R::project_for_role_with(resource, role, &recorder)"),
+        "placeholder detection must use the shared role projection"
+    );
+
+    let marker = "impl AdminResource for ";
+    let starts: Vec<usize> = crud.match_indices(marker).map(|(at, _)| at).collect();
+    assert!(!starts.is_empty(), "AdminResource impls must be found");
+    let mut projected = Vec::new();
+    for (index, start) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(crud.len());
+        let region = &crud[*start..end];
+        let name = region[marker.len()..]
+            .split_whitespace()
+            .next()
+            .expect("impl target name");
+        assert!(
+            !region.contains("fn response_body_for_role(")
+                && !region.contains("fn masked_placeholder_sites("),
+            "{name} must not override the shared role response or placeholder detection"
+        );
+        if region.contains("fn project_for_role_with(") {
+            projected.push(name);
+        }
+    }
+    projected.sort_unstable();
+    assert_eq!(projected, ["PluginConfig", "Proxy", "Upstream"]);
+    assert!(
+        crud.contains("masked_placeholder_sites(&resource, actor.role)"),
+        "the generic write path must run the check with the caller's role"
+    );
+}

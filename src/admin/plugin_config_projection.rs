@@ -56,19 +56,24 @@
 
 use serde_json::{Value, json};
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 use crate::config::types::{PlaceholderRendering, RedactionRendering, push_json_pointer_segment};
 
-use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
+use crate::plugins::utils::metadata_redaction::{
+    REDACTED_PLACEHOLDER, REDACTED_USERINFO_PLACEHOLDER, is_sensitive_metadata_key,
+};
 use crate::plugins::utils::redis_rate_limiter;
 
 /// Placeholder substituted for a URL path that may carry credentials.
 pub const REDACTED_PATH_PLACEHOLDER: &str = "[REDACTED_PATH]";
 /// Placeholder substituted for a URL query that may carry credentials.
-pub const REDACTED_QUERY_PLACEHOLDER: &str = "[REDACTED_QUERY]";
+pub const REDACTED_QUERY_PLACEHOLDER: &str =
+    crate::plugins::utils::metadata_redaction::REDACTED_QUERY_PLACEHOLDER;
 /// Placeholder substituted for a URL fragment that may carry credentials.
-pub const REDACTED_FRAGMENT_PLACEHOLDER: &str = "[REDACTED_FRAGMENT]";
+pub const REDACTED_FRAGMENT_PLACEHOLDER: &str =
+    crate::plugins::utils::metadata_redaction::REDACTED_FRAGMENT_PLACEHOLDER;
 
 /// How a schema-declared config path must be projected.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -753,11 +758,79 @@ fn url_without_userinfo(raw: &str) -> Option<Value> {
     }
     // `set_username`/`set_password` return Err for cannot-be-a-base URLs, which
     // by construction have no userinfo to strip; fail closed anyway.
-    let stripped = parsed.set_username("redacted").is_ok() && parsed.set_password(None).is_ok();
+    let stripped = parsed.set_username(REDACTED_USERINFO_PLACEHOLDER).is_ok()
+        && parsed.set_password(None).is_ok();
     if stripped {
         Some(json!(parsed.to_string()))
     } else {
         Some(json!(REDACTED_PLACEHOLDER))
+    }
+}
+
+/// Whether `value` is one of the redaction markers a projection emits in place
+/// of a stored value, rather than a value anyone could mean to store (issue
+/// #5925).
+///
+/// Every comparison is exact against a placeholder constant, so a legitimate
+/// value is never matched by resemblance:
+///
+/// * the string is exactly [`REDACTED_PLACEHOLDER`];
+/// * or it parses as a URL whose path is exactly `/` +
+///   [`REDACTED_PATH_PLACEHOLDER`], whose query is exactly
+///   [`REDACTED_QUERY_PLACEHOLDER`], or whose fragment is exactly
+///   [`REDACTED_FRAGMENT_PLACEHOLDER`] (the structural endpoint projection);
+/// * or it parses as a URL whose username is exactly
+///   [`REDACTED_USERINFO_PLACEHOLDER`] with no password (the userinfo sweep
+///   and the Redis URL projection).
+///
+/// A URL whose userinfo is literally `redacted@` with no password is therefore
+/// indistinguishable from a projected one and is treated as the placeholder.
+pub fn is_redaction_placeholder(value: &Value) -> bool {
+    let Some(raw) = value.as_str() else {
+        return false;
+    };
+    if raw == REDACTED_PLACEHOLDER {
+        return true;
+    }
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    (parsed.username() == REDACTED_USERINFO_PLACEHOLDER && parsed.password().is_none())
+        || parsed.path().strip_prefix('/') == Some(REDACTED_PATH_PLACEHOLDER)
+        || parsed.query() == Some(REDACTED_QUERY_PLACEHOLDER)
+        || parsed.fragment() == Some(REDACTED_FRAGMENT_PLACEHOLDER)
+}
+
+/// A [`RedactionRendering`] that renders exactly like [`PlaceholderRendering`]
+/// and records every site whose *incoming* value is already a redaction
+/// placeholder (see [`is_redaction_placeholder`]).
+///
+/// Run a read projection over a write body with this renderer to find the
+/// fields that would overwrite a stored secret with the marker the caller was
+/// shown in its place (issue #5925). Only the first render of each site is
+/// inspected: a later projection layer at the same site sees the earlier
+/// layer's output (a structural URL, say), not the value the caller sent.
+#[derive(Debug, Default)]
+pub struct PlaceholderSiteRecorder {
+    visited: RefCell<HashSet<String>>,
+    sites: RefCell<Vec<String>>,
+}
+
+impl PlaceholderSiteRecorder {
+    /// The JSON pointers of the sites that carried a placeholder, in the order
+    /// the projection visited them.
+    pub fn into_sites(self) -> Vec<String> {
+        self.sites.into_inner()
+    }
+}
+
+impl RedactionRendering for PlaceholderSiteRecorder {
+    fn render(&self, pointer: &str, stored: &Value, redacted: Value) -> Value {
+        let first_visit = self.visited.borrow_mut().insert(pointer.to_string());
+        if first_visit && is_redaction_placeholder(stored) {
+            self.sites.borrow_mut().push(pointer.to_string());
+        }
+        redacted
     }
 }
 
@@ -774,8 +847,8 @@ pub fn is_safe_kafka_producer_property(key: &str) -> bool {
 /// Project a credential-bearing endpoint URL down to its structural form.
 ///
 /// Emits `scheme://host[:port]` plus a marker for each component that was
-/// present and may carry credentials. Userinfo is never emitted. Fails closed
-/// to [`REDACTED_PLACEHOLDER`] when the value does not parse or has no host,
+/// present and may carry credentials. Original userinfo is never emitted.
+/// Fails closed to [`REDACTED_PLACEHOLDER`] when the value does not parse or has no host,
 /// because a value that cannot be structurally decomposed cannot be shown to be
 /// credential-free.
 pub fn redact_endpoint_url(raw: &str) -> String {
@@ -788,7 +861,12 @@ pub fn redact_endpoint_url(raw: &str) -> String {
         Some(url::Host::Ipv6(host)) => format!("[{host}]"),
         None => return REDACTED_PLACEHOLDER.to_string(),
     };
-    let mut redacted = format!("{}://{}", parsed.scheme(), host);
+    let mut redacted = format!("{}://", parsed.scheme());
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        redacted.push_str(REDACTED_USERINFO_PLACEHOLDER);
+        redacted.push('@');
+    }
+    redacted.push_str(&host);
     if let Some(port) = parsed.port() {
         redacted.push(':');
         redacted.push_str(&port.to_string());

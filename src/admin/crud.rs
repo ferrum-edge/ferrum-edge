@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
+use crate::admin::plugin_config_projection::PlaceholderSiteRecorder;
 use crate::admin::preconditions::{self, IfMatch};
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
@@ -2539,7 +2540,11 @@ pub(crate) trait AdminResource:
         serde_json::to_value(resource)
     }
 
-    fn response_body_for_role(resource: &Self, _role: AdminRole) -> Value {
+    fn project_for_role_with(
+        resource: &Self,
+        _role: AdminRole,
+        _rendering: &dyn RedactionRendering,
+    ) -> Value {
         Self::response_body(resource)
     }
 
@@ -2829,6 +2834,25 @@ pub(crate) trait AdminResource:
     }
 }
 
+/// The role-projected read representation. Kept outside `AdminResource` so
+/// implementations can only customize the shared `project_for_role_with`
+/// hook, never the response and placeholder-detection paths independently.
+fn response_body_for_role<R: AdminResource>(resource: &R, role: AdminRole) -> Value {
+    R::project_for_role_with(resource, role, &PlaceholderRendering)
+}
+
+/// JSON pointers of fields in a write body that carry a placeholder at a site
+/// the caller's role-specific read projection withholds (issue #5925).
+///
+/// A non-empty result refuses the write with `400`: writing the body back
+/// would replace the stored secret with the marker the caller was shown. Both
+/// this check and `response_body_for_role` use the same projection hook.
+fn masked_placeholder_sites<R: AdminResource>(resource: &R, role: AdminRole) -> Vec<String> {
+    let recorder = PlaceholderSiteRecorder::default();
+    R::project_for_role_with(resource, role, &recorder);
+    recorder.into_sites()
+}
+
 pub(crate) async fn handle_list<R: AdminResource>(
     state: &AdminState,
     pagination: &super::PaginationParams,
@@ -2858,7 +2882,7 @@ pub(crate) async fn handle_list_filtered<R: AdminResource>(
                 let items: Vec<Value> = result
                     .items
                     .iter()
-                    .map(|resource| R::response_body_for_role(resource, role))
+                    .map(|resource| response_body_for_role(resource, role))
                     .collect();
                 let body = super::paginate_db_response(&items, result.total, pagination);
                 return Ok(super::json_response(StatusCode::OK, &body));
@@ -2877,7 +2901,7 @@ pub(crate) async fn handle_list_filtered<R: AdminResource>(
             resource.namespace() == namespace && R::matches_list_filter(resource, filter)
         });
         let body = super::paginate_mapped_response(items, pagination, |resource| {
-            R::response_body_for_role(resource, role)
+            response_body_for_role(resource, role)
         });
         Ok(super::json_response_with_stale(StatusCode::OK, &body))
     } else {
@@ -2904,7 +2928,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
     if let Some(ref db) = state.db {
         match R::db_get(db.as_ref(), namespace, id).await {
             Ok(Some(resource)) => {
-                let body = R::response_body_for_role(&resource, role);
+                let body = response_body_for_role(&resource, role);
                 let mut response = super::json_response(StatusCode::OK, &body);
                 // Tags are issued only for a read from the store. The cached
                 // fallback below may lag the store, and a tag for a
@@ -2937,7 +2961,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
             .find(|resource| resource.id() == id && resource.namespace() == namespace)
         {
             Some(resource) => {
-                let body = R::response_body_for_role(resource, role);
+                let body = response_body_for_role(resource, role);
                 Ok(super::json_response_with_stale(StatusCode::OK, &body))
             }
             None => Ok(not_found_response::<R>()),
@@ -3747,13 +3771,17 @@ impl AdminResource for Upstream {
         upstream_audit_body(resource)
     }
 
-    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+    fn project_for_role_with(
+        resource: &Self,
+        role: AdminRole,
+        rendering: &dyn RedactionRendering,
+    ) -> Value {
         match role {
             AdminRole::Admin => Self::response_body(resource),
             // Operators write upstreams: withhold only the Consul token (as
             // before issue #5904) so a GET-then-PUT keeps stored URL userinfo.
-            AdminRole::Operator => upstream_consul_token_redacted(resource, &PlaceholderRendering),
-            AdminRole::Viewer => upstream_audit_body(resource),
+            AdminRole::Operator => upstream_consul_token_redacted(resource, rendering),
+            AdminRole::Viewer => upstream_audit_body_with(resource, rendering),
         }
     }
 
@@ -4230,11 +4258,15 @@ impl AdminResource for PluginConfig {
         plugin_config_audit_body(resource)
     }
 
-    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+    fn project_for_role_with(
+        resource: &Self,
+        role: AdminRole,
+        rendering: &dyn RedactionRendering,
+    ) -> Value {
         if role == AdminRole::Admin {
             Self::response_body(resource)
         } else {
-            plugin_config_audit_body(resource)
+            plugin_config_audit_body_with(resource, rendering)
         }
     }
 
@@ -4662,12 +4694,16 @@ impl AdminResource for Proxy {
         proxy_audit_body_with(resource, &PlaceholderRendering)
     }
 
-    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
+    fn project_for_role_with(
+        resource: &Self,
+        role: AdminRole,
+        rendering: &dyn RedactionRendering,
+    ) -> Value {
         match role {
             // Both roles write proxies: a GET-then-PUT must round-trip the
             // stored body unchanged.
             AdminRole::Admin | AdminRole::Operator => Self::response_body(resource),
-            AdminRole::Viewer => proxy_audit_body_with(resource, &PlaceholderRendering),
+            AdminRole::Viewer => proxy_audit_body_with(resource, rendering),
         }
     }
 
@@ -5601,6 +5637,26 @@ impl AdminResource for Consumer {
     }
 }
 
+/// The `400` message for a write refused by
+/// [`masked_placeholder_sites`]. The pointers come from the
+/// caller's own body; no stored value is named.
+fn masked_placeholder_message<R: AdminResource>(role: AdminRole, sites: &[String]) -> String {
+    const MAX_LISTED_SITES: usize = 16;
+    let mut listed_sites: Vec<String> = sites.iter().take(MAX_LISTED_SITES).cloned().collect();
+    if sites.len() > MAX_LISTED_SITES {
+        listed_sites.push(format!("…and {} more", sites.len() - MAX_LISTED_SITES));
+    }
+    format!(
+        "{} field(s) {} carry the redaction placeholder that '{}' reads return in place of the \
+         stored secret; writing it back would replace the secret with the placeholder. Send the \
+         real value, or remove the field only if you mean to clear it (PUT is a full replace and \
+         does not keep the stored value), or have an admin make the change",
+        R::RESOURCE_LABEL,
+        listed_sites.join(", "),
+        role.as_str()
+    )
+}
+
 fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
     super::json_response(
         StatusCode::NOT_FOUND,
@@ -5694,6 +5750,17 @@ async fn handle_write<R: AdminResource>(
             ));
         }
     };
+    // Issue #5925: refuse a body that writes back a redaction placeholder the
+    // caller's own read projection put in place of a stored secret. Checked
+    // on the body as sent, before any update-path merge or normalization.
+    let placeholder_sites = masked_placeholder_sites(&resource, actor.role);
+    if !placeholder_sites.is_empty() {
+        let message = masked_placeholder_message::<R>(actor.role, &placeholder_sites);
+        return Ok(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ));
+    }
     if matches!(action, WriteAction::Create)
         && let Some(labels) = resource.labels_mut()
     {
@@ -5948,7 +6015,7 @@ async fn handle_write<R: AdminResource>(
         }
     }
 
-    let body = R::response_body_for_role(&settled, actor.role);
+    let body = response_body_for_role(&settled, actor.role);
     let status = match action {
         WriteAction::Create => StatusCode::CREATED,
         WriteAction::Update { .. } => StatusCode::OK,
@@ -5976,6 +6043,7 @@ fn validation_error_response<R: AdminResource>(field_errors: &[String]) -> Respo
 
 #[cfg(test)]
 mod redis_plugin_projection_tests {
+    use super::{AdminRole, Upstream, masked_placeholder_message};
     use crate::admin::plugin_config_projection::{
         is_credential_bearing_url_config_key, is_sensitive_plugin_config_key,
         project_plugin_config, redact_sensitive_plugin_config_fields,
@@ -6040,11 +6108,11 @@ mod redis_plugin_projection_tests {
         assert_eq!(config["providers"][0]["redisIntegrityKey"], "[REDACTED]");
         assert_eq!(
             config["providers"][0]["Redis-Url"],
-            "redis://redacted@cache.internal:6379/3"
+            "redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]#[REDACTED_FRAGMENT]"
         );
         assert_eq!(
             config["providers"][0]["redisUrl"],
-            "redis://redacted@other.internal:6379/1"
+            "redis://redacted@other.internal:6379/1?[REDACTED_QUERY]#[REDACTED_FRAGMENT]"
         );
         let serialized = config.to_string();
         assert!(
@@ -6068,5 +6136,24 @@ mod redis_plugin_projection_tests {
         let mut null_url = json!({"redis_url": null});
         project_plugin_config("rate_limiting", &mut null_url);
         assert!(null_url["redis_url"].is_null());
+    }
+
+    #[test]
+    fn masked_placeholder_error_has_no_suffix_at_the_pointer_cap() {
+        let sites: Vec<String> = (0..16).map(|index| format!("/secret/{index}")).collect();
+        let message = masked_placeholder_message::<Upstream>(AdminRole::Operator, &sites);
+
+        assert!(message.contains("/secret/15"));
+        assert!(!message.contains("…and"));
+    }
+
+    #[test]
+    fn masked_placeholder_error_lists_only_one_pointer_beyond_the_cap() {
+        let sites: Vec<String> = (0..17).map(|index| format!("/secret/{index}")).collect();
+        let message = masked_placeholder_message::<Upstream>(AdminRole::Operator, &sites);
+
+        assert!(message.contains("/secret/15"));
+        assert!(message.contains("…and 1 more"));
+        assert!(!message.contains("/secret/16"));
     }
 }

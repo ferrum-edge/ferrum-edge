@@ -4629,14 +4629,15 @@ paths:
         schema-aware sensitivity contract used for non-admin plugin reads:
         credential-bearing endpoint URLs keep only scheme/host/port with
         structural `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]`
-        markers and never userinfo, all values of arbitrary header maps and
-        webhook body templates are replaced by `[REDACTED]`, as are
+        markers, with userinfo replaced by `redacted@`. All values of arbitrary
+        header maps and webhook body templates are replaced by `[REDACTED]`, as are
         `serverless_function.azure_function_key` and every
         `kafka_logging.producer_config` property outside the safe-tuning
         allow-list. Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
-        userinfo/query/fragment data is stripped while its
-        scheme/host/port/database are kept. Explicit JSON `null` values on
+        userinfo is replaced by `redacted@` and stripped query/fragment data
+        is marked while its scheme/host/port/database are kept. Explicit JSON
+        `null` values on
         sensitive fields stay `null`.
         Basic credential
         mutations remain visible by type and action, but values, entry fields,
@@ -6170,6 +6171,9 @@ paths:
       description: |
         Creates the plugin configuration.
 
+        A write that sends a redaction placeholder returned by the caller's
+        masked read back as a stored secret is rejected with `400`.
+
         The complete prospective plugin chain is validated before persistence.
         Invalid CORS/mesh-dispatch ordering, exclusive-instance conflicts,
         effective metric-tag plan budgets or global registry ownership return
@@ -6276,6 +6280,16 @@ paths:
         mutated. `POST /plugins/config` and `/batch` still default `enabled` to
         `true` when the key is absent — a create has no prior state to
         overwrite.
+
+        **Masked secrets.** Non-admin reads return the redacted plugin-config
+        projection. A `PUT` (or `POST /plugins/config`) by an `operator` whose
+        body carries one of that projection's placeholders at a field it
+        masks is rejected with `400` and nothing is mutated. The placeholders
+        are `[REDACTED]`, a URL whose path, query, or fragment is exactly
+        `/[REDACTED_PATH]`, `[REDACTED_QUERY]`, or `[REDACTED_FRAGMENT]`, and
+        `redacted@` userinfo with no password. Send the real value, or omit
+        the field to clear it: the full replace does not keep the stored
+        value. `admin` reads are raw, so an admin round trip is unaffected.
 
         **Proxy-scoped side effect (database mode).** The proxy association is
         reconciled with the replacement body in the same transaction, so
@@ -6415,6 +6429,9 @@ paths:
     post:
       operationId: createUpstream
       summary: Create an upstream
+      description: |
+        A write that sends a redaction placeholder returned by the caller's
+        masked read back as a stored secret is rejected with `400`.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -6493,6 +6510,15 @@ paths:
         any field the body omits is reset to its schema default. `targets` is
         required by the schema, so a body that omits it is rejected with `400`
         rather than silently emptying the target list.
+
+        **Masked secrets.** An `operator` read returns
+        `service_discovery.consul.token` as `[REDACTED]`. A `PUT` (or
+        `POST /upstreams`) by an `operator` whose body carries that exact
+        placeholder as the token is rejected with `400` and nothing is
+        mutated. Otherwise a read-modify-write would store the placeholder as
+        the token, and `If-Match` would not catch it. Send the real token, or
+        omit it to clear it: the full replace does not keep the stored token.
+        `admin` reads are raw, so an admin round trip is unaffected.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -9624,8 +9650,9 @@ components:
             URLs receive the same structural projection. `redis_integrity_key`
             (and any other
             `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
-            `redis_url` userinfo/query/fragment data is stripped while
-            scheme/host/port/database are kept. Any remaining URL-shaped
+            `redis_url` userinfo is replaced by `redacted@` and stripped
+            query/fragment data is marked while scheme/host/port/database are
+            kept. Any remaining URL-shaped
             string carrying userinfo has that userinfo replaced. A plugin
             config that is not an object (and not `null`) is replaced
             wholesale. Explicit JSON `null` values on sensitive fields stay
@@ -33704,7 +33731,8 @@ components:
             URL-embedded userinfo is accepted but never disclosed:
             connection/health-check logs and non-admin/audit projections keep
             only the scheme, host, port, and database, replace the userinfo, and
-            remove query/fragment data. Full admin reads stay raw.
+            replace query/fragment data with `[REDACTED_QUERY]` and
+            `[REDACTED_FRAGMENT]` markers. Full admin reads stay raw.
         redis_tls:
           type: boolean
           default: false

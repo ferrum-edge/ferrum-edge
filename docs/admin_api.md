@@ -1228,6 +1228,66 @@ default would otherwise silently change security state are handled explicitly:
 Every other field on these three resources replaces normally: a `GET`-modify-`PUT`
 round trip is safe because the response serializes them, but a hand-authored or
 templated partial body will reset anything it leaves out to the schema default.
+The one exception is a field the caller's own read masks, covered next.
+
+### Masked secrets on write (redaction placeholders)
+
+Non-admin reads withhold some stored values and put a redaction placeholder in
+their place. For the roles that can write:
+
+- **`operator` reads of upstreams** replace `service_discovery.consul.token`
+  with `[REDACTED]`.
+- **`operator` reads of plugin configs** use the redacted plugin-config
+  projection described under [Plugin Configs](#plugin-configs): `[REDACTED]`
+  for secrets, structural endpoint URLs retain markers for each stripped
+  component (including `redacted@` userinfo when present), and Redis URLs
+  retain `[REDACTED_QUERY]` and `[REDACTED_FRAGMENT]` markers when those
+  components were stripped. A Redis URL with userinfo but no suffix projects
+  as `redis://redacted@host:port/db`; one with a query projects as
+  `redis://host:port/db?[REDACTED_QUERY]`.
+
+`admin` reads of these resources are raw, and `operator` reads of proxies keep
+URL userinfo verbatim, so neither has anything to write back.
+
+A `POST` or `PUT` of an upstream or plugin config whose body carries one of those
+placeholders at a field the caller's read projection masks is refused with `400`
+and nothing is mutated (issue #5925). Without this check, an operator tool that
+reads a resource, edits an unrelated field, and writes the body back would store
+the literal placeholder as the secret. `If-Match` cannot catch it: the `ETag`
+covers the full stored resource, so the masked body's tag still matches. The
+error names each offending field by JSON pointer:
+
+```json
+{"error":"Upstream field(s) /service_discovery/consul/token carry the redaction placeholder that 'operator' reads return in place of the stored secret; writing it back would replace the secret with the placeholder. Send the real value, or remove the field only if you mean to clear it (PUT is a full replace and does not keep the stored value), or have an admin make the change"}
+```
+
+The check compares against the placeholder constants exactly: the string
+`[REDACTED]`; a URL whose whole path is `/[REDACTED_PATH]`, whose whole query is
+`[REDACTED_QUERY]`, or whose whole fragment is `[REDACTED_FRAGMENT]`; or a URL whose
+username is `redacted` with no password. It looks only at fields the caller's
+projection masks, so the same string in a field the read shows verbatim is
+written as sent. One real value looks exactly like a placeholder: a URL whose
+userinfo is the username `redacted` with no password, at a masked field. An
+operator cannot write that value, but an admin can.
+
+To change a resource that holds a masked secret, an operator must do one of these:
+
+- **Send the real value.** A new token or header value is an ordinary write, so
+  rotation by `PUT` works.
+- **Remove the field, but only to clear the secret.** `PUT` stays a full
+  replace. A body without `service_discovery.consul.token` stores no token, and
+  a plugin config without the secret loses it, or fails validation if the
+  plugin requires it. The stored secret is deliberately *not* kept for an
+  omitted field. Keeping it would let an operator point the Consul `address` or
+  a plugin endpoint at a host they control, and the gateway would then send
+  that host a credential the operator cannot read.
+- **Ask an `admin`**, whose raw read-modify-write round trip is unchanged.
+
+These resources have no `PATCH`. `/batch`, `/restore` and API-spec writes are
+`admin`-only and see raw values, so the check does not apply to them. Consumers
+are also `admin`-only, and their credential projection has its own round-trip
+rule: a `[REDACTED]` credential entry is restored from the stored entry (see
+[Consumers](#consumers)).
 
 
 ### Conditional writes (`ETag` / `If-Match`)
@@ -1358,7 +1418,7 @@ Disabled plugin configs are stored without plugin-specific construction, so oper
 
 Global-scope requirements for `transaction_log_schema` and `prometheus_metrics` still apply while disabled.
 
-Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
+Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. An `operator` write that sends one of the projection's placeholders back at a masked field is refused with `400`; see [Masked secrets on write](#masked-secrets-on-write-redaction-placeholders).
 
 That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Three layers run in order, and each can only add redaction:
 
@@ -1366,7 +1426,7 @@ That projection is driven by a **schema-aware sensitivity contract** (`src/admin
 2. **Name heuristics** — the historical substring matcher (`api_key`, `client_secret`, `private_key`, `*_integrity_key`, `*function_key*`, `webhook`, plus the shared log-redaction key list). It still covers custom plugins, which have no built-in schema.
 3. **Structural URL sweep** — any remaining string anywhere in the config that parses as a URL carrying userinfo has that userinfo replaced by `redacted`, so `https://user:pass@host/x` cannot survive a projection even on a path no rule names.
 
-A structurally projected endpoint URL keeps only `scheme://host[:port]` and emits `[REDACTED_PATH]`, `[REDACTED_QUERY]`, and `[REDACTED_FRAGMENT]` markers for the components that were present; userinfo is never emitted. A value that does not parse as a URL, or that has no host, fails closed to `[REDACTED]`. A plugin `config` that is not an object (and not `null`) is replaced wholesale — no built-in accepts a scalar or array config, so its interior cannot be classified. Explicit JSON `null` values on sensitive fields stay `null` (they disclose nothing) rather than becoming `[REDACTED]`.
+A structurally projected endpoint URL keeps `scheme://host[:port]`, replaces userinfo with `redacted@` when present, and emits `[REDACTED_PATH]`, `[REDACTED_QUERY]`, and `[REDACTED_FRAGMENT]` markers for the components that were present. A value that does not parse as a URL, or that has no host, fails closed to `[REDACTED]`. A plugin `config` that is not an object (and not `null`) is replaced wholesale — no built-in accepts a scalar or array config, so its interior cannot be classified. Explicit JSON `null` values on sensitive fields stay `null` (they disclose nothing) rather than becoming `[REDACTED]`.
 
 Fields covered by the schema include:
 
@@ -1398,7 +1458,7 @@ Header **values** are secret by default wherever a plugin accepts an arbitrary h
 
 `GET /backup` remains `admin`-only and intentionally exports raw configuration: backups must stay restorable.
 
-For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and query/fragment data is removed, so `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
+For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and stripped query/fragment components get `[REDACTED_QUERY]` and `[REDACTED_FRAGMENT]` markers. For example, `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]#[REDACTED_FRAGMENT]`, while a query-free URL with userinfo projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
 
 ## Upstreams
 
@@ -1767,7 +1827,7 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
 
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing, so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim, or `viewer-key:<sub>` for a token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. The `namespace` field is the authorization-scoping key `GET /audit` filters on. Namespace-scoped mutations (after the `ns`-claim gate, when that flag is on) use the validated request namespace. Fleet-global mutations, invalid-header backup attempts, and namespace-claim denials use the canonical default namespace (`ferrum`) rather than an unvalidated `X-Ferrum-Namespace`. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and strip `redis_url` userinfo/query/fragment while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, an audited admin mutation is made durable **before it runs**, not after it commits. `POST /batch` is all-or-nothing, so it emits exactly one audit event when its graph commits and none at all when it does not. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim, or `viewer-key:<sub>` for a token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`), action, resource type, resource ID, namespace, outcome, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. The `namespace` field is the authorization-scoping key `GET /audit` filters on. Namespace-scoped mutations (after the `ns`-claim gate, when that flag is on) use the validated request namespace. Fleet-global mutations, invalid-header backup attempts, and namespace-claim denials use the canonical default namespace (`ferrum`) rather than an unvalidated `X-Ferrum-Namespace`. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values. Redis-backed plugin diffs replace `redis_integrity_key` (and any other `*_integrity_key` signing secret) with `[REDACTED]` and replace `redis_url` userinfo/query/fragment with markers while keeping its scheme/host/port/database. Every redaction above is applied before the durable spool write, so a spooled or retained record carries exactly the same redacted representation as the `audit_events` row.
 
 This pipeline covers every Admin action that emits an ordinary mutation audit
 event: configuration-database mutations (CRUD, credentials, API specs, batch,

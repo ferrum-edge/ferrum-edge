@@ -943,8 +943,8 @@ impl RedisConfig {
     /// (`redis://user:pass@host`), so the raw string must never reach a tracing
     /// field, an error message, or an admin projection. Scheme, host, port, and
     /// database path are preserved because they are the diagnostics that make a
-    /// connect failure actionable; userinfo is replaced and query/fragment data
-    /// is removed.
+    /// connect failure actionable; userinfo is replaced with `redacted` and
+    /// stripped query/fragment components are marked with placeholders.
     ///
     /// Cold path only (connect/health-check failure logging), so the allocation
     /// here never touches a proxy hot path.
@@ -1151,8 +1151,8 @@ impl RedisConfig {
     }
 }
 
-/// Strip userinfo, query, and fragment from a connection URL, keeping
-/// scheme/host/port/path.
+/// Replace userinfo, query, and fragment in a connection URL with markers,
+/// keeping scheme/host/port/path.
 ///
 /// Only `redis` / `rediss` URLs receive the diagnostic-preserving projection.
 /// Any other parseable scheme (including opaque `data:` / `mailto:` values and
@@ -1180,16 +1180,22 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
         // projection or a log line.
         return raw_url.to_string();
     }
+    let userinfo_marker = super::metadata_redaction::REDACTED_USERINFO_PLACEHOLDER;
     if has_userinfo
-        && (parsed.set_password(None).is_err() || parsed.set_username("redacted").is_err())
+        && (parsed.set_password(None).is_err() || parsed.set_username(userinfo_marker).is_err())
     {
         return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string();
     }
-    // Redis URLs may carry non-secret transport options in the query, but
-    // arbitrary disabled/unvalidated plugin configs can also put credentials
-    // there or in a fragment. Neither is needed to identify the destination.
-    parsed.set_query(None);
-    parsed.set_fragment(None);
+    // Keep explicit markers so a caller who writes this projection back does
+    // not silently erase a stripped query or fragment.
+    if parsed.query().is_some() {
+        parsed.set_query(Some(super::metadata_redaction::REDACTED_QUERY_PLACEHOLDER));
+    }
+    if parsed.fragment().is_some() {
+        parsed.set_fragment(Some(
+            super::metadata_redaction::REDACTED_FRAGMENT_PLACEHOLDER,
+        ));
+    }
     parsed.to_string()
 }
 
