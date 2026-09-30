@@ -38,8 +38,14 @@ commit whose push CI succeeded. This verifier pins the fail-closed shape of
   eBPF variant. The build runs from the public Git URL of the CI-validated
   commit, each platform image is smoke-run by digest before the manifest, and
   the digest is attested and then signed, verified under the pinned identity
-  and issuer, and `latest` is created only from the digest reference that the
-  verify step exported, then checked to resolve to it.
+  and issuer, and `latest` is created only from the digest that the verify
+  step exported, then checked to resolve to it;
+* only bare `sha256:<64 hex>` digests cross from `attest` into `promote`, and
+  every job output a job consumes is one its producer declares. GitHub
+  withholds a job output that may contain a secret, and a full `repo@sha256:`
+  reference can match the Docker Hub username secret (issue #5893), so
+  `promote` rebuilds each reference from its fixed repository name after
+  rejecting a missing or malformed digest.
 
 It reads files only; it does not contact a registry or execute the workflow.
 """
@@ -133,14 +139,36 @@ RESOLVE_OUTPUTS = (
     "      sha: ${{ steps.head.outputs.sha }}\n"
     "      build: ${{ steps.existing.outputs.build }}\n"
 )
-ATTEST_OUTPUTS = (
-    "    outputs:\n"
-    "      docker_ref: ${{ steps.verify.outputs.docker_ref }}\n"
-    "      ghcr_ref: ${{ steps.verify.outputs.ghcr_ref }}\n"
+# Every output each job declares. Job outputs cross a job boundary, where
+# GitHub withholds any value that may contain a secret: a full `repo@sha256:`
+# reference can match the Docker Hub username secret and silently arrive empty
+# (issue #5893). `attest` therefore exports only bare digests, and `promote`
+# rebuilds each reference from its fixed repository name.
+EXPECTED_JOB_OUTPUTS = {
+    "resolve": {
+        "publish": "${{ steps.head.outputs.publish }}",
+        "sha": "${{ steps.head.outputs.sha }}",
+        "build": "${{ steps.existing.outputs.build }}",
+    },
+    "attest": {
+        "docker_digest": "${{ steps.verify.outputs.docker_digest }}",
+        "ghcr_digest": "${{ steps.verify.outputs.ghcr_digest }}",
+    },
+}
+JOB_OUTPUT_LINE = re.compile(r"^      (?P<name>[A-Za-z0-9_-]+):[ \t]*(?P<value>\S.*?)\s*$")
+# A consumed job output must be named, so the declared-output check sees it.
+# The job and `outputs` are matched through dot or bracket access alike, and
+# case-insensitively, as GitHub resolves context names.
+NEEDS_OUTPUT = re.compile(
+    r"\bneeds\s*(?:\.\s*(?P<job>[A-Za-z0-9_-]+)"
+    r"|\[\s*['\"]?(?P<bracket_job>[A-Za-z0-9_-]+)['\"]?\s*\])"
+    r"\s*(?:\.\s*outputs\b|\[\s*['\"]?outputs['\"]?\s*\])"
+    r"(?:\.(?P<name>[A-Za-z0-9_-]+)\b)?",
+    re.IGNORECASE,
 )
 PROMOTE_ENV = (
-    "          DOCKER_REF: ${{ needs.attest.outputs.docker_ref }}\n",
-    "          GHCR_REF: ${{ needs.attest.outputs.ghcr_ref }}\n",
+    "          DOCKER_DIGEST: ${{ needs.attest.outputs.docker_digest }}\n",
+    "          GHCR_DIGEST: ${{ needs.attest.outputs.ghcr_digest }}\n",
 )
 HEAD_LOOKUP = 'gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main"'
 WORKFLOW_SHA_COMPARE = 'if ! is_ancestor "$SOURCE_SHA" "$GITHUB_SHA"; then'
@@ -298,9 +326,26 @@ VERIFY_IMAGE_CALLS = (
     '          verify_image docker "$DOCKER_REF"',
     '          verify_image ghcr "$GHCR_REF"',
 )
-VERIFY_OUTPUT_LINES = (
-    'echo "docker_ref=${DOCKER_REF}" >> "$GITHUB_OUTPUT"',
-    'echo "ghcr_ref=${GHCR_REF}" >> "$GITHUB_OUTPUT"',
+# The verify step's only output: each verified reference must name its fixed
+# repository, and only its bare digest is written.
+EXPORT_VERIFIED_DIGEST = (
+    "          export_verified_digest() {\n"
+    '            local registry="$1"\n'
+    '            local repository="$2"\n'
+    '            local image_ref="$3"\n'
+    '            local digest="${image_ref#*@}"\n'
+    '            if [ "${image_ref%@*}" != "$repository" ] || '
+    '[[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then\n'
+    '              echo "::error::${image_ref} is not a verified ${repository} digest '
+    'reference" >&2\n'
+    "              exit 1\n"
+    "            fi\n"
+    '            echo "${registry}_digest=${digest}" >> "$GITHUB_OUTPUT"\n'
+    "          }\n"
+)
+VERIFY_EXPORT_CALLS = (
+    '          export_verified_digest docker "ferrumedge/ferrum-edge" "$DOCKER_REF"',
+    '          export_verified_digest ghcr "ghcr.io/${GITHUB_REPOSITORY}" "$GHCR_REF"',
 )
 SMOKE_PULL = (
     '          pull_err="$RUNNER_TEMP/smoke-pull.err"\n'
@@ -323,6 +368,7 @@ SMOKE_CHECK = (
     "jq -e '.version | type == \"string\" and length > 0' <<<\"$version_json\" >/dev/null"
 )
 PROMOTE_FUNCTIONS = (
+    "require_verified_digest",
     "require_verified_ref",
     "is_ancestor",
     "require_on_main",
@@ -330,25 +376,47 @@ PROMOTE_FUNCTIONS = (
     "require_latest",
     "summarize",
 )
+# `promote` rejects a missing or malformed digest, then rebuilds each reference
+# from its fixed repository name; no reference crosses a job boundary.
+PROMOTE_DIGEST_CHECKS = (
+    'require_verified_digest docker "$DOCKER_DIGEST"',
+    'require_verified_digest ghcr "$GHCR_DIGEST"',
+)
+PROMOTE_REBUILT_REFS = (
+    'docker_ref="ferrumedge/ferrum-edge@${DOCKER_DIGEST}"',
+    'ghcr_ref="ghcr.io/${GITHUB_REPOSITORY}@${GHCR_DIGEST}"',
+)
+REQUIRE_VERIFIED_DIGEST = (
+    'local registry="$1"',
+    'local digest="$2"',
+    'if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then',
+    'echo "::error::jobs.attest exported no verified ${registry} digest" >&2',
+    "exit 1",
+    "fi",
+)
+LATEST_DOCKER_GATE = 'require_latest_not_newer "ferrumedge/ferrum-edge"'
+LATEST_DOCKER_CHECK = 'require_latest "ferrumedge/ferrum-edge:latest" "$docker_ref"'
 # The top-level statements of the promote step, in order: every gate is
 # invoked, and each registry's move is bracketed by its own checks.
 PROMOTE_SEQUENCE = (
     "set -euo pipefail",
-    'require_verified_ref "ferrumedge/ferrum-edge" "$DOCKER_REF"',
-    'require_verified_ref "ghcr.io/${GITHUB_REPOSITORY}" "$GHCR_REF"',
+    *PROMOTE_DIGEST_CHECKS,
+    *PROMOTE_REBUILT_REFS,
+    'require_verified_ref "ferrumedge/ferrum-edge" "$docker_ref"',
+    'require_verified_ref "ghcr.io/${GITHUB_REPOSITORY}" "$ghcr_ref"',
     "require_on_main",
-    'require_latest_not_newer "ferrumedge/ferrum-edge"',
-    'docker buildx imagetools create -t "ferrumedge/ferrum-edge:latest" "$DOCKER_REF"',
-    'require_latest "ferrumedge/ferrum-edge:latest" "$DOCKER_REF"',
+    LATEST_DOCKER_GATE,
+    'docker buildx imagetools create -t "ferrumedge/ferrum-edge:latest" "$docker_ref"',
+    LATEST_DOCKER_CHECK,
     "require_on_main",
     'require_latest_not_newer "ghcr.io/${GITHUB_REPOSITORY}"',
-    'docker buildx imagetools create -t "ghcr.io/${GITHUB_REPOSITORY}:latest" "$GHCR_REF"',
-    'require_latest "ghcr.io/${GITHUB_REPOSITORY}:latest" "$GHCR_REF"',
+    'docker buildx imagetools create -t "ghcr.io/${GITHUB_REPOSITORY}:latest" "$ghcr_ref"',
+    'require_latest "ghcr.io/${GITHUB_REPOSITORY}:latest" "$ghcr_ref"',
     "summarize",
 )
 PROMOTE_SOURCES = {
-    '"ferrumedge/ferrum-edge:latest"': '"$DOCKER_REF"',
-    '"ghcr.io/${GITHUB_REPOSITORY}:latest"': '"$GHCR_REF"',
+    '"ferrumedge/ferrum-edge:latest"': '"$docker_ref"',
+    '"ghcr.io/${GITHUB_REPOSITORY}:latest"': '"$ghcr_ref"',
 }
 # Only `contract` checks out the repository: the running workflow's own commit.
 CHECKOUT_REFS = {
@@ -487,18 +555,30 @@ SIGN_MESSAGE = (
 )
 VERIFY_MESSAGE = (
     "jobs.attest must verify signatures, provenance, and SBOMs of both registries in "
-    "one unconditional `id: verify` step after signing, and export only those references"
+    "one unconditional `id: verify` step after signing, and then export only the bare "
+    "digests of those references"
 )
 ATTEST_IDENTITY_MESSAGE = (
     "jobs.attest must verify under the pinned main-latest-image.yml signing identity "
     "and issuer"
 )
 ATTEST_OUTPUTS_MESSAGE = (
-    "jobs.attest must expose only the digest references its verify step checked"
+    "jobs.attest must expose only the bare sha256 digests its verify step checked, "
+    "never a full image reference"
 )
+JOB_OUTPUTS_MESSAGE = "outputs must be exactly"
+CROSS_JOB_OUTPUT_MESSAGE = "consumes a job output that its producer does not declare"
 PROMOTE_SOURCE_MESSAGE = (
-    "jobs.promote must create latest only from the verified digest reference exported "
-    "by jobs.attest's verify step"
+    "jobs.promote must create latest only from the verified digest exported by "
+    "jobs.attest's verify step"
+)
+PROMOTE_INPUT_MESSAGE = (
+    "jobs.promote must take only the bare digests jobs.attest exported, reject a "
+    "missing or malformed one, and rebuild each reference from its fixed repository name"
+)
+PROMOTE_SUMMARY_MESSAGE = (
+    "jobs.promote must summarize only the verified digests, never a full image reference "
+    "or repository name that GitHub could mask"
 )
 PROMOTE_ON_MAIN_MESSAGE = (
     "jobs.promote must leave latest unchanged when the commit is no longer on main"
@@ -619,6 +699,32 @@ def job_permissions(block: str) -> dict[str, str] | None:
             break
         permissions[match.group(1)] = match.group(2)
     return permissions
+
+
+def job_outputs(block: str) -> dict[str, str] | None:
+    """Every output a job declares; None when the block is not plain pairs.
+
+    Comment and blank lines are skipped rather than ending the block, so a
+    declaration cannot hide behind one.
+    """
+
+    lines = block.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.startswith("    outputs:")]
+    if not starts:
+        return {}
+    if len(starts) != 1 or lines[starts[0]].rstrip() != "    outputs:":
+        return None
+    outputs: dict[str, str] = {}
+    for line in lines[starts[0] + 1 :]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if len(line) - len(line.lstrip(" ")) <= 4:
+            break
+        match = JOB_OUTPUT_LINE.match(line)
+        if match is None or match.group("name") in outputs:
+            return None
+        outputs[match.group("name")] = match.group("value")
+    return outputs
 
 
 def run_bodies(block: str) -> list[str]:
@@ -912,7 +1018,7 @@ def validate_syft(steps: list[str]) -> list[str]:
 
 def validate_attest(block: str) -> list[str]:
     failures: list[str] = []
-    if ATTEST_OUTPUTS not in block:
+    if job_outputs(block) != EXPECTED_JOB_OUTPUTS["attest"]:
         failures.append(ATTEST_OUTPUTS_MESSAGE)
     steps = step_blocks(block)
     failures.extend(validate_syft(steps))
@@ -946,14 +1052,17 @@ def validate_attest(block: str) -> list[str]:
     if VERIFY_IDENTITY not in step:
         failures.append(ATTEST_IDENTITY_MESSAGE)
     calls = [step.find(call) for call in VERIFY_IMAGE_CALLS]
-    outputs = [step.find(line) for line in VERIFY_OUTPUT_LINES]
+    exports = [step.find(call) for call in VERIFY_EXPORT_CALLS]
     if (
         "\n        if:" in step
         or index < sign_index
         or not all(snippet in step for snippet in VERIFY_SNIPPETS)
         or min(calls) < 0
-        or min(outputs) < max(calls)
-        or any(step.count(line) != 1 for line in VERIFY_OUTPUT_LINES)
+        or min(exports) < max(calls)
+        or any(step.count(call) != 1 for call in VERIFY_EXPORT_CALLS)
+        or step.count(EXPORT_VERIFIED_DIGEST) != 1
+        or step.count("export_verified_digest() {") != 1
+        or step.count('>> "$GITHUB_OUTPUT"') != 1
     ):
         failures.append(VERIFY_MESSAGE)
     return failures
@@ -961,10 +1070,14 @@ def validate_attest(block: str) -> list[str]:
 
 def validate_promote(block: str) -> list[str]:
     failures: list[str] = []
-    if any(line not in block for line in PROMOTE_ENV) or (
-        block.count("DOCKER_REF:") != 1 or block.count("GHCR_REF:") != 1
+    if (
+        any(block.count(line) != 1 for line in PROMOTE_ENV)
+        or block.count("DOCKER_DIGEST:") != 1
+        or block.count("GHCR_DIGEST:") != 1
+        or block.count("needs.attest.outputs.") != 2
+        or re.search(r"^\s+[A-Z0-9_]*_REF:", block, re.MULTILINE) is not None
     ):
-        failures.append(PROMOTE_SOURCE_MESSAGE)
+        failures.append(PROMOTE_INPUT_MESSAGE)
 
     bodies = [body for body in run_bodies(block) if "imagetools create" in body]
     if len(bodies) != 1:
@@ -992,6 +1105,8 @@ def validate_promote(block: str) -> list[str]:
     for statement in dict.fromkeys(PROMOTE_SEQUENCE):
         if statements.count(statement) < PROMOTE_SEQUENCE.count(statement):
             failures.append(f"jobs.promote must run {statement!r}")
+    if any(statements.count(statement) != 1 for statement in PROMOTE_REBUILT_REFS):
+        failures.append(PROMOTE_INPUT_MESSAGE)
     if tuple(statements) != PROMOTE_SEQUENCE:
         failures.append(
             "jobs.promote must run exactly its pinned gate sequence: re-check main and "
@@ -1028,6 +1143,18 @@ def validate_promote(block: str) -> list[str]:
         failures.append(PROMOTE_ORPHAN_MESSAGE)
     if not branch_contains(function("require_latest"), DIGEST_COMPARE, "exit 1"):
         failures.append(PROMOTE_DIGEST_MESSAGE)
+    summary = function("summarize")
+    if (
+        "_ref" in summary.lower()
+        or "ferrumedge/" in summary.lower()
+        or "github_repository" in summary.lower()
+        or "${DOCKER_DIGEST}" not in summary
+        or "${GHCR_DIGEST}" not in summary
+    ):
+        failures.append(PROMOTE_SUMMARY_MESSAGE)
+    verified_digest = function("require_verified_digest")
+    if tuple(line.strip() for line in verified_digest.splitlines()) != REQUIRE_VERIFIED_DIGEST:
+        failures.append(PROMOTE_INPUT_MESSAGE)
     verified_ref = function("require_verified_ref")
     if (
         '[ "${ref%@*}" != "$repository" ]' not in verified_ref
@@ -1077,6 +1204,12 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
             failures.append(
                 f"jobs.{job_name}.permissions must be exactly "
                 f"{EXPECTED_JOB_PERMISSIONS[job_name]}, found {permissions}"
+            )
+        outputs = job_outputs(block)
+        expected_outputs = EXPECTED_JOB_OUTPUTS.get(job_name, {})
+        if outputs != expected_outputs:
+            failures.append(
+                f"jobs.{job_name}.{JOB_OUTPUTS_MESSAGE} {expected_outputs}, found {outputs}"
             )
         needs = job_field(block, "needs")
         if needs != EXPECTED_NEEDS[job_name]:
@@ -1138,6 +1271,12 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
             failures.append(f"jobs.{job_name} must not push platform images")
         if job_name not in {"attest", "resolve"} and "cosign " in job_active:
             failures.append(f"jobs.{job_name} must not use cosign; only jobs.attest signs")
+
+    for consumed in NEEDS_OUTPUT.finditer(active):
+        job = (consumed.group("job") or consumed.group("bracket_job")).lower()
+        declared = EXPECTED_JOB_OUTPUTS.get(job, {})
+        if (consumed.group("name") or "").lower() not in declared:
+            failures.append(f"workflow {CROSS_JOB_OUTPUT_MESSAGE}: {consumed.group(0)}")
 
     failures.extend(validate_resolve(jobs["resolve"], active))
     failures.extend(validate_contract(jobs["contract"]))
@@ -1255,6 +1394,9 @@ def self_test() -> int:
     syft_update_check = "                -e SYFT_CHECK_FOR_APP_UPDATE=false \\\n"
     syft_token_arg = '                -e SYFT_REGISTRY_AUTH_PASSWORD="$DOCKERHUB_PASSWORD" \\\n'
     other_identity = 'main-latest-image.yml@refs/heads/feature"'
+    docker_digest_output = "      docker_digest: ${{ steps.verify.outputs.docker_digest }}\n"
+    ghcr_digest_output = "      ghcr_digest: ${{ steps.verify.outputs.ghcr_digest }}\n"
+    docker_ref_output = "      docker_ref: ${{ steps.verify.outputs.docker_ref }}\n"
     # Each mutation maps to (mutation, a fragment its rejection must contain).
     # None accepts any rejection.
     mutations: dict[str, tuple[Callable[[str], str | None], str | None]] = {
@@ -1408,31 +1550,169 @@ def self_test() -> int:
             replace_in_job(
                 "promote", '          require_latest_not_newer "ferrumedge/ferrum-edge"\n', ""
             ),
-            f"jobs.promote must run {PROMOTE_SEQUENCE[4]!r}",
+            f"jobs.promote must run {LATEST_DOCKER_GATE!r}",
         ),
         "digest gate defined but not called": (
             replace_in_job(
                 "promote",
-                '          require_latest "ferrumedge/ferrum-edge:latest" "$DOCKER_REF"\n',
+                f"          {LATEST_DOCKER_CHECK}\n",
                 "",
             ),
-            f"jobs.promote must run {PROMOTE_SEQUENCE[6]!r}",
+            f"jobs.promote must run {LATEST_DOCKER_CHECK!r}",
         ),
         "latest created from a tag": (
             replace_in_job(
                 "promote",
-                '-t "ferrumedge/ferrum-edge:latest" \\\n            "$DOCKER_REF"',
+                '-t "ferrumedge/ferrum-edge:latest" \\\n            "$docker_ref"',
                 '-t "ferrumedge/ferrum-edge:latest" \\\n'
                 '            "ferrumedge/ferrum-edge:main-${SOURCE_SHA}"',
             ),
             PROMOTE_SOURCE_MESSAGE,
         ),
-        "latest from an unverified reference": (
+        "latest from an unverified digest": (
             replace_once(
-                "docker_ref: ${{ steps.verify.outputs.docker_ref }}",
-                "docker_ref: ${{ steps.images.outputs.docker_ref }}",
+                "docker_digest: ${{ steps.verify.outputs.docker_digest }}",
+                "docker_digest: ${{ steps.images.outputs.docker_digest }}",
             ),
             ATTEST_OUTPUTS_MESSAGE,
+        ),
+        # Issue #5893: GitHub withheld the full Docker Hub reference output as
+        # possibly secret, so `promote` received an empty reference.
+        "full Docker reference crosses the job boundary": (
+            replace_once(docker_digest_output, docker_ref_output),
+            ATTEST_OUTPUTS_MESSAGE,
+        ),
+        "full reference output beside the digests": (
+            replace_once(ghcr_digest_output, ghcr_digest_output + docker_ref_output),
+            ATTEST_OUTPUTS_MESSAGE,
+        ),
+        "full reference output hidden behind a comment": (
+            replace_once(
+                ghcr_digest_output,
+                ghcr_digest_output + "      # verified\n" + docker_ref_output,
+            ),
+            ATTEST_OUTPUTS_MESSAGE,
+        ),
+        "output declared by a job that exports nothing": (
+            replace_in_job(
+                "manifest",
+                "    timeout-minutes: 15\n",
+                "    timeout-minutes: 15\n    outputs:\n" + docker_ref_output,
+            ),
+            f"jobs.manifest.{JOB_OUTPUTS_MESSAGE}",
+        ),
+        "promote consumes a full-reference output": (
+            replace_in_job(
+                "promote",
+                "          DOCKER_DIGEST: ${{ needs.attest.outputs.docker_digest }}\n",
+                "          DOCKER_REF: ${{ needs.attest.outputs.docker_ref }}\n",
+            ),
+            CROSS_JOB_OUTPUT_MESSAGE,
+        ),
+        "promote reads outputs by an unnamed expression": (
+            replace_in_job(
+                "promote",
+                "${{ needs.attest.outputs.docker_digest }}",
+                "${{ needs.attest.outputs['docker_digest'] }}",
+            ),
+            CROSS_JOB_OUTPUT_MESSAGE,
+        ),
+        "promote reads a job by bracket access": (
+            replace_in_job(
+                "promote",
+                "${{ needs.attest.outputs.docker_digest }}",
+                "${{ needs['attest'].outputs.docker_ref }}",
+            ),
+            CROSS_JOB_OUTPUT_MESSAGE,
+        ),
+        "promote reads outputs by bracket access": (
+            replace_in_job(
+                "promote",
+                "${{ needs.attest.outputs.docker_digest }}",
+                "${{ needs.attest['outputs'].docker_ref }}",
+            ),
+            CROSS_JOB_OUTPUT_MESSAGE,
+        ),
+        "promote reads outputs through mixed-case names": (
+            replace_in_job(
+                "promote",
+                "${{ needs.attest.outputs.docker_digest }}",
+                "${{ NEEDS.attest.OUTPUTS.docker_ref }}",
+            ),
+            CROSS_JOB_OUTPUT_MESSAGE,
+        ),
+        # Anchored on the whole export function: the images step writes the
+        # same `_digest` output line earlier in the job.
+        "verify step exports a full reference": (
+            replace_once(
+                EXPORT_VERIFIED_DIGEST,
+                EXPORT_VERIFIED_DIGEST.replace(
+                    'echo "${registry}_digest=${digest}" >> "$GITHUB_OUTPUT"',
+                    'echo "${registry}_ref=${image_ref}" >> "$GITHUB_OUTPUT"',
+                ),
+            ),
+            VERIFY_MESSAGE,
+        ),
+        "verify step exports an unchecked digest": (
+            replace_in_job(
+                "attest",
+                'if [ "${image_ref%@*}" != "$repository" ] || '
+                '[[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then',
+                "if false; then",
+            ),
+            VERIFY_MESSAGE,
+        ),
+        "digest exported before verification": (
+            replace_in_job(
+                "attest",
+                "\n".join(VERIFY_IMAGE_CALLS) + "\n\n" + "\n".join(VERIFY_EXPORT_CALLS) + "\n",
+                "\n".join(VERIFY_EXPORT_CALLS) + "\n\n" + "\n".join(VERIFY_IMAGE_CALLS) + "\n",
+            ),
+            VERIFY_MESSAGE,
+        ),
+        "promote accepts a malformed digest": (
+            replace_in_job(
+                "promote",
+                '[[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]',
+                '[[ ! "$digest" =~ ^sha256: ]]',
+            ),
+            PROMOTE_INPUT_MESSAGE,
+        ),
+        "promote accepts a missing digest": (
+            replace_in_job("promote", f"          {PROMOTE_DIGEST_CHECKS[0]}\n", ""),
+            f"jobs.promote must run {PROMOTE_DIGEST_CHECKS[0]!r}",
+        ),
+        "promote summary prints a full reference": (
+            replace_in_job(
+                "promote",
+                'echo "- Docker Hub: \\`${DOCKER_DIGEST}\\`"',
+                'echo "- \\`${docker_ref}\\`"',
+            ),
+            PROMOTE_SUMMARY_MESSAGE,
+        ),
+        "promote summary hard-codes the Docker Hub repository": (
+            replace_in_job(
+                "promote",
+                'echo "- Docker Hub: \\`${DOCKER_DIGEST}\\`"',
+                'echo "- Docker Hub: \\`ferrumedge/ferrum-edge@${DOCKER_DIGEST}\\`"',
+            ),
+            PROMOTE_SUMMARY_MESSAGE,
+        ),
+        "promote summary names the GHCR repository": (
+            replace_in_job(
+                "promote",
+                'echo "- GHCR: \\`${GHCR_DIGEST}\\`"',
+                'echo "- GHCR: \\`ghcr.io/${GITHUB_REPOSITORY}@${GHCR_DIGEST}\\`"',
+            ),
+            PROMOTE_SUMMARY_MESSAGE,
+        ),
+        "promote takes its repository from outside the workflow": (
+            replace_in_job(
+                "promote",
+                PROMOTE_REBUILT_REFS[0],
+                'docker_ref="${DOCKER_REPOSITORY}@${DOCKER_DIGEST}"',
+            ),
+            PROMOTE_INPUT_MESSAGE,
         ),
         "verify step deleted": (
             cut(
@@ -1549,10 +1829,9 @@ def self_test() -> int:
         "interpreter in a credentialed job": (
             replace_in_job(
                 "promote",
-                "          set -euo pipefail\n\n          require_verified_ref() {",
-                "          set -euo pipefail\n"
+                "          require_verified_digest() {\n",
                 "          python3 -I -c 'print(1)'\n\n"
-                "          require_verified_ref() {",
+                "          require_verified_digest() {\n",
             ),
             REPOSITORY_EXECUTION_MESSAGE,
         ),
