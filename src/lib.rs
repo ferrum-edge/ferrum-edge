@@ -15016,6 +15016,7 @@ pub mod _test_support {
         backend_version: http::Version,
         decoder_length: Option<u64>,
         trusted_backend_content_length: Option<u64>,
+        declared_after_hooks: Option<u64>,
         response_status: u16,
         client_grpc_deadline: bool,
     ) -> Option<u64> {
@@ -15023,6 +15024,7 @@ pub mod _test_support {
             backend_version,
             decoder_length,
             trusted_backend_content_length,
+            declared_after_hooks,
             response_status,
             client_grpc_deadline,
         )

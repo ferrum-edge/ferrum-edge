@@ -2107,6 +2107,12 @@ pub(crate) fn streaming_response_requires_size_limit(
 /// the connection on a short one, so the client can never be handed a framing
 /// claim that disagrees with the bytes written.
 ///
+/// Hooks may still WITHDRAW the length: `declared_after_hooks` is the value
+/// left on the header map after `after_proxy`, and it must equal the decoder
+/// length. A plugin that strips `Content-Length` to force streaming framing
+/// (the `sse` plugin does) is honored, while one cannot substitute any other
+/// value — the header map only ever votes the decoder's length out, never in.
+///
 /// HTTP/1.x backends only: their `Content-Length` framing cannot carry
 /// trailers, so nothing the chunked writer could relay is lost. A client gRPC
 /// deadline disqualifies the body because its wrapper may append a terminal
@@ -2116,6 +2122,7 @@ pub(crate) fn passthrough_streaming_content_length(
     backend_version: http::Version,
     decoder_length: Option<u64>,
     trusted_backend_content_length: Option<u64>,
+    declared_after_hooks: Option<u64>,
     response_status: u16,
     client_grpc_deadline: bool,
 ) -> Option<u64> {
@@ -2130,8 +2137,16 @@ pub(crate) fn passthrough_streaming_content_length(
     {
         return None;
     }
-    match (decoder_length, trusted_backend_content_length) {
-        (Some(decoded), Some(declared)) if decoded == declared && decoded > 0 => Some(decoded),
+    match (
+        decoder_length,
+        trusted_backend_content_length,
+        declared_after_hooks,
+    ) {
+        (Some(decoded), Some(declared), Some(after_hooks))
+            if decoded == declared && decoded == after_hooks && decoded > 0 =>
+        {
+            Some(decoded)
+        }
         _ => None,
     }
 }
@@ -42263,6 +42278,7 @@ async fn handle_proxy_request_inner(
                         response.version(),
                         response.content_length(),
                         cl,
+                        declared_streaming_content_length,
                         response_status,
                         ctx.grpc_deadline_at().is_some(),
                     )

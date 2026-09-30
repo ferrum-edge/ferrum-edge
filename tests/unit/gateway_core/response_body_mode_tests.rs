@@ -493,6 +493,7 @@ fn passthrough_content_length_is_the_http1_backend_decoder_length() {
             Version::HTTP_11,
             Some(512_000),
             Some(512_000),
+            Some(512_000),
             200,
             false
         ),
@@ -503,6 +504,7 @@ fn passthrough_content_length_is_the_http1_backend_decoder_length() {
             Version::HTTP_10,
             Some(7),
             Some(7),
+            Some(7),
             206,
             false
         ),
@@ -511,43 +513,50 @@ fn passthrough_content_length_is_the_http1_backend_decoder_length() {
 }
 
 /// Anything that cannot be framed by that decoder-enforced length keeps the
-/// unknown-length framing: a header value the decoder disagrees with, a
-/// backend that may carry trailers, a gRPC deadline wrapper that may append a
-/// terminal frame, a status that forbids a body, or an empty body.
+/// unknown-length framing: a header value the decoder disagrees with, a hook
+/// that withdrew or changed the length, a backend that may carry trailers, a
+/// gRPC deadline wrapper that may append a terminal frame, a status that
+/// forbids a body, or an empty body.
 #[test]
 fn passthrough_content_length_refuses_every_unverifiable_shape() {
     use http::Version;
-    let refuse = |version, decoded, declared, status, deadline| {
-        passthrough_streaming_content_length_for_test(version, decoded, declared, status, deadline)
+    let refuse = |version, decoded, declared, after_hooks, status, deadline| {
+        passthrough_streaming_content_length_for_test(
+            version,
+            decoded,
+            declared,
+            after_hooks,
+            status,
+            deadline,
+        )
     };
+    let ten = Some(10);
     // The declared header and the decoder must agree.
     assert_eq!(
-        refuse(Version::HTTP_11, Some(10), Some(11), 200, false),
+        refuse(Version::HTTP_11, ten, Some(11), ten, 200, false),
         None
     );
-    assert_eq!(refuse(Version::HTTP_11, None, Some(10), 200, false), None);
-    assert_eq!(refuse(Version::HTTP_11, Some(10), None, 200, false), None);
+    assert_eq!(refuse(Version::HTTP_11, None, ten, ten, 200, false), None);
+    assert_eq!(refuse(Version::HTTP_11, ten, None, ten, 200, false), None);
+    // A hook may withdraw the length (the `sse` plugin strips it to force
+    // streaming framing) but never substitute another value.
+    assert_eq!(refuse(Version::HTTP_11, ten, ten, None, 200, false), None);
+    assert_eq!(
+        refuse(Version::HTTP_11, ten, ten, Some(9), 200, false),
+        None
+    );
     // H2 and H3 backends can send trailers after a Content-Length body.
-    assert_eq!(
-        refuse(Version::HTTP_2, Some(10), Some(10), 200, false),
-        None
-    );
-    assert_eq!(
-        refuse(Version::HTTP_3, Some(10), Some(10), 200, false),
-        None
-    );
+    assert_eq!(refuse(Version::HTTP_2, ten, ten, ten, 200, false), None);
+    assert_eq!(refuse(Version::HTTP_3, ten, ten, ten, 200, false), None);
     // A client gRPC deadline may append a terminal frame.
-    assert_eq!(
-        refuse(Version::HTTP_11, Some(10), Some(10), 200, true),
-        None
-    );
+    assert_eq!(refuse(Version::HTTP_11, ten, ten, ten, 200, true), None);
     // Statuses that forbid a body, and informational ones.
     for status in [101, 204, 304] {
-        assert_eq!(
-            refuse(Version::HTTP_11, Some(10), Some(10), status, false),
-            None
-        );
+        assert_eq!(refuse(Version::HTTP_11, ten, ten, ten, status, false), None);
     }
     // An empty body gains nothing from a length.
-    assert_eq!(refuse(Version::HTTP_11, Some(0), Some(0), 200, false), None);
+    assert_eq!(
+        refuse(Version::HTTP_11, Some(0), Some(0), Some(0), 200, false),
+        None
+    );
 }
