@@ -13418,8 +13418,7 @@ async fn mcp_audit_final_fallback_skips_large_content_type_less_uploads() {
         PluginResult::Continue
     ));
     assert!(
-        !ctx.metadata
-            .contains_key("ai_transcript_audit.candidate"),
+        !ctx.metadata.contains_key("ai_transcript_audit.candidate"),
         "a large Content-Type-less binary upload is not staged as an AI request"
     );
     assert!(received_records(&server).await.is_empty());
@@ -13515,15 +13514,10 @@ async fn mcp_batch_outcomes_canonicalize_raw_numeric_and_escaped_string_ids() {
     assert_eq!(records.len(), 1, "{records:?}");
     let calls = records[0]["mcp"]["calls"].as_array().expect("mcp.calls");
     assert_eq!(calls.len(), 2);
-    assert_eq!(
-        calls[0]["result"],
-        "error",
-        "exponent id matches its value"
-    );
+    assert_eq!(calls[0]["result"], "error", "exponent id matches its value");
     assert_eq!(calls[0]["error_code"], json!(-32009));
     assert_eq!(
-        calls[1]["result"],
-        "result",
+        calls[1]["result"], "result",
         "escaped string id matches its value"
     );
 }
