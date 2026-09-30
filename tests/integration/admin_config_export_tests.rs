@@ -802,7 +802,6 @@ async fn ceiling_bound_viewers_are_denied_global_routes_except_the_explicit_allo
         "/metrics/runtime",
         "/cluster",
         "/backend-capabilities",
-        "/overload",
     ] {
         let reply = get(&base, path, Some(&ceiling_viewer), None).await;
         assert_ceiling_refusal(&reply, &format!("GET {path}"));
@@ -818,6 +817,32 @@ async fn ceiling_bound_viewers_are_denied_global_routes_except_the_explicit_allo
     ] {
         let reply = get(&base, path, Some(&ceiling_viewer), None).await;
         assert_eq!(reply.status, 200, "GET {path}: {}", reply.text);
+        if path == "/health" || path == "/status" {
+            assert_eq!(
+                reply.body.as_object().map(|body| body.len()),
+                Some(2)
+            );
+            assert!(reply.body.get("status").is_some(), "{}", reply.text);
+            assert!(reply.body.get("ready").is_some(), "{}", reply.text);
+        }
+    }
+    let overload = get(&base, "/overload", Some(&ceiling_viewer), None).await;
+    assert_eq!(overload.status, 200, "{}", overload.text);
+    assert_eq!(overload.body, json!({"level": "normal"}));
+
+    let unbounded_config = cached(registry_config());
+    let (unbounded_base, _sd) = start_admin(admin_state(unbounded_config, false)).await;
+    let unbounded_viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    for path in ["/health", "/status"] {
+        let reply = get(&unbounded_base, path, Some(&unbounded_viewer), None).await;
+        assert_eq!(reply.status, 200, "GET {path}: {}", reply.text);
+        for detail in ["timestamp", "mode", "admin_writes_enabled", "fips"] {
+            assert!(
+                reply.body.get(detail).is_some(),
+                "GET {path}: {}",
+                reply.text
+            );
+        }
     }
 
     // A viewer-key token without a configured ceiling keeps the existing
@@ -978,17 +1003,12 @@ async fn database_namespace_registry_is_filtered_to_the_viewer_namespace_ceiling
         .expect("consumer fixture deserializes");
         db.create_consumer(&consumer).await.expect("seed consumer");
     }
-    let mut state = ceiling_admin_state(cached(GatewayConfig::default()), true, "staging");
+    let mut state = ceiling_admin_state(cached(GatewayConfig::default()), false, "staging");
     state.db = Some(Arc::new(db));
     state.mode = "database".to_string();
     let (base, _sd) = start_admin(state).await;
 
-    let viewer = token(
-        VIEWER_SECRET,
-        Algorithm::HS256,
-        "viewer",
-        Some(json!("staging")),
-    );
+    let viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
     let list = get(&base, "/namespaces", Some(&viewer), None).await;
     assert_eq!(list.status, 200, "{}", list.text);
     let names = listed_names(&list);
@@ -1015,9 +1035,9 @@ async fn database_namespace_registry_is_filtered_to_the_viewer_namespace_ceiling
 #[tokio::test]
 async fn viewer_namespace_ceiling_composes_with_namespace_claim_enforcement() {
     let config = cached(registry_config());
-    let (base, _sd) = start_admin(ceiling_admin_state(config, true, "staging")).await;
+    let (base, _sd) = start_admin(ceiling_admin_state(config, true, "staging,prod")).await;
 
-    let staging_claim = Some(json!(["staging"]));
+    let staging_claim = Some(json!(["staging", "ferrum"]));
     let scoped = token(VIEWER_SECRET, Algorithm::HS256, "viewer", staging_claim);
     let allowed = get(&base, EXPORT, Some(&scoped), Some("staging")).await;
     assert_eq!(allowed.status, 200, "{}", allowed.text);

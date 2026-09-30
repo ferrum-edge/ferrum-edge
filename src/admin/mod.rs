@@ -2716,11 +2716,9 @@ fn authorize_request_namespace(
 /// ceiling. Keep this list explicit: a new global route is denied by default.
 fn ceiling_global_route_is_allowed(method: &Method, segments: &[&str]) -> bool {
     (*method == Method::GET && matches!(segments, ["plugins"]))
-        || (*method == Method::GET && matches!(segments, ["health"] | ["live"] | ["status"]))
-        || (matches!(segments, ["namespaces"])
-            && (*method == Method::GET || *method == Method::POST))
-        || (matches!(segments, ["namespaces", _])
-            && (*method == Method::GET || *method == Method::PUT || *method == Method::DELETE))
+        || (*method == Method::GET
+            && matches!(segments, ["health"] | ["live"] | ["status"] | ["overload"]))
+        || (*method == Method::GET && matches!(segments, ["namespaces"] | ["namespaces", _]))
 }
 
 /// Refuse a ceiling-bound viewer key on every global route except the small
@@ -2768,6 +2766,16 @@ fn observability_detail_allowed(
     auth_header: Option<&str>,
     client_ip: &std::net::IpAddr,
 ) -> bool {
+    if state
+        .jwt_manager
+        .verify_request(auth_header)
+        .ok()
+        .and_then(|token| AuditActor::from_verified(&token).ok())
+        .is_some_and(|actor| actor.namespace_ceiling.is_some())
+    {
+        return false;
+    }
+
     admin_jwt_detail_allowed(state, auth_header)
         || state.metrics_auth.token_matches(auth_header)
         || state.metrics_auth.ip_allowed(client_ip)
@@ -2782,7 +2790,7 @@ fn admin_jwt_detail_allowed(state: &AdminState, auth_header: Option<&str>) -> bo
         .verify_request(auth_header)
         .ok()
         .and_then(|token| AuditActor::from_verified(&token).ok())
-        .is_some()
+        .is_some_and(|actor| actor.namespace_ceiling.is_none())
 }
 
 /// Throttles the `diagnostic_ref_lookup` audit event for refused (`403`) and
@@ -3650,15 +3658,15 @@ async fn handle_admin_request_inner(
     // from `FERRUM_METRICS_ALLOWED_CIDRS`. Unauthenticated scraping is an
     // explicit operator opt-in (token or CIDR), not the default.
     if path == "/metrics" && method == Method::GET {
-        if !observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
-            return Ok(metrics_unauthorized_response());
-        }
         if let Ok(token_data) = state.jwt_manager.verify_request(auth_header.as_deref())
             && let Ok(actor) = AuditActor::from_verified(&token_data)
             && let Some(response) =
-                authorize_ceiling_global_route(&method, &["metrics"], path, &actor)
+                authorize_ceiling_global_route(&method, &["metrics"], &path, &actor)
         {
             return Ok(response);
+        }
+        if !observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
+            return Ok(metrics_unauthorized_response());
         }
         let registry = admin_metrics_registry(&state);
         // TLS certificate metadata comes from the cached, non-secret inventory
@@ -12630,6 +12638,8 @@ mod tests {
             vec!["plugins", "config", "pc1"],
             vec!["api-specs"],
             vec!["api-specs", "s1"],
+            vec!["gateway-trust-bundles"],
+            vec!["gateway-trust", "status"],
             vec!["batch"],
             vec!["backup"],
             vec!["config", "export"],
@@ -12652,6 +12662,7 @@ mod tests {
             (Method::GET, vec!["health"]),
             (Method::GET, vec!["live"]),
             (Method::GET, vec!["status"]),
+            (Method::GET, vec!["overload"]),
         ] {
             assert!(
                 ceiling_global_route_is_allowed(&method, &segs),
@@ -12665,10 +12676,11 @@ mod tests {
             (Method::GET, vec!["metrics"]),
             (Method::GET, vec!["admin", "metrics"]),
             (Method::GET, vec!["metrics", "runtime"]),
-            (Method::GET, vec!["overload"]),
             (Method::GET, vec!["cluster"]),
             (Method::GET, vec!["backend-capabilities"]),
             (Method::POST, vec!["namespaces"]),
+            (Method::PUT, vec!["namespaces", "tenant-a"]),
+            (Method::DELETE, vec!["namespaces", "tenant-a"]),
             (Method::POST, vec!["plugins"]),
         ] {
             assert!(
