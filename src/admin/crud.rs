@@ -2548,25 +2548,6 @@ pub(crate) trait AdminResource:
         Self::response_body(resource)
     }
 
-    fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
-        Self::project_for_role_with(resource, role, &PlaceholderRendering)
-    }
-
-    /// JSON pointers of the fields in a write body that carry a redaction
-    /// placeholder at a site `role`'s read projection withholds (issue #5925).
-    ///
-    /// A non-empty result refuses the write with `400`: writing the body back
-    /// would replace the stored secret with the marker the caller was shown in
-    /// its place, and the `ETag` (which covers the full stored resource) cannot
-    /// catch that. Both this check and [`Self::response_body_for_role`] use
-    /// [`Self::project_for_role_with`], so the caller's read and write check
-    /// cannot drift.
-    fn masked_placeholder_sites(resource: &Self, role: AdminRole) -> Vec<String> {
-        let recorder = PlaceholderSiteRecorder::default();
-        Self::project_for_role_with(resource, role, &recorder);
-        recorder.into_sites()
-    }
-
     fn audit_body(resource: &Self) -> Value {
         Self::response_body(resource)
     }
@@ -2853,6 +2834,25 @@ pub(crate) trait AdminResource:
     }
 }
 
+/// The role-projected read representation. Kept outside `AdminResource` so
+/// implementations can only customize the shared `project_for_role_with`
+/// hook, never the response and placeholder-detection paths independently.
+fn response_body_for_role<R: AdminResource>(resource: &R, role: AdminRole) -> Value {
+    R::project_for_role_with(resource, role, &PlaceholderRendering)
+}
+
+/// JSON pointers of fields in a write body that carry a placeholder at a site
+/// the caller's role-specific read projection withholds (issue #5925).
+///
+/// A non-empty result refuses the write with `400`: writing the body back
+/// would replace the stored secret with the marker the caller was shown. Both
+/// this check and `response_body_for_role` use the same projection hook.
+fn masked_placeholder_sites<R: AdminResource>(resource: &R, role: AdminRole) -> Vec<String> {
+    let recorder = PlaceholderSiteRecorder::default();
+    R::project_for_role_with(resource, role, &recorder);
+    recorder.into_sites()
+}
+
 pub(crate) async fn handle_list<R: AdminResource>(
     state: &AdminState,
     pagination: &super::PaginationParams,
@@ -2882,7 +2882,7 @@ pub(crate) async fn handle_list_filtered<R: AdminResource>(
                 let items: Vec<Value> = result
                     .items
                     .iter()
-                    .map(|resource| R::response_body_for_role(resource, role))
+                    .map(|resource| response_body_for_role(resource, role))
                     .collect();
                 let body = super::paginate_db_response(&items, result.total, pagination);
                 return Ok(super::json_response(StatusCode::OK, &body));
@@ -2901,7 +2901,7 @@ pub(crate) async fn handle_list_filtered<R: AdminResource>(
             resource.namespace() == namespace && R::matches_list_filter(resource, filter)
         });
         let body = super::paginate_mapped_response(items, pagination, |resource| {
-            R::response_body_for_role(resource, role)
+            response_body_for_role(resource, role)
         });
         Ok(super::json_response_with_stale(StatusCode::OK, &body))
     } else {
@@ -2928,7 +2928,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
     if let Some(ref db) = state.db {
         match R::db_get(db.as_ref(), namespace, id).await {
             Ok(Some(resource)) => {
-                let body = R::response_body_for_role(&resource, role);
+                let body = response_body_for_role(&resource, role);
                 let mut response = super::json_response(StatusCode::OK, &body);
                 // Tags are issued only for a read from the store. The cached
                 // fallback below may lag the store, and a tag for a
@@ -2961,7 +2961,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
             .find(|resource| resource.id() == id && resource.namespace() == namespace)
         {
             Some(resource) => {
-                let body = R::response_body_for_role(resource, role);
+                let body = response_body_for_role(resource, role);
                 Ok(super::json_response_with_stale(StatusCode::OK, &body))
             }
             None => Ok(not_found_response::<R>()),
@@ -5657,22 +5657,6 @@ fn masked_placeholder_message<R: AdminResource>(role: AdminRole, sites: &[String
     )
 }
 
-#[cfg(test)]
-mod masked_placeholder_message_tests {
-    use super::{AdminRole, Upstream, masked_placeholder_message};
-
-    #[test]
-    fn masked_placeholder_error_caps_listed_pointers() {
-        let sites: Vec<String> = (0..19).map(|index| format!("/secret/{index}")).collect();
-        let message = masked_placeholder_message::<Upstream>(AdminRole::Operator, &sites);
-
-        assert!(message.contains("/secret/0"));
-        assert!(message.contains("/secret/15"));
-        assert!(message.contains("…and 3 more"));
-        assert!(!message.contains("/secret/16"));
-    }
-}
-
 fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
     super::json_response(
         StatusCode::NOT_FOUND,
@@ -5769,7 +5753,7 @@ async fn handle_write<R: AdminResource>(
     // Issue #5925: refuse a body that writes back a redaction placeholder the
     // caller's own read projection put in place of a stored secret. Checked
     // on the body as sent, before any update-path merge or normalization.
-    let placeholder_sites = R::masked_placeholder_sites(&resource, actor.role);
+    let placeholder_sites = masked_placeholder_sites(&resource, actor.role);
     if !placeholder_sites.is_empty() {
         let message = masked_placeholder_message::<R>(actor.role, &placeholder_sites);
         return Ok(super::json_response(
@@ -6031,7 +6015,7 @@ async fn handle_write<R: AdminResource>(
         }
     }
 
-    let body = R::response_body_for_role(&settled, actor.role);
+    let body = response_body_for_role(&settled, actor.role);
     let status = match action {
         WriteAction::Create => StatusCode::CREATED,
         WriteAction::Update { .. } => StatusCode::OK,
@@ -6059,6 +6043,7 @@ fn validation_error_response<R: AdminResource>(field_errors: &[String]) -> Respo
 
 #[cfg(test)]
 mod redis_plugin_projection_tests {
+    use super::{AdminRole, Upstream, masked_placeholder_message};
     use crate::admin::plugin_config_projection::{
         is_credential_bearing_url_config_key, is_sensitive_plugin_config_key,
         project_plugin_config, redact_sensitive_plugin_config_fields,
@@ -6151,5 +6136,24 @@ mod redis_plugin_projection_tests {
         let mut null_url = json!({"redis_url": null});
         project_plugin_config("rate_limiting", &mut null_url);
         assert!(null_url["redis_url"].is_null());
+    }
+
+    #[test]
+    fn masked_placeholder_error_has_no_suffix_at_the_pointer_cap() {
+        let sites: Vec<String> = (0..16).map(|index| format!("/secret/{index}")).collect();
+        let message = masked_placeholder_message::<Upstream>(AdminRole::Operator, &sites);
+
+        assert!(message.contains("/secret/15"));
+        assert!(!message.contains("…and"));
+    }
+
+    #[test]
+    fn masked_placeholder_error_lists_only_one_pointer_beyond_the_cap() {
+        let sites: Vec<String> = (0..17).map(|index| format!("/secret/{index}")).collect();
+        let message = masked_placeholder_message::<Upstream>(AdminRole::Operator, &sites);
+
+        assert!(message.contains("/secret/15"));
+        assert!(message.contains("…and 1 more"));
+        assert!(!message.contains("/secret/16"));
     }
 }

@@ -943,8 +943,8 @@ impl RedisConfig {
     /// (`redis://user:pass@host`), so the raw string must never reach a tracing
     /// field, an error message, or an admin projection. Scheme, host, port, and
     /// database path are preserved because they are the diagnostics that make a
-    /// connect failure actionable; userinfo is replaced and query/fragment data
-    /// is removed.
+    /// connect failure actionable; userinfo is replaced with `redacted` and
+    /// stripped query/fragment components are marked with placeholders.
     ///
     /// Cold path only (connect/health-check failure logging), so the allocation
     /// here never touches a proxy hot path.

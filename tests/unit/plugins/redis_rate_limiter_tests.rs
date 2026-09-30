@@ -133,7 +133,8 @@ fn test_hostname_uses_url_parser_and_preserves_credentials() {
 
 /// Connect/health-check failures log `redis_url`. `redis_url` is a documented
 /// place to encode Redis ACL credentials, so the logged rendering must strip
-/// userinfo while keeping scheme/host/port/db as actionable diagnostics.
+/// userinfo and mark stripped query/fragment data while keeping
+/// scheme/host/port/db as actionable diagnostics.
 #[test]
 fn test_redacted_url_strips_userinfo_and_keeps_diagnostics() {
     let with_both = make_config("redis://user:pass@redis.internal:6379/15", false);
@@ -160,7 +161,7 @@ fn test_redacted_url_strips_userinfo_and_keeps_diagnostics() {
     );
     assert_eq!(
         suffix_secrets.redacted_url(),
-        "redis://redis.internal:6379/4"
+        "redis://redis.internal:6379/4?[REDACTED_QUERY]#[REDACTED_FRAGMENT]"
     );
 
     // No userinfo: the original bytes are returned, not the parser's

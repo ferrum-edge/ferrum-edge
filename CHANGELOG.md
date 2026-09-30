@@ -25,11 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Preserve redaction markers in masked admin reads** (#5925). Structural
-  endpoint URLs now mark stripped userinfo even without a path, query, or
-  fragment; Redis URL projections retain query and fragment markers so a
-  read-modify-write is rejected instead of silently dropping those components.
-
 - **`mcp_gateway` OpenAPI bridge and `x-ferrum-mcp`** (#5906). A
   `servers.<id>` entry may carry an `openapi` block instead of `upstream_url`:
   each configured OpenAPI operation (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`)
@@ -653,7 +648,10 @@ outright with no deprecation period:
   or omit the field to clear it: `PUT` is still a full replace and does not
   keep an omitted secret, because keeping it would let an operator redirect a
   credential they cannot read. Admin round trips, which read raw values, are
-  unchanged.
+  unchanged. Structural endpoint URL projections mark stripped userinfo as
+  `redacted@`, even without a path, query, or fragment; Redis URL projections
+  retain `[REDACTED_QUERY]` and `[REDACTED_FRAGMENT]` markers, so a
+  read-modify-write is rejected instead of silently dropping those components.
 
 - **A Gateway listener class, bind, or direction flip serves at once**
   (#5921). When a listener's TLS class, bind address, or mesh direction

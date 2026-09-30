@@ -583,11 +583,13 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 ///   gateway will replay as a cache hit, so it is redacted wholesale.
 /// * `redis_url` credentials — Redis ACL credentials are documented as
 ///   encodable in the URL (`redis://user:pass@host`). Userinfo is replaced and
-///   query/fragment data is marked; scheme/host/port/database stay visible as
+///   query/fragment data is marked with `[REDACTED_QUERY]` and
+///   `[REDACTED_FRAGMENT]`; scheme/host/port/database stay visible as
 ///   bounded diagnostics. A URL *fragment* can no longer reach storage at all
 ///   (issue #4147: redis-rs reads `#insecure` as a TLS-verification opt-out, so
 ///   admission refuses any fragment), but the projection still strips fragments
-///   because configs written before that guard can still hold one.
+///   because configs written before that guard can still hold one; any such
+///   legacy fragment is marked with `[REDACTED_FRAGMENT]` in the projection.
 ///
 /// Full-Admin reads stay raw so rotation via read-modify-write keeps working.
 #[tokio::test]

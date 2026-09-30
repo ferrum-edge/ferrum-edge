@@ -1972,7 +1972,7 @@ fn proxy_ws_origin_star_is_rejected_on_admin_and_validate_admission() {
 fn role_projected_resources_refuse_writing_their_placeholders_back() {
     let crud = include_str!("../../../src/admin/crud.rs");
     let trait_start = crud
-        .find("pub trait AdminResource")
+        .find("trait AdminResource")
         .expect("AdminResource trait must be found");
     let trait_end = crud[trait_start..]
         .find("impl AdminResource for Proxy")
@@ -1999,19 +1999,19 @@ fn role_projected_resources_refuse_writing_their_placeholders_back() {
             .split_whitespace()
             .next()
             .expect("impl target name");
+        assert!(
+            !region.contains("fn response_body_for_role(")
+                && !region.contains("fn masked_placeholder_sites("),
+            "{name} must not override the shared role response or placeholder detection"
+        );
         if region.contains("fn project_for_role_with(") {
             projected.push(name);
-            assert!(
-                !region.contains("fn response_body_for_role(")
-                    && !region.contains("fn masked_placeholder_sites("),
-                "{name} must define one projection instead of separate read and write logic"
-            );
         }
     }
     projected.sort_unstable();
     assert_eq!(projected, ["PluginConfig", "Proxy", "Upstream"]);
     assert!(
-        crud.contains("R::masked_placeholder_sites(&resource, actor.role)"),
+        crud.contains("masked_placeholder_sites(&resource, actor.role)"),
         "the generic write path must run the check with the caller's role"
     );
 }

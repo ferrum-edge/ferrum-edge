@@ -740,10 +740,11 @@ fn url_userinfo_is_stripped_on_paths_no_rule_names() {
         projected["discovery"]["peers"][1],
         "https://plain.example.com/mcp"
     );
-    // The schema rule wins on the named path: no userinfo and no path.
+    // The schema rule wins on the named path: userinfo is marked and the path
+    // is replaced with its structural marker.
     assert_eq!(
         projected["upstream_url"],
-        "https://up.example.com/[REDACTED_PATH]"
+        "https://redacted@up.example.com/[REDACTED_PATH]"
     );
     assert_no_canaries(
         &projected,

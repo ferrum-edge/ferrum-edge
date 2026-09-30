@@ -4611,14 +4611,15 @@ paths:
         schema-aware sensitivity contract used for non-admin plugin reads:
         credential-bearing endpoint URLs keep only scheme/host/port with
         structural `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]`
-        markers and never userinfo, all values of arbitrary header maps and
-        webhook body templates are replaced by `[REDACTED]`, as are
+        markers, with userinfo replaced by `redacted@`. All values of arbitrary
+        header maps and webhook body templates are replaced by `[REDACTED]`, as are
         `serverless_function.azure_function_key` and every
         `kafka_logging.producer_config` property outside the safe-tuning
         allow-list. Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
-        userinfo/query/fragment data is stripped while its
-        scheme/host/port/database are kept. Explicit JSON `null` values on
+        userinfo is replaced by `redacted@` and stripped query/fragment data
+        is marked while its scheme/host/port/database are kept. Explicit JSON
+        `null` values on
         sensitive fields stay `null`.
         Basic credential
         mutations remain visible by type and action, but values, entry fields,
@@ -9607,8 +9608,9 @@ components:
             URLs receive the same structural projection. `redis_integrity_key`
             (and any other
             `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
-            `redis_url` userinfo/query/fragment data is stripped while
-            scheme/host/port/database are kept. Any remaining URL-shaped
+            `redis_url` userinfo is replaced by `redacted@` and stripped
+            query/fragment data is marked while scheme/host/port/database are
+            kept. Any remaining URL-shaped
             string carrying userinfo has that userinfo replaced. A plugin
             config that is not an object (and not `null`) is replaced
             wholesale. Explicit JSON `null` values on sensitive fields stay
@@ -33570,7 +33572,8 @@ components:
             URL-embedded userinfo is accepted but never disclosed:
             connection/health-check logs and non-admin/audit projections keep
             only the scheme, host, port, and database, replace the userinfo, and
-            remove query/fragment data. Full admin reads stay raw.
+            replace query/fragment data with `[REDACTED_QUERY]` and
+            `[REDACTED_FRAGMENT]` markers. Full admin reads stay raw.
         redis_tls:
           type: boolean
           default: false
