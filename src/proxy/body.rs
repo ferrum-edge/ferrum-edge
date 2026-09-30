@@ -3155,6 +3155,31 @@ pub(crate) fn publish_passthrough_request_bytes(
     latch.finish();
 }
 
+/// Poll `body` past zero-length DATA frames (issue #5588).
+///
+/// An H2 client's END_STREAM often arrives as an empty DATA frame after the
+/// last payload frame. Relayed as-is, hyper can send it upstream as an empty
+/// DATA frame WITHOUT END_STREAM whenever the source does not yet report end
+/// of stream, and h2 >= 0.4.16 peers answer the 101st such frame on a
+/// connection with GOAWAY(ENHANCE_YOUR_CALM), failing every stream on it. An
+/// empty frame carries no content, so skipping it is lossless; the end of the
+/// body is still relayed as `None` (hyper's END_STREAM) or as trailers.
+fn poll_nonempty_frame<B>(
+    mut body: Pin<&mut B>,
+    cx: &mut Context<'_>,
+) -> Poll<Option<Result<Frame<Bytes>, B::Error>>>
+where
+    B: http_body::Body<Data = Bytes> + ?Sized,
+{
+    loop {
+        match body.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame)))
+                if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+            other => return other,
+        }
+    }
+}
+
 /// Request body for the ordinary direct-H2 pool ([`super::http2_pool::Http2Sender`]).
 ///
 /// [`Self::Passthrough`] is the Jun 19 hot path: hyper polls `Incoming`
@@ -3238,7 +3263,7 @@ impl http_body::Body for DirectH2RequestBody {
                 // `http_body::Body`, so the call must name the trait (E0034).
                 // `http_body::Body` is the one whose error converts into
                 // `BoxError` below.
-                match http_body::Body::poll_frame(Pin::new(inner), cx) {
+                match poll_nonempty_frame(Pin::new(inner), cx) {
                     Poll::Ready(Some(Ok(frame))) => {
                         if let Some(data) = frame.data_ref() {
                             *seen = seen.saturating_add(data.len() as u64);
@@ -3330,7 +3355,15 @@ impl http_body::Body for SizeLimitedIncoming {
                 "request body forwarding cancelled after upload timeout".into(),
             )));
         }
-        match this.inner.poll_frame(cx) {
+        let polled = loop {
+            match this.inner.poll_frame(cx) {
+                // See `poll_nonempty_frame` (issue #5588).
+                Poll::Ready(Some(Ok(frame)))
+                    if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+                other => break other,
+            }
+        };
+        match polled {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     // Single atomic RMW: fetch_add returns the pre-increment
@@ -3536,7 +3569,15 @@ impl http_body::Body for CountingIncoming {
         {
             return Poll::Ready(Some(Err(deadline.message().into())));
         }
-        match this.inner.poll_frame(cx) {
+        let polled = loop {
+            match this.inner.poll_frame(cx) {
+                // See `poll_nonempty_frame` (issue #5588).
+                Poll::Ready(Some(Ok(frame)))
+                    if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+                other => break other,
+            }
+        };
+        match polled {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     // Release ordering pairs with Acquire on
