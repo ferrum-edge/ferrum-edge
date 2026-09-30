@@ -334,12 +334,7 @@ async fn send_h3(client: &Http3Client, https_port: u16, target: &str) -> u16 {
 
 /// HTTP/3 with a caller-chosen `:authority` host. The test client dials only
 /// loopback names, so `host` is `127.0.0.1` or `localhost`.
-async fn send_h3_with_host(
-    client: &Http3Client,
-    host: &str,
-    https_port: u16,
-    target: &str,
-) -> u16 {
+async fn send_h3_with_host(client: &Http3Client, host: &str, https_port: u16, target: &str) -> u16 {
     let url = format!("https://{host}:{https_port}{target}");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
