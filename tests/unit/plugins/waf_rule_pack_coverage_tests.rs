@@ -580,6 +580,62 @@ async fn like_tautology_continuation_requires_an_injection_shaped_final_operand(
     }
 }
 
+/// A closed `like` operand may be followed by a longer boolean tail — more
+/// closed terms, numbers, `not`, a column comparison, or parentheses — as long
+/// as the tail ends in an unterminated or comment-terminated string. A tail
+/// whose last string is closed stays prose.
+#[tokio::test]
+async fn like_tautology_multi_term_continuation_is_detected() {
+    let plugin = monitor_waf(1);
+    for value in [
+        "x' or 'a' like 'a' or 'b' or 'x",
+        "x' or 'a' like 'a' and 'b' or 'x",
+        "x' or 'a' like 'a' or 'b' or 'c' or 'd' or 'x",
+        "x' or 'a' like 'a' or 1 or 'x",
+        "x' or 'a' like 'a' or not 'x",
+        "x' or 'a' like 'a' or true or 'x",
+        "x' or 'a' like 'a' and user<>'x",
+        "x' or 'a' like 'a' or user like 'x",
+        "x' or 'a' like 'a' ) or ('x",
+        "x' or 'a' like 'a'/**/or/**/'b'/**/or/**/'x",
+        "x' or 'a' like 'a' or 1 or 'x' limit 1-- ",
+        "x\" or \"a\" like \"a\" or \"b\" or \"x",
+    ] {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("user", value)
+            .finish();
+        assert_detected(&plugin, "FE-SQLI-009", Surface::Query(&query)).await;
+        let body = serde_json::to_vec(&json!({ "user": value })).unwrap();
+        assert_detected(&plugin, "FE-SQLI-009-B", Surface::Body(JSON, &body)).await;
+        assert_detected(
+            &plugin,
+            "FE-SQLI-009-B",
+            Surface::Body(TEXT, value.as_bytes()),
+        )
+        .await;
+    }
+
+    for prose in [
+        "Is it 'soda' or 'pop' like 'grandma' or 'grandpa' or 'mom' says?",
+        "Is it 'soda' or 'pop' like 'grandma' or grandpa's",
+        "Is it 'soda' or 'pop' like 'grandma' and 5 more says?",
+        "Is it 'soda' or 'pop' like 'grandma' or not 'grandpa' at all?",
+    ] {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("q", prose)
+            .finish();
+        assert_clean(&plugin, "FE-SQLI-009", Surface::Query(&query)).await;
+        let body = serde_json::to_vec(&json!({ "text": prose })).unwrap();
+        assert_clean(&plugin, "FE-SQLI-009-B", Surface::Body(JSON, &body)).await;
+        assert_clean(
+            &plugin,
+            "FE-SQLI-009-B",
+            Surface::Body(TEXT, prose.as_bytes()),
+        )
+        .await;
+    }
+}
+
 /// The comment after a `like` right operand may follow closing parentheses, a
 /// statement `;`, or a `LIMIT` clause.
 #[tokio::test]
@@ -1501,6 +1557,7 @@ async fn recommended_posture_enforces_new_level_one_signatures() {
         Surface::Path("/.git/config"),
         Surface::Body(JSON, br#"{"@type":"com.sun.rowset.JdbcRowSetImpl"}"#),
         Surface::Body(JSON, br#"{"user":"x' or 'a' like 'a' or 'x"}"#),
+        Surface::Body(JSON, br#"{"user":"x' or 'a' like 'a' or 'b' or 1 or 'x"}"#),
     ] {
         let (result, request) = scan(&plugin, &surface).await;
         assert!(

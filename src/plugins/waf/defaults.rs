@@ -162,14 +162,22 @@ const SQLI_ERROR_OR_OOB_FUNCTION: &str = r#"(?i)(?:\b(?:extractvalue|updatexml)\
 /// (`' or 'a' like '%`), it is left unterminated for the application's own
 /// closing quote — the value ends inside it, or a JSON string closes it
 /// (`' or 'a' like 'a`) — or it is followed by an SQL comment
-/// (`' or 'a' like 'a'--`), or the closed comparison continues with another
-/// SQL boolean term whose string is likewise unterminated or followed by a
-/// comment (`' or 'a' like 'a' or 'x`). Fully closed quoted alternatives
-/// remain prose. Closing parentheses, a statement `;`, and a `LIMIT n` /
-/// `LIMIT n, m` clause may sit between the string and the comment
+/// (`' or 'a' like 'a'--`). Closing parentheses, a statement `;`, and a
+/// `LIMIT n` / `LIMIT n, m` clause may sit between the string and the comment
 /// (`' or 'a' like 'a')--`, `' or 'a' like 'a';--`,
 /// `' or 'a' like 'a' limit 1--`).
-const SQLI_STRING_TAUTOLOGY: &str = r#"(?i)['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:\bor\b|\|\|)(?:\s|/\*(?s:.){0,64}?\*/)*['"][^'"]{0,32}['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:=(?:\s|/\*(?s:.){0,64}?\*/)*['"]|\blike\b(?:\s|/\*(?s:.){0,64}?\*/)*(?:['"][%_]|'[^'"]{0,32}(?:"|$|'?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*)|'(?:\s|/\*(?s:.){0,64}?\*/)*(?:\band\b|\bor\b|\bxor\b|&&|\|\|)(?:\s|/\*(?s:.){0,64}?\*/)*(?:'[^'"]{0,32}(?:"|$|'?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))|"[^'"]{0,32}(?:$|"?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))))|"[^'"]{0,32}(?:$|"?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*)|"(?:\s|/\*(?s:.){0,64}?\*/)*(?:\band\b|\bor\b|\bxor\b|&&|\|\|)(?:\s|/\*(?s:.){0,64}?\*/)*(?:'[^'"]{0,32}(?:"|$|'?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))|"[^'"]{0,32}(?:$|"?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))))))"#;
+///
+/// A closed right operand may also continue into a boolean tail that ends in
+/// one of those injection-shaped strings: an `and` / `or` / `xor` / `&&` /
+/// `||` operator, then up to six further operators, `not`s, closed strings,
+/// numbers, or `true` / `false` / `null` (parentheses and bounded comments
+/// may separate them), then optionally a `column <op>` comparison, and
+/// finally an unterminated or comment-terminated string
+/// (`' or 'a' like 'a' or 'x`, `' or 'a' like 'a' or 'b' or 1 or 'x`,
+/// `' or 'a' like 'a' and user<>'x`, `' or 'a' like 'a') or ('x`). A tail
+/// whose last string is closed (`'pop' like 'grandma' or 'grandpa' says?`)
+/// remains prose.
+const SQLI_STRING_TAUTOLOGY: &str = r#"(?i)['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:\bor\b|\|\|)(?:\s|/\*(?s:.){0,64}?\*/)*['"][^'"]{0,32}['"](?:\s|/\*(?s:.){0,64}?\*/)*(?:=(?:\s|/\*(?s:.){0,64}?\*/)*['"]|\blike\b(?:\s|/\*(?s:.){0,64}?\*/)*(?:['"][%_]|'[^'"]{0,32}(?:"|$|'?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))|"[^'"]{0,32}(?:$|"?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))|(?:'[^'"]{0,32}'|"[^'"]{0,32}")(?:[\s()]|/\*(?s:.){0,64}?\*/)*(?:\band\b|\bor\b|\bxor\b|&&|\|\|)(?:(?:[\s()]|/\*(?s:.){0,64}?\*/)*(?:(?:\band\b|\bor\b|\bxor\b|&&|\|\|)|\bnot\b|'[^'"]{0,32}'|"[^'"]{0,32}"|\d{1,16}\b|\b(?:true|false|null)\b)){0,6}(?:[\s()]|/\*(?s:.){0,64}?\*/)*(?:\w{1,32}\s*(?:<>|[<>!]?=|[<>]|\blike\b)\s*)?(?:'[^'"]{0,32}(?:"|$|'?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*))|"[^'"]{0,32}(?:$|"?[\s);]*(?:\blimit\s+\d+(?:\s*,\s*\d+)?[\s);]*)?(?:--|#|/\*)))))"#;
 
 /// Script-capable URL schemes, claimed by `FE-XSS-002` and its body / cookie
 /// mirrors. Browsers delete ASCII tab, LF, and CR anywhere inside a URL before
