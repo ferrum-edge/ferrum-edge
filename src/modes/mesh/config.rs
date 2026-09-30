@@ -2100,7 +2100,7 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
     }
 }
 
-pub(crate) fn bracketed_mesh_attribute_name(key: &str, prefix: &str) -> Option<&str> {
+pub(crate) fn bracketed_mesh_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
     let name = key
         .strip_prefix(prefix)?
         .strip_suffix(']')?;
