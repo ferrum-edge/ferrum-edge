@@ -485,7 +485,8 @@ async fn quoted_string_tautology_is_detected_including_unspaced_form() {
 
 /// `like` is an English word, so a `like` tautology needs an injection-shaped
 /// right operand: a wildcard, an unterminated string the application closes,
-/// or a trailing SQL comment. Quoted words in prose stay clean.
+/// or a trailing SQL comment, including the final operand of a continuation.
+/// Quoted words in prose stay clean.
 #[tokio::test]
 async fn like_tautology_requires_an_injection_shaped_right_operand() {
     let plugin = monitor_waf(1);
@@ -523,6 +524,59 @@ async fn like_tautology_requires_an_injection_shaped_right_operand() {
         b"Is it 'soda' or 'pop' like 'grandma' says?",
     ] {
         assert_clean(&plugin, "FE-SQLI-009-B", Surface::Body(TEXT, body)).await;
+    }
+}
+
+#[tokio::test]
+async fn like_tautology_continuation_requires_an_injection_shaped_final_operand() {
+    let plugin = monitor_waf(1);
+    for like_quote in ["'", "\""] {
+        for final_quote in ["'", "\""] {
+            for operator in ["and", "or", "xor", "&&", "||"] {
+                let prose = format!(
+                    "Is it {like_quote}soda{like_quote} or {like_quote}pop{like_quote} like \
+                     {like_quote}grandma{like_quote} {operator} \
+                     {final_quote}grandpa{final_quote} says?"
+                );
+                let query = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("q", &prose)
+                    .finish();
+                assert_clean(&plugin, "FE-SQLI-009", Surface::Query(&query)).await;
+                let body = serde_json::to_vec(&json!({ "text": prose })).unwrap();
+                assert_clean(&plugin, "FE-SQLI-009-B", Surface::Body(JSON, &body)).await;
+                assert_clean(
+                    &plugin,
+                    "FE-SQLI-009-B",
+                    Surface::Body(TEXT, prose.as_bytes()),
+                )
+                .await;
+
+                let attack = format!(
+                    "x{like_quote} or {like_quote}a{like_quote} like \
+                     {like_quote}a{like_quote} {operator} {final_quote}x"
+                );
+                for suffix in [
+                    String::new(),
+                    format!("{final_quote}-- "),
+                    format!("{final_quote}#"),
+                    format!("{final_quote}/* comment */"),
+                ] {
+                    let value = format!("{attack}{suffix}");
+                    let query = url::form_urlencoded::Serializer::new(String::new())
+                        .append_pair("user", &value)
+                        .finish();
+                    assert_detected(&plugin, "FE-SQLI-009", Surface::Query(&query)).await;
+                    let body = serde_json::to_vec(&json!({ "user": value })).unwrap();
+                    assert_detected(&plugin, "FE-SQLI-009-B", Surface::Body(JSON, &body)).await;
+                    assert_detected(
+                        &plugin,
+                        "FE-SQLI-009-B",
+                        Surface::Body(TEXT, value.as_bytes()),
+                    )
+                    .await;
+                }
+            }
+        }
     }
 }
 
@@ -1465,6 +1519,14 @@ async fn recommended_posture_enforces_new_level_one_signatures() {
 
     for surface in [
         Surface::Query("q=shoes%20and%20socks&page=2"),
+        Surface::Query(
+            "q=Is%20it%20'soda'%20or%20'pop'%20like%20'grandma'%20or%20'grandpa'%20says%3F",
+        ),
+        Surface::Body(
+            JSON,
+            br#"{"text":"Is it 'soda' or 'pop' like 'grandma' or 'grandpa' says?"}"#,
+        ),
+        Surface::Body(TEXT, b"Is it 'soda' or 'pop' like 'grandma' or 'grandpa' says?"),
         Surface::Cookie("_ga=GA1.2.1234567890.1700000000; locale=en-US"),
         Surface::Path("/.well-known/openid-configuration"),
         Surface::Body(
