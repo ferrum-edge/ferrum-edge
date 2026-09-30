@@ -2,9 +2,10 @@
 
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::identity::SpiffeId;
+use ferrum_edge::plugins::rate_limiting::MCP_TOOL_CALL_RATE_LIMITED;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, StreamConnectionContext,
-    priority, rate_limiting::RateLimiting,
+    ALL_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
+    StreamConnectionContext, priority, rate_limiting::RateLimiting,
 };
 use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip};
 use serde_json::{Value, json};
@@ -1978,10 +1979,25 @@ async fn default_fallback_retains_budget_on_reload_and_marks_request_metadata() 
 #[test]
 fn the_capacity_refusal_is_attributed_from_the_decision_not_from_availability() {
     let source = include_str!("../../../src/plugins/rate_limiting.rs");
-    let body = source
+    let check_rate = source
         .split("    async fn check_rate(")
         .nth(1)
         .expect("check_rate must exist")
+        .split("\n    async fn ")
+        .next()
+        .expect("the next method ends the body");
+    assert!(
+        check_rate.contains("self.decide(key, limit_op, ctx).await"),
+        "request admission must go through the shared decision"
+    );
+    assert!(
+        !check_rate.contains("local_fallback_active()"),
+        "check_rate must use decision attribution"
+    );
+    let body = source
+        .split("    async fn decide(")
+        .nth(1)
+        .expect("decide must exist")
         .split("\n    async fn ")
         .next()
         .expect("the next method ends the body");
@@ -2459,4 +2475,336 @@ fn traffic_backend_errors_keep_plugin_context_and_withhold_policy_and_identity()
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `mcp_tool_calls`: count MCP `tools/call` requests (issue #5908)
+// ---------------------------------------------------------------------------
+
+/// A consumer-keyed tool-call limiter allowing two calls per minute.
+fn mcp_limiter(mcp_tool_calls: Value) -> RateLimiting {
+    RateLimiting::new(
+        &json!({
+            "limit_by": "consumer",
+            "expose_headers": true,
+            "limits": [{ "scope": "default", "window_seconds": 60, "max_requests": 2 }],
+            "mcp_tool_calls": mcp_tool_calls
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("valid mcp_tool_calls config")
+}
+
+fn mcp_post_raw(body: &str) -> (RequestContext, HashMap<String, String>) {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/mcp".to_string();
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    (ctx, headers)
+}
+
+fn mcp_call(id: i64, name: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": {} }
+    })
+}
+
+async fn send_raw(plugin: &RateLimiting, body: &str) -> (PluginResult, RequestContext) {
+    let (mut ctx, mut headers) = mcp_post_raw(body);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (result, ctx)
+}
+
+async fn send_mcp(plugin: &RateLimiting, body: &Value) -> (PluginResult, RequestContext) {
+    send_raw(plugin, &body.to_string()).await
+}
+
+/// The JSON-RPC refusal body and headers; the refusal rides HTTP 200.
+fn jsonrpc_refusal(result: PluginResult) -> (Value, HashMap<String, String>) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(
+                status_code, 200,
+                "a JSON-RPC refusal rides HTTP 200: {body}"
+            );
+            let body = serde_json::from_str(&body).expect("JSON-RPC refusal body");
+            (body, headers)
+        }
+        other => panic!("expected a JSON-RPC refusal, got {other:?}"),
+    }
+}
+
+fn header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str)
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_charge_only_tools_call() {
+    let plugin = mcp_limiter(json!({}));
+    for body in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+    ] {
+        for _ in 0..5 {
+            let (result, ctx) = send_mcp(&plugin, &body).await;
+            assert_continue(result);
+            assert!(
+                !ctx.metadata.contains_key("ratelimit_remaining"),
+                "an uncounted method publishes no budget: {body}"
+            );
+        }
+    }
+
+    let (result, ctx) = send_mcp(&plugin, &mcp_call(10, "pets.getPet")).await;
+    assert_continue(result);
+    assert_eq!(header(&ctx.metadata, "ratelimit_remaining"), Some("1"));
+    assert_eq!(header(&ctx.metadata, "ratelimit_mcp_tool_calls"), Some("1"));
+    let (result, _) = send_mcp(&plugin, &mcp_call(11, "pets.getPet")).await;
+    assert_continue(result);
+
+    let (result, _) = send_mcp(&plugin, &mcp_call(12, "pets.getPet")).await;
+    let (body, headers) = jsonrpc_refusal(result);
+    assert_eq!(body["jsonrpc"], json!("2.0"));
+    assert_eq!(body["id"], json!(12), "the refusal names the call: {body}");
+    assert_eq!(body["error"]["code"], json!(MCP_TOOL_CALL_RATE_LIMITED));
+    assert_eq!(
+        body["error"]["message"],
+        "MCP tool-call rate limit exceeded"
+    );
+    assert_eq!(header(&headers, "content-type"), Some("application/json"));
+    assert_eq!(header(&headers, "x-ratelimit-limit"), Some("2"));
+    assert_eq!(header(&headers, "x-ratelimit-remaining"), Some("0"));
+    assert_eq!(header(&headers, "x-ratelimit-window"), Some("60"));
+
+    // Discovery keeps working once the tool-call budget is spent.
+    let list = json!({"jsonrpc": "2.0", "id": 13, "method": "tools/list"});
+    assert_continue(send_mcp(&plugin, &list).await.0);
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_mode_leaves_the_request_phases_alone() {
+    let plugin = mcp_limiter(json!({}));
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(!plugin.is_authorize_plugin());
+    assert!(plugin.requires_request_body_before_before_proxy());
+    for _ in 0..5 {
+        let mut ctx = create_test_context();
+        assert_continue(plugin.on_request_received(&mut ctx).await);
+        assert_continue(plugin.authorize(&mut ctx).await);
+    }
+    // No HTTP-phase charge was taken: the first two tool calls still fit.
+    assert_continue(send_mcp(&plugin, &mcp_call(1, "a")).await.0);
+    assert_continue(send_mcp(&plugin, &mcp_call(2, "a")).await.0);
+
+    let request_limiter = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 2,
+        "limit_by": "consumer"
+    }));
+    assert!(!request_limiter.requires_request_body_before_before_proxy());
+    assert!(request_limiter.is_authorize_plugin());
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_count_each_batch_member_and_refuse_the_whole_batch() {
+    let plugin = mcp_limiter(json!({}));
+    let within = json!([mcp_call(1, "a"), mcp_call(2, "b")]);
+    let (result, ctx) = send_mcp(&plugin, &within).await;
+    assert_continue(result);
+    assert_eq!(header(&ctx.metadata, "ratelimit_mcp_tool_calls"), Some("2"));
+    assert_eq!(header(&ctx.metadata, "ratelimit_remaining"), Some("0"));
+    let (result, _) = send_mcp(&plugin, &mcp_call(3, "a")).await;
+    jsonrpc_refusal(result);
+
+    // Three calls against a budget of two: the third charge refuses the
+    // whole batch, and every request-form member is answered by its own id.
+    let plugin = mcp_limiter(json!({}));
+    let batch = json!([
+        mcp_call(1, "a"),
+        {"jsonrpc": "2.0", "id": "list", "method": "tools/list"},
+        mcp_call(3, "b"),
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        mcp_call(5, "c")
+    ]);
+    let (result, ctx) = send_mcp(&plugin, &batch).await;
+    assert_eq!(header(&ctx.metadata, "ratelimit_mcp_tool_calls"), Some("3"));
+    let (body, _) = jsonrpc_refusal(result);
+    let errors = body.as_array().expect("a batch refusal is an array");
+    let ids: Vec<&Value> = errors.iter().map(|error| &error["id"]).collect();
+    assert_eq!(ids, vec![&json!(1), &json!("list"), &json!(3), &json!(5)]);
+    for error in errors {
+        assert_eq!(error["error"]["code"], json!(MCP_TOOL_CALL_RATE_LIMITED));
+    }
+
+    // A refused notification-only batch is one error with `id: null`.
+    let plugin = mcp_limiter(json!({}));
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": { "name": "a" }
+    });
+    let batch = json!([notification.clone(), notification.clone(), notification]);
+    let (body, _) = jsonrpc_refusal(send_mcp(&plugin, &batch).await.0);
+    assert_eq!(body["id"], Value::Null, "{body}");
+    assert_eq!(body["error"]["code"], json!(MCP_TOOL_CALL_RATE_LIMITED));
+}
+
+#[tokio::test]
+async fn mcp_tool_call_notification_is_charged_and_unsupported_encoding_fails_closed() {
+    let plugin = mcp_limiter(json!({}));
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": { "name": "a", "arguments": {} }
+    });
+    let (result, ctx) = send_mcp(&plugin, &notification).await;
+    assert_continue(result);
+    assert_eq!(header(&ctx.metadata, "ratelimit_mcp_tool_calls"), Some("1"));
+
+    let (mut ctx, mut headers) = mcp_post_raw(&notification.to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (body, _) = jsonrpc_refusal(result);
+    assert_eq!(body["error"]["code"], json!(-32017), "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "MCP request content encoding cannot be inspected"
+    );
+    assert_eq!(
+        header(&ctx.metadata, "ratelimit_mcp_uninspectable"),
+        Some("unsupported_content_encoding")
+    );
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_can_count_listed_tools_and_keep_per_tool_budgets() {
+    let plugin = mcp_limiter(json!({"tools": ["pets.createPet"]}));
+    for id in 0..5 {
+        assert_continue(send_mcp(&plugin, &mcp_call(id, "pets.getPet")).await.0);
+    }
+    assert_continue(send_mcp(&plugin, &mcp_call(10, "pets.createPet")).await.0);
+    assert_continue(send_mcp(&plugin, &mcp_call(11, "pets.createPet")).await.0);
+    jsonrpc_refusal(send_mcp(&plugin, &mcp_call(12, "pets.createPet")).await.0);
+
+    let plugin = mcp_limiter(json!({"tools": ["a", "b"], "per_tool": true}));
+    assert_continue(send_mcp(&plugin, &mcp_call(1, "a")).await.0);
+    assert_continue(send_mcp(&plugin, &mcp_call(2, "a")).await.0);
+    jsonrpc_refusal(send_mcp(&plugin, &mcp_call(3, "a")).await.0);
+    // `b` keeps its own budget; an unlisted tool is never counted.
+    assert_continue(send_mcp(&plugin, &mcp_call(4, "b")).await.0);
+    for id in 5..10 {
+        assert_continue(send_mcp(&plugin, &mcp_call(id, "c")).await.0);
+    }
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_read_escaped_names_and_refuse_ambiguous_bodies() {
+    let plugin = mcp_limiter(json!({}));
+    let escaped = r#"{"jsonrpc":"2.0","id":1,"m\u0065thod":"tools\/call","params":{"name":"a"}}"#;
+    assert_continue(send_raw(&plugin, escaped).await.0);
+    assert_continue(send_raw(&plugin, escaped).await.0);
+    jsonrpc_refusal(send_raw(&plugin, escaped).await.0);
+
+    // Which method a server executes would depend on its JSON parser.
+    let plugin = mcp_limiter(json!({}));
+    let ambiguous = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","method":"tools/list"}"#;
+    let (result, ctx) = send_raw(&plugin, ambiguous).await;
+    let (body, _) = jsonrpc_refusal(result);
+    assert_eq!(body["error"]["code"], json!(-32600), "{body}");
+    assert_eq!(body["id"], Value::Null);
+    assert_eq!(
+        header(&ctx.metadata, "ratelimit_mcp_uninspectable"),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_scope_follows_the_mcp_gateway_media_types_and_endpoint() {
+    let plugin = mcp_limiter(json!({"endpoint_path": "/mcp"}));
+
+    // Another path on the same proxy is neither buffered nor counted.
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/pets".to_string();
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    for id in 0..5 {
+        let (mut ctx, mut headers) = mcp_post_raw(&mcp_call(id, "a").to_string());
+        ctx.path = "/pets".to_string();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+
+    // `mcp_gateway` admits a request without `Content-Type`, so it is counted.
+    ctx.path = "/mcp".to_string();
+    assert!(plugin.should_buffer_request_body(&ctx));
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/json-rpc".to_string(),
+    );
+    assert!(plugin.should_buffer_request_body(&ctx));
+    ctx.headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    ctx.method = "GET".to_string();
+    ctx.headers.remove("content-type");
+    assert!(!plugin.should_buffer_request_body(&ctx));
+
+    for id in 0..2 {
+        let (mut ctx, mut headers) = mcp_post_raw(&mcp_call(id, "a").to_string());
+        headers.remove("content-type");
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+    let (mut ctx, mut headers) = mcp_post_raw(&mcp_call(3, "a").to_string());
+    headers.remove("content-type");
+    jsonrpc_refusal(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+fn mcp_tool_calls_config(mcp_tool_calls: Value) -> Value {
+    json!({
+        "limit_by": "consumer",
+        "limits": [{ "scope": "default", "requests_per_minute": 10 }],
+        "mcp_tool_calls": mcp_tool_calls
+    })
+}
+
+fn assert_mcp_tool_calls_rejected(mcp_tool_calls: Value, expected: &str) {
+    let config = mcp_tool_calls_config(mcp_tool_calls);
+    let result = RateLimiting::new(&config, PluginHttpClient::default());
+    let Err(error) = result else {
+        panic!("{config} must be rejected");
+    };
+    assert!(error.contains(expected), "{config}: {error}");
+}
+
+#[test]
+fn mcp_tool_calls_config_is_closed_and_bounded() {
+    assert_mcp_tool_calls_rejected(json!(true), "must be an object");
+    assert_mcp_tool_calls_rejected(json!({"toolz": ["a"]}), "unknown configuration key");
+    assert_mcp_tool_calls_rejected(json!({"per_tool": true}), "requires `mcp_tool_calls");
+    assert_mcp_tool_calls_rejected(json!({"per_tool": "yes"}), "must be a boolean");
+    assert_mcp_tool_calls_rejected(json!({"tools": []}), "must name between 1 and 256");
+    assert_mcp_tool_calls_rejected(json!({"tools": "a"}), "must be an array of tool names");
+    assert_mcp_tool_calls_rejected(json!({"tools": ["a", "a"]}), "duplicates an earlier");
+    assert_mcp_tool_calls_rejected(json!({"tools": [""]}), "must be a non-empty tool name");
+    assert_mcp_tool_calls_rejected(json!({"tools": ["a\nb"]}), "must be a non-empty tool");
+    let too_many: Vec<String> = (0..257).map(|index| format!("tool-{index}")).collect();
+    assert_mcp_tool_calls_rejected(json!({ "tools": too_many }), "must name between 1 and 256");
+    let starts_with_slash = "must be a path starting with `/`";
+    assert_mcp_tool_calls_rejected(json!({"endpoint_path": "mcp"}), starts_with_slash);
+    assert_mcp_tool_calls_rejected(json!({"endpoint_path": "/mcp?x=1"}), starts_with_slash);
+
+    let config = mcp_tool_calls_config(Value::Null);
+    let plugin = RateLimiting::new(&config, PluginHttpClient::default());
+    let plugin = plugin.expect("null keeps request counting");
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }

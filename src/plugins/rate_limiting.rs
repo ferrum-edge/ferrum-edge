@@ -1,13 +1,21 @@
 //! General request rate limiting with optional Redis-backed failover.
+//!
+//! With `mcp_tool_calls` the same limiter counts MCP JSON-RPC `tools/call`
+//! requests instead of HTTP requests (issue #5908): `initialize`,
+//! `tools/list`, notifications, and every other method pass uncounted, each
+//! `tools/call` member of a batch is one charge, and a refusal is a JSON-RPC
+//! error an MCP client can surface.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::utils::mcp_jsonrpc::{self, RequestScan};
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
@@ -94,7 +102,36 @@ impl HeaderAuthority {
 }
 
 /// `rate_limiting`-specific top-level config keys (excludes shared Redis fields).
-const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &["limit_by", "expose_headers", "limits"];
+const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
+    &["limit_by", "expose_headers", "limits", "mcp_tool_calls"];
+
+/// Closed key set for the optional `mcp_tool_calls` object.
+pub const RATE_LIMITING_MCP_TOOL_CALLS_KEYS: &[&str] = &["endpoint_path", "tools", "per_tool"];
+
+/// Most tool names one `mcp_tool_calls.tools` list may name.
+pub const MAX_MCP_TOOL_CALL_TOOLS: usize = 256;
+
+/// Longest tool name `mcp_tool_calls.tools` accepts, in bytes.
+pub const MAX_MCP_TOOL_CALL_TOOL_NAME_BYTES: usize = 255;
+
+/// JSON-RPC error code of a `tools/call` refused by an exhausted tool-call
+/// budget. In the server-defined range `mcp_gateway` uses for its own
+/// gateway errors (`-32001` .. `-32014`).
+pub const MCP_TOOL_CALL_RATE_LIMITED: i64 = -32015;
+
+/// JSON-RPC error code of a `tools/call` refused because the tool-call budget
+/// cannot be enforced (`redis_failure_policy: fail_closed` during an outage).
+pub const MCP_TOOL_CALL_RATE_LIMIT_UNAVAILABLE: i64 = -32016;
+
+/// JSON-RPC error code when an in-scope POST uses a non-identity content coding
+/// the governance recognizer cannot inspect (`-32017`). This applies whether
+/// or not the body contains `tools/call`; `endpoint_path` narrows the scope.
+pub const MCP_TOOL_CALL_UNINSPECTABLE_ENCODING: i64 = -32017;
+
+const MCP_TOOL_CALL_RATE_LIMITED_MESSAGE: &str = "MCP tool-call rate limit exceeded";
+const MCP_TOOL_CALL_RATE_LIMIT_UNAVAILABLE_MESSAGE: &str = "MCP tool-call rate limit unavailable";
+const MCP_TOOL_CALL_UNINSPECTABLE_ENCODING_MESSAGE: &str =
+    "MCP request content encoding cannot be inspected";
 
 /// Closed top-level key set for `rate_limiting` plugin config.
 ///
@@ -109,6 +146,7 @@ pub const RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "limit_by",
     "expose_headers",
     "limits",
+    "mcp_tool_calls",
     // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
@@ -143,9 +181,76 @@ impl LimitBy {
     }
 }
 
+/// `mcp_tool_calls`: count MCP `tools/call` requests instead of HTTP requests.
+struct McpToolCallCounting {
+    /// Only requests to exactly this path are inspected (and buffered).
+    endpoint_path: Option<String>,
+    /// Only calls naming one of these public tool names are counted.
+    tools: Option<HashSet<String>>,
+    /// Keep one budget per counted tool instead of one for every call.
+    per_tool: bool,
+}
+
+impl McpToolCallCounting {
+    /// Whether this request is in scope: an MCP JSON-RPC exchange is a `POST`.
+    fn applies_to(&self, ctx: &RequestContext) -> bool {
+        ctx.method.eq_ignore_ascii_case("POST")
+            && self
+                .endpoint_path
+                .as_deref()
+                .is_none_or(|path| ctx.path == path)
+    }
+
+    /// Whether a call naming `name` is counted.
+    fn counts(&self, name: Option<&str>) -> bool {
+        match &self.tools {
+            None => true,
+            Some(tools) => name.is_some_and(|name| tools.contains(name)),
+        }
+    }
+}
+
+/// What one request asks an `mcp_tool_calls` limiter to do. Decided from the
+/// request body before any charge, so nothing borrowed from the body outlives
+/// the decision.
+enum McpToolCallPlan {
+    /// No counted `tools/call`: the request passes uncounted.
+    Skip,
+    /// The body may call a tool but cannot be counted faithfully.
+    Refuse,
+    /// One charge per entry, in wire order. `Some(name)` charges that tool's
+    /// own budget (`per_tool`).
+    Charge {
+        charges: Vec<Option<String>>,
+        replies: McpReplyShape,
+    },
+}
+
+/// How a JSON-RPC refusal answers the request: one error per request-form
+/// member, correlated by the id token the client sent.
+#[derive(Default)]
+struct McpReplyShape {
+    batch: bool,
+    /// The id of each request-form member, in wire order. `None` answers
+    /// `id: null` (an id past the reflected-id bound).
+    ids: Vec<Option<Box<RawValue>>>,
+}
+
+/// One admission decision, before it is rendered for HTTP or JSON-RPC.
+enum RateVerdict {
+    Admitted,
+    /// A previously unseen key refused at the state-capacity bound. Carries no
+    /// budget of its own.
+    Capacity,
+    /// Refused by a window (or because enforcement is unavailable).
+    Refused(RateLimitOutcome),
+}
+
 pub struct RateLimiting {
     limit_by: LimitBy,
     expose_headers: bool,
+    /// `Some` when this instance counts MCP `tools/call` requests.
+    mcp_tool_calls: Option<McpToolCallCounting>,
     default_limit: DynamicRateLimitOp,
     consumer_overrides: HashMap<String, DynamicRateLimitOp>,
     limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
@@ -221,6 +326,7 @@ impl RateLimiting {
         let expose_headers = parse_optional_bool(object, "expose_headers")?.unwrap_or(false);
 
         let parsed_limits = parse_limits(object)?;
+        let mcp_tool_calls = parse_mcp_tool_calls(object)?;
         if !parsed_limits.consumer_overrides.is_empty() && limit_by != LimitBy::Consumer {
             return Err(
                 "rate_limiting: consumer-scoped limits can only be used with `limit_by=consumer`"
@@ -242,6 +348,20 @@ impl RateLimiting {
                 .iter()
                 .map(|(consumer, limit)| (consumer.as_str(), limit.specs())),
         );
+        // What is counted is enforcement semantics too: a request counter and
+        // a tool-call counter must never share a live budget. Nothing is added
+        // for an ordinary request limiter, so its existing budgets survive.
+        if let Some(mcp) = mcp_tool_calls.as_ref() {
+            semantics.text("count", "mcp_tool_calls");
+            semantics.text(
+                "mcp_endpoint_path",
+                mcp.endpoint_path.as_deref().unwrap_or(""),
+            );
+            let mut tools: Vec<&str> = mcp.tools.iter().flatten().map(String::as_str).collect();
+            tools.sort_unstable();
+            semantics.text("mcp_tools", &tools.join("\n"));
+            semantics.text("mcp_per_tool", if mcp.per_tool { "true" } else { "false" });
+        }
 
         let limiter = RateLimitBackend::from_plugin_config_with_policy_identity(
             "rate_limiting",
@@ -257,6 +377,7 @@ impl RateLimiting {
         Ok(Self {
             limit_by,
             expose_headers,
+            mcp_tool_calls,
             default_limit: parsed_limits.default_limit,
             consumer_overrides: parsed_limits.consumer_overrides,
             limiter,
@@ -557,6 +678,16 @@ impl RateLimiting {
             };
         }
 
+        PluginResult::Reject {
+            status_code: 429,
+            body: r#"{"error":"Rate limit exceeded"}"#.into(),
+            headers: self.refusal_headers(outcome),
+        }
+    }
+
+    /// The `x-ratelimit-*` headers a quota refusal carries (none unless
+    /// `expose_headers`).
+    fn refusal_headers(&self, outcome: &RateLimitOutcome) -> HashMap<String, String> {
         let mut headers = HashMap::with_capacity(3);
         if self.expose_headers {
             if let Some(limit) = outcome.limit {
@@ -567,12 +698,7 @@ impl RateLimiting {
                 headers.insert("x-ratelimit-window".to_string(), window.to_string());
             }
         }
-
-        PluginResult::Reject {
-            status_code: 429,
-            body: r#"{"error":"Rate limit exceeded"}"#.into(),
-            headers,
-        }
+        headers
     }
 
     fn store_metadata(&self, outcome: &RateLimitOutcome, ctx: &mut RequestContext) {
@@ -688,6 +814,22 @@ impl RateLimiting {
         limit_op: &DynamicRateLimitOp,
         ctx: &mut RequestContext,
     ) -> PluginResult {
+        match self.decide(key, limit_op, ctx).await {
+            RateVerdict::Admitted => PluginResult::Continue,
+            RateVerdict::Capacity => self.reject_capacity(),
+            RateVerdict::Refused(outcome) => self.reject(&outcome),
+        }
+    }
+
+    /// Charge one unit against `key` and record the decision's telemetry and
+    /// metrics. Rendering the refusal is the caller's: an HTTP request limiter
+    /// answers `429` / `503`, an `mcp_tool_calls` limiter a JSON-RPC error.
+    async fn decide(
+        &self,
+        key: String,
+        limit_op: &DynamicRateLimitOp,
+        ctx: &mut RequestContext,
+    ) -> RateVerdict {
         // Run sampled idle reclamation before admission. Capacity denial must
         // still advance the cleanup schedule; otherwise an exactly-full map of
         // expired keys could remain pinned closed when only new identities
@@ -719,7 +861,7 @@ impl RateLimiting {
             if decision.local_fallback {
                 self.mark_local_fallback(ctx);
             }
-            return self.reject_capacity();
+            return RateVerdict::Capacity;
         };
         if outcome.local_fallback {
             self.mark_local_fallback(ctx);
@@ -735,7 +877,7 @@ impl RateLimiting {
                 // bounded counter is the per-request operational signal.
                 super::prometheus_metrics::global_registry()
                     .record_rate_limit_enforcement_unavailable();
-                return self.reject(&outcome);
+                return RateVerdict::Refused(outcome);
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             // The rate-limit key embeds the identity dimension (consumer
@@ -743,10 +885,151 @@ impl RateLimiting {
             // is never logged. Enforcement outcomes are attributed through the
             // transaction summary, which applies metadata redaction.
             warn_sampled!(plugin = "rate_limiting", "Rate limit exceeded");
-            return self.reject(&outcome);
+            return RateVerdict::Refused(outcome);
         }
 
         self.store_metadata(&outcome, ctx);
+        RateVerdict::Admitted
+    }
+
+    /// Decide what an `mcp_tool_calls` limiter charges for `body`.
+    ///
+    /// Only `tools/call` members are counted — `initialize`, `tools/list`,
+    /// notifications, and every other method pass uncounted — and a batch is
+    /// one charge per counted `tools/call` member. Recognition is shared with
+    /// `mcp_gateway` and the other AI governance plugins
+    /// ([`mcp_jsonrpc::scan_request_bytes`]), so escaped member names count and
+    /// an ambiguous or over-bound batch is refused rather than read one way
+    /// here and another way downstream.
+    fn mcp_tool_call_plan(&self, mcp: &McpToolCallCounting, body: &[u8]) -> McpToolCallPlan {
+        let (batch, members) = match mcp_jsonrpc::scan_request_bytes(body) {
+            RequestScan::NoToolCall => return McpToolCallPlan::Skip,
+            RequestScan::Uninspectable(_) => return McpToolCallPlan::Refuse,
+            RequestScan::ToolCalls { batch, members } => (batch, members),
+        };
+        let charges: Vec<Option<String>> = members
+            .iter()
+            .filter_map(|member| member.tool_call.as_ref())
+            .filter(|call| mcp.counts(call.name.as_deref()))
+            .map(|call| call.name.clone().filter(|_| mcp.per_tool))
+            .collect();
+        if charges.is_empty() {
+            return McpToolCallPlan::Skip;
+        }
+        let ids = members
+            .iter()
+            .filter_map(|member| member.id)
+            .map(|id| {
+                (id.get().len() <= mcp_jsonrpc::MAX_REFLECTED_ID_BYTES).then(|| id.to_owned())
+            })
+            .collect();
+        McpToolCallPlan::Charge {
+            charges,
+            replies: McpReplyShape { batch, ids },
+        }
+    }
+
+    /// Count this request's `tools/call` members against the tool-call budget.
+    ///
+    /// Charges are taken in wire order and the first refused charge refuses
+    /// the whole request (a JSON-RPC batch is one HTTP exchange and cannot be
+    /// forwarded in part). Charges admitted before that refusal stay charged:
+    /// a batch that crosses the budget boundary consumes what was left of it,
+    /// which is the conservative direction.
+    async fn check_mcp_tool_calls(
+        &self,
+        mcp: &McpToolCallCounting,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        // `mcp_gateway` admits JSON (`application/json`, `application/json-rpc`,
+        // `+json`) and a request with no `Content-Type` at all, so the counter
+        // must see exactly that set: a narrower one would let a client omit
+        // the header and call tools uncounted.
+        if !mcp.applies_to(ctx)
+            || headers
+                .get("content-type")
+                .is_some_and(|value| !mcp_jsonrpc::content_type_is_json(value))
+        {
+            return PluginResult::Continue;
+        }
+        if headers.get("content-encoding").is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+        }) {
+            ctx.metadata.insert(
+                "ratelimit_mcp_uninspectable".to_string(),
+                "unsupported_content_encoding".to_string(),
+            );
+            return mcp_jsonrpc_refusal(
+                &McpReplyShape::default(),
+                MCP_TOOL_CALL_UNINSPECTABLE_ENCODING,
+                MCP_TOOL_CALL_UNINSPECTABLE_ENCODING_MESSAGE,
+                HashMap::new(),
+            );
+        }
+        let plan = match mcp_request_body(ctx) {
+            Some(body) => self.mcp_tool_call_plan(mcp, body),
+            None => McpToolCallPlan::Skip,
+        };
+        let (charges, replies) = match plan {
+            McpToolCallPlan::Skip => return PluginResult::Continue,
+            McpToolCallPlan::Refuse => {
+                ctx.metadata.insert(
+                    "ratelimit_mcp_uninspectable".to_string(),
+                    "true".to_string(),
+                );
+                return mcp_jsonrpc_refusal(
+                    &McpReplyShape::default(),
+                    -32600,
+                    "Invalid MCP JSON-RPC request",
+                    HashMap::new(),
+                );
+            }
+            McpToolCallPlan::Charge { charges, replies } => (charges, replies),
+        };
+        ctx.metadata.insert(
+            "ratelimit_mcp_tool_calls".to_string(),
+            charges.len().to_string(),
+        );
+        let base_key = self.request_key(ctx);
+        let limit_op = self.request_limit_op(ctx);
+        for tool in &charges {
+            let key = match tool {
+                Some(name) => per_tool_key(name, &base_key),
+                None => base_key.clone(),
+            };
+            match self.decide(key, limit_op, ctx).await {
+                RateVerdict::Admitted => {}
+                RateVerdict::Capacity => {
+                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+                    return mcp_jsonrpc_refusal(
+                        &replies,
+                        MCP_TOOL_CALL_RATE_LIMITED,
+                        MCP_TOOL_CALL_RATE_LIMITED_MESSAGE,
+                        HashMap::new(),
+                    );
+                }
+                RateVerdict::Refused(outcome) if outcome.enforcement_unavailable => {
+                    return mcp_jsonrpc_refusal(
+                        &replies,
+                        MCP_TOOL_CALL_RATE_LIMIT_UNAVAILABLE,
+                        MCP_TOOL_CALL_RATE_LIMIT_UNAVAILABLE_MESSAGE,
+                        HashMap::new(),
+                    );
+                }
+                RateVerdict::Refused(outcome) => {
+                    return mcp_jsonrpc_refusal(
+                        &replies,
+                        MCP_TOOL_CALL_RATE_LIMITED,
+                        MCP_TOOL_CALL_RATE_LIMITED_MESSAGE,
+                        self.refusal_headers(&outcome),
+                    );
+                }
+            }
+        }
         PluginResult::Continue
     }
 
@@ -817,11 +1100,35 @@ impl Plugin for RateLimiting {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::ALL_PROTOCOLS
+        // `tools/call` is an HTTP JSON-RPC exchange; a tool-call limiter has
+        // nothing to count on a stream, WebSocket, or gRPC request.
+        if self.mcp_tool_calls.is_some() {
+            super::HTTP_ONLY_PROTOCOLS
+        } else {
+            super::ALL_PROTOCOLS
+        }
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.limiter.tracked_keys_count())
+    }
+
+    /// A tool-call limiter reads the buffered JSON-RPC body in `before_proxy`.
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.mcp_tool_calls.is_some()
+    }
+
+    /// Only an in-scope MCP `POST` is buffered: JSON (the media types
+    /// `mcp_gateway` admits) or no `Content-Type` at all, and only on
+    /// `mcp_tool_calls.endpoint_path` when one is configured.
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.mcp_tool_calls.as_ref().is_some_and(|mcp| {
+            mcp.applies_to(ctx)
+                && ctx
+                    .headers
+                    .get("content-type")
+                    .is_none_or(|value| mcp_jsonrpc::content_type_is_json(value))
+        })
     }
 
     fn modifies_request_headers(&self) -> bool {
@@ -836,13 +1143,18 @@ impl Plugin for RateLimiting {
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
+        if self.mcp_tool_calls.is_some() {
+            return PluginResult::Continue;
+        }
         let key = self.stream_key(ctx);
         let limit_op = self.stream_limit_op(ctx);
         self.check_rate_stream(key, limit_op, ctx).await
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        if self.limit_by != LimitBy::Ip {
+        // A tool-call limiter charges `tools/call` members in `before_proxy`,
+        // once the JSON-RPC body is buffered, never the HTTP request itself.
+        if self.mcp_tool_calls.is_some() || self.limit_by != LimitBy::Ip {
             return PluginResult::Continue;
         }
 
@@ -852,7 +1164,9 @@ impl Plugin for RateLimiting {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        if !matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity) {
+        if self.mcp_tool_calls.is_some()
+            || !matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
+        {
             return PluginResult::Continue;
         }
 
@@ -862,7 +1176,8 @@ impl Plugin for RateLimiting {
     }
 
     fn is_authorize_plugin(&self) -> bool {
-        matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
+        self.mcp_tool_calls.is_none()
+            && matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
     }
 
     /// Never reusable, in any `limit_by` mode (issue #5583). A limit is a
@@ -891,6 +1206,12 @@ impl Plugin for RateLimiting {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if let Some(mcp) = self.mcp_tool_calls.as_ref() {
+            let verdict = self.check_mcp_tool_calls(mcp, ctx, headers).await;
+            if !matches!(verdict, PluginResult::Continue) {
+                return verdict;
+            }
+        }
         remove_rate_limit_identity_header(headers);
         if !self.expose_headers {
             return PluginResult::Continue;
@@ -947,6 +1268,154 @@ impl Plugin for RateLimiting {
         } else {
             super::ResponseTrailerPolicy::None
         }
+    }
+}
+
+/// Parse the optional `mcp_tool_calls` object.
+fn parse_mcp_tool_calls(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<McpToolCallCounting>, String> {
+    let config = match object.get("mcp_tool_calls") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(config)) => config,
+        Some(_) => return Err("rate_limiting: `mcp_tool_calls` must be an object".to_string()),
+    };
+    reject_unknown_keys(
+        config,
+        "config.mcp_tool_calls",
+        RATE_LIMITING_MCP_TOOL_CALLS_KEYS,
+        "rate_limiting: `mcp_tool_calls`: ",
+    )?;
+    let endpoint_path = match config.get("endpoint_path") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) if valid_mcp_endpoint_path(path) => Some(path.clone()),
+        Some(_) => {
+            return Err(
+                "rate_limiting: `mcp_tool_calls.endpoint_path` must be a path starting with `/`, without a query, fragment, or control character"
+                    .to_string(),
+            );
+        }
+    };
+    let tools = match config.get("tools") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(entries)) => {
+            if entries.is_empty() || entries.len() > MAX_MCP_TOOL_CALL_TOOLS {
+                return Err(format!(
+                    "rate_limiting: `mcp_tool_calls.tools` must name between 1 and {MAX_MCP_TOOL_CALL_TOOLS} tools"
+                ));
+            }
+            let mut tools = HashSet::with_capacity(entries.len());
+            for (idx, entry) in entries.iter().enumerate() {
+                let Some(name) = entry.as_str().filter(|name| valid_mcp_tool_name(name)) else {
+                    return Err(format!(
+                        "rate_limiting: `mcp_tool_calls.tools[{idx}]` must be a non-empty tool name of at most {MAX_MCP_TOOL_CALL_TOOL_NAME_BYTES} bytes without control characters"
+                    ));
+                };
+                if !tools.insert(name.to_string()) {
+                    return Err(format!(
+                        "rate_limiting: `mcp_tool_calls.tools[{idx}]` duplicates an earlier entry"
+                    ));
+                }
+            }
+            Some(tools)
+        }
+        Some(_) => {
+            return Err(
+                "rate_limiting: `mcp_tool_calls.tools` must be an array of tool names".to_string(),
+            );
+        }
+    };
+    let per_tool = match config.get("per_tool") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(per_tool)) => *per_tool,
+        Some(_) => {
+            return Err("rate_limiting: `mcp_tool_calls.per_tool` must be a boolean".to_string());
+        }
+    };
+    if per_tool && tools.is_none() {
+        return Err(
+            "rate_limiting: `mcp_tool_calls.per_tool` requires `mcp_tool_calls.tools`: a per-tool budget is kept only for configured tool names, so a caller cannot mint limiter state with invented names"
+                .to_string(),
+        );
+    }
+    Ok(Some(McpToolCallCounting {
+        endpoint_path,
+        tools,
+        per_tool,
+    }))
+}
+
+/// An `mcp_tool_calls.endpoint_path` is compared with the request path, so it
+/// is a path: no query, fragment, or control character.
+fn valid_mcp_endpoint_path(path: &str) -> bool {
+    path.starts_with('/') && !path.contains(['?', '#']) && !path.chars().any(char::is_control)
+}
+
+fn valid_mcp_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_MCP_TOOL_CALL_TOOL_NAME_BYTES
+        && !name.chars().any(char::is_control)
+}
+
+/// The buffered request body, read exactly as `mcp_gateway` reads it.
+fn mcp_request_body(ctx: &RequestContext) -> Option<&[u8]> {
+    ctx.request_body_bytes
+        .as_ref()
+        .map(|body| body.as_ref())
+        .or_else(|| ctx.metadata.get("request_body").map(|body| body.as_bytes()))
+}
+
+/// The key of one tool's own budget for the caller keyed `base_key`.
+///
+/// The tool name is length-prefixed, so no identity text can make one
+/// caller's per-tool key equal another caller's: every such key starts with
+/// `tool:<len>:`, which no `ip:` / `consumer:` / `spiffe:` key does.
+fn per_tool_key(tool: &str, base_key: &str) -> String {
+    let length = tool.len().to_string();
+    let mut key = String::with_capacity(7 + length.len() + tool.len() + base_key.len());
+    key.push_str("tool:");
+    key.push_str(&length);
+    key.push(':');
+    key.push_str(tool);
+    key.push('|');
+    key.push_str(base_key);
+    key
+}
+
+/// A JSON-RPC error answering every request-form member of a refused MCP
+/// request, on HTTP `200`.
+///
+/// HTTP `200` is deliberate and matches `mcp_gateway`, which answers every
+/// JSON-RPC error on `200`: the MCP streamable HTTP clients resolve the
+/// pending request from a JSON-RPC error body on a 2xx response and surface
+/// its code and message, while a non-2xx POST response is raised as a
+/// transport failure that loses both. The `x-ratelimit-*` headers still carry
+/// the budget. A batch is answered with one error per request-form member
+/// (notifications get none); a refusal with no request-form member at all is
+/// one error with `id: null`, as `mcp_gateway` answers a blocked
+/// notification-only batch. `message` is a compiled-in literal and every id is
+/// the member's own already-parsed JSON token, so nothing is re-escaped.
+fn mcp_jsonrpc_refusal(
+    replies: &McpReplyShape,
+    code: i64,
+    message: &'static str,
+    mut headers: HashMap<String, String>,
+) -> PluginResult {
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let member = |id: Option<&RawValue>| {
+        let id = id.map_or("null", RawValue::get);
+        format!(r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":{code},"message":"{message}"}}}}"#)
+    };
+    let body = if replies.batch && !replies.ids.is_empty() {
+        let members: Vec<String> = replies.ids.iter().map(|id| member(id.as_deref())).collect();
+        format!("[{}]", members.join(","))
+    } else {
+        member(replies.ids.first().and_then(|id| id.as_deref()))
+    };
+    PluginResult::Reject {
+        status_code: 200,
+        body,
+        headers,
     }
 }
 

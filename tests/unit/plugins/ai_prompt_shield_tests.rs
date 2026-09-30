@@ -4135,3 +4135,351 @@ async fn configured_decompression_redacts_compressed_requests_instead_of_refusin
         );
     }
 }
+
+// ─── MCP tool arguments (`scan_fields: mcp_arguments`, issue #5908) ─────
+
+fn mcp_shield(action: &str) -> AiPromptShield {
+    AiPromptShield::new(&json!({
+        "action": action,
+        "scan_fields": "mcp_arguments",
+        "patterns": ["ssn", "email"]
+    }))
+    .unwrap()
+}
+
+fn mcp_tool_call(id: i64, arguments: serde_json::Value) -> serde_json::Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": "crm.lookup", "arguments": arguments }
+    })
+}
+
+fn shield_metadata<'a>(
+    ctx: &'a ferrum_edge::plugins::RequestContext,
+    key: &str,
+) -> Option<&'a str> {
+    ctx.metadata.get(key).map(String::as_str)
+}
+
+#[test]
+fn mcp_arguments_is_an_accepted_scan_mode() {
+    assert!(AiPromptShield::new(&json!({"scan_fields": "mcp_arguments"})).is_ok());
+    let error = AiPromptShield::new(&json!({"scan_fields": "arguments"}))
+        .err()
+        .expect("unknown scan mode");
+    assert!(error.contains("`mcp_arguments`"), "{error}");
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_rejects_pii_in_tool_arguments() {
+    let plugin = mcp_shield("reject");
+    let body = mcp_tool_call(1, json!({"query": {"ssn": "123-45-6789"}}));
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), Some("ssn"));
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_scans_only_tool_call_arguments() {
+    let plugin = mcp_shield("reject");
+    for body in [
+        // The tool name and the rest of the envelope are not tool input.
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "alice@example.com", "arguments": {"q": "weather"} }
+        }),
+        // Another method's params are not scanned.
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/list",
+            "params": { "arguments": {"email": "alice@example.com"} }
+        }),
+        // An LLM prompt is out of scope for this mode.
+        ai_request("my ssn is 123-45-6789"),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_scans_every_batch_member() {
+    let plugin = mcp_shield("reject");
+    let clean = json!([
+        mcp_tool_call(1, json!({"q": "weather"})),
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+    ]);
+    let mut ctx = make_post_ctx(&clean);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let dirty = json!([
+        mcp_tool_call(1, json!({"q": "weather"})),
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        mcp_tool_call(3, json!({"contact": ["mail alice@example.com"]}))
+    ]);
+    let mut ctx = make_post_ctx(&dirty);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), Some("email"));
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_follows_the_mcp_gateway_media_types() {
+    let plugin = mcp_shield("reject");
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "no Content-Type is an MCP request mcp_gateway admits"
+    );
+    for (content_type, expected) in [
+        ("application/json-rpc", true),
+        ("application/vnd.mcp+json", true),
+        ("text/plain", false),
+        ("application/grpc-web+json", true),
+    ] {
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        assert_eq!(
+            plugin.should_buffer_request_body(&ctx),
+            expected,
+            "{content_type}"
+        );
+    }
+    // The other modes keep their JSON-only scope.
+    ctx.headers.remove("content-type");
+    let content = AiPromptShield::new(&json!({})).unwrap();
+    assert!(!content.should_buffer_request_body(&ctx));
+
+    // A tool call sent without the header is still scanned.
+    let body = mcp_tool_call(4, json!({"ssn": "123-45-6789"}));
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    let body = mcp_tool_call(5, json!({"ssn": "123-45-6789"}));
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web+json".to_string(),
+    )]);
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_refuses_duplicate_member_names() {
+    let body = concat!(
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"crm.lookup","#,
+        r#""arguments":{"q":"123-45-6789"},"arguments":{"q":"x"}}}"#
+    );
+    let plugin = mcp_shield("reject");
+    let mut ctx = make_post_ctx_with_raw_body(body);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("ambiguous_json")
+    );
+
+    let plugin = mcp_shield("warn");
+    let mut ctx = make_post_ctx_with_raw_body(body);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_warnings"),
+        Some("ambiguous_json")
+    );
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_redacts_arguments_in_place() {
+    let plugin = mcp_shield("redact");
+    let body = mcp_tool_call(6, json!({"note": "mail alice@example.com", "count": 2}));
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(shield_metadata(&ctx, "ai_shield_redacted"), Some("email"));
+    assert_eq!(
+        ctx.request_body_bytes.as_deref(),
+        ctx.metadata.get("request_body").map(String::as_bytes),
+        "downstream MCP parsing must see the same redacted JSON bytes"
+    );
+    let staged = shield_metadata(&ctx, "request_body").expect("staged body");
+    let staged: serde_json::Value = serde_json::from_str(staged).unwrap();
+    assert_eq!(
+        staged["params"]["arguments"]["note"],
+        "mail [REDACTED:email]"
+    );
+    assert_eq!(staged["params"]["arguments"]["count"], 2);
+    assert_eq!(staged["params"]["name"], "crm.lookup");
+    assert_eq!(staged["id"], 6);
+
+    let wire = serde_json::to_vec(&body).unwrap();
+    let rewritten = plugin
+        .transform_request_body_with_context(&mut ctx, &wire, Some("application/json"), &headers)
+        .await
+        .expect("the wire body is redacted");
+    let rewritten_json: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(rewritten_json, staged);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &rewritten)
+            .await,
+    );
+
+    // PII carried in an argument NAME cannot be rewritten: fail closed.
+    let body = mcp_tool_call(7, json!({"alice@example.com": "hello"}));
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_inspects_lowercase_post_and_rejects_uninspectable_encoding() {
+    let plugin = mcp_shield("reject");
+    let body = mcp_tool_call(8, json!({"ssn": "123-45-6789"}));
+    let mut ctx = make_post_ctx(&body);
+    ctx.method = "post".to_string();
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("unsupported_content_encoding")
+    );
+}
+
+#[tokio::test]
+async fn mcp_redaction_refuses_numeric_ids_that_cannot_round_trip() {
+    let plugin = mcp_shield("redact");
+    for id in ["18446744073709551616", "1e3"] {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"crm.lookup","arguments":{{"ssn":"123-45-6789"}}}}}}"#
+        );
+        let mut ctx = make_post_ctx_with_raw_body(&body);
+        let mut headers = make_post_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_rejected"),
+            Some("jsonrpc_id_not_round_trippable")
+        );
+        assert!(
+            !shield_metadata(&ctx, "request_body")
+                .unwrap_or_default()
+                .contains("REDACTED"),
+            "a changed id token must not accompany a partial rewrite"
+        );
+    }
+
+    let body = r##"{
+        "jsonrpc":"2.0",
+        "id":1e3,
+        "method":"tools/call",
+        "params":{"name":"crm.lookup","arguments":{"ssn":"123-45-6789"}}
+    }"##;
+    let mut transform_headers = make_post_headers();
+    transform_headers.insert(":method".to_string(), "POST".to_string());
+    assert!(
+        plugin
+            .transform_request_body(
+                body.as_bytes(),
+                Some("application/json"),
+                &transform_headers,
+            )
+            .await
+            .is_none(),
+        "an id refusal must never emit a rewritten or original document"
+    );
+
+    // Control: the same body with an id that round-trips is rewritten.
+    let control = body.replace("\"id\":1e3", "\"id\":7");
+    assert!(
+        plugin
+            .transform_request_body(
+                control.as_bytes(),
+                Some("application/json"),
+                &transform_headers,
+            )
+            .await
+            .is_some(),
+        "a round-trippable id still gets its redacted document"
+    );
+}
+
+#[tokio::test]
+async fn mcp_redaction_refuses_over_limit_batches_as_uninspectable() {
+    let mut members = vec![mcp_tool_call(1, json!({"ssn": "123-45-6789"})).to_string()];
+    members.extend((2..=33).map(|id| mcp_tool_call(id, json!({"q": "safe"})).to_string()));
+    let body = format!("[{}]", members.join(","));
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "scan_fields": "mcp_arguments",
+        "patterns": ["ssn", "email"],
+        "max_scan_bytes": 400_000
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx_with_raw_body(&body);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("jsonrpc_request_uninspectable")
+    );
+}
+
+#[tokio::test]
+async fn mcp_redaction_refuses_progress_tokens_that_would_change_on_serialize() {
+    let plugin = mcp_shield("redact");
+    let body = r##"{
+        "jsonrpc":"2.0",
+        "id":7,
+        "method":"tools/call",
+        "params":{
+            "_meta":{"progressToken":1e3},
+            "name":"crm.lookup",
+            "arguments":{"ssn":"123-45-6789"}
+        }
+    }"##;
+    let mut ctx = make_post_ctx_with_raw_body(body);
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("jsonrpc_progress_token_not_round_trippable")
+    );
+    assert!(
+        !shield_metadata(&ctx, "request_body")
+            .unwrap_or_default()
+            .contains("REDACTED"),
+        "a changed progress token must not accompany a partial rewrite"
+    );
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_rechecks_the_final_request_body() {
+    let plugin = mcp_shield("reject");
+    let clean = mcp_tool_call(8, json!({"q": "weather"}));
+    let mut ctx = make_post_ctx(&clean);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    // A later transform put PII into the backend-visible arguments.
+    let dirty = serde_json::to_vec(&mcp_tool_call(8, json!({"q": "123-45-6789"}))).unwrap();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &dirty)
+            .await,
+        Some(400),
+    );
+}

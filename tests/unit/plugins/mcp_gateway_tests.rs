@@ -13502,6 +13502,150 @@ async fn aggregate_final_body_refuses_method_argument_and_destination_drift() {
     );
 }
 
+/// An aggregate gateway over [`start_mcp_catalog_server`] that allows every
+/// tool by policy, with `discovery.on_new_tool` left at its default when
+/// `on_new_tool` is `None`.
+fn allow_all_aggregate_plugin(
+    server: &MockServer,
+    on_new_tool: Option<&str>,
+) -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["policy"] = json!({ "default_action": "allow" });
+    match on_new_tool {
+        Some(behavior) => config["discovery"] = json!({ "on_new_tool": behavior }),
+        None => {
+            config.as_object_mut().unwrap().remove("discovery");
+        }
+    }
+    create_plugin("mcp_gateway", &config).unwrap().unwrap()
+}
+
+/// `discovery.on_new_tool` defaults to `hide_until_configured`, whatever the
+/// policy's `default_action`: a tool the upstream newly advertises and no
+/// `policy.tools` entry names is neither listed nor callable, and its
+/// `tools/call` is denied `-32001` by gateway policy before any argument is
+/// looked at. Only `on_new_tool: allow` (or configuring the tool) admits it.
+#[tokio::test]
+async fn aggregate_default_discovery_denies_calls_to_unconfigured_new_tools() {
+    let server = start_mcp_catalog_server().await;
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 70,
+        "method": "tools/call",
+        "params": { "name": "github.merge_pr", "arguments": {} }
+    });
+
+    let plugin = allow_all_aggregate_plugin(&server, None);
+    let session_id = initialize(&plugin).await;
+    let names = aggregate_tool_names(&plugin, &session_id, 71).await;
+    assert!(
+        names.is_empty(),
+        "new tools stay hidden by default: {names:?}"
+    );
+    let (mut ctx, mut headers) = mcp_ctx(call.clone());
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(70), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+    assert_eq!(
+        body["error"]["message"], "MCP tool call denied by gateway policy",
+        "{body}"
+    );
+
+    let plugin = allow_all_aggregate_plugin(&server, Some("allow"));
+    let session_id = initialize(&plugin).await;
+    let names = aggregate_tool_names(&plugin, &session_id, 72).await;
+    assert!(
+        names.iter().any(|name| name == "github.merge_pr"),
+        "{names:?}"
+    );
+    let (mut ctx, mut headers) = mcp_ctx(call);
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let routed = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(routed, PluginResult::Continue), "{routed:?}");
+}
+
+/// A redacting `ai_prompt_shield` (`scan_fields: mcp_arguments`) runs before
+/// `mcp_gateway` and rewrites the buffered body views, so the gateway admits
+/// the redacted arguments, forwards exactly them, and accepts them at its
+/// final request-body check. A later plugin that changes the admitted
+/// arguments is still refused.
+#[tokio::test]
+async fn aggregate_admits_and_forwards_shield_redacted_arguments() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = allow_all_aggregate_plugin(&server, Some("allow"));
+    let shield_config = json!({
+        "action": "redact",
+        "scan_fields": "mcp_arguments",
+        "patterns": ["email"]
+    });
+    let shield = create_plugin("ai_prompt_shield", &shield_config)
+        .unwrap()
+        .unwrap();
+    assert!(shield.priority() < plugin.priority());
+    let session_id = initialize(&plugin).await;
+    let restore = body_transformer(json!([{
+        "operation": "update",
+        "target": "body",
+        "key": "params.arguments.contact",
+        "value": "alice@example.com"
+    }]));
+
+    for (request_id, later) in [(73, None), (74, Some(&restore))] {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "github.merge_pr",
+                "arguments": { "contact": "alice@example.com" }
+            }
+        });
+        let (mut ctx, mut headers) = mcp_ctx(request.clone());
+        headers.insert("mcp-session-id".to_string(), session_id.clone());
+        let shielded = shield.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(shielded, PluginResult::Continue), "{shielded:?}");
+        assert!(ctx.metadata.contains_key("ai_shield_redacted"));
+        let admitted = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(admitted, PluginResult::Continue),
+            "the shield-redacted call must be admitted: {admitted:?}"
+        );
+        let mut body = serde_json::to_vec(&request).unwrap();
+        for stage in [&shield, &plugin].into_iter().chain(later) {
+            let transformed = stage
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &headers,
+                )
+                .await;
+            if let Some(rewritten) = transformed {
+                body = rewritten;
+            }
+        }
+        let forwarded: Value = serde_json::from_slice(&body).unwrap();
+        let verdicts = final_body_verdicts(&plugin, &mut ctx, &headers, &body).await;
+        if later.is_some() {
+            assert_eq!(
+                forwarded["params"]["arguments"]["contact"], "alice@example.com",
+                "{forwarded}"
+            );
+            assert_admission_drift_refused(verdicts, request_id, "arguments restored");
+            continue;
+        }
+        assert_eq!(forwarded["params"]["name"], "merge_pr", "{forwarded}");
+        assert_eq!(
+            forwarded["params"]["arguments"],
+            json!({ "contact": "[REDACTED:email]" }),
+            "{forwarded}"
+        );
+        assert_admission_holds(verdicts, "shield-redacted arguments");
+    }
+}
+
 #[tokio::test]
 async fn aggregate_final_body_refuses_prompt_and_resource_target_drift() {
     let (_server, plugin) = aggregate_plugin_with_catalog().await;
@@ -15872,11 +16016,17 @@ async fn openapi_bridge_calls_obey_the_route_allowed_methods() {
     let (status, body, _) = reject_json(result);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!(140), "{body}");
-    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32003), "{body}");
+    assert_eq!(body["error"]["message"], "Unknown MCP tool", "{body}");
     assert!(!mcp_bridge_is_claimed_for_test(&ctx));
     assert!(backend_method_override_for_test(&ctx).is_none());
     assert!(ctx.route_override_path.is_none());
     assert_eq!(policy_decision(&ctx), Some("method_not_allowed"));
+
+    let unknown = bridge_tool_call(148, "pets.noSuchTool", json!({}));
+    let (result, _, _) = bridge_call_with(&plugin, unknown, |_, _| {}).await;
+    let (_, unknown_body, _) = reject_json(result);
+    assert_eq!(body["error"], unknown_body["error"]);
 
     let call = bridge_tool_call(141, "pets.getPet", json!({ "petId": "7" }));
     let (result, ctx, _) = bridge_call_with(&plugin, call, |ctx, _| {
@@ -15885,6 +16035,127 @@ async fn openapi_bridge_calls_obey_the_route_allowed_methods() {
     .await;
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
     assert_eq!(backend_method_override_for_test(&ctx), Some("GET"));
+}
+
+/// A bridged tool whose operation method the route's `allowed_methods`
+/// refuses can never be called, so `tools/list` does not advertise it; a
+/// route without a method restriction still lists every operation.
+#[tokio::test]
+async fn openapi_bridge_tools_list_hides_tools_the_route_methods_refuse() {
+    let plugin = bridge_plugin_with(|_| {});
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.allowed_methods = Some(vec!["GET".to_string(), "POST".to_string()]);
+    let proxy = Arc::new(proxy);
+    let session = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 142,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session.clone());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list result missing tools array: {body}"))
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"pets.getPet"), "{body}");
+    assert!(names.contains(&"pets.createPet"), "{body}");
+    assert!(
+        !names.contains(&"pets.deletePet"),
+        "a DELETE operation the route refuses must not be listed: {body}"
+    );
+
+    let names = aggregate_tool_names(&plugin, &session, 143).await;
+    assert!(
+        names.iter().any(|name| name == "pets.deletePet"),
+        "without a method restriction every operation is listed: {names:?}"
+    );
+}
+
+/// The route's method refusal is decided before argument validation, so a
+/// granted caller sending invalid arguments to a refused operation learns the
+/// method refusal, not the argument error, and no schema verdict is recorded.
+#[tokio::test]
+async fn openapi_bridge_method_refusal_precedes_argument_validation() {
+    let plugin = bridge_plugin_with(|_| {});
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.allowed_methods = Some(vec!["GET".to_string(), "POST".to_string()]);
+    let proxy = Arc::new(proxy);
+
+    // `petId` must be a string: this call fails `inputSchema` validation.
+    let call = bridge_tool_call(144, "pets.deletePet", json!({ "petId": 7 }));
+    let (result, ctx, _) = bridge_call_with(&plugin, call, |ctx, _| {
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+    })
+    .await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(144), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32003), "{body}");
+    assert_eq!(body["error"]["message"], "Unknown MCP tool", "{body}");
+    assert_eq!(policy_decision(&ctx), Some("method_not_allowed"));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
+        Some("skipped"),
+        "arguments of a refused operation are never validated"
+    );
+    assert!(!mcp_bridge_is_claimed_for_test(&ctx));
+
+    // With the method allowed, the same invalid call is an argument error.
+    let call = bridge_tool_call(145, "pets.deletePet", json!({ "petId": 7 }));
+    let (result, _, _) = bridge_call_with(&plugin, call, |_, _| {}).await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["error"]["code"], json!(-32602), "{body}");
+}
+
+/// A per-consumer grant is still decided first: an ungranted caller gets the
+/// ordinary denial whatever the route's methods are.
+#[tokio::test]
+async fn openapi_bridge_grant_denial_precedes_the_method_refusal() {
+    let plugin = bridge_plugin_with(|config| {
+        config["policy"]["tools"] = json!({
+            "pets.deletePet": { "action": "allow", "allowed_groups": ["pet-admins"] }
+        });
+    });
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.allowed_methods = Some(vec!["GET".to_string(), "POST".to_string()]);
+    let proxy = Arc::new(proxy);
+
+    for (consumer, request_id, expected_decision) in [
+        (
+            consumer_with_groups("outsider", &["readers"]),
+            146,
+            "deny_group",
+        ),
+        (
+            consumer_with_groups("admin", &["pet-admins"]),
+            147,
+            "method_not_allowed",
+        ),
+    ] {
+        let session = session_for(&plugin, &consumer).await;
+        let call = bridge_tool_call(request_id, "pets.deletePet", json!({ "petId": "7" }));
+        let (mut ctx, headers) = caller_with(call, &consumer);
+        ctx.matched_proxy = Some(Arc::clone(&proxy));
+        let (result, ctx) = send_on_session(&plugin, &session, (ctx, headers)).await;
+        assert_tool_call_refused(result, request_id);
+        assert_eq!(policy_decision(&ctx), Some(expected_decision));
+    }
+}
+
+fn assert_tool_call_refused(result: PluginResult, request_id: i64) {
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!(request_id), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
 }
 
 const BRIDGE_TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";

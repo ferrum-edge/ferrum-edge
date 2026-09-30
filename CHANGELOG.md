@@ -108,6 +108,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bypassed with a `;` segment. Default-off services still refuse `;`
   with `400 path_parameter`. See `docs/mesh.md` and
   `docs/request_path_canonicalization.md`.
+- **AI governance for MCP tool calls** (#5908). The AI governance plugins now
+  treat MCP JSON-RPC `tools/call` traffic as AI traffic, through one shared
+  recognizer (`plugins::utils::mcp_jsonrpc`) that decodes member names,
+  refuses duplicate members, and reuses `mcp_gateway`'s default batch bounds:
+  - `ai_transcript_audit` captures `tools/call` requests (singletons and
+    batches, including `application/json-rpc`; Content-Type-less POSTs are in
+    scope on all paths by default and `capture.mcp_endpoint_path` narrows that
+    scope) under `capture.mcp_tool_calls`
+    (default `true`). Records gain an
+    `mcp` section with, per call, the public tool name, a keyed
+    `arguments_hash`, an optional redacted `arguments` excerpt
+    (`capture.mcp_arguments`, default `false`, redacted/full modes only), and
+    the JSON-RPC outcome (`result` / `error`, `error_code`, `isError`) read from
+    the final client-visible response — for an OpenAPI bridge call, the
+    converted `tools/call` result, not the REST body — plus a bounded map of
+    `mcp_gateway` decisions. `ai_tool_governor` decisions keep landing in
+    `guardrails`, and a JSON-RPC error or `isError: true` counts as an error for
+    `always_capture_on_error`.
+  - `rate_limiting` gains `mcp_tool_calls` (`endpoint_path`, `tools`,
+    `per_tool`): the limiter counts only `tools/call` (each batch member is one
+    charge; `notifications/*` methods are free, while a `tools/call` sent
+    without an id is still charged), optionally
+    per tool, on the existing local and Redis budgets and `x-ratelimit-*`
+    headers. A refusal is a JSON-RPC error on HTTP `200` (`-32015`, or `-32016`
+    for a fail-closed Redis outage; `-32017` when scoped non-identity
+    `Content-Encoding` prevents inspection), which MCP clients surface.
+  - `ai_prompt_shield` gains `scan_fields: mcp_arguments`, which scans (and
+    redacts) only `params.arguments` of each `tools/call`, accepts the media
+    types `mcp_gateway` admits (including `application/grpc-web+json`), refuses
+    duplicate member names, and rejects redaction when an id cannot round-trip.
+    `mcp_gateway` admits and forwards the redacted arguments; through an
+    OpenAPI bridge, a redacted path argument fails the call with `-32602`.
+  - `docs/plugins.md` documents the recommended plugin stack for an
+    agent-facing MCP endpoint.
 
 - **`mcp_gateway` OpenAPI bridge and `x-ferrum-mcp`** (#5906). A
   `servers.<id>` entry may carry an `openapi` block instead of `upstream_url`:
@@ -122,8 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_tool_arguments`, `validate_tool_results`, and `mcp.*` metadata
   paths as upstream tools, plus `mcp.bridge.operation`, and (always)
   `mcp.bridge.upstream_status` and `mcp.bridge.gateway_error`. The proxy's
-  `allowed_methods` is applied to the bridged method (`-32001`); method- and
-  path-conditioned triggers, WAF rules, and path-keyed authorization see the
+  `allowed_methods` is applied to the bridged method (`-32003` / "Unknown MCP
+  tool" when no grants are configured, `-32001` when grants are configured);
+  method- and path-conditioned triggers, WAF rules, and path-keyed authorization see the
   MCP request, so bridged operations are restricted through `mcp_gateway`
   policy. Path arguments are percent-encoded per segment and must yield a
   canonical path with no `;` (no `/`, dot segment, `..;`, `?`, or `#` can be
@@ -138,8 +173,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, query, and body are re-checked in the final request-body hook
   (`-32014` on drift); a request-body transform (for example a prompt-guard
   redaction) that changed the admitted envelope is re-validated and carried
-  into the REST body, or refused when it would change the request line or
-  headers. The backend response is converted in the buffered normalize phase
+  into the REST request, including redacted query, header, and body
+  arguments; a redacted path argument is not a canonical path segment, so that
+  call fails with `-32602` and nothing is dispatched. The backend response is converted in the buffered normalize phase
   into a `tools/call` result answered with HTTP 200: a 2xx is always
   `isError: false` (text content plus `structuredContent` for a bounded JSON
   object, or a note when the body is omitted as oversized, coded, streamed,
@@ -503,6 +539,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id need updating.
 
 ### Changed
+
+- **`mcp_gateway` applies a route's `allowed_methods` to bridged tools earlier**
+  (#5908). A hand-written OpenAPI bridge tool whose operation method the
+  route's `allowed_methods` refuses is no longer listed by `tools/list`, and a
+  call to it is refused with `-32001` right after the tool policy and
+  per-consumer grant, before argument validation, so a granted caller gets the
+  method refusal instead of an argument error.
 
 - **`mcp_gateway` aggregate `initialize` advertises `listChanged: false`**
   for tools, resources, and prompts (#5907). It advertised `true`, but the

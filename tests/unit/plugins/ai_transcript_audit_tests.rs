@@ -695,6 +695,9 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "headers",
             "tool_calls",
             "stream_hash",
+            "mcp_tool_calls",
+            "mcp_arguments",
+            "mcp_endpoint_path",
         ]
     );
     assert_eq!(
@@ -13194,4 +13197,456 @@ fn transcript_config_limit_diagnostics_withhold_supplied_and_derived_sizes() {
             assert!(!rendered.contains(secret), "{rendered}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// MCP tool calls (issue #5908)
+// ---------------------------------------------------------------------------
+
+fn mcp_call_value(id: Value, name: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments }
+    })
+}
+
+/// A client `POST /mcp` from the test consumer, with its JSON-RPC body
+/// prebuffered the way the proxy stages it before `before_proxy`.
+fn mcp_ctx(request: &Value) -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.path = "/mcp".to_string();
+    ctx.identified_consumer = Some(Arc::new(super::plugin_utils::create_test_consumer()));
+    ctx.metadata
+        .insert("request_body".to_string(), request.to_string());
+    ctx
+}
+
+/// Drive one MCP exchange through the audit hooks: staging over the client
+/// body, the final hook over `final_body` (what the backend receives), and the
+/// buffered final client-visible response.
+async fn mcp_roundtrip(
+    overrides: Value,
+    ctx: &mut RequestContext,
+    final_body: &[u8],
+    response: &Value,
+) -> Vec<Value> {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a tools/call is an audit candidate"
+    );
+    plugin
+        .on_final_request_body_with_context(ctx, &headers, final_body)
+        .await;
+    let response = serde_json::to_vec(response).expect("serialize response");
+    plugin
+        .capture_final_response_body(ctx, 200, &json_headers(), &response)
+        .await;
+    wait_for_records(&server).await
+}
+
+#[tokio::test]
+async fn mcp_bridged_tool_call_record_names_consumer_tool_and_outcome() {
+    let request = mcp_call_value(json!(7), "pets.getPet", json!({"petId": "7"}));
+    let mut ctx = mcp_ctx(&request);
+    // Decisions the gateway and the tool governor publish for the call.
+    for (key, value) in [
+        ("mcp.mode", "aggregate_router"),
+        ("mcp.policy_decision", "allow"),
+        ("mcp.bridge.operation", "GET /pets/{petId}"),
+        ("mcp.bridge.upstream_status", "200"),
+        ("mcp.arguments", r#"{"petId":"7"}"#),
+        ("mcp.session.downstream", "session-hash"),
+        ("ai_tool_governor.decision", "allow"),
+    ] {
+        ctx.metadata.insert(key.to_string(), value.to_string());
+    }
+    // An OpenAPI bridge call reaches the backend as a REST request: the
+    // backend-visible body is neither an LLM request nor JSON-RPC.
+    let rest_body = br#"{"unrelated":"rest body"}"#;
+    let converted = json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "result": {
+            "content": [{ "type": "text", "text": "{\"id\":\"7\"}" }],
+            "structuredContent": { "id": "7" },
+            "isError": false
+        }
+    });
+    let records = mcp_roundtrip(json!({}), &mut ctx, rest_body, &converted).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record["consumer_username"], "testuser");
+    let mcp = &record["mcp"];
+    assert_eq!(mcp["batch"], json!(false));
+    let calls = mcp["calls"].as_array().expect("mcp.calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "pets.getPet");
+    let hash = calls[0]["arguments_hash"].as_str().expect("hash");
+    assert_eq!(hash.len(), 64, "a keyed HMAC-SHA256 hex digest: {hash}");
+    assert!(calls[0].get("arguments").is_none(), "arguments are opt-in");
+    assert_eq!(calls[0]["result"], "result");
+    assert_eq!(calls[0]["is_error"], json!(false));
+    assert_eq!(mcp["gateway"]["mcp.policy_decision"], "allow");
+    assert_eq!(mcp["gateway"]["mcp.bridge.upstream_status"], "200");
+    assert_eq!(mcp["gateway"]["mcp.bridge.operation"], "GET /pets/{petId}");
+    assert!(mcp["gateway"].get("mcp.arguments").is_none(), "{mcp}");
+    assert!(mcp["gateway"].get("mcp.session.downstream").is_none());
+    assert_eq!(record["guardrails"]["ai_tool_governor.decision"], "allow");
+    // The REST body is what the backend received, so it drives the request
+    // hash, but it never names a model or a tool.
+    assert!(record.get("model").is_none(), "{record}");
+    assert!(record.get("request_hash").is_some());
+}
+
+#[tokio::test]
+async fn mcp_audit_recognizes_lowercase_post_and_scan_limited_bridged_calls() {
+    let request = mcp_call_value(json!(71), "pets.getPet", json!({"petId": "7"}));
+    let mut ctx = mcp_ctx(&request);
+    ctx.method = "post".to_string();
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        br#"{"id":"7"}"#,
+        &json!({"jsonrpc": "2.0", "id": 71, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "lowercase POST remains auditable");
+    assert_eq!(records[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
+
+    let padded = format!(
+        r#"{{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{{"name":"pets.getPet","arguments":{{"padding":"{}"}}}}}}"#,
+        "x".repeat(1_100_000)
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata.insert("request_body".to_string(), padded);
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        br#"{"id":"7"}"#,
+        &json!({"jsonrpc": "2.0", "id": 72, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "scan-limited bridge remains auditable");
+    assert!(records[0]["mcp"].is_object(), "{records:#?}");
+    assert_eq!(records[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
+}
+
+#[tokio::test]
+async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
+    let request = mcp_call_value(json!(73), "pets.getPet", json!({"petId": "7"}));
+    let mut ctx = mcp_ctx(&request);
+    ctx.path = "/another-mcp-route".to_string();
+    ctx.headers.remove("content-type");
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        br#"{"id":"7"}"#,
+        &json!({"jsonrpc": "2.0", "id": 73, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(
+        records.len(),
+        1,
+        "default scope audits Content-Type-less calls"
+    );
+    assert_eq!(records[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
+
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("http://127.0.0.1:1/ingest", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid default MCP scope");
+    let ordinary_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "ordinary LLM prompt"}]
+    });
+    let mut ordinary = mcp_ctx(&ordinary_body);
+    ordinary.headers.remove("content-type");
+    let mut headers = ordinary.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ordinary, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !ordinary
+            .metadata
+            .contains_key("ai_transcript_audit.candidate"),
+        "a Content-Type-less body that cannot spell tools/call is skipped by the byte pre-scan"
+    );
+}
+
+#[tokio::test]
+async fn mcp_audit_final_fallback_skips_large_content_type_less_uploads() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.headers.remove("content-type");
+    let mut headers = ctx.headers.clone();
+    headers.remove("content-type");
+    let body = vec![0xff; 1024 * 1024 + 1];
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false"),
+        "a large Content-Type-less binary upload is not staged as an AI request"
+    );
+}
+
+#[test]
+fn mcp_audit_content_type_less_buffering_is_scoped_to_configured_path() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "http://127.0.0.1:1/ingest",
+            json!({"capture": {"mcp_endpoint_path": "/mcp"}}),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid MCP endpoint path");
+    let mut ctx = mcp_ctx(&mcp_call_value(json!(1), "pets.getPet", json!({})));
+    ctx.headers.remove("content-type");
+    assert!(plugin.should_buffer_request_body(&ctx));
+    ctx.path = "/unrelated".to_string();
+    assert!(!plugin.should_buffer_request_body(&ctx));
+}
+
+#[tokio::test]
+async fn mcp_batch_record_describes_every_call_and_matches_outcomes_by_id() {
+    let request = json!([
+        mcp_call_value(json!(1), "search.web", json!({"q": "weather"})),
+        {"jsonrpc": "2.0", "id": "list", "method": "tools/list"},
+        mcp_call_value(json!(3), "files.read", json!({"path": "/tmp/a"})),
+        mcp_call_value(json!(4), "files.write", json!({}))
+    ]);
+    let mut ctx = mcp_ctx(&request);
+    let body = request.to_string();
+    let response = json!([
+        {"jsonrpc": "2.0", "id": 1, "result": {"content": [], "isError": true}},
+        {"jsonrpc": "2.0", "id": "list", "result": {"tools": []}},
+        {"jsonrpc": "2.0", "id": 3, "error": {"code": -32009, "message": "singleton only"}}
+    ]);
+    let records = mcp_roundtrip(json!({}), &mut ctx, body.as_bytes(), &response).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let mcp = &records[0]["mcp"];
+    assert_eq!(mcp["batch"], json!(true));
+    let calls = mcp["calls"].as_array().expect("mcp.calls");
+    let tools: Vec<&str> = calls
+        .iter()
+        .filter_map(|call| call["tool"].as_str())
+        .collect();
+    assert_eq!(tools, vec!["search.web", "files.read", "files.write"]);
+    assert_eq!(calls[0]["result"], "result");
+    assert_eq!(calls[0]["is_error"], json!(true));
+    assert_eq!(calls[1]["result"], "error");
+    assert_eq!(calls[1]["error_code"], json!(-32009));
+    assert_eq!(calls[2]["result"], "no_response");
+    let hashes: std::collections::BTreeSet<&str> = calls
+        .iter()
+        .filter_map(|call| call["arguments_hash"].as_str())
+        .collect();
+    assert_eq!(hashes.len(), 3, "each call's arguments hash separately");
+}
+
+#[tokio::test]
+async fn mcp_batch_outcomes_canonicalize_raw_numeric_and_escaped_string_ids() {
+    let body = format!(
+        r##"[
+            {{
+                "jsonrpc":"2.0",
+                "id":1e3,
+                "method":"tools/call",
+                "params":{{"name":"search.web","arguments":{{"padding":"{padding}"}}}}
+            }},
+            {{
+                "jsonrpc":"2.0",
+                "id":"a\u0062",
+                "method":"tools/call",
+                "params":{{"name":"files.read","arguments":{{}}}}
+            }}
+        ]"##,
+        padding = "x".repeat(5_000),
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    let response = json!([
+        {"jsonrpc": "2.0", "id": 1000.0, "error": {"code": -32009, "message": "denied"}},
+        {"jsonrpc": "2.0", "id": "ab", "result": {"isError": false}}
+    ]);
+    let records = mcp_roundtrip(
+        json!({"limits": {"max_redaction_scan_bytes": 4096}}),
+        &mut ctx,
+        body.as_bytes(),
+        &response,
+    )
+    .await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let calls = records[0]["mcp"]["calls"].as_array().expect("mcp.calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["result"], "error", "exponent id matches its value");
+    assert_eq!(calls[0]["error_code"], json!(-32009));
+    assert_eq!(
+        calls[1]["result"], "result",
+        "escaped string id matches its value"
+    );
+}
+
+#[tokio::test]
+async fn mcp_arguments_excerpt_is_opt_in_and_redacted() {
+    let arguments = json!({"to": "alice@example.com", "subject": "hello"});
+    let request = mcp_call_value(json!(9), "mail.send", arguments);
+    let mut ctx = mcp_ctx(&request);
+    let body = request.to_string();
+    let response = json!({"jsonrpc": "2.0", "id": 9, "result": {"content": []}});
+    let overrides = json!({ "capture": { "mcp_arguments": true } });
+    let records = mcp_roundtrip(overrides, &mut ctx, body.as_bytes(), &response).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let call = &records[0]["mcp"]["calls"][0];
+    let excerpt = call["arguments"].as_str().expect("arguments excerpt");
+    assert!(!excerpt.contains("alice@example.com"), "{excerpt}");
+    assert!(excerpt.contains("REDACTED"), "{excerpt}");
+    assert!(excerpt.contains("hello"), "{excerpt}");
+    // A result without `isError` is a success.
+    assert_eq!(call["is_error"], json!(false));
+}
+
+#[tokio::test]
+async fn mcp_hash_only_record_keeps_hashes_and_outcome_without_names() {
+    let request = mcp_call_value(json!(10), "crm.lookup", json!({"id": 1}));
+    let mut ctx = mcp_ctx(&request);
+    ctx.metadata
+        .insert("mcp.policy_decision".to_string(), "allow".to_string());
+    let body = request.to_string();
+    let response = json!({"jsonrpc": "2.0", "id": 10, "error": {"code": -32015, "message": "x"}});
+    let overrides = json!({ "mode": "hash_only" });
+    let records = mcp_roundtrip(overrides, &mut ctx, body.as_bytes(), &response).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let mcp = &records[0]["mcp"];
+    let call = &mcp["calls"][0];
+    assert!(call.get("tool").is_none(), "{call}");
+    assert_eq!(call["arguments_hash"].as_str().map(str::len), Some(64));
+    assert_eq!(call["result"], "error");
+    assert_eq!(call["error_code"], json!(-32015));
+    assert!(mcp.get("gateway").is_none(), "{mcp}");
+}
+
+#[tokio::test]
+async fn a_jsonrpc_error_outcome_is_an_error_for_retention() {
+    let request = mcp_call_value(json!(11), "pets.deletePet", json!({"petId": "7"}));
+    let mut ctx = mcp_ctx(&request);
+    let body = request.to_string();
+    // A JSON-RPC refusal rides HTTP 200, so the transport status alone would
+    // let a losing sampling roll drop it.
+    let response = json!({"jsonrpc": "2.0", "id": 11, "error": {"code": -32001, "message": "x"}});
+    let overrides = json!({ "sampling": { "rate": 0.0, "always_capture_on_error": true } });
+    let records = mcp_roundtrip(overrides, &mut ctx, body.as_bytes(), &response).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["capture_reason"], "error");
+    assert_eq!(records[0]["mcp"]["calls"][0]["error_code"], json!(-32001));
+}
+
+#[tokio::test]
+async fn mcp_tool_calls_follow_the_mcp_gateway_media_types_and_can_be_disabled() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let request = mcp_call_value(json!(12), "pets.getPet", json!({}));
+
+    // `mcp_gateway` admits a POST without `Content-Type`.
+    let mut ctx = mcp_ctx(&request);
+    ctx.headers.remove("content-type");
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    let disabled = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "mcp_tool_calls": false } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut ctx = mcp_ctx(&request);
+    let mut headers = json_headers();
+    disabled.before_proxy(&mut ctx, &mut headers).await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "with capture.mcp_tool_calls off a tools/call is not an LLM request"
+    );
+}
+
+#[test]
+fn mcp_arguments_capture_requires_mcp_calls_and_a_body_mode() {
+    for (overrides, expected) in [
+        (
+            json!({ "capture": { "mcp_arguments": true, "mcp_tool_calls": false } }),
+            "requires `capture.mcp_tool_calls`",
+        ),
+        (
+            json!({ "mode": "metadata_only", "capture": { "mcp_arguments": true } }),
+            "requires mode `redacted_body` or `full_body`",
+        ),
+        (
+            json!({ "mode": "hash_only", "capture": { "mcp_arguments": true } }),
+            "requires mode `redacted_body` or `full_body`",
+        ),
+    ] {
+        let config = config_with_sink("https://audit.example.com/x", overrides);
+        let Err(error) = AiTranscriptAudit::new(&config, loopback_http_client()) else {
+            panic!("{config} must be rejected");
+        };
+        assert!(error.contains(expected), "{error}");
+    }
+    let overrides = json!({
+        "mode": "full_body",
+        "allow_full_body": true,
+        "capture": { "mcp_arguments": true }
+    });
+    let config = config_with_sink("https://audit.example.com/x", overrides);
+    assert!(AiTranscriptAudit::new(&config, loopback_http_client()).is_ok());
 }
