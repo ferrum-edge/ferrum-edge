@@ -17,6 +17,14 @@ SHA256 = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 REVISION = "d57d1b852fec9dda6d42d3454502006d52104da8"
 URL = "https://static.crates.io/crates/h2/h2-0.4.19.crate"
 VENDOR = "vendor/h2-0.4.19-observation"
+# Input anchors shared by the hosted preparation and the quick pin check, so the
+# two cannot disagree about what "present" means.
+PATCH_TABLE = "[patch.crates-io]\n"
+LOCK_PIN = ('name = "h2"\nversion = "0.4.19"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            f'checksum = "{SHA256}"\n')
+DOCKER_CARGO = 'cargo build --features "${FEATURES}"'
+METRICS_ANCHOR = b"        let mut metrics_output = registry.render();\n"
 
 
 def sha(data):
@@ -73,29 +81,25 @@ def patch_source(source, provenance):
 
 def select_dependency(context, evidence, provenance):
     original = (context / "Cargo.toml").read_text()
-    if original.count("[patch.crates-io]\n") != 1:
+    if original.count(PATCH_TABLE) != 1:
         raise ValueError("unexpected root patch table")
-    modified = original.replace("[patch.crates-io]\n", '[patch.crates-io]\nh2 = { path = "' + VENDOR + '" }\n')
+    modified = original.replace(PATCH_TABLE, PATCH_TABLE + 'h2 = { path = "' + VENDOR + '" }\n')
     (context / "Cargo.toml").write_text(modified)
     diff = "".join(difflib.unified_diff(original.splitlines(True), modified.splitlines(True),
                                        fromfile="a/Cargo.toml", tofile="b/Cargo.toml"))
     lock = (context / "Cargo.lock").read_text()
-    pin = ('name = "h2"\nversion = "0.4.19"\n'
-           'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
-           f'checksum = "{SHA256}"\n')
-    if lock.count(pin) != 1:
+    if lock.count(LOCK_PIN) != 1:
         raise ValueError("root lock no longer pins the approved h2 archive")
-    selected = lock.replace(pin, 'name = "h2"\nversion = "0.4.19"\n')
+    selected = lock.replace(LOCK_PIN, 'name = "h2"\nversion = "0.4.19"\n')
     (context / "Cargo.lock").write_text(selected)
     diff += "".join(difflib.unified_diff(lock.splitlines(True), selected.splitlines(True),
                                         fromfile="a/Cargo.lock", tofile="b/Cargo.lock"))
     # Keep the existing Docker stages/features/profile. Lock both Cargo calls in
     # this generated copy; the ordinary Dockerfile is never rewritten.
     docker = (context / "Dockerfile").read_text()
-    if docker.count('cargo build --features "${FEATURES}"') != 2:
+    if docker.count(DOCKER_CARGO) != 2:
         raise ValueError("Docker build recipe drift")
-    locked = docker.replace('cargo build --features "${FEATURES}"',
-                            'cargo build --locked --features "${FEATURES}"')
+    locked = docker.replace(DOCKER_CARGO, 'cargo build --locked --features "${FEATURES}"')
     (context / "Dockerfile").write_text(locked)
     diff += "".join(difflib.unified_diff(docker.splitlines(True), locked.splitlines(True),
                                         fromfile="a/Dockerfile", tofile="b/Dockerfile"))
@@ -107,10 +111,9 @@ def select_dependency(context, evidence, provenance):
     admin = context / "src/admin/mod.rs"
     before = admin.read_bytes()
     pin = provenance["context_files"]["src/admin/mod.rs"]
-    anchor = b"        let mut metrics_output = registry.render();\n"
-    if sha(before) != pin["before"] or before.count(anchor) != 1:
+    if sha(before) != pin["before"] or before.count(METRICS_ANCHOR) != 1:
         raise ValueError("diagnostic metrics context drift")
-    after = before.replace(anchor, anchor + hook)
+    after = before.replace(METRICS_ANCHOR, METRICS_ANCHOR + hook)
     if sha(after) != pin["after"]:
         raise ValueError("diagnostic metrics postimage mismatch")
     admin.write_bytes(after)
@@ -122,10 +125,55 @@ def select_dependency(context, evidence, provenance):
         shutil.copy2(context / name, evidence / name.lstrip("."))
 
 
+def check_pins_only(provenance):
+    """Check pinned source anchors and print replacement context hashes."""
+    admin = (ROOT / "src/admin/mod.rs").read_bytes()
+    if admin.count(METRICS_ANCHOR) != 1:
+        raise SystemExit("pin check failed: src/admin/mod.rs metrics anchor must occur once")
+    hook = (ASSETS / "metrics-hook.txt").read_bytes()
+    hook_hash = sha(hook)
+    after = admin.replace(METRICS_ANCHOR, METRICS_ANCHOR + hook)
+    before_hash = sha(admin)
+    after_hash = sha(after)
+
+    lock = (ROOT / "Cargo.lock").read_text()
+    if lock.count(LOCK_PIN) != 1:
+        raise SystemExit("pin check failed: approved h2 0.4.19 lock anchor must occur once")
+
+    manifest = (ROOT / "Cargo.toml").read_text()
+    if manifest.count(PATCH_TABLE) != 1:
+        raise SystemExit("pin check failed: Cargo.toml [patch.crates-io] anchor must occur once")
+
+    docker = (ROOT / "Dockerfile").read_text()
+    if docker.count(DOCKER_CARGO) != 2:
+        raise SystemExit("pin check failed: Dockerfile cargo build anchor must occur twice")
+
+    expected = provenance["context_files"]["src/admin/mod.rs"]
+    print("Computed source.json values (replace only these keys; keep every other key):")
+    print(json.dumps({
+        "context_files": {"src/admin/mod.rs": {"before": before_hash, "after": after_hash}},
+        "assets": {"metrics-hook.txt": hook_hash},
+    }, indent=2))
+    if (before_hash, after_hash) != (expected["before"], expected["after"]):
+        raise SystemExit("pin check failed: update source.json with the computed values above")
+    if hook_hash != provenance["assets"]["metrics-hook.txt"]:
+        raise SystemExit(
+            "pin check failed: update source.json with the computed metrics hook hash above"
+        )
+    print("H2 guard pins match source.json and all pinned input anchors are present.")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--check-pins-only", action="store_true")
     args = parser.parse_args()
+    if args.check_pins_only:
+        provenance = json.loads((ASSETS / "source.json").read_text())
+        check_pins_only(provenance)
+        return
+    if args.output is None:
+        parser.error("--output is required unless --check-pins-only is selected")
     if (os.environ.get("GITHUB_ACTIONS") != "true"
             or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
             or os.environ.get("RUNNER_OS") != "Linux"):

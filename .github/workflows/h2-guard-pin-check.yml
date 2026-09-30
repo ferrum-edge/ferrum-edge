@@ -1,0 +1,30 @@
+name: H2 Guard Pin Check
+
+on:
+  pull_request:
+    paths:
+      - src/admin/mod.rs
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile
+      - tests/performance/multi_protocol/h2_guard/**
+      - .github/workflows/h2-guard-pin-check.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check-pins:
+    name: H2 guard pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Verify pinned inputs without building
+        run: python3 tests/performance/multi_protocol/h2_guard/prepare.py --check-pins-only

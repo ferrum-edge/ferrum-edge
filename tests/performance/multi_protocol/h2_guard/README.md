@@ -196,7 +196,10 @@ absence, complete histories, or the cause of every client error.
 Pull requests touching the assets run `H2 pinned guard regressions`, and so
 does every push to `main` that touches the assets or a pinned repository file
 (`src/admin/mod.rs`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`), so pin drift
-fails on the commit that causes it. The job
+fails on the commit that causes it. The lightweight `H2 guard pins` check
+(`h2-guard-pin-check.yml`) runs the same anchor and hash checks on the pull
+request that edits one of those files and prints the replacement
+`source.json` values; see `docs/ci_cd.md` for re-pinning. The job
 verifies/prepares the source, formats the generated dependency on the runner,
 compiles/lints it, exercises its real receive/poll/clear paths and existing
 budget tests, checks both dependency chains, and runs the harness tests.
