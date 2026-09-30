@@ -2712,6 +2712,52 @@ fn authorize_request_namespace(
     None
 }
 
+/// Global routes that remain available to viewer-key tokens with a namespace
+/// ceiling. Keep this list explicit: a new global route is denied by default.
+fn ceiling_global_route_is_allowed(method: &Method, segments: &[&str]) -> bool {
+    (*method == Method::GET && matches!(segments, ["plugins"]))
+        || (*method == Method::GET
+            && matches!(segments, ["health"] | ["live"] | ["status"]))
+        || (matches!(segments, ["namespaces"])
+            && (*method == Method::GET || *method == Method::POST))
+        || (matches!(segments, ["namespaces", _])
+            && (*method == Method::GET || *method == Method::PUT || *method == Method::DELETE))
+}
+
+/// Refuse a ceiling-bound viewer key on every global route except the small
+/// allowlist. Namespace-scoped routes have their own name-based authorization
+/// through [`authorize_request_namespace`].
+fn authorize_ceiling_global_route(
+    method: &Method,
+    segments: &[&str],
+    path: &str,
+    auth: &AuditActor,
+) -> Option<Response<Full<Bytes>>> {
+    if auth.namespace_ceiling.is_none()
+        || is_namespace_scoped_route(segments)
+        || ceiling_global_route_is_allowed(method, segments)
+    {
+        return None;
+    }
+
+    warn!(
+        audit.event = "admin_namespace_authz",
+        actor = %auth.sub,
+        key_tier = auth.key_tier.as_str(),
+        path = %path,
+        namespace_ceiling = "global_route_denied",
+        result = "denied",
+        "Admin request rejected: viewer-key tokens with a namespace ceiling cannot access this global route"
+    );
+    Some(json_response(
+        StatusCode::FORBIDDEN,
+        &json!({"error": format!(
+            "global route '{path}' is unavailable to viewer-key tokens with a namespace ceiling \
+             (FERRUM_ADMIN_JWT_VIEWER_NAMESPACES)"
+        )}),
+    ))
+}
+
 /// Whether the caller may see the detailed observability views (`/metrics`
 /// scrape body, full `/health`, full `/overload`). Granted on any of: a valid
 /// admin JWT, a matching metrics bearer token, or an allowlisted source IP.
@@ -3608,6 +3654,17 @@ async fn handle_admin_request_inner(
         if !observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
             return Ok(metrics_unauthorized_response());
         }
+        if let Ok(token_data) = state.jwt_manager.verify_request(auth_header.as_deref())
+            && let Ok(actor) = AuditActor::from_verified(&token_data)
+            && let Some(response) = authorize_ceiling_global_route(
+                &method,
+                &["metrics"],
+                path,
+                &actor,
+            )
+        {
+            return Ok(response);
+        }
         let registry = admin_metrics_registry(&state);
         // TLS certificate metadata comes from the cached, non-secret inventory
         // snapshot (issue #2410). The scrape performs zero filesystem,
@@ -3738,6 +3795,14 @@ async fn handle_admin_request_inner(
     // #2421). Nothing is written to the spool here: an authenticated read never
     // reaches the write gate.
     audit::note_request_actor(&auth, &audit_request_ctx);
+
+    let route_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if let Some(response) =
+        authorize_ceiling_global_route(&method, &route_segments, &path, &auth)
+    {
+        drop(req.into_body());
+        return Ok(response);
+    }
 
     // API chargeback endpoint. Chargeback output contains customer/business data,
     // so it stays behind the standard admin JWT gate even though it is scrapeable.
@@ -12581,6 +12646,42 @@ mod tests {
             assert!(
                 is_namespace_scoped_route(&segs),
                 "/{} should be namespace-scoped",
+                segs.join("/")
+            );
+        }
+
+        // Ceiling-bound viewer keys are fail-closed on global routes, except
+        // this intentionally small set of filtered or probe-safe endpoints.
+        for (method, segs) in [
+            (Method::GET, vec!["plugins"]),
+            (Method::GET, vec!["namespaces"]),
+            (Method::GET, vec!["namespaces", "tenant-a"]),
+            (Method::GET, vec!["health"]),
+            (Method::GET, vec!["live"]),
+            (Method::GET, vec!["status"]),
+        ] {
+            assert!(
+                ceiling_global_route_is_allowed(&method, &segs),
+                "{} /{} should be allowlisted",
+                method,
+                segs.join("/")
+            );
+        }
+        for (method, segs) in [
+            (Method::GET, vec!["charges"]),
+            (Method::GET, vec!["metrics"]),
+            (Method::GET, vec!["admin", "metrics"]),
+            (Method::GET, vec!["metrics", "runtime"]),
+            (Method::GET, vec!["overload"]),
+            (Method::GET, vec!["cluster"]),
+            (Method::GET, vec!["backend-capabilities"]),
+            (Method::POST, vec!["namespaces"]),
+            (Method::POST, vec!["plugins"]),
+        ] {
+            assert!(
+                !ceiling_global_route_is_allowed(&method, &segs),
+                "{} /{} should be denied by default",
+                method,
                 segs.join("/")
             );
         }

@@ -122,9 +122,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (proxies, consumers, upstreams, plugin configs, API specs, trust bundles,
   batch, backup, restore, audit) and `GET /config/export` answer `403` for a
   namespace outside it, `GET /namespaces/{name}` answers the same `403`, and
-  `GET /namespaces` is filtered to it. A present `ns` claim is narrowed to
-  `claim ∩ ceiling`. Primary-key tokens are unaffected, and unset keeps
-  today's fleet-wide behaviour. Refusal logs carry `namespace_ceiling`, and
+  `GET /namespaces` is filtered to it. Namespace matching is exact and
+  case-sensitive. Ceiling-bound viewer-key tokens are denied with `403` on all
+  other global routes except the filtered namespace registry, `GET /plugins`
+  (plugin type catalog), and health/liveness/readiness probes (`GET /health`,
+  `/live`, `/status`). This includes `/charges`, detailed
+  `/metrics`, `/admin/metrics`, `/metrics/runtime`, `/cluster`,
+  `/backend-capabilities`, `/overload`, mesh introspection, and future global routes by
+  default. A present `ns` claim is narrowed to `claim ∩ ceiling`. Primary-key
+  tokens and viewer-key tokens without a ceiling are unaffected; unset keeps
+  today's fleet-wide behaviour. Namespace refusal logs carry `namespace_ceiling = outside`,
+  global-route refusals log `global_route_denied`, and
   `GET /backup` security audit records for a ceiling-bound token record the
   decision in their `diff`. Startup and `validate` refuse an empty value, an
   empty entry, `*`, or an invalid namespace name.

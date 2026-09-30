@@ -688,12 +688,16 @@ const NAMESPACE_SCOPED_READS: &[&str] = &[
     "/plugins/config",
     "/plugins/config/plugin-prod",
     "/api-specs",
+    "/api-specs/00000000-0000-0000-0000-000000000000",
     EXPORT,
     "/gateway-trust-bundles",
+    "/gateway-trust-bundles/00000000-0000-0000-0000-000000000000",
     "/gateway-trust/status",
     "/backup",
     "/audit",
 ];
+
+const NAMESPACE_SCOPED_POSTS: &[&str] = &["/batch", "/restore?confirm=true"];
 
 fn ceiling_admin_state(
     cached: Arc<ArcSwap<GatewayConfig>>,
@@ -783,6 +787,75 @@ async fn viewer_key_token_is_refused_outside_the_namespace_ceiling_on_every_rout
     )
     .await;
     assert_ceiling_refusal(&reply, "POST /proxies (prod)");
+}
+
+#[tokio::test]
+async fn ceiling_bound_viewers_are_denied_global_routes_except_the_explicit_allowlist() {
+    let config = cached(registry_config());
+    let (base, _sd) = start_admin(ceiling_admin_state(config, false, "staging")).await;
+    let ceiling_viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+
+    for path in [
+        "/charges",
+        "/metrics",
+        "/admin/metrics",
+        "/metrics/runtime",
+        "/cluster",
+        "/backend-capabilities",
+        "/overload",
+    ] {
+        let reply = get(&base, path, Some(&ceiling_viewer), None).await;
+        assert_ceiling_refusal(&reply, &format!("GET {path}"));
+    }
+
+    for path in [
+        "/namespaces",
+        "/namespaces/staging",
+        "/plugins",
+        "/health",
+        "/live",
+        "/status",
+    ] {
+        let reply = get(&base, path, Some(&ceiling_viewer), None).await;
+        assert_eq!(reply.status, 200, "GET {path}: {}", reply.text);
+    }
+
+    // A viewer-key token without a configured ceiling keeps the existing
+    // global read behavior.
+    let config = cached(registry_config());
+    let (base, _sd) = start_admin(admin_state(config, false)).await;
+    let fleet_viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    for path in [
+        "/charges",
+        "/metrics",
+        "/admin/metrics",
+        "/metrics/runtime",
+        "/cluster",
+        "/backend-capabilities",
+    ] {
+        let reply = get(&base, path, Some(&fleet_viewer), None).await;
+        assert_ne!(reply.status, 403, "GET {path}: {}", reply.text);
+    }
+}
+
+#[tokio::test]
+async fn ceiling_bound_viewers_cannot_post_batch_or_restore_outside_the_ceiling() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(ceiling_admin_state(config, false, "staging")).await;
+    let viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+
+    for path in NAMESPACE_SCOPED_POSTS {
+        let reply = send(
+            reqwest::Method::POST,
+            &base,
+            path,
+            Some(&viewer),
+            Some("prod"),
+            Some(&json!({})),
+        )
+        .await;
+        assert_ceiling_refusal(&reply, &format!("POST {path}"));
+    }
 }
 
 #[tokio::test]
@@ -905,18 +978,28 @@ async fn database_namespace_registry_is_filtered_to_the_viewer_namespace_ceiling
         .expect("consumer fixture deserializes");
         db.create_consumer(&consumer).await.expect("seed consumer");
     }
-    let mut state = ceiling_admin_state(cached(GatewayConfig::default()), false, "staging");
+    let mut state = ceiling_admin_state(cached(GatewayConfig::default()), true, "staging");
     state.db = Some(Arc::new(db));
     state.mode = "database".to_string();
     let (base, _sd) = start_admin(state).await;
 
-    let viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+    let viewer = token(
+        VIEWER_SECRET,
+        Algorithm::HS256,
+        "viewer",
+        Some(json!("staging")),
+    );
     let list = get(&base, "/namespaces", Some(&viewer), None).await;
     assert_eq!(list.status, 200, "{}", list.text);
     let names = listed_names(&list);
     assert_eq!(names, ["staging"], "{}", list.text);
 
-    let primary = token(PRIMARY_SECRET, Algorithm::HS256, "viewer", None);
+    let primary = token(
+        PRIMARY_SECRET,
+        Algorithm::HS256,
+        "viewer",
+        Some(json!(["prod", "staging"])),
+    );
     let list = get(&base, "/namespaces", Some(&primary), None).await;
     let names = listed_names(&list);
     assert!(names.iter().any(|name| name == "prod"), "{}", list.text);
@@ -931,7 +1014,7 @@ async fn database_namespace_registry_is_filtered_to_the_viewer_namespace_ceiling
 
 #[tokio::test]
 async fn viewer_namespace_ceiling_composes_with_namespace_claim_enforcement() {
-    let config = cached(two_tenant_config(STAGING_KEY));
+    let config = cached(registry_config());
     let (base, _sd) = start_admin(ceiling_admin_state(config, true, "staging")).await;
 
     let staging_claim = Some(json!(["staging"]));
@@ -958,6 +1041,39 @@ async fn viewer_namespace_ceiling_composes_with_namespace_claim_enforcement() {
     // Listing is filtered by both.
     let list = get(&base, "/namespaces", Some(&scoped), None).await;
     assert_eq!(list.status, 200, "{}", list.text);
+    assert_eq!(listed_names(&list), ["staging"], "{}", list.text);
+}
+
+#[tokio::test]
+async fn ceiling_refused_backup_is_recorded_with_namespace_ceiling_decision() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Arc::new(sqlite_store(&dir).await);
+    let mut state = ceiling_admin_state(cached(two_tenant_config(STAGING_KEY)), false, "staging");
+    state.db = Some(db.clone());
+    state.mode = "database".to_string();
+    let (base, _sd) = start_admin(state).await;
+    let viewer = token(VIEWER_SECRET, Algorithm::HS256, "viewer", None);
+
+    let reply = get(&base, "/backup", Some(&viewer), Some("prod")).await;
+    assert_ceiling_refusal(&reply, "GET /backup (prod)");
+
+    let rows = db
+        .list_audit_events(
+            "ferrum",
+            &ferrum_edge::admin::audit::AuditListFilter {
+                action: Some("backup".to_string()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list backup security audit rows");
+    let event = rows
+        .items
+        .iter()
+        .find(|event| event.outcome == "denied")
+        .expect("ceiling refusal is durably audited");
+    assert_eq!(event.diff["namespace_ceiling"], "outside");
 }
 
 #[tokio::test]

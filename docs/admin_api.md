@@ -153,10 +153,19 @@ are never affected.
   enforcement on, a namespace must be inside the ceiling **and** the claim.
   Diagnostic reference lookups use the narrowed claim, and viewer-key tokens
   never hold `diagnostics:read` in any case.
-- Global surfaces that are not selected by `X-Ferrum-Namespace` (observability,
-  `/cluster`, mesh introspection, `GET /plugins`, `/charges`) are unchanged.
-- Refusals log `audit.event = "admin_namespace_authz"` with
-  `namespace_ceiling = "outside"` next to `actor` and `key_tier`; `ns`-claim
+- Namespace matching is exact and case-sensitive.
+- For a ceiling-bound viewer-key token, global routes fail closed with `403`
+  unless they are `GET /namespaces`, `GET /namespaces/{name}`, `GET /plugins`
+  (plugin type catalog), or health/liveness/readiness probes (`GET /health`,
+  `/live`, `/status`). This includes `/charges`, detailed
+  `/metrics`, `/admin/metrics`, `/metrics/runtime`, `/cluster`,
+  `/backend-capabilities`, `/overload`, mesh introspection, and all other global routes.
+  The namespace registry remains filtered as described above. Primary-key
+  tokens and viewer-key tokens without a namespace ceiling retain existing
+  global-route access.
+- Namespace refusals log `audit.event = "admin_namespace_authz"` with
+  `namespace_ceiling = "outside"` next to `actor` and `key_tier`; global-route
+  refusals use `namespace_ceiling = "global_route_denied"`. `ns`-claim
   refusals and served exports also carry `namespace_ceiling`
   (`within`, `outside`, or `not_applicable`). `GET /backup` security audit
   records for a ceiling-bound token add `namespace_ceiling` to their `diff`.

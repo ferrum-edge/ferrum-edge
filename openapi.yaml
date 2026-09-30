@@ -44,8 +44,16 @@ info:
     effectively read-only on the wire). Process/runtime surfaces such as
     observability, cluster state, backend capabilities, TLS management, and mesh
     topology reflect the current node or control-plane state and are not
-    namespace-filtered unless their operation explicitly declares the namespace
-    header. Both `/gateway-trust-bundles` and `/gateway-trust` (including
+    selected by the namespace header. However, when a viewer-key token carries
+    `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, every global route is denied with
+    `403` unless it is the filtered `/namespaces` registry, `GET /plugins`
+    (plugin type catalog), or a health/liveness/readiness probe (`GET /health`,
+    `/live`, `/status`). This fail-closed rule includes `/charges`,
+    detailed `/metrics`, `/admin/metrics`, `/metrics/runtime`, `/cluster`,
+    `/backend-capabilities`, `/overload`, mesh introspection, and new global routes by
+    default. Primary-key tokens and viewer-key tokens without a namespace
+    ceiling retain existing access. Both `/gateway-trust-bundles` and
+    `/gateway-trust` (including
     `GET /gateway-trust/status`) are namespace-scoped. Audit events for those
     fleet-global mutations (TLS/ACME management
     and `POST /mesh/config-revision/reset`) are stored under the canonical
@@ -7982,7 +7990,7 @@ components:
         |----------|---------|-------------|
         | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key (minimum 32 characters) |
         | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | *(unset)* | Optional second signing key (minimum 32 characters, distinct from `FERRUM_ADMIN_JWT_SECRET`) whose tokens are capped at `viewer` |
-        | `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` | *(unset: fleet-wide)* | Optional comma-separated namespace ceiling for tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET` |
+        | `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` | *(unset: fleet-wide)* | Optional comma-separated, exact and case-sensitive namespace ceiling for tokens verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`; denies global routes except filtered namespaces, plugin type catalog, and health probes |
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
         | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds); `0` disables the cap |
 
@@ -8016,15 +8024,20 @@ components:
         as `viewer-key:<sub>`.
 
         Namespace ceiling: when `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` is set, a
-        viewer-secret token may read only the listed namespaces, whatever its
-        `ns` claim or `X-Ferrum-Namespace` says, independently of
+        viewer-secret token may read only the listed namespaces, matched exactly
+        and case-sensitively, whatever its `ns` claim or `X-Ferrum-Namespace`
+        says, independently of
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`. Every namespace-scoped route and
         `GET /config/export` answer `403` for a namespace outside it (the
         answer depends only on the credential and the requested name), as does
         `GET /namespaces/{name}`, and `GET /namespaces` is filtered to it. A
-        present `ns` claim is narrowed to `claim ∩ ceiling`. Tokens verified by
-        `FERRUM_ADMIN_JWT_SECRET` are never affected. Unset, the viewer secret
-        is a fleet-wide read credential; per-tenant readers can also use tokens
+        present `ns` claim is narrowed to `claim ∩ ceiling`. Every global route
+        is denied with `403` by default for a ceiling-bound token except the
+        filtered namespace registry, `GET /plugins` (plugin type catalog), and
+        health/liveness/readiness probes (`GET /health`, `/live`, `/status`,
+        `/overload`). Tokens verified by `FERRUM_ADMIN_JWT_SECRET` are never
+        affected. Unset, the viewer secret is a fleet-wide read credential;
+        per-tenant readers can also use tokens
         pre-minted with the primary key and an `ns` claim.
 
     metricsBearerAuth:
