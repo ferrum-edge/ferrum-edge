@@ -583,7 +583,7 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 ///   gateway will replay as a cache hit, so it is redacted wholesale.
 /// * `redis_url` credentials — Redis ACL credentials are documented as
 ///   encodable in the URL (`redis://user:pass@host`). Userinfo is replaced and
-///   query/fragment data is removed; scheme/host/port/database stay visible as
+///   query/fragment data is marked; scheme/host/port/database stay visible as
 ///   bounded diagnostics. A URL *fragment* can no longer reach storage at all
 ///   (issue #4147: redis-rs reads `#insecure` as a TLS-verification opt-out, so
 ///   admission refuses any fragment), but the projection still strips fragments
@@ -637,7 +637,7 @@ async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
     let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
     assert_eq!(status, 201, "plugin create failed: {body:?}");
 
-    let expected_url = "redis://redacted@cache.internal:6379/3";
+    let expected_url = "redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]";
 
     for (role, actor) in [("viewer", &viewer), ("operator", &operator)] {
         let (status, projected) =

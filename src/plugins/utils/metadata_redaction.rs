@@ -102,6 +102,12 @@ pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 /// `scheme://redacted@host`, with no password.
 pub const REDACTED_USERINFO_PLACEHOLDER: &str = "redacted";
 
+/// Placeholder substituted for a URL query that may carry credentials.
+pub const REDACTED_QUERY_PLACEHOLDER: &str = "[REDACTED_QUERY]";
+
+/// Placeholder substituted for a URL fragment that may carry credentials.
+pub const REDACTED_FRAGMENT_PLACEHOLDER: &str = "[REDACTED_FRAGMENT]";
+
 /// Operator-supplied extras parsed once from `FERRUM_LOG_REDACT_METADATA_KEYS`.
 ///
 /// Stored lowercased and trimmed. `None`-equivalent: an empty `Vec`.

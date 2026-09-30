@@ -125,9 +125,14 @@ fn unknown_custom_plugins_get_no_schema_rules_but_still_project() {
 fn endpoint_url_projection_keeps_only_origin_and_structural_markers() {
     assert_eq!(
         redact_endpoint_url("https://user:pw@collector.example.com:4318/v1/traces?k=v#frag"),
-        "https://collector.example.com:4318/[REDACTED_PATH]?[REDACTED_QUERY]#[REDACTED_FRAGMENT]"
+        "https://redacted@collector.example.com:4318/[REDACTED_PATH]?[REDACTED_QUERY]#[REDACTED_FRAGMENT]"
     );
-    // No path/query/fragment means no markers — the origin alone is emitted.
+    // Userinfo gets its own marker even when the URL has no other suffix.
+    assert_eq!(
+        redact_endpoint_url("https://user:pw@collector.example.com"),
+        "https://redacted@collector.example.com"
+    );
+    // Without userinfo or suffix components, the origin alone is emitted.
     assert_eq!(
         redact_endpoint_url("https://collector.example.com"),
         "https://collector.example.com"
@@ -786,7 +791,7 @@ fn redis_url_keeps_its_documented_projection_shape() {
     );
     assert_eq!(
         projected["redis_url"],
-        "redis://redacted@cache.internal:6379/3"
+        "redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]#[REDACTED_FRAGMENT]"
     );
     // `redis_username` is not secret material and stays visible.
     assert_eq!(projected["redis_username"], "cacheuser");
@@ -799,6 +804,27 @@ fn redis_url_keeps_its_documented_projection_shape() {
             "redis-frag-canary",
         ],
     );
+}
+
+#[test]
+fn redis_projection_placeholders_are_detected_at_the_masked_site() {
+    for (raw_url, expected) in [
+        (
+            "redis://redacted@h:6379/0",
+            "redis://redacted@h:6379/0",
+        ),
+        (
+            "redis://h:6379/0?[REDACTED_QUERY]",
+            "redis://h:6379/0?[REDACTED_QUERY]",
+        ),
+    ] {
+        let mut config = json!({"redis_url": raw_url, "sync_mode": "redis"});
+        let recorder = PlaceholderSiteRecorder::default();
+        project_plugin_config_with("rate_limiting", &mut config, "/config", &recorder);
+        assert_eq!(config["redis_url"], expected);
+        assert_eq!(recorder.into_sites(), vec!["/config/redis_url".to_string()]);
+        assert!(is_redaction_placeholder(&config["redis_url"]));
+    }
 }
 
 /// `workload_metrics` accepts the same tracing-provider endpoint families as
@@ -1192,9 +1218,10 @@ fn redaction_placeholder_matches_only_the_exact_markers() {
         json!("https://collector.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"),
         json!("https://collector.example.com?[REDACTED_QUERY]"),
         json!("https://collector.example.com#[REDACTED_FRAGMENT]"),
+        json!("https://redacted@collector.example.com"),
         // A partial edit that keeps one marker still carries it.
         json!("https://other.example.com:8443/[REDACTED_PATH]?page=2"),
-        json!("redis://redacted@cache.internal:6379/3"),
+        json!("redis://redacted@cache.internal:6379/3?[REDACTED_QUERY]"),
         json!("postgres://redacted@db.internal/app"),
     ] {
         assert!(is_redaction_placeholder(&marker), "{marker} not matched");

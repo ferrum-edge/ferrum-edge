@@ -6152,6 +6152,9 @@ paths:
       description: |
         Creates the plugin configuration.
 
+        A write that sends a redaction placeholder returned by the caller's
+        masked read back as a stored secret is rejected with `400`.
+
         The complete prospective plugin chain is validated before persistence.
         Invalid CORS/mesh-dispatch ordering, exclusive-instance conflicts,
         effective metric-tag plan budgets or global registry ownership return
@@ -6407,6 +6410,9 @@ paths:
     post:
       operationId: createUpstream
       summary: Create an upstream
+      description: |
+        A write that sends a redaction placeholder returned by the caller's
+        masked read back as a stored secret is rejected with `400`.
       tags: [Upstreams]
       requestBody:
         required: true

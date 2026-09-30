@@ -69,9 +69,11 @@ use crate::plugins::utils::redis_rate_limiter;
 /// Placeholder substituted for a URL path that may carry credentials.
 pub const REDACTED_PATH_PLACEHOLDER: &str = "[REDACTED_PATH]";
 /// Placeholder substituted for a URL query that may carry credentials.
-pub const REDACTED_QUERY_PLACEHOLDER: &str = "[REDACTED_QUERY]";
+pub const REDACTED_QUERY_PLACEHOLDER: &str =
+    crate::plugins::utils::metadata_redaction::REDACTED_QUERY_PLACEHOLDER;
 /// Placeholder substituted for a URL fragment that may carry credentials.
-pub const REDACTED_FRAGMENT_PLACEHOLDER: &str = "[REDACTED_FRAGMENT]";
+pub const REDACTED_FRAGMENT_PLACEHOLDER: &str =
+    crate::plugins::utils::metadata_redaction::REDACTED_FRAGMENT_PLACEHOLDER;
 
 /// How a schema-declared config path must be projected.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -845,8 +847,8 @@ pub fn is_safe_kafka_producer_property(key: &str) -> bool {
 /// Project a credential-bearing endpoint URL down to its structural form.
 ///
 /// Emits `scheme://host[:port]` plus a marker for each component that was
-/// present and may carry credentials. Userinfo is never emitted. Fails closed
-/// to [`REDACTED_PLACEHOLDER`] when the value does not parse or has no host,
+/// present and may carry credentials. Original userinfo is never emitted.
+/// Fails closed to [`REDACTED_PLACEHOLDER`] when the value does not parse or has no host,
 /// because a value that cannot be structurally decomposed cannot be shown to be
 /// credential-free.
 pub fn redact_endpoint_url(raw: &str) -> String {
@@ -859,7 +861,12 @@ pub fn redact_endpoint_url(raw: &str) -> String {
         Some(url::Host::Ipv6(host)) => format!("[{host}]"),
         None => return REDACTED_PLACEHOLDER.to_string(),
     };
-    let mut redacted = format!("{}://{}", parsed.scheme(), host);
+    let mut redacted = format!("{}://", parsed.scheme());
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        redacted.push_str(REDACTED_USERINFO_PLACEHOLDER);
+        redacted.push('@');
+    }
+    redacted.push_str(&host);
     if let Some(port) = parsed.port() {
         redacted.push(':');
         redacted.push_str(&port.to_string());

@@ -1151,8 +1151,8 @@ impl RedisConfig {
     }
 }
 
-/// Strip userinfo, query, and fragment from a connection URL, keeping
-/// scheme/host/port/path.
+/// Replace userinfo, query, and fragment in a connection URL with markers,
+/// keeping scheme/host/port/path.
 ///
 /// Only `redis` / `rediss` URLs receive the diagnostic-preserving projection.
 /// Any other parseable scheme (including opaque `data:` / `mailto:` values and
@@ -1186,11 +1186,16 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
     {
         return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string();
     }
-    // Redis URLs may carry non-secret transport options in the query, but
-    // arbitrary disabled/unvalidated plugin configs can also put credentials
-    // there or in a fragment. Neither is needed to identify the destination.
-    parsed.set_query(None);
-    parsed.set_fragment(None);
+    // Keep explicit markers so a caller who writes this projection back does
+    // not silently erase a stripped query or fragment.
+    if parsed.query().is_some() {
+        parsed.set_query(Some(super::metadata_redaction::REDACTED_QUERY_PLACEHOLDER));
+    }
+    if parsed.fragment().is_some() {
+        parsed.set_fragment(Some(
+            super::metadata_redaction::REDACTED_FRAGMENT_PLACEHOLDER,
+        ));
+    }
     parsed.to_string()
 }
 
