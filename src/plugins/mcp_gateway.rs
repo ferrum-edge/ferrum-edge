@@ -1013,7 +1013,6 @@ struct McpCatalog {
     collision_tombstone_overflow: BTreeSet<&'static str>,
 }
 
-
 impl McpCatalog {
     fn is_stale(&self, ttl: Duration) -> bool {
         match self.last_refreshed_at {
