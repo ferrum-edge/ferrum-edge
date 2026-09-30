@@ -12728,6 +12728,11 @@ fn grant_fixture(entry: Value) -> Value {
     schema_fixture(json!({ "policy": { "tools": { "demo.thing": entry } } }))
 }
 
+/// An aggregate fixture whose single `policy.tools` entry is `key` → `entry`.
+fn grant_key_fixture(key: &str, entry: Value) -> Value {
+    schema_fixture(json!({ "policy": { "tools": { (key): entry } } }))
+}
+
 /// Distinct ACL group names `group-{start}` through `group-{end - 1}`.
 fn numbered_groups(start: usize, end: usize) -> Vec<String> {
     (start..end).map(|index| format!("group-{index}")).collect()
@@ -12914,6 +12919,14 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
         (
             "too many grant group entries",
             grant_fixture(json!({ "action": "allow", "allowed_groups": vec!["same"; 513] })),
+        ),
+        (
+            "control-character grant group",
+            grant_fixture(json!({ "action": "allow", "allowed_groups": ["a\x01b"] })),
+        ),
+        (
+            "tab-bearing grant group",
+            grant_fixture(json!({ "action": "allow", "allowed_groups": ["a\tb"] })),
         ),
         // Unknown keys, at every placement the constructor closes.
         ("unknown root key", schema_fixture(json!({ "bogus": 1 }))),
@@ -13149,6 +13162,17 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
                     "two": { "upstream_url": "http://127.0.0.1:10/mcp", "namespace": "same" }
                 }
             })),
+        ),
+        (
+            "multi-byte grant group over 255 bytes",
+            grant_fixture(json!({ "action": "allow", "allowed_groups": ["é".repeat(128)] })),
+        ),
+        (
+            "grant key outside every server namespace",
+            grant_key_fixture(
+                "other.thing",
+                json!({ "action": "allow", "denied_groups": ["x"] }),
+            ),
         ),
         (
             "a grant group in both lists",
@@ -14400,12 +14424,12 @@ async fn denied_groups_take_precedence_over_allowed_groups() {
     assert_routed(&result, "admins still grants create_pr");
 }
 
-/// No mapped Consumer (an anonymous proxy, or an external identity without a
-/// Consumer mapping) is never granted a group-conditioned tool; ungated tools
-/// keep working for it.
 /// A named way of building a caller for a request body.
 type CallerCase = (&'static str, fn(Value) -> McpCaller);
 
+/// No mapped Consumer (an anonymous proxy, or an external identity without a
+/// Consumer mapping) is never granted a group-conditioned tool; ungated tools
+/// keep working for it.
 #[tokio::test]
 async fn group_conditioned_tools_fail_closed_without_a_consumer() {
     let (_server, plugin) = grant_plugin().await;
@@ -14647,6 +14671,9 @@ async fn tool_grants_filter_the_aggregate_catalog_across_upstreams() {
 fn tool_grant_config_errors_are_clear_and_withhold_group_names() {
     let secret = "MCP_GROUP_SECRET";
     let over_long = format!("{secret}{}", "g".repeat(255));
+    // 136 characters but 256 bytes: the bound is in bytes, like Consumer groups.
+    let multi_byte = format!("{secret}{}", "é".repeat(120));
+    let control = format!("{secret}\x07");
     let cases = [
         (
             json!({ "action": "allow", "allowed_groups": [] }),
@@ -14670,7 +14697,19 @@ fn tool_grant_config_errors_are_clear_and_withhold_group_names() {
         ),
         (
             json!({ "action": "allow", "allowed_groups": [over_long] }),
-            "must not exceed 255 characters",
+            "must not exceed 255 bytes",
+        ),
+        (
+            json!({ "action": "allow", "allowed_groups": [multi_byte] }),
+            "must not exceed 255 bytes",
+        ),
+        (
+            json!({ "action": "allow", "denied_groups": [control] }),
+            "must not contain control characters",
+        ),
+        (
+            json!({ "action": "deny", "allowed_groups": [] }),
+            "require `action: allow`",
         ),
         (
             json!({ "action": "allow", "allowed_groups": vec![secret; 513] }),
@@ -14714,6 +14753,51 @@ fn tool_grant_config_errors_are_clear_and_withhold_group_names() {
     );
     assert!(!error.contains("group-512"), "{error}");
 
+    // A group-conditioned key must be a tool some enabled, tool-exposing
+    // server could publish under `discovery.namespace_separator`.
+    let grant = json!({ "action": "allow", "allowed_groups": ["readers"] });
+    let servers = json!({
+        "demo": { "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "demo" },
+        "docs": {
+            "upstream_url": "http://127.0.0.1:10/mcp",
+            "namespace": "docs",
+            "expose_tools": false,
+            "expose_resources": true
+        },
+        "off": { "upstream_url": "http://127.0.0.1:11/mcp", "namespace": "off", "enabled": false }
+    });
+    for key in [
+        "thing",
+        "demo_thing",
+        "other.thing",
+        "demo.",
+        "docs.thing",
+        "off.thing",
+    ] {
+        let config = schema_fixture(json!({
+            "servers": servers.clone(),
+            "policy": { "tools": { (key): grant.clone() } }
+        }));
+        let error = create_plugin("mcp_gateway", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{key} must be rejected"));
+        assert!(
+            error.contains("so the grant could never apply"),
+            "{key}: {error}"
+        );
+    }
+    let custom_separator = |key: &str| {
+        schema_fixture(json!({
+            "discovery": { "namespace_separator": "__" },
+            "policy": { "tools": { (key): grant.clone() } }
+        }))
+    };
+    assert!(create_plugin("mcp_gateway", &custom_separator("demo__thing")).is_ok());
+    assert!(create_plugin("mcp_gateway", &custom_separator("demo.thing")).is_err());
+    // Tool-name-only entries are not restricted to known namespaces.
+    let plain = grant_key_fixture("other.thing", json!({ "action": "deny" }));
+    assert!(create_plugin("mcp_gateway", &plain).is_ok());
+
     // Accepted: explicit nulls, duplicate names, a deny-only grant, and
     // exactly the cap.
     for entry in [
@@ -14728,4 +14812,182 @@ fn tool_grant_config_errors_are_clear_and_withhold_group_names() {
             "{entry}"
         );
     }
+}
+
+/// Nothing emits `notifications/*/list_changed`, so the synthetic `initialize`
+/// must not promise it.
+#[tokio::test]
+async fn aggregate_initialize_does_not_advertise_list_changed() {
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(initialize_request_body());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let capabilities = &body["result"]["capabilities"];
+    for family in ["tools", "resources", "prompts"] {
+        assert_eq!(
+            capabilities[family]["listChanged"],
+            json!(false),
+            "{family}: {body}"
+        );
+    }
+}
+
+/// A batch `tools/list` member is filtered per caller, and a batch `tools/call`
+/// member is refused as singleton-only (`-32009`) whatever the grant says.
+#[tokio::test]
+async fn tool_grants_apply_inside_a_json_rpc_batch() {
+    let (_server, plugin) = grant_plugin().await;
+    let writer = consumer_with_groups("writer", &["pr-writers"]);
+    let outsider = consumer_with_groups("outsider", &["unrelated"]);
+    for (consumer, expected) in [
+        (&writer, vec!["github.create_pr", "github.hidden_new"]),
+        (&outsider, vec!["github.hidden_new"]),
+    ] {
+        let session = session_for(&plugin, consumer).await;
+        let batch = json!([
+            tools_list_body(1),
+            named_tool_call(2, "github.create_pr"),
+            named_tool_call(3, "github.merge_pr")
+        ]);
+        let (result, _) = send_on_session(&plugin, &session, caller_with(batch, consumer)).await;
+        let (status, body, _) = reject_json(result);
+        assert_eq!(status, 200);
+        let responses = body.as_array().expect("a batch answers with an array");
+        assert_eq!(responses.len(), 3, "{body}");
+        let mut names: Vec<&str> = responses[0]["result"]["tools"]
+            .as_array()
+            .expect("the tools/list member has a result")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, expected, "{}", consumer.id);
+        for response in &responses[1..] {
+            assert_eq!(response["error"]["code"], json!(-32009), "{response}");
+        }
+    }
+}
+
+/// With `sessions.sse_multiplexing` on and a client that accepts an event
+/// stream, grant decisions are unchanged: gateway-authored answers stay inline
+/// JSON, and only a granted call opens a request stream.
+#[tokio::test]
+async fn tool_grants_hold_on_the_sse_multiplexed_post_path() {
+    let (_server, plugin) = grant_plugin_with(|config| {
+        config["sessions"] = json!({ "sse_multiplexing": true });
+    })
+    .await;
+    let writer = consumer_with_groups("writer", &["pr-writers"]);
+    let session = session_for(&plugin, &writer).await;
+    let sse_caller = |body: Value| {
+        let (ctx, mut headers) = caller_with(body, &writer);
+        headers.insert("accept".to_string(), CLIENT_ACCEPTS_BOTH.to_string());
+        (ctx, headers)
+    };
+
+    let (result, ctx) = send_on_session(&plugin, &session, sse_caller(tools_list_body(2))).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
+    let mut names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .expect("tools/list has a result")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["github.create_pr", "github.hidden_new"]);
+
+    let call = sse_caller(named_tool_call(3, "github.merge_pr"));
+    let (result, ctx) = send_on_session(&plugin, &session, call).await;
+    assert!(!mcp_sse_stream_is_open_for_test(&ctx));
+    assert_eq!(policy_decision(&ctx), Some("deny_group"));
+    assert_tool_call_denied(result, 3);
+
+    let call = sse_caller(named_tool_call(4, "github.create_pr"));
+    let (result, ctx) = send_on_session(&plugin, &session, call).await;
+    assert_routed(&result, "a granted call on the SSE path");
+    assert!(mcp_sse_stream_is_open_for_test(&ctx));
+    assert_eq!(policy_decision(&ctx), Some("allow"));
+}
+
+/// Interned group indices at the edges of the bit set's 64-bit words: 63 and
+/// 64 straddle the first boundary and 511 is the last representable bit.
+#[tokio::test]
+async fn tool_grants_resolve_group_bits_across_word_boundaries() {
+    let (_server, plugin) = grant_plugin_with(|config| {
+        // `github.create_pr` sorts, and is written, first, so `group-{i}` is
+        // interned at index `i`.
+        config["policy"]["tools"] = json!({
+            "github.create_pr": { "action": "allow", "allowed_groups": numbered_groups(0, 512) },
+            "github.hidden_new": { "action": "allow", "allowed_groups": ["group-511"] },
+            "github.merge_pr": { "action": "allow", "allowed_groups": ["group-64"] }
+        });
+    })
+    .await;
+    for (group, expected) in [
+        ("group-0", vec!["github.create_pr"]),
+        ("group-63", vec!["github.create_pr"]),
+        ("group-64", vec!["github.create_pr", "github.merge_pr"]),
+        ("group-511", vec!["github.create_pr", "github.hidden_new"]),
+        ("group-512", vec![]),
+    ] {
+        let consumer = consumer_with_groups(group, &[group]);
+        let session = session_for(&plugin, &consumer).await;
+        assert_eq!(
+            tools_listed_to(&plugin, &session, &consumer).await,
+            expected,
+            "{group}"
+        );
+    }
+
+    let bit_63 = consumer_with_groups("bit-63", &["group-63"]);
+    let session = session_for(&plugin, &bit_63).await;
+    let (result, _) = call_tool_as(&plugin, &session, &bit_63, 80, "github.merge_pr").await;
+    assert_tool_call_denied(result, 80);
+    let bit_64 = consumer_with_groups("bit-64", &["group-64"]);
+    let session = session_for(&plugin, &bit_64).await;
+    let (result, _) = call_tool_as(&plugin, &session, &bit_64, 81, "github.merge_pr").await;
+    assert_routed(&result, "group-64 grants merge_pr");
+}
+
+/// An entry with only `denied_groups` grants every mapped Consumer outside
+/// those groups, and still never a request with no mapped Consumer.
+#[tokio::test]
+async fn a_denied_groups_only_entry_still_requires_a_consumer() {
+    let (_server, plugin) = grant_plugin_with(|config| {
+        let entry = json!({ "action": "allow", "denied_groups": ["contractors"] });
+        config["policy"]["tools"]["github.hidden_new"] = entry;
+    })
+    .await;
+
+    let session = initialize_as(&plugin, caller_unauthenticated(initialize_request_body())).await;
+    let caller = caller_unauthenticated(tools_list_body(2));
+    let listed = listed_tools(&plugin, &session, caller).await;
+    assert!(listed.is_empty(), "{listed:?}");
+    let call = caller_unauthenticated(named_tool_call(90, "github.hidden_new"));
+    let (result, ctx) = send_on_session(&plugin, &session, call).await;
+    assert_tool_call_denied(result, 90);
+    assert_eq!(policy_decision(&ctx), Some("deny_no_consumer"));
+
+    let employee = consumer_with_groups("employee", &[]);
+    let session = session_for(&plugin, &employee).await;
+    assert_eq!(
+        tools_listed_to(&plugin, &session, &employee).await,
+        vec!["github.hidden_new"]
+    );
+    let (result, _) = call_tool_as(&plugin, &session, &employee, 91, "github.hidden_new").await;
+    assert_routed(&result, "a mapped Consumer outside denied_groups");
+
+    let contractor = consumer_with_groups("contractor", &["contractors"]);
+    let session = session_for(&plugin, &contractor).await;
+    let (result, ctx) = call_tool_as(&plugin, &session, &contractor, 92, "github.hidden_new").await;
+    assert_tool_call_denied(result, 92);
+    assert_eq!(policy_decision(&ctx), Some("deny_group"));
 }

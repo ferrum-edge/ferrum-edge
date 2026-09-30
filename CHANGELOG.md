@@ -27,8 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   swap the identified Consumer to carry an ungranted call upstream.
   `mcp.policy_decision` records `deny_group` or `deny_no_consumer`. Empty
   lists, group lists on `deny` / `hide_from_discovery` entries, a group in
-  both lists, and more than 512 distinct groups per policy are rejected at
-  config load. Tool-name-only policies behave exactly as before.
+  both lists, more than 512 distinct groups per policy, and a
+  group-conditioned key outside every enabled tool server's namespace are
+  rejected at config load. Grants cover `tools/list` and `tools/call` only.
+  Tool-name-only policies behave exactly as before.
   `notifications/tools/list_changed` is not yet sent when grants change.
 
 - **`otel_tracing` attempt spans on the HTTP/3 bridge to HTTP/1.1 and HTTP/2
@@ -288,6 +290,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id need updating.
 
 ### Changed
+
+- **`mcp_gateway` aggregate `initialize` advertises `listChanged: false`**
+  for tools, resources, and prompts (#5907). It advertised `true`, but the
+  gateway never emits `notifications/*/list_changed`, so a client relying on
+  it would never re-list. It returns to `true` once an emitter exists.
 
 - **Mesh `connection.sni` condition values are normalized at load** (#5903).
   Every surface that loads a policy (Kubernetes translation, file and native

@@ -409,6 +409,7 @@ impl McpPolicy {
     fn grant_view(&self, consumer: Option<&Consumer>) -> McpGrantView {
         let mut held = McpGroupSet::default();
         if let Some(consumer) = consumer {
+            // A consumer with no groups costs no lookups at all.
             for group in &consumer.acl_groups {
                 if let Some(index) = self.grant_groups.get(group.as_str()) {
                     held.insert(*index);
@@ -430,6 +431,7 @@ impl McpPolicy {
 /// with no allocation.
 const MAX_MCP_POLICY_GRANT_GROUPS: usize = 512;
 const MCP_GROUP_SET_WORDS: usize = MAX_MCP_POLICY_GRANT_GROUPS / 64;
+const _: () = assert!(MAX_MCP_POLICY_GRANT_GROUPS % 64 == 0);
 
 /// A set of interned policy group names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -437,6 +439,7 @@ struct McpGroupSet([u64; MCP_GROUP_SET_WORDS]);
 
 impl McpGroupSet {
     fn insert(&mut self, index: usize) {
+        debug_assert!(index < MAX_MCP_POLICY_GRANT_GROUPS);
         if let Some(word) = self.0.get_mut(index / 64) {
             *word |= 1u64 << (index % 64);
         }
@@ -1436,6 +1439,9 @@ impl McpGateway {
         enabled_server_ids.sort();
         if enabled_server_ids.is_empty() {
             return Err("mcp_gateway: at least one server must be enabled".to_string());
+        }
+        if mode == McpGatewayMode::AggregateRouter {
+            validate_grant_keys(&policy, &servers, &discovery.namespace_separator)?;
         }
         if mode == McpGatewayMode::TransparentProxy && enabled_server_ids.len() != 1 {
             return Err(
@@ -3981,14 +3987,18 @@ impl McpGateway {
         downstream_session_id: &str,
     ) -> PluginResult {
         let mut capabilities = Map::new();
+        // `listChanged` stays false until the gateway emits
+        // `notifications/*/list_changed`: nothing sends one today (not on a
+        // catalog refresh, not when a consumer's tool grants change), and a
+        // client that trusted `true` would never re-list.
         if self.capabilities.advertise_tools {
-            capabilities.insert("tools".to_string(), json!({"listChanged": true}));
+            capabilities.insert("tools".to_string(), json!({"listChanged": false}));
         }
         if self.capabilities.advertise_resources {
-            capabilities.insert("resources".to_string(), json!({"listChanged": true}));
+            capabilities.insert("resources".to_string(), json!({"listChanged": false}));
         }
         if self.capabilities.advertise_prompts {
-            capabilities.insert("prompts".to_string(), json!({"listChanged": true}));
+            capabilities.insert("prompts".to_string(), json!({"listChanged": false}));
         }
         if self.capabilities.advertise_logging {
             capabilities.insert("logging".to_string(), json!({}));
@@ -8785,6 +8795,39 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
     })
 }
 
+/// Refuse a group-conditioned `policy.tools` key that no catalog tool can
+/// have: one that is not an enabled, tool-exposing server's `namespace`
+/// followed by `discovery.namespace_separator` and a non-empty name.
+///
+/// Such a grant (a typo, a missing namespace, the wrong separator) would never
+/// apply, and under `default_action: allow` or `on_new_tool: allow` the real
+/// tool it was meant to restrict would stay open to every caller.
+fn validate_grant_keys(
+    policy: &McpPolicy,
+    servers: &HashMap<String, McpServerConfig>,
+    separator: &str,
+) -> Result<(), String> {
+    for (tool_name, tool) in &policy.tools {
+        if tool.grant.is_none() {
+            continue;
+        }
+        let publishable = servers.values().any(|server| {
+            server.enabled
+                && server.expose_tools
+                && tool_name
+                    .strip_prefix(server.namespace.as_str())
+                    .and_then(|rest| rest.strip_prefix(separator))
+                    .is_some_and(|name| !name.is_empty())
+        });
+        if !publishable {
+            return Err(format!(
+                "mcp_gateway: `policy.tools` key {tool_name:?} carries `allowed_groups` / `denied_groups` but is not an enabled, tool-exposing server's `namespace` followed by `discovery.namespace_separator` and a tool name, so the grant could never apply"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse the optional `allowed_groups` / `denied_groups` condition of one
 /// `policy.tools` entry, interning each group name into `grant_groups`.
 ///
@@ -8795,19 +8838,21 @@ fn parse_tool_grant(
     action: PolicyAction,
     grant_groups: &mut HashMap<String, usize>,
 ) -> Result<Option<McpToolGrant>, String> {
-    let allowed = parse_grant_group_list(object, "allowed_groups", tool_name, grant_groups)?;
-    let denied = parse_grant_group_list(object, "denied_groups", tool_name, grant_groups)?;
-    if allowed.is_none() && denied.is_none() {
+    let present = |key: &str| object.get(key).is_some_and(|value| !value.is_null());
+    if !present("allowed_groups") && !present("denied_groups") {
         return Ok(None);
     }
     // A group condition narrows an allow. On `deny` or `hide_from_discovery`
     // it could never grant anything, so it is refused rather than stored
-    // inert.
+    // inert. Checked before the lists are read, so this is the error such an
+    // entry gets whatever its lists hold.
     if action != PolicyAction::Allow {
         return Err(format!(
             "mcp_gateway: `policy.tools.*.allowed_groups` and `policy.tools.*.denied_groups` require `action: allow` for tool {tool_name:?}"
         ));
     }
+    let allowed = parse_grant_group_list(object, "allowed_groups", tool_name, grant_groups)?;
+    let denied = parse_grant_group_list(object, "denied_groups", tool_name, grant_groups)?;
     let denied = denied.unwrap_or_default();
     if allowed.is_some_and(|allowed| allowed.intersects(&denied)) {
         return Err(format!(
@@ -8858,10 +8903,21 @@ fn parse_grant_group_list(
                 "mcp_gateway: `policy.tools.*.{key}` entries must contain non-whitespace characters for tool {tool_name:?}"
             ));
         }
-        if group.chars().count() > crate::config::types::MAX_ACL_GROUP_LENGTH {
+        // The same bounds Consumer `acl_groups` admission applies (bytes, and
+        // no control characters other than tab / LF / CR), so a policy can
+        // never name a group no Consumer is able to hold.
+        if group.len() > crate::config::types::MAX_ACL_GROUP_LENGTH {
             return Err(format!(
-                "mcp_gateway: `policy.tools.*.{key}` entries must not exceed {} characters for tool {tool_name:?}",
+                "mcp_gateway: `policy.tools.*.{key}` entries must not exceed {} bytes for tool {tool_name:?}",
                 crate::config::types::MAX_ACL_GROUP_LENGTH
+            ));
+        }
+        if group
+            .bytes()
+            .any(|byte| byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r'))
+        {
+            return Err(format!(
+                "mcp_gateway: `policy.tools.*.{key}` entries must not contain control characters for tool {tool_name:?}"
             ));
         }
         let index = match grant_groups.get(group) {
