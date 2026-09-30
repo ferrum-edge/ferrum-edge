@@ -1245,10 +1245,9 @@ impl ListenerConvergenceFailure {
     }
 }
 
-/// Poll until the active listener set equals `expected_active` and the
+/// Poll until the accepting listener set equals `expected_active` and the
 /// lock-free `bind_failures` snapshot no longer lists any of
-/// `withdrawn_failure_ports` — reconcile can insert a socket before it
-/// publishes the updated failure set.
+/// `withdrawn_failure_ports`.
 ///
 /// Fallible so that a caller which reserved-and-released a port the gateway is
 /// about to bind can retry the whole scenario on a fresh port instead of

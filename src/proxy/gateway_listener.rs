@@ -512,8 +512,6 @@ struct ReconcileOutcome {
     h3_ports: Vec<u16>,
     /// Gateway listener ports this process must bind for this generation.
     desired_listeners: usize,
-    /// Gateway listener ports with a live TCP accept loop at the end of the pass.
-    active_listeners: usize,
 }
 
 type ListenerTask = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
@@ -533,6 +531,9 @@ struct LiveListener {
     /// ingress binds use `Inbound`; ordinary Gateway listeners use `None`.
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     shutdown_tx: watch::Sender<bool>,
+    /// Held until this listener's config generation has published its
+    /// admission decision. The socket is bound, but it cannot accept yet.
+    accept_gate_tx: watch::Sender<bool>,
     /// The TCP accept-loop task. Returns once every accept socket is closed;
     /// accepted connections drain in their own tasks.
     tcp: ListenerTask,
@@ -758,12 +759,18 @@ impl GatewayListenerManager {
         self
     }
 
-    /// Ports currently bound by this manager, for tests and diagnostics.
+    /// Ports with an active accept loop, for tests and diagnostics. Newly bound
+    /// listeners remain absent until their config generation is admitted.
     // The binary target re-declares these modules, so a `pub` item consumed
     // only by `tests/` reads as dead code there.
     #[allow(dead_code)]
     pub async fn active_ports(&self) -> Vec<u16> {
-        self.listeners.lock().await.keys().copied().collect()
+        self.listeners
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(port, listener)| (*listener.accept_gate_tx.borrow()).then_some(*port))
+            .collect()
     }
 
     /// `(port, bind_addr)` pairs currently owned by this manager.
@@ -814,11 +821,19 @@ impl GatewayListenerManager {
                 refused_route_ports,
                 h3_ports,
                 desired_listeners,
-                active_listeners,
             } = self.reconcile_generation(&expected).await;
+            let pending_accept_gates = self.pending_accept_gates().await;
             if !self
                 .state
-                .publish_gateway_listener_admission(&expected, refused_route_ports)
+                .publish_gateway_listener_admission(
+                    &expected,
+                    refused_route_ports,
+                    move || {
+                        for accept_gate_tx in pending_accept_gates {
+                            accept_gate_tx.send_replace(true);
+                        }
+                    },
+                )
             {
                 // The config changed while this pass awaited socket/drain
                 // work. Its decision must never govern the newer route table;
@@ -830,6 +845,13 @@ impl GatewayListenerManager {
                 );
                 continue;
             }
+            let active_listeners = self
+                .listeners
+                .lock()
+                .await
+                .values()
+                .filter(|listener| *listener.accept_gate_tx.borrow())
+                .count();
             self.state.publish_gateway_h3_alt_svc(&h3_ports);
             self.bind_failures.store(Arc::new(failures.clone()));
             // Publish the bounded operator-facing status last, and only after
@@ -1216,7 +1238,6 @@ impl GatewayListenerManager {
         // QUIC-only refusal is NOT counted here — its port is still in
         // `plan.ports` and its TCP half is expected to bind and serve.
         let desired_listeners = plan.ports.len() + plan.refused.len();
-        let active_listeners = live.len();
 
         let status_observations: Vec<GatewayListenerFailureObservation> = failures
             .iter()
@@ -1260,8 +1281,18 @@ impl GatewayListenerManager {
             refused_route_ports,
             h3_ports,
             desired_listeners,
-            active_listeners,
         }
+    }
+
+    /// Let newly bound listeners accept only after the matching route
+    /// admission snapshot has been committed to the request epoch.
+    async fn pending_accept_gates(&self) -> Vec<watch::Sender<bool>> {
+        let mut live = self.listeners.lock().await;
+        live.iter_mut()
+            .filter_map(|(_, listener)| {
+                (!*listener.accept_gate_tx.borrow()).then(|| listener.accept_gate_tx.clone())
+            })
+            .collect()
     }
 
     /// Drop finished drains so completed handles cannot accumulate for the life
@@ -1496,6 +1527,7 @@ impl GatewayListenerManager {
             client_ca_bundle_path: http3.client_ca_bundle_path.clone(),
             client_crls: http3.client_crls.clone(),
             started_tx: Some(started_tx),
+            accept_gate_rx: Some(listener.accept_gate_tx.subscribe()),
             frontend_tls_reload: http3.frontend_tls_reload(),
             // The listener arms this right after its UDP bind succeeds and
             // hands it to Quinn inside the socket, so the claim lasts exactly
@@ -1600,13 +1632,14 @@ impl GatewayListenerManager {
         let addr = SocketAddr::new(desired.bind_addr, port);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (started_tx, started_rx) = oneshot::channel();
+        let (accept_gate_tx, accept_gate_rx) = watch::channel(false);
         let state = self.state.clone();
         let tls = self.tls.clone();
         let task = tokio::spawn(async move {
             match desired.class {
                 GatewayListenerClass::Plaintext => match desired.mesh_direction {
                     Some(mesh_direction) => {
-                        crate::proxy::start_mesh_plaintext_listener_with_signal(
+                        crate::proxy::start_mesh_plaintext_listener_with_accept_gate(
                             addr,
                             state,
                             shutdown_rx,
@@ -1618,37 +1651,41 @@ impl GatewayListenerManager {
                             // host's default V6ONLY posture.
                             false,
                             Some(started_tx),
+                            Some(accept_gate_rx),
                         )
                         .await
                     }
                     None => {
-                        crate::proxy::start_proxy_listener_with_tls_and_signal(
+                        crate::proxy::start_proxy_listener_with_tls_and_accept_gate(
                             addr,
                             state,
                             shutdown_rx,
                             None,
                             Some(started_tx),
+                            Some(accept_gate_rx),
                         )
                         .await
                     }
                 },
                 GatewayListenerClass::Tls => {
                     if let Some(slot) = tls.reload_slot {
-                        crate::proxy::start_proxy_listener_with_dynamic_tls_and_signal(
+                        crate::proxy::start_proxy_listener_with_dynamic_tls_and_accept_gate(
                             addr,
                             state,
                             shutdown_rx,
                             slot,
                             Some(started_tx),
+                            Some(accept_gate_rx),
                         )
                         .await
                     } else {
-                        crate::proxy::start_proxy_listener_with_tls_and_signal(
+                        crate::proxy::start_proxy_listener_with_tls_and_accept_gate(
                             addr,
                             state,
                             shutdown_rx,
                             tls.static_config,
                             Some(started_tx),
+                            Some(accept_gate_rx),
                         )
                         .await
                     }
@@ -1671,6 +1708,7 @@ impl GatewayListenerManager {
                     bind_addr: desired.bind_addr,
                     mesh_direction: desired.mesh_direction,
                     shutdown_tx,
+                    accept_gate_tx,
                     tcp: task,
                     quic: None,
                     quic_shutdown_tx: None,
