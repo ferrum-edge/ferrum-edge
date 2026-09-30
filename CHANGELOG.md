@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
+  GHSA-7gcf-g7xr-8hxj, `cmov` 0.5.4 for GHSA-3rjw-m598-pq24, and
+  `opentelemetry_sdk` 0.32.1 for GHSA-w9wp-h8wv-79jx).
+
 ### Added
 
 - **`otel_tracing` attempt spans on the HTTP/3 bridge to HTTP/1.1 and HTTP/2
