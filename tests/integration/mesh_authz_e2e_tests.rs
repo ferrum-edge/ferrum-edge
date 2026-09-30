@@ -503,6 +503,56 @@ async fn condition_match_on_connection_sni_enforces_match_and_no_match() {
         PluginResult::Continue
     ));
 
+    let mut east_west_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    east_west_ctx.frontend_sni_hostname = Some("p9080.admin.mesh.internal".to_string());
+    assert!(
+        matches!(
+            plugin.authorize(&mut east_west_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "an exact bare-FQDN DENY must also protect its canonical east-west alias"
+    );
+
+    let mut noncanonical_alias_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    noncanonical_alias_ctx.frontend_sni_hostname = Some("p09080.admin.mesh.internal".to_string());
+    assert!(
+        matches!(
+            plugin.authorize(&mut noncanonical_alias_ctx).await,
+            PluginResult::Continue
+        ),
+        "a noncanonical lookalike must not acquire east-west alias equivalence"
+    );
+
+    let allow_sni = MeshPolicy {
+        name: "allow-admin-sni".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "connection.sni".to_string(),
+                values: vec!["admin.mesh.internal".to_string()],
+                not_values: Vec::new(),
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    };
+    let allow_plugin = build_mesh_authz_for_workload(&[], vec![allow_sni]);
+    let mut alias_shaped_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    alias_shaped_ctx.frontend_sni_hostname = Some("p9080.admin.mesh.internal".to_string());
+    assert!(
+        matches!(
+            allow_plugin.authorize(&mut alias_shaped_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "DENY compatibility must not broaden an exact ALLOW to alias-shaped hostnames"
+    );
+
     let mut missing_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
     assert!(matches!(
         plugin.authorize(&mut missing_ctx).await,

@@ -423,9 +423,10 @@ outright with no deprecation period:
     when it names that port's alias (or a covering wildcard). An entry that
     names only a local service's base FQDN now logs a one-time warning.
   - Destination authorization sees the alias as `connection.sni` for
-    cross-cluster traffic. A `connection.sni` rule written against the bare
-    service FQDN no longer matches it, so a DENY rule written that way stops
-    applying.
+    cross-cluster traffic. Exact DENY values written against the bare service
+    FQDN also match its canonical per-port TCP or UDP alias, so an existing
+    denial remains effective across the wire-format change without broadening
+    ALLOW or AUDIT rules.
 - **Non-reserved xDS DestinationRule ECDS carriers.** A resource carrying the
   DestinationRule carrier type under any name other than
   `ferrum-destination-rule-carrier/<namespace>/<name>` now NACKs. Mesh config

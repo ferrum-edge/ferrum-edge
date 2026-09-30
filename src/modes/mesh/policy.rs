@@ -916,6 +916,7 @@ fn normalize_hostname(host: &str) -> Option<String> {
 struct ConditionMatchContext<'a> {
     kind: MeshConditionKeyKind,
     policy_namespace: &'a str,
+    allow_east_west_sni_alias: bool,
 }
 
 fn matches_conditions(
@@ -957,6 +958,10 @@ fn matches_conditions(
         let context = ConditionMatchContext {
             kind,
             policy_namespace,
+            // Alias equivalence exists to keep an established denial from
+            // disappearing during the east-west wire-format change. Applying
+            // it to ALLOW would broaden access for an alias-shaped hostname.
+            allow_east_west_sni_alias: matches!(action, PolicyAction::Deny),
         };
         let value = request.attributes.get(&match_.key);
         if !match_.values.is_empty()
@@ -1034,8 +1039,37 @@ fn condition_scalar_value_matches(
             istio_service_account_match(candidate, value, context.policy_namespace)
         }
         MeshConditionKeyKind::SourceNamespace => wildcard_match(candidate, value),
+        MeshConditionKeyKind::ConnectionSni => {
+            istio_condition_string_match(candidate, value)
+                || (context.allow_east_west_sni_alias
+                    && !candidate.contains('*')
+                    && east_west_sni_alias_base(value) == Some(candidate))
+        }
         _ => istio_condition_string_match(candidate, value),
     }
+}
+
+/// Return the service FQDN carried by a canonical east-west per-port alias.
+///
+/// Exact DENY `connection.sni` values written before per-port aliases were
+/// introduced must continue to protect cross-cluster traffic. Keep the actual
+/// ClientHello SNI as the attribute, but treat its canonical `p<port>.` (or
+/// UDP `p<port>-udp.`) routing label as an additional exact-match spelling of
+/// the service FQDN for DENY evaluation. Strict parsing prevents arbitrary
+/// `p...` hostnames from acquiring that equivalence.
+fn east_west_sni_alias_base(value: &str) -> Option<&str> {
+    let (label, base) = value.split_once('.')?;
+    let suffix = label.strip_prefix('p')?;
+    let port = suffix.strip_suffix("-udp").unwrap_or(suffix);
+    if port.is_empty()
+        || port.starts_with('0')
+        || !port.bytes().all(|byte| byte.is_ascii_digit())
+        || port.parse::<u16>().ok().filter(|port| *port != 0).is_none()
+        || base.is_empty()
+    {
+        return None;
+    }
+    Some(base)
 }
 
 /// Istio's namespace-relative `source.serviceAccount` comparison.

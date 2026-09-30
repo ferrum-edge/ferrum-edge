@@ -2078,7 +2078,7 @@ Every key documented in Istio's [AuthorizationPolicy conditions](https://istio.i
 | `remote.ip` | CIDR / bare IP | yes | yes | yes | resolved client IP after trusted XFF / PROXY protocol |
 | `destination.ip` | CIDR / bare IP | yes | yes | no (see below) | captured pre-NAT original destination, else the connection's local address |
 | `destination.port` | numeric `0..=65535` | yes | yes | yes | mesh inbound app port / captured outbound port / listener port |
-| `connection.sni` | Istio string match | yes | yes | yes | frontend TLS / QUIC / DTLS ClientHello SNI; cross-cluster traffic arrives with the east-west alias `p<port>.<fqdn>` (`p<port>-udp.<fqdn>` for UDP), never the bare service FQDN |
+| `connection.sni` | Istio string match plus fail-closed east-west DENY alias equivalence | yes | yes | yes | frontend TLS / QUIC / DTLS ClientHello SNI; cross-cluster traffic arrives with the east-west alias `p<port>.<fqdn>` (`p<port>-udp.<fqdn>` for UDP), while an exact bare service FQDN DENY value also matches that canonical alias |
 | `request.auth.principal` | Istio string match | yes | HTTP only | HTTP only | validated JWT `iss/sub` |
 | `request.auth.presenter` | Istio string match | yes | HTTP only | HTTP only | validated JWT scalar `azp` |
 | `request.auth.audiences` | Istio string match | yes | HTTP only | HTTP only | validated JWT `aud` |
@@ -2086,7 +2086,7 @@ Every key documented in Istio's [AuthorizationPolicy conditions](https://istio.i
 | `request.headers[<name>]` | Istio string match | yes | HTTP only | HTTP only | request headers, matched case-insensitively; `:authority`, `:method`, `:path`, and `:scheme` use typed request facts |
 | `experimental.envoy.filters.<filter>[<key>]` | Istio string match | never sourceable | never sourceable | never sourceable | Envoy dynamic metadata; Ferrum has no Envoy filter chain |
 
-**`connection.sni` on cross-cluster traffic.** A destination sidecar or terminator reads the ClientHello SNI the client sent through the east-west gateway. That SNI is the per-port [east-west alias](#multi-port-cross-cluster-sni-aliases), `p<port>.<service>.<namespace>.svc.<cluster-domain>` (or `p<port>-udp.…` for UDP), for single-port and multi-port services alike. A `connection.sni` value written against the bare service FQDN therefore never matches cross-cluster traffic, and a DENY rule written that way does not apply to it. Match the alias instead, or use a suffix match such as `*.reviews.default.svc.cluster.local` to cover every port.
+**`connection.sni` on cross-cluster traffic.** A destination sidecar or terminator reads the ClientHello SNI the client sent through the east-west gateway. That SNI is the per-port [east-west alias](#multi-port-cross-cluster-sni-aliases), `p<port>.<service>.<namespace>.svc.<cluster-domain>` (or `p<port>-udp.…` for UDP), for single-port and multi-port services alike. To keep an established denial from disappearing across the wire-format change, an exact bare-service-FQDN value in a DENY rule also matches either canonical per-port alias; this applies to both `values` and `notValues`. Alias equivalence is deliberately not applied to ALLOW or AUDIT rules because that could grant access to an alias-shaped hostname. Policies may match the alias directly, or use a suffix match such as `*.reviews.default.svc.cluster.local` to cover every port. Noncanonical lookalikes (including zero or zero-padded ports) receive no bare-FQDN equivalence.
 
 ##### Value grammars (per key)
 
