@@ -3440,11 +3440,26 @@ fn upstream_audit_body(resource: &Upstream) -> Value {
     upstream_audit_body_with(resource, &PlaceholderRendering)
 }
 
-/// The one redacted Upstream projection (non-admin reads and audit diffs),
-/// with an explicit [`RedactionRendering`] for the read-only configuration
-/// export: the Consul ACL token is withheld, and every URL-shaped string in the
-/// body (a Consul `address`, for example) has any userinfo removed.
+/// The redacted Upstream projection for `viewer` reads, audit diffs, and (with
+/// a fingerprint [`RedactionRendering`]) the read-only configuration export:
+/// the Consul ACL token is withheld, and every URL-shaped string in the body
+/// (a Consul `address`, for example) has any userinfo removed.
+///
+/// Operator reads deliberately do not use this: operators write upstreams, and
+/// a GET-then-PUT of a userinfo-stripped body would silently replace stored
+/// credentials with `redacted@`. They get [`upstream_consul_token_redacted`].
 pub(crate) fn upstream_audit_body_with(
+    resource: &Upstream,
+    rendering: &dyn RedactionRendering,
+) -> Value {
+    let mut body = upstream_consul_token_redacted(resource, rendering);
+    crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
+    body
+}
+
+/// An Upstream body with only the Consul ACL token withheld: the `operator`
+/// read projection.
+fn upstream_consul_token_redacted(
     resource: &Upstream,
     rendering: &dyn RedactionRendering,
 ) -> Value {
@@ -3459,16 +3474,17 @@ pub(crate) fn upstream_audit_body_with(
         let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
         *token = rendering.render(UPSTREAM_CONSUL_TOKEN_POINTER, &stored, marker);
     }
-    crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
     body
 }
 
 /// JSON pointer of the Consul ACL token inside an Upstream body.
 const UPSTREAM_CONSUL_TOKEN_POINTER: &str = "/service_discovery/consul/token";
 
-/// The one redacted Proxy projection (non-admin reads and audit diffs), with an
-/// explicit [`RedactionRendering`] for the read-only configuration export: any
-/// URL-shaped string carrying userinfo is stripped.
+/// The redacted Proxy projection for `viewer` reads, audit diffs, and (with a
+/// fingerprint [`RedactionRendering`]) the read-only configuration export: any
+/// URL-shaped string carrying userinfo is stripped. `admin` and `operator` reads
+/// stay raw, because both roles write proxies and a GET-then-PUT must not
+/// replace stored userinfo with `redacted@`.
 pub(crate) fn proxy_audit_body_with(resource: &Proxy, rendering: &dyn RedactionRendering) -> Value {
     let mut body = json!(resource);
     crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
@@ -3709,10 +3725,12 @@ impl AdminResource for Upstream {
     }
 
     fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
-        if role == AdminRole::Admin {
-            Self::response_body(resource)
-        } else {
-            upstream_audit_body(resource)
+        match role {
+            AdminRole::Admin => Self::response_body(resource),
+            // Operators write upstreams: withhold only the Consul token (as
+            // before issue #5904) so a GET-then-PUT keeps stored URL userinfo.
+            AdminRole::Operator => upstream_consul_token_redacted(resource, &PlaceholderRendering),
+            AdminRole::Viewer => upstream_audit_body(resource),
         }
     }
 
@@ -4622,10 +4640,11 @@ impl AdminResource for Proxy {
     }
 
     fn response_body_for_role(resource: &Self, role: AdminRole) -> Value {
-        if role == AdminRole::Admin {
-            Self::response_body(resource)
-        } else {
-            proxy_audit_body_with(resource, &PlaceholderRendering)
+        match role {
+            // Both roles write proxies: a GET-then-PUT must round-trip the
+            // stored body unchanged.
+            AdminRole::Admin | AdminRole::Operator => Self::response_body(resource),
+            AdminRole::Viewer => proxy_audit_body_with(resource, &PlaceholderRendering),
         }
     }
 

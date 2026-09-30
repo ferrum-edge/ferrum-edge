@@ -113,6 +113,16 @@ an identity or tenancy boundary:
   with `FERRUM_ADMIN_JWT_SECRET` and an explicit `ns` claim instead, and hand
   out the tokens, not the secret.
 
+- **Denied attempts are still audited under the chosen subject.** Security
+  audit records for refused attempts, such as a `GET /backup` refused with
+  `403`, are written as `DENIED` or `VALIDATION_FAILED` rows. A viewer-secret
+  holder can therefore add such rows under any subject it chooses. They are
+  labelled `viewer-key:<sub>` and grant nothing, but they can add noise to the
+  audit log. This is accepted: suppressing them would hide real probing.
+- A primary-key token whose `sub` itself starts with `viewer-key:` or
+  `primary-key:` is recorded as `primary-key:<sub>`, so no primary subject can
+  render the same as a viewer-key actor.
+
 A namespace ceiling for the viewer key (a `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`
 that intersects the `ns` claim and is enforced on every namespace-scoped route
 and on the `/namespaces` registry) is a planned follow-up. It is not
@@ -1634,8 +1644,10 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
     URLs, including URLs whose path or query would otherwise be masked.
   - Upstream `service_discovery.consul.token` gets a fingerprint, and any URL
     carrying userinfo anywhere in a Proxy or Upstream (a Consul `address`,
-    for example) is fingerprinted. Ordinary viewer reads and audit diffs strip
-    that userinfo to `redacted@` as well.
+    for example) is fingerprinted. `viewer` reads and audit diffs strip that
+    userinfo to `redacted@` as well. `operator` and `admin` reads of proxies
+    and upstreams keep it verbatim: both roles write those resources, and a
+    GET-then-PUT must not replace stored userinfo with `redacted@`.
 
   A value the viewer projection shows is shown verbatim.
 - **Hidden credential types.** Ordinary Consumer reads omit `basicauth` and
@@ -1655,7 +1667,13 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
     value.
   - Equal secrets in two fields, or on two resources, therefore fingerprint
     differently.
-  - A field that more than one projection rule matches is fingerprinted once.
+  - Each JSON pointer is fingerprinted once, even when more than one
+    projection rule matches it (a schema rule and the name heuristic). A
+    fingerprint of an ancestor, such as a whole value that fails closed, may
+    still cover fingerprints of its children.
+  - A legacy single-object credential is emitted as a one-element array, and
+    its pointer uses index `0` (for example `/credentials/keyauth/0/key`), so
+    the pointer always names the emitted position.
 - **Stable.** An unchanged credential fingerprints identically across calls and
   across replicas that share `FERRUM_ADMIN_JWT_SECRET`. Rotating that secret
   changes every fingerprint and `redaction.fingerprint_key_id`. Two caveats:
@@ -1676,8 +1694,16 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
   to a database read.
 - **Data source.** Like `/backup`, the export falls back to the cached
   configuration when the database is unavailable and says so with
-  `X-Data-Source: cached`. It returns `503` when there is neither. At most two
-  database-backed exports load at once per process; later requests wait.
+  `X-Data-Source: cached`. It returns `503` when there is neither.
+- **Concurrency limits.** Each process bounds export work so parallel exports
+  cannot tie up the admin plane:
+  - At most one export loads from the database at a time. A concurrent export
+    does not wait for it: it serves the labelled cached snapshot
+    (`X-Data-Source: cached`), exactly as on a database error.
+  - At most four exports are in flight at a time, from either source. The
+    document is built and serialized on the blocking pool, not on an async
+    admin worker. A request that cannot start within 5 seconds gets `503`
+    with `Retry-After: 1`.
 - **Scope.** The export is namespace-scoped through `X-Ferrum-Namespace`. A
   present `ns` claim must authorize the namespace (`403` otherwise), even with
   `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` off. API-spec documents (Admin-gated)

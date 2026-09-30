@@ -25,12 +25,14 @@ const PRIMARY_SECRET: &str = "config-export-primary-secret-0123456789ab";
 const VIEWER_SECRET: &str = "config-export-viewer-secret-0123456789abc";
 const ISSUER: &str = "ferrum-edge-config-export-test";
 const EXPORT: &str = "/config/export";
+const CREDENTIAL_PATH: &str = "/consumers/consumer-staging/credentials/keyauth";
 const METRICS_TOKEN: &str = "config-export-metrics-bearer-token-0123456789";
 
 const STAGING_KEY: &str = "staging-api-key-must-not-leak";
 const PROD_KEY: &str = "prod-api-key-must-not-leak";
 const CONSUL_TOKEN: &str = "consul-token-must-not-leak";
 const CONSUL_PASSWORD: &str = "consul-address-password-must-not-leak";
+const LABEL_PASSWORD: &str = "proxy-label-password-must-not-leak";
 
 /// Fixed timestamps, so rebuilding the fixture yields the same configuration.
 const STAMP: &str = "2026-01-02T03:04:05Z";
@@ -76,6 +78,10 @@ fn two_tenant_config(staging_key: &str) -> GatewayConfig {
             {
                 "id": "proxy-staging",
                 "namespace": "staging",
+                "labels": {
+                    "runbook": format!("https://ops:{LABEL_PASSWORD}@wiki.internal/runbook"),
+                    "repo": "ssh://git@github.com/org/repo"
+                },
                 "listen_path": "/api",
                 "backend_host": "staging.internal",
                 "backend_port": 8080,
@@ -288,6 +294,7 @@ async fn viewer_can_export_fingerprints_but_not_backup() {
         PROD_KEY,
         CONSUL_TOKEN,
         CONSUL_PASSWORD,
+        LABEL_PASSWORD,
         PRIMARY_SECRET,
         VIEWER_SECRET,
     ] {
@@ -433,7 +440,7 @@ async fn export_requires_an_ns_claim_when_enforcement_is_on() {
 }
 
 #[tokio::test]
-async fn viewer_secret_token_is_refused_on_every_write_route() {
+async fn viewer_secret_token_is_refused_on_write_and_operator_routes() {
     let config = cached(two_tenant_config(STAGING_KEY));
     let (base, _sd) = start_admin(admin_state(config, false)).await;
     let capped_admin = token(VIEWER_SECRET, Algorithm::HS256, "admin", None);
@@ -445,20 +452,35 @@ async fn viewer_secret_token_is_refused_on_every_write_route() {
         "backend_scheme": "http"
     });
     let consumer = json!({"id": "consumer-new", "username": "mallory"});
+    let plugin = json!({"plugin_name": "cors", "scope": "global", "config": {}});
+    let upstream = json!({"name": "new", "targets": [{"host": "new.internal", "port": 80}]});
+    let credential = json!({"key": "mallory-key-0123456789"});
     let empty = json!({});
 
     use reqwest::Method;
-    let writes: [(Method, &str, Option<&Value>); 10] = [
+    let writes: Vec<(Method, &str, Option<&Value>)> = vec![
         (Method::POST, "/proxies", Some(&proxy)),
         (Method::PUT, "/proxies/proxy-staging", Some(&proxy)),
         (Method::DELETE, "/proxies/proxy-staging", None),
         (Method::POST, "/consumers", Some(&consumer)),
         (Method::PUT, "/consumers/consumer-staging", Some(&consumer)),
         (Method::DELETE, "/consumers/consumer-staging", None),
+        (Method::PUT, CREDENTIAL_PATH, Some(&credential)),
+        (Method::POST, CREDENTIAL_PATH, Some(&credential)),
+        (Method::DELETE, CREDENTIAL_PATH, None),
+        (Method::POST, "/plugins/config", Some(&plugin)),
+        (Method::PUT, "/plugins/config/plugin-x", Some(&plugin)),
+        (Method::DELETE, "/plugins/config/plugin-x", None),
+        (Method::POST, "/upstreams", Some(&upstream)),
+        (Method::PUT, "/upstreams/upstream-staging", Some(&upstream)),
         (Method::DELETE, "/upstreams/upstream-staging", None),
         (Method::POST, "/batch", Some(&empty)),
         (Method::POST, "/restore?confirm=true", Some(&empty)),
         (Method::POST, "/namespaces", Some(&empty)),
+        (Method::POST, "/admin/tls/certificates", Some(&empty)),
+        (Method::DELETE, "/admin/tls/acme/certificates/cert-x", None),
+        (Method::POST, "/mesh/config-revision/reset?confirm=true", None),
+        (Method::POST, "/backend-capabilities/refresh", None),
     ];
     for (method, path, body) in writes {
         let label = format!("{method} {path}");
@@ -599,4 +621,44 @@ async fn database_export_is_labelled_and_falls_back_to_cached_on_database_error(
     assert_eq!(fallback.body["source"], "cached");
     assert_eq!(fallback.body["consumers"][0]["username"], "carol");
     assert!(!fallback.text.contains(cached_key));
+}
+
+/// Userinfo is stripped only for `viewer` reads. `operator` and `admin` write
+/// proxies and upstreams, so their reads must round-trip through `PUT`
+/// unchanged, including username-only URLs such as `ssh://git@host`.
+#[tokio::test]
+async fn only_viewer_reads_strip_url_userinfo() {
+    let config = cached(two_tenant_config(STAGING_KEY));
+    let (base, _sd) = start_admin(admin_state(config, false)).await;
+    let proxy_path = "/proxies/proxy-staging";
+    let upstream_path = "/upstreams/upstream-staging";
+    let stored_runbook = format!("https://ops:{LABEL_PASSWORD}@wiki.internal/runbook");
+    let stored_address = format!("http://acl:{CONSUL_PASSWORD}@consul.internal:8500");
+
+    for role in ["admin", "operator"] {
+        let writer = token(PRIMARY_SECRET, Algorithm::HS256, role, None);
+        let proxy = get(&base, proxy_path, Some(&writer), Some("staging")).await;
+        assert_eq!(proxy.status, 200, "{role}: {}", proxy.text);
+        let labels = &proxy.body["labels"];
+        assert_eq!(labels["runbook"], stored_runbook.as_str(), "{role}");
+        assert_eq!(labels["repo"], "ssh://git@github.com/org/repo", "{role}");
+
+        let upstream = get(&base, upstream_path, Some(&writer), Some("staging")).await;
+        assert_eq!(upstream.status, 200, "{role}: {}", upstream.text);
+        let consul = &upstream.body["service_discovery"]["consul"];
+        assert_eq!(consul["address"], stored_address.as_str(), "{role}");
+    }
+
+    // The Consul token stays withheld from operators, as before.
+    let operator = token(PRIMARY_SECRET, Algorithm::HS256, "operator", None);
+    let upstream = get(&base, upstream_path, Some(&operator), Some("staging")).await;
+    assert!(!upstream.text.contains(CONSUL_TOKEN));
+
+    let viewer = token(PRIMARY_SECRET, Algorithm::HS256, "viewer", None);
+    let proxy = get(&base, proxy_path, Some(&viewer), Some("staging")).await;
+    assert_eq!(proxy.status, 200, "{}", proxy.text);
+    assert!(!proxy.text.contains(LABEL_PASSWORD));
+    let labels = &proxy.body["labels"];
+    assert_eq!(labels["runbook"], "https://redacted@wiki.internal/runbook");
+    assert_eq!(labels["repo"], "ssh://redacted@github.com/org/repo");
 }

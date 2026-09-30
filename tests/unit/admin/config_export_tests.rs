@@ -536,3 +536,17 @@ fn consumer_export_uses_the_viewer_projection_decisions() {
     }
     walk(&placeholder, &fingerprinted, "consumer");
 }
+
+#[test]
+fn legacy_single_object_credentials_use_the_emitted_index() {
+    let key = key(ADMIN_SECRET);
+    let mut consumer: Consumer = fixture(KEYAUTH_KEY).consumers.remove(0);
+    consumer
+        .credentials
+        .insert("jwt".to_string(), json!({"secret": JWT_SECRET}));
+    let exported = export_consumer(&consumer, &key);
+
+    let rendering = FingerprintRendering::new(&key, "consumer", "ferrum", &consumer.id);
+    let expected = rendering.fingerprint("/credentials/jwt/0/secret", &json!(JWT_SECRET));
+    assert_eq!(exported["credentials"]["jwt"][0]["secret"], expected);
+}

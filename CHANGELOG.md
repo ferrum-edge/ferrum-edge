@@ -18,8 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticated role, including `viewer`, can now take a whole-namespace
   snapshot of proxies, consumers, plugin configs, and upstreams for drift
   detection. It uses the same authoritative load as `GET /backup` and the same
-  `X-Data-Source: database|cached` signal, with at most two database-backed
-  exports loading at once per process. The export reuses the projections that
+  `X-Data-Source: database|cached` signal. At most one export loads from the
+  database at a time, and a concurrent export serves the labelled cached
+  snapshot instead of waiting. At most four exports build at a time, off the
+  async workers. The export reuses the projections that
   ordinary viewer reads use, so the two cannot disagree about which fields are
   sensitive. Every value those withhold is replaced by a keyed fingerprint,
   `hmac-sha256:<64 hex>`, instead of `[REDACTED]`. Credential types viewer
@@ -720,10 +722,13 @@ outright with no deprecation period:
   floor to the new secret. `GET /config/export` fingerprints are keyed from the
   primary secret only, so a viewer-secret holder cannot compute or offline-guess
   them.
-- Proxy and Upstream non-admin reads and audit diffs now strip URL userinfo
-  anywhere in the body (for example a Consul `address` of
-  `http://user:pass@host`), the same structural sweep plugin configs already
-  had (#5904).
+- Proxy and Upstream `viewer` reads, audit diffs, and the configuration
+  export now strip URL userinfo anywhere in the body (for example a Consul
+  `address` of `http://user:pass@host`), the same structural sweep plugin
+  configs already had (#5904). `operator` and `admin` reads of proxies and
+  upstreams are unchanged, so an operator's GET-then-PUT keeps the stored
+  URL. A primary-key subject that starts with `viewer-key:` or `primary-key:`
+  is recorded as `primary-key:<sub>` in audit records.
 
 - `mcp_gateway` `aggregate_router` admission now holds on the final request
   (GHSA-3w98-6p32-8qm2). The message kind, method, selected upstream, mediated

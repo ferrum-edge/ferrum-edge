@@ -60,9 +60,11 @@
 //!   pointer are MAC inputs, so equal secrets in two fields — or on two
 //!   resources — do not produce equal fingerprints, and a fingerprint cannot be
 //!   replayed onto another field.
-//! - **One fingerprint per field**: once a layer has fingerprinted a field, a
-//!   later layer matching it (a schema rule and then the name heuristic) leaves
-//!   it alone.
+//! - **One fingerprint per JSON pointer**: once a layer has fingerprinted a
+//!   pointer, a later layer matching it (a schema rule and then the name
+//!   heuristic) leaves it alone. A fingerprint of an ancestor may still cover
+//!   fingerprints of its children. A legacy single-object credential uses
+//!   index `0`, the position it is emitted at.
 //!
 //! Residual oracle: a principal that can *write* a field (an operator for
 //! plugin configs and upstreams, an admin for consumers) can confirm a guess
@@ -73,6 +75,7 @@
 
 use bytes::Bytes;
 use http_body_util::Full;
+use hyper::header::{HeaderValue, RETRY_AFTER};
 use hyper::{Response, StatusCode};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
@@ -114,14 +117,29 @@ pub const HIDDEN_CREDENTIALS_FIELD: &str = "hidden_credentials_fingerprint";
 /// JSON pointer the hidden-credentials fingerprint is bound to.
 const HIDDEN_CREDENTIALS_POINTER: &str = "/hidden_credentials";
 
-/// At most this many database-backed exports load concurrently per process;
-/// later callers wait for a permit. Cached exports take no permit.
-const MAX_CONCURRENT_DATABASE_EXPORTS: usize = 2;
+/// At most this many exports load from the database at once per process. An
+/// export that finds every permit taken does not wait: it serves the labelled
+/// cached snapshot (`X-Data-Source: cached`), the same as on a database error.
+pub const MAX_CONCURRENT_DATABASE_EXPORT_LOADS: usize = 1;
+
+/// At most this many exports (database or cached) are in flight at once per
+/// process. The document is built and serialized on the blocking pool, never
+/// on an async admin worker.
+pub const MAX_CONCURRENT_EXPORT_BUILDS: usize = 4;
+
+/// How long an export waits for a build permit before answering `503` with
+/// `Retry-After: 1`.
+pub const EXPORT_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 static DATABASE_EXPORT_LOADS: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+static EXPORT_BUILDS: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
 
 fn database_export_loads() -> &'static Semaphore {
-    DATABASE_EXPORT_LOADS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_DATABASE_EXPORTS))
+    DATABASE_EXPORT_LOADS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_DATABASE_EXPORT_LOADS))
+}
+
+fn export_builds() -> &'static Semaphore {
+    EXPORT_BUILDS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_EXPORT_BUILDS))
 }
 
 /// Derive the fingerprint subkey from the primary admin JWT secret. `None`
@@ -324,14 +342,28 @@ fn config_export_unavailable_response(message: &str) -> Response<Full<Bytes>> {
     super::json_response(StatusCode::SERVICE_UNAVAILABLE, &json!({"error": message}))
 }
 
-/// Load the namespace from the database under the process-wide export cap.
-/// `None` when no permit could be taken or the load failed; the caller then
-/// falls back to the cached configuration.
+fn config_export_busy_response() -> Response<Full<Bytes>> {
+    let mut response = config_export_unavailable_response(
+        "Configuration export busy: too many exports in progress; retry shortly",
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+/// Load the namespace from the database under the process-wide load cap.
+/// `None` when the cap is saturated or the load failed; the caller then falls
+/// back to the labelled cached configuration.
 async fn load_from_database(
     db: &dyn crate::config::db_backend::DatabaseBackend,
     namespace: &str,
 ) -> Option<GatewayConfig> {
-    let Ok(_permit) = database_export_loads().acquire().await else {
+    let Ok(_permit) = database_export_loads().try_acquire() else {
+        info!(
+            namespace = %namespace,
+            "Configuration export database load cap reached; serving the cached snapshot"
+        );
         return None;
     };
     match db
@@ -346,6 +378,13 @@ async fn load_from_database(
     }
 }
 
+/// Where an export's configuration came from.
+enum ExportInput {
+    Database(GatewayConfig),
+    /// The whole cached snapshot; namespace filtering runs off the async worker.
+    Cached(std::sync::Arc<GatewayConfig>),
+}
+
 /// `GET /config/export`. Authorization (any authenticated role, `ns` claim)
 /// is enforced by the dispatcher before this runs.
 pub(crate) async fn handle_config_export(
@@ -358,18 +397,19 @@ pub(crate) async fn handle_config_export(
             "Configuration export unavailable: no admin JWT secret is configured",
         );
     };
+    let permit = match tokio::time::timeout(EXPORT_PERMIT_WAIT, export_builds().acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => return config_export_busy_response(),
+    };
 
     let from_database = match state.db.as_ref() {
         Some(db) => load_from_database(db.as_ref(), namespace).await,
         None => None,
     };
-    let (config, source) = match from_database {
-        Some(config) => (config, "database"),
+    let (input, source) = match from_database {
+        Some(config) => (ExportInput::Database(config), "database"),
         None => match state.cached_gateway_config() {
-            Some(cached) => (
-                crate::admin::backup::filter_config_by_namespace(&cached, namespace),
-                "cached",
-            ),
+            Some(cached) => (ExportInput::Cached(cached), "cached"),
             None => {
                 return config_export_unavailable_response(
                     "No database available and no cached config",
@@ -378,8 +418,26 @@ pub(crate) async fn handle_config_export(
         },
     };
 
-    let export = build_config_export(config, source, namespace, &key);
-    let body = serde_json::to_vec(&export).unwrap_or_else(|_| b"{}".to_vec());
+    let owned_namespace = namespace.to_string();
+    let built = tokio::task::spawn_blocking(move || {
+        // Held until the document is serialized.
+        let _permit = permit;
+        let config = match input {
+            ExportInput::Database(config) => config,
+            ExportInput::Cached(snapshot) => {
+                crate::admin::backup::filter_config_by_namespace(&snapshot, &owned_namespace)
+            }
+        };
+        let export = build_config_export(config, source, &owned_namespace, &key);
+        serde_json::to_vec(&export).unwrap_or_else(|_| b"{}".to_vec())
+    })
+    .await;
+    let Ok(body) = built else {
+        return super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": "Configuration export failed"}),
+        );
+    };
     info!(
         actor = %actor.sub,
         key_tier = actor.key_tier.as_str(),

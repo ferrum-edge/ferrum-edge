@@ -60,6 +60,30 @@ fn test_audit_actor_from_viewer_key_is_capped_and_labelled() {
 }
 
 #[test]
+fn test_primary_subjects_cannot_impersonate_a_viewer_key_actor() {
+    let actor_for = |sub: &str, key_tier: AdminKeyTier| {
+        let mut claims = claims_with_role(json!("viewer"));
+        claims.sub = sub.to_string();
+        AuditActor::from_verified(&verified(claims, key_tier)).unwrap()
+    };
+
+    let viewer = actor_for("alice", AdminKeyTier::Viewer).audit_subject();
+    assert_eq!(viewer, "viewer-key:alice");
+    let lookalike = actor_for("viewer-key:alice", AdminKeyTier::Primary).audit_subject();
+    assert_eq!(lookalike, "primary-key:viewer-key:alice");
+    assert_ne!(lookalike, viewer);
+
+    // The escape is itself escaped, so the mapping stays injective.
+    let escaped = actor_for("primary-key:viewer-key:alice", AdminKeyTier::Primary);
+    assert_eq!(
+        escaped.audit_subject(),
+        "primary-key:primary-key:viewer-key:alice"
+    );
+    let plain = actor_for("alice", AdminKeyTier::Primary).audit_subject();
+    assert_eq!(plain, "alice");
+}
+
+#[test]
 fn test_audit_actor_from_claims_rejects_missing_role() {
     let now = Utc::now();
     let claims = AdminClaims {

@@ -542,15 +542,35 @@ impl AuditActor {
         })
     }
 
-    /// The actor string persisted on audit records: the `sub` for a primary-key
-    /// token, `viewer-key:<sub>` for a viewer-key token.
+    /// The actor string persisted on audit records.
+    ///
+    /// - A viewer-key token renders as `viewer-key:<sub>`.
+    /// - A primary-key token renders as its bare `sub`, unless that `sub`
+    ///   itself starts with `viewer-key:` or `primary-key:`; then it is escaped
+    ///   as `primary-key:<sub>`.
+    ///
+    /// The mapping is injective, so a primary-key subject can never render the
+    /// same as a viewer-key actor (the audit record has no separate tier
+    /// column; the tier is carried in this string).
     pub fn audit_subject(&self) -> String {
         match self.key_tier {
-            AdminKeyTier::Primary => self.sub.clone(),
+            AdminKeyTier::Primary => {
+                let reserved = self.sub.starts_with(VIEWER_KEY_ACTOR_PREFIX)
+                    || self.sub.starts_with(PRIMARY_KEY_ACTOR_ESCAPE_PREFIX);
+                if reserved {
+                    format!("{PRIMARY_KEY_ACTOR_ESCAPE_PREFIX}{}", self.sub)
+                } else {
+                    self.sub.clone()
+                }
+            }
             AdminKeyTier::Viewer => format!("{VIEWER_KEY_ACTOR_PREFIX}{}", self.sub),
         }
     }
 }
+
+/// Escape prefix for a primary-key subject that would otherwise look like a
+/// tier-labelled actor. See [`AuditActor::audit_subject`].
+pub const PRIMARY_KEY_ACTOR_ESCAPE_PREFIX: &str = "primary-key:";
 
 #[derive(Debug, Clone, Default)]
 pub struct AuditListFilter {

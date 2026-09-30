@@ -2266,7 +2266,8 @@ paths:
         `FERRUM_ADMIN_JWT_SECRET` (never from the viewer secret), bound to the
         resource kind, namespace, id, and the field's JSON pointer, over a
         key-sorted canonical JSON of the stored value. Equal values in two
-        fields fingerprint differently, and each field is fingerprinted once.
+        fields fingerprint differently, and each JSON pointer is fingerprinted
+        once (an ancestor's fingerprint may still cover a child's).
         An unchanged credential fingerprints identically across calls and
         across replicas sharing `FERRUM_ADMIN_JWT_SECRET`; a changed one
         fingerprints differently; the value cannot be recovered or
@@ -2285,8 +2286,13 @@ paths:
         compares equal to a database read. Collections are sorted by `id`,
         proxy plugin associations by config id, and the document carries no
         timestamp, so exports of unchanged configuration are byte-identical.
-        At most two database-backed exports load concurrently per process;
-        later requests wait.
+        At most one export loads from the database at a time per process; a
+        concurrent export serves the labelled cached snapshot instead of
+        waiting. At most four exports are in flight at a time, built off the
+        async workers; a request that cannot start within 5 seconds gets `503`
+        with `Retry-After: 1`. `viewer` reads of proxies and upstreams strip
+        URL userinfo the same way; `operator` and `admin` reads keep it, so
+        their GET-then-PUT round-trips.
 
         Namespace-scoped via `X-Ferrum-Namespace`. A JWT `ns` claim, when
         present, must authorize the selected namespace (`403` otherwise) even
@@ -2315,8 +2321,17 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
-          description: No database is reachable and no cached configuration is available
+          description: >-
+            No database is reachable and no cached configuration is available,
+            or too many exports are in progress (then with `Retry-After: 1`)
+          headers:
+            Retry-After:
+              description: Present as `1` when the export concurrency limit is saturated.
+              schema:
+                type: integer
           content:
             application/json:
               schema:

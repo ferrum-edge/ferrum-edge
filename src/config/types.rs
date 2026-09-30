@@ -9059,18 +9059,19 @@ pub fn redact_consumer_credentials_with(
 ) -> Consumer {
     let mut redacted = consumer.clone();
 
-    /// Object entries of one credential type, each with its stored array index
-    /// (`None` for the legacy single-object form).
+    /// Object entries of one credential type, each with its stored array index.
+    /// The legacy single-object form is index `0`: the projection emits it as a
+    /// one-element array, so the index names the emitted position.
     fn entry_objects(
         credential_value: &serde_json::Value,
-    ) -> Vec<(Option<usize>, &serde_json::Map<String, serde_json::Value>)> {
+    ) -> Vec<(usize, &serde_json::Map<String, serde_json::Value>)> {
         match credential_value {
             serde_json::Value::Array(entries) => entries
                 .iter()
                 .enumerate()
-                .filter_map(|(index, entry)| Some((Some(index), entry.as_object()?)))
+                .filter_map(|(index, entry)| Some((index, entry.as_object()?)))
                 .collect(),
-            serde_json::Value::Object(object) => vec![(None, object)],
+            serde_json::Value::Object(object) => vec![(0, object)],
             _ => Vec::new(),
         }
     }
@@ -9086,9 +9087,7 @@ pub fn redact_consumer_credentials_with(
             .map(|(index, entry)| {
                 let mut pointer = String::from("/credentials");
                 push_json_pointer_segment(&mut pointer, cred_type);
-                if let Some(index) = index {
-                    push_json_pointer_segment(&mut pointer, &index.to_string());
-                }
+                push_json_pointer_segment(&mut pointer, &index.to_string());
                 push_json_pointer_segment(&mut pointer, field);
                 let stored = entry.get(field).unwrap_or(&serde_json::Value::Null);
                 let marker = serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER);
