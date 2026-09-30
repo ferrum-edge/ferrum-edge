@@ -1,7 +1,9 @@
 use chrono::Utc;
 use ferrum_edge::RouterCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::policy_path::strip_path_parameters;
 use ferrum_edge::proxy::build_backend_url;
+use ferrum_edge::router_cache::{HostRouteRank, host_route_rank, path_parameter_route_admitted};
 
 // This suite intentionally exercises the public RouterCache facade.
 // Request hot paths use epoch-loaded route snapshots and are covered by
@@ -2074,4 +2076,287 @@ fn later_port_scoped_regex_cannot_shadow_an_earlier_different_pattern() {
         .find_proxy_on_frontend(Some("app.example.com"), "/admin/secret", Some(9001), false)
         .expect("the earlier protected regex must match");
     assert_eq!(matched.proxy.id, "protected-admin");
+}
+
+// ============================================================
+// Path-parameter re-route admission (GHSA-fcqw-793q-wg5x, issue #5938)
+// ============================================================
+
+fn opted_in(mut proxy: Proxy) -> Proxy {
+    proxy.allow_path_parameters = true;
+    proxy
+}
+
+fn opted_in_hosted(id: &str, listen_path: &str, hosts: Vec<&str>) -> Proxy {
+    opted_in(test_proxy_with_hosts(id, listen_path, hosts))
+}
+
+/// Route `path` and its parameter-stripped form the way the frontends do.
+/// Returns the proxy the request reached and whether the request is served:
+/// a stripped path that routes nowhere is served, and any other is decided by
+/// `path_parameter_route_admitted`.
+fn reroute(cache: &RouterCache, host: Option<&str>, path: &str) -> (String, bool) {
+    let matched = cache.find_proxy(host, path).expect("request must route");
+    let stripped = strip_path_parameters(path);
+    let Some(stripped_route) = cache.find_proxy(host, &stripped) else {
+        return (matched.proxy.id.clone(), true);
+    };
+    let admitted = path_parameter_route_admitted(&matched.proxy, &stripped_route, host);
+    (matched.proxy.id.clone(), admitted)
+}
+
+#[test]
+fn literal_parameter_listen_path_is_not_shadowed_by_a_catch_all() {
+    let config = test_config(vec![
+        opted_in(test_proxy("root", "/")),
+        opted_in(test_proxy("versioned", "/api;v=1")),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    for path in [
+        "/api;v=1",
+        "/api;v=1/",
+        "/api;v=1/x",
+        "/api;v=1/x;y=2/z",
+        "/api;v=1/admin;x/users",
+    ] {
+        assert_eq!(
+            reroute(&cache, None, path),
+            ("versioned".to_string(), true),
+            "{path}: the catch-all `/` is an ancestor of `/api`"
+        );
+    }
+}
+
+#[test]
+fn opted_in_catch_all_still_refuses_a_parameter_that_skips_a_proxy() {
+    let config = test_config(vec![
+        opted_in(test_proxy("root", "/")),
+        test_proxy("admin", "/admin"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    for path in ["/admin;x/users", "/admin;/users", "/admin;x", "/admin;x/"] {
+        assert_eq!(
+            reroute(&cache, None, path),
+            ("root".to_string(), false),
+            "{path}: the stripped path belongs to `/admin`"
+        );
+    }
+    assert_eq!(
+        reroute(&cache, None, "/other;x/y"),
+        ("root".to_string(), true),
+        "a stripped path that stays on the catch-all is served"
+    );
+}
+
+#[test]
+fn sibling_or_descendant_of_the_stripped_listen_path_still_refuses() {
+    for (sibling, path) in [
+        ("/api", "/api;v=1/x"),
+        ("/api/", "/api;v=1/x"),
+        ("/api/private", "/api;v=1/private/x"),
+        ("/api/private", "/api;v=1/private;x/y"),
+        ("=/api/x", "/api;v=1/x"),
+        ("~/api/.*", "/api;v=1/x"),
+    ] {
+        let config = test_config(vec![
+            opted_in(test_proxy("versioned", "/api;v=1")),
+            test_proxy("sibling", sibling),
+        ]);
+        let cache = RouterCache::new(&config, 100);
+        assert_eq!(
+            reroute(&cache, None, path),
+            ("versioned".to_string(), false),
+            "{path}: `{sibling}` owns the stripped path"
+        );
+    }
+
+    let config = test_config(vec![
+        test_proxy("root", "/"),
+        opted_in(test_proxy("versioned", "/api;v=1")),
+        test_proxy("private", "/api/private"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, None, "/api;v=1/public/x"),
+        ("versioned".to_string(), true),
+        "a path outside the descendant still reaches the literal route"
+    );
+}
+
+#[test]
+fn exact_parameter_listen_path_is_not_shadowed_by_a_catch_all() {
+    let config = test_config(vec![
+        test_proxy("root", "/"),
+        opted_in(test_proxy("exact", "=/exact;v=1")),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, None, "/exact;v=1"),
+        ("exact".to_string(), true)
+    );
+
+    for sibling in ["/exact", "=/exact"] {
+        let config = test_config(vec![
+            test_proxy("root", "/"),
+            opted_in(test_proxy("exact", "=/exact;v=1")),
+            test_proxy("sibling", sibling),
+        ]);
+        let cache = RouterCache::new(&config, 100);
+        assert_eq!(
+            reroute(&cache, None, "/exact;v=1"),
+            ("exact".to_string(), false),
+            "`{sibling}` owns the stripped path"
+        );
+    }
+}
+
+#[test]
+fn path_parameter_reroute_respects_host_tiers() {
+    let config = test_config(vec![
+        test_proxy("root", "/"),
+        test_proxy("private", "/api/private"),
+        opted_in_hosted("api-v", "/api;v=1", vec!["api.test"]),
+        opted_in_hosted("www-v", "/api;v=1", vec!["www.org.test"]),
+        test_proxy_with_hosts("wild-root", "/", vec!["*.org.test"]),
+        opted_in(test_proxy("svc-v", "/svc;v=1/v2")),
+        test_proxy_with_hosts("api-svc", "/svc", vec!["api.test"]),
+        opted_in_hosted("wild-v", "/wild;v=1/v2", vec!["*.org.test"]),
+        test_proxy_with_hosts("www-wild", "/wild", vec!["www.org.test"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    for (host, path, expected_proxy, expected) in [
+        // Exact-host literal route against a less specific catch-all `/`.
+        ("api.test", "/api;v=1/x", "api-v", true),
+        // Exact-host literal route against a less specific wildcard `/`.
+        ("www.org.test", "/api;v=1/x", "www-v", true),
+        // A catch-all descendant owns the stripped path on a host whose own
+        // routes do not cover it.
+        ("api.test", "/api;v=1/private/x", "api-v", false),
+        // On a host with a wildcard `/`, that wildcard owns the stripped path
+        // ahead of the catch-all descendant, exactly as plain routing does.
+        ("www.org.test", "/api;v=1/private/x", "www-v", true),
+        // An exact-host `/svc` owns `/svc/v2/x` ahead of the catch-all
+        // `/svc;v=1/v2`, although its prefix is shorter.
+        ("api.test", "/svc;v=1/v2/x", "svc-v", false),
+        // On a host without that route the catch-all `/` is an ancestor.
+        ("other.test", "/svc;v=1/v2/x", "svc-v", true),
+        // An exact-host `/wild` outranks the wildcard `/wild;v=1/v2`.
+        ("www.org.test", "/wild;v=1/v2/x", "wild-v", false),
+    ] {
+        assert_eq!(
+            reroute(&cache, Some(host), path),
+            (expected_proxy.to_string(), expected),
+            "{host} {path}"
+        );
+    }
+}
+
+#[test]
+fn path_parameter_reroute_ranks_wildcard_patterns_by_specificity() {
+    let config = test_config(vec![
+        opted_in_hosted("broad-v", "/w;v=1/v2", vec!["*.example.com"]),
+        test_proxy_with_hosts("narrow-w", "/w", vec!["*.a.example.com"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, Some("x.a.example.com"), "/w;v=1/v2/x"),
+        ("broad-v".to_string(), false),
+        "a longer wildcard pattern outranks a shorter one"
+    );
+
+    let config = test_config(vec![
+        opted_in_hosted("narrow-v", "/w;v=1/v2", vec!["*.a.example.com"]),
+        test_proxy_with_hosts("broad-w", "/w", vec!["*.example.com"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, Some("x.a.example.com"), "/w;v=1/v2/x"),
+        ("narrow-v".to_string(), true),
+        "a shorter wildcard ancestor does not shadow a longer one"
+    );
+}
+
+#[test]
+fn regex_and_host_only_proxies_keep_the_strict_reroute_rule() {
+    let config = test_config(vec![
+        opted_in(test_proxy("regex", "~/re;v=1/v2/.*")),
+        test_proxy("re", "/re"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, None, "/re;v=1/v2/x"),
+        ("regex".to_string(), false),
+        "a regex proxy claims no literal prefix, so even an ancestor refuses"
+    );
+
+    let config = test_config(vec![
+        opted_in(host_only_proxy("host-only", &["api.test"])),
+        test_proxy_with_hosts("admin", "/admin", vec!["api.test"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, Some("api.test"), "/admin;x/users"),
+        ("host-only".to_string(), false)
+    );
+    assert_eq!(
+        reroute(&cache, Some("api.test"), "/other;x/y"),
+        ("host-only".to_string(), true),
+        "a stripped path that stays on the host-only proxy is served"
+    );
+}
+
+#[test]
+fn path_parameter_reroute_refuses_a_direction_scoped_mesh_route() {
+    let config = test_config(vec![
+        test_proxy("__mesh-inbound-default-web-8080", "/"),
+        opted_in(test_proxy("versioned", "/api;v=1")),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    assert_eq!(
+        reroute(&cache, None, "/api;v=1/x"),
+        ("versioned".to_string(), false),
+        "the re-lookup does not filter mesh direction (ferrum-edge#5937)"
+    );
+}
+
+#[test]
+fn host_route_rank_orders_host_tiers() {
+    let hosts = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        host_route_rank(&[], Some("api.test")),
+        Some(HostRouteRank::CatchAll)
+    );
+    assert_eq!(host_route_rank(&[], None), Some(HostRouteRank::CatchAll));
+    assert_eq!(
+        host_route_rank(&hosts(&["api.test"]), Some("api.test")),
+        Some(HostRouteRank::Exact)
+    );
+    assert_eq!(
+        host_route_rank(&hosts(&["*.test", "*.a.test"]), Some("x.a.test")),
+        Some(HostRouteRank::Wildcard { pattern_len: 8 })
+    );
+    assert_eq!(
+        host_route_rank(&hosts(&["*.test", "x.a.test"]), Some("x.a.test")),
+        Some(HostRouteRank::Exact)
+    );
+    assert_eq!(
+        host_route_rank(&hosts(&["api.test"]), Some("other.test")),
+        None
+    );
+    assert_eq!(
+        host_route_rank(&hosts(&["*.a.test"]), Some("a.test")),
+        None,
+        "a wildcard does not match its base domain"
+    );
+    assert_eq!(host_route_rank(&hosts(&["api.test"]), None), None);
+
+    let broad = HostRouteRank::Wildcard { pattern_len: 6 };
+    let narrow = HostRouteRank::Wildcard { pattern_len: 8 };
+    assert!(HostRouteRank::CatchAll < broad);
+    assert!(broad < narrow);
+    assert!(narrow < HostRouteRank::Exact);
 }

@@ -31136,13 +31136,18 @@ pub(crate) struct RouteLookupScope<'a> {
 /// A `;` is refused unless the routed proxy set `allow_path_parameters`. On an
 /// opted-in proxy the request is also re-resolved with its parameters removed
 /// (the path a parameter-stripping backend executes) and refused when that
-/// path routes to a *different* proxy. The router splits only on `/`, so
+/// path belongs to a *different* proxy. The router splits only on `/`, so
 /// `/admin;x/users` misses an `/admin` route and can land on an opted-in `/`
 /// or `/api` catch-all whose backend then runs `/admin/users` without the
 /// `/admin` proxy's plugins. A stripped path that routes nowhere cannot skip
-/// another proxy's policy, so it is allowed: that keeps a proxy whose literal
-/// `listen_path` itself contains `;` reachable. The re-resolve allocates, but
-/// only for a request that carries a `;` and reached an opted-in proxy.
+/// another proxy's policy, so it is allowed.
+///
+/// A different stripped route is still allowed when it is a less specific
+/// ancestor of the proxy's own literal `listen_path`, so a catch-all `/` does
+/// not shadow `/api;v=1` (issue #5938). The rule is
+/// [`crate::router_cache::path_parameter_route_admitted`]. The re-resolve
+/// allocates, but only for a request that carries a `;` and reached an
+/// opted-in proxy.
 pub(crate) fn check_routed_path_parameters(
     state: &ProxyState,
     epoch: &crate::request_epoch::RequestEpoch,
@@ -31166,7 +31171,7 @@ pub(crate) fn check_routed_path_parameters(
     ) else {
         return Ok(());
     };
-    if stripped_route.proxy.namespace == proxy.namespace && stripped_route.proxy.id == proxy.id {
+    if crate::router_cache::path_parameter_route_admitted(proxy, &stripped_route, scope.host) {
         Ok(())
     } else {
         Err(crate::policy_path::PolicyPathRejection::PathParameter)

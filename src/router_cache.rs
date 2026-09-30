@@ -3551,6 +3551,111 @@ fn is_exact_path_proxy(proxy: &Proxy) -> bool {
         .is_some_and(|p| p.starts_with('='))
 }
 
+/// Where a proxy's `hosts` place it in the host-tier order of a route lookup
+/// for one request host, from least to most specific.
+///
+/// The lookup searches an exact host first, then wildcard patterns (a longer
+/// pattern first), then the catch-all tier of proxies with no `hosts`. A proxy
+/// that lists several hosts is found in the most specific tier any of them
+/// matches, because every tier indexes the same `listen_path`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HostRouteRank {
+    /// The proxy has no `hosts`.
+    CatchAll,
+    /// The longest `*.` pattern of the proxy that matches the request host.
+    Wildcard { pattern_len: usize },
+    /// One of the proxy's hosts is the request host.
+    Exact,
+}
+
+/// The [`HostRouteRank`] at which a proxy with `hosts` matches
+/// `request_host`, or `None` when it cannot match that host at all (the
+/// proxy lists hosts and the request has none, or none of them matches).
+///
+/// Mirrors the host tiers of the route lookup: a host that starts with `*.`
+/// is a wildcard pattern tested with [`wildcard_matches`], and any other host
+/// must equal the request host.
+pub fn host_route_rank(hosts: &[String], request_host: Option<&str>) -> Option<HostRouteRank> {
+    if hosts.is_empty() {
+        return Some(HostRouteRank::CatchAll);
+    }
+    let request_host = request_host?;
+    let mut rank = None;
+    for host in hosts {
+        if host.starts_with("*.") {
+            if wildcard_matches(host, request_host) {
+                rank = rank.max(Some(HostRouteRank::Wildcard {
+                    pattern_len: host.len(),
+                }));
+            }
+        } else if host == request_host {
+            return Some(HostRouteRank::Exact);
+        }
+    }
+    rank
+}
+
+/// Whether a request that carries `;` path parameters and routed to the
+/// opted-in proxy `matched` may be served there, given the route its
+/// parameter-stripped path resolves to (GHSA-fcqw-793q-wg5x, issue #5938).
+///
+/// A backend that strips path parameters executes the stripped path, so the
+/// request must not reach `matched` when that path belongs to another proxy.
+/// The stripped route is admitted when it is `matched` itself, or when all of
+/// the following hold:
+///
+/// - `matched` has a literal `listen_path` (a prefix, or `=` exact). A regex or
+///   host-only proxy claims no fixed path to compare against, so any other
+///   stripped route is refused.
+/// - The stripped route consumed fewer bytes than `listen_path` with its own
+///   parameters stripped. The stripped request always begins with that
+///   stripped `listen_path`, and the router matches only on `/` boundaries, so
+///   a shorter prefix route is an ancestor of the whole space `matched`
+///   claims (`/` for `/api;v=1`), and a host-only route consumes nothing. An
+///   exact or regex route consumes the whole path, and a prefix route at least
+///   as long is a sibling or a descendant (`/api`, `/api/private`), so those
+///   are refused.
+/// - The stripped route is in a host tier no more specific than the one
+///   `matched` was found in. An exact-host `/svc` owns `/svc/v2/x` on its host
+///   ahead of every catch-all route, including a catch-all `/svc;v=1/v2`.
+/// - The stripped route is not a direction-scoped mesh route. The re-lookup
+///   does not repeat the mesh direction filtering of the original lookup
+///   (ferrum-edge#5937), so such a route is refused as before.
+///
+/// Anything this cannot place, such as a proxy whose hosts do not match the
+/// request host, is refused.
+pub fn path_parameter_route_admitted(
+    matched: &Proxy,
+    stripped_route: &RouteMatch,
+    request_host: Option<&str>,
+) -> bool {
+    let stripped_proxy = &stripped_route.proxy;
+    if stripped_proxy.namespace == matched.namespace && stripped_proxy.id == matched.id {
+        return true;
+    }
+    let Some(listen_path) = matched.listen_path.as_deref() else {
+        return false;
+    };
+    if listen_path.starts_with('~') {
+        return false;
+    }
+    if crate::modes::mesh::mesh_route_direction(&stripped_proxy.id).is_some() {
+        return false;
+    }
+    let literal_path = listen_path.strip_prefix('=').unwrap_or(listen_path);
+    let claimed_len = crate::policy_path::strip_path_parameters(literal_path).len();
+    if stripped_route.matched_prefix_len >= claimed_len {
+        return false;
+    }
+    match (
+        host_route_rank(&matched.hosts, request_host),
+        host_route_rank(&stripped_proxy.hosts, request_host),
+    ) {
+        (Some(matched_rank), Some(stripped_rank)) => stripped_rank <= matched_rank,
+        _ => false,
+    }
+}
+
 fn resolve_auto_router_cache_entries(proxy_count: usize) -> usize {
     proxy_count.saturating_mul(3).clamp(10_000, 1_000_000)
 }

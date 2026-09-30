@@ -257,11 +257,17 @@ async fn send_h1(proxy_port: u16, target: &str) -> u16 {
 /// need it: an HTTP-01 challenge is proven by the key-authorization bytes, and a
 /// refusal is proven by a fixed body that does not echo the target.
 async fn send_h1_full(proxy_port: u16, target: &str) -> (u16, String) {
+    send_h1_full_with_host(proxy_port, "127.0.0.1", target).await
+}
+
+/// The same raw HTTP/1.1 exchange with a caller-chosen `Host`, for host-tier
+/// routing cases.
+async fn send_h1_full_with_host(proxy_port: u16, host: &str, target: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect h1");
     let _ = stream.set_nodelay(true);
-    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -291,6 +297,11 @@ fn h1_status(text: &str, target: &str) -> u16 {
 /// HTTP/2 cleartext with prior knowledge. `http::Uri` preserves percent
 /// escapes verbatim, so `:path` carries the spelling under test.
 async fn send_h2(proxy_port: u16, target: &str) -> u16 {
+    send_h2_with_host(proxy_port, "127.0.0.1", target).await
+}
+
+/// HTTP/2 with a caller-chosen `:authority` host, for host-tier routing cases.
+async fn send_h2_with_host(proxy_port: u16, host: &str, target: &str) -> u16 {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect h2");
@@ -305,7 +316,7 @@ async fn send_h2(proxy_port: u16, target: &str) -> u16 {
 
     let request = Request::builder()
         .method("GET")
-        .uri(format!("http://127.0.0.1:{proxy_port}{target}"))
+        .uri(format!("http://{host}:{proxy_port}{target}"))
         .body(Full::new(Bytes::new()))
         .expect("build h2 request");
     let response = sender.send_request(request).await.expect("send h2 request");
@@ -318,7 +329,18 @@ async fn send_h2(proxy_port: u16, target: &str) -> u16 {
 }
 
 async fn send_h3(client: &Http3Client, https_port: u16, target: &str) -> u16 {
-    let url = format!("https://127.0.0.1:{https_port}{target}");
+    send_h3_with_host(client, "127.0.0.1", https_port, target).await
+}
+
+/// HTTP/3 with a caller-chosen `:authority` host. The test client dials only
+/// loopback names, so `host` is `127.0.0.1` or `localhost`.
+async fn send_h3_with_host(
+    client: &Http3Client,
+    host: &str,
+    https_port: u16,
+    target: &str,
+) -> u16 {
+    let url = format!("https://{host}:{https_port}{target}");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match client.get(&url).await {
@@ -1033,6 +1055,241 @@ plugin_configs:
     }
 
     gateway.shutdown();
+}
+
+/// One HTTP proxy entry of a path-parameter re-route config. `host` is a single
+/// exact or wildcard host, or empty for the catch-all tier.
+fn reroute_proxy(id: &str, host: &str, listen_path: &str, port: u16, allow: bool) -> String {
+    let hosts = if host.is_empty() {
+        String::new()
+    } else {
+        format!("\"{host}\"")
+    };
+    format!(
+        r#"  - id: "{id}"
+    hosts: [{hosts}]
+    listen_path: "{listen_path}"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {port}
+    strip_listen_path: false
+    pool_enable_http2: false
+    allow_path_parameters: {allow}
+"#
+    )
+}
+
+/// One request of a path-parameter re-route matrix. The literal `;` routes
+/// under test forward to one backend and every other proxy to another, so each
+/// case proves which proxy served it.
+struct RerouteCase {
+    host: &'static str,
+    target: &'static str,
+    status: u16,
+    /// What the literal-route backend must record, if anything.
+    literal: Option<&'static str>,
+    /// What the other backend must record, if anything.
+    other: Option<&'static str>,
+}
+
+async fn send_with_host(
+    protocol: &str,
+    h3: &Http3Client,
+    (proxy_port, https_port): (u16, u16),
+    host: &str,
+    target: &str,
+) -> u16 {
+    match protocol {
+        "H1" => send_h1_full_with_host(proxy_port, host, target).await.0,
+        "H2" => send_h2_with_host(proxy_port, host, target).await,
+        _ => send_h3_with_host(h3, host, https_port, target).await,
+    }
+}
+
+fn recorded(target: Option<&str>) -> Vec<String> {
+    target.map(str::to_string).into_iter().collect()
+}
+
+/// Run every case over HTTP/1.1, HTTP/2, and HTTP/3 against one gateway.
+async fn run_reroute_matrix(
+    config: &str,
+    literal: &RecordingBackend,
+    other: &RecordingBackend,
+    cases: &[RerouteCase],
+) {
+    let (mut gateway, https_port) = spawn_path_gateway(config, None).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .expect("proxy port ready");
+    let ports = (gateway.proxy_port, https_port);
+    let _ = literal.take_targets();
+    let _ = other.take_targets();
+
+    let h3 = Http3Client::insecure().expect("H3 client");
+    for case in cases {
+        for protocol in ["H1", "H2", "H3"] {
+            let status = send_with_host(protocol, &h3, ports, case.host, case.target).await;
+            let context = format!("{protocol} {} {}", case.host, case.target);
+            assert_eq!(status, case.status, "{context}");
+            assert_eq!(
+                literal.take_targets(),
+                recorded(case.literal),
+                "{context}: literal-route backend"
+            );
+            assert_eq!(
+                other.take_targets(),
+                recorded(case.other),
+                "{context}: other backend"
+            );
+        }
+    }
+
+    gateway.shutdown();
+}
+
+/// A proxy whose literal `listen_path` contains `;` is reachable next to a
+/// catch-all `/` on the same host, while the re-route check still refuses a
+/// parameter that would skip a sibling, a descendant, or a protected proxy
+/// (issue #5938, GHSA-fcqw-793q-wg5x).
+#[ignore]
+#[tokio::test]
+async fn functional_literal_path_parameter_route_is_not_shadowed_by_a_catch_all() {
+    let literal = RecordingBackend::start().await;
+    let other = RecordingBackend::start().await;
+    let (literal_port, other_port) = (literal.port, other.port);
+
+    let mut config = String::from("version: \"1\"\nproxies:\n");
+    for (id, listen_path, port, allow) in [
+        ("root", "/", other_port, true),
+        ("versioned", "/api;v=1", literal_port, true),
+        ("exact-versioned", "=/exact;v=1", literal_port, true),
+        ("private", "/api/private", other_port, false),
+        ("svc-versioned", "/svc;v=1", literal_port, true),
+        ("svc", "/svc", other_port, false),
+        ("admin", "/admin", other_port, false),
+    ] {
+        config.push_str(&reroute_proxy(id, "", listen_path, port, allow));
+    }
+    config.push_str(
+        r#"    plugins:
+      - plugin_config_id: "admin-termination"
+
+consumers: []
+plugin_configs:
+  - id: "admin-termination"
+    plugin_name: request_termination
+    scope: proxy
+    proxy_id: "admin"
+    enabled: true
+    config:
+      status_code: 403
+      content_type: application/json
+      message: "blocked by policy"
+      trigger:
+        path_prefix: "/admin"
+"#,
+    );
+
+    let case = |target, status, literal, other| RerouteCase {
+        host: "127.0.0.1",
+        target,
+        status,
+        literal,
+        other,
+    };
+    let cases = [
+        // The catch-all `/` is an ancestor of `/api`, so it does not shadow
+        // the literal route, whether the `;` is literal or `%3B`.
+        case("/api;v=1/x", 200, Some("/api;v=1/x"), None),
+        case("/api%3Bv=1/x", 200, Some("/api;v=1/x"), None),
+        case("/api;v=1", 200, Some("/api;v=1"), None),
+        // An `=` exact listen_path with `;` is reachable the same way.
+        case("/exact;v=1", 200, Some("/exact;v=1"), None),
+        // A more specific route under the stripped prefix still refuses,
+        // including one reached through a second parameter.
+        case("/api;v=1/private/x", 400, None, None),
+        case("/api;v=1/private%3Bx/y", 400, None, None),
+        // A sibling at the stripped prefix still refuses.
+        case("/svc;v=1/x", 400, None, None),
+        // The classic bypass: an opted-in catch-all cannot serve a path that
+        // strips into `/admin`.
+        case("/admin;x/users", 400, None, None),
+        case("/admin%3Bx/users", 400, None, None),
+        case("/admin/users", 403, None, None),
+        // A stripped path that stays on the catch-all is served there.
+        case("/other;x/y", 200, None, Some("/other;x/y")),
+    ];
+    run_reroute_matrix(&config, &literal, &other, &cases).await;
+}
+
+/// The re-route check compares host tiers the way the router does: an
+/// exact-host literal route is not shadowed by a less specific wildcard or
+/// catch-all ancestor, and a route on a more specific host tier still refuses
+/// even when its prefix is shorter (issue #5938). The test client dials only
+/// loopback names, so `localhost` and `127.0.0.1` are the exact hosts and
+/// `*.0.0.1` is the wildcard that matches `127.0.0.1`.
+#[ignore]
+#[tokio::test]
+async fn functional_path_parameter_reroute_respects_host_tiers() {
+    let literal = RecordingBackend::start().await;
+    let other = RecordingBackend::start().await;
+    let (literal_port, other_port) = (literal.port, other.port);
+
+    let mut config = String::from("version: \"1\"\nproxies:\n");
+    for (id, host, listen_path, port, allow) in [
+        ("root", "", "/", other_port, false),
+        ("private", "", "/api/private", other_port, false),
+        ("local-v", "localhost", "/api;v=1", literal_port, true),
+        ("ip-v", "127.0.0.1", "/api;v=1/v2", literal_port, true),
+        ("wild-api", "*.0.0.1", "/api", other_port, false),
+        ("svc-v", "", "/svc;v=1/v2", literal_port, true),
+        ("local-svc", "localhost", "/svc", other_port, false),
+        ("wild-v", "*.0.0.1", "/wild;v=1/v2", literal_port, true),
+        ("ip-wild", "127.0.0.1", "/wild", other_port, false),
+    ] {
+        config.push_str(&reroute_proxy(id, host, listen_path, port, allow));
+    }
+    config.push_str("\nconsumers: []\nplugin_configs: []\n");
+
+    let case = |host, target, status, literal, other| RerouteCase {
+        host,
+        target,
+        status,
+        literal,
+        other,
+    };
+    let cases = [
+        // Exact-host literal route against a catch-all `/` ancestor.
+        case("localhost", "/api;v=1/x", 200, Some("/api;v=1/x"), None),
+        // Exact-host literal route against a wildcard `/api` ancestor.
+        case(
+            "127.0.0.1",
+            "/api;v=1/v2/x",
+            200,
+            Some("/api;v=1/v2/x"),
+            None,
+        ),
+        // A catch-all descendant owns the stripped path on this host.
+        case("localhost", "/api;v=1/private/x", 400, None, None),
+        // An exact-host `/svc` owns `/svc/v2/x` ahead of the catch-all
+        // `/svc;v=1/v2`, although its prefix is shorter.
+        case("localhost", "/svc;v=1/v2/x", 400, None, None),
+        // The same request on a host without that route is served.
+        case(
+            "127.0.0.1",
+            "/svc;v=1/v2/x",
+            200,
+            Some("/svc;v=1/v2/x"),
+            None,
+        ),
+        // An exact-host `/wild` outranks the wildcard `/wild;v=1/v2`.
+        case("127.0.0.1", "/wild;v=1/v2/x", 400, None, None),
+        // Controls: the shadowing routes are live for plain paths.
+        case("127.0.0.1", "/api/v2/x", 200, None, Some("/api/v2/x")),
+        case("localhost", "/svc/v2/x", 200, None, Some("/svc/v2/x")),
+    ];
+    run_reroute_matrix(&config, &literal, &other, &cases).await;
 }
 
 fn assert_native_grpc_path_rejection(

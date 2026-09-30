@@ -72,7 +72,7 @@ risking disagreement with the backend:
 | `ambiguous_dot_segment`  | `/a/%2e%2e/b`, `/a/%2e%2e;/b`, `/a/..%3B/b` | A percent escape produced a `.` or `..` segment, or the `;` that makes one a path-parameter dot segment. |
 | `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..`, `/a/..;/b`, `/a/.;x/b` | A `.` or `..` segment written literally, with or without a `;` path parameter. See below. |
 | `empty_segment`          | `//a`, `/a//b`, `/;x/a`, `/a/%3Bx/b` | A non-final empty segment, or a non-final segment that is empty before its first `;`. See below. |
-| `path_parameter`         | `/a;x/b`, `/a%3Bx/b` | A `;` path parameter on a proxy that has not set `allow_path_parameters`, or whose parameter-stripped path routes to a different proxy. Applied after route lookup and before any plugin runs. See below. |
+| `path_parameter`         | `/a;x/b`, `/a%3Bx/b` | A `;` path parameter on a proxy that has not set `allow_path_parameters`, or whose parameter-stripped path belongs to a different proxy. Applied after route lookup and before any plugin runs. See below. |
 
 Rejections carry a fixed JSON body and a fixed reason token. Neither echoes any
 request bytes, and the reject is logged with the reason token only.
@@ -147,7 +147,8 @@ is routed, and canonicalization runs before routing. The frontends therefore:
    opted in;
 4. on an opted-in proxy, re-resolve the route with every parameter removed
    (the path a parameter-stripping backend executes) and refuse the request
-   when that path routes to a different proxy;
+   when that path belongs to a different proxy (see below for which one
+   counts);
 5. only then run any plugin phase or backend dispatch.
 
 Route lookup is a literal match on the canonical path and grants nothing on its
@@ -161,10 +162,46 @@ not match an `/admin` route, so on its own it would fall through to an opted-in
 `/admin/users` without the `/admin` proxy's plugins. The stripped path
 `/admin/users` routes to `/admin`, a different proxy, so the request is
 refused. A stripped path that routes to the same proxy, or to no proxy at all,
-is accepted: neither can skip another proxy's policy, and the second keeps a
-proxy whose literal `listen_path` contains `;` reachable. The re-resolve
+is accepted: neither can skip another proxy's policy. The re-resolve
 allocates, but only for a request that carries a `;` and reached an opted-in
 proxy.
+
+**A literal `listen_path` with `;` is not shadowed by a catch-all.** A proxy
+whose literal `listen_path` itself contains `;` (for example `/api;v=1`) only
+ever receives requests whose stripped path starts with that `listen_path`
+stripped (`/api`). If a catch-all `/` exists, that stripped path routes to the
+catch-all, so refusing every different stripped route would make the proxy
+unreachable. For a proxy with a literal `listen_path` (prefix or `=` exact),
+the gateway therefore accepts a different stripped route when all of these
+hold:
+
+- the stripped route matched fewer bytes than the proxy's `listen_path` with
+  its own parameters stripped. The router matches prefixes only on `/`
+  boundaries, so such a route is an ancestor of the whole space the proxy
+  claims (`/` for `/api;v=1`). A host-only route matches zero bytes and counts
+  as an ancestor too;
+- the stripped route sits in a host tier no more specific than the one the
+  proxy was found in (exact host, then a longer wildcard, then a shorter
+  wildcard, then no hosts);
+- the stripped route is not a direction-scoped mesh route.
+
+Every other different stripped route is refused. A sibling at the stripped
+prefix (`/api` next to `/api;v=1`), a more specific descendant
+(`/api/private`, reached with `/api;v=1/private/x`), and any exact or regex
+route, which always matches the whole path, stay refused. So does an exact-host
+`/svc` against a catch-all `/svc;v=1/v2`: on that host the exact-host route
+owns `/svc/v2/x` ahead of every catch-all route, even though its prefix is
+shorter. A catch-all `/api/private` is refused against an exact-host
+`/api;v=1` as well: on that host `/api/private/x` routes to it, and the
+host-specific proxy does not claim that path. A proxy whose `listen_path` is a
+regex, or that has none (host-only), keeps the plain rule: any different
+stripped route is refused. The classic case is unchanged: an opted-in `/` has a
+stripped prefix of one byte, so an `/admin` route always outranks it and
+`/admin;x/users` is refused.
+
+The re-resolve does not yet repeat the mesh direction filtering of the original
+lookup, which only produces false refusals. It must mirror it once mesh routes
+can opt in (ferrum-edge#5937).
 
 **With the opt-in.** On a proxy with `allow_path_parameters: true`, the `;` is
 kept in the canonical path and forwarded unchanged, so routing, policy, and the

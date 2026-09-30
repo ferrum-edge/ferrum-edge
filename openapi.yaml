@@ -9857,7 +9857,12 @@ components:
             different path than routing and policy evaluated. Enable it only
             for backends that use matrix parameters: routing, policy, and the
             backend request line then carry the `;` unchanged, so policy keyed
-            on a parameter-free path does not match those requests. Dot
+            on a parameter-free path does not match those requests. A request
+            is still refused when its path with every parameter removed
+            belongs to a different proxy (`/admin;x/users` on an opted-in `/`
+            when an `/admin` proxy exists); a less specific ancestor of this
+            proxy's own literal `listen_path` does not count, so a catch-all
+            `/` does not shadow `/api;v=1`. Dot
             segments with a parameter (`..;`) and segments that are empty
             before their `;` (`/;x/admin`) are refused either way. A literal
             `listen_path` containing `;` requires `true`. HTTP-family proxies

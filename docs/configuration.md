@@ -934,7 +934,11 @@ request whose canonical path contains a `;` (literal or `%3B`) is refused with
 backends such as Tomcat and Spring strip `;…` from path segments and would
 execute a different path than routing and policy evaluated. Set it to `true`
 only on proxies whose backends use matrix parameters; the `;` is then routed,
-evaluated, and forwarded unchanged. Dot segments with a parameter (`..;`) and
+evaluated, and forwarded unchanged, unless the path with every parameter
+removed belongs to a different proxy: `/admin;x/users` on an opted-in `/` is
+refused when an `/admin` proxy exists. A less specific ancestor of the proxy's
+own literal `listen_path` does not count, so a catch-all `/` does not shadow
+`/api;v=1`. Dot segments with a parameter (`..;`) and
 segments empty before their `;` are refused either way, a literal `listen_path`
 containing `;` requires `true`, and stream proxies must leave it `false`. See
 [request_path_canonicalization.md](request_path_canonicalization.md#path-parameters-require-a-per-proxy-opt-in).

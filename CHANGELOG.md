@@ -61,6 +61,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a client could inject provider query parameters (for example a second
   `api-version`) and break query-string signatures. Only the path component is
   canonicalized now; the query reaches the provider byte-identical.
+- **A literal `;` `listen_path` is no longer shadowed by a catch-all** (#5938,
+  follow-up to GHSA-fcqw-793q-wg5x). A proxy whose literal `listen_path`
+  contains `;` (for example `/api;v=1`, which Gateway API translation opts in
+  automatically) was unreachable whenever a catch-all `/` shared its host,
+  because every request's parameter-stripped path (`/api/...`) routed to the
+  catch-all and was refused as belonging to a different proxy. For a proxy
+  with a literal `listen_path` (prefix or `=` exact), the gateway now accepts a
+  different stripped route when it matched fewer bytes than the
+  parameter-stripped `listen_path` and sits in a host tier no more specific
+  than the proxy's. A sibling at the stripped prefix (`/api`), a more specific
+  descendant (`/api/private`), an exact or regex route, a more specific host
+  tier, and a direction-scoped mesh route all still refuse, as does
+  `/admin;x/users` against an opted-in `/` when `/admin` exists. Regex and
+  host-only proxies keep the previous rule.
 
 ### Added
 
