@@ -4416,7 +4416,10 @@ async fn functional_mesh_sidecar_inbound_service_without_opt_in_refuses_path_par
         );
     }
     let (status, body) = &results[3];
-    assert_eq!(*status, 200, "a plain path must still be served; body: {body:?}");
+    assert_eq!(
+        *status, 200,
+        "a plain path must still be served; body: {body:?}"
+    );
     assert!(
         body.contains("backend-a GET /app/page HTTP/1.1"),
         "the plain path must reach the backend: {body:?}"
@@ -4433,15 +4436,30 @@ async fn functional_mesh_sidecar_inbound_service_without_opt_in_refuses_path_par
 #[tokio::test]
 async fn functional_mesh_sidecar_inbound_path_parameters_stay_on_the_selected_port_sibling() {
     let requests = [
-        ("echo.ferrum.svc.cluster.local:8080", "/app/;jsessionid=abc123"),
-        ("echo.ferrum.svc.cluster.local:9090", "/app/;jsessionid=abc123"),
-        ("echo.ferrum.svc.cluster.local:9090", "/app/page;jsessionid=abc123"),
-        ("echo.ferrum.svc.cluster.local:7777", "/app/;jsessionid=abc123"),
+        (
+            "echo.ferrum.svc.cluster.local:8080",
+            "/app/;jsessionid=abc123",
+        ),
+        (
+            "echo.ferrum.svc.cluster.local:9090",
+            "/app/;jsessionid=abc123",
+        ),
+        (
+            "echo.ferrum.svc.cluster.local:9090",
+            "/app/page;jsessionid=abc123",
+        ),
+        (
+            "echo.ferrum.svc.cluster.local:7777",
+            "/app/;jsessionid=abc123",
+        ),
     ];
     let expected = [
         (200, Some("backend-a GET /app/;jsessionid=abc123 HTTP/1.1")),
         (200, Some("backend-b GET /app/;jsessionid=abc123 HTTP/1.1")),
-        (200, Some("backend-b GET /app/page;jsessionid=abc123 HTTP/1.1")),
+        (
+            200,
+            Some("backend-b GET /app/page;jsessionid=abc123 HTTP/1.1"),
+        ),
         (502, None),
     ];
     let results = drive_inbound_path_parameter_requests(true, true, &requests)

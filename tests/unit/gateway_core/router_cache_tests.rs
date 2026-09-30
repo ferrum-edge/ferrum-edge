@@ -2514,7 +2514,12 @@ fn mesh_scoped_reroute_selects_the_port_sibling_the_request_selected() {
 
     for port in [80u16, 90] {
         assert_eq!(
-            mesh_reroute(&cache, Some("web"), "/app/;jsessionid=x", outbound(Some(port))),
+            mesh_reroute(
+                &cache,
+                Some("web"),
+                "/app/;jsessionid=x",
+                outbound(Some(port))
+            ),
             (format!("__mesh-outbound-default-web-{port}"), true)
         );
     }
@@ -2600,7 +2605,11 @@ fn mesh_scoped_reroute_admits_a_mesh_ancestor_of_a_literal_parameter_route() {
     let raw = cache
         .find_proxy(Some("web"), "/api/x")
         .expect("the mesh route owns the stripped path");
-    assert!(!path_parameter_route_admitted(&matched.proxy, &raw, Some("web")));
+    assert!(!path_parameter_route_admitted(
+        &matched.proxy,
+        &raw,
+        Some("web")
+    ));
 
     // A mesh `/` route never outranks a sibling or descendant: the opted-in
     // mesh route itself stays refused for a path an operator route owns.
