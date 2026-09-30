@@ -39,6 +39,18 @@
 //!   connections finish; nothing new is routed", not "traffic keeps being
 //!   served". Finished drains are reaped on every reconcile, so completed
 //!   handles never accumulate until process exit.
+//! - **Route admission across reloads.** Each decided admission records the
+//!   listener plan it was made against (`GatewayListenerAdmissionBasis`).
+//!   The config publication derives the new generation's admission from it,
+//!   in the same `ArcSwap` store as the new route table, instead of resetting
+//!   every port to pending (issue #5914). A port whose planned identity (class,
+//!   bind address, mesh direction, process-global ownership, or plan refusal)
+//!   is unchanged keeps serving under its previous decision, and so does the
+//!   single-listener Service remap onto it. A new port is pending until this
+//!   generation's reconcile publishes. A withdrawn port, or a changed port
+//!   that had a live socket, is refused as a frontend port at once, so its
+//!   old socket never routes under the old identity. Only a reconcile of the
+//!   exact generation may admit anything this carry-forward did not.
 //! - **Supervision.** A started listener whose task later finishes — cleanly,
 //!   with an error, or by panic — is reaped on the next reconcile, surfaced on
 //!   [`GatewayListenerManager::bind_failures`], and rebound. A dead accept loop
@@ -426,6 +438,105 @@ impl GatewayListenerPlan {
             quic_refused,
         }
     }
+
+    /// Per-port identity that decides route admission. QUIC-only refusals are
+    /// left out: they never enter the refused-route set.
+    fn admission_ports(&self) -> BTreeMap<u16, PlannedListenerPort> {
+        let mut ports: BTreeMap<u16, PlannedListenerPort> = self
+            .ports
+            .iter()
+            .map(|(port, desired)| (*port, PlannedListenerPort::Bind(*desired)))
+            .collect();
+        ports.extend(
+            self.already_served
+                .iter()
+                .map(|(port, class)| (*port, PlannedListenerPort::AlreadyServed(*class))),
+        );
+        ports.extend(
+            self.refused
+                .iter()
+                .map(|(port, refusal)| (*port, PlannedListenerPort::Refused(refusal.category))),
+        );
+        ports
+    }
+}
+
+/// What one Gateway listener port looks like in a [`GatewayListenerPlan`],
+/// reduced to the fields that decide its route admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlannedListenerPort {
+    /// A dedicated socket with this class, bind address, and mesh direction.
+    Bind(DesiredGatewayListener),
+    /// Served by the process-global proxy frontend of this class.
+    AlreadyServed(GatewayListenerClass),
+    /// Refused before any bind was tried.
+    Refused(GatewayListenerFailureCategory),
+}
+
+impl PlannedListenerPort {
+    pub(crate) fn is_refused(self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+
+    /// Whether this manager owns an accept socket for the port. A withdrawn
+    /// port like this keeps accepting until reconcile retires it.
+    pub(crate) fn owns_socket(self) -> bool {
+        matches!(self, Self::Bind(_))
+    }
+}
+
+/// The inputs [`GatewayListenerPlan::from_config`] takes besides the config.
+/// They are fixed for the life of one [`GatewayListenerManager`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayListenerPlanner {
+    reserved: Arc<std::collections::HashSet<u16>>,
+    existing_frontends: BTreeMap<u16, GatewayListenerClass>,
+    default_bind_addr: IpAddr,
+    http3_enabled: bool,
+}
+
+impl GatewayListenerPlanner {
+    fn plan(&self, config: &GatewayConfig) -> GatewayListenerPlan {
+        GatewayListenerPlan::from_config(
+            config,
+            self.reserved.as_ref(),
+            &self.existing_frontends,
+            self.default_bind_addr,
+            self.http3_enabled,
+        )
+    }
+}
+
+/// The listener plan a decided route admission was derived from (issue #5914).
+///
+/// Config publication uses it to derive the next generation's admission in
+/// the same store as the new route table, instead of resetting every port to
+/// pending. Ports whose planned identity is unchanged keep their decision.
+/// Ports that are new, changed, or withdrawn fail closed until the matching
+/// reconcile publishes its own decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayListenerAdmissionBasis {
+    planner: GatewayListenerPlanner,
+    ports: BTreeMap<u16, PlannedListenerPort>,
+}
+
+impl GatewayListenerAdmissionBasis {
+    fn new(planner: GatewayListenerPlanner, plan: &GatewayListenerPlan) -> Self {
+        Self {
+            planner,
+            ports: plan.admission_ports(),
+        }
+    }
+
+    /// The same planner applied to another config generation.
+    pub(crate) fn for_config(&self, config: &GatewayConfig) -> Self {
+        let plan = self.planner.plan(config);
+        Self::new(self.planner.clone(), &plan)
+    }
+
+    pub(crate) fn ports(&self) -> &BTreeMap<u16, PlannedListenerPort> {
+        &self.ports
+    }
 }
 
 /// A refusal or bind failure for one Gateway listener port (or protocol half).
@@ -512,6 +623,9 @@ struct ReconcileOutcome {
     status_observations: Vec<GatewayListenerFailureObservation>,
     transient_events: Vec<GatewayListenerTransientEvent>,
     refused_route_ports: BTreeSet<u16>,
+    /// The plan `refused_route_ports` was decided against. Published with the
+    /// decision so the next config generation can carry it forward.
+    admission_basis: GatewayListenerAdmissionBasis,
     h3_ports: Vec<u16>,
     /// Gateway listener ports this process must bind for this generation.
     desired_listeners: usize,
@@ -822,6 +936,7 @@ impl GatewayListenerManager {
                 status_observations,
                 transient_events,
                 refused_route_ports,
+                admission_basis,
                 h3_ports,
                 desired_listeners,
             } = self.reconcile_generation(&expected).await;
@@ -829,6 +944,7 @@ impl GatewayListenerManager {
             if !self.state.publish_gateway_listener_admission(
                 &expected,
                 refused_route_ports,
+                admission_basis,
                 move || {
                     for accept_gate_tx in pending_accept_gates {
                         accept_gate_tx.send_replace(true);
@@ -878,14 +994,9 @@ impl GatewayListenerManager {
         expected: &crate::request_epoch::RequestEpoch,
     ) -> ReconcileOutcome {
         let mut quic_rebind_budget = QuicRebindBudget::new();
-        let config = expected.config();
-        let plan = GatewayListenerPlan::from_config(
-            config,
-            self.state.reserved_gateway_ports.as_ref(),
-            &self.existing_frontends,
-            self.bind_addr,
-            self.http3.is_some(),
-        );
+        let planner = self.planner();
+        let plan = planner.plan(expected.config());
+        let admission_basis = GatewayListenerAdmissionBasis::new(planner, &plan);
         let mut failures: Vec<GatewayListenerBindFailure> = plan
             .refused
             .iter()
@@ -1279,8 +1390,19 @@ impl GatewayListenerManager {
             status_observations,
             transient_events,
             refused_route_ports,
+            admission_basis,
             h3_ports,
             desired_listeners,
+        }
+    }
+
+    /// The fixed inputs this manager derives every listener plan from.
+    fn planner(&self) -> GatewayListenerPlanner {
+        GatewayListenerPlanner {
+            reserved: Arc::clone(&self.state.reserved_gateway_ports),
+            existing_frontends: self.existing_frontends.clone(),
+            default_bind_addr: self.bind_addr,
+            http3_enabled: self.http3.is_some(),
         }
     }
 
@@ -1890,6 +2012,7 @@ mod tests {
     use crate::config::EnvConfig;
     use crate::config::types::GatewayConfig;
     use crate::dns::{DnsCache, DnsConfig};
+    use crate::router_cache::GatewayListenerAdmission;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -2060,11 +2183,17 @@ mod tests {
             }
 
             let expected = state.request_epoch.load();
-            assert!(
-                state.publish_gateway_listener_admission(&expected, BTreeSet::new(), || {
+            let planner = manager.planner();
+            let plan = planner.plan(expected.config());
+            let published = state.publish_gateway_listener_admission(
+                &expected,
+                BTreeSet::new(),
+                GatewayListenerAdmissionBasis::new(planner, &plan),
+                || {
                     listener.accept_gate_tx.send_replace(true);
-                })
+                },
             );
+            assert!(published);
             manager.listeners.lock().await.insert(port, listener);
 
             let mut response = Vec::new();
@@ -3623,5 +3752,255 @@ mod tests {
             "refusal must name the dedicated-bind collision: {}",
             reason.message
         );
+    }
+
+    // ── Route admission carry-forward across unreconciled reloads (#5914) ───
+
+    const CARRY_A: u16 = 18101;
+    const CARRY_B: u16 = 18102;
+    const CARRY_C: u16 = 18103;
+    const CARRY_GLOBAL: u16 = 18000;
+    const CARRY_ADMIN: u16 = 18001;
+
+    /// One route admission state of a port, as the router sees it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Admitted {
+        /// Listener-scoped routes on the port serve.
+        Allowed,
+        /// Listener-scoped routes fail closed; the frontend port still routes.
+        Pending,
+        /// Refused as a route port and as a frontend port.
+        Refused,
+    }
+
+    fn admitted(admission: &GatewayListenerAdmission, port: u16) -> Admitted {
+        if admission.explicitly_refuses(port) {
+            Admitted::Refused
+        } else if admission.allows(port) {
+            Admitted::Allowed
+        } else {
+            Admitted::Pending
+        }
+    }
+
+    /// A manager's fixed plan inputs: the admin port is reserved and the
+    /// process-global plaintext frontend is `CARRY_GLOBAL`.
+    fn carry_planner() -> GatewayListenerPlanner {
+        GatewayListenerPlanner {
+            reserved: Arc::new(std::collections::HashSet::from([CARRY_ADMIN])),
+            existing_frontends: BTreeMap::from([(CARRY_GLOBAL, GatewayListenerClass::Plaintext)]),
+            default_bind_addr: IpAddr::from([0, 0, 0, 0]),
+            http3_enabled: false,
+        }
+    }
+
+    /// Plaintext listener-scoped routes, one per port.
+    fn routes_on_ports(ports: &[u16]) -> GatewayConfig {
+        let mut config = GatewayConfig::default();
+        for port in ports {
+            let mut proxy = port_scoped_config(*port).proxies.remove(0);
+            proxy.id = format!("gw-{port}");
+            config.proxies.push(proxy);
+        }
+        config
+    }
+
+    fn with_tls_port(mut config: GatewayConfig, port: u16) -> GatewayConfig {
+        config
+            .http_tls_listen_ports
+            .insert((crate::config::types::default_namespace(), port));
+        config
+    }
+
+    fn with_tcp_stream_on(mut config: GatewayConfig, port: u16) -> GatewayConfig {
+        let tcp: crate::config::types::Proxy = serde_json::from_value(serde_json::json!({
+            "id": "tcp-stream",
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 1,
+            "listen_port": port,
+        }))
+        .expect("tcp proxy");
+        config.proxies.push(tcp);
+        config.resolve_dispatch_kind();
+        config
+    }
+
+    fn with_sidecar_bind(mut config: GatewayConfig, port: u16, bind: IpAddr) -> GatewayConfig {
+        let mut mesh = crate::modes::mesh::config::MeshConfig::default();
+        mesh.sidecar_ingress_bind_overrides.insert(port, bind);
+        config.mesh = Some(Box::new(mesh));
+        config
+    }
+
+    /// What a reconcile of `config` publishes when it refuses `refused`.
+    fn reconciled(config: &GatewayConfig, refused: &[u16]) -> Arc<GatewayListenerAdmission> {
+        let planner = carry_planner();
+        let plan = planner.plan(config);
+        GatewayListenerAdmission::decided_for_plan(
+            refused.iter().copied().collect(),
+            GatewayListenerAdmissionBasis::new(planner, &plan),
+        )
+    }
+
+    /// Publish each config in turn without any reconcile in between, and
+    /// check every port's admission after each publication.
+    fn assert_reload_sequence(
+        scenario: &str,
+        mut admission: Arc<GatewayListenerAdmission>,
+        reloads: Vec<(GatewayConfig, Vec<(u16, Admitted)>)>,
+    ) {
+        for (step, (config, expected)) in reloads.into_iter().enumerate() {
+            admission = admission.carry_forward(&config);
+            let reload = step + 1;
+            for (port, want) in expected {
+                let got = admitted(&admission, port);
+                assert_eq!(got, want, "{scenario}: reload {reload} port {port}");
+            }
+        }
+    }
+
+    #[test]
+    fn route_admission_carry_forward_table() {
+        use Admitted::{Allowed, Pending, Refused};
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        let loopback_v6 = IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
+        let wildcard = IpAddr::from([0, 0, 0, 0]);
+
+        // An identical plan carries the very same decision.
+        let decided = reconciled(&routes_on_ports(&[CARRY_A]), &[]);
+        let mut unrelated = routes_on_ports(&[CARRY_A]);
+        unrelated.proxies[0].backend_port = 2;
+        assert!(Arc::ptr_eq(&decided, &decided.carry_forward(&unrelated)));
+
+        // No recorded plan: the next generation is wholly pending.
+        let basisless = GatewayListenerAdmission::decided(BTreeSet::new());
+        let next = basisless.carry_forward(&routes_on_ports(&[CARRY_A]));
+        assert_eq!(admitted(&next, CARRY_A), Pending);
+        assert_eq!(admitted(&next, CARRY_B), Pending);
+        let next = GatewayListenerAdmission::pending().carry_forward(&unrelated);
+        assert_eq!(admitted(&next, CARRY_A), Pending);
+
+        assert_reload_sequence(
+            "three reloads without a reconcile",
+            reconciled(&routes_on_ports(&[CARRY_A, CARRY_B]), &[]),
+            vec![
+                (
+                    routes_on_ports(&[CARRY_A, CARRY_B, CARRY_C]),
+                    vec![(CARRY_A, Allowed), (CARRY_B, Allowed), (CARRY_C, Pending)],
+                ),
+                (
+                    with_tls_port(routes_on_ports(&[CARRY_A, CARRY_B, CARRY_C]), CARRY_B),
+                    vec![(CARRY_A, Allowed), (CARRY_B, Refused), (CARRY_C, Pending)],
+                ),
+                (
+                    routes_on_ports(&[CARRY_A]),
+                    vec![(CARRY_A, Allowed), (CARRY_B, Refused), (CARRY_C, Refused)],
+                ),
+            ],
+        );
+
+        assert_reload_sequence(
+            "Sidecar ingress bind address change",
+            reconciled(
+                &with_sidecar_bind(routes_on_ports(&[CARRY_A, CARRY_B]), CARRY_A, loopback),
+                &[],
+            ),
+            vec![(
+                with_sidecar_bind(routes_on_ports(&[CARRY_A, CARRY_B]), CARRY_A, loopback_v6),
+                vec![(CARRY_A, Refused), (CARRY_B, Allowed)],
+            )],
+        );
+
+        assert_reload_sequence(
+            "Sidecar ingress mesh direction change on the same bind address",
+            reconciled(&routes_on_ports(&[CARRY_A, CARRY_B]), &[]),
+            vec![(
+                with_sidecar_bind(routes_on_ports(&[CARRY_A, CARRY_B]), CARRY_A, wildcard),
+                vec![(CARRY_A, Refused), (CARRY_B, Allowed)],
+            )],
+        );
+
+        assert_reload_sequence(
+            "plan refusal lifted before reconcile",
+            reconciled(
+                &with_tcp_stream_on(routes_on_ports(&[CARRY_A, CARRY_B]), CARRY_A),
+                &[CARRY_A],
+            ),
+            vec![(
+                routes_on_ports(&[CARRY_A, CARRY_B]),
+                vec![(CARRY_A, Refused), (CARRY_B, Allowed)],
+            )],
+        );
+
+        assert_reload_sequence(
+            "process-global port changes class",
+            reconciled(&routes_on_ports(&[CARRY_GLOBAL]), &[]),
+            vec![(
+                with_tls_port(routes_on_ports(&[CARRY_GLOBAL]), CARRY_GLOBAL),
+                vec![(CARRY_GLOBAL, Refused)],
+            )],
+        );
+
+        assert_reload_sequence(
+            "process-global route withdrawn",
+            reconciled(&routes_on_ports(&[CARRY_GLOBAL, CARRY_A]), &[]),
+            vec![(
+                routes_on_ports(&[CARRY_A]),
+                vec![(CARRY_GLOBAL, Allowed), (CARRY_A, Allowed)],
+            )],
+        );
+
+        assert_reload_sequence(
+            "new reserved port is refused from the plan",
+            reconciled(&routes_on_ports(&[CARRY_A]), &[]),
+            vec![(
+                routes_on_ports(&[CARRY_A, CARRY_ADMIN]),
+                vec![(CARRY_A, Allowed), (CARRY_ADMIN, Refused)],
+            )],
+        );
+
+        // A port that never had a decision must not become admitted by
+        // leaving the plan before its reconcile.
+        assert_reload_sequence(
+            "pending process-global port withdrawn",
+            reconciled(&routes_on_ports(&[CARRY_A]), &[]),
+            vec![
+                (
+                    routes_on_ports(&[CARRY_A, CARRY_GLOBAL]),
+                    vec![(CARRY_A, Allowed), (CARRY_GLOBAL, Pending)],
+                ),
+                (
+                    routes_on_ports(&[CARRY_A]),
+                    vec![(CARRY_A, Allowed), (CARRY_GLOBAL, Pending)],
+                ),
+            ],
+        );
+
+        assert_reload_sequence(
+            "pending listener port changed then withdrawn",
+            reconciled(&routes_on_ports(&[CARRY_A]), &[]),
+            vec![
+                (
+                    routes_on_ports(&[CARRY_A, CARRY_B]),
+                    vec![(CARRY_A, Allowed), (CARRY_B, Pending)],
+                ),
+                (
+                    with_tls_port(routes_on_ports(&[CARRY_A, CARRY_B]), CARRY_B),
+                    vec![(CARRY_A, Allowed), (CARRY_B, Pending)],
+                ),
+                (
+                    routes_on_ports(&[CARRY_A]),
+                    vec![(CARRY_A, Allowed), (CARRY_B, Refused)],
+                ),
+            ],
+        );
+
+        // Only the exact generation's reconcile widens admission.
+        let previous = reconciled(&routes_on_ports(&[CARRY_A]), &[]);
+        let carried = previous.carry_forward(&routes_on_ports(&[CARRY_A, CARRY_B]));
+        assert_eq!(admitted(&carried, CARRY_B), Pending);
+        let decided = reconciled(&routes_on_ports(&[CARRY_A, CARRY_B]), &[]);
+        assert_eq!(admitted(&decided, CARRY_B), Allowed);
     }
 }

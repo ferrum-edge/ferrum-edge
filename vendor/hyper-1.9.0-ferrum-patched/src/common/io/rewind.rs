@@ -10,6 +10,9 @@ use crate::rt::{Read, ReadBufCursor, Write};
 #[derive(Debug)]
 pub(crate) struct Rewind<T> {
     pre: Option<Bytes>,
+    // FERRUM PATCH 003: a read error the HTTP/1 connection hit while reading
+    // ahead, delivered once on the first read after `pre` (ferrum-edge #5911).
+    read_error: Option<io::Error>,
     inner: T,
 }
 
@@ -22,6 +25,7 @@ impl<T> Rewind<T> {
     pub(crate) fn new(io: T) -> Self {
         Rewind {
             pre: None,
+            read_error: None,
             inner: io,
         }
     }
@@ -29,8 +33,16 @@ impl<T> Rewind<T> {
     pub(crate) fn new_buffered(io: T, buf: Bytes) -> Self {
         Rewind {
             pre: Some(buf),
+            read_error: None,
             inner: io,
         }
+    }
+
+    /// FERRUM PATCH 003: return `error` from the first read after the
+    /// buffered bytes, before reading `inner` again.
+    pub(crate) fn with_read_error(mut self, error: Option<io::Error>) -> Self {
+        self.read_error = error;
+        self
     }
 
     #[cfg(all(
@@ -43,8 +55,8 @@ impl<T> Rewind<T> {
         self.pre = Some(bs);
     }
 
-    pub(crate) fn into_inner(self) -> (T, Bytes) {
-        (self.inner, self.pre.unwrap_or_default())
+    pub(crate) fn into_inner(self) -> (T, Bytes, Option<io::Error>) {
+        (self.inner, self.pre.unwrap_or_default(), self.read_error)
     }
 
     #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
@@ -76,6 +88,9 @@ where
 
                 return Poll::Ready(Ok(()));
             }
+        }
+        if let Some(error) = self.read_error.take() {
+            return Poll::Ready(Err(error));
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }

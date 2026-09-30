@@ -33,8 +33,13 @@ across that per-chunk path.
 
 ## Patch
 
-Only `src/proto/h1/io.rs` changes; the unified diff is
-[`hyper-greedy-h1-read.patch`](hyper-greedy-h1-read.patch).
+The read-ahead lives in `src/proto/h1/io.rs`; the upgrade handoff below also
+touches `src/common/io/rewind.rs`, `src/upgrade.rs`, `src/proto/h1/conn.rs`,
+`src/proto/h1/dispatch.rs`, and the HTTP/1 client and server connections
+(`src/client/conn/http1.rs`, `src/server/conn/http1.rs`). The unified diff is
+[`hyper-greedy-h1-read.patch`](hyper-greedy-h1-read.patch), taken against
+hyper 1.9.0 with patches 001 and 002 applied (001 also touches `rewind.rs`
+and `upgrade.rs`).
 
 After a successful read, if that read returned at least `GREEDY_READ_MIN`
 (16 KiB, one maximum TLS record's plaintext) and the read buffer has room,
@@ -47,19 +52,32 @@ not guarantee that a transport error will recur on the next read. (Over
 plain TCP a reset is reported once and later reads see EOF, which would end a
 close-delimited body as if the peer had closed it.)
 
-Known limitation: an upgrade (101 Switching Protocols or CONNECT) hands the
-tunnel only the IO and the buffered bytes (`Buffered::into_inner`), so an
-error still pending at that point is dropped with a `debug!` log, and the
-tunnel's next read may see EOF instead of the reset. Reaching it needs at least
-16 KiB right behind the upgrade head plus a transport error in the same read
-burst; tracked in [#5911](https://github.com/ferrum-edge/ferrum-edge/issues/5911).
-
 - A read shorter than 16 KiB never triggers another, so small messages (a
   10 KiB request) cost no extra `recv`.
 - Filling the buffer lets hyper's adaptive read strategy grow as it was
   designed to, so bulk bodies settle into 64–128 KiB reads.
 - It applies to every HTTP/1 connection hyper drives: Ferrum's frontend
   listeners and its reqwest backend pools.
+
+### Upgrades
+
+An upgrade (101 Switching Protocols, WebSocket, or CONNECT) carries a
+pending error into the tunnel ([#5911](https://github.com/ferrum-edge/ferrum-edge/issues/5911)).
+`Buffered::into_inner` returns it next to the IO and the buffered bytes, and
+the HTTP/1 client and server `UpgradeableConnection`s build the `Upgraded`
+with it. `Upgraded` keeps the buffered bytes in `Rewind`, which now also holds
+the error: its first read after the buffered bytes returns the error once,
+before it reads the IO again. Without this, a reset seen during read-ahead was
+lost and the tunnel's next read over plain TCP returned EOF, so a WebSocket or
+TCP relay closed normally instead of recording an abortive close. The upgrade
+API does not change.
+
+Two paths still drop a pending error, with a `debug!` log, because their
+return types have no place for it: `Connection::into_parts` on the HTTP/1
+client and server (used with `without_shutdown` for manual upgrades), and a
+successful `Upgraded::downcast`. A failed downcast keeps the error on the
+`Upgraded` it returns. Ferrum uses neither path: its tunnels read the
+`Upgraded` from `hyper::upgrade::on` directly.
 
 ## Measured
 
@@ -80,8 +98,11 @@ fails with 16,384 bytes without the patch);
 `ferrum_greedy_read_skips_short_reads` proves a short first read returns alone;
 `ferrum_greedy_read_preserves_read_ahead_error` proves a one-shot error
 during read-ahead is delivered once, after every buffered byte has drained
-through small reads; and `ferrum_greedy_read_error_fails_a_close_delimited_body`
-proves a close-delimited body cut by that error fails instead of ending cleanly.
+through small reads; `ferrum_greedy_read_error_fails_a_close_delimited_body`
+proves a close-delimited body cut by that error fails instead of ending cleanly;
+and `ferrum_greedy_read_error_reaches_the_upgraded_tunnel` upgrades a client
+connection with a 101 whose read-ahead ends in a one-time `ConnectionReset`,
+and proves the tunnel reads every buffered byte, then the reset, then EOF.
 The `Vendored Patch Regressions` CI job runs them with
 
 ```bash
@@ -92,6 +113,7 @@ cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --featur
 
 Retire when hyper (or tokio-rustls, by filling the caller's buffer from every
 record already readable) stops handing HTTP/1 bodies over one TLS record per
-read, or when the vendored hyper is retired as a whole. Drop the hunk from the
-vendored copy, the inventory row, the lifecycle entry and the CI command, then
-regenerate `vendor/VENDOR_INTEGRITY.sha256`.
+read, or when the vendored hyper is retired as a whole. Drop the patch's hunks
+(the read-ahead and the upgrade handoff go together) from the vendored copy,
+the inventory row, the lifecycle entry and the CI command, then regenerate
+`vendor/VENDOR_INTEGRITY.sha256`.

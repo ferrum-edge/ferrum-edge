@@ -47,6 +47,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every namespace. Per-tenant readers should use tokens pre-minted with the
   primary key and an `ns` claim. A namespace ceiling for the viewer key is a
   planned follow-up.
+- **`mcp_gateway` per-consumer tool grants** (#5907). In `aggregate_router`
+  mode a `policy.tools` entry with `action: allow` can carry
+  `allowed_groups` and `denied_groups`, matched against the request
+  Consumer's `acl_groups`. A tool is granted when the caller is a mapped
+  Consumer that holds none of `denied_groups` (which takes precedence) and
+  either the entry has no `allowed_groups` or the Consumer holds one of them;
+  a request with no mapped Consumer is never granted a group-conditioned
+  tool. `tools/list` leaves out every ungranted tool, across every aggregated
+  upstream, and `tools/call` of one answers the existing `-32001`. Once any
+  entry carries a group list, an unknown tool name also answers `-32001`
+  instead of `-32003`, so hidden tool names cannot be probed. Groups are read
+  from the Consumer resolved for each request from the live configuration, so
+  an Admin API grant or revoke applies to that consumer's next request on the
+  same MCP session without a restart. The grant is re-decided in the final
+  request-body hook after the admission re-check, so a later plugin cannot
+  swap the identified Consumer to carry an ungranted call upstream.
+  `mcp.policy_decision` records `deny_group` or `deny_no_consumer`. Empty
+  lists, group lists on `deny` / `hide_from_discovery` entries, a group in
+  both lists, more than 512 distinct groups per policy, and a
+  group-conditioned key outside every configured server's namespace are
+  rejected at config load. Grants cover `tools/list` and `tools/call` only.
+  Tool-name-only policies behave exactly as before.
+  `notifications/tools/list_changed` is not yet sent when grants change.
 
 - **`otel_tracing` attempt spans on the HTTP/3 bridge to HTTP/1.1 and HTTP/2
   backends** (#5875). The HTTP/3 frontend's bridge to a backend without
@@ -306,6 +329,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`mcp_gateway` aggregate `initialize` advertises `listChanged: false`**
+  for tools, resources, and prompts (#5907). It advertised `true`, but the
+  gateway never emits `notifications/*/list_changed`, so a client relying on
+  it would never re-list. It returns to `true` once an emitter exists.
+
 - **Mesh `connection.sni` condition values are normalized at load** (#5903).
   Every surface that loads a policy (Kubernetes translation, file and native
   config, and `mesh_authz` construction) strips one trailing dot, lowercases
@@ -342,10 +370,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   patch 003 keeps reading after a full-record read while the transport has more
   ready; a short read still returns alone, and a read error met during that
   read-ahead is kept and delivered after the bytes already read, so a
-  close-delimited body cut by a connection reset still fails (#5909). On
-  Linux, large HTTPS/1.1 proxied
-  responses use 14–20% less CPU per request (+11% throughput at 70 KiB, +15% at
-  1 MiB), with no change at 10 KiB.
+  close-delimited body cut by a connection reset still fails (#5909). A
+  connection upgraded right after such a read (101 Switching Protocols,
+  WebSocket, or CONNECT) hands that error to its tunnel after the buffered
+  bytes, so the WebSocket or TCP relay sees the reset instead of a clean EOF
+  (#5911). On Linux, large HTTPS/1.1 proxied responses use 14–20% less CPU
+  per request (+11% throughput at 70 KiB, +15% at 1 MiB), with no change at
+  10 KiB.
 
 - **Streamed HTTP/1.x backend responses keep their `Content-Length`**
   (#5588). A streamed response used to lose its length and go to HTTP/1.1
@@ -538,6 +569,16 @@ outright with no deprecation period:
   longer polled with `FERRUM_CP_DP_GRPC_JWT_SECRET`.
 
 ### Fixed
+
+- **Config reloads no longer 404 live Gateway listener routes** (#5914). Every
+  config publication used to reset listener route admission to pending, so
+  each reload briefly answered 404 on listener-scoped routes of listeners that
+  were already serving, and on the single-listener Service remap of the
+  process-global port. A publication now keeps the previous decision for ports
+  whose listener plan (class, bind address, mesh direction, process-global
+  ownership) is unchanged. A new port waits for its reconcile. A withdrawn
+  port, or a changed port that had a live socket, fails closed at once, so its
+  old socket never serves under its old identity.
 
 - **Gateway listeners wait for matching route admission** (#5913). Newly bound
   listener sockets do not accept connections until their matching config

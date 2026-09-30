@@ -99,9 +99,9 @@ where
         }
     }
 
-    pub(crate) fn into_inner(self) -> (I, Bytes, D) {
-        let (io, buf) = self.conn.into_inner();
-        (io, buf, self.dispatch)
+    pub(crate) fn into_inner(self) -> (I, Bytes, Option<std::io::Error>, D) {
+        let (io, buf, read_error) = self.conn.into_inner();
+        (io, buf, read_error, self.dispatch)
     }
 
     /// Run this dispatcher until HTTP says this connection is done,

@@ -458,14 +458,33 @@ without a restart. These bounds are deliberate and tested:
 
 - **Routing admission is generation-bound.** The atomic `RequestEpoch` that
   publishes a new route table also publishes that generation's listener
-  admission as pending. Every listener-scoped route in the pending generation
-  fails closed on exact, prefix, regex, cached, global-socket, and
-  single-listener-remap lookups. Reconcile derives its decision from that exact
-  config snapshot and acknowledges only while the same config generation is
-  still current; a stale pass is discarded and the latest generation is
-  reconciled immediately. This prevents a new route table from borrowing an
-  older generation's successful listener decision while preserving complete
-  prior snapshots for requests already in flight.
+  admission, derived from the previous reconcile decision and the listener plan
+  it was made against (issue #5914):
+  - a port whose planned identity (class, bind address, mesh direction,
+    process-global ownership, or plan refusal) is unchanged keeps its
+    decision, so a live listener and the single-listener Service remap onto it
+    keep serving through the reload;
+  - a new port is pending (or refused, if the plan itself refuses it, such as a
+    reserved port): its listener-scoped routes fail closed on exact,
+    prefix, regex, cached, global-socket, and single-listener-remap lookups;
+  - a changed or withdrawn port that already had a decision and owns a Gateway
+    listener socket is refused (a changed port that is still pending stays
+    pending, since its socket's accept gate is closed),
+    also as a frontend port, so its still-open socket never serves under the
+    old identity or falls back to port-agnostic routes;
+  - refusals held for retiring sockets are kept;
+  - a route withdrawn from the process-global proxy port never refuses that
+    frontend, which keeps serving its port-agnostic routes.
+
+  A generation with no prior decision (startup) is wholly pending. The carried
+  admission is never less strict than the one it replaces: only a reconcile of
+  the exact config generation can widen it. Reconcile derives its decision from
+  that exact config snapshot and acknowledges only while the same config
+  generation is still current; a stale pass is discarded, opens no accept
+  gate, and the latest generation is reconciled immediately. So a new route
+  table can never gain admission from an older generation's decision for a
+  port that generation did not decide identically, while complete prior
+  snapshots stay intact for requests already in flight.
 
 - **Withdrawal is fail-closed but not instantaneous at the socket.** Routes are
   withdrawn by the atomic config swap that *precedes* the listener reconcile, so

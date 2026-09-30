@@ -10727,13 +10727,19 @@ impl ProxyState {
     /// Publish the listener admission decision produced from `expected` only
     /// while that exact config generation remains current. Returns `false` for
     /// a stale reconcile so the manager can immediately process the newer one.
+    ///
+    /// `basis` is the listener plan the decision was made against. Later
+    /// config publications carry the decision forward for ports whose plan is
+    /// unchanged instead of resetting every listener-scoped route to pending.
     pub(crate) fn publish_gateway_listener_admission(
         &self,
         expected: &RequestEpoch,
         refused_ports: std::collections::BTreeSet<u16>,
+        basis: crate::proxy::gateway_listener::GatewayListenerAdmissionBasis,
         activate_listeners: impl FnOnce(),
     ) -> bool {
-        let admission = crate::router_cache::GatewayListenerAdmission::decided(refused_ports);
+        let admission =
+            crate::router_cache::GatewayListenerAdmission::decided_for_plan(refused_ports, basis);
         self.request_epoch
             .publish_gateway_listener_admission(expected, admission, |published| {
                 self.router_cache.store_route_epoch_snapshot(
