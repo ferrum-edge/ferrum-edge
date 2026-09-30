@@ -69,7 +69,12 @@ where
     ///
     /// Only works for HTTP/1 connections. HTTP/2 connections will panic.
     pub fn into_parts(self) -> Parts<T> {
-        let (io, read_buf, _) = self.inner.into_inner();
+        let (io, read_buf, read_error, _) = self.inner.into_inner();
+        // FERRUM PATCH 003: `Parts` has no place for a pending read-ahead
+        // error, so taking the connection apart drops it.
+        if let Some(_error) = &read_error {
+            debug!("into_parts drops a pending read-ahead error: {}", _error);
+        }
         Parts { io, read_buf }
     }
 
@@ -600,8 +605,11 @@ mod upgrades {
             match ready!(Pin::new(&mut self.inner.as_mut().unwrap().inner).poll(cx)) {
                 Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
                 Ok(proto::Dispatched::Upgrade(pending)) => {
-                    let Parts { io, read_buf } = self.inner.take().unwrap().into_parts();
-                    pending.fulfill(Upgraded::new(io, read_buf));
+                    // FERRUM PATCH 003: carry a pending read-ahead error
+                    // into the tunnel (ferrum-edge issue #5911).
+                    let (io, read_buf, read_error, _) =
+                        self.inner.take().unwrap().inner.into_inner();
+                    pending.fulfill(Upgraded::new_with_read_error(io, read_buf, read_error));
                     Poll::Ready(Ok(()))
                 }
                 Err(e) => Poll::Ready(Err(e)),

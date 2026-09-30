@@ -156,7 +156,7 @@ where
         self.state.date_header = false;
     }
 
-    pub(crate) fn into_inner(self) -> (I, Bytes) {
+    pub(crate) fn into_inner(self) -> (I, Bytes, Option<io::Error>) {
         self.io.into_inner()
     }
 
