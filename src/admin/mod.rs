@@ -2716,8 +2716,7 @@ fn authorize_request_namespace(
 /// ceiling. Keep this list explicit: a new global route is denied by default.
 fn ceiling_global_route_is_allowed(method: &Method, segments: &[&str]) -> bool {
     (*method == Method::GET && matches!(segments, ["plugins"]))
-        || (*method == Method::GET
-            && matches!(segments, ["health"] | ["live"] | ["status"]))
+        || (*method == Method::GET && matches!(segments, ["health"] | ["live"] | ["status"]))
         || (matches!(segments, ["namespaces"])
             && (*method == Method::GET || *method == Method::POST))
         || (matches!(segments, ["namespaces", _])
@@ -3656,12 +3655,8 @@ async fn handle_admin_request_inner(
         }
         if let Ok(token_data) = state.jwt_manager.verify_request(auth_header.as_deref())
             && let Ok(actor) = AuditActor::from_verified(&token_data)
-            && let Some(response) = authorize_ceiling_global_route(
-                &method,
-                &["metrics"],
-                path,
-                &actor,
-            )
+            && let Some(response) =
+                authorize_ceiling_global_route(&method, &["metrics"], path, &actor)
         {
             return Ok(response);
         }
@@ -3797,9 +3792,7 @@ async fn handle_admin_request_inner(
     audit::note_request_actor(&auth, &audit_request_ctx);
 
     let route_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    if let Some(response) =
-        authorize_ceiling_global_route(&method, &route_segments, &path, &auth)
-    {
+    if let Some(response) = authorize_ceiling_global_route(&method, &route_segments, &path, &auth) {
         drop(req.into_body());
         return Ok(response);
     }
