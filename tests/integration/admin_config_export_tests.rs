@@ -818,10 +818,7 @@ async fn ceiling_bound_viewers_are_denied_global_routes_except_the_explicit_allo
         let reply = get(&base, path, Some(&ceiling_viewer), None).await;
         assert_eq!(reply.status, 200, "GET {path}: {}", reply.text);
         if path == "/health" || path == "/status" {
-            assert_eq!(
-                reply.body.as_object().map(|body| body.len()),
-                Some(2)
-            );
+            assert_eq!(reply.body.as_object().map(|body| body.len()), Some(2));
             assert!(reply.body.get("status").is_some(), "{}", reply.text);
             assert!(reply.body.get("ready").is_some(), "{}", reply.text);
         }
