@@ -462,6 +462,11 @@ async fn test_http3_proxy_state_creation() {
         websocket_write_buffer_size: 131_072,
         websocket_tunnel_mode: false,
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
+        process_global_frontends: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrum_edge::proxy::gateway_listener::env_process_global_frontends(
+                &ferrum_edge::config::EnvConfig::default(),
+            ),
+        )),
         reserved_gateway_ports: Arc::new(std::collections::HashSet::new()),
         trusted_proxies: Arc::new(
             ferrum_edge::proxy::client_ip::TrustedProxies::parse_strict("", "test")
@@ -808,6 +813,11 @@ async fn test_http3_full_integration() {
         websocket_write_buffer_size: 131_072,
         websocket_tunnel_mode: false,
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
+        process_global_frontends: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrum_edge::proxy::gateway_listener::env_process_global_frontends(
+                &ferrum_edge::config::EnvConfig::default(),
+            ),
+        )),
         reserved_gateway_ports: Arc::new(std::collections::HashSet::new()),
         trusted_proxies: Arc::new(
             ferrum_edge::proxy::client_ip::TrustedProxies::parse_strict("", "test")
