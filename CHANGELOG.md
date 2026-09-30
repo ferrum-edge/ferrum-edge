@@ -624,23 +624,32 @@ outright with no deprecation period:
 ### Security
 
 - `mcp_gateway` `aggregate_router` admission now holds on the final request
-  body (GHSA-3w98-6p32-8qm2). The method, selected upstream, tool or prompt
-  name, resource URI, and arguments the gateway admitted are recorded privately
-  on the request and checked again over the exact bytes the upstream will
-  receive, after every request-body transform. A routed `tools/call`,
-  `prompts/get`, `resources/read`, or passthrough request that a later plugin
-  changed is refused before it is sent upstream with JSON-RPC `-32014`; the
-  gateway's own public-to-upstream name rewrite is the only permitted
-  difference. The check runs on HTTP/1.1, HTTP/2, and HTTP/3.
+  (GHSA-3w98-6p32-8qm2). The message kind, method, selected upstream, mediated
+  upstream session, tool or prompt name, resource URI, and arguments the
+  gateway admitted are recorded privately on the request and checked again
+  over the exact request the upstream will receive, after every request-body
+  transform. A routed `tools/call`, `prompts/get`, `resources/read`, or
+  passthrough message that a later plugin changed is refused before it is sent
+  upstream with JSON-RPC `-32014`; the gateway's own public-to-upstream name
+  rewrite is the only permitted difference. A client-sent JSON-RPC response
+  forwarded through `passthrough_unknown_methods` is still admitted, bound to
+  the request `id` it answers. A later route rewrite of an MCP-routed request,
+  including a `mesh_route_dispatch` destination rewrite, is now refused. The
+  check runs on HTTP/1.1, HTTP/2, and HTTP/3.
 - `mcp_gateway` sessions owned by an external identity with no Consumer
   mapping are now bound to the authentication realm that verified that
   identity, not only to its subject string (GHSA-wr96-j2c3-qh66). `jwks_auth`,
   `oidc_relying_party`, `oauth2_introspection`, and `ldap_auth` commit the
-  verifying authority (issuer, key source, or directory) with the identity, so
-  the same `sub` from two accepted issuers or auth plugins names two different
-  session owners, and neither can use the other's session for catalog
-  listing, routed calls, the SSE listener, cancellation, or `DELETE`.
+  verifying authority (issuer, key source, introspection endpoint, or
+  directory, plus the claim the identity is read from) with the identity; a
+  `jwks_auth` provider that pins no issuer also binds each token's `iss`. The
+  same `sub` from two accepted issuers, tenants, or auth plugins therefore names
+  two different session owners, and neither can use the other's session for
+  catalog listing, routed calls, the SSE listener, cancellation, or `DELETE`.
   Consumer-mapped ownership is still bound to namespace and record id.
+  Changing a provider's issuer, key source, endpoint, or identity claim
+  changes the realm, so existing external-identity MCP sessions under the old
+  realm end and their clients must initialize again.
 - `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
   says (#5767): a backend or serverless-function copy, in the headers or the
   trailers, is stripped at every backend response boundary, as

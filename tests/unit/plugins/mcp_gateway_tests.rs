@@ -13097,7 +13097,7 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
 }
 
 // ---------------------------------------------------------------------------
-// GHSA-3w98-6p32-8qm2: aggregate admission holds on the final request body
+// Aggregate admission holds on the final request
 // ---------------------------------------------------------------------------
 
 /// A `request_transformer` instance built from body rules only.
@@ -13164,6 +13164,16 @@ async fn final_body_verdicts(
 }
 
 fn assert_admission_drift_refused(verdicts: [PluginResult; 2], request_id: i64, case: &str) {
+    assert_admission_drift_refused_with_id(verdicts, json!(request_id), case);
+}
+
+/// As [`assert_admission_drift_refused`], for a message whose refusal carries
+/// `expected_id` (`null` for a notification or a client-sent response).
+fn assert_admission_drift_refused_with_id(
+    verdicts: [PluginResult; 2],
+    expected_id: Value,
+    case: &str,
+) {
     for verdict in verdicts {
         let (status, body, _) = reject_json(verdict);
         assert_eq!(status, 200, "{case}");
@@ -13172,7 +13182,7 @@ fn assert_admission_drift_refused(verdicts: [PluginResult; 2], request_id: i64, 
             body["error"]["message"], "MCP request changed after gateway admission",
             "{case}"
         );
-        assert_eq!(body["id"], json!(request_id), "{case}: names the call");
+        assert_eq!(body["id"], expected_id, "{case}: names the call");
     }
 }
 
@@ -13467,7 +13477,7 @@ async fn aggregate_final_body_check_ignores_requests_it_did_not_route() {
 }
 
 // ---------------------------------------------------------------------------
-// GHSA-wr96-j2c3-qh66: external session owners are bound to their identity realm
+// External session owners are bound to their identity realm
 // ---------------------------------------------------------------------------
 
 const ISSUER_A: &str = "https://issuer-a.example";
@@ -13501,23 +13511,33 @@ async fn authenticate_via_issuer(
     issuer: &str,
     subject: &str,
 ) -> McpCaller {
+    let claims = json!({ "iss": issuer, "sub": subject });
+    let caller = authenticate_with_claims(auth, caller, &claims).await;
+    assert_eq!(caller.0.authenticated_identity.as_deref(), Some(subject));
+    caller
+}
+
+/// Authenticate a caller through `jwks_auth` with a token carrying `claims`,
+/// signed by issuer B's key when `iss` names issuer B and by issuer A's key
+/// otherwise, with no Consumer mapping.
+async fn authenticate_with_claims(
+    auth: &ferrum_edge::plugins::jwks_auth::JwksAuth,
+    caller: McpCaller,
+    claims: &Value,
+) -> McpCaller {
     let (mut ctx, headers) = caller;
-    let (private_key, kid): (&[u8], &str) = if issuer == ISSUER_A {
-        (
-            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
-            "issuer-a",
-        )
-    } else {
+    let (private_key, kid): (&[u8], &str) = if claims["iss"] == ISSUER_B {
         (
             include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
             "issuer-b",
         )
+    } else {
+        (
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+            "issuer-a",
+        )
     };
-    let token = super::jwks_auth_support::create_rs256_token_with_kid(
-        &json!({ "iss": issuer, "sub": subject }),
-        private_key,
-        kid,
-    );
+    let token = super::jwks_auth_support::create_rs256_token_with_kid(claims, private_key, kid);
     ctx.identified_consumer = None;
     ctx.authenticated_identity = None;
     ctx.headers
@@ -13529,10 +13549,9 @@ async fn authenticate_via_issuer(
         .await;
     assert!(
         matches!(result, PluginResult::Continue),
-        "{issuer} must authenticate {subject}: {result:?}"
+        "{claims} must authenticate: {result:?}"
     );
     assert!(ctx.identified_consumer.is_none());
-    assert_eq!(ctx.authenticated_identity.as_deref(), Some(subject));
     (ctx, headers)
 }
 
@@ -13542,7 +13561,7 @@ fn delete_session(session_id: &str) -> McpCaller {
     (ctx, headers)
 }
 
-fn cancel_notification() -> Value {
+fn cancel_notification_body() -> Value {
     json!({
         "jsonrpc": "2.0",
         "method": "notifications/cancelled",
@@ -13601,7 +13620,7 @@ async fn aggregate_session_is_not_reusable_by_an_equal_subject_from_another_issu
     assert_session_refused(reuse_session_as(&plugin, &session_id, b_list).await);
     let b_call = as_b(mcp_ctx(create_pr_call(3))).await;
     assert_session_refused(reuse_session_as(&plugin, &session_id, b_call).await);
-    let b_cancel = as_b(mcp_ctx(cancel_notification())).await;
+    let b_cancel = as_b(mcp_ctx(cancel_notification_body())).await;
     assert_session_refused(reuse_session_as(&plugin, &session_id, b_cancel).await);
     let b_sse = as_b(sse_get(&session_id)).await;
     assert_session_refused(reuse_session_as(&plugin, &session_id, b_sse).await);
@@ -13636,4 +13655,292 @@ async fn aggregate_session_is_not_reusable_by_an_equal_subject_from_another_issu
     assert_eq!(status, 200);
     let a_after = as_a(mcp_ctx(tools_list_body(7))).await;
     assert_session_refused(reuse_session_as(&plugin, &session_id, a_after).await);
+}
+
+// ---------------------------------------------------------------------------
+// Final admission: passthrough kinds, forged rewrite metadata, upstream session
+// ---------------------------------------------------------------------------
+
+fn passthrough_client_response() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": "upstream-sampling-7",
+        "result": { "roots": [] }
+    })
+}
+
+fn vendor_custom_request() -> Value {
+    json!({ "jsonrpc": "2.0", "id": 81, "method": "vendor/custom", "params": {} })
+}
+
+fn roots_list_changed() -> Value {
+    json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed", "params": {} })
+}
+
+async fn passthrough_plugin_with_catalog() -> (MockServer, Arc<dyn ferrum_edge::plugins::Plugin>) {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["capabilities"] = json!({ "passthrough_unknown_methods": true });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    (server, plugin)
+}
+
+/// A client answering an upstream sampling / elicitation / roots request sends
+/// a JSON-RPC response with no `method`. It must still reach the upstream, and
+/// may not be turned into a different message or answer a different request.
+#[tokio::test]
+async fn aggregate_passthrough_client_response_is_admitted_and_bound_to_its_id() {
+    let (_server, plugin) = passthrough_plugin_with_catalog().await;
+    let session_id = initialize(&plugin).await;
+    let response = passthrough_client_response;
+
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, None, &session_id, response()).await;
+    assert!(plugin.enforces_final_request_body_policy(&ctx, &headers, &body));
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "a client-sent JSON-RPC response",
+    );
+
+    let rebind = body_transformer(json!([
+        {"operation": "update", "target": "body", "key": "id", "value": "upstream-sampling-8"}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&rebind), &session_id, response()).await;
+    assert_admission_drift_refused_with_id(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        Value::Null,
+        "response re-addressed to another upstream request",
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.admission_violation")
+            .map(String::as_str),
+        Some("response_id_changed")
+    );
+
+    let add_method = body_transformer(json!([
+        {"operation": "add", "target": "body", "key": "method", "value": "tools/call"}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&add_method), &session_id, response()).await;
+    assert_admission_drift_refused_with_id(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        Value::Null,
+        "method injected into a response",
+    );
+}
+
+#[tokio::test]
+async fn aggregate_passthrough_method_and_message_kind_are_bound() {
+    let (_server, plugin) = passthrough_plugin_with_catalog().await;
+    let session_id = initialize(&plugin).await;
+    let custom = vendor_custom_request;
+
+    let (mut ctx, headers, body) = admit_and_transform(&plugin, None, &session_id, custom()).await;
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "passthrough request",
+    );
+
+    let swap = body_transformer(json!([
+        {"operation": "update", "target": "body", "key": "method", "value": "tools/call"}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&swap), &session_id, custom()).await;
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        81,
+        "passthrough method replaced by a policed one",
+    );
+
+    let notification = roots_list_changed;
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, None, &session_id, notification()).await;
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "passthrough notification",
+    );
+
+    let add_id = body_transformer(json!([
+        {"operation": "add", "target": "body", "key": "id", "value": 5}
+    ]));
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, Some(&add_id), &session_id, notification()).await;
+    assert_admission_drift_refused_with_id(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        Value::Null,
+        "notification turned into a request",
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.admission_violation")
+            .map(String::as_str),
+        Some("message_kind_changed")
+    );
+}
+
+/// Forgeable `mcp.rewrite.*` metadata cannot drive the gateway's rewrite to a
+/// different upstream item: whatever the rewrite produced, the final body must
+/// carry the recorded upstream identity.
+#[tokio::test]
+async fn aggregate_forged_rewrite_metadata_cannot_retarget_the_admitted_item() {
+    let (_server, plugin) = aggregate_plugin_with_catalog().await;
+    let session_id = initialize(&plugin).await;
+
+    for (request, request_id, forged) in [
+        (allowed_tool_call(91), 91, "merge_pr"),
+        (prompt_get(92), 92, "internal_prompt"),
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(request.clone());
+        headers.insert("mcp-session-id".to_string(), session_id.clone());
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        // A later before_proxy hook rewrites the public rewrite staging.
+        ctx.metadata
+            .insert("mcp.rewrite.upstream_value".to_string(), forged.to_string());
+        let original = serde_json::to_vec(&request).unwrap();
+        let transformed = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &headers,
+            )
+            .await;
+        let body = transformed.unwrap_or(original);
+        assert_admission_drift_refused(
+            final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+            request_id,
+            "forged rewrite metadata",
+        );
+    }
+}
+
+/// The mediated upstream session id the gateway placed on the backend request
+/// is part of the admitted call: a later header transform cannot swap it.
+#[tokio::test]
+async fn aggregate_final_check_binds_the_mediated_upstream_session_header() {
+    let (_server, plugin) = aggregate_plugin_with_catalog().await;
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, headers, body) =
+        admit_and_transform(&plugin, None, &session_id, allowed_tool_call(95)).await;
+    assert_eq!(
+        headers.get("mcp-session-id").map(String::as_str),
+        Some("upstream-session"),
+        "precondition: the gateway mediated an upstream session"
+    );
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &headers, &body).await,
+        "the gateway's own upstream session",
+    );
+
+    let mut swapped = headers.clone();
+    swapped.insert("mcp-session-id".to_string(), "another-session".to_string());
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &swapped, &body).await,
+        95,
+        "upstream session replaced",
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.admission_violation")
+            .map(String::as_str),
+        Some("upstream_session_changed")
+    );
+
+    let mut duplicated = headers.clone();
+    duplicated.insert("Mcp-Session-Id".to_string(), "another-session".to_string());
+    assert_admission_drift_refused(
+        final_body_verdicts(&plugin, &mut ctx, &duplicated, &body).await,
+        95,
+        "second upstream session spelling",
+    );
+
+    // Dropping the header cannot bind the call to another session.
+    let mut dropped = headers.clone();
+    dropped.remove("mcp-session-id");
+    assert_admission_holds(
+        final_body_verdicts(&plugin, &mut ctx, &dropped, &body).await,
+        "upstream session header removed",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// jwks_auth realm: unpinned issuers and identity claim paths
+// ---------------------------------------------------------------------------
+
+fn issuer_a_inline_jwks() -> String {
+    let key_a = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    super::jwks_auth_support::build_rsa_jwks_from_pem_with_kid(key_a, "issuer-a")
+        .to_string()
+}
+
+fn single_provider_jwks_auth(provider: Value) -> ferrum_edge::plugins::jwks_auth::JwksAuth {
+    ferrum_edge::plugins::jwks_auth::JwksAuth::new(
+        &json!({ "providers": [provider] }),
+        PluginHttpClient::default(),
+    )
+    .expect("single-provider jwks_auth")
+}
+
+async fn realm_for(
+    auth: &ferrum_edge::plugins::jwks_auth::JwksAuth,
+    claims: Value,
+) -> ferrum_edge::plugins::utils::auth_flow::ExternalIdentityRealm {
+    let (ctx, _) = authenticate_with_claims(auth, mcp_ctx(json!({})), &claims).await;
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+    ctx.authenticated_identity_realm()
+        .expect("an external identity carries its realm")
+}
+
+/// One provider with no pinned issuer serving a key set shared by several
+/// tenants: the verified `iss` of each token is part of the realm, so equal
+/// subjects from different tenants cannot share an MCP session.
+#[tokio::test]
+async fn unpinned_jwks_provider_binds_each_tokens_issuer_into_the_realm() {
+    let auth = single_provider_jwks_auth(json!({ "jwks": issuer_a_inline_jwks() }));
+    let tenant = |iss: &str| json!({ "iss": iss, "sub": "alice" });
+    let tenant_1 = realm_for(&auth, tenant("https://tenant-1.example")).await;
+    let tenant_1_again = realm_for(&auth, tenant("https://tenant-1.example")).await;
+    let tenant_2 = realm_for(&auth, tenant("https://tenant-2.example")).await;
+    assert_eq!(tenant_1, tenant_1_again);
+    assert_ne!(tenant_1, tenant_2);
+
+    let server = start_mcp_catalog_server().await;
+    let config = aggregate_config(&format!("{}/mcp", server.uri()));
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let claims_1 = tenant("https://tenant-1.example");
+    let init = mcp_ctx(initialize_request_body());
+    let owner = authenticate_with_claims(&auth, init, &claims_1).await;
+    let session_id = initialize_as(&plugin, owner).await;
+
+    let claims_2 = tenant("https://tenant-2.example");
+    let other = authenticate_with_claims(&auth, mcp_ctx(tools_list_body(2)), &claims_2).await;
+    assert_session_refused(reuse_session_as(&plugin, &session_id, other).await);
+    let owner = authenticate_with_claims(&auth, mcp_ctx(tools_list_body(3)), &claims_1).await;
+    assert_tools_listed(reuse_session_as(&plugin, &session_id, owner).await);
+}
+
+/// The claim the identity is read from is part of the realm: `sub: alice` and
+/// `preferred_username: alice` are different principals even under one issuer.
+#[tokio::test]
+async fn jwks_identity_claim_path_is_part_of_the_realm() {
+    let by_sub = single_provider_jwks_auth(json!({
+        "issuer": ISSUER_A,
+        "jwks": issuer_a_inline_jwks()
+    }));
+    let by_username = single_provider_jwks_auth(json!({
+        "issuer": ISSUER_A,
+        "jwks": issuer_a_inline_jwks(),
+        "consumer_identity_claim": "preferred_username"
+    }));
+    let claims = json!({ "iss": ISSUER_A, "sub": "alice", "preferred_username": "alice" });
+    let sub_realm = realm_for(&by_sub, claims.clone()).await;
+    let username_realm = realm_for(&by_username, claims.clone()).await;
+    assert_ne!(sub_realm, username_realm);
+    assert_eq!(sub_realm, realm_for(&by_sub, claims).await);
 }

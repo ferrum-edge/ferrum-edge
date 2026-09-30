@@ -18,6 +18,7 @@ use super::utils::auth_flow::constant_time_eq;
 use super::utils::auth_flow::{
     AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
     credential_deadline_from_claims, external_identity_realm_authority, nonblank_identity,
+    refine_external_identity_realm_authority,
 };
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
@@ -246,10 +247,29 @@ struct JwksProvider {
     /// Outbound hosts used by direct JWKS or discovery URLs.
     warmup_hostnames: Vec<String>,
     /// Verifying-authority digest committed with every external principal
-    /// this provider vouches for (`GHSA-wr96-j2c3-qh66`): its pinned issuer
-    /// and its key source. Two providers that can each accept the same `sub`
-    /// therefore never commit the same principal.
+    /// this provider vouches for: its pinned issuer, its key source, and the
+    /// claim the identity is read from. Two providers that can each accept the
+    /// same `sub` therefore never commit the same principal. A provider that
+    /// pins no issuer additionally binds each token's verified `iss`
+    /// ([`JwksProvider::identity_realm_authority_for`]).
     identity_realm_authority: [u8; 32],
+}
+
+impl JwksProvider {
+    /// Realm authority for one accepted token. A provider that pins no issuer
+    /// can accept tokens from several issuers sharing its key set (a
+    /// multi-tenant JWKS), so equal subjects from different tenants must not
+    /// collapse into one principal: the token's verified `iss` joins the realm.
+    fn identity_realm_authority_for(&self, claims: &Value) -> [u8; 32] {
+        if self.issuer.is_some() {
+            return self.identity_realm_authority;
+        }
+        refine_external_identity_realm_authority(
+            &self.identity_realm_authority,
+            "token.iss",
+            claims.get("iss").and_then(Value::as_str),
+        )
+    }
 }
 
 enum JwksSource {
@@ -793,6 +813,9 @@ impl JwksAuth {
                 ));
             };
 
+            let identity_claim = prov_consumer_identity_claim
+                .as_deref()
+                .unwrap_or(consumer_identity_claim.as_str());
             let identity_realm_authority = external_identity_realm_authority(
                 "jwks_auth",
                 &[
@@ -800,6 +823,7 @@ impl JwksAuth {
                     ("provider.jwks_uri", jwks_uri.as_deref()),
                     ("provider.discovery_url", discovery_url.as_deref()),
                     ("provider.jwks", inline_jwks.as_deref()),
+                    ("provider.identity_claim", Some(identity_claim)),
                 ],
             );
 
@@ -1429,7 +1453,8 @@ impl JwksAuth {
                 // to the victim's JWK thumbprint and an attacker cannot mint one
                 // for a key it does not hold.
                 let mut attempt = AuthenticationAttempt::new();
-                attempt.stage_identity_realm_authority(provider.identity_realm_authority);
+                let realm_authority = provider.identity_realm_authority_for(&claims);
+                attempt.stage_identity_realm_authority(realm_authority);
                 if self.emit_mesh_request_principal_metadata {
                     stage_mesh_request_principal_metadata(&claims, &mut attempt);
                 }

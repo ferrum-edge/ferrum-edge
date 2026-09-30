@@ -128,9 +128,9 @@ struct IntrospectionProvider {
     warmup_hostnames: Vec<String>,
     introspection_limit: Arc<Semaphore>,
     in_flight: Arc<DashMap<TokenKey, Arc<InFlightCell>>>,
-    /// Verifying-authority digest (pinned issuer plus introspection or
-    /// discovery endpoint) committed with every external principal this
-    /// provider vouches for (`GHSA-wr96-j2c3-qh66`).
+    /// Verifying-authority digest (pinned issuer, introspection or discovery
+    /// endpoint, and the claim the identity is read from) committed with every
+    /// external principal this provider vouches for.
     identity_realm_authority: [u8; 32],
 }
 
@@ -267,6 +267,7 @@ impl Oauth2Introspection {
             None => consumer_identity_claim.clone(),
         };
 
+        let global_identity_claim = consumer_identity_claim.as_str();
         let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
         let Some(providers_arr) = providers_val.as_array() else {
             return Err("oauth2_introspection: `providers` must be a non-empty array".to_string());
@@ -419,6 +420,9 @@ impl Oauth2Introspection {
                 warmup_hostnames.push(discovery.hostname.clone());
             }
 
+            let identity_claim = consumer_identity_claim
+                .as_deref()
+                .unwrap_or(global_identity_claim);
             let identity_realm_authority = external_identity_realm_authority(
                 "oauth2_introspection",
                 &[
@@ -431,6 +435,7 @@ impl Oauth2Introspection {
                         "provider.discovery_url",
                         discovery.as_ref().map(|parsed| parsed.url.as_str()),
                     ),
+                    ("provider.identity_claim", Some(identity_claim)),
                 ],
             );
 

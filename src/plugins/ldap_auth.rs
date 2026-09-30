@@ -225,7 +225,7 @@ pub struct LdapAuth {
     plaintext_requires_loopback: bool,
     /// Verifying-authority digest (directory URL, bind/search base, and
     /// identity attribute) committed with every external principal this
-    /// instance vouches for (`GHSA-wr96-j2c3-qh66`).
+    /// instance vouches for.
     identity_realm_authority: [u8; 32],
 }
 

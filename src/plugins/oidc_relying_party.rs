@@ -215,8 +215,9 @@ fn oidc_jwks_requirement() -> JwksRefreshRequirement {
 
 struct ProviderRuntime {
     issuer: String,
-    /// Verifying-authority digest (the configured issuer) committed with every
-    /// external principal this provider vouches for (`GHSA-wr96-j2c3-qh66`).
+    /// Verifying-authority digest (the configured issuer and the claim the
+    /// identity is read from) committed with every external principal this
+    /// provider vouches for.
     identity_realm_authority: [u8; 32],
     discovery: Arc<ArcSwap<Option<DiscoveryDoc>>>,
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
@@ -1243,9 +1244,18 @@ impl OidcRelyingParty {
         let claim_header_destinations =
             ClaimHeaderDestinations::from_mapping_groups(std::iter::once(claim_headers.as_slice()));
 
+        let consumer_identity_claim =
+            optional_string(provider_obj, "consumer_identity_claim", "provider[0]")?
+                .unwrap_or_else(|| "sub".to_string());
         let identity_realm_authority = external_identity_realm_authority(
             "oidc_relying_party",
-            &[("provider.issuer", Some(issuer.as_str()))],
+            &[
+                ("provider.issuer", Some(issuer.as_str())),
+                (
+                    "provider.identity_claim",
+                    Some(consumer_identity_claim.as_str()),
+                ),
+            ],
         );
         let provider = Arc::new(ProviderRuntime {
             issuer,
@@ -1261,12 +1271,7 @@ impl OidcRelyingParty {
             callback_path,
             logout_path,
             post_logout_redirect_uri,
-            consumer_identity_claim: optional_string(
-                provider_obj,
-                "consumer_identity_claim",
-                "provider[0]",
-            )?
-            .unwrap_or_else(|| "sub".to_string()),
+            consumer_identity_claim,
             consumer_header_claim: optional_string(
                 provider_obj,
                 "consumer_header_claim",

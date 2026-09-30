@@ -2485,3 +2485,62 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+async fn introspection_server_for(username: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": username,
+            "sub": username
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn introspection_plugin(config: serde_json::Value) -> Oauth2Introspection {
+    Oauth2Introspection::new(&config, PluginHttpClient::default()).unwrap()
+}
+
+async fn introspected_realm(
+    plugin: &Oauth2Introspection,
+    token: &str,
+) -> ferrum_edge::plugins::utils::auth_flow::ExternalIdentityRealm {
+    let mut ctx = make_ctx(token);
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+    ctx.authenticated_identity_realm()
+        .expect("an introspected external identity carries its realm")
+}
+
+/// The same `username` vouched for by two introspection authorities, or read
+/// from a different claim, is a different principal; one authority is one realm.
+#[tokio::test]
+async fn external_identity_realm_binds_the_introspection_authority_and_claim() {
+    let first = introspection_server_for("alice").await;
+    let second = introspection_server_for("alice").await;
+    let first_endpoint = format!("{}/introspect", first.uri());
+    let second_endpoint = format!("{}/introspect", second.uri());
+
+    let plugin = introspection_plugin(config(&first_endpoint));
+    let realm = introspected_realm(&plugin, "token-1").await;
+    assert_eq!(realm.mechanism(), "oauth2_introspection");
+    let plugin = introspection_plugin(config(&first_endpoint));
+    let same = introspected_realm(&plugin, "token-2").await;
+    assert_eq!(realm, same, "one introspection authority is one realm");
+
+    let plugin = introspection_plugin(config(&second_endpoint));
+    let other = introspected_realm(&plugin, "token-3").await;
+    assert_ne!(realm, other, "a different authority is a different realm");
+
+    let mut by_sub = config(&first_endpoint);
+    by_sub["providers"][0]["consumer_identity_claim"] = json!("sub");
+    let plugin = introspection_plugin(by_sub);
+    let by_sub = introspected_realm(&plugin, "token-4").await;
+    assert_ne!(realm, by_sub, "the identity claim path is part of the realm");
+}

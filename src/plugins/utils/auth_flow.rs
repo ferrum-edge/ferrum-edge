@@ -149,7 +149,7 @@ fn identity_within_limit(identity: &str, field: &'static str) -> Result<(), Veri
 /// verified it. Two accepted authorities can legitimately issue the same string
 /// for different people, so anything that authorizes on an external identity
 /// (`mcp_gateway` session ownership, for one) must compare the realm together
-/// with the subject (`GHSA-wr96-j2c3-qh66`).
+/// with the subject.
 ///
 /// The realm is the authentication mechanism that committed the principal plus,
 /// for mechanisms that can accept more than one authority, an opaque
@@ -212,6 +212,24 @@ pub fn external_identity_realm_authority(
     for (label, value) in fields {
         hasher.optional_text(label, *value);
     }
+    hasher.digest()
+}
+
+/// Bind one per-credential verified value into a construction-time realm
+/// authority from [`external_identity_realm_authority`].
+///
+/// Used when the configured authority alone does not decide the realm: a
+/// `jwks_auth` provider that pins no issuer can accept tokens from several
+/// issuers sharing one key set (a multi-tenant JWKS), so the token's verified
+/// `iss` joins the realm.
+pub fn refine_external_identity_realm_authority(
+    authority: &[u8; 32],
+    label: &str,
+    value: Option<&str>,
+) -> [u8; 32] {
+    let mut hasher = PartitionHasher::new("ferrum-edge/auth/external-identity-realm/refined/v1");
+    hasher.nested("authority", authority);
+    hasher.optional_text(label, value);
     hasher.digest()
 }
 
@@ -728,7 +746,7 @@ pub fn commit_authentication_attempt(
         }
         // The realm is committed with the identity, never separately: a
         // subject string is only meaningful inside the authority that verified
-        // it (`GHSA-wr96-j2c3-qh66`).
+        // it.
         ctx.authenticated_identity_realm = external_identity
             .as_ref()
             .map(|_| ExternalIdentityRealm::new(auth_method, attempt.identity_realm_authority()));

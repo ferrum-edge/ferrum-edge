@@ -54,7 +54,7 @@ impl AuthenticationAttempt {
     /// [`super::auth_flow::external_identity_realm_authority`]). Mechanisms
     /// that can accept the same subject string from more than one authority
     /// must stage one, so equal subjects from different authorities never
-    /// name the same principal (`GHSA-wr96-j2c3-qh66`).
+    /// name the same principal.
     pub fn stage_identity_realm_authority(&mut self, authority: [u8; 32]) {
         self.identity_realm_authority = Some(authority);
     }

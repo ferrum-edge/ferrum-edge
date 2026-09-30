@@ -875,8 +875,7 @@ enum McpCatalogError {
 }
 
 /// Instance-owned record of what the aggregate router admitted for one request
-/// it routes upstream, re-checked over the FINAL backend-visible body
-/// (`GHSA-3w98-6p32-8qm2`).
+/// it routes upstream, re-checked over the FINAL backend-visible request.
 ///
 /// Policy (catalog membership, per-tool allow/deny, `inputSchema` validation)
 /// is decided in `before_proxy` over the client's envelope, but later body
@@ -887,19 +886,29 @@ enum McpCatalogError {
 /// permitted difference is this plugin's own recorded public→upstream rewrite.
 ///
 /// Private and typed: forgeable `mcp.*` metadata cannot create, alter, or clear
-/// it. `Debug` never renders arguments or target values, which can carry
-/// secrets.
+/// it. `Debug` never renders arguments, ids, session values, or target values,
+/// which can carry secrets.
 #[derive(Clone)]
 pub(crate) struct McpAdmissionRecord {
     /// The `mcp_gateway` instance that admitted the request.
     owner: u64,
-    /// JSON-RPC method the request was admitted and routed as.
-    method: String,
+    /// JSON-RPC message kind the body was admitted as. A client may also send
+    /// a JSON-RPC *response* (to an upstream sampling / elicitation / roots
+    /// request) through passthrough; it carries no `method`.
+    message_kind: McpMessageKind,
+    /// JSON-RPC `method` exactly as admitted, `None` for a response.
+    method: Option<String>,
+    /// For a response, the `id` of the upstream request it answers. Rebinding
+    /// it would deliver the answer to a different pending upstream request.
+    response_id: Option<Value>,
     /// Selected upstream server id.
     server_id: String,
     /// Backend destination the gateway selected for that server.
     destination: McpAdmittedDestination,
-    /// Admitted item identity, absent for passthrough methods.
+    /// The mediated upstream session id the gateway placed on the backend
+    /// request, `None` when the upstream session is stateless.
+    upstream_session: Option<String>,
+    /// Admitted item identity, absent for passthrough methods and responses.
     target: Option<McpAdmittedTarget>,
 }
 
@@ -908,6 +917,7 @@ impl std::fmt::Debug for McpAdmissionRecord {
         formatter
             .debug_struct("McpAdmissionRecord")
             .field("owner", &self.owner)
+            .field("message_kind", &self.message_kind.as_str())
             .field("method", &self.method)
             .field("server_id", &self.server_id)
             .field("target", &self.target.as_ref().map(|target| target.param))
@@ -1011,7 +1021,7 @@ enum McpSessionPrincipal {
     /// A subject string only names a user inside the authority that verified
     /// it: two accepted issuers can both assert `sub: alice` for different
     /// people. Comparing the subject alone would let either reuse the other's
-    /// session, so the realm is part of the principal (`GHSA-wr96-j2c3-qh66`).
+    /// session, so the realm is part of the principal.
     /// `realm` is `None` only for an identity that never crossed the
     /// authentication commit boundary, and such an identity matches only
     /// another realm-less identity.
@@ -1607,24 +1617,55 @@ impl McpGateway {
     }
 
     /// Pin what this instance admitted for a request it is about to route
-    /// upstream, for the final request-body re-check (`GHSA-3w98-6p32-8qm2`).
-    /// Must run after `set_route_to_server`, so the recorded destination is
-    /// the one the gateway selected.
+    /// upstream, for the final request-body re-check. Must run after
+    /// `set_route_to_server`, so the recorded destination and upstream session
+    /// are the ones the gateway selected.
     fn record_admission(
         &self,
         ctx: &mut RequestContext,
-        method: &str,
+        headers: &HashMap<String, String>,
+        envelope: &McpEnvelope,
         server_id: &str,
         target: Option<McpAdmittedTarget>,
     ) {
         let destination = McpAdmittedDestination::capture(ctx);
+        let response_id = match envelope.message_kind {
+            McpMessageKind::Response | McpMessageKind::ErrorResponse => envelope.id.clone(),
+            McpMessageKind::Request | McpMessageKind::Notification => None,
+        };
+        let upstream_session = header_value(headers, &self.sessions.upstream_session_header);
         ctx.mcp_admission = Some(Arc::new(McpAdmissionRecord {
             owner: self.instance_id,
-            method: method.to_string(),
+            message_kind: envelope.message_kind,
+            method: envelope.method.clone(),
+            response_id,
             server_id: server_id.to_string(),
             destination,
+            upstream_session: upstream_session.map(ToOwned::to_owned),
             target,
         }));
+    }
+
+    /// Whether the final backend-visible headers still carry exactly the
+    /// mediated upstream session the gateway selected. Dropping the header
+    /// cannot bind the call to another session, so absence is tolerated; a
+    /// different value, a second spelling, or a value injected where the
+    /// gateway selected none is refused.
+    fn upstream_session_intact(
+        &self,
+        recorded: Option<&str>,
+        headers: &HashMap<String, String>,
+    ) -> bool {
+        let name = self.sessions.upstream_session_header.as_str();
+        let mut values = headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str());
+        match (values.next(), values.next()) {
+            (None, _) => true,
+            (Some(value), None) => recorded == Some(value),
+            (Some(_), Some(_)) => false,
+        }
     }
 
     fn mark_request_rewrite(
@@ -4223,7 +4264,8 @@ impl McpGateway {
         );
         self.record_admission(
             ctx,
-            "tools/call",
+            headers,
+            envelope,
             &server.server_id,
             Some(McpAdmittedTarget::with_arguments(
                 "name",
@@ -4335,7 +4377,8 @@ impl McpGateway {
         );
         self.record_admission(
             ctx,
-            "prompts/get",
+            headers,
+            envelope,
             &server.server_id,
             Some(McpAdmittedTarget::with_arguments(
                 "name",
@@ -4542,7 +4585,8 @@ impl McpGateway {
         );
         self.record_admission(
             ctx,
-            "resources/read",
+            headers,
+            envelope,
             &server_id,
             Some(McpAdmittedTarget::without_arguments("uri", &upstream_uri)),
         );
@@ -5623,7 +5667,7 @@ impl McpGateway {
                         );
                     }
                     self.set_route_to_server(ctx, headers, server, Some(&session_id));
-                    self.record_admission(ctx, method, &server.server_id, None);
+                    self.record_admission(ctx, headers, envelope, &server.server_id, None);
                     PluginResult::Continue
                 } else {
                     json_rpc_error(
@@ -5652,7 +5696,12 @@ impl McpGateway {
     /// after this instance routed it upstream, and every such route records
     /// its admission; a missing or foreign record is therefore itself a
     /// violation. Reasons are fixed tokens.
-    fn final_admission_violation(&self, ctx: &RequestContext, body: &[u8]) -> Option<&'static str> {
+    fn final_admission_violation(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<&'static str> {
         let Some(record) = ctx.mcp_admission.as_deref() else {
             return Some("missing_admission");
         };
@@ -5661,6 +5710,9 @@ impl McpGateway {
         }
         if !record.destination.still_targets(ctx) {
             return Some("destination_changed");
+        }
+        if !self.upstream_session_intact(record.upstream_session.as_deref(), headers) {
+            return Some("upstream_session_changed");
         }
         // A duplicate member makes the upstream-visible operation
         // parser-dependent, so an equality check against either copy proves
@@ -5671,15 +5723,28 @@ impl McpGateway {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return Some("invalid_body");
         };
-        let Some(request) = value.as_object() else {
+        // Classified exactly as admission classified the client body, so a
+        // response stays a response and a notification stays a notification.
+        let Ok(envelope) = parse_mcp_envelope_value(&value, None) else {
             return Some("invalid_body");
         };
-        if request.get("method").and_then(Value::as_str) != Some(record.method.as_str()) {
+        if envelope.message_kind != record.message_kind {
+            return Some("message_kind_changed");
+        }
+        if envelope.method != record.method {
             return Some("method_changed");
         }
-        // A passthrough method has no admitted item beyond its method.
+        let answers_upstream = matches!(
+            record.message_kind,
+            McpMessageKind::Response | McpMessageKind::ErrorResponse
+        );
+        if answers_upstream && envelope.id != record.response_id {
+            return Some("response_id_changed");
+        }
+        // A passthrough method or a response has no admitted item beyond the
+        // checks above.
         let target = record.target.as_ref()?;
-        let Some(params) = request.get("params").and_then(Value::as_object) else {
+        let Some(params) = envelope.params.as_ref().and_then(Value::as_object) else {
             return Some("target_changed");
         };
         // Only the gateway's own recorded rewrite is admissible: the upstream
@@ -5949,21 +6014,22 @@ impl Plugin for McpGateway {
             && ctx.mcp_admission.is_some()
     }
 
-    /// Re-check aggregate MCP admission over the FINAL backend-visible body
-    /// (`GHSA-3w98-6p32-8qm2`).
+    /// Re-check aggregate MCP admission over the FINAL backend-visible request.
     ///
     /// Runs after every `transform_request_body` hook, including this plugin's
     /// own public→upstream rewrite and any later `request_transformer` body
     /// rule, so `body` is exactly what the selected upstream would receive. The
-    /// request must still be the admitted method, aimed at the admitted
-    /// destination, naming the admitted item by its recorded upstream identity,
-    /// and carrying the admitted arguments. Every failure is fail-closed with a
+    /// request must still be the admitted message kind and method (and, for a
+    /// response, answer the admitted upstream request id), aimed at the
+    /// admitted destination and mediated upstream session, naming the admitted
+    /// item by its recorded upstream identity, and carrying the admitted
+    /// arguments. Every failure is fail-closed with a
     /// fixed-cardinality reason; no body, name, URI, or argument is echoed or
     /// logged.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
-        _headers: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         if self.mode != McpGatewayMode::AggregateRouter || !self.owns_request(ctx) {
@@ -5971,7 +6037,7 @@ impl Plugin for McpGateway {
         }
         let violation = {
             let body = ctx.inspectable_final_request_body(body);
-            self.final_admission_violation(ctx, body)
+            self.final_admission_violation(ctx, headers, body)
         };
         match violation {
             None => PluginResult::Continue,

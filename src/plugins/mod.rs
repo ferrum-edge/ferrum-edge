@@ -2431,8 +2431,8 @@ pub struct RequestContext {
     ///
     /// A subject string only names a user inside the authority that verified
     /// it, so a decision that authorizes on the external identity must compare
-    /// this realm too (`GHSA-wr96-j2c3-qh66`). Private so a plugin that can
-    /// only write the public identity string cannot also claim a realm.
+    /// this realm too. Private so a plugin that can only write the public
+    /// identity string cannot also claim a realm.
     pub(crate) authenticated_identity_realm: Option<utils::auth_flow::ExternalIdentityRealm>,
     /// Authoritative GeoIP country assertion staged by `geo_restriction` for
     /// backend dispatch. Kept outside the mutable plugin header map and public
@@ -2958,12 +2958,13 @@ pub struct RequestContext {
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
     /// What the owning `mcp_gateway` aggregate router admitted for a request it
-    /// routes upstream — method, selected destination, upstream item identity,
-    /// and admitted arguments — re-checked over the FINAL backend-visible body
-    /// so a later body transform cannot swap the operation after admission
-    /// (`GHSA-3w98-6p32-8qm2`). Private for the same reason as the claims
-    /// around it: forgeable `mcp.*` metadata must not be able to mint, alter,
-    /// or clear it. `Arc` so the final-body hook context clone shares it.
+    /// routes upstream — message kind and method, selected destination and
+    /// upstream session, upstream item identity, and admitted arguments —
+    /// re-checked over the FINAL backend-visible request so a later transform
+    /// cannot swap the operation after admission. Private for the same reason
+    /// as the claims around it: forgeable `mcp.*` metadata must not be able to
+    /// mint, alter, or clear it. `Arc` so the final-body hook context clone
+    /// shares it.
     pub(crate) mcp_admission: Option<Arc<mcp_gateway::McpAdmissionRecord>>,
     /// Identity of the `mcp_gateway` instance that admitted this request in
     /// `before_proxy`, and therefore the only instance whose response-phase
