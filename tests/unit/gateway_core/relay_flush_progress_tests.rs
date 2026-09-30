@@ -1789,14 +1789,32 @@ impl ReadGate {
 struct ScriptedReader {
     steps: std::collections::VecDeque<ReadStep>,
     polls: Arc<AtomicUsize>,
+    /// Fail every poll after the first EOF (see [`Self::erroring_after_eof`]).
+    error_after_eof: bool,
+    eof_seen: bool,
 }
+
+const POLLED_AFTER_EOF_TEXT: &str = "simulated wrapper error on a poll past EOF";
 
 impl ScriptedReader {
     fn new(steps: Vec<ReadStep>) -> (Self, Arc<AtomicUsize>) {
+        Self::build(steps, false)
+    }
+
+    /// The same reader, failing every poll after its first EOF with
+    /// `ConnectionAborted` — the way `AdmittedStream` or
+    /// `AuthorizationDeadlineStream` can answer a poll past EOF.
+    fn erroring_after_eof(steps: Vec<ReadStep>) -> (Self, Arc<AtomicUsize>) {
+        Self::build(steps, true)
+    }
+
+    fn build(steps: Vec<ReadStep>, error_after_eof: bool) -> (Self, Arc<AtomicUsize>) {
         let polls = Arc::new(AtomicUsize::new(0));
         let reader = Self {
             steps: steps.into(),
             polls: Arc::clone(&polls),
+            error_after_eof,
+            eof_seen: false,
         };
         (reader, polls)
     }
@@ -1809,9 +1827,16 @@ impl AsyncRead for ScriptedReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.polls.fetch_add(1, Ordering::SeqCst);
+        if self.eof_seen && self.error_after_eof {
+            let e = io::Error::new(io::ErrorKind::ConnectionAborted, POLLED_AFTER_EOF_TEXT);
+            return Poll::Ready(Err(e));
+        }
         loop {
             match self.steps.pop_front() {
-                None => return Poll::Ready(Ok(())),
+                None => {
+                    self.eof_seen = true;
+                    return Poll::Ready(Ok(()));
+                }
                 Some(ReadStep::Data(len)) => {
                     let n = len.min(buf.remaining());
                     buf.put_slice(&vec![b'x'; n]);
@@ -2037,16 +2062,16 @@ async fn a_close_without_notify_mid_top_up_half_closes_cleanly() {
 /// is half-closed, and the reader is never polled past its EOF. Wrappers such
 /// as the admission, trust-fence, HBONE tunnel and authorization-deadline
 /// streams may answer a second poll with an error, which would turn this clean
-/// EOF into a read-side failure.
+/// EOF into a read-side failure — so this reader does exactly that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eof_mid_top_up_half_closes_after_the_batch() {
-    let (client, polls) = ScriptedReader::new(vec![ReadStep::Data(TLS_RECORD)]);
+    let (client, polls) = ScriptedReader::erroring_after_eof(vec![ReadStep::Data(TLS_RECORD)]);
     let (backend, log) = RecordingBackend::new(None);
     let result = run_relay(client, backend).await;
 
     assert!(
         result.first_failure.is_none(),
-        "EOF mid-batch is a clean end, got {:?}",
+        "EOF mid-batch is a clean end, not an error from polling past it, got {:?}",
         result.first_failure
     );
     assert_eq!(

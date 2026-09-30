@@ -8458,22 +8458,30 @@ struct CopyDirectionState {
     /// Mirrors `need_flush` in tokio's own `CopyBuffer`, which exists for the
     /// same deadlock.
     needs_flush: bool,
-    /// A read error met while topping up a batch that already held bytes
-    /// (see [`RELAY_TOP_UP_MIN`]). The next read phase reports it, after the
-    /// batch is written, as a first-read error would be reported — unless
-    /// writing the batch fails first. Then the write error ends the direction
-    /// and this read error is dropped, the same order as before batching,
-    /// when the failing read was simply never reached.
-    deferred_read_error: Option<std::io::Error>,
-    /// A top-up read returned EOF after the batch already held bytes. The next
-    /// read phase half-closes straight away instead of polling the reader
-    /// again: a reader past EOF need not repeat it, and several relay wrappers
-    /// do not — `AdmittedStream` (admission closed), `TrustFencedStream`
-    /// (fence), `H2ConnectTunnel` (retired / keepalive failed) and
-    /// `AuthorizationDeadlineStream` (expired) can answer a second poll with
-    /// an error, turning a clean EOF into a read-side failure. A first-read
-    /// EOF needs no flag: it half-closes on the spot.
-    read_eof: bool,
+    /// What the top-up read that ended the last batch met, carried to the next
+    /// read phase so the batch is written first ([`CarriedRead`]). One slot,
+    /// so EOF and an error can never both be pending.
+    carried: Option<CarriedRead>,
+}
+
+/// A terminal read outcome met while topping up a batch that already held
+/// bytes (see [`RELAY_TOP_UP_MIN`]). A first read that meets either needs no
+/// carrying: it is handled on the spot.
+enum CarriedRead {
+    /// The top-up read returned EOF. The next read phase half-closes straight
+    /// away instead of polling the reader again: a reader past EOF need not
+    /// repeat it, and several relay wrappers do not — `AdmittedStream`
+    /// (admission closed), `TrustFencedStream` (fence), `H2ConnectTunnel`
+    /// (retired / keepalive failed) and `AuthorizationDeadlineStream`
+    /// (expired) can answer a second poll with an error, turning a clean EOF
+    /// into a read-side failure.
+    Eof,
+    /// The top-up read failed. The next read phase reports it, after the batch
+    /// is written, as a first-read error would be reported — unless writing
+    /// the batch fails first. Then the write error ends the direction and this
+    /// read error is dropped, the same order as before batching, when the
+    /// failing read was simply never reached.
+    Err(std::io::Error),
 }
 
 /// A relay read at least this large (one maximum TLS record's plaintext)
@@ -8499,8 +8507,7 @@ impl CopyDirectionState {
             cap: 0,
             terminal_read_error: None,
             needs_flush: false,
-            deferred_read_error: None,
-            read_eof: false,
+            carried: None,
         }
     }
 }
@@ -8773,12 +8780,11 @@ fn relay_watchdog(interval: Duration) -> tokio::time::Interval {
 /// with further reads into the same buffer, while it has room and for at most
 /// [`RELAY_TOP_UP_MAX_ROUNDS`] extra reads, so a userspace TLS reader's
 /// back-to-back records reach the writer as one write. A short read, `Pending`
-/// or EOF ends the batch; EOF is remembered ([`CopyDirectionState::read_eof`])
-/// so the next read phase half-closes without polling the reader again. A read
-/// error met while topping up is deferred
-/// ([`CopyDirectionState::deferred_read_error`]): the batch is written first
-/// and the error is then reported as a first-read error would be, unless that
-/// write fails first, in which case the write error ends the direction.
+/// or EOF ends the batch; EOF is remembered ([`CarriedRead::Eof`]) so the next
+/// read phase half-closes without polling the reader again. A read error met
+/// while topping up is deferred ([`CarriedRead::Err`]): the batch is written
+/// first and the error is then reported as a first-read error would be, unless
+/// that write fails first, in which case the write error ends the direction.
 ///
 /// `read_watermark` / `write_watermark` are per-direction inactivity
 /// timestamps polled by the `bidirectional_copy` watchdog. Shared via
@@ -8812,13 +8818,14 @@ where
                 };
             }
             CopyPhase::Reading => {
-                let read_outcome = if let Some(e) = state.deferred_read_error.take() {
-                    CopyReadOutcome::Failed(e)
-                } else if state.read_eof {
-                    // The top-up that ended the last batch already saw EOF, so
-                    // take the half-close path without polling the reader
-                    // again (see `CopyDirectionState::read_eof`).
-                    CopyReadOutcome::Filled(0)
+                let read_outcome = if let Some(carried) = state.carried.take() {
+                    match carried {
+                        CarriedRead::Err(e) => CopyReadOutcome::Failed(e),
+                        // The top-up that ended the last batch already saw
+                        // EOF, so take the half-close path without polling
+                        // the reader again (see `CarriedRead::Eof`).
+                        CarriedRead::Eof => CopyReadOutcome::Filled(0),
+                    }
                 } else {
                     let mut read_buf = ReadBuf::new(state.buf.as_mut_slice());
                     match reader.as_mut().poll_read(cx, &mut read_buf) {
@@ -8841,12 +8848,12 @@ where
                                     Poll::Ready(Ok(())) => {
                                         last = read_buf.filled().len() - before;
                                         if last == 0 {
-                                            state.read_eof = true;
+                                            state.carried = Some(CarriedRead::Eof);
                                             break;
                                         }
                                     }
                                     Poll::Ready(Err(e)) => {
-                                        state.deferred_read_error = Some(e);
+                                        state.carried = Some(CarriedRead::Err(e));
                                         break;
                                     }
                                     Poll::Pending => break,
