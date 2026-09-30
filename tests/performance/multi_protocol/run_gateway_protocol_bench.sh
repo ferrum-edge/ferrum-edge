@@ -1210,6 +1210,7 @@ run_bench() {
     fi
     if [ -n "$perf_bg" ]; then
         wait "$perf_bg" || true
+        sudo chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR/perf" || true
         local reqs
         reqs=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('total_requests',0))" "$out" 2>/dev/null || echo 0)
         echo "total_requests_full_run=$reqs duration=$DURATION" >> "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt"
@@ -1221,6 +1222,7 @@ run_bench() {
             sudo rm -f "/tmp/perf_${gateway}_${payload}.data"
         fi
     fi
+    true
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
             touch "$sampler_stop_file"
