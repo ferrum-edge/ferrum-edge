@@ -12,7 +12,8 @@ use chrono::{Duration, Utc};
 use ferrum_edge::admin::audit::AuditActor;
 use ferrum_edge::admin::jwt_auth::{
     ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR, AdminKeyTier, AdminRole, JwtConfig, JwtError,
-    JwtManager, create_jwt_manager_from_env, random_read_only_jwt_manager,
+    JwtManager, MAX_VIEWER_KEY_SUBJECT_BYTES, create_jwt_manager_from_env,
+    random_read_only_jwt_manager,
 };
 use ferrum_edge::fips::approved::HmacSha256;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -259,6 +260,38 @@ fn viewer_secret_tokens_get_the_full_claim_validation() {
         Algorithm::HS256,
     );
     assert!(manager.verify_token(&foreign).is_err());
+}
+
+#[test]
+fn viewer_key_subjects_with_control_characters_or_excess_length_are_rejected() {
+    let manager = manager_with_viewer_secret();
+    let long = "a".repeat(MAX_VIEWER_KEY_SUBJECT_BYTES + 1);
+    let at_limit = "a".repeat(MAX_VIEWER_KEY_SUBJECT_BYTES);
+    for sub in [
+        "forged\nkey_tier=primary",
+        "tab\there",
+        "bell\u{7}",
+        long.as_str(),
+    ] {
+        let mut hostile = claims("viewer");
+        hostile["sub"] = json!(sub);
+        let token = sign(&hostile, VIEWER_SECRET, Algorithm::HS256);
+        assert!(
+            manager.verify_token(&token).is_err(),
+            "viewer-key subject {sub:?} must be refused"
+        );
+    }
+
+    let mut ok = claims("viewer");
+    ok["sub"] = json!(at_limit);
+    let token = sign(&ok, VIEWER_SECRET, Algorithm::HS256);
+    assert!(manager.verify_token(&token).is_ok());
+
+    // Primary-key subjects keep their existing behaviour.
+    let mut primary = claims("viewer");
+    primary["sub"] = json!("line\nbreak");
+    let token = sign(&primary, PRIMARY_SECRET, Algorithm::HS256);
+    assert!(manager.verify_token(&token).is_ok());
 }
 
 #[test]

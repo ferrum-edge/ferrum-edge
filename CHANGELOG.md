@@ -711,7 +711,8 @@ outright with no deprecation period:
   cannot use `diagnostics:read`. Authorization and audit log lines carry
   `key_tier` next to the actor, and audit records name the actor
   `viewer-key:<sub>`, so a subject chosen by the secret's holder cannot pass
-  for a primary-key identity. The ceiling is recorded from which key
+  for a primary-key identity. A viewer-key `sub` longer than 256 bytes or
+  containing a control character is rejected, so it cannot forge log lines. The ceiling is recorded from which key
   verified the signature and applied where the request's actor is built,
   which is where every route reads its role. Both keys accept only `HS256`, so
   `none`, `HS384`/`HS512`, and asymmetric algorithms are refused. The viewer key

@@ -352,35 +352,44 @@ fn config_export_busy_response() -> Response<Full<Bytes>> {
     response
 }
 
+/// Outcome of a database-backed export load.
+enum DatabaseLoad {
+    Loaded(Box<GatewayConfig>),
+    /// Another export holds the load permit. Retrying shortly will succeed.
+    Busy,
+    /// No database is configured, or the load failed.
+    Unavailable,
+}
+
 /// Load the namespace from the database under the process-wide load cap.
-/// `None` when the cap is saturated or the load failed; the caller then falls
-/// back to the labelled cached configuration.
+/// On `Busy` or `Unavailable` the caller falls back to the labelled cached
+/// configuration.
 async fn load_from_database(
     db: &dyn crate::config::db_backend::DatabaseBackend,
     namespace: &str,
-) -> Option<GatewayConfig> {
+) -> DatabaseLoad {
     let Ok(_permit) = database_export_loads().try_acquire() else {
         info!(
             namespace = %namespace,
             "Configuration export database load cap reached; serving the cached snapshot"
         );
-        return None;
+        return DatabaseLoad::Busy;
     };
     match db
         .load_full_config_for_purpose(namespace, FullConfigLoadPurpose::BackupExport)
         .await
     {
-        Ok(config) => Some(config),
+        Ok(config) => DatabaseLoad::Loaded(Box::new(config)),
         Err(_error) => {
             super::warn_persistence_failure_redacted("config_export_database_load");
-            None
+            DatabaseLoad::Unavailable
         }
     }
 }
 
 /// Where an export's configuration came from.
 enum ExportInput {
-    Database(GatewayConfig),
+    Database(Box<GatewayConfig>),
     /// The whole cached snapshot; namespace filtering runs off the async worker.
     Cached(std::sync::Arc<GatewayConfig>),
 }
@@ -404,12 +413,17 @@ pub(crate) async fn handle_config_export(
 
     let from_database = match state.db.as_ref() {
         Some(db) => load_from_database(db.as_ref(), namespace).await,
-        None => None,
+        None => DatabaseLoad::Unavailable,
     };
     let (input, source) = match from_database {
-        Some(config) => (ExportInput::Database(config), "database"),
-        None => match state.cached_gateway_config() {
+        DatabaseLoad::Loaded(config) => (ExportInput::Database(config), "database"),
+        fallback => match state.cached_gateway_config() {
             Some(cached) => (ExportInput::Cached(cached), "cached"),
+            // Busy with nothing cached (for example just after startup): the
+            // database is fine, so say so and ask for a retry.
+            None if matches!(fallback, DatabaseLoad::Busy) => {
+                return config_export_busy_response();
+            }
             None => {
                 return config_export_unavailable_response(
                     "No database available and no cached config",
@@ -423,7 +437,7 @@ pub(crate) async fn handle_config_export(
         // Held until the document is serialized.
         let _permit = permit;
         let config = match input {
-            ExportInput::Database(config) => config,
+            ExportInput::Database(config) => *config,
             ExportInput::Cached(snapshot) => {
                 crate::admin::backup::filter_config_by_namespace(&snapshot, &owned_namespace)
             }

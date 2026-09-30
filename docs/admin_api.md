@@ -119,6 +119,9 @@ an identity or tenancy boundary:
   holder can therefore add such rows under any subject it chooses. They are
   labelled `viewer-key:<sub>` and grant nothing, but they can add noise to the
   audit log. This is accepted: suppressing them would hide real probing.
+- A viewer-key token whose `sub` is longer than 256 bytes or contains a
+  control character is rejected with `401`, so a chosen subject cannot forge
+  or flood log lines. Primary-key subjects are unchanged.
 - A primary-key token whose `sub` itself starts with `viewer-key:` or
   `primary-key:` is recorded as `primary-key:<sub>`, so no primary subject can
   render the same as a viewer-key actor.
@@ -1699,7 +1702,8 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
   cannot tie up the admin plane:
   - At most one export loads from the database at a time. A concurrent export
     does not wait for it: it serves the labelled cached snapshot
-    (`X-Data-Source: cached`), exactly as on a database error.
+    (`X-Data-Source: cached`), exactly as on a database error. When there is
+    no cached snapshot yet, it gets `503` with `Retry-After: 1` instead.
   - At most four exports are in flight at a time, from either source. The
     document is built and serialized on the blocking pool, not on an async
     admin worker. A request that cannot start within 5 seconds gets `503`

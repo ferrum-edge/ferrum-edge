@@ -361,6 +361,14 @@ impl JwtManager {
         // Pinned to HS256 regardless of the primary configuration: the ceiling
         // key must never accept another algorithm.
         let data = self.verify_with_key(token, viewer_secret, Algorithm::HS256)?;
+        // The viewer secret's holder chooses `sub`, and it is rendered into
+        // log lines next to `key_tier`. Refuse subjects that could forge or
+        // flood those lines.
+        if !is_acceptable_viewer_key_subject(&data.claims.sub) {
+            return Err(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidToken,
+            ));
+        }
         Ok(VerifiedAdminToken {
             header: data.header,
             claims: data.claims,
@@ -655,6 +663,17 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     };
 
     with_viewer_secret_from_env(JwtManager::new(config))
+}
+
+/// Longest `sub` a viewer-key token may carry, in bytes.
+pub const MAX_VIEWER_KEY_SUBJECT_BYTES: usize = 256;
+
+/// Whether a viewer-key token's `sub` is acceptable: at most
+/// [`MAX_VIEWER_KEY_SUBJECT_BYTES`] bytes and free of control characters.
+/// Primary-key tokens are not subject to this rule; their subjects come from
+/// whoever holds the primary secret.
+pub fn is_acceptable_viewer_key_subject(sub: &str) -> bool {
+    sub.len() <= MAX_VIEWER_KEY_SUBJECT_BYTES && !sub.chars().any(char::is_control)
 }
 
 /// Message for a viewer secret equal to the primary admin secret. Names both

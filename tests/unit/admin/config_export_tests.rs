@@ -549,4 +549,12 @@ fn legacy_single_object_credentials_use_the_emitted_index() {
     let rendering = FingerprintRendering::new(&key, "consumer", "ferrum", &consumer.id);
     let expected = rendering.fingerprint("/credentials/jwt/0/secret", &json!(JWT_SECRET));
     assert_eq!(exported["credentials"]["jwt"][0]["secret"], expected);
+
+    // A non-object entry is dropped before indexing: the surviving entry is
+    // emitted at index 0, and its pointer says so.
+    consumer
+        .credentials
+        .insert("jwt".to_string(), json!([null, {"secret": JWT_SECRET}]));
+    let exported = export_consumer(&consumer, &key);
+    assert_eq!(exported["credentials"]["jwt"][0]["secret"], expected);
 }

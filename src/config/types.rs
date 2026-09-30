@@ -9059,17 +9059,18 @@ pub fn redact_consumer_credentials_with(
 ) -> Consumer {
     let mut redacted = consumer.clone();
 
-    /// Object entries of one credential type, each with its stored array index.
-    /// The legacy single-object form is index `0`: the projection emits it as a
-    /// one-element array, so the index names the emitted position.
+    /// Object entries of one credential type, each with the index the
+    /// projection emits it at. Non-object entries are dropped before indexing,
+    /// and the legacy single-object form is index `0` (it is emitted as a
+    /// one-element array), so the index always names the emitted position.
     fn entry_objects(
         credential_value: &serde_json::Value,
     ) -> Vec<(usize, &serde_json::Map<String, serde_json::Value>)> {
         match credential_value {
             serde_json::Value::Array(entries) => entries
                 .iter()
+                .filter_map(serde_json::Value::as_object)
                 .enumerate()
-                .filter_map(|(index, entry)| Some((index, entry.as_object()?)))
                 .collect(),
             serde_json::Value::Object(object) => vec![(0, object)],
             _ => Vec::new(),

@@ -479,7 +479,11 @@ async fn viewer_secret_token_is_refused_on_write_and_operator_routes() {
         (Method::POST, "/namespaces", Some(&empty)),
         (Method::POST, "/admin/tls/certificates", Some(&empty)),
         (Method::DELETE, "/admin/tls/acme/certificates/cert-x", None),
-        (Method::POST, "/mesh/config-revision/reset?confirm=true", None),
+        (
+            Method::POST,
+            "/mesh/config-revision/reset?confirm=true",
+            None,
+        ),
         (Method::POST, "/backend-capabilities/refresh", None),
     ];
     for (method, path, body) in writes {
