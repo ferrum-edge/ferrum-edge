@@ -566,8 +566,14 @@ async fn like_tautology_continuation_requires_an_injection_shaped_final_operand(
                         .append_pair("user", &value)
                         .finish();
                     assert_detected(&plugin, "FE-SQLI-009", Surface::Query(&query)).await;
-                    let body = serde_json::to_vec(&json!({ "user": value })).unwrap();
-                    assert_detected(&plugin, "FE-SQLI-009-B", Surface::Body(JSON, &body)).await;
+                    // A JSON body closes the value with `"`, which is
+                    // indistinguishable from a closed double-quoted operand,
+                    // so an open double-quoted final operand needs a comment
+                    // to be visible there.
+                    if final_quote == "'" || !suffix.is_empty() {
+                        let body = serde_json::to_vec(&json!({ "user": value })).unwrap();
+                        assert_detected(&plugin, "FE-SQLI-009-B", Surface::Body(JSON, &body)).await;
+                    }
                     assert_detected(
                         &plugin,
                         "FE-SQLI-009-B",
@@ -599,7 +605,7 @@ async fn like_tautology_multi_term_continuation_is_detected() {
         "x' or 'a' like 'a' ) or ('x",
         "x' or 'a' like 'a'/**/or/**/'b'/**/or/**/'x",
         "x' or 'a' like 'a' or 1 or 'x' limit 1-- ",
-        "x\" or \"a\" like \"a\" or \"b\" or \"x",
+        "x\" or \"a\" like \"a\" or \"b\" or \"x\"-- ",
     ] {
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("user", value)
