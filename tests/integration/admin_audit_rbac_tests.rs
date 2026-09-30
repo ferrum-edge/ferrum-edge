@@ -2291,3 +2291,275 @@ async fn mesh_config_revision_reset_audit_ignores_request_namespace_header() {
         "mesh reset must not be filed under the spoofed tenant: {tenant_b_body:?}"
     );
 }
+
+/// One admin request with an optional `If-Match` and JSON body: `(status,
+/// ETag, body)`.
+async fn send_json(
+    method: reqwest::Method,
+    base: &str,
+    path: &str,
+    bearer: &str,
+    if_match: Option<&str>,
+    body: Option<&Value>,
+) -> (u16, Option<String>, Value) {
+    let mut request = reqwest::Client::new()
+        .request(method, format!("{base}{path}"))
+        .bearer_auth(bearer);
+    if let Some(if_match) = if_match {
+        request = request.header("If-Match", if_match);
+    }
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request.send().await.expect("admin request");
+    let status = response.status().as_u16();
+    let etag = response
+        .headers()
+        .get("etag")
+        .map(|value| value.to_str().expect("etag is ascii").to_string());
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, etag, body)
+}
+
+/// Issue #5925: an operator reads an upstream through a projection that
+/// replaces the Consul ACL token with `[REDACTED]`. Writing that body back
+/// (even under a matching `If-Match`, whose tag covers the full stored
+/// resource) must be refused rather than store the placeholder as the token.
+#[tokio::test]
+async fn operator_round_trip_of_masked_consul_token_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let operator = token("mesh-operator", Some("operator"));
+    let path = "/upstreams/roundtrip-consul";
+
+    let consul_token = "roundtrip-consul-acl-token";
+    let upstream = json!({
+        "id": "roundtrip-consul",
+        "name": "roundtrip-consul",
+        "targets": [
+            {"host": "10.0.0.10", "port": 8080, "weight": 100}
+        ],
+        "algorithm": "round_robin",
+        "service_discovery": {
+            "provider": "consul",
+            "consul": {
+                "address": "http://consul.local:8500",
+                "service_name": "my-service",
+                "token": consul_token
+            }
+        }
+    });
+    let (status, body) = post_json(&base, "/upstreams", &admin, &upstream).await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let (status, etag, mut masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator upstream get failed: {masked:?}");
+    assert_eq!(masked["service_discovery"]["consul"]["token"], "[REDACTED]");
+    let etag = etag.expect("upstream GET carries an ETag");
+
+    // An unrelated edit, written back with the masked token and a fresh tag.
+    masked["targets"][0]["weight"] = json!(50);
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked round trip was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/service_discovery/consul/token") && error.contains("real value"),
+        "unexpected refusal: {error}"
+    );
+
+    let (status, _, stored) =
+        send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(stored["service_discovery"]["consul"]["token"], consul_token);
+    assert_eq!(stored["targets"][0]["weight"], 100, "refused write mutated");
+
+    // A create copied from the masked read is refused the same way.
+    let mut copy = masked.clone();
+    copy["id"] = json!("roundtrip-consul-copy");
+    copy["name"] = json!("roundtrip-consul-copy");
+    let (status, refused) = post_json(&base, "/upstreams", &operator, &copy).await;
+    assert_eq!(status, 400, "masked copy was created: {refused:?}");
+    let (status, _) = get_json(&base, "/upstreams/roundtrip-consul-copy", &admin).await;
+    assert_eq!(status, 404);
+
+    // Sending a real value is an ordinary write (token rotation).
+    masked["service_discovery"]["consul"]["token"] = json!("rotated-consul-acl-token");
+    let (status, _, body) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 200, "operator rotation failed: {body:?}");
+    let (_, etag, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(
+        stored["service_discovery"]["consul"]["token"],
+        "rotated-consul-acl-token"
+    );
+    assert_eq!(stored["targets"][0]["weight"], 50);
+
+    // An admin reads the token raw, so its round trip is unchanged.
+    let mut raw = stored.clone();
+    raw["targets"][0]["weight"] = json!(75);
+    let (status, _, body) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        path,
+        &admin,
+        etag.as_deref(),
+        Some(&raw),
+    )
+    .await;
+    assert_eq!(status, 200, "admin round trip failed: {body:?}");
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(
+        stored["service_discovery"]["consul"]["token"],
+        "rotated-consul-acl-token"
+    );
+    assert_eq!(stored["targets"][0]["weight"], 75);
+
+    // PUT stays a full replace: an operator body without the token clears it.
+    // (There is no PATCH; documented in docs/admin_api.md.)
+    let (_, _, mut masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    masked["service_discovery"]["consul"]
+        .as_object_mut()
+        .expect("consul object")
+        .remove("token");
+    let (status, _, body) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        path,
+        &operator,
+        None,
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "operator PUT without the token failed: {body:?}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["service_discovery"]["consul"]["token"], Value::Null);
+}
+
+/// Issue #5925: the same round trip for a plugin config whose secrets the
+/// schema-aware projection masks for non-admin reads — a structural endpoint
+/// URL and a vendor authentication header.
+#[tokio::test]
+async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let operator = token("mesh-operator", Some("operator"));
+    let path = "/plugins/config/roundtrip-http-logging";
+
+    let endpoint = "https://collector.example.com/roundtrip-path-canary/ingest?api_key=canary";
+    let header_secret = "roundtrip-honeycomb-canary";
+    let plugin = json!({
+        "id": "roundtrip-http-logging",
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {
+            "endpoint_url": endpoint,
+            "custom_headers": {"x-honeycomb-team": header_secret},
+            "batch_size": 50
+        }
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "http_logging create failed: {body:?}");
+
+    let (status, etag, mut masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    assert_eq!(
+        masked["config"]["endpoint_url"],
+        "https://collector.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(
+        masked["config"]["custom_headers"]["x-honeycomb-team"],
+        "[REDACTED]"
+    );
+    let etag = etag.expect("plugin config GET carries an ETag");
+
+    masked["config"]["batch_size"] = json!(75);
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked round trip was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/endpoint_url")
+            && error.contains("/config/custom_headers/x-honeycomb-team"),
+        "unexpected refusal: {error}"
+    );
+
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["config"]["endpoint_url"], endpoint);
+    assert_eq!(
+        stored["config"]["custom_headers"]["x-honeycomb-team"],
+        header_secret
+    );
+    assert_eq!(stored["config"]["batch_size"], 50, "refused write mutated");
+
+    // Sending the real values is an ordinary operator write.
+    masked["config"]["endpoint_url"] = json!(endpoint);
+    masked["config"]["custom_headers"]["x-honeycomb-team"] = json!(header_secret);
+    let (status, _, body) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "operator write with real values failed: {body:?}"
+    );
+
+    // An admin reads the config raw, so its round trip is unchanged.
+    let (_, etag, mut raw) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(raw["config"]["batch_size"], 75);
+    raw["config"]["batch_size"] = json!(100);
+    let (status, _, body) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        path,
+        &admin,
+        etag.as_deref(),
+        Some(&raw),
+    )
+    .await;
+    assert_eq!(status, 200, "admin round trip failed: {body:?}");
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["config"]["endpoint_url"], endpoint);
+    assert_eq!(
+        stored["config"]["custom_headers"]["x-honeycomb-team"],
+        header_secret
+    );
+    assert_eq!(stored["config"]["batch_size"], 100);
+}

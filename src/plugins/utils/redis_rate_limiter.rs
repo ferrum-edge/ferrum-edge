@@ -1180,8 +1180,9 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
         // projection or a log line.
         return raw_url.to_string();
     }
+    let userinfo_marker = super::metadata_redaction::REDACTED_USERINFO_PLACEHOLDER;
     if has_userinfo
-        && (parsed.set_password(None).is_err() || parsed.set_username("redacted").is_err())
+        && (parsed.set_password(None).is_err() || parsed.set_username(userinfo_marker).is_err())
     {
         return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string();
     }

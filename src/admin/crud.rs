@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
+use crate::admin::plugin_config_projection::PlaceholderSiteRecorder;
 use crate::admin::preconditions::{self, IfMatch};
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
@@ -2543,6 +2544,19 @@ pub(crate) trait AdminResource:
         Self::response_body(resource)
     }
 
+    /// JSON pointers of the fields in a write body that carry a redaction
+    /// placeholder at a site `role`'s read projection withholds (issue #5925).
+    ///
+    /// A non-empty result refuses the write with `400`: writing the body back
+    /// would replace the stored secret with the marker the caller was shown in
+    /// its place, and the `ETag` (which covers the full stored resource) cannot
+    /// catch that. Override alongside [`Self::response_body_for_role`] with the
+    /// same projection rendered through a [`PlaceholderSiteRecorder`].
+    /// Default: no masked fields, so nothing is refused.
+    fn masked_placeholder_sites(_resource: &Self, _role: AdminRole) -> Vec<String> {
+        Vec::new()
+    }
+
     fn audit_body(resource: &Self) -> Value {
         Self::response_body(resource)
     }
@@ -3757,6 +3771,20 @@ impl AdminResource for Upstream {
         }
     }
 
+    fn masked_placeholder_sites(resource: &Self, role: AdminRole) -> Vec<String> {
+        let recorder = PlaceholderSiteRecorder::default();
+        match role {
+            AdminRole::Admin => {}
+            AdminRole::Operator => {
+                upstream_consul_token_redacted(resource, &recorder);
+            }
+            AdminRole::Viewer => {
+                upstream_audit_body_with(resource, &recorder);
+            }
+        }
+        recorder.into_sites()
+    }
+
     fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
         if self.targets.is_empty() && self.service_discovery.is_none() {
             return Err(ValidationError::Message(
@@ -4238,6 +4266,15 @@ impl AdminResource for PluginConfig {
         }
     }
 
+    fn masked_placeholder_sites(resource: &Self, role: AdminRole) -> Vec<String> {
+        if role == AdminRole::Admin {
+            return Vec::new();
+        }
+        let recorder = PlaceholderSiteRecorder::default();
+        plugin_config_audit_body_with(resource, &recorder);
+        recorder.into_sites()
+    }
+
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
         super::json_response(
             StatusCode::BAD_REQUEST,
@@ -4669,6 +4706,16 @@ impl AdminResource for Proxy {
             AdminRole::Admin | AdminRole::Operator => Self::response_body(resource),
             AdminRole::Viewer => proxy_audit_body_with(resource, &PlaceholderRendering),
         }
+    }
+
+    fn masked_placeholder_sites(resource: &Self, role: AdminRole) -> Vec<String> {
+        // Mirrors `response_body_for_role`. Viewers cannot write proxies today,
+        // so this only matters if that ever changes.
+        let recorder = PlaceholderSiteRecorder::default();
+        if role == AdminRole::Viewer {
+            proxy_audit_body_with(resource, &recorder);
+        }
+        recorder.into_sites()
     }
 
     fn etag_representation(resource: &Self) -> Result<Value, serde_json::Error> {
@@ -5601,6 +5648,21 @@ impl AdminResource for Consumer {
     }
 }
 
+/// The `400` message for a write refused by
+/// [`AdminResource::masked_placeholder_sites`]. The pointers come from the
+/// caller's own body; no stored value is named.
+fn masked_placeholder_message<R: AdminResource>(role: AdminRole, sites: &[String]) -> String {
+    format!(
+        "{} field(s) {} carry the redaction placeholder that '{}' reads return in place of the \
+         stored secret; writing it back would replace the secret with the placeholder. Send the \
+         real value, or remove the field only if you mean to clear it (PUT is a full replace and \
+         does not keep the stored value), or have an admin make the change",
+        R::RESOURCE_LABEL,
+        sites.join(", "),
+        role.as_str()
+    )
+}
+
 fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
     super::json_response(
         StatusCode::NOT_FOUND,
@@ -5694,6 +5756,17 @@ async fn handle_write<R: AdminResource>(
             ));
         }
     };
+    // Issue #5925: refuse a body that writes back a redaction placeholder the
+    // caller's own read projection put in place of a stored secret. Checked
+    // on the body as sent, before any update-path merge or normalization.
+    let placeholder_sites = R::masked_placeholder_sites(&resource, actor.role);
+    if !placeholder_sites.is_empty() {
+        let message = masked_placeholder_message::<R>(actor.role, &placeholder_sites);
+        return Ok(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ));
+    }
     if matches!(action, WriteAction::Create)
         && let Some(labels) = resource.labels_mut()
     {

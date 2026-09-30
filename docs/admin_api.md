@@ -1181,6 +1181,63 @@ default would otherwise silently change security state are handled explicitly:
 Every other field on these three resources replaces normally: a `GET`-modify-`PUT`
 round trip is safe because the response serializes them, but a hand-authored or
 templated partial body will reset anything it leaves out to the schema default.
+The one exception is a field the caller's own read masks, covered next.
+
+### Masked secrets on write (redaction placeholders)
+
+Non-admin reads withhold some stored values and put a redaction placeholder in
+their place. For the roles that can write:
+
+- **`operator` reads of upstreams** replace `service_discovery.consul.token`
+  with `[REDACTED]`.
+- **`operator` reads of plugin configs** use the redacted plugin-config
+  projection described under [Plugin Configs](#plugin-configs): `[REDACTED]`
+  for secrets, `scheme://host[:port]/[REDACTED_PATH]?[REDACTED_QUERY]#[REDACTED_FRAGMENT]`
+  for structural endpoint URLs, and `redacted@` userinfo (no password) for
+  URLs that carried credentials, including `redis_url`.
+
+`admin` reads of these resources are raw, and `operator` reads of proxies keep
+URL userinfo verbatim, so neither has anything to write back.
+
+A `POST` or `PUT` of an upstream or plugin config whose body carries one of those
+placeholders at a field the caller's read projection masks is refused with `400`
+and nothing is mutated (issue #5925). Without this check, an operator tool that
+reads a resource, edits an unrelated field, and writes the body back would store
+the literal placeholder as the secret. `If-Match` cannot catch it: the `ETag`
+covers the full stored resource, so the masked body's tag still matches. The
+error names each offending field by JSON pointer:
+
+```json
+{"error":"Upstream field(s) /service_discovery/consul/token carry the redaction placeholder that 'operator' reads return in place of the stored secret; writing it back would replace the secret with the placeholder. Send the real value, or remove the field only if you mean to clear it (PUT is a full replace and does not keep the stored value), or have an admin make the change"}
+```
+
+The check compares against the placeholder constants exactly: the string
+`[REDACTED]`; a URL whose whole path is `/[REDACTED_PATH]`, whose whole query is
+`[REDACTED_QUERY]`, or whose whole fragment is `[REDACTED_FRAGMENT]`; or a URL whose
+username is `redacted` with no password. It looks only at fields the caller's
+projection masks, so the same string in a field the read shows verbatim is
+written as sent. One real value looks exactly like a placeholder: a URL whose
+userinfo is the username `redacted` with no password, at a masked field. An
+operator cannot write that value, but an admin can.
+
+To change a resource that holds a masked secret, an operator must do one of these:
+
+- **Send the real value.** A new token or header value is an ordinary write, so
+  rotation by `PUT` works.
+- **Remove the field, but only to clear the secret.** `PUT` stays a full
+  replace. A body without `service_discovery.consul.token` stores no token, and
+  a plugin config without the secret loses it, or fails validation if the
+  plugin requires it. The stored secret is deliberately *not* kept for an
+  omitted field. Keeping it would let an operator point the Consul `address` or
+  a plugin endpoint at a host they control, and the gateway would then send
+  that host a credential the operator cannot read.
+- **Ask an `admin`**, whose raw read-modify-write round trip is unchanged.
+
+These resources have no `PATCH`. `/batch`, `/restore` and API-spec writes are
+`admin`-only and see raw values, so the check does not apply to them. Consumers
+are also `admin`-only, and their credential projection has its own round-trip
+rule: a `[REDACTED]` credential entry is restored from the stored entry (see
+[Consumers](#consumers)).
 
 
 ### Conditional writes (`ETag` / `If-Match`)
@@ -1311,7 +1368,7 @@ Disabled plugin configs are stored without plugin-specific construction, so oper
 
 Global-scope requirements for `transaction_log_schema` and `prometheus_metrics` still apply while disabled.
 
-Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
+Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. An `operator` write that sends one of the projection's placeholders back at a masked field is refused with `400`; see [Masked secrets on write](#masked-secrets-on-write-redaction-placeholders).
 
 That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Three layers run in order, and each can only add redaction:
 

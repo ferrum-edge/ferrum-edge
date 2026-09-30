@@ -6259,6 +6259,16 @@ paths:
         `true` when the key is absent — a create has no prior state to
         overwrite.
 
+        **Masked secrets.** Non-admin reads return the redacted plugin-config
+        projection. A `PUT` (or `POST /plugins/config`) by an `operator` whose
+        body carries one of that projection's placeholders at a field it
+        masks is rejected with `400` and nothing is mutated. The placeholders
+        are `[REDACTED]`, a URL whose path, query, or fragment is exactly
+        `/[REDACTED_PATH]`, `[REDACTED_QUERY]`, or `[REDACTED_FRAGMENT]`, and
+        `redacted@` userinfo with no password. Send the real value, or omit
+        the field to clear it: the full replace does not keep the stored
+        value. `admin` reads are raw, so an admin round trip is unaffected.
+
         **Proxy-scoped side effect (database mode).** The proxy association is
         reconciled with the replacement body in the same transaction, so
         `GET /proxies/{id}` stays authoritative. `scope: "proxy"` ensures the
@@ -6475,6 +6485,15 @@ paths:
         any field the body omits is reset to its schema default. `targets` is
         required by the schema, so a body that omits it is rejected with `400`
         rather than silently emptying the target list.
+
+        **Masked secrets.** An `operator` read returns
+        `service_discovery.consul.token` as `[REDACTED]`. A `PUT` (or
+        `POST /upstreams`) by an `operator` whose body carries that exact
+        placeholder as the token is rejected with `400` and nothing is
+        mutated. Otherwise a read-modify-write would store the placeholder as
+        the token, and `If-Match` would not catch it. Send the real token, or
+        omit it to clear it: the full replace does not keep the stored token.
+        `admin` reads are raw, so an admin round trip is unaffected.
       tags: [Upstreams]
       requestBody:
         required: true

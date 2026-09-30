@@ -1965,3 +1965,39 @@ fn proxy_ws_origin_star_is_rejected_on_admin_and_validate_admission() {
         "ferrum-edge validate must reject '*' after loading the file spec"
     );
 }
+
+/// Issue #5925: every admin resource whose read is projected per role must also
+/// refuse a write that sends that projection's placeholders back. A new
+/// `response_body_for_role` override without the matching
+/// `masked_placeholder_sites` override fails here, rather than shipping a
+/// round trip that stores `[REDACTED]` as a secret.
+#[test]
+fn role_projected_resources_refuse_writing_their_placeholders_back() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    let marker = "impl AdminResource for ";
+    let starts: Vec<usize> = crud.match_indices(marker).map(|(at, _)| at).collect();
+    assert!(!starts.is_empty(), "AdminResource impls must be found");
+    let mut projected = Vec::new();
+    for (index, start) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(crud.len());
+        let region = &crud[*start..end];
+        let name = region[marker.len()..]
+            .split_whitespace()
+            .next()
+            .expect("impl target name");
+        if region.contains("fn response_body_for_role(") {
+            projected.push(name);
+            assert!(
+                region.contains("fn masked_placeholder_sites("),
+                "{name} projects reads per role but does not refuse writing the \
+                 projection's placeholders back (override masked_placeholder_sites)"
+            );
+        }
+    }
+    projected.sort_unstable();
+    assert_eq!(projected, ["PluginConfig", "Proxy", "Upstream"]);
+    assert!(
+        crud.contains("R::masked_placeholder_sites(&resource, actor.role)"),
+        "the generic write path must run the check with the caller's role"
+    );
+}

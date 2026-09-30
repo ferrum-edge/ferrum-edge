@@ -635,6 +635,21 @@ outright with no deprecation period:
 
 ### Fixed
 
+- **An operator's read-modify-write can no longer overwrite masked secrets
+  with the redaction placeholder** (#5925). Operator reads replace an
+  upstream's Consul ACL token, and plugin-config secrets, with placeholders
+  such as `[REDACTED]`, `[REDACTED_PATH]`, or `redacted@` userinfo. Writing
+  such a body back (a UI edits a timeout and PUTs what it read) used to store
+  the placeholder as the secret, and `If-Match` let it through because the
+  `ETag` covers the full stored resource. Such a `POST` or `PUT` of an upstream
+  or plugin config is now refused with `400`. The error names each field and
+  nothing is written. A field only counts when the caller's own read masks it
+  and its value matches a placeholder constant exactly. Send the real value,
+  or omit the field to clear it: `PUT` is still a full replace and does not
+  keep an omitted secret, because keeping it would let an operator redirect a
+  credential they cannot read. Admin round trips, which read raw values, are
+  unchanged.
+
 - **A Gateway listener class, bind, or direction flip serves at once**
   (#5921). When a listener's TLS class, bind address, or mesh direction
   changed, reconcile refused the whole port even though the replacement socket

@@ -6,10 +6,10 @@
 //! `tests/integration/admin_audit_rbac_tests.rs`.
 
 use ferrum_edge::admin::plugin_config_projection::{
-    KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS,
-    is_credential_bearing_url_config_key, is_safe_kafka_producer_property,
+    KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS, PlaceholderSiteRecorder,
+    is_credential_bearing_url_config_key, is_redaction_placeholder, is_safe_kafka_producer_property,
     is_sensitive_plugin_config_key, normalize_config_key, project_plugin_config,
-    redact_endpoint_url, sensitivity_rules_for,
+    project_plugin_config_with, redact_endpoint_url, sensitivity_rules_for,
 };
 use ferrum_edge::plugins::builtin_parity::BUILTIN_PLUGIN_PARITY_META;
 use serde_json::{Value, json};
@@ -1169,4 +1169,120 @@ fn chargeback_clickhouse_endpoint_and_insert_params_are_projected() {
         &projected,
         &["chargeback-path-canary", "chargeback-param-canary"],
     );
+}
+
+// ---------------------------------------------------------------------------
+// Placeholder write-back detection (issue #5925)
+// ---------------------------------------------------------------------------
+
+/// The sites where `config` already carries a redaction placeholder, as the
+/// admin write path finds them.
+fn placeholder_sites(plugin: &str, config: &Value) -> Vec<String> {
+    let recorder = PlaceholderSiteRecorder::default();
+    let mut walked = config.clone();
+    project_plugin_config_with(plugin, &mut walked, "/config", &recorder);
+    recorder.into_sites()
+}
+
+#[test]
+fn redaction_placeholder_matches_only_the_exact_markers() {
+    for marker in [
+        json!("[REDACTED]"),
+        json!("https://collector.example.com/[REDACTED_PATH]"),
+        json!("https://collector.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"),
+        json!("https://collector.example.com?[REDACTED_QUERY]"),
+        json!("https://collector.example.com#[REDACTED_FRAGMENT]"),
+        // A partial edit that keeps one marker still carries it.
+        json!("https://other.example.com:8443/[REDACTED_PATH]?page=2"),
+        json!("redis://redacted@cache.internal:6379/3"),
+        json!("postgres://redacted@db.internal/app"),
+    ] {
+        assert!(is_redaction_placeholder(&marker), "{marker} not matched");
+    }
+
+    for legitimate in [
+        json!("[redacted]"),
+        json!("[REDACTED] "),
+        json!(" [REDACTED]"),
+        json!("x[REDACTED]"),
+        json!("REDACTED"),
+        json!("redacted"),
+        json!("https://collector.example.com"),
+        json!("https://collector.example.com/v1/[REDACTED_PATH]"),
+        json!("https://collector.example.com/[REDACTED_PATH]x"),
+        json!("https://collector.example.com?q=[REDACTED_QUERY]"),
+        json!("https://redacted:password@collector.example.com/"),
+        json!("https://user@collector.example.com/"),
+        json!("redis://cache.internal:6379/3"),
+        json!(42),
+        json!(true),
+        Value::Null,
+        json!(["[REDACTED]"]),
+        json!({"key": "[REDACTED]"}),
+    ] {
+        assert!(
+            !is_redaction_placeholder(&legitimate),
+            "{legitimate} wrongly matched"
+        );
+    }
+}
+
+/// Every value an operator read masks is found again when that read is sent
+/// back, and the stored (raw) config itself trips nothing.
+#[test]
+fn placeholder_sites_are_exactly_the_masked_sites_of_a_round_tripped_read() {
+    let raw = json!({
+        "endpoint_url": "https://collector.example.com/push/path-canary?api_key=query-canary",
+        "custom_headers": {"x-honeycomb-team": "vendor-canary"},
+        "api_key": "name-heuristic-canary",
+        "fallback": "https://user:pass@backup.example.com/ingest",
+        "batch_size": 50,
+        "service": "orders"
+    });
+    assert!(
+        placeholder_sites("http_logging", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("http_logging", raw);
+    let mut sites = placeholder_sites("http_logging", &projected);
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            "/config/api_key".to_string(),
+            "/config/custom_headers/x-honeycomb-team".to_string(),
+            "/config/endpoint_url".to_string(),
+            "/config/fallback".to_string(),
+        ]
+    );
+}
+
+/// A layered site (structural URL projection, then the name heuristic) is
+/// judged on the value the caller sent, not on the earlier layer's output.
+#[test]
+fn placeholder_sites_ignore_a_later_layer_rendering_an_earlier_layers_output() {
+    let raw = json!({
+        "providers": [{
+            "issuer": "https://idp.example.com/",
+            "token_endpoint": "https://idp.example.com/oauth/token",
+            "client_id": "edge"
+        }]
+    });
+    assert!(placeholder_sites("oidc_relying_party", &raw).is_empty());
+
+    let projected = project("oidc_relying_party", raw);
+    assert_eq!(projected["providers"][0]["token_endpoint"], REDACTED);
+    assert_eq!(
+        placeholder_sites("oidc_relying_party", &projected),
+        vec!["/config/providers/0/token_endpoint".to_string()]
+    );
+}
+
+/// A placeholder only matters where the projection masks: the same string in a
+/// field the read shows verbatim was put there by the caller, not the read.
+#[test]
+fn placeholder_outside_a_masked_site_is_not_reported() {
+    let config = json!({"service": "[REDACTED]", "batch_size": 50});
+    assert!(placeholder_sites("http_logging", &config).is_empty());
 }
