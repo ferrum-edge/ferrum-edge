@@ -9421,3 +9421,50 @@ fn typed_mesh_maps_keep_trusted_fields_after_withheld_keys() {
         &["MAP_KEY_5594", "telemetry-marker-5594", "true"],
     );
 }
+
+/// The bare-FQDN `connection.sni` warning logs its operator-supplied fields
+/// with `Debug` escaping: the operator can read which policy to fix (nothing
+/// is redacted), and a newline in a policy name cannot forge a log line.
+#[test]
+fn connection_sni_bare_fqdn_warning_logs_debug_escaped_fields() {
+    let mut policy = allow_client_policy(PolicyAction::Deny);
+    policy.name = "deny-bare-sni-warning\nforged=1".to_string();
+    policy.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".to_string(),
+        values: vec!["Ratings.Warning-Test.svc.cluster.local.".to_string()],
+        not_values: Vec::new(),
+    });
+    let slice = MeshSlice {
+        mesh_policies: vec![policy],
+        ..MeshSlice::default()
+    };
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    ferrum_edge::modes::mesh::warn_connection_sni_bare_service_fqdn(&slice, "cluster.local");
+    drop(guard);
+    let logs = logs.contents();
+
+    assert!(
+        logs.contains("names a service's bare FQDN"),
+        "the warning must be logged: {logs}"
+    );
+    for field in [
+        r#"policy="deny-bare-sni-warning\nforged=1""#,
+        r#"namespace="default""#,
+        r#"sni_value="ratings.warning-test.svc.cluster.local""#,
+        r#"suggested_value="*.ratings.warning-test.svc.cluster.local""#,
+    ] {
+        assert!(
+            logs.contains(field),
+            "expected the Debug-escaped field {field} in: {logs}"
+        );
+    }
+    assert!(
+        !logs.contains("redacted"),
+        "the warning fields must not be redacted: {logs}"
+    );
+    assert!(
+        !logs.contains("\nforged=1"),
+        "a newline in the policy name must not reach the log unescaped: {logs}"
+    );
+}

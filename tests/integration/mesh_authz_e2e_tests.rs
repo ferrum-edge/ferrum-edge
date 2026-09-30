@@ -3410,15 +3410,35 @@ async fn connection_sni_values_are_lowercased_when_mesh_authz_is_built() {
     );
 }
 
+#[tokio::test]
+async fn connection_sni_trailing_dot_and_u_label_values_are_normalized_in_mesh_authz() {
+    let deny = condition_policy(
+        "deny-normalized-sni",
+        PolicyAction::Deny,
+        "connection.sni",
+        vec!["Reviews.Default.svc.cluster.local.", "Bücher.Example"],
+        Vec::new(),
+    );
+    let config = json!({ "mesh_policies": [deny] });
+    let plugin = MeshAuthz::new(&config).expect("normalizable values build");
+
+    for sni in [REVIEWS_FQDN, "xn--bcher-kva.example"] {
+        assert_eq!(
+            sni_rejections(&plugin, sni).await,
+            [true; 3],
+            "the normalized value must match the received SNI {sni} on every path"
+        );
+    }
+}
+
 #[test]
-fn mesh_authz_rejects_connection_sni_trailing_dot_and_u_label_values() {
-    let trailing_dot = "reviews.default.svc.cluster.local.";
-    for (values, not_values, reason) in [
-        (vec![trailing_dot], Vec::new(), "must not end with '.'"),
-        (Vec::new(), vec!["bücher.example"], "A-label"),
+fn mesh_authz_rejects_unconvertible_connection_sni_values() {
+    for (values, not_values) in [
+        (vec!["bücher example"], Vec::new()),
+        (Vec::new(), vec!["bü*"]),
     ] {
         let deny = condition_policy(
-            "deny-unmatchable-sni",
+            "deny-unconvertible-sni",
             PolicyAction::Deny,
             "connection.sni",
             values,
@@ -3426,12 +3446,12 @@ fn mesh_authz_rejects_connection_sni_trailing_dot_and_u_label_values() {
         );
         let config = json!({ "mesh_policies": [deny] });
         let err = match MeshAuthz::new(&config) {
-            Ok(_) => panic!("an unmatchable connection.sni value must fail closed"),
+            Ok(_) => panic!("an unconvertible connection.sni value must fail closed"),
             Err(err) => err,
         };
         assert!(
-            err.contains("connection.sni") && err.contains(reason),
-            "expected a '{reason}' construction error, got: {err}"
+            err.contains("connection.sni") && err.contains("cannot be converted to an A-label"),
+            "expected an A-label construction error, got: {err}"
         );
     }
 }
@@ -3462,12 +3482,13 @@ fn bare_service_fqdn_sni_values_are_reported_for_the_load_time_warning() {
         vec![REVIEWS_FQDN],
     );
     // Not in this proxy's service view: reported by the Kubernetes Service
-    // FQDN shape `<service>.<namespace>.svc.<cluster-domain>`.
+    // FQDN shape `<service>.<namespace>.svc.<cluster-domain>`, compared in its
+    // canonical spelling (the trailing dot is stripped).
     let audit_unknown_service = condition_policy(
         "audit-unknown-service",
         PolicyAction::Audit,
         "connection.sni",
-        vec!["ratings.prod.svc.cluster.local"],
+        vec!["ratings.prod.svc.cluster.local."],
         Vec::new(),
     );
     let never_reported = condition_policy(

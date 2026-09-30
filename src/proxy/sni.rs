@@ -592,6 +592,21 @@ pub fn classify_client_hello(data: &[u8]) -> ClientHelloSni {
     }
 }
 
+/// Normalize the hostname a TLS stack reports for a received `server_name`.
+///
+/// rustls validates a received SNI with its `DnsName` rules, which accept a
+/// trailing root dot, and `ServerConnection::server_name()` (and quinn's
+/// `HandshakeData::server_name`) report the name with that dot kept. Consumers
+/// such as `mesh_authz`'s `connection.sni` compare the name as a string, so a
+/// client sending `admin.example.com.` would otherwise slip past a policy
+/// written for `admin.example.com`. This strips exactly one trailing dot and
+/// ASCII-lowercases the rest, giving every read site one spelling of the name.
+/// Returns `None` when nothing is left.
+pub fn normalize_received_server_name(name: &str) -> Option<String> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
 /// Extract the SNI hostname from a TLS ClientHello byte slice.
 ///
 /// Parses the TLS record layer and handshake message to find the

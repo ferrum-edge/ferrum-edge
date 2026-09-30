@@ -4559,7 +4559,15 @@ const CONNECTION_SNI_BARE_FQDN_WARN_MAX_KEYS: usize = 1024;
 /// DENY written that way does not apply to cross-cluster traffic, and a
 /// `notValues` exclusion does not exclude it. Matching is deliberately
 /// unchanged (Istio's plain string match); this only tells the operator.
-fn warn_connection_sni_bare_service_fqdn(mesh_slice: &MeshSlice, cluster_domain: &str) {
+///
+/// Operator-supplied fields are logged with `Debug` escaping (`?field`), so a
+/// control character or newline in a policy name or value cannot forge log
+/// lines, while the operator still sees which policy to fix.
+///
+/// `pub` only so the unit suite can capture the warning; runtime code calls it
+/// from mesh slice preparation.
+#[doc(hidden)]
+pub fn warn_connection_sni_bare_service_fqdn(mesh_slice: &MeshSlice, cluster_domain: &str) {
     let findings = crate::modes::mesh::policy::find_bare_service_fqdn_sni_conditions(
         &mesh_slice.mesh_policies,
         &mesh_slice.services,
@@ -4584,11 +4592,12 @@ fn warn_connection_sni_bare_service_fqdn(mesh_slice: &MeshSlice, cluster_domain:
         if !first {
             continue;
         }
+        let suggested_value = format!("*.{}", finding.value);
         warn!(
-            policy = %sanitize_startup_scalar(&finding.policy_name),
-            namespace = %sanitize_startup_scalar(&finding.policy_namespace),
-            sni_value = %sanitize_startup_scalar(&finding.value),
-            suggested_value = %sanitize_startup_scalar(format!("*.{}", finding.value)),
+            policy = ?finding.policy_name,
+            namespace = ?finding.policy_namespace,
+            sni_value = ?finding.value,
+            suggested_value = ?suggested_value,
             "Mesh policy connection.sni value names a service's bare FQDN; cross-cluster \
              traffic arrives with the east-west alias SNI p<port>.<fqdn> (p<port>-udp.<fqdn> \
              for UDP) and never matches it. To cover cross-cluster traffic, use \

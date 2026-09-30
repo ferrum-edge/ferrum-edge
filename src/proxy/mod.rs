@@ -23345,7 +23345,7 @@ async fn handle_tls_connection(
         .get_ref()
         .1
         .server_name()
-        .map(str::to_ascii_lowercase);
+        .and_then(crate::proxy::sni::normalize_received_server_name);
 
     #[cfg(feature = "bench-h1-profile")]
     let profile_layer = if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {

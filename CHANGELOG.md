@@ -267,19 +267,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Mesh `connection.sni` condition values are normalized and checked at
-  load.** Values are lowercased on every surface that loads a policy
-  (Kubernetes translation, file and native config, and `mesh_authz`
-  construction), matching the lowercased ClientHello SNI they are compared
-  with. A value that ends in `.` or contains a non-ASCII character could never
-  match and is now a validation error, in `values` and `notValues`; write an
-  internationalized name as its A-label (`xn--…`). A mesh data plane also logs
-  a one-time warning, naming the policy, when an exact `connection.sni` value
-  names a service's bare FQDN (`<service>.<namespace>.svc.<cluster-domain>`).
-  Cross-cluster traffic carries the `p<port>[-udp].<fqdn>` alias, so such a
-  value never matches it; the warning suggests `*.<fqdn>` or the explicit
-  aliases. Matching is unchanged: `connection.sni` stays Istio's plain string
-  match.
+- **Mesh `connection.sni` condition values are normalized at load** (#5903).
+  Every surface that loads a policy (Kubernetes translation, file and native
+  config, and `mesh_authz` construction) strips one trailing dot, lowercases
+  ASCII, and converts a non-ASCII (U-label) name to its A-label with IDNA
+  (`bücher.example` becomes `xn--bcher-kva.example`). A non-ASCII value that
+  cannot be converted is rejected with a validation error, in `values` and
+  `notValues`; on Kubernetes, the AuthorizationPolicy carrying it is not
+  installed. A mesh data plane also logs a one-time warning, naming the
+  policy, when an exact `connection.sni` value names a service's bare FQDN
+  (`<service>.<namespace>.svc.<cluster-domain>`). Cross-cluster traffic
+  carries the `p<port>[-udp].<fqdn>` alias, so such a value never matches it;
+  the warning suggests `*.<fqdn>` or the explicit aliases. Matching is
+  unchanged: `connection.sni` stays Istio's plain string match.
 
 - **HTTP/1 over TLS moves bulk bodies in large reads** (#5588). tokio-rustls
   returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher used
@@ -481,6 +481,13 @@ outright with no deprecation period:
   longer polled with `FERRUM_CP_DP_GRPC_JWT_SECRET`.
 
 ### Fixed
+
+- **A trailing root dot in a received SNI no longer bypasses mesh
+  `connection.sni` policy** (#5903). rustls accepts `admin.example.com.` and
+  reported it with the dot, so on TLS-terminated HTTP/1.1, HTTP/2, HTTP/3, and
+  TCP connections a DENY written for `admin.example.com` (or
+  `*.example.com`) did not fire. Those read sites now strip exactly one
+  trailing dot and lowercase the name before plugins see it.
 
 - **gRPC and HTTP/2 backend connections no longer die after 100 requests
   against h2 >= 0.4.16 peers** (#5588). A client that ends a request with a

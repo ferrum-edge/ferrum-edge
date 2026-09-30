@@ -1102,8 +1102,10 @@ fn condition_match(
             ),
         ));
     }
-    // Lowercase `connection.sni` values, as every other load surface does, so
-    // the translated policy compares directly with the lowercase received SNI.
+    // Normalize `connection.sni` values (one trailing dot stripped, ASCII
+    // lowercased, U-labels converted to A-labels), as every other load surface
+    // does, so the translated policy compares directly with the received SNI.
+    // Validation above admitted every value this can convert.
     normalize_mesh_condition_values(&mut condition);
     Ok(condition)
 }

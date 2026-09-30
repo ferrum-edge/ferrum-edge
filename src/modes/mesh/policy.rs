@@ -14,8 +14,8 @@ use std::net::IpAddr;
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{
     ConditionMatch, MeshConditionKeyKind, MeshPolicy, MeshRule, MeshService, PolicyAction,
-    PrincipalMatch, RequestMatch, SourceNegationMatch, classify_mesh_condition_key,
-    normalize_mesh_policy_header_map,
+    PrincipalMatch, RequestMatch, SourceNegationMatch, canonical_mesh_condition_sni_value,
+    classify_mesh_condition_key, normalize_mesh_policy_header_map,
 };
 use crate::modes::mesh::slice::MeshSlice;
 
@@ -1314,7 +1314,7 @@ pub struct BareServiceFqdnSniCondition {
     pub policy_namespace: String,
     /// Name of the policy that carries the value.
     pub policy_name: String,
-    /// The value, ASCII-lowercased.
+    /// The value in its canonical spelling (lowercase, no trailing dot).
     pub value: String,
 }
 
@@ -1357,10 +1357,14 @@ pub fn find_bare_service_fqdn_sni_conditions(
             });
         for condition in conditions {
             for value in condition.values.iter().chain(&condition.not_values) {
+                // Compare the spelling the evaluator compares; a slice from
+                // the control plane may not have been normalized yet.
+                let Ok(value) = canonical_mesh_condition_sni_value(value) else {
+                    continue;
+                };
                 if value.contains('*') {
                     continue;
                 }
-                let value = value.to_ascii_lowercase();
                 let known = service_fqdns
                     .get_or_insert_with(|| {
                         services

@@ -2021,7 +2021,8 @@ async fn handle_h3_connection(
     let frontend_sni_hostname = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-        .and_then(|data| data.server_name.as_deref().map(str::to_ascii_lowercase));
+        .and_then(|data| data.server_name)
+        .and_then(|name| crate::proxy::sni::normalize_received_server_name(&name));
 
     // Keep a handle to the quinn connection so we can detect QUIC connection
     // migration (RFC 9000 §9). When a client migrates to a new IP (e.g., mobile

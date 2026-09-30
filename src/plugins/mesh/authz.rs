@@ -1592,8 +1592,9 @@ fn normalize_authz_policies(policies: &mut [MeshPolicy]) {
         normalize_mesh_policy_header_names(policy);
         for rule in &mut policy.rules {
             // A slice arriving over xDS / MeshSubscribe never passed
-            // `MeshConfig::normalize()`, so lowercase `connection.sni` values
-            // here too; the received SNI they are compared with is lowercase.
+            // `MeshConfig::normalize()`, so normalize `connection.sni` values
+            // here too, to the spelling of the received SNI they are compared
+            // with.
             for condition in &mut rule.when {
                 normalize_mesh_condition_values(condition);
             }
