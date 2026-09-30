@@ -288,6 +288,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `orders.internal.` keeps matching now that the received SNI has its
   trailing dot stripped. An entry with non-ASCII text that cannot be
   converted is rejected; `sni` regexes are unchanged.
+  **Upgrade notes:** a `prefix` written with a trailing dot to catch the
+  dotted client spelling (`internal.example.`) no longer matches it, because
+  the received name now arrives without the dot; write the dotless name as an
+  `exact` entry instead. An `sni` regex that requires a trailing dot
+  (`…\.$`) no longer matches. A stored trigger whose `exact` or `prefix`
+  entry has non-ASCII text that cannot be converted now fails to load
+  instead of silently never matching.
 
 - **HTTP/1 over TLS moves bulk bodies in large reads** (#5588). tokio-rustls
   returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher used

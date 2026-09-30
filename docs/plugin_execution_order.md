@@ -1310,7 +1310,8 @@ trailing dot, is lowercased, and has a non-ASCII (U-label) name converted to
 its A-label (`xn--…`) with IDNA. A `prefix` entry is lowercased and has whole
 labels before a trailing `.` converted; a trailing `.` in a prefix stays. An
 entry with non-ASCII text that cannot be converted is rejected. `sni` regexes
-are left as written.
+are left as written, so a regex that requires a trailing dot no longer matches:
+the received name arrives without it.
 
 At startup and cache rebuild, a warning identifies each proxy/protocol whose
 effective authentication instances are all trigger-gated. Requests matching none
