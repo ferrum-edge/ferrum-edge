@@ -72,6 +72,7 @@ const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 struct Captured {
     method: String,
     head: String,
+    body: Vec<u8>,
 }
 
 impl Captured {
@@ -107,6 +108,7 @@ async fn serve_mcp_upstream(listener: TcpListener, captures: Captures) {
                     captured.push(Captured {
                         method: method.clone(),
                         head,
+                        body: body.clone(),
                     });
                 }
                 let written = match parsed.get("id") {
@@ -119,6 +121,19 @@ async fn serve_mcp_upstream(listener: TcpListener, captures: Captures) {
                         });
                         let extra = [(SESSION_HEADER, UPSTREAM_SESSION)];
                         write_http_response(&mut stream, 200, &extra, &payload.to_string()).await
+                    }
+                    Some(id) if method == "tools/list" => {
+                        let payload = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "tools": [{
+                                    "name": "echo",
+                                    "inputSchema": {"type": "object"}
+                                }]
+                            }
+                        });
+                        write_http_response(&mut stream, 200, &[], &payload.to_string()).await
                     }
                     Some(id) => {
                         let payload = json!({"jsonrpc": "2.0", "id": id, "result": {}});
@@ -144,13 +159,14 @@ async fn serve_rest_backend(listener: TcpListener, captures: Captures) {
         let captures = Arc::clone(&captures);
         tokio::spawn(async move {
             let mut pending = Vec::new();
-            while let Some((head, _)) = read_one_http_request(&mut stream, &mut pending).await {
+            while let Some((head, body)) = read_one_http_request(&mut stream, &mut pending).await {
                 let method = head.split(' ').next().unwrap_or_default().to_string();
                 {
                     let mut captured = captures.lock().expect("captures lock");
                     captured.push(Captured {
                         method: method.clone(),
                         head,
+                        body,
                     });
                 }
                 let written = if method == "GET" {
@@ -497,6 +513,17 @@ impl Fixture {
         body: &Value,
         extra: &[(&str, &str)],
     ) -> (u16, Value, http::HeaderMap) {
+        self.post_h1_method_with(http::Method::POST, session_id, body, extra)
+            .await
+    }
+
+    async fn post_h1_method_with(
+        &self,
+        method: http::Method,
+        session_id: Option<&str>,
+        body: &Value,
+        extra: &[(&str, &str)],
+    ) -> (u16, Value, http::HeaderMap) {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .http1_only()
@@ -504,7 +531,7 @@ impl Fixture {
             .expect("build client");
         let bytes = serde_json::to_vec(body).expect("serialize JSON-RPC body");
         let mut request = client
-            .post(format!("http://127.0.0.1:{}/mcp", self.http_port))
+            .request(method, format!("http://127.0.0.1:{}/mcp", self.http_port))
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", PROTOCOL_VERSION)
@@ -673,6 +700,33 @@ fn admission_config(writer: LaterWriter, upstream_port: u16, function_port: u16)
     .expect("MCP admission config is valid")
 }
 
+fn shielded_admission_config(upstream_port: u16) -> GatewayConfig {
+    let mut config = serde_json::to_value(admission_config(
+        LaterWriter::RequestTransformer,
+        upstream_port,
+        0,
+    ))
+    .expect("serialize admission config");
+    config["proxies"][0]["plugins"] = json!([
+        {"plugin_config_id": "mcp-admission-gw"},
+        {"plugin_config_id": "mcp-admission-shield"}
+    ]);
+    let configs = config["plugin_configs"]
+        .as_array_mut()
+        .expect("plugin configs");
+    configs.retain(|plugin| plugin["id"] == "mcp-admission-gw");
+    configs.push(json!({
+        "id": "mcp-admission-shield",
+        "namespace": TEST_NAMESPACE,
+        "plugin_name": "ai_prompt_shield",
+        "scope": "proxy",
+        "proxy_id": "mcp-admission",
+        "enabled": true,
+        "config": {"action": "redact", "scan_fields": "mcp_arguments", "patterns": ["email"]}
+    }));
+    serde_json::from_value(config).expect("shielded admission config is valid")
+}
+
 /// An `aggregate_router` gateway whose only server is an OpenAPI bridge over
 /// this proxy's own REST backend.
 fn bridge_config(backend_port: u16) -> GatewayConfig {
@@ -838,6 +892,28 @@ fn governed_bridge_config(backend_port: u16, collector_port: u16) -> GatewayConf
     .expect("governed MCP bridge config is valid")
 }
 
+fn shielded_governed_bridge_config(backend_port: u16, collector_port: u16) -> GatewayConfig {
+    let mut config = serde_json::to_value(governed_bridge_config(backend_port, collector_port))
+        .expect("serialize governed bridge config");
+    config["proxies"][0]["plugins"]
+        .as_array_mut()
+        .expect("proxy plugin list")
+        .push(json!({"plugin_config_id": "governed-shield"}));
+    config["plugin_configs"]
+        .as_array_mut()
+        .expect("plugin configs")
+        .push(json!({
+            "id": "governed-shield",
+            "namespace": TEST_NAMESPACE,
+            "plugin_name": "ai_prompt_shield",
+            "scope": "proxy",
+            "proxy_id": "mcp-governed",
+            "enabled": true,
+            "config": {"action": "redact", "scan_fields": "mcp_arguments", "patterns": ["email"]}
+        }));
+    serde_json::from_value(config).expect("shielded governed bridge config is valid")
+}
+
 fn bridge_call_body(id: i64, name: &str, arguments: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -973,6 +1049,50 @@ async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
             );
         }
     }
+    fixture.shutdown().await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mcp_gateway_forwards_shielded_upstream_tool_arguments() {
+    let config = |upstream_port: u16, _| shielded_admission_config(upstream_port);
+    let fixture = Fixture::start_with(Backend::Mcp, config).await;
+    let (status, _, session) = fixture.post("HTTP/1.1", None, &initialize_body()).await;
+    assert_eq!(status, 200);
+    let session = session.expect("downstream session");
+    let list = json!({"jsonrpc": "2.0", "id": 90, "method": "tools/list"});
+    let (status, body, _) = fixture.post("HTTP/1.1", Some(&session), &list).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["result"]["tools"].is_array(), "{body}");
+
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 91,
+        "method": "tools/call",
+        "params": {
+            "name": "echo.echo",
+            "arguments": {"contact": "alice@example.com"}
+        }
+    });
+    let (status, body, _) = fixture.post("HTTP/1.1", Some(&session), &call).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], json!(91), "{body}");
+    let forwarded = fixture
+        .captures
+        .lock()
+        .expect("upstream captures")
+        .clone();
+    let forwarded = forwarded
+        .iter()
+        .find(|request| request.method == "tools/call")
+        .expect("upstream tools/call request");
+    let call_body: Value = serde_json::from_slice(&forwarded.body).expect("forwarded JSON-RPC");
+    assert_eq!(
+        call_body["params"]["arguments"]["contact"],
+        "[REDACTED:email]",
+        "mcp_gateway must dispatch and log only the shielded arguments: {call_body}"
+    );
+    assert!(!call_body.to_string().contains("alice@example.com"));
     fixture.shutdown().await;
 }
 
@@ -1122,6 +1242,56 @@ async fn functional_mcp_gateway_governed_bridge_audits_and_limits_tool_calls() {
     for call in calls {
         assert_eq!(call["error_code"], json!(-32015), "{call}");
     }
+
+    fixture.shutdown().await;
+    collector_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mcp_gateway_lowercase_post_is_shielded_and_audited() {
+    let collector = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind audit collector");
+    let collector_port = collector.local_addr().expect("collector addr").port();
+    let records: AuditRecords = Arc::new(Mutex::new(Vec::new()));
+    let collector_task = tokio::spawn(serve_audit_collector(collector, Arc::clone(&records)));
+    let config = move |backend_port: u16, _: u16| {
+        shielded_governed_bridge_config(backend_port, collector_port)
+    };
+    let fixture = Fixture::start_with(Backend::Rest, config).await;
+    let key = [("x-api-key", AGENT_KEY)];
+    let (status, _, headers) = fixture
+        .post_h1_with(None, &initialize_body(), &key)
+        .await;
+    assert_eq!(status, 200);
+    let session = header_string(&headers).expect("initialize session");
+
+    let call = bridge_call_body(
+        81,
+        "pets.getPet",
+        json!({"petId": "alice@example.com"}),
+    );
+    let lower_post = http::Method::from_bytes(b"post").expect("lowercase HTTP method");
+    let (status, body, _) = fixture
+        .post_h1_method_with(lower_post, Some(&session), &call, &key)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], json!(81), "{body}");
+    let received = fixture.received();
+    assert!(
+        received.iter().any(|request| {
+            request.head.starts_with("GET /pets/%5BREDACTED:email%5D HTTP/1.1")
+        }),
+        "the bridge must receive only the shielded argument: {received:#?}"
+    );
+    let audited = wait_for_audit_records(&records, 1).await;
+    assert_eq!(audited.len(), 1, "lowercase POST must be audited: {audited:#?}");
+    assert_eq!(audited[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
+    assert!(
+        !audited[0].to_string().contains("alice@example.com"),
+        "the original argument must not be exported: {audited:#?}"
+    );
 
     fixture.shutdown().await;
     collector_task.abort();

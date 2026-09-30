@@ -201,6 +201,7 @@ pub const AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS: &[&str] = &[
     "stream_hash",
     "mcp_tool_calls",
     "mcp_arguments",
+    "mcp_endpoint_path",
 ];
 
 /// Accepted keys under `sampling`.
@@ -636,6 +637,8 @@ struct CaptureConfig {
     /// Treat MCP JSON-RPC `tools/call` requests as audit candidates and record
     /// their calls.
     mcp_tool_calls: bool,
+    /// Optional exact path scope for Content-Type-less MCP requests.
+    mcp_endpoint_path: Option<String>,
     /// Include each MCP call's arguments excerpt (redacted per `mode`).
     mcp_arguments: bool,
 }
@@ -2098,8 +2101,21 @@ impl AiTranscriptAudit {
             tool_calls: cfg_bool(capture_obj, "tool_calls", true, "capture")?,
             stream_hash,
             mcp_tool_calls: cfg_bool(capture_obj, "mcp_tool_calls", true, "capture")?,
+            mcp_endpoint_path: cfg_str(capture_obj, "mcp_endpoint_path", "capture")?
+                .map(ToOwned::to_owned),
             mcp_arguments: cfg_bool(capture_obj, "mcp_arguments", false, "capture")?,
         };
+        if capture.mcp_endpoint_path.as_deref().is_some_and(|path| {
+            !path.starts_with('/')
+                || path.contains('?')
+                || path.contains('#')
+                || path.chars().any(char::is_control)
+        }) {
+            return Err(
+                "ai_transcript_audit: `capture.mcp_endpoint_path` must be an absolute path without query, fragment, or control characters"
+                    .to_string(),
+            );
+        }
         if capture.mcp_arguments && !capture.mcp_tool_calls {
             return Err(
                 "ai_transcript_audit: `capture.mcp_arguments` requires `capture.mcp_tool_calls`"
@@ -3762,7 +3778,12 @@ impl AiTranscriptAudit {
             serde_json::from_slice(body).ok()
         };
         let is_ai = scan_limited || parsed.as_ref().is_some_and(json_looks_like_ai_request);
-        let carries_tool_call = parsed.as_ref().is_some_and(mcp_jsonrpc::has_tool_call);
+        let bounded_mcp_scan = (scan_limited && self.capture.mcp_tool_calls)
+            .then(|| mcp_jsonrpc::scan_request_bytes(body));
+        let carries_tool_call = parsed.as_ref().is_some_and(mcp_jsonrpc::has_tool_call)
+            || bounded_mcp_scan.as_ref().is_some_and(|scan| {
+                matches!(scan, mcp_jsonrpc::RequestScan::ToolCalls { .. })
+            });
         let is_mcp = self.capture.mcp_tool_calls && carries_tool_call;
         if !is_ai && !is_mcp {
             self.discard_staged_candidate(ctx);
@@ -3819,10 +3840,19 @@ impl AiTranscriptAudit {
         // provisional pass (before `mcp_gateway`) that is the only view that
         // still names them publicly and carries their JSON-RPC arguments.
         let exportable = self.commit_may_emit(sample_hit);
-        let staged_mcp = parsed
-            .as_ref()
-            .filter(|_| is_mcp)
-            .and_then(|json| self.mcp_section(json, exportable));
+        let staged_mcp = if scan_limited && is_mcp {
+            // The body-redaction ceiling prevents a full Value parse. Keep an
+            // empty MCP section so the final bridge hook still emits a record;
+            // the bounded byte recognizer proves the request was a tools/call.
+            bounded_mcp_scan
+                .as_ref()
+                .and_then(|scan| self.mcp_section_from_scan(scan, exportable))
+        } else {
+            parsed
+                .as_ref()
+                .filter(|_| is_mcp)
+                .and_then(|json| self.mcp_section(json, exportable))
+        };
         let mcp_retained_bytes = staged_mcp.as_ref().map_or(0, |mcp| mcp.retained_bytes);
         let mcp_arguments_bytes = staged_mcp.as_ref().map_or(0, |mcp| mcp.arguments_bytes);
         let mcp_section = staged_mcp.map(|mcp| mcp.section);
@@ -4473,16 +4503,23 @@ impl AiTranscriptAudit {
 
     /// Whether a request `Content-Type` makes a `POST` a JSON capture
     /// candidate. With `capture.mcp_tool_calls` the media types `mcp_gateway`
-    /// admits qualify too — `application/json-rpc`, any `+json`, or no
-    /// `Content-Type` at all — so a `tools/call` sent without the header is
-    /// still audited.
-    fn candidate_content_type(&self, content_type: Option<&str>) -> bool {
+    /// admits qualify too — `application/json-rpc` and any `+json`. A request
+    /// without `Content-Type` is scoped to `capture.mcp_endpoint_path` so other
+    /// POST routes do not incur MCP-specific buffering.
+    fn candidate_content_type(&self, ctx: &RequestContext, content_type: Option<&str>) -> bool {
         match content_type {
             Some(value) => {
                 is_json_content_type(value)
                     || (self.capture.mcp_tool_calls && mcp_jsonrpc::content_type_is_json(value))
             }
-            None => self.capture.mcp_tool_calls,
+            None => {
+                self.capture.mcp_tool_calls
+                    && self
+                        .capture
+                        .mcp_endpoint_path
+                        .as_deref()
+                        .is_some_and(|path| ctx.path == path)
+            }
         }
     }
 
@@ -4553,6 +4590,62 @@ impl AiTranscriptAudit {
             }
             let entry_bytes = mcp_call_retained_bytes(&entry);
             staged.retained_bytes = staged.retained_bytes.saturating_add(entry_bytes);
+            staged.section.calls.push(entry);
+        }
+        Some(staged)
+    }
+
+    /// Retain bounded tool names and ids from a scan-limited raw request. The
+    /// scanner can identify those fields without building a full JSON Value;
+    /// arguments remain unhashed and omitted because redacted mode's scan
+    /// ceiling forbids walking their contents.
+    fn mcp_section_from_scan(
+        &self,
+        scan: &mcp_jsonrpc::RequestScan<'_>,
+        exportable: bool,
+    ) -> Option<StagedMcp> {
+        let mcp_jsonrpc::RequestScan::ToolCalls { batch, members } = scan else {
+            return None;
+        };
+        let mut staged = StagedMcp {
+            section: McpAuditSection {
+                batch: *batch,
+                ..McpAuditSection::default()
+            },
+            retained_bytes: 0,
+            arguments_bytes: 0,
+        };
+        if !exportable {
+            return Some(staged);
+        }
+        let mut name_bytes = 0usize;
+        for member in members {
+            let Some(call) = member.tool_call.as_ref() else {
+                continue;
+            };
+            if staged.section.calls.len() >= MAX_MCP_CALLS {
+                staged.section.calls_omitted = staged.section.calls_omitted.saturating_add(1);
+                continue;
+            }
+            let (tool, tool_truncated) = if self.mode.harvests_metadata() {
+                bound_mcp_tool_name(
+                    call.name.as_deref(),
+                    &self.redactor,
+                    self.mode != AuditMode::FullBody,
+                    &mut name_bytes,
+                )
+            } else {
+                (None, false)
+            };
+            let entry = McpAuditCall {
+                tool,
+                tool_truncated,
+                id_key: mcp_correlation_key(member.id),
+                ..McpAuditCall::default()
+            };
+            staged.retained_bytes = staged
+                .retained_bytes
+                .saturating_add(mcp_call_retained_bytes(&entry));
             staged.section.calls.push(entry);
         }
         Some(staged)
@@ -4641,7 +4734,7 @@ impl AiTranscriptAudit {
             // the `log` fallback.
             Some("false") => false,
             _ => {
-                ctx.method == "POST"
+                ctx.method.eq_ignore_ascii_case("POST")
                     && ctx
                         .headers
                         .get("content-type")
@@ -4813,8 +4906,11 @@ impl Plugin for AiTranscriptAudit {
         if self.grpc_enrollment_owns_request(ctx) {
             return true;
         }
-        ctx.method == "POST"
-            && self.candidate_content_type(ctx.headers.get("content-type").map(String::as_str))
+        ctx.method.eq_ignore_ascii_case("POST")
+            && self.candidate_content_type(
+                ctx,
+                ctx.headers.get("content-type").map(String::as_str),
+            )
     }
 
     async fn before_proxy(
@@ -4875,8 +4971,8 @@ impl Plugin for AiTranscriptAudit {
             }
             return self.request_phase_commit_admission(ctx);
         }
-        let candidate_shape = ctx.method == "POST"
-            && self.candidate_content_type(headers.get("content-type").map(String::as_str));
+        let candidate_shape = ctx.method.eq_ignore_ascii_case("POST")
+            && self.candidate_content_type(ctx, headers.get("content-type").map(String::as_str));
         if !candidate_shape {
             return PluginResult::Continue;
         }
@@ -4982,7 +5078,8 @@ impl Plugin for AiTranscriptAudit {
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
-        let is_json = self.candidate_content_type(headers.get("content-type").map(String::as_str));
+        let is_json = self
+            .candidate_content_type(ctx, headers.get("content-type").map(String::as_str));
         if !is_json {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;

@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recognizer (`plugins::utils::mcp_jsonrpc`) that decodes member names,
   refuses duplicate members, and reuses `mcp_gateway`'s default batch bounds:
   - `ai_transcript_audit` captures `tools/call` requests (singletons and
-    batches, including `application/json-rpc` and `Content-Type`-less POSTs)
-    under the new `capture.mcp_tool_calls` (default `true`). Records gain an
+    batches, including `application/json-rpc`; Content-Type-less POSTs require the
+    exact `capture.mcp_endpoint_path` scope) under `capture.mcp_tool_calls`
+    (default `true`). Records gain an
     `mcp` section with, per call, the public tool name, a keyed
     `arguments_hash`, an optional redacted `arguments` excerpt
     (`capture.mcp_arguments`, default `false`, redacted/full modes only), and
@@ -43,10 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `always_capture_on_error`.
   - `rate_limiting` gains `mcp_tool_calls` (`endpoint_path`, `tools`,
     `per_tool`): the limiter counts only `tools/call` (each batch member is one
-    charge; `initialize`, `tools/list`, and notifications are free), optionally
+    charge; `notifications/*` methods are free, while a `tools/call` sent
+    without an id is still charged), optionally
     per tool, on the existing local and Redis budgets and `x-ratelimit-*`
     headers. A refusal is a JSON-RPC error on HTTP `200` (`-32015`, or `-32016`
-    for a fail-closed Redis outage), which MCP clients surface.
+    for a fail-closed Redis outage; `-32017` when scoped non-identity
+    `Content-Encoding` prevents inspection), which MCP clients surface.
   - `ai_prompt_shield` gains `scan_fields: mcp_arguments`, which scans (and
     redacts) only `params.arguments` of each `tools/call`, accepts the media
     types `mcp_gateway` admits, and refuses bodies with duplicate member names.

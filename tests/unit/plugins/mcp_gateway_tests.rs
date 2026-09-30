@@ -15872,11 +15872,17 @@ async fn openapi_bridge_calls_obey_the_route_allowed_methods() {
     let (status, body, _) = reject_json(result);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!(140), "{body}");
-    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32003), "{body}");
+    assert_eq!(body["error"]["message"], "Unknown MCP tool", "{body}");
     assert!(!mcp_bridge_is_claimed_for_test(&ctx));
     assert!(backend_method_override_for_test(&ctx).is_none());
     assert!(ctx.route_override_path.is_none());
     assert_eq!(policy_decision(&ctx), Some("method_not_allowed"));
+
+    let unknown = bridge_tool_call(148, "pets.noSuchTool", json!({}));
+    let (result, _, _) = bridge_call_with(&plugin, unknown, |_, _| {}).await;
+    let (_, unknown_body, _) = reject_json(result);
+    assert_eq!(body["error"], unknown_body["error"]);
 
     let call = bridge_tool_call(141, "pets.getPet", json!({ "petId": "7" }));
     let (result, ctx, _) = bridge_call_with(&plugin, call, |ctx, _| {
@@ -15947,7 +15953,8 @@ async fn openapi_bridge_method_refusal_precedes_argument_validation() {
     let (status, body, _) = reject_json(result);
     assert_eq!(status, 200);
     assert_eq!(body["id"], json!(144), "{body}");
-    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+    assert_eq!(body["error"]["code"], json!(-32003), "{body}");
+    assert_eq!(body["error"]["message"], "Unknown MCP tool", "{body}");
     assert_eq!(policy_decision(&ctx), Some("method_not_allowed"));
     assert_eq!(
         ctx.metadata

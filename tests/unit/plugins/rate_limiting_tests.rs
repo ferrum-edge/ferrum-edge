@@ -2646,6 +2646,29 @@ async fn mcp_tool_calls_count_each_batch_member_and_refuse_the_whole_batch() {
 }
 
 #[tokio::test]
+async fn mcp_tool_call_notification_is_charged_and_unsupported_encoding_fails_closed() {
+    let plugin = mcp_limiter(json!({}));
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": { "name": "a", "arguments": {} }
+    });
+    let (result, ctx) = send_mcp(&plugin, &notification).await;
+    assert_continue(result);
+    assert_eq!(header(&ctx.metadata, "ratelimit_mcp_tool_calls"), Some("1"));
+
+    let (mut ctx, mut headers) = mcp_post_raw(&notification.to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (body, _) = jsonrpc_refusal(result);
+    assert_eq!(body["error"]["code"], json!(-32017), "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "MCP tool-call request content encoding cannot be inspected"
+    );
+}
+
+#[tokio::test]
 async fn mcp_tool_calls_can_count_listed_tools_and_keep_per_tool_budgets() {
     let plugin = mcp_limiter(json!({"tools": ["pets.createPet"]}));
     for id in 0..5 {

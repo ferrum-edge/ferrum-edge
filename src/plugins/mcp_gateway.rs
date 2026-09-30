@@ -4894,12 +4894,11 @@ impl McpGateway {
                 ctx.metadata
                     .insert("mcp.route_decision".to_string(), "deny".to_string());
             }
-            return json_rpc_error(
-                envelope.id.clone(),
-                -32001,
-                "OpenAPI bridge operation method is not allowed on this proxy",
-                None,
-            );
+            return if self.policy.has_grants() {
+                tool_call_denied(envelope.id.clone())
+            } else {
+                json_rpc_error(envelope.id.clone(), -32003, "Unknown MCP tool", None)
+            };
         }
         if self.observability.emit_metadata {
             ctx.metadata

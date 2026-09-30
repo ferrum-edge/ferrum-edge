@@ -13317,6 +13317,56 @@ async fn mcp_bridged_tool_call_record_names_consumer_tool_and_outcome() {
 }
 
 #[tokio::test]
+async fn mcp_audit_recognizes_lowercase_post_and_scan_limited_bridged_calls() {
+    let request = mcp_call_value(json!(71), "pets.getPet", json!({"petId": "7"}));
+    let mut ctx = mcp_ctx(&request);
+    ctx.method = "post".to_string();
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        br#"{"id":"7"}"#,
+        &json!({"jsonrpc": "2.0", "id": 71, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "lowercase POST remains auditable");
+    assert_eq!(records[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
+
+    let padded = format!(
+        r#"{{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{{"name":"pets.getPet","arguments":{{"padding":"{}"}}}}}}"#,
+        "x".repeat(1_100_000)
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata.insert("request_body".to_string(), padded);
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        br#"{"id":"7"}"#,
+        &json!({"jsonrpc": "2.0", "id": 72, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "scan-limited bridge remains auditable");
+    assert!(records[0]["mcp"].is_object(), "{records:#?}");
+    assert_eq!(records[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
+}
+
+#[test]
+fn mcp_audit_content_type_less_buffering_is_scoped_to_configured_path() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "http://127.0.0.1:1/ingest",
+            json!({"capture": {"mcp_endpoint_path": "/mcp"}}),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid MCP endpoint path");
+    let mut ctx = mcp_ctx(&mcp_call_value(json!(1), "pets.getPet", json!({})));
+    ctx.headers.remove("content-type");
+    assert!(plugin.should_buffer_request_body(&ctx));
+    ctx.path = "/unrelated".to_string();
+    assert!(!plugin.should_buffer_request_body(&ctx));
+}
+
+#[tokio::test]
 async fn mcp_batch_record_describes_every_call_and_matches_outcomes_by_id() {
     let request = json!([
         mcp_call_value(json!(1), "search.web", json!({"q": "weather"})),

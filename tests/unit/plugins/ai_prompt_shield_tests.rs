@@ -4244,7 +4244,7 @@ async fn mcp_arguments_mode_follows_the_mcp_gateway_media_types() {
         ("application/json-rpc", true),
         ("application/vnd.mcp+json", true),
         ("text/plain", false),
-        ("application/grpc-web+json", false),
+        ("application/grpc-web+json", true),
     ] {
         ctx.headers
             .insert("content-type".to_string(), content_type.to_string());
@@ -4263,6 +4263,14 @@ async fn mcp_arguments_mode_follows_the_mcp_gateway_media_types() {
     let body = mcp_tool_call(4, json!({"ssn": "123-45-6789"}));
     let mut ctx = make_post_ctx(&body);
     let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    let body = mcp_tool_call(5, json!({"ssn": "123-45-6789"}));
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web+json".to_string(),
+    )]);
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -4299,6 +4307,11 @@ async fn mcp_arguments_mode_redacts_arguments_in_place() {
     let mut headers = make_post_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(shield_metadata(&ctx, "ai_shield_redacted"), Some("email"));
+    assert_eq!(
+        ctx.request_body_bytes.as_deref(),
+        ctx.metadata.get("request_body").map(String::as_bytes),
+        "downstream MCP parsing must see the same redacted JSON bytes"
+    );
     let staged = shield_metadata(&ctx, "request_body").expect("staged body");
     let staged: serde_json::Value = serde_json::from_str(staged).unwrap();
     assert_eq!(
@@ -4327,6 +4340,42 @@ async fn mcp_arguments_mode_redacts_arguments_in_place() {
     let mut ctx = make_post_ctx(&body);
     let mut headers = make_post_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_inspects_lowercase_post_and_rejects_uninspectable_encoding() {
+    let plugin = mcp_shield("reject");
+    let body = mcp_tool_call(8, json!({"ssn": "123-45-6789"}));
+    let mut ctx = make_post_ctx(&body);
+    ctx.method = "post".to_string();
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("unsupported_content_encoding")
+    );
+}
+
+#[tokio::test]
+async fn mcp_redaction_refuses_numeric_ids_that_cannot_round_trip() {
+    let plugin = mcp_shield("redact");
+    for id in ["18446744073709551616", "1e3"] {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"crm.lookup","arguments":{{"ssn":"123-45-6789"}}}}}}"#
+        );
+        let mut ctx = make_post_ctx_with_raw_body(&body);
+        let mut headers = make_post_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+        assert!(
+            !shield_metadata(&ctx, "request_body").unwrap_or_default().contains("REDACTED"),
+            "a changed id token must not accompany a partial rewrite"
+        );
+    }
 }
 
 #[tokio::test]

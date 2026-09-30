@@ -482,6 +482,24 @@ fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool 
 }
 
 impl AiPromptShield {
+    fn reject_uninspectable_mcp_body(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &str,
+    ) -> PluginResult {
+        ctx.metadata
+            .insert("ai_shield_rejected".to_string(), reason.to_string());
+        PluginResult::Reject {
+            status_code: 400,
+            body: serde_json::json!({
+                "error": "MCP request body could not be inspected",
+                "message": reason
+            })
+            .to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
     pub fn new(config: &Value) -> Result<Self, String> {
         let Some(config_object) = config.as_object() else {
             return Err("ai_prompt_shield: config must be an object".to_string());
@@ -1141,10 +1159,10 @@ impl AiPromptShield {
     fn content_type_in_scope(&self, content_type: Option<&str>) -> bool {
         match content_type {
             None => self.scan_mode == ScanMode::McpArguments,
-            Some(value) if is_framed_grpc_content_type(value) => false,
             Some(value) if self.scan_mode == ScanMode::McpArguments => {
                 mcp_jsonrpc::content_type_is_json(value)
             }
+            Some(value) if is_framed_grpc_content_type(value) => false,
             Some(value) => is_json_content_type(value),
         }
     }
@@ -1363,6 +1381,9 @@ impl AiPromptShield {
         if self.scan_mode == ScanMode::McpArguments {
             if self.detect_pii_mcp_arguments(&json).is_empty() {
                 return RedactionOutcome::NoChange;
+            }
+            if !mcp_ids_round_trip(body) {
+                return RedactionOutcome::Incomplete(json);
             }
             mcp_jsonrpc::for_each_tool_call_arguments_mut(&mut json, |arguments| {
                 redact_json_strings(arguments, &self.patterns, false, &budget);
@@ -1664,6 +1685,37 @@ impl AiPromptShield {
     }
 }
 
+/// JSON-RPC numeric ids are wire tokens. Refuse redaction if serde's Value
+/// representation would rewrite an exponent, fraction, or integer outside its
+/// exact signed/unsigned range.
+fn mcp_ids_round_trip(body: &str) -> bool {
+    match mcp_jsonrpc::scan_request_bytes(body.as_bytes()) {
+        mcp_jsonrpc::RequestScan::ToolCalls { members, .. } => members
+            .iter()
+            .filter_map(|member| member.id)
+            .all(|id| {
+                let token = id.get();
+                if !token
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| *byte == b'-' || byte.is_ascii_digit())
+                {
+                    return true;
+                }
+                token
+                    .parse::<i64>()
+                    .map(|value| value.to_string() == token)
+                    .or_else(|_| {
+                        token
+                            .parse::<u64>()
+                            .map(|value| value.to_string() == token)
+                    })
+                    .unwrap_or(false)
+            }),
+        mcp_jsonrpc::RequestScan::NoToolCall | mcp_jsonrpc::RequestScan::Uninspectable(_) => true,
+    }
+}
+
 #[async_trait]
 impl Plugin for AiPromptShield {
     fn name(&self) -> &str {
@@ -1697,7 +1749,7 @@ impl Plugin for AiPromptShield {
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         self.requires_request_body
-            && ctx.method == "POST"
+            && ctx.method.eq_ignore_ascii_case("POST")
             && self.content_type_in_scope(ctx.headers.get("content-type").map(String::as_str))
     }
 
@@ -1707,7 +1759,7 @@ impl Plugin for AiPromptShield {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Only process POST requests
-        if ctx.method != "POST" {
+        if !ctx.method.eq_ignore_ascii_case("POST") {
             return PluginResult::Continue;
         }
 
@@ -1718,6 +1770,10 @@ impl Plugin for AiPromptShield {
         // HTTP_ONLY_PROTOCOLS.
         if !self.content_type_in_scope(headers.get("content-type").map(String::as_str)) {
             return PluginResult::Continue;
+        }
+
+        if self.scan_mode == ScanMode::McpArguments && has_non_identity_content_encoding(headers) {
+            return self.reject_uninspectable_mcp_body(ctx, "unsupported_content_encoding");
         }
 
         // This instance owns the request from here on. Carry that scope into
@@ -1872,7 +1928,9 @@ impl Plugin for AiPromptShield {
                         ctx.metadata
                             .insert("ai_shield_redacted".to_string(), detected.join(","));
                         if let Ok(serialized) = serde_json::to_string(&json) {
-                            ctx.metadata.insert("request_body".to_string(), serialized);
+                            ctx.metadata
+                                .insert("request_body".to_string(), serialized.clone());
+                            ctx.request_body_bytes = Some(bytes::Bytes::from(serialized));
                         }
                         PluginResult::Continue
                     }
@@ -1973,7 +2031,7 @@ impl Plugin for AiPromptShield {
         if !self.requires_request_body || self.action == ShieldAction::Warn {
             return false;
         }
-        if ctx.method != "POST" {
+        if !ctx.method.eq_ignore_ascii_case("POST") {
             return false;
         }
         self.content_type_in_scope(headers.get("content-type").map(String::as_str))
@@ -2022,7 +2080,7 @@ impl Plugin for AiPromptShield {
         // The markers can only be set by `before_proxy` on a POST. Keep the
         // method check defensive for direct hook callers and future runner
         // changes.
-        if ctx.method != "POST" {
+        if !ctx.method.eq_ignore_ascii_case("POST") {
             return PluginResult::Continue;
         }
 
@@ -2106,7 +2164,7 @@ impl Plugin for AiPromptShield {
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if ctx.method != "POST" {
+        if !ctx.method.eq_ignore_ascii_case("POST") {
             return None;
         }
         // A later compression plugin may already have stripped the encoding
