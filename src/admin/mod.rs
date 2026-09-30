@@ -3038,11 +3038,7 @@ async fn handle_admin_request_inner(
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
         let admin_jwt_detail = admin_jwt_detail_allowed(&state, auth_header.as_deref());
-        let detailed = observability_detail_allowed(
-            &state,
-            auth_header.as_deref(),
-            &client_ip,
-        );
+        let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
         let mut health_status = json!({
             "status": "ok",
             "timestamp": Utc::now().to_rfc3339(),

@@ -264,12 +264,7 @@ async fn namespace_ceiling_viewer_does_not_grant_observability_detail() {
     cidr_state.proxy_state = Some(proxy_state());
     let (cidr_base, _cidr_sd) = start_admin(cidr_state).await;
     assert_observability_detail(&cidr_base, None, true).await;
-    assert_observability_detail(
-        &cidr_base,
-        Some(&format!("Bearer {ceiling_viewer}")),
-        true,
-    )
-    .await;
+    assert_observability_detail(&cidr_base, Some(&format!("Bearer {ceiling_viewer}")), true).await;
 }
 
 #[tokio::test]
