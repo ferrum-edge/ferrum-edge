@@ -607,6 +607,20 @@ outright with no deprecation period:
 
 ### Security
 
+- The `graphql` plugin now tokenizes string literals exactly as the GraphQL
+  specification does (GHSA-chqw-m79r-hgjx). Inside a block string the only
+  escape is `\"""`, which is content, and every other backslash is one byte
+  of content; regular strings keep their own escape rules. A block string could
+  previously be closed earlier than a conforming GraphQL server closes it, so
+  the introspection denial and the depth, complexity, and alias limits could be
+  measured over a different selection set from the one the backend executed.
+  The whole-document fallback scan now uses the same string scanner, and a
+  string at document level is skipped as one token rather than read as
+  structure. A document whose string literals do not lex (an unterminated
+  regular or block string, a line terminator inside a regular string, or an
+  escape a regular string does not define) is now refused with `400` instead
+  of being analyzed as though the string ran to the end of the document. The
+  final request-body recheck applies the same rules.
 - `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
   says (#5767): a backend or serverless-function copy, in the headers or the
   trailers, is stripped at every backend response boundary, as

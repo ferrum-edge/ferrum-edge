@@ -2289,3 +2289,250 @@ fn unreachable_operation_key_shapes_are_rejected_before_shared_rate_bounds() {
         }
     }
 }
+
+// ── Spec-exact string tokenization (GHSA-chqw-m79r-hgjx) ──
+
+/// Operation `Q` whose variable default is a block string holding two
+/// backslashes before an escaped triple quote. A conforming lexer reads the
+/// first backslash as one byte of content and `\"""` as an escaped delimiter,
+/// so the string runs on through the selection-looking text and the `#` to the
+/// closing `"""`, and `Q`'s selection set is whatever follows on the next line.
+/// Pairing the backslashes ended the string early and analyzed `{ harmless }`
+/// in its place.
+fn block_string_hidden_selection(selection: &str) -> String {
+    let string_default = r##""""\\""") { harmless } #""""##;
+    format!("query Q($v: String = {string_default}\n) {selection}")
+}
+
+async fn evaluate_graphql(
+    config: serde_json::Value,
+    query: &str,
+    operation_name: Option<&str>,
+) -> (PluginResult, RequestContext) {
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+    let mut ctx = create_graphql_context(query, operation_name);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (result, ctx)
+}
+
+fn reject_status_and_message(result: PluginResult) -> (u16, String) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("reject body must be JSON");
+            let message = parsed["errors"][0]["message"]
+                .as_str()
+                .expect("GraphQL error message")
+                .to_string();
+            (status_code, message)
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+/// The advisory's reproduction: the introspection the backend executes must be
+/// the introspection the gateway sees, with or without `operationName`.
+#[tokio::test]
+async fn escaped_block_string_delimiter_after_a_backslash_does_not_hide_introspection() {
+    let selection = "{ __type(name: $v) { name } __schema { types { name } } }";
+    let query = block_string_hidden_selection(selection);
+
+    for operation_name in [Some("Q"), None] {
+        let config = json!({ "introspection_allowed": false });
+        let (result, ctx) = evaluate_graphql(config, &query, operation_name).await;
+        assert_reject(result, Some(403));
+        let parsed_name = ctx.metadata.get("graphql_operation_name").cloned();
+        assert_eq!(
+            parsed_name.as_deref(),
+            Some("Q"),
+            "the document defines exactly one operation, `Q`"
+        );
+    }
+}
+
+/// The same hidden selection must not drop depth, complexity, or alias work
+/// from the gateway's measurements.
+#[tokio::test]
+async fn escaped_block_string_delimiter_after_a_backslash_does_not_hide_query_cost() {
+    let cases = [
+        (
+            json!({ "max_depth": 2 }),
+            "{ a(v: $v) { b { c { d { e } } } } }",
+            "Query depth 5 exceeds maximum allowed depth of 2",
+        ),
+        (
+            json!({ "max_complexity": 2 }),
+            "{ a(v: $v) b c d e }",
+            "Query complexity 5 exceeds maximum allowed complexity of 2",
+        ),
+        (
+            json!({ "max_aliases": 1 }),
+            "{ a1: a(v: $v) a2: a a3: a }",
+            "Query uses 3 aliases, maximum allowed is 1",
+        ),
+    ];
+
+    for (config, selection, expected) in cases {
+        let query = block_string_hidden_selection(selection);
+        let (result, _) = evaluate_graphql(config, &query, Some("Q")).await;
+        let (status, message) = reject_status_and_message(result);
+        assert_eq!(status, 400, "{selection}");
+        assert_eq!(message, expected, "{selection}");
+    }
+
+    // Positive control: under limits that admit it, the measured operation is
+    // the real selection set, not the text inside the block string.
+    let query = block_string_hidden_selection("{ a(v: $v) { b { c { d { e } } } } }");
+    let config = json!({ "max_depth": 5, "introspection_allowed": false });
+    let (result, ctx) = evaluate_graphql(config, &query, Some("Q")).await;
+    assert_continue(result);
+    assert_eq!(ctx.metadata.get("graphql_depth").unwrap(), "5");
+    assert_eq!(ctx.metadata.get("graphql_complexity").unwrap(), "5");
+}
+
+/// The final backend-visible envelope is re-parsed with the same lexer, so a
+/// transform that installs the hidden selection is caught there too.
+#[tokio::test]
+async fn final_body_recheck_uses_spec_exact_block_string_boundaries() {
+    let plugin = create_plugin("graphql", &json!({ "introspection_allowed": false }))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_graphql_context("{ user { id } }", None);
+    let mut headers = make_graphql_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let query = block_string_hidden_selection("{ __type(name: $v) { name } }");
+    let transformed = json!({ "query": query, "operationName": "Q" }).to_string();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, transformed.as_bytes())
+        .await;
+
+    assert_reject(result, Some(403));
+}
+
+/// Positive controls: legitimate block strings are single tokens, whatever
+/// braces, comment markers, field names, backslashes, or escaped delimiters
+/// they hold.
+#[tokio::test]
+async fn legitimate_block_strings_are_single_tokens() {
+    let cases = [
+        // An escaped delimiter is content; the string ends at the next `"""`.
+        (
+            r#"query Q($v: String = """say \""" { __schema } """) { echo(v: $v) }"#,
+            "1",
+            "1",
+        ),
+        // A backslash that does not start `\"""` is one byte of content.
+        (
+            r#"{ echo(v: """C:\dir\sub \n \u00 \\ end""") { id } }"#,
+            "2",
+            "2",
+        ),
+        // Braces, `#`, and field-looking text inside a block string are content.
+        (
+            r#"{ search(text: """ { __schema { types } } # not a comment """) { id } }"#,
+            "2",
+            "2",
+        ),
+        // A multi-line block string with a comment-looking line.
+        (
+            "{ echo(v: \"\"\"\n  line one\n  # still content\n  __schema\n\"\"\") { id } }",
+            "2",
+            "2",
+        ),
+        // An escaped delimiter immediately before the closing delimiter.
+        (r#"{ echo(v: """a\"""""") { id } }"#, "2", "2"),
+    ];
+
+    for (query, expected_depth, expected_complexity) in cases {
+        let config = json!({ "introspection_allowed": false, "max_depth": 2 });
+        let (result, ctx) = evaluate_graphql(config, query, None).await;
+        assert_continue(result);
+        let depth = ctx.metadata.get("graphql_depth").cloned();
+        let complexity = ctx.metadata.get("graphql_complexity").cloned();
+        assert_eq!(depth.as_deref(), Some(expected_depth), "{query}");
+        assert_eq!(complexity.as_deref(), Some(expected_complexity), "{query}");
+    }
+}
+
+/// Regular strings keep their own escape grammar: `\\` then `"` closes the
+/// string, `\"` does not, and every defined escape (including both unicode
+/// forms) stays inside the literal.
+#[tokio::test]
+async fn regular_string_escapes_keep_their_own_grammar() {
+    for query in [
+        r#"{ a(x: "back\\", y: "quote \" } { __schema }") { id } }"#,
+        r#"{ a(x: "\u0041 \u{1F600} \" \\ \/ \b \f \n \r \t") { id } }"#,
+    ] {
+        let config = json!({ "introspection_allowed": false, "max_depth": 2 });
+        let (result, ctx) = evaluate_graphql(config, query, None).await;
+        assert_continue(result);
+        let depth = ctx.metadata.get("graphql_depth").cloned();
+        let complexity = ctx.metadata.get("graphql_complexity").cloned();
+        assert_eq!(depth.as_deref(), Some("2"), "{query}");
+        assert_eq!(complexity.as_deref(), Some("2"), "{query}");
+    }
+}
+
+/// A string literal that does not lex is refused rather than run to
+/// end-of-input, where it hid everything after it from every limit.
+#[tokio::test]
+async fn malformed_string_literals_fail_closed() {
+    for query in [
+        // Unterminated block string.
+        r#"query Q($v: String = """abc) { __schema { types { name } } }"#,
+        // `"""` always opens a block string, never an empty string and a quote.
+        r#"{ a(x: """) { id } }"#,
+        // A block string whose only closing delimiter is escaped never closes.
+        r#"{ a(x: """abc\""") { __schema { types { name } } } }"#,
+        // Unterminated regular string.
+        r#"{ a(x: "abc) { __schema { types { name } } } }"#,
+        // A line terminator ends a regular string unclosed.
+        "{ a(x: \"abc\n\") { id } }",
+        "{ a(x: \"abc\r\") { id } }",
+        // Escapes a regular string does not define.
+        r#"{ a(x: "\q") { id } }"#,
+        r#"{ a(x: "\u12") { id } }"#,
+        r#"{ a(x: "\u{}") { id } }"#,
+        r#"{ a(x: "\u{41") { id } }"#,
+        // A trailing backslash.
+        "{ a(x: \"\\",
+    ] {
+        let config = json!({ "introspection_allowed": false });
+        let (result, _) = evaluate_graphql(config, query, None).await;
+        let (status, message) = reject_status_and_message(result);
+        assert_eq!(status, 400, "{query:?}");
+        assert!(
+            message.starts_with("Malformed GraphQL document"),
+            "{query:?}: {message}"
+        );
+    }
+}
+
+/// A string at document level is one token. Reading its contents as structure
+/// found a harmless definition of the selected operation inside it.
+#[tokio::test]
+async fn document_level_string_contents_are_not_parsed_as_definitions() {
+    for query in [
+        r#""""query Q { harmless }""" query Q { __schema { types { name } } }"#,
+        r#""query Q { harmless }" query Q { __schema { types { name } } }"#,
+    ] {
+        let config = json!({ "introspection_allowed": false });
+        let (result, _) = evaluate_graphql(config, query, Some("Q")).await;
+        assert_reject(result, Some(403));
+    }
+}
+
+/// The whole-document fallback scan (reached by an unbalanced document) lexes
+/// strings with the same scanner, so an escaped block-string delimiter cannot
+/// open a phantom string there that swallows the rest of the document.
+#[tokio::test]
+async fn fallback_scanner_keeps_escaped_block_string_delimiters_as_content() {
+    let config = json!({ "introspection_allowed": false });
+    let query = r#"{ a(x: """\""" """) { __schema { types { name } }"#;
+    let (result, _) = evaluate_graphql(config, query, None).await;
+    assert_reject(result, Some(403));
+}

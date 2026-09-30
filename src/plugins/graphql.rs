@@ -686,7 +686,18 @@ struct OperationDef<'a> {
 /// bypassed by hiding nesting/fields behind fragments. Fragment expansion is
 /// cycle-safe and byte-budgeted so the expansion itself cannot be turned into a
 /// DoS.
+///
+/// Every string literal and comment is lexed first with the spec's token
+/// rules ([`validate_string_tokens`]). A document whose strings do not lex
+/// cleanly is rejected here, so every later scan runs over a document whose
+/// token boundaries a conforming backend would draw in the same places.
 fn parse_graphql_query(query: &str, operation_name: Option<&str>) -> ParsedQuery {
+    if let Err(error) = validate_string_tokens(query.as_bytes()) {
+        return ParsedQuery::Reject {
+            status_code: 400,
+            message: format!("Malformed GraphQL document: {}", error.message()),
+        };
+    }
     let operation_name = operation_name.filter(|n| !n.is_empty());
     let (operations, fragments) = parse_document(query);
 
@@ -802,6 +813,14 @@ fn parse_document(query: &str) -> (Vec<OperationDef<'_>>, HashMap<&str, &str>) {
         let after_ignored = skip_ignored(bytes, i);
         if after_ignored != i {
             i = after_ignored;
+            continue;
+        }
+
+        // A document-level string (a description, where a backend accepts
+        // one) is a single opaque token. Scanning its contents byte by byte
+        // would parse selection-looking text inside it as a definition.
+        if c == b'"' {
+            i = skip_string(bytes, i);
             continue;
         }
 
@@ -998,40 +1017,146 @@ fn skip_parens(bytes: &[u8], i: usize) -> usize {
     len
 }
 
+/// GraphQL `BlockString` delimiter.
+const BLOCK_STRING_DELIMITER: &[u8] = b"\"\"\"";
+
+/// The only escape a GraphQL `BlockString` has: `\"""` is three literal
+/// quotes of content, not a delimiter.
+const ESCAPED_BLOCK_STRING_DELIMITER: &[u8] = b"\\\"\"\"";
+
+/// Why a string literal failed to lex under the GraphQL `StringValue` rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StringTokenError {
+    /// A regular string reached a line terminator or end-of-input unclosed.
+    UnterminatedString,
+    /// A block string reached end-of-input without its closing `"""`.
+    UnterminatedBlockString,
+    /// A regular string holds a `\` that starts no `EscapedCharacter` or
+    /// `EscapedUnicode`.
+    InvalidEscape,
+}
+
+impl StringTokenError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::UnterminatedString => "unterminated string",
+            Self::UnterminatedBlockString => "unterminated block string",
+            Self::InvalidEscape => "invalid escape sequence in string",
+        }
+    }
+}
+
+/// Lex every string literal and comment in the document with the GraphQL
+/// token rules, without interpreting anything else.
+///
+/// The structural scanners below locate strings with [`skip_string`] from many
+/// entry points and on sub-slices of the document. Lexing the whole document
+/// once up front, through the same [`scan_string`], means a malformed string
+/// is refused (fail closed) instead of silently running to end-of-input, and
+/// every later scan sees exactly the token boundaries a conforming parser
+/// draws.
+fn validate_string_tokens(bytes: &[u8]) -> Result<(), StringTokenError> {
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'#' => i = skip_line_comment(bytes, i),
+            b'"' => i = scan_string(bytes, i)?,
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
 /// Skip a string literal (regular or block) starting at `bytes[i] == b'"'`.
 /// Returns the index just past the closing quote(s).
+///
+/// [`parse_graphql_query`] refuses any document whose strings fail
+/// [`validate_string_tokens`] before a structural scan runs, so the
+/// end-of-input result for a malformed string is only a scan terminator here.
 fn skip_string(bytes: &[u8], i: usize) -> usize {
-    let len = bytes.len();
-    // Block string """ ... """
-    if i + 2 < len && bytes[i..i + 3] == *b"\"\"\"" {
-        let mut j = i + 3;
-        while j < len {
-            if j + 2 < len && bytes[j..j + 3] == *b"\"\"\"" {
-                return j + 3;
-            }
-            // Block strings allow escaped triple-quote via backslash; treat any
-            // backslash as escaping the next byte to stay conservative.
-            if bytes[j] == b'\\' {
-                j = (j + 2).min(len);
-                continue;
-            }
-            j += 1;
-        }
-        return len;
+    scan_string(bytes, i).unwrap_or(bytes.len())
+}
+
+/// Lex one GraphQL `StringValue` starting at `bytes[i] == b'"'` and return the
+/// index just past its closing quote(s).
+///
+/// Regular and block strings have different escape grammars and must never
+/// share one: a regular string's `\` always begins a two-or-more-byte escape,
+/// while inside a block string the four bytes `\"""` are the only escape and
+/// every other `\` is one byte of content. Pairing backslashes inside a block
+/// string ends it early at `\\"""`, where a conforming parser keeps going, and
+/// the text the parser still reads as string content is then analyzed as the
+/// operation's selection set.
+fn scan_string(bytes: &[u8], i: usize) -> Result<usize, StringTokenError> {
+    if bytes[i..].starts_with(BLOCK_STRING_DELIMITER) {
+        return scan_block_string(bytes, i + BLOCK_STRING_DELIMITER.len());
     }
-    // Regular string
+    let len = bytes.len();
     let mut j = i + 1;
     while j < len {
         match bytes[j] {
-            b'\\' => {
-                j = (j + 2).min(len);
-                continue;
-            }
-            b'"' => return j + 1,
+            b'"' => return Ok(j + 1),
+            // `StringCharacter` excludes `LineTerminator`.
+            b'\n' | b'\r' => return Err(StringTokenError::UnterminatedString),
+            b'\\' => j = scan_string_escape(bytes, j + 1)?,
             _ => j += 1,
         }
     }
-    len
+    Err(StringTokenError::UnterminatedString)
+}
+
+/// Lex a `BlockString` body starting just past its opening `"""`.
+fn scan_block_string(bytes: &[u8], mut j: usize) -> Result<usize, StringTokenError> {
+    let len = bytes.len();
+    while j < len {
+        match bytes[j] {
+            b'\\' if bytes[j..].starts_with(ESCAPED_BLOCK_STRING_DELIMITER) => {
+                j += ESCAPED_BLOCK_STRING_DELIMITER.len();
+            }
+            b'"' if bytes[j..].starts_with(BLOCK_STRING_DELIMITER) => {
+                return Ok(j + BLOCK_STRING_DELIMITER.len());
+            }
+            // Any other byte, a lone `\` included, is one byte of content.
+            _ => j += 1,
+        }
+    }
+    Err(StringTokenError::UnterminatedBlockString)
+}
+
+/// Lex a regular-string escape whose `\` sits just before `bytes[j]`. Returns
+/// the index just past the escape.
+fn scan_string_escape(bytes: &[u8], j: usize) -> Result<usize, StringTokenError> {
+    match bytes.get(j) {
+        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => Ok(j + 1),
+        Some(b'u') => scan_unicode_escape(bytes, j + 1),
+        _ => Err(StringTokenError::InvalidEscape),
+    }
+}
+
+/// Lex the `EscapedUnicode` after `\u` starting at `bytes[j]`: either the
+/// variable-width `{HexDigit+}` form or exactly four hex digits.
+///
+/// Only the escape's extent is checked here, because that is what decides
+/// where the string ends. Code-point range and surrogate pairing are value
+/// rules the backend applies to a string whose boundaries are already fixed.
+fn scan_unicode_escape(bytes: &[u8], j: usize) -> Result<usize, StringTokenError> {
+    if bytes.get(j) == Some(&b'{') {
+        let digits_start = j + 1;
+        let digits = bytes[digits_start..]
+            .iter()
+            .take_while(|b| b.is_ascii_hexdigit())
+            .count();
+        let close = digits_start + digits;
+        if digits == 0 || bytes.get(close) != Some(&b'}') {
+            return Err(StringTokenError::InvalidEscape);
+        }
+        return Ok(close + 1);
+    }
+    match bytes.get(j..j + 4) {
+        Some(hex) if hex.iter().all(u8::is_ascii_hexdigit) => Ok(j + 4),
+        _ => Err(StringTokenError::InvalidEscape),
+    }
 }
 
 /// Skip a `#` line comment starting at `bytes[i] == b'#'`. Returns the index of
@@ -1397,9 +1522,6 @@ fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
     let mut complexity: u32 = 0;
     let mut alias_count: u32 = 0;
     let mut paren_depth: u32 = 0; // Track parentheses for arguments
-    let mut in_string = false;
-    let mut in_block_string = false;
-    let mut in_comment = false;
     let mut is_introspection = false;
     let bytes = query.as_bytes();
     let len = bytes.len();
@@ -1408,52 +1530,16 @@ fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
     while i < len {
         let c = bytes[i];
 
-        if in_block_string {
-            if i + 2 < len && bytes[i..i + 3] == *b"\"\"\"" {
-                in_block_string = false;
-                i += 3;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Handle string literals
-        if in_string {
-            if c == b'\\' {
-                i = (i + 2).min(len); // skip escaped char
-                continue;
-            }
-            if c == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        // Handle comments
-        if in_comment {
-            if c == b'\n' || c == b'\r' {
-                in_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-
+        // Comments and strings go through the same token scanners as the
+        // structured parser, so the fallback cannot draw a different string
+        // boundary (block-string `\"""` in particular) than the backend does.
         if c == b'#' {
-            in_comment = true;
-            i += 1;
+            i = skip_line_comment(bytes, i);
             continue;
         }
 
         if c == b'"' {
-            if i + 2 < len && bytes[i..i + 3] == *b"\"\"\"" {
-                in_block_string = true;
-                i += 3;
-            } else {
-                in_string = true;
-                i += 1;
-            }
+            i = skip_string(bytes, i);
             continue;
         }
 
