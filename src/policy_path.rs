@@ -51,17 +51,32 @@
 //!    string. Refusing keeps the *decoded* alphabet to bytes that survive that
 //!    parser byte-for-byte. See "Literal non-`pchar` bytes" below for what this
 //!    rule does and does not say about a byte sent literally.
-//! 5. **No `.` or `..` path segment survives, literal or escaped.** A segment
-//!    that became `.`/`..` only through a percent escape (`/a/%2e%2e/b`) is
-//!    [`PolicyPathRejection::AmbiguousDotSegment`]; one written literally
-//!    (`/a/../b`) is [`PolicyPathRejection::LiteralDotSegment`]. Neither is
-//!    removed — removal *is* a second reading. A dot segment is not a single
+//! 5. **No `.` or `..` path segment survives, literal or escaped, with or
+//!    without path parameters.** A segment is a dot segment when its text
+//!    before the first `;` is `.` or `..`: `..`, `.`, and also `..;`, `.;x`,
+//!    and `..;jsessionid=1`. A dot segment that an escape helped form — an
+//!    escaped dot (`/a/%2e%2e/b`, `/a/.%2e;x/b`) or an escaped `;` delimiter
+//!    (`/a/..%3b/b`) — is [`PolicyPathRejection::AmbiguousDotSegment`]; one
+//!    written literally (`/a/../b`, `/a/..;/b`) is
+//!    [`PolicyPathRejection::LiteralDotSegment`]. Neither is removed —
+//!    removal *is* a second reading. A dot segment is not a single
 //!    policy/backend coordinate: Ferrum forwards through URL parsers (the
 //!    `url` crate behind `reqwest` on the HTTP/1.1, HTTP/2, and H3
 //!    cross-protocol paths) and every RFC 3986 / WHATWG normalizer removes dot
 //!    segments, so policy would evaluate `/a/../protected` while the request
-//!    line resolves `/protected`. That is exactly the divergence this module
-//!    exists to remove, so the target is refused.
+//!    line resolves `/protected`. The `;` form is the same divergence one hop
+//!    later: `;` is a legal `pchar`, so the `url` crate forwards `/a/..;/b`
+//!    unchanged, but servlet containers and frameworks that strip RFC 3986
+//!    path parameters before resolving dot segments (Tomcat, Spring, some
+//!    Jetty configurations) resolve it to `/b`. That is exactly the divergence
+//!    this module exists to remove, so the target is refused.
+//!
+//!    An escaped `;` (`%3B`) is decoded like every other `sub-delims` escape
+//!    (rule 8), so the dot-segment check sees the decoded `;` and `..%3B` is
+//!    refused. No escape survives canonicalization, so there is no retained
+//!    `%3B` a decoding backend could turn into `..;` after policy ran. A `;`
+//!    that does not follow a bare `.`/`..` (`/v1;version=2`, `/a;b`,
+//!    `/..a;b`) is an ordinary segment byte and is accepted.
 //! 6. **No `\` survives, literal or escaped.** An encoded `\` is
 //!    [`PolicyPathRejection::EncodedBackslash`] and a literal one is
 //!    [`PolicyPathRejection::LiteralBackslash`]. The `url` crate treats a
@@ -112,9 +127,10 @@
 //!
 //! The normal path is allocation-free but not unvalidated. A single scan
 //! proves the target carries no percent escape, no literal `\`, and no literal
-//! `.`/`..` segment; only then is it returned borrowed and unmodified. That
-//! covers the overwhelming majority of production traffic, so the hot path
-//! never allocates, but a target is accepted because the scan cleared it, not
+//! `.`/`..` segment (with or without a `;` parameter); only then is it
+//! returned borrowed and unmodified. That covers the overwhelming majority of
+//! production traffic, so the hot path never allocates — the `;` form is a
+//! fixed-length slice match on the segment, not a second scan — but a target is accepted because the scan cleared it, not
 //! because it happened to contain no `%`. The scan hands off to the decoding
 //! pass as soon as it sees a `%`, and that pass re-validates from the start, so
 //! the two cannot disagree about what is accepted.
@@ -173,11 +189,14 @@ pub enum PolicyPathRejection {
     /// governs escapes only — such a byte sent *literally* is accepted (see the
     /// module docs).
     UnrepresentableEscape,
-    /// A percent escape produced a `.` or `..` path segment.
+    /// A percent escape helped produce a `.` or `..` path segment: an escaped
+    /// dot (`%2e%2e`, `.%2e;x`) or an escaped `;` delimiter (`..%3B`).
     AmbiguousDotSegment,
-    /// A literal `.` or `..` path segment. Every RFC 3986 / WHATWG normalizer
-    /// removes dot segments, so policy would read `/a/../protected` while the
-    /// forwarded request line resolves `/protected`.
+    /// A literal `.` or `..` path segment, including one carrying a `;` path
+    /// parameter (`..;`, `.;x`). Every RFC 3986 / WHATWG normalizer removes
+    /// dot segments, so policy would read `/a/../protected` while the
+    /// forwarded request line resolves `/protected`; a backend that strips
+    /// path parameters first resolves `/a/..;/protected` the same way.
     LiteralDotSegment,
 }
 
@@ -300,24 +319,56 @@ enum LiteralStructure {
     PatternOnly,
 }
 
+/// How many leading bytes of `segment` form a dot segment, or `None` when it
+/// is not one.
+///
+/// A segment is a dot segment when its text before the first `;` is `.` or
+/// `..`. The returned length covers the dots and, when present, the `;`
+/// delimiter — the bytes that make the segment resolve as a dot segment on a
+/// backend that strips path parameters. Any bytes after the `;` are the
+/// parameter and do not matter. A constant-size slice match: no scan and no
+/// allocation, so the hot path pays nothing for the parameter form.
 #[inline]
-fn is_dot_segment(segment: &[u8]) -> bool {
-    segment == b".".as_slice() || segment == b"..".as_slice()
+fn dot_segment_len(segment: &[u8]) -> Option<usize> {
+    match segment {
+        [b'.'] => Some(1),
+        [b'.', b'.'] | [b'.', b';', ..] => Some(2),
+        [b'.', b'.', b';', ..] => Some(3),
+        _ => None,
+    }
 }
 
-/// Reject a completed `.` or `..` segment, naming whether an escape built it.
+/// Whether one path segment, taken literally, is a dot segment under rule 5 of
+/// the module contract: its text before the first `;` is `.` or `..`.
+///
+/// `segment` must not contain `/`. Percent escapes are *not* decoded — this
+/// is for callers that have already refused `%` or that validate a decoded
+/// value. Anything that may still carry escapes should go through
+/// [`canonicalize_policy_path`] instead, which applies the same rule after
+/// decoding.
+pub fn is_literal_dot_segment(segment: &str) -> bool {
+    dot_segment_len(segment.as_bytes()).is_some()
+}
+
+/// Reject a completed dot segment, naming whether an escape helped build it.
+///
+/// `first_escape` is the offset, within the segment, of the first byte that
+/// was decoded from a percent escape. The segment is ambiguous when that byte
+/// is one of the dots or the `;` delimiter that make it a dot segment; an
+/// escape inside the trailing parameter (`..;%61`) does not change that the
+/// dot segment itself was written literally.
 #[inline]
 fn check_segment(
     canonical: &[u8],
     segment_start: usize,
-    segment_has_escape: bool,
+    first_escape: Option<usize>,
     structure: LiteralStructure,
 ) -> Result<(), PolicyPathRejection> {
     if structure == LiteralStructure::PatternOnly {
         return Ok(());
     }
-    if is_dot_segment(&canonical[segment_start..]) {
-        return Err(if segment_has_escape {
+    if let Some(dot_len) = dot_segment_len(&canonical[segment_start..]) {
+        return Err(if first_escape.is_some_and(|offset| offset < dot_len) {
             PolicyPathRejection::AmbiguousDotSegment
         } else {
             PolicyPathRejection::LiteralDotSegment
@@ -340,8 +391,8 @@ enum Prescan {
 ///
 /// This is the hot path for essentially all production traffic. It is a
 /// validating scan, not a "no `%` means accept" shortcut: a literal `\` or a
-/// literal `.`/`..` segment is refused here exactly as the decoding pass
-/// refuses it.
+/// literal `.`/`..` segment (including `..;` and `.;x`) is refused here exactly
+/// as the decoding pass refuses it.
 fn prescan(bytes: &[u8], structure: LiteralStructure) -> Result<Prescan, PolicyPathRejection> {
     let enforced = structure == LiteralStructure::Enforced;
     let mut segment_start = 0usize;
@@ -352,7 +403,7 @@ fn prescan(bytes: &[u8], structure: LiteralStructure) -> Result<Prescan, PolicyP
             b'%' => return Ok(Prescan::NeedsDecoding),
             b'\\' if enforced => return Err(PolicyPathRejection::LiteralBackslash),
             b'/' if enforced => {
-                if is_dot_segment(&bytes[segment_start..index]) {
+                if dot_segment_len(&bytes[segment_start..index]).is_some() {
                     return Err(PolicyPathRejection::LiteralDotSegment);
                 }
                 segment_start = index + 1;
@@ -362,7 +413,7 @@ fn prescan(bytes: &[u8], structure: LiteralStructure) -> Result<Prescan, PolicyP
         index += 1;
     }
 
-    if enforced && is_dot_segment(&bytes[segment_start..]) {
+    if enforced && dot_segment_len(&bytes[segment_start..]).is_some() {
         return Err(PolicyPathRejection::LiteralDotSegment);
     }
     Ok(Prescan::AlreadyCanonical)
@@ -392,17 +443,18 @@ fn canonicalize(
     // there is only one buffer because there is only one coordinate system.
     let mut canonical: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut segment_start = 0usize;
-    let mut segment_has_escape = false;
+    // Offset within the current segment of its first escape-decoded byte.
+    let mut segment_first_escape: Option<usize> = None;
     let mut index = 0usize;
 
     while index < bytes.len() {
         let byte = bytes[index];
 
         if byte == b'/' {
-            check_segment(&canonical, segment_start, segment_has_escape, structure)?;
+            check_segment(&canonical, segment_start, segment_first_escape, structure)?;
             canonical.push(b'/');
             segment_start = canonical.len();
-            segment_has_escape = false;
+            segment_first_escape = None;
             index += 1;
             continue;
         }
@@ -449,12 +501,17 @@ fn canonicalize(
             _ => {}
         }
 
+        // `;` is a `sub-delims` byte, so `%3B` decodes here like any other
+        // `pchar` escape and the segment check below sees the real delimiter:
+        // `..%3B` is refused exactly like `..;`.
+        if segment_first_escape.is_none() {
+            segment_first_escape = Some(canonical.len() - segment_start);
+        }
         canonical.push(value);
-        segment_has_escape = true;
         index += 3;
     }
 
-    check_segment(&canonical, segment_start, segment_has_escape, structure)?;
+    check_segment(&canonical, segment_start, segment_first_escape, structure)?;
 
     // Reaching here means at least one `%` was consumed (the pre-scan handled
     // the escape-free case) and every escape collapsed from three bytes to one,

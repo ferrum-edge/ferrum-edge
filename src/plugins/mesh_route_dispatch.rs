@@ -2394,9 +2394,14 @@ fn rewrite_request_path(
     out
 }
 
+/// Whether the tail's first segment is a dot segment under the canonical-path
+/// rule: its text before the first `;` is `.` or `..` (`..`, `./`, `..;/`,
+/// `.;x`). Sharing the predicate keeps a path-parameter traversal operand from
+/// being fused into an ordinary segment here while the boundary refuses it.
 #[inline]
 fn tail_opens_dot_segment(tail: &str) -> bool {
-    tail == "." || tail == ".." || tail.starts_with("./") || tail.starts_with("../")
+    let first_segment = tail.split_once('/').map_or(tail, |(head, _)| head);
+    crate::policy_path::is_literal_dot_segment(first_segment)
 }
 
 /// Re-sync the forwarded `Host` header to the original client value, undoing a

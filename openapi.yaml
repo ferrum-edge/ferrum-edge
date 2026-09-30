@@ -9693,8 +9693,12 @@ components:
             segments and backslashes are rejected in both spellings — literal
             (`/a/../b`, `/a/./b`, `/a\b`) and encoded (`%2e%2e`, `%5C`) —
             because the URL parser that builds the backend request line removes
-            dot segments and reads `\` as a separator. A `.` inside a segment
-            (`/v1.0/users`) is an ordinary path character.
+            dot segments and reads `\` as a separator. A segment whose text
+            before the first `;` is `.` or `..` (`..;`, `.;x`, `%2e%2e;`,
+            `..%3B`) is a dot segment too, because backends that strip path
+            parameters resolve it as one. A `.` inside a segment
+            (`/v1.0/users`) and a `;` on an ordinary segment (`/v1;version=2`)
+            are ordinary path characters.
 
 
             A literal `listen_path` containing any of the above is unreachable,

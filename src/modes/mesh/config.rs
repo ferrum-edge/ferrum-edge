@@ -924,9 +924,11 @@ pub fn validate_mesh_ext_authz_path_prefix(prefix: &str) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // Same dot-segment rule as the canonical request path: `..;` / `.;x` are
+    // dot segments to a provider that strips path parameters before resolving.
     if prefix
         .split('/')
-        .any(|segment| matches!(segment, "." | ".."))
+        .any(crate::policy_path::is_literal_dot_segment)
     {
         return Err("pathPrefix must not contain a '.' or '..' segment".to_string());
     }

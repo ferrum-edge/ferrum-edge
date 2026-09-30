@@ -5346,13 +5346,19 @@ fn test_listen_path_encodings_rejects_literal_dot_segments_and_backslashes() {
         make_proxy("bad-dot", "/api/./legacy"),
         make_proxy("bad-backslash", "/api\\legacy"),
         make_proxy("bad-exact-dotdot", "=/api/../legacy"),
+        // A `;` path parameter does not make `..` an ordinary segment
+        // (GHSA-5mrg-vq2h-6j3w).
+        make_proxy("bad-param-dotdot", "/api/..;/legacy"),
+        make_proxy("good-param", "/api/v1;version=2"),
     ];
     let errs = config.validate_listen_path_encodings().unwrap_err();
-    assert_eq!(errs.len(), 4);
+    assert_eq!(errs.len(), 5);
     assert!(errs.iter().any(|e| e.contains("bad-dotdot")));
     assert!(errs.iter().any(|e| e.contains("bad-dot")));
     assert!(errs.iter().any(|e| e.contains("bad-backslash")));
     assert!(errs.iter().any(|e| e.contains("bad-exact-dotdot")));
+    assert!(errs.iter().any(|e| e.contains("bad-param-dotdot")));
+    assert!(!errs.iter().any(|e| e.contains("good-param")));
     assert!(errs.iter().all(|e| e.contains("canonical policy path")));
 }
 

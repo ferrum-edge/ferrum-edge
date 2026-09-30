@@ -313,6 +313,124 @@ fn a_literal_dot_segment_is_rejected_even_alongside_accepted_escapes() {
     );
 }
 
+// ── Dot segments carrying a `;` path parameter (GHSA-5mrg-vq2h-6j3w) ───────
+
+#[test]
+fn literal_dot_segments_with_a_path_parameter_are_rejected() {
+    // `;` is a legal `pchar`, so no URL parser removes `..;`, but servlet
+    // containers and frameworks that strip path parameters before resolving
+    // dot segments resolve `/public/..;/admin` to `/admin`. A segment whose
+    // text before the first `;` is `.` or `..` is therefore a dot segment, and
+    // is refused exactly as a bare one is — on the escape-free fast path and
+    // on the decoding pass alike.
+    for path in [
+        "/public/..;/admin",
+        "/public/..;/admin/users",
+        "/a/.;/b",
+        "/a/.;x/b",
+        "/a/..;a=b/c",
+        "/a/..;jsessionid=1/b",
+        "/a/..;;",
+        "/a/..;",
+        "/a/.;",
+        "..;",
+        ".;x",
+        "/..;/admin",
+        // The same targets carrying an unrelated decodable escape reach the
+        // decoding pass instead of the fast path.
+        "/%61/..;/admin",
+        "/a/..;/%61dmin",
+        // An escape inside the parameter does not make the dot segment itself
+        // any less literal.
+        "/a/..;%61/b",
+        "/a/.;%78",
+    ] {
+        assert_eq!(
+            rejection(path),
+            PolicyPathRejection::LiteralDotSegment,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn escaped_dot_segments_with_a_path_parameter_are_ambiguous() {
+    // A dot segment an escape helped form — an escaped dot or an escaped `;`
+    // delimiter — is refused as ambiguous, mirroring `%2e%2e`.
+    for path in [
+        "/a/%2e%2e;/b",
+        "/a/%2E%2E;x/b",
+        "/a/.%2e;x/b",
+        "/a/%2e.;/b",
+        "/a/%2e;/b",
+        "/a/%2e;x",
+        // `%3B` is a `sub-delims` escape and decodes to `;` like every other
+        // `pchar` escape, so `..%3B` is the dot segment `..;` after
+        // canonicalization and no retained `%3B` reaches a decoding backend.
+        "/a/..%3b/b",
+        "/a/..%3B/b",
+        "/a/..%3bjsessionid=1/b",
+        "/a/.%3bx/b",
+        "/a/%2e%2e%3b/b",
+    ] {
+        assert_eq!(
+            rejection(path),
+            PolicyPathRejection::AmbiguousDotSegment,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn a_path_parameter_on_an_ordinary_segment_is_still_accepted() {
+    // Only a segment whose text before the first `;` is exactly `.` or `..`
+    // is a dot segment. Matrix parameters on ordinary segments are legal
+    // `pchar`s and stay on the allocation-free fast path.
+    for path in [
+        "/a;b",
+        "/v1;version=2",
+        "/api/v1;version=2/users",
+        "/a/;/b",
+        "/a/;x/b",
+        "/a/..a;b/c",
+        "/a/a..;b/c",
+        "/a/...;x/c",
+        "/a/.hidden;x/c",
+        "/a/b;..",
+        "/a/b;../c",
+    ] {
+        let result = canonicalize_policy_path(path)
+            .unwrap_or_else(|rejection| panic!("{path:?} rejected: {rejection:?}"));
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "{path:?} must not allocate"
+        );
+        assert_eq!(result, path);
+    }
+
+    // An escaped `;` on an ordinary segment decodes like any `pchar` escape.
+    assert_eq!(canonical("/a%3bb"), "/a;b");
+    assert_eq!(canonical("/v1%3Bversion=2"), "/v1;version=2");
+    assert_eq!(canonical("/a/%2e%2ea%3bb"), "/a/..a;b");
+}
+
+#[test]
+fn config_values_with_a_path_parameter_dot_segment_can_never_match() {
+    assert_eq!(
+        non_canonical_policy_path_reason("/api/..;/admin"),
+        Some("literal_dot_segment")
+    );
+    assert_eq!(
+        non_canonical_policy_path_reason("/api/.;x"),
+        Some("literal_dot_segment")
+    );
+    assert_eq!(
+        non_canonical_policy_path_reason("/api/..%3B/admin"),
+        Some("ambiguous_dot_segment")
+    );
+    assert_eq!(non_canonical_policy_path_reason("/api/v1;version=2"), None);
+}
+
 // ── Backslash: literal as well as encoded ──────────────────────────────────
 
 #[test]

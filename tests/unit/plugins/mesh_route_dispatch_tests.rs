@@ -2316,6 +2316,11 @@ async fn rewrite_composition_refuses_new_dot_segments_before_publication() {
             ("/api../admin", None),
             ("/api..", None),
             ("/api./users", None),
+            // A `;` path parameter does not stop `..` / `.` from being a dot
+            // segment to a backend that strips parameters (GHSA-5mrg-vq2h-6j3w).
+            ("/api..;/admin", None),
+            ("/api..;jsessionid=1/admin", None),
+            ("/api.;x/users", None),
             ("/api/users", Some("/v2/users")),
             (
                 "/api..hidden/users",
@@ -2536,6 +2541,7 @@ async fn prefix_rewrite_refuses_a_dot_segment_that_opens_the_suffix() {
             ("/prefix/old../admin", None),
             ("/prefix/old..", None),
             ("/prefix/old./users", None),
+            ("/prefix/old..;/admin", None),
             ("/prefix/old..hidden", Some("/new..hidden")),
             ("/prefix/old.env", Some("/new.env")),
             ("/prefix/oldtail", Some("/newtail")),

@@ -1080,6 +1080,10 @@ fn hostile_provider_path_prefixes_are_refused_at_admission() {
         "/check\\evil",
         "/check/./root",
         "/check/../../root",
+        // A `;` path parameter does not make `..` / `.` an ordinary segment
+        // to a provider that strips parameters (GHSA-5mrg-vq2h-6j3w).
+        "/check/..;/root",
+        "/check/.;x/root",
         "/check/%2e%2e/root",
         "/check/%2Froot",
         "/check\u{7f}",
@@ -1091,12 +1095,14 @@ fn hostile_provider_path_prefixes_are_refused_at_admission() {
             "a pathPrefix that re-targets the check must be refused: {prefix:?}"
         );
     }
-    let mut provider = provider("p");
-    provider.path_prefix = Some("/check/v1".to_string());
-    assert!(
-        provider.validate().is_ok(),
-        "an ordinary path prefix is fine"
-    );
+    for prefix in ["/check/v1", "/check/v1;version=2"] {
+        let mut provider = provider("p");
+        provider.path_prefix = Some(prefix.to_string());
+        assert!(
+            provider.validate().is_ok(),
+            "an ordinary path prefix is fine: {prefix:?}"
+        );
+    }
 }
 
 #[test]

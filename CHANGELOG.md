@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
   GHSA-7gcf-g7xr-8hxj and `cmov` 0.5.4 for GHSA-3rjw-m598-pq24).
+- **The canonical request path refuses dot segments that carry a `;` path
+  parameter** (GHSA-5mrg-vq2h-6j3w). A segment whose text before the first `;`
+  is `.` or `..` — `..;`, `.;x`, `..;jsessionid=1` — is now a dot segment, so a
+  backend that strips path parameters cannot resolve a different path than
+  routing and policy evaluated. It is refused with `400`: literal forms as
+  `literal_dot_segment`, and forms where an escape produced a dot or the `;`
+  (`%2e%2e;`, `..%3B`) as `ambiguous_dot_segment`. A `;` on an ordinary segment
+  (`/v1;version=2`) is still accepted. The same rule now applies at admission
+  to literal `listen_path` values, plugin path triggers, `request_termination`
+  prefixes, OpenAPI server base paths, mesh `extensionProviders[].pathPrefix`,
+  and mesh rewrite composition, so configuration cannot contain `..;` either.
 
 ### Added
 

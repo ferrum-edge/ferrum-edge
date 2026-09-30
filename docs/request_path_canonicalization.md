@@ -62,8 +62,8 @@ risking disagreement with the backend:
 | `literal_backslash`      | `/a\b`           | The Rust `url` parser — which parses the backend URL on the reqwest dispatch paths — treats `\` as a path separator for special HTTP(S) URLs, as do several backend stacks. A literal `\` is the same route-structure mismatch an encoded one is. |
 | `encoded_control`        | `/a%00`, `/a%0A` | A NUL truncates the path in several runtimes; other C0 controls and `DEL` are equally divergent. |
 | `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte is outside the `pchar` decode set (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would emit a byte the backend URL parser cannot carry (space, controls) or percent-encodes again (`"`, `{`, `}`, non-ASCII), so the forwarded request line would not be the canonical string. Neither is a single coordinate, so the target is refused. This rule governs *escapes*; see [Literal non-`pchar` bytes](#literal-non-pchar-bytes) for the same bytes sent literally. |
-| `ambiguous_dot_segment`  | `/a/%2e%2e/b`    | A percent escape produced a `.` or `..` segment. |
-| `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..` | A `.` or `..` segment written literally. See below. |
+| `ambiguous_dot_segment`  | `/a/%2e%2e/b`, `/a/%2e%2e;/b`, `/a/..%3B/b` | A percent escape produced a `.` or `..` segment, or the `;` that makes one a path-parameter dot segment. |
+| `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..`, `/a/..;/b`, `/a/.;x/b` | A `.` or `..` segment written literally, with or without a `;` path parameter. See below. |
 
 Rejections carry a fixed JSON body and a fixed reason token. Neither echoes any
 request bytes, and the reject is logged with the reason token only.
@@ -79,6 +79,21 @@ a fix either — removal *is* a second reading, and it would change a request's
 meaning. The target is refused instead. A `.` inside a segment is an ordinary
 path character: `/v1.0/users` and `/a/.hidden/b` are unaffected; only a
 *complete* `.` or `..` segment is a dot segment.
+
+**A `;` path parameter does not hide a dot segment.** A segment is a dot segment
+when its text before the first `;` is `.` or `..`, so `..;`, `.;x`, and
+`..;jsessionid=1` are refused exactly like `..` and `.`. `;` is a legal path
+character, so the `url` crate forwards `/a/..;/b` unchanged, but servlet
+containers and frameworks that strip path parameters before resolving dot
+segments (Tomcat, Spring, some Jetty configurations) resolve it to `/b`. An
+escaped `;` (`%3B`) is decoded like every other `pchar` escape, so `..%3B` is
+the same segment after canonicalization and is refused as
+`ambiguous_dot_segment`; because no escape survives canonicalization, a
+decoding backend is never handed a `%3B` it could turn into `..;` after policy
+ran. A dot segment is `ambiguous_dot_segment` when an escape produced one of
+its dots or its `;` delimiter, and `literal_dot_segment` otherwise; an escape
+inside the parameter itself (`..;%61`) does not change that. A `;` on an
+ordinary segment (`/v1;version=2`, `/a;b`, `/..a;b`) is unaffected.
 
 ## Literal non-`pchar` bytes
 
@@ -212,7 +227,8 @@ must change:
   parameter must move that value into the query string or a header.
 - Targets with a `.` or `..` segment, whether the segment was
   written literally (`/a/../b`, `literal_dot_segment`) or produced by a percent
-  escape (`/a/%2e%2e/b`, `ambiguous_dot_segment`). Clients that relied on the
+  escape (`/a/%2e%2e/b`, `ambiguous_dot_segment`), and whether or not it carries
+  a `;` path parameter (`/a/..;/b`, `/a/.;x/b`). Clients that relied on the
   gateway forwarding a relative target must send the resolved path. A `.` inside
   a segment (`/v1.0/users`, `/a/.hidden`) is unaffected.
 - Targets with a literal backslash (`literal_backslash`), alongside the

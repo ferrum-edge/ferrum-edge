@@ -580,6 +580,41 @@ const CASES: &[Case] = &[
         backend_target: Backend::Never,
         why: "the literal rules apply to targets that also carry escapes",
     },
+    // A `;` path parameter does not make `..` an ordinary segment
+    // (GHSA-5mrg-vq2h-6j3w). No URL parser removes `..;`, but a backend that
+    // strips path parameters before resolving dot segments executes
+    // `/canon/blocked/thing` — the termination prefix the permissive-looking
+    // spelling would otherwise skip.
+    Case {
+        target: "/canon/public/..;/blocked/thing",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a dot segment with an empty path parameter is still a dot segment",
+    },
+    Case {
+        target: "/canon/public/..;jsessionid=1/blocked/thing",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a dot segment with a named path parameter is still a dot segment",
+    },
+    Case {
+        target: "/canon/public/%2e%2e;/blocked/thing",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "escaped dots before a path parameter are an ambiguous dot segment",
+    },
+    Case {
+        target: "/canon/public/..%3B/blocked/thing",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "an escaped `;` delimiter decodes and forms the same dot segment",
+    },
+    Case {
+        target: "/canon/v1;version=2",
+        status: 200,
+        backend_target: Backend::Exact("/canon/v1;version=2"),
+        why: "a path parameter on an ordinary segment is forwarded unchanged",
+    },
     // A literal backslash is rejected as well as `%5C`. All three senders can
     // carry it verbatim: the raw H1 socket writes the request line byte for
     // byte, and `http::Uri` — which the H2 and H3 senders parse their target
@@ -655,6 +690,74 @@ async fn functional_policy_path_canonicalization_is_identical_across_h1_h2_h3() 
     assert!(
         backend.targets().is_empty(),
         "no stray backend traffic should remain"
+    );
+
+    gateway.shutdown();
+}
+
+/// A path-parameter dot segment is refused exactly like the literal or escaped
+/// dot segment it resolves as on a parameter-stripping backend: same status,
+/// same fixed diagnostic body, and no backend request (GHSA-5mrg-vq2h-6j3w).
+#[ignore]
+#[tokio::test]
+async fn functional_path_parameter_dot_segment_is_refused_like_a_dot_segment() {
+    const DOT_SEGMENT_BODY: &str = r#"{"error":"Request path contains a dot segment"}"#;
+    const ENCODED_DOT_SEGMENT_BODY: &str =
+        r#"{"error":"Request path contains an encoded dot segment"}"#;
+
+    let backend = RecordingBackend::start().await;
+    let (mut gateway, _https_port) = spawn_gateway(backend.port, None).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .expect("proxy port ready");
+    let proxy_port = gateway.proxy_port;
+    let _ = backend.take_targets();
+
+    for (baseline, expected_body, variants) in [
+        (
+            "/canon/public/../blocked/thing",
+            DOT_SEGMENT_BODY,
+            [
+                "/canon/public/..;/blocked/thing",
+                "/canon/public/..;jsessionid=1/blocked/thing",
+                "/canon/public/.;x/blocked/thing",
+            ],
+        ),
+        (
+            "/canon/public/%2e%2e/blocked/thing",
+            ENCODED_DOT_SEGMENT_BODY,
+            [
+                "/canon/public/%2e%2e;/blocked/thing",
+                "/canon/public/.%2e;x/blocked/thing",
+                "/canon/public/..%3B/blocked/thing",
+            ],
+        ),
+    ] {
+        let (baseline_status, baseline_body) = send_h1_full(proxy_port, baseline).await;
+        assert_eq!(baseline_status, 400, "{baseline}: body {baseline_body:?}");
+        assert_eq!(baseline_body, expected_body, "{baseline}");
+        for target in variants {
+            let (status, body) = send_h1_full(proxy_port, target).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (baseline_status, baseline_body.as_str()),
+                "{target} must be refused exactly like {baseline}"
+            );
+        }
+        assert!(
+            backend.take_targets().is_empty(),
+            "no dot-segment spelling may reach the backend"
+        );
+    }
+
+    // Control: a path parameter on an ordinary segment is still served, so
+    // the refusals above are the dot-segment rule rather than a `;` ban.
+    let (status, body) = send_h1_full(proxy_port, "/canon/v1;version=2").await;
+    assert_eq!(status, 200, "ordinary path parameter must be served: {body:?}");
+    assert_eq!(
+        backend.take_targets(),
+        vec!["/canon/v1;version=2".to_string()]
     );
 
     gateway.shutdown();

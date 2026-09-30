@@ -4790,6 +4790,11 @@ mod tests {
             "/admin/secret/.",
             "/..",
             "/.",
+            // GHSA-5mrg-vq2h-6j3w: a `;` path parameter does not hide a dot
+            // segment from a backend that strips parameters first.
+            "/public/..;/admin/secret",
+            "/public/..;jsessionid=1/admin/secret",
+            "/.;x/admin/secret",
         ] {
             assert_eq!(
                 mesh_authz_authorization_path(path).err(),
@@ -4803,6 +4808,8 @@ mod tests {
             "/x/%2E%2E/admin/secret",
             "/x/.%2e/admin/secret",
             "/%2e/admin/secret",
+            "/x/%2e%2e;/admin/secret",
+            "/x/..%3B/admin/secret",
         ] {
             assert_eq!(
                 mesh_authz_authorization_path(path).err(),

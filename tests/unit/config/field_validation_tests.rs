@@ -436,6 +436,11 @@ fn test_proxy_listen_path_rejects_non_canonical_policy_paths() {
         "/api/../admin",
         "/api/./admin",
         "/api/..",
+        // A `;` path parameter does not stop a segment being a dot segment
+        // (GHSA-5mrg-vq2h-6j3w), literal or with an escaped delimiter.
+        "/api/..;/admin",
+        "/api/.;x/admin",
+        "/api/..%3B/admin",
         "/api\\admin",
         "=/api/../admin",
     ] {

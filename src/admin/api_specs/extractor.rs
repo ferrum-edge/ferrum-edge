@@ -1542,10 +1542,18 @@ fn server_url_pathname(
     validate_safe_server_pathname(parsed.path(), location, error_surface)
 }
 
+/// Whether one server-URL path segment is a dot segment, literal or escaped,
+/// under the canonical request-path rule: its text before the first `;` is `.`
+/// or `..` (`..`, `%2e%2E`, `..;`, `.%2e;x`, `..%3B`).
+///
+/// Delegates to the canonicalizer so a server base cannot admit a spelling the
+/// request boundary refuses. A segment the canonicalizer refuses for another
+/// reason is not a dot segment; the URL parse below handles it.
 fn is_url_dot_segment(segment: &str) -> bool {
+    use crate::policy_path::PolicyPathRejection;
     matches!(
-        segment.to_ascii_lowercase().as_str(),
-        "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+        crate::policy_path::canonicalize_policy_path(segment),
+        Err(PolicyPathRejection::LiteralDotSegment | PolicyPathRejection::AmbiguousDotSegment)
     )
 }
 
@@ -1578,7 +1586,7 @@ fn validate_safe_server_pathname(
     // cannot silently change the matcher. Empty segments remain literal and
     // safe because the generated operation regex is fully anchored.
     for segment in trimmed.split('/').skip(1) {
-        if segment == "." || segment == ".." {
+        if is_url_dot_segment(segment) {
             return Err(ExtractError::MalformedExtension {
                 which: error_surface,
                 error: format!(
