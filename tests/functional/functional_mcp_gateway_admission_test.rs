@@ -1081,7 +1081,9 @@ async fn functional_mcp_gateway_forwards_shielded_upstream_tool_arguments() {
     let forwarded = forwarded
         .iter()
         .find(|request| request.method == "tools/call")
-        .expect("upstream tools/call request");
+        .unwrap_or_else(|| {
+            panic!("upstream tools/call request was not forwarded; response: {body}")
+        });
     let call_body: Value = serde_json::from_slice(&forwarded.body).expect("forwarded JSON-RPC");
     assert_eq!(
         call_body["params"]["arguments"]["contact"], "[REDACTED:email]",
@@ -1274,7 +1276,7 @@ async fn functional_mcp_gateway_lowercase_post_is_shielded_and_audited() {
                 .head
                 .starts_with("GET /pets/%5BREDACTED:email%5D HTTP/1.1")
         }),
-        "the bridge must receive only the shielded argument: {received:#?}"
+        "the bridge must receive only the shielded argument: {received:#?}; response: {body}"
     );
     let audited = wait_for_audit_records(&records, 1).await;
     assert_eq!(

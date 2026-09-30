@@ -1677,9 +1677,14 @@ impl McpGateway {
     }
 
     fn request_body<'a>(&self, ctx: &'a RequestContext) -> Option<&'a [u8]> {
-        ctx.request_body_bytes
+        ctx.mcp_shielded_request_body
             .as_ref()
             .map(|body| body.as_ref())
+            .or_else(|| {
+                ctx.request_body_bytes
+                    .as_ref()
+                    .map(|body| body.as_ref())
+            })
             .or_else(|| ctx.metadata.get("request_body").map(|body| body.as_bytes()))
     }
 
