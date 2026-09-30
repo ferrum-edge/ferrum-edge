@@ -1041,10 +1041,20 @@ curl -H "Authorization: Bearer $TOKEN" -H "X-Ferrum-Namespace: ferrum" \
   with `{"error": "Proxy has no mcp_gateway plugin"}`. The effective set
   follows the runtime merge: associated proxy / proxy-group instances, else
   global instances of the proxy's namespace.
+- **Database mode limitation.** The proxy row and associated plugin configs
+  are read from the store, but global `mcp_gateway` configs are discovered
+  from this node's cached namespace config. If the store contains a proxy in a
+  namespace absent from that cached config, and the proxy relies only on a
+  global `mcp_gateway`, this endpoint currently returns the `404` above rather
+  than a `not_served` catalog. A namespace-specific proxy or proxy-group
+  association is still resolved from the store.
 - **Cached only.** The response reads only what the running instances already
   cached. It never contacts an upstream and never starts a refresh. Catalogs
-  are cached per downstream MCP session, so each instance reports its most
-  recently refreshed session catalog. Until a session has listed tools, `data`
+  are cached per downstream MCP session, so each instance reports the most
+  recently refreshed session's catalog. An upstream may tailor its tools to
+  the session principal, so the reported catalog can reflect one principal's
+  view. `refreshed_at` and `stale` track the tools catalog; resource-template
+  refreshes do not change them. Until a session has listed tools, `data`
   is empty, `refreshed_at` is `null`, `stale` is `true`, and the instance's
   `catalog_state` is `not_refreshed`. A catalog older than
   `discovery.cache_ttl_seconds` is `stale`; the next MCP request refreshes it.
@@ -1062,9 +1072,16 @@ curl -H "Authorization: Bearer $TOKEN" -H "X-Ferrum-Namespace: ferrum" \
   hide_until_configured`, `hidden_schema_changed` under
   `discovery.on_schema_change: hide_until_configured`, otherwise the action),
   and whether `tools/list` lists it and `tools/call` admits it for a consumer
-  its grant admits; `allowed_groups` (`null` when not group-conditioned) and
-  `denied_groups`; `input_schema_hash`, the lowercase hex SHA-256 of the
-  serialized `inputSchema`; and `discovered_at`.
+  its grant admits. For OpenAPI bridge tools, both flags also account for the
+  proxy's `allowed_methods`; `allowed_groups` (`null` when not
+  group-conditioned) and `denied_groups`; `schema_hash`, the gateway's
+  lowercase hex SHA-256 schema
+  hash; and `discovered_at`. With `validation.validate_tool_results: false`,
+  this hashes the serialized `inputSchema`. With it enabled, this hashes the
+  serialized object `{ "inputSchema": ..., "outputSchema": ... }`, including
+  `outputSchema: null` when none is declared. This is the same hash used by
+  schema drift detection, `hidden_schema_changed`, and `mcp.input_schema_hash`
+  metadata.
 - **Per instance** (`catalogs`): `catalog_state`, `refreshed_at`, `stale`,
   `catalog_version`, the number of cached sessions, the discovery and policy
   defaults, the `validation.max_catalog_*` caps, and one entry per configured

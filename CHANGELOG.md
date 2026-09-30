@@ -88,9 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path template), description and annotations, the configured and effective
   policy (including tools hidden by `discovery.on_new_tool` /
   `discovery.on_schema_change: hide_until_configured`), `allowed_groups` /
-  `denied_groups`, and a SHA-256 `input_schema_hash`. Per instance it reports
-  `refreshed_at`, a `stale` flag, and each server's last `tools/list` outcome
-  as fixed text. It reads only the cached catalog (the most recently refreshed
+  `denied_groups`, and the gateway's stored SHA-256 `schema_hash`. Per instance
+  it reports `refreshed_at`, a `stale` flag, and each server's last
+  `tools/list` outcome as fixed text. It reads only the cached catalog (the most recently refreshed
   session's), never calls an upstream, paginates with the shared bounds, and
   returns every server `upstream_url` in its structural redacted form for all
   roles. Before any session lists tools the list is empty with

@@ -5542,11 +5542,23 @@ paths:
         The response reads only the catalog the running `mcp_gateway`
         instances already cached. It never contacts an upstream and never
         starts a refresh. Catalogs are cached per downstream MCP session, so
-        each instance reports its most recently refreshed session catalog.
+        each instance reports its most recently refreshed session catalog. An
+        upstream may tailor tools per principal, so the catalog can reflect
+        one principal's view. `refreshed_at` and `stale` track tools refreshes;
+        resource-template refreshes do not change them.
         `refreshed_at` is `null` and `stale` is `true` until a session has
         listed tools. The catalog is node-local: on a control plane, or on a
         data plane that does not serve the proxy's namespace, each instance
         reports `catalog_state: not_served` and no tools.
+
+        In database mode, the proxy row and associated plugin configs come
+        from the store, while global `mcp_gateway` configs come from this
+        node's cached namespace config. If the proxy exists in the store but
+        its namespace is absent from that cache, and it relies only on a
+        global `mcp_gateway`, the endpoint returns
+        `Proxy has no mcp_gateway plugin` (404) instead of a `not_served`
+        catalog. Proxy and proxy-group associations are still read from the
+        store.
 
         `data` lists the tools of every effective `mcp_gateway` instance on
         the proxy, ordered by instance then public name, and paginates with
@@ -5582,7 +5594,9 @@ paths:
           description: |
             The proxy does not exist in this namespace (`Proxy not found`), or
             no enabled `mcp_gateway` applies to it
-            (`Proxy has no mcp_gateway plugin`).
+            (`Proxy has no mcp_gateway plugin`). In database mode, the latter
+            can also occur when the proxy relies only on a global config in a
+            namespace absent from this node's cached configuration.
           content:
             application/json:
               schema:
@@ -18570,14 +18584,17 @@ components:
             multiplied by the number of replicas receiving that identity's TCP
             connections.
 
-    # ── Pagination envelope ────────────────────────────────────────────
+    # ── MCP tool catalog ──────────────────────────────────────────────
     McpToolCatalogResponse:
       type: object
       description: |
         `GET /proxies/{id}/mcp/tools`. Top-level `refreshed_at` is the least
-        recent refresh across `catalogs`, `null` when any of them has never
-        been refreshed on this node. `stale` is `true` unless every catalog is
-        `fresh`.
+        recent tools refresh across `catalogs`, `null` when any of them has
+        never been refreshed on this node. Resource-template refreshes do not
+        change this timestamp. `stale` is `true` unless every tools catalog is
+        `fresh`. Catalogs show the most recently refreshed downstream session;
+        an upstream that tailors tools per principal can make this one
+        principal's view.
       required: [proxy_id, namespace, refreshed_at, stale, catalogs, data, pagination]
       properties:
         proxy_id:
@@ -18620,7 +18637,10 @@ components:
             no session has listed tools yet. `unmediated`: a
             `transparent_proxy` instance, which has no catalog. `not_served`:
             this node runs no instance for the proxy (a control plane, another
-            namespace, or a change that is not live yet).
+            namespace, or a change that is not live yet). In database mode,
+            when a proxy exists in the store but only relies on a global
+            `mcp_gateway` in a namespace absent from this node's cached config,
+            the endpoint can return 404 before producing a `not_served` entry.
         mode:
           type: string
           enum: [aggregate_router, transparent_proxy]
@@ -18632,6 +18652,7 @@ components:
         refreshed_at:
           type: [string, "null"]
           format: date-time
+          description: Last tools catalog refresh; resource-template refreshes do not change it.
         stale:
           type: boolean
         cache_ttl_seconds:
@@ -18741,7 +18762,7 @@ components:
         - policy
         - allowed_groups
         - denied_groups
-        - input_schema_hash
+        - schema_hash
         - discovered_at
       properties:
         name:
@@ -18797,15 +18818,26 @@ components:
               description: |
                 `hidden_until_configured`: hidden by `discovery.on_new_tool:
                 hide_until_configured` until `policy.tools` names it.
-                `hidden_schema_changed`: its `inputSchema` changed under
-                `discovery.on_schema_change: hide_until_configured`. Otherwise
-                the configured action.
+                `hidden_schema_changed`: the schema hash changed under
+                `discovery.on_schema_change: hide_until_configured`. The hash
+                covers `inputSchema` alone when
+                `validation.validate_tool_results` is false; when true it
+                covers the serialized object containing both `inputSchema`
+                and `outputSchema`, matching drift detection and
+                `mcp.input_schema_hash` metadata. Otherwise the configured
+                action.
             listed:
               type: boolean
-              description: Whether `tools/list` includes it for a consumer its grant admits.
+              description: |
+                Whether `tools/list` includes it for a consumer its grant
+                admits. OpenAPI bridge tools are also filtered by the proxy's
+                `allowed_methods`.
             callable:
               type: boolean
-              description: Whether `tools/call` is admitted for a consumer its grant admits.
+              description: |
+                Whether `tools/call` is admitted for a consumer its grant
+                admits. OpenAPI bridge tools are also filtered by the proxy's
+                `allowed_methods`.
         allowed_groups:
           type: [array, "null"]
           items:
@@ -18817,13 +18849,20 @@ components:
           type: array
           items:
             type: string
-        input_schema_hash:
+        schema_hash:
           type: string
           pattern: "^[0-9a-f]{64}$"
-          description: Lowercase hex SHA-256 of the serialized `inputSchema`.
+          description: |
+            Gateway stored lowercase hex SHA-256 schema hash. With
+            `validation.validate_tool_results: false`, it hashes serialized
+            `inputSchema`. With it true, it hashes the serialized object
+            `{ "inputSchema": ..., "outputSchema": ... }` (including null
+            when outputSchema is absent). This is the hash used by
+            `hidden_schema_changed` and `mcp.input_schema_hash` metadata.
         discovered_at:
           type: string
           format: date-time
+    # ── Pagination envelope ────────────────────────────────────────────
     Pagination:
       type: object
       description: |

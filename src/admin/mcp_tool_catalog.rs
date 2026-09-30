@@ -34,6 +34,7 @@ const MCP_GATEWAY_NOT_FOUND_MESSAGE: &str = "Proxy has no mcp_gateway plugin";
 struct ResolvedGateways {
     configs: Vec<PluginConfig>,
     from_cache: bool,
+    allowed_methods: Option<Vec<String>>,
 }
 
 pub(super) async fn handle_get_mcp_tool_catalog(
@@ -65,7 +66,12 @@ pub(super) async fn handle_get_mcp_tool_catalog(
         ));
     }
 
-    let mut snapshots = runtime_snapshots(state, namespace, proxy_id);
+    let mut snapshots = runtime_snapshots(
+        state,
+        namespace,
+        proxy_id,
+        resolved.allowed_methods.as_deref(),
+    );
     let catalogs: Vec<(&PluginConfig, Option<McpAdminCatalogSnapshot>)> = resolved
         .configs
         .iter()
@@ -145,6 +151,7 @@ async fn resolve_gateways(
                 return Ok(Some(ResolvedGateways {
                     configs,
                     from_cache: false,
+                    allowed_methods: proxy.allowed_methods,
                 }));
             }
             Err(error) => {
@@ -180,6 +187,7 @@ async fn resolve_gateways(
     Ok(Some(ResolvedGateways {
         configs,
         from_cache: true,
+        allowed_methods: proxy.allowed_methods.clone(),
     }))
 }
 
@@ -257,6 +265,7 @@ fn runtime_snapshots(
     state: &AdminState,
     namespace: &str,
     proxy_id: &str,
+    allowed_methods: Option<&[String]>,
 ) -> Vec<McpAdminCatalogSnapshot> {
     let Some(proxy_state) = state.proxy_state.as_ref() else {
         return Vec::new();
@@ -277,7 +286,7 @@ fn runtime_snapshots(
     plugins
         .iter()
         .filter_map(|plugin| plugin.mcp_gateway())
-        .map(McpGateway::admin_catalog_snapshot)
+        .map(|gateway| gateway.admin_catalog_snapshot(allowed_methods))
         .collect()
 }
 
@@ -403,7 +412,7 @@ fn tool_entry_json((plugin_config_id, tool): (&str, &McpAdminToolSnapshot)) -> V
         },
         "allowed_groups": tool.allowed_groups,
         "denied_groups": tool.denied_groups,
-        "input_schema_hash": tool.input_schema_hash(),
+        "schema_hash": tool.schema_hash,
         "discovered_at": tool.discovered_at.to_rfc3339(),
     })
 }

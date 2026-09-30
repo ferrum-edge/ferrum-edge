@@ -83,6 +83,11 @@ fn proxy(id: &str, namespace: &str, listen_path: &str, plugins: &[&str]) -> Valu
         "backend_scheme": "http",
         "backend_host": "127.0.0.1",
         "backend_port": 8080,
+        "allowed_methods": if id == "mcp-bridge" {
+            json!(["GET"])
+        } else {
+            Value::Null
+        },
         "plugins": plugins
             .iter()
             .map(|plugin| json!({"plugin_config_id": plugin}))
@@ -109,12 +114,17 @@ fn aggregate_config(github_url: &str, flaky_url: &str) -> Value {
         "endpoint": {"path": "/mcp", "protocol_versions": ["2025-11-25"]},
         "sessions": {"initialize_upstreams": "passthrough"},
         "discovery": {
-            "aggregate_resources": false,
+            "aggregate_resources": true,
             "aggregate_prompts": false,
             "on_new_tool": "hide_until_configured"
         },
+        "validation": {"validate_tool_results": true},
         "servers": {
-            "github": {"upstream_url": github_url, "namespace": "github"},
+            "github": {
+                "upstream_url": github_url,
+                "namespace": "github",
+                "expose_resources": true
+            },
             "flaky": {"upstream_url": flaky_url, "namespace": "flaky"}
         },
         "policy": {
@@ -255,14 +265,25 @@ async fn start_mcp_servers() -> (MockServer, MockServer) {
                 {
                     "name": "merge_pr",
                     "description": "Merge a pull request",
-                    "inputSchema": {"type": "object"}
+                    "inputSchema": {"type": "object"},
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {"merged": {"type": "boolean"}}
+                    }
                 },
                 {
                     "name": "hidden_new",
                     "description": "Not configured yet",
-                    "inputSchema": {"type": "object"}
+                    "inputSchema": {"type": "object"},
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {"hidden": {"type": "boolean"}}
+                    }
                 }
-            ]}
+            ], "resourceTemplates": [{
+                "uriTemplate": "file:///repos/{repo}",
+                "name": "repo-file"
+            }]}
         })))
         .mount(&github)
         .await;
@@ -436,7 +457,7 @@ fn mcp_request(body: Value, session: Option<&str>) -> (RequestContext, HashMap<S
 
 /// Initialize an MCP session on the proxy's running `mcp_gateway` and list
 /// tools once, which refreshes that session's catalog.
-async fn refresh_catalog(proxy_state: &ProxyState, proxy_id: &str) {
+async fn refresh_catalog(proxy_state: &ProxyState, proxy_id: &str) -> String {
     let plugins = proxy_state
         .plugin_cache
         .request_view("ferrum", proxy_id, ProxyProtocol::Http)
@@ -478,6 +499,33 @@ async fn refresh_catalog(proxy_state: &ProxyState, proxy_id: &str) {
             status_code: 200, ..
         } => {}
         other => panic!("tools/list must be answered by the gateway: {other:?}"),
+    }
+    session
+}
+
+async fn refresh_resource_templates(proxy_state: &ProxyState, proxy_id: &str, session: &str) {
+    let plugins = proxy_state
+        .plugin_cache
+        .request_view("ferrum", proxy_id, ProxyProtocol::Http)
+        .plugins();
+    let plugin: &Arc<dyn Plugin> = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "mcp_gateway")
+        .expect("the proxy runs an mcp_gateway");
+    let (mut ctx, mut headers) = mcp_request(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/templates/list",
+            "params": {}
+        }),
+        Some(session),
+    );
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code: 200, ..
+        } => {}
+        other => panic!("resources/templates/list must be answered by the gateway: {other:?}"),
     }
 }
 
@@ -582,7 +630,7 @@ async fn aggregate_catalog_reports_upstream_sources_policy_grants_and_refresh_er
         json!(["admins", "release-managers"])
     );
     assert_eq!(create["denied_groups"], json!(["contractors"]));
-    assert!(is_sha256_hex(&create["input_schema_hash"]), "{create}");
+    assert!(is_sha256_hex(&create["schema_hash"]), "{create}");
 
     let merge = tool(&reply, "github.merge_pr");
     assert_eq!(merge["policy"]["action"], "deny");
@@ -599,9 +647,10 @@ async fn aggregate_catalog_reports_upstream_sources_policy_grants_and_refresh_er
     assert_eq!(hidden["policy"]["effective"], "hidden_until_configured");
     assert_eq!(hidden["policy"]["listed"], false);
 
-    // The hash covers the input schema only: equal schemas hash equally.
-    assert_eq!(merge["input_schema_hash"], hidden["input_schema_hash"]);
-    assert_ne!(create["input_schema_hash"], merge["input_schema_hash"]);
+    // Result validation makes the stored hash cover both schemas, even though
+    // these tools have identical input schemas.
+    assert_ne!(merge["schema_hash"], hidden["schema_hash"]);
+    assert_ne!(create["schema_hash"], merge["schema_hash"]);
 
     let catalog = &reply.body["catalogs"][0];
     assert_eq!(catalog["catalog_state"], "fresh");
@@ -685,6 +734,9 @@ async fn bridge_catalog_reports_openapi_operations_and_paginates() {
     assert_eq!(get_pet["annotations"]["readOnlyHint"], true);
     assert_eq!(get_pet["policy"]["effective"], "allow");
     assert_eq!(get_pet["policy"]["callable"], true);
+    let create_pet = tool(&reply, "pets.createPet");
+    assert_eq!(create_pet["policy"]["listed"], false);
+    assert_eq!(create_pet["policy"]["callable"], false);
     assert_eq!(tool(&reply, "pets.createPet")["source"]["method"], "POST");
     assert_eq!(tool(&reply, "pets.createPet")["source"]["path"], "/pets");
     let catalog = &reply.body["catalogs"][0];
@@ -721,6 +773,24 @@ async fn bridge_catalog_reports_openapi_operations_and_paginates() {
     )
     .await;
     assert_eq!(malformed.status, 400, "{}", malformed.text);
+}
+
+#[tokio::test]
+async fn resource_template_refresh_does_not_change_tool_catalog_refreshed_at() {
+    let fixture = fixture().await;
+    let session = refresh_catalog(&fixture.proxy_state, "mcp-agg").await;
+    let before = get(&fixture.base, AGG, Some(&viewer()), None).await;
+    assert_eq!(before.status, 200, "{}", before.text);
+    let refreshed_at = before.body["catalogs"][0]["refreshed_at"].clone();
+    assert!(refreshed_at.is_string());
+
+    refresh_resource_templates(&fixture.proxy_state, "mcp-agg", &session).await;
+
+    let after = get(&fixture.base, AGG, Some(&viewer()), None).await;
+    assert_eq!(after.status, 200, "{}", after.text);
+    assert_eq!(after.body["catalogs"][0]["refreshed_at"], refreshed_at);
+    assert_eq!(after.body["catalogs"][0]["stale"], false);
+    assert_eq!(after.body["stale"], false);
 }
 
 #[tokio::test]

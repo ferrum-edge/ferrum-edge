@@ -984,7 +984,7 @@ struct McpCatalog {
     last_refreshed_at: Option<Instant>,
     resource_templates_refreshed_at: Option<Instant>,
     resource_templates_last_attempted_at: HashMap<String, Instant>,
-    last_refreshed_wall: DateTime<Utc>,
+    tools_refreshed_wall: Option<DateTime<Utc>>,
     // `(server_id, catalog family)` pairs whose most recent list refresh
     // failed and whose entries (if any) are being served stale from the last
     // good refresh. Bounded by configured servers x catalog families; exposed
@@ -1024,7 +1024,7 @@ impl Default for McpCatalog {
             last_refreshed_at: None,
             resource_templates_refreshed_at: None,
             resource_templates_last_attempted_at: HashMap::new(),
-            last_refreshed_wall: Utc::now(),
+            tools_refreshed_wall: None,
             degraded: BTreeSet::new(),
             last_good: BTreeSet::new(),
             unavailable: BTreeSet::new(),
@@ -4134,7 +4134,7 @@ impl McpGateway {
             catalog.version = catalog.version.saturating_add(1);
         }
         catalog.last_refreshed_at = Some(Instant::now());
-        catalog.last_refreshed_wall = discovered_at;
+        catalog.tools_refreshed_wall = Some(discovered_at);
         Ok(())
     }
 
@@ -4250,7 +4250,6 @@ impl McpGateway {
                     .insert(server.server_id.clone(), attempted_at);
             }
         }
-        catalog.last_refreshed_wall = discovered_at;
         Ok(())
     }
 
@@ -4316,7 +4315,6 @@ impl McpGateway {
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
-        catalog.last_refreshed_wall = discovered_at;
         Ok(())
     }
 
@@ -6761,15 +6759,8 @@ pub(crate) struct McpAdminToolSnapshot {
     /// `None` when every consumer is admitted subject to the action.
     pub(crate) allowed_groups: Option<Vec<String>>,
     pub(crate) denied_groups: Vec<String>,
-    pub(crate) input_schema: Arc<Value>,
+    pub(crate) schema_hash: String,
     pub(crate) discovered_at: DateTime<Utc>,
-}
-
-impl McpAdminToolSnapshot {
-    /// Lowercase hex SHA-256 of the serialized `inputSchema`.
-    pub(crate) fn input_schema_hash(&self) -> String {
-        hash_value(&self.input_schema)
-    }
 }
 
 impl McpGateway {
@@ -6778,7 +6769,10 @@ impl McpGateway {
     /// Catalogs are per downstream session, so this reports the most recently
     /// refreshed one. It is bounded by the catalog caps the refresh already
     /// enforced, plus one `Arc` clone per cached session.
-    pub(crate) fn admin_catalog_snapshot(&self) -> McpAdminCatalogSnapshot {
+    pub(crate) fn admin_catalog_snapshot(
+        &self,
+        allowed_methods: Option<&[String]>,
+    ) -> McpAdminCatalogSnapshot {
         let mediated = self.mode == McpGatewayMode::AggregateRouter;
         let catalogs: Vec<Arc<RwLock<McpCatalog>>> = if mediated {
             self.session_catalogs_by_hash
@@ -6815,7 +6809,14 @@ impl McpGateway {
                 catalog
                     .tools
                     .values()
-                    .map(|entry| self.admin_tool_snapshot(entry, &group_names, hide_denied_tools))
+                    .map(|entry| {
+                        self.admin_tool_snapshot(
+                            entry,
+                            &group_names,
+                            hide_denied_tools,
+                            allowed_methods,
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -6852,7 +6853,7 @@ impl McpGateway {
             max_catalog_items_per_list: self.validation.max_catalog_items_per_list,
             max_catalog_bytes_per_list: self.validation.max_catalog_bytes_per_list,
             cached_sessions: catalogs.len(),
-            refreshed_at: catalog.map(|catalog| catalog.last_refreshed_wall),
+            refreshed_at: catalog.and_then(|catalog| catalog.tools_refreshed_wall),
             stale: catalog.is_none_or(|catalog| catalog.is_stale(self.discovery.cache_ttl)),
             catalog_version: catalog.map(|catalog| catalog.version),
             tools_unavailable: catalog.is_some_and(|catalog| {
@@ -6869,6 +6870,7 @@ impl McpGateway {
         entry: &ToolCatalogEntry,
         group_names: &[&str],
         hide_denied_tools: bool,
+        allowed_methods: Option<&[String]>,
     ) -> McpAdminToolSnapshot {
         let action = self.policy.action_for_tool(&entry.public_name);
         let effective = if entry.hidden_by_schema_change {
@@ -6879,6 +6881,9 @@ impl McpGateway {
             action.as_str()
         };
         let grant = self.policy.grant_for_tool(&entry.public_name);
+        let route_allowed = self
+            .bridge_operation_method(entry)
+            .is_none_or(|method| bridge_method_is_allowed(allowed_methods, method));
         McpAdminToolSnapshot {
             name: entry.public_name.clone(),
             title: entry.title.clone(),
@@ -6891,15 +6896,17 @@ impl McpGateway {
             action: action.as_str(),
             explicitly_configured: self.policy.tools.contains_key(&entry.public_name),
             effective,
-            listed: !entry.hidden_from_discovery && (entry.enabled || !hide_denied_tools),
-            callable: entry.enabled,
+            listed: route_allowed
+                && !entry.hidden_from_discovery
+                && (entry.enabled || !hide_denied_tools),
+            callable: route_allowed && entry.enabled,
             allowed_groups: grant
                 .and_then(|grant| grant.allowed)
                 .map(|allowed| admin_group_names(&allowed, group_names)),
             denied_groups: grant
                 .map(|grant| admin_group_names(&grant.denied, group_names))
                 .unwrap_or_default(),
-            input_schema: Arc::clone(&entry.input_schema),
+            schema_hash: entry.schema_hash.clone(),
             discovered_at: entry.discovered_at,
         }
     }
@@ -10212,10 +10219,16 @@ fn parse_servers(
 /// Whether the matched route's `allowed_methods` (when set) admits the method
 /// an OpenAPI bridge call dispatches.
 fn bridge_method_allowed_on_route(ctx: &RequestContext, method: &str) -> bool {
-    ctx.matched_proxy
-        .as_deref()
-        .and_then(|proxy| proxy.allowed_methods.as_deref())
-        .is_none_or(|allowed| crate::proxy::request_method_is_allowed(allowed, method))
+    bridge_method_is_allowed(
+        ctx.matched_proxy
+            .as_deref()
+            .and_then(|proxy| proxy.allowed_methods.as_deref()),
+        method,
+    )
+}
+
+fn bridge_method_is_allowed(allowed_methods: Option<&[String]>, method: &str) -> bool {
+    allowed_methods.is_none_or(|allowed| crate::proxy::request_method_is_allowed(allowed, method))
 }
 
 /// Map an OpenAPI bridge operation's public request path onto the backend path
