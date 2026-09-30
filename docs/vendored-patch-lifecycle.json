@@ -796,7 +796,7 @@
       "docs_path": "docs/upstream-hyper-patches/003-greedy-h1-read/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "tokio-rustls returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher moved bulk bodies 16 KiB at a time and paid its per-chunk path for every record; after a full-record read, Buffered now keeps reading while the transport has more ready (#5588).",
+      "reason": "tokio-rustls returns one decrypted TLS record per read, so hyper's HTTP/1 dispatcher moved bulk bodies 16 KiB at a time and paid its per-chunk path for every record; after a full-record read, Buffered now keeps reading while the transport has more ready (#5588). The patch also changes the HTTP/1 upgrade handoff: Rewind and Upgraded carry a read error met during that read-ahead into the tunnel after the buffered bytes, so a WebSocket or TCP relay sees the reset instead of a clean EOF (#5911).",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/hyper",

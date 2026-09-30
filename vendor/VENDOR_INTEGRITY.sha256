@@ -246,7 +246,7 @@ a3405c478bc3a1b6187e0393745d778441cf416138e082abb047aa0c4c3b3fde  vendor/hyper-1
 7339f38e4fc2fc4dec82692e6495bf655d4e6a0d3e50c58cf0e7511a9b3749a9  vendor/hyper-1.9.0-ferrum-patched/src/proto/h1/decode.rs
 13bf1050b105efff3e0f6cecbceec7d0ca0a14723a8c0b001bdafc67fe7a6dba  vendor/hyper-1.9.0-ferrum-patched/src/proto/h1/dispatch.rs
 2483a7e4ee55663f7738da26f111a00ac999f68e4de432a680755402c325a4df  vendor/hyper-1.9.0-ferrum-patched/src/proto/h1/encode.rs
-78c551904fa237b7ce72d27a69123bb9b169f4fe55c3f12f4551b64a439c7ff6  vendor/hyper-1.9.0-ferrum-patched/src/proto/h1/io.rs
+d601106e53bdea3f0585e21d005c2829fd0cc88df54cb918eca930242b75bee1  vendor/hyper-1.9.0-ferrum-patched/src/proto/h1/io.rs
 179bbde1399e5d827175f27157b96fb7bd6da9707965ad7df41fa85f24e80588  vendor/hyper-1.9.0-ferrum-patched/src/proto/h1/mod.rs
 c13307092a033ae9696893c83f27f75f3dbe5da50d17a2c58cd8e98ebfbf1917  vendor/hyper-1.9.0-ferrum-patched/src/proto/h1/role.rs
 15fdf02cdac55bcf1c98b8fd362f465b3da98959ca70ffb4da1df57633d740e9  vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/client.rs
