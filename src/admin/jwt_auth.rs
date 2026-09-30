@@ -608,8 +608,7 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
 
 /// Message for a viewer secret equal to the primary admin secret. Names both
 /// settings and neither value.
-pub const ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR: &str =
-    "FERRUM_ADMIN_JWT_VIEWER_SECRET must differ from FERRUM_ADMIN_JWT_SECRET; identical values \
+pub const ADMIN_JWT_VIEWER_SECRET_EQUALS_PRIMARY_ERROR: &str = "FERRUM_ADMIN_JWT_VIEWER_SECRET must differ from FERRUM_ADMIN_JWT_SECRET; identical values \
      would let a viewer-secret holder mint tokens the primary key accepts without the viewer \
      role ceiling";
 

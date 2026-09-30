@@ -118,10 +118,7 @@ fn two_tenant_config(staging_key: &str) -> GatewayConfig {
     .expect("fixture deserializes")
 }
 
-fn admin_state(
-    cached: Arc<ArcSwap<GatewayConfig>>,
-    require_namespace_claim: bool,
-) -> AdminState {
+fn admin_state(cached: Arc<ArcSwap<GatewayConfig>>, require_namespace_claim: bool) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: jwt_manager(),

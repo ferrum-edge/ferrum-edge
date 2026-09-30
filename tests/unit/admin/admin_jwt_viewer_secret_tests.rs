@@ -103,7 +103,8 @@ fn viewer_secret_token_is_capped_at_viewer_whatever_its_role_claim() {
 
         let actor = AuditActor::from_verified(&verified).expect("actor builds");
         assert_eq!(
-            actor.role, AdminRole::Viewer,
+            actor.role,
+            AdminRole::Viewer,
             "a viewer-secret token claiming `{}` must authorize as viewer",
             claimed.as_str()
         );
@@ -249,8 +250,8 @@ fn identical_and_short_viewer_secrets_are_refused_without_echoing_them() {
     assert!(!message.contains(PRIMARY_SECRET));
 
     let short = "short-viewer-secret";
-    let refused = JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER))
-        .with_viewer_secret(short.to_string());
+    let refused =
+        JwtManager::new(jwt_config(PRIMARY_SECRET, ISSUER)).with_viewer_secret(short.to_string());
     let Err(JwtError::VerificationFailed(message)) = refused else {
         panic!("a viewer secret under 32 characters must be refused");
     };
