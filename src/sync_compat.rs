@@ -12,7 +12,7 @@
 //! arguments, same orderings, same closure contract, same result — and is the
 //! single place the deprecation is allowed. Once every fuzz lane moves to a
 //! nightly at or above Rust 1.95, call `try_update` directly and delete this
-//! module (tracked by the fuzz-toolchain follow-up issue).
+//! module (tracked by ferrum-edge/ferrum-edge#5965).
 
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
