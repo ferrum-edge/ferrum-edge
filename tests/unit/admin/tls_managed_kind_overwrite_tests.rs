@@ -657,9 +657,76 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
             "{owner} error must identify the CA field, got: {errors}"
         );
         assert!(
-            errors.contains("has kind ca_bundle, expected certificate"),
-            "{owner} error must explain the selected material kind is absent, got: {errors}"
+            errors.contains(
+                "fragment selects cert material, but this field expects ca_bundle material"
+            ),
+            "{owner} error must explain the fragment contradicts the CA field, got: {errors}"
         );
+    }
+
+    // Issue #5959: a certificate record must not reach a CA field through a
+    // fragment, a collection segment, or a `?kind=` hint — even when the
+    // referenced record exists and would load.
+    let cert_id = format!("ref-cert-{}", Uuid::new_v4().simple());
+    let create_cert = send_raw_admin_request(
+        addr,
+        "POST",
+        Collection::Certificate.path(),
+        &token,
+        &create_body(Collection::Certificate, &cert_id, &fixtures),
+    )
+    .await;
+    assert_eq!(
+        raw_http_status(&create_cert),
+        201,
+        "create certificate record: {create_cert}"
+    );
+    for (value, reason) in [
+        (
+            format!("managed://certificates/{cert_id}#cert"),
+            "fragment selects cert material, but this field expects ca_bundle material",
+        ),
+        (
+            format!("managed://{cert_id}#chain"),
+            "fragment selects cert material, but this field expects ca_bundle material",
+        ),
+        (
+            format!("managed://certificates/{ca_id}"),
+            "collection `certificates` holds certificate records, which cannot supply \
+             ca_bundle material",
+        ),
+        (
+            format!("managed://certificates/{cert_id}?kind=cert"),
+            "`kind` option selects cert material, but this field expects ca_bundle material",
+        ),
+    ] {
+        gateway_for_admission.proxies[0].backend_tls_server_ca_cert_path = Some(value.clone());
+        gateway_for_admission.upstreams[0].backend_tls_server_ca_cert_path = Some(value.clone());
+        let errors = gateway_for_admission
+            .validate_all_fields(30)
+            .expect_err("an incompatible CA reference must not be admitted");
+        assert_eq!(
+            errors.len(),
+            2,
+            "{value}: proxy and upstream should each report one error: {errors:?}"
+        );
+        for error in &errors {
+            assert!(
+                error.contains("backend_tls_server_ca_cert_path") && error.contains(reason),
+                "{value}: error must name the CA field and the mismatch, got: {error}"
+            );
+        }
+    }
+    for value in [
+        format!("managed://{ca_id}"),
+        format!("managed://{ca_id}#ca-bundle"),
+        format!("managed://ca-bundles/{ca_id}?kind=ca-bundle"),
+    ] {
+        gateway_for_admission.proxies[0].backend_tls_server_ca_cert_path = Some(value.clone());
+        gateway_for_admission.upstreams[0].backend_tls_server_ca_cert_path = Some(value.clone());
+        if let Err(errors) = gateway_for_admission.validate_all_fields(30) {
+            panic!("{value}: a compatible CA reference must stay admitted: {errors:?}");
+        }
     }
 
     let same_kind = send_raw_admin_request(

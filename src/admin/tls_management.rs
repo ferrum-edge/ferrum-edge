@@ -1874,7 +1874,8 @@ fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
         ManagedTlsError::InvalidId(_)
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
-        | ManagedTlsError::WrongKind { .. } => StatusCode::BAD_REQUEST,
+        | ManagedTlsError::WrongKind { .. }
+        | ManagedTlsError::IncompatibleReference(_) => StatusCode::BAD_REQUEST,
         // Bounded admitted material and an oversized candidate document are
         // write-side admission decisions, so they stay caller-facing 413s. An
         // authoritative document that is already oversized is unreachable
@@ -1910,7 +1911,8 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         | AcmeError::InvalidPath(_)
         | AcmeError::InvalidChallengeToken(_)
         | AcmeError::BlockedDirectoryUrl(_)
-        | AcmeError::MissingMaterial { .. } => StatusCode::BAD_REQUEST,
+        | AcmeError::MissingMaterial { .. }
+        | AcmeError::IncompatibleReference(_) => StatusCode::BAD_REQUEST,
         // Admitted material and an oversized candidate document are write-side
         // admission decisions, so they stay caller-facing 413s. An
         // authoritative document that is already oversized maps to 500 below.

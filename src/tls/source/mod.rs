@@ -870,6 +870,7 @@ pub fn load_material_blocking_with(
     max_bytes: usize,
 ) -> Result<MaterializedMaterial, MaterialError> {
     let max_bytes = validate_explicit_tls_max_material_size_bytes(max_bytes)?;
+    validate_source_field_kind(source, fallback_kind)?;
     match source {
         CertSource::Path(path) => load_file_material_with(path, fallback_kind, max_bytes),
         CertSource::InlinePem(secret) => {
@@ -928,6 +929,98 @@ pub fn load_material_blocking_with(
         CertSource::Uri(uri) => Err(MaterialError::UnsupportedScheme {
             scheme: uri.scheme.as_str(),
         }),
+    }
+}
+
+/// Reject explicit material selectors in a source reference that contradict
+/// the material kind its configured field expects (issue #5959).
+///
+/// Besides the field it is configured in, a reference can name its material
+/// through a `?kind=` hint, a scheme-specific fragment or data key
+/// (`managed://…#cert`, `acme://…#key`, `k8s://…#ca.crt`, `vault://…#ca`), and
+/// for `managed://` / `acme://` a collection path segment (`ca-bundles/`,
+/// `certificates/`). Each used to be honored or ignored without consulting the
+/// field, so `backend_tls_server_ca_cert_path:
+/// managed://certificates/<id>#cert` loaded a leaf certificate and its chain
+/// into a trust store. Now a CA field accepts only CA selectors (`#ca`,
+/// `#ca-bundle`, `ca-bundles/`, Kubernetes `ca.crt`), a certificate field only
+/// certificate selectors, and a key field only key selectors.
+///
+/// `field_kind` is the kind the owning field declares; `Unknown` means the
+/// caller has no field kind and the reference's own selectors decide. Paths,
+/// inline PEM, and `system://` carry no selectors. A Kubernetes data key or
+/// provider secret field that names no material kind (`custom.pem`) is the
+/// operator's own naming and stays admitted.
+///
+/// Every load ([`load_material_blocking_with`]) runs this before resolving
+/// anything, and config validation runs it without loading
+/// (`config::types::validate_tls_material_source_field` and `EnvConfig`
+/// validation), so an incompatible reference is an admission error rather than
+/// a handshake failure.
+pub fn validate_source_field_kind(
+    source: &CertSource,
+    field_kind: MaterialKind,
+) -> Result<(), MaterialError> {
+    let CertSource::Uri(uri) = source else {
+        return Ok(());
+    };
+    if field_kind == MaterialKind::Unknown || uri.scheme == SourceScheme::System {
+        return Ok(());
+    }
+    if let Some(hint) = uri.options.get("kind") {
+        let details = match MaterialKind::parse(hint) {
+            Some(kind) if kind == field_kind => None,
+            Some(kind) => Some(format!(
+                "`kind` option selects {kind} material, but this field expects {field_kind} \
+                 material"
+            )),
+            None => Some(format!(
+                "`kind` option is not a recognized material kind; this field expects \
+                 {field_kind} material"
+            )),
+        };
+        if let Some(details) = details {
+            return Err(incompatible_source_selector(uri, details));
+        }
+    }
+    match uri.scheme {
+        SourceScheme::Managed => {
+            crate::tls::managed::validate_source_reference_kind(&uri.identifier, field_kind)
+                .map_err(|error| incompatible_source_selector(uri, error.to_string()))
+        }
+        SourceScheme::Acme => {
+            crate::tls::acme::validate_source_reference_kind(&uri.identifier, field_kind)
+                .map_err(|error| incompatible_source_selector(uri, error.to_string()))
+        }
+        SourceScheme::K8sSecret => K8sSecretReference::parse(uri, field_kind).map(|_| ()),
+        // Vault and AWS select a field of the stored secret with `#<field>`.
+        // Field names are operator-chosen; only one that names a material kind
+        // is a selector this check can contradict.
+        SourceScheme::Vault | SourceScheme::Aws => {
+            let selected = uri
+                .identifier
+                .split_once('#')
+                .and_then(|(_, field)| MaterialKind::parse(field))
+                .filter(|kind| *kind != MaterialKind::Unknown);
+            match selected {
+                Some(kind) if kind != field_kind => {
+                    let details = format!(
+                        "secret field selects {kind} material, but this field expects \
+                         {field_kind} material"
+                    );
+                    Err(incompatible_source_selector(uri, details))
+                }
+                _ => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn incompatible_source_selector(uri: &CertSourceUri, details: String) -> MaterialError {
+    MaterialError::InvalidSource {
+        source_id: uri.redacted_source_id(),
+        details,
     }
 }
 
@@ -1789,6 +1882,20 @@ impl K8sSecretReference {
         } else {
             uri.kind
         };
+        // A well-known data key names its material; it must be the kind the
+        // field expects, so `#tls.crt` cannot feed a CA field (issue #5959).
+        if kind != MaterialKind::Unknown
+            && let Some(selected) = k8s_data_key_material_kind(&data_key)
+            && selected != kind
+        {
+            return Err(MaterialError::InvalidSource {
+                source_id,
+                details: format!(
+                    "Kubernetes Secret data key selects {selected} material, but this field \
+                     expects {kind} material"
+                ),
+            });
+        }
         let source_id = format!(
             "{}://{}/{}#{}",
             uri.scheme.as_str(),
@@ -1848,6 +1955,22 @@ fn default_k8s_secret_key(
         MaterialKind::Jwks => Some("jwks.json"),
         MaterialKind::Ocsp => Some("ocsp.der"),
         MaterialKind::Unknown => None,
+    }
+}
+
+/// Material kind a Kubernetes Secret data key names: the standard
+/// `kubernetes.io/tls` keys, the defaults [`default_k8s_secret_key`] selects,
+/// or a key spelled as a material kind (`ca`, `cert`, `key`). Any other key is
+/// operator naming and names no kind.
+fn k8s_data_key_material_kind(data_key: &str) -> Option<MaterialKind> {
+    match data_key {
+        "tls.crt" => Some(MaterialKind::Cert),
+        "tls.key" => Some(MaterialKind::Key),
+        "ca.crt" => Some(MaterialKind::CaBundle),
+        "tls.crl" => Some(MaterialKind::Crl),
+        "jwks.json" => Some(MaterialKind::Jwks),
+        "ocsp.der" => Some(MaterialKind::Ocsp),
+        other => MaterialKind::parse(other).filter(|kind| *kind != MaterialKind::Unknown),
     }
 }
 

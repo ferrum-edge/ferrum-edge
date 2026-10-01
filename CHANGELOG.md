@@ -18,6 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is rejected. Fragmentless `k8s://` and secret-provider CA sources in these
   fields now check expiry against the CA data key (`ca.crt`), so a valid
   `tls.crt` cannot mask an expired CA certificate.
+- **TLS source selectors must match the field's material kind** (#5959). A
+  source reference's explicit fragment, Kubernetes data key, `?kind=` hint,
+  and `managed://` / `acme://` collection segment were checked only against
+  the stored record, never against the field. A CA field such as
+  `backend_tls_server_ca_cert_path: managed://certificates/<id>#cert`
+  therefore loaded a leaf certificate and its chain as trust anchors. A CA
+  field now accepts only CA selectors (`#ca`, `#ca-bundle`, `ca-bundles/`,
+  `ca.crt`, `?kind=ca-bundle`), a certificate field only certificate
+  selectors, and a key field only key selectors. Unknown `managed://`
+  collections, `acme://` collections other than `certificates`, and
+  unrecognized `?kind=` values are refused. The check covers `managed://`,
+  `acme://`, `k8s://`, `vault://` / `aws://` secret fields, and `?kind=` on
+  every scheme. It runs at config admission (proxy, upstream, Gateway frontend
+  certificates, mesh/Istio `caCertificates`, and every `FERRUM_*` TLS
+  material setting, so `ferrum-edge validate` reports it) and again at every
+  material load. Breaking: references that relied on a contradictory selector
+  must be corrected.
 
 ### Changed
 
