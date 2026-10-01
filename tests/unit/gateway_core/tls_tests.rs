@@ -284,7 +284,12 @@ fn test_check_cert_expiry_rejects_all_malformed_certificate_records() {
 
 #[test]
 fn test_check_cert_expiry_for_validation_returns_string_error() {
-    let result = check_cert_expiry_for_validation("/nonexistent/cert.pem", "test_field", 30);
+    let result = check_cert_expiry_for_validation(
+        "/nonexistent/cert.pem",
+        ferrum_edge::tls::source::MaterialKind::Cert,
+        "test_field",
+        30,
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("failed to read"));
@@ -296,7 +301,12 @@ fn test_check_cert_expiry_for_validation_valid_cert_succeeds() {
     let (cert_pem, _key_pem) = generate_self_signed_cert(&["localhost"]);
     let cert_path = write_pem(&dir, "cert.pem", &cert_pem);
 
-    let result = check_cert_expiry_for_validation(&cert_path, "test_field", 30);
+    let result = check_cert_expiry_for_validation(
+        &cert_path,
+        ferrum_edge::tls::source::MaterialKind::Cert,
+        "test_field",
+        30,
+    );
     assert!(result.is_ok());
 }
 

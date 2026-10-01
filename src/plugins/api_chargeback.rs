@@ -50,6 +50,7 @@ use crate::plugins::utils::log_schema::{
     DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
     SummarySchema, TimestampFormat, resolve_schema,
 };
+use crate::sync_compat::AtomicUpdate;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Closed top-level config key set for `api_chargeback` admission.
@@ -1556,7 +1557,7 @@ impl ChargebackRegistry {
             let max_entries = self.max_entries.load(Ordering::Acquire);
             if self
                 .reserved_entries
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
                     (count < max_entries).then_some(count + 1)
                 })
                 .is_err()
@@ -1567,7 +1568,7 @@ impl ChargebackRegistry {
         let max_bytes = self.max_retained_bytes.load(Ordering::Acquire);
         let reserved = self
             .retained_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
                 let next = used.checked_add(entry_bytes)?;
                 (next <= max_bytes).then_some(next)
             })

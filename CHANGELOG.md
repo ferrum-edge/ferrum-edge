@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Fragmentless managed CA references now pass backend TLS expiry admission**
+  (#5957). Proxy and upstream CA fields, as well as DP gRPC and DTLS client-CA
+  expiry checks, now resolve sources with their declared CA-bundle material
+  kind. The `managed://ca-bundles/<id>` URI advertised by the managed CA API
+  works without a `#ca` fragment; explicit material fragments remain honored,
+  and a fragment selecting a material part the referenced record does not hold
+  is rejected. Fragmentless `k8s://` and secret-provider CA sources in these
+  fields now check expiry against the CA data key (`ca.crt`), so a valid
+  `tls.crt` cannot mask an expired CA certificate.
+- **TLS source selectors must match the field's material kind** (#5959). A
+  source reference's explicit fragment, Kubernetes data key, `?kind=` hint,
+  and `managed://` / `acme://` collection segment were checked only against
+  the stored record, never against the field. A CA field such as
+  `backend_tls_server_ca_cert_path: managed://certificates/<id>#cert`
+  therefore loaded a leaf certificate and its chain as trust anchors. A CA
+  field now accepts only CA selectors (`#ca`, `#ca-bundle`, `ca-bundles/`,
+  `ca.crt`, `?kind=ca-bundle`), a certificate field only certificate
+  selectors, and a key field only key selectors. Unknown `managed://`
+  collections, `acme://` collections other than `certificates`, and
+  unrecognized `?kind=` values are refused. The check covers `managed://`,
+  `acme://`, `k8s://`, `vault://` / `aws://` secret fields, and `?kind=` on
+  every scheme. Kubernetes data keys and `vault://` / `aws://` secret fields
+  share one well-known key map (`tls.crt`, `tls.key`, `ca.crt`, …, plus keys
+  spelled as a material kind), so `vault://…#tls.crt` in
+  `FERRUM_TLS_CA_BUNDLE_PATH` is refused just like `k8s://…#tls.crt`. It runs
+  at config admission (proxy, upstream, Gateway frontend certificates,
+  mesh/Istio DestinationRule `caCertificates`, `clientCertificate`, and
+  `privateKey`, and every `FERRUM_*` TLS material setting, so
+  `ferrum-edge validate` reports it; the Admin API returns its usual `400`
+  validation error) and again at every material load. Breaking: references that relied on a contradictory selector
+  must be corrected.
+
 ### Changed
 
 - Documented the Edge-owned contract vocabularies (`gateway-errors`,
@@ -16,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by consumers via `contracts-edge-<edge-version>` tags. The README lists the
   Edge source files whose changes require a ferrum-contracts PR, and CLAUDE.md
   notes the requirement.
+- Suppressed Rust 1.99's `clippy::double_must_use` on `#[async_trait]` traits
+  and tonic-generated proto modules, and dropped needless borrows flagged by
+  `clippy::needless_borrows_for_generic_args`.
+- Routed atomic read-modify-write updates through a crate-private
+  `sync_compat::AtomicUpdate::update_with` shim, so the crate builds without
+  Rust 1.99's `fetch_update` deprecation while the fuzz lanes stay on pinned
+  `nightly-2025-07-01`, where `try_update` is unstable. The h2 guard observer
+  uses an equivalent compare-exchange loop, with its pinned hashes refreshed.
 
 ### Performance
 

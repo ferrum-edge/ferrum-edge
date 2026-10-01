@@ -33,6 +33,9 @@ use multi_protocol_perf::tls_utils;
 // ── gRPC service ─────────────────────────────────────────────────────────────
 
 pub mod bench_proto {
+    // tonic's generated server traits expand through async-trait, which adds a
+    // bare `#[must_use]` to methods already returning a must-use boxed future.
+    #![allow(clippy::double_must_use)]
     tonic::include_proto!("bench");
 }
 

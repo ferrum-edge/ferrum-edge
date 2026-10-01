@@ -411,6 +411,7 @@ pub fn admit_discovered_snapshot(
 }
 
 /// Trait for service discovery providers.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait::async_trait]
 pub trait ServiceDiscoverer: Send + Sync {
     /// Discover current targets from the external registry.

@@ -842,6 +842,62 @@ fn dr_tls_translation_rejects_istio_mutual_with_explicit_cert() {
 }
 
 #[test]
+fn dr_tls_translation_rejects_client_material_selectors_of_the_wrong_kind() {
+    let cases = [
+        (
+            "k8s://default/client-tls#tls.key",
+            "k8s://default/client-tls#tls.key",
+            "trafficPolicy.tls.clientCertificate",
+            "selects key material, but this field expects cert material",
+        ),
+        (
+            "k8s://default/client-tls#tls.crt",
+            "k8s://default/client-tls#tls.crt",
+            "trafficPolicy.tls.privateKey",
+            "selects cert material, but this field expects key material",
+        ),
+    ];
+    for (client_certificate, private_key, field, reason) in cases {
+        let err = translate_k8s_objects(
+            &[istio_object(
+                "DestinationRule",
+                "reviews",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "tls": {
+                            "mode": "MUTUAL",
+                            "clientCertificate": client_certificate,
+                            "privateKey": private_key
+                        }
+                    }
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect_err("a client material selector of the wrong kind must be rejected (#5959)");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(field) && rendered.contains(reason),
+            "{field} must reject the mismatched selector ({reason:?}), got: {rendered}"
+        );
+    }
+
+    let (_, tls) = translate_dr(serde_json::json!({
+        "host": "reviews.default.svc.cluster.local",
+        "trafficPolicy": {
+            "tls": {
+                "mode": "MUTUAL",
+                "clientCertificate": "k8s://default/client-tls#tls.crt",
+                "privateKey": "k8s://default/client-tls#tls.key"
+            }
+        }
+    }));
+    let tls = tls.expect("matching client certificate and key selectors stay admitted");
+    assert_eq!(tls.mode, MtlsMode::Mutual);
+}
+
+#[test]
 fn dr_subset_istio_mutual_without_runtime_svid_fails_closed() {
     // GAP-3B fail-closed regression guard: a subset configured for
     // `ISTIO_MUTUAL` without SVID material must REJECT the slice, not

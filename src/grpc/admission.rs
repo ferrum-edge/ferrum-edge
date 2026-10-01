@@ -62,6 +62,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
 use crate::fips::approved::Sha256;
+use crate::sync_compat::AtomicUpdate;
 
 /// Closed metric/log dimension for the native stream handlers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,7 +703,7 @@ impl CpGrpcAdmissionController {
         }
         self.inner
             .total_streams
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current >= max {
                     None
                 } else {
@@ -719,7 +720,7 @@ impl CpGrpcAdmissionController {
         let _ =
             self.inner
                 .total_streams
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
                     Some(current.saturating_sub(1))
                 });
     }
@@ -823,7 +824,7 @@ impl CpGrpcAdmissionController {
         }
         self.inner
             .active_nodes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current >= max {
                     None
                 } else {
@@ -857,7 +858,7 @@ impl CpGrpcAdmissionController {
                     // then make the key vacant for a new generation.
                     cleanup();
                     entry.remove();
-                    let _ = self.inner.active_nodes.fetch_update(
+                    let _ = self.inner.active_nodes.update_with(
                         Ordering::AcqRel,
                         Ordering::Acquire,
                         |current| Some(current.saturating_sub(1)),

@@ -69,6 +69,7 @@ pub enum AttestError {
 }
 
 /// A workload attestor.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait Attestor: Send + Sync + 'static {
     /// Short kind identifier, e.g. "k8s_psat", "unix", "static".

@@ -653,6 +653,7 @@ impl RemoteEndpointStore {
 /// Abstracts the remote-cluster endpoint fetch so the discovery loop is
 /// testable without a live remote control plane. The production implementation
 /// is [`NativeRemoteSource`]; tests inject a deterministic mock.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait RemoteServiceSource: Send + Sync {
     /// Fetch the remote cluster's current service endpoints. Returns `Err` on

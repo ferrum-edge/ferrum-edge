@@ -106,6 +106,7 @@
 //! unrelated name change fails closed.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
+use crate::sync_compat::AtomicUpdate;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -4273,7 +4274,7 @@ impl AiToolGovernor {
     /// production ceiling remains [`MAX_APPROVAL_BATCH_DEADLINE`].
     pub fn advance_approval_clock_for_tests(&self, duration: Duration) {
         let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-        let _ = self.engine.approval_clock_offset_ms.fetch_update(
+        let _ = self.engine.approval_clock_offset_ms.update_with(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_add(millis)),

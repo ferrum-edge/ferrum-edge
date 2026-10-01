@@ -25,6 +25,9 @@
 /// speaks, rather than adding a second copy of the proto or a `tonic-health`
 /// dependency.
 pub mod grpc_health_v1 {
+    // tonic's generated server traits expand through async-trait, which adds a
+    // bare `#[must_use]` to methods already returning a must-use boxed future.
+    #![allow(clippy::double_must_use)]
     tonic::include_proto!("grpc.health.v1");
 }
 

@@ -49,6 +49,7 @@
 
 #![allow(dead_code)]
 
+use crate::sync_compat::AtomicUpdate;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -375,7 +376,7 @@ fn observe_latency(
 #[inline]
 fn saturating_increment(counter: &AtomicU64) -> bool {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        .update_with(Ordering::Relaxed, Ordering::Relaxed, |old| {
             old.checked_add(1)
         })
         .is_ok()

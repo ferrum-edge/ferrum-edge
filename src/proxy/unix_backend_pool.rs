@@ -411,6 +411,7 @@ mod imp {
         handshake_unix_h2c_sender,
     };
     use crate::runtime_metrics::PoolKind;
+    use crate::sync_compat::AtomicUpdate;
     use crate::util::unix_socket::AdmittedUnixSocket;
 
     /// Bounded budget the graceful shutdown gives Unix connection drivers to
@@ -1557,7 +1558,7 @@ mod imp {
             if count == 0 {
                 return;
             }
-            let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            let _ = gauge.update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(count))
             });
         }

@@ -6241,12 +6241,38 @@ pub(crate) fn validate_tls_material_source_field(
         #[cfg(not(feature = "pkcs11"))]
         validate_pkcs11_key_source(field_name, uri)?;
     }
+    validate_tls_source_field_kind(field_name, value, kind)?;
     match source {
         crate::tls::source::CertSource::InlinePem(_) => {
             validate_string_field(field_name, value, MAX_TLS_INLINE_PEM_LENGTH)
         }
         _ => validate_string_field(field_name, value, MAX_FILE_PATH_LENGTH),
     }
+}
+
+/// Reject a TLS source whose explicit material selectors — a `?kind=` hint,
+/// a fragment or data key, or a `managed://`/`acme://` collection — contradict
+/// the material kind `field_name` expects (issue #5959). Pure: nothing is
+/// loaded, so the rejection happens at admission even where material is only
+/// resolved later (DP, mesh, listener startup).
+pub(crate) fn validate_tls_source_field_kind(
+    field_name: &str,
+    value: &str,
+    kind: crate::tls::source::MaterialKind,
+) -> Result<(), String> {
+    let source = crate::tls::source::CertSource::parse(value, kind);
+    crate::tls::source::validate_source_field_kind(&source, kind)
+        .map_err(|error| format!("`{field_name}`: {error}"))
+}
+
+/// True when `value`'s explicit material selectors agree with `kind`.
+///
+/// Content validation (load + parse + expiry) skips a source the static
+/// [`validate_tls_material_source_field`] pass already rejected for its
+/// selectors, so one misconfiguration is reported once rather than twice.
+fn tls_source_selectors_match(value: &str, kind: crate::tls::source::MaterialKind) -> bool {
+    let source = crate::tls::source::CertSource::parse(value, kind);
+    crate::tls::source::validate_source_field_kind(&source, kind).is_ok()
 }
 
 /// Admit `system://` only in its exact canonical spelling, and only where
@@ -8599,11 +8625,14 @@ impl Proxy {
             let already_validated = validated_tls_paths
                 .as_ref()
                 .is_some_and(|s| s.contains(&cache_key));
-            if !already_validated {
+            if !already_validated
+                && tls_source_selectors_match(path, crate::tls::source::MaterialKind::Cert)
+            {
                 if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
+                    crate::tls::source::MaterialKind::Cert,
                     "backend_tls_client_cert_path",
                     cert_expiry_warning_days,
                 ) {
@@ -8618,7 +8647,9 @@ impl Proxy {
             let already_validated = validated_tls_paths
                 .as_ref()
                 .is_some_and(|s| s.contains(&cache_key));
-            if !already_validated {
+            if !already_validated
+                && tls_source_selectors_match(path, crate::tls::source::MaterialKind::Key)
+            {
                 if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
@@ -8632,11 +8663,14 @@ impl Proxy {
             let already_validated = validated_tls_paths
                 .as_ref()
                 .is_some_and(|s| s.contains(&cache_key));
-            if !already_validated {
+            if !already_validated
+                && tls_source_selectors_match(path, crate::tls::source::MaterialKind::CaBundle)
+            {
                 if let Err(e) = validate_pem_ca_file("backend_tls_server_ca_cert_path", path) {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
+                    crate::tls::source::MaterialKind::CaBundle,
                     "backend_tls_server_ca_cert_path",
                     cert_expiry_warning_days,
                 ) {
@@ -10052,11 +10086,14 @@ impl Upstream {
         if let Some(ref path) = self.backend_tls_client_cert_path {
             let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
             let already_validated = validated_tls_paths.contains(&cache_key);
-            if !already_validated {
+            if !already_validated
+                && tls_source_selectors_match(path, crate::tls::source::MaterialKind::Cert)
+            {
                 if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
+                    crate::tls::source::MaterialKind::Cert,
                     "backend_tls_client_cert_path",
                     cert_expiry_warning_days,
                 ) {
@@ -10069,7 +10106,9 @@ impl Upstream {
         if let Some(ref path) = self.backend_tls_client_key_path {
             let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
             let already_validated = validated_tls_paths.contains(&cache_key);
-            if !already_validated {
+            if !already_validated
+                && tls_source_selectors_match(path, crate::tls::source::MaterialKind::Key)
+            {
                 if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
                     errors.push(e);
                 } else {
@@ -10081,11 +10120,14 @@ impl Upstream {
             let cache_key =
                 tls_validation_cache_key(crate::tls::source::MaterialKind::CaBundle, path);
             let already_validated = validated_tls_paths.contains(&cache_key);
-            if !already_validated {
+            if !already_validated
+                && tls_source_selectors_match(path, crate::tls::source::MaterialKind::CaBundle)
+            {
                 if let Err(e) = validate_pem_ca_file("backend_tls_server_ca_cert_path", path) {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
+                    crate::tls::source::MaterialKind::CaBundle,
                     "backend_tls_server_ca_cert_path",
                     cert_expiry_warning_days,
                 ) {
@@ -10811,6 +10853,21 @@ impl GatewayConfig {
                 "frontend_tls_key_path",
                 key,
                 crate::tls::source::MaterialKind::Key,
+            ) {
+                errors.push(error);
+            }
+        }
+        // Distributed frontend certificates must not select key or CA material
+        // through a fragment, collection, or `?kind=` (issue #5959).
+        for cert in self.frontend_tls_cert_path.iter().chain(
+            self.frontend_tls_certificate_sources
+                .iter()
+                .map(|source| &source.cert_path),
+        ) {
+            if let Err(error) = validate_tls_source_field_kind(
+                "frontend_tls_cert_path",
+                cert,
+                crate::tls::source::MaterialKind::Cert,
             ) {
                 errors.push(error);
             }

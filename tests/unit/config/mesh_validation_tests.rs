@@ -2778,6 +2778,63 @@ fn mesh_config_validate_rejects_destination_rule_system_roots_without_verificati
 }
 
 #[test]
+fn mesh_config_validate_rejects_destination_rule_client_material_of_the_wrong_kind() {
+    let destination_rule = |client_certificate: &str, private_key: &str| MeshDestinationRule {
+        name: "dr".into(),
+        namespace: "default".into(),
+        host: "reviews.default.svc.cluster.local".into(),
+        traffic_policy: Some(MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Mutual,
+                client_certificate: Some(client_certificate.into()),
+                private_key: Some(private_key.into()),
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        }),
+        port_level_settings: HashMap::new(),
+        subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
+    };
+
+    let swapped = MeshConfig {
+        destination_rules: vec![destination_rule(
+            "k8s://default/client-tls#tls.key",
+            "k8s://default/client-tls#tls.crt",
+        )],
+        ..MeshConfig::default()
+    };
+    let errors = swapped.validate();
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("tls.client_certificate")
+                && error.contains("selects key material, but this field expects cert material")
+        }),
+        "a key selector in client_certificate must be rejected (issue #5959): {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("tls.private_key")
+                && error.contains("selects cert material, but this field expects key material")
+        }),
+        "a certificate selector in private_key must be rejected (issue #5959): {errors:?}"
+    );
+
+    let matching = MeshConfig {
+        destination_rules: vec![destination_rule(
+            "k8s://default/client-tls#tls.crt",
+            "k8s://default/client-tls#tls.key",
+        )],
+        ..MeshConfig::default()
+    };
+    let errors = matching.validate();
+    assert!(
+        errors.is_empty(),
+        "matching client certificate and key selectors must stay admitted: {errors:?}"
+    );
+}
+
+#[test]
 fn mesh_config_validate_rejects_tracing_percentage_bounds() {
     let mesh = MeshConfig {
         telemetry_resources: vec![MeshTelemetryResource {

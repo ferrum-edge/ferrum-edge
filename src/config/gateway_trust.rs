@@ -793,6 +793,7 @@ pub fn gateway_trust_state_drifted(
 /// it directly (see `db_backend.rs`); a blanket implementation is deliberately
 /// avoided so an external test crate can still implement this trait for its own
 /// simulator.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait::async_trait]
 pub trait GatewayTrustDriftSource: Send + Sync {
     /// `true` when a trust document mutation and its `config_changes` signal

@@ -6,6 +6,7 @@
 //! - **Half-Open**: After a timeout, a limited number of probe requests are allowed.
 
 use crate::config::types::CircuitBreakerConfig;
+use crate::sync_compat::AtomicUpdate;
 use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -555,7 +556,7 @@ impl CircuitBreaker {
     fn release_half_open_slot(&self) {
         let _ = self
             .packed
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |packed| {
                 let count = packed_count(packed);
                 if count == 0 {
                     None
@@ -818,7 +819,7 @@ impl CircuitBreakerCache {
 
     fn try_reserve_entry_slot(&self) -> bool {
         self.entry_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < self.max_entries).then_some(count + 1)
             })
             .is_ok()
@@ -827,7 +828,7 @@ impl CircuitBreakerCache {
     fn release_entry_slot(&self) {
         let _ = self
             .entry_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             });
     }

@@ -64,6 +64,18 @@ impl ManagedTlsMaterialKind {
             Self::Jwks => "jwks",
         }
     }
+
+    /// Inverse of [`Self::collection_path`].
+    fn from_collection_path(collection: &str) -> Option<Self> {
+        match collection {
+            "certificates" => Some(Self::Certificate),
+            "ca-bundles" => Some(Self::CaBundle),
+            "crls" => Some(Self::Crl),
+            "ocsp-responses" => Some(Self::OcspResponse),
+            "jwks" => Some(Self::Jwks),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +172,11 @@ pub enum ManagedTlsError {
         actual: &'static str,
         expected: &'static str,
     },
+    /// A source reference's fragment or collection contradicts the material
+    /// kind its field expects, or names a collection that does not exist.
+    /// Raised from the reference alone, before any record is read.
+    #[error("incompatible managed TLS source reference: {0}")]
+    IncompatibleReference(String),
     /// Material bytes exceeded `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
     ///
     /// Deliberately content-free: diagnostics must not echo PEM, JWKS, paths,
@@ -654,20 +671,55 @@ impl ManagedMaterialPart {
             Self::Jwks => MaterialKind::Jwks,
         }
     }
+
+    /// The record kind that holds this part.
+    fn record_kind(self) -> ManagedTlsMaterialKind {
+        match self {
+            Self::Cert | Self::Key => ManagedTlsMaterialKind::Certificate,
+            Self::CaBundle => ManagedTlsMaterialKind::CaBundle,
+            Self::Crl => ManagedTlsMaterialKind::Crl,
+            Self::Ocsp => ManagedTlsMaterialKind::OcspResponse,
+            Self::Jwks => ManagedTlsMaterialKind::Jwks,
+        }
+    }
+}
+
+/// Check a `managed://` identifier's fragment and collection against the
+/// material kind its field expects, without reading the store.
+///
+/// Used by [`crate::tls::source::validate_source_field_kind`] so config
+/// validation rejects an incompatible reference at admission time; loads
+/// enforce the same rules through `ManagedSourceReference::parse`.
+pub(crate) fn validate_source_reference_kind(
+    identifier: &str,
+    field_kind: MaterialKind,
+) -> Result<(), ManagedTlsError> {
+    ManagedSourceReference::parse(identifier, field_kind).map(|_| ())
 }
 
 impl ManagedSourceReference {
+    /// Parse `[<collection>/]<id>[#<part>]`.
+    ///
+    /// `fallback_kind` is the material kind the owning field expects. When it
+    /// is known, an explicit fragment must select that kind, and a collection
+    /// segment must name the collection whose records hold the selected part:
+    /// a CA field accepts only `ca`/`ca-bundle` parts from `ca-bundles/`, a
+    /// certificate field only certificate parts from `certificates/`, and so
+    /// on. Without that check `managed://certificates/<id>#cert` in a CA field
+    /// loaded a leaf certificate and its chain as trust anchors (issue #5959).
     fn parse(identifier: &str, fallback_kind: MaterialKind) -> Result<Self, ManagedTlsError> {
         let (path, fragment) = match identifier.split_once('#') {
             Some((path, fragment)) => (path, Some(fragment)),
             None => (identifier, None),
         };
-        let id = path
-            .rsplit('/')
-            .next()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| ManagedTlsError::InvalidId(identifier.to_string()))?
-            .to_string();
+        let (collection, id) = match path.rsplit_once('/') {
+            Some((collection, id)) => (Some(collection), id),
+            None => (None, path),
+        };
+        if id.is_empty() {
+            return Err(ManagedTlsError::InvalidId(identifier.to_string()));
+        }
+        let id = id.to_string();
         validate_managed_id(&id)?;
         let part = match fragment {
             Some("cert" | "certificate" | "chain") => ManagedMaterialPart::Cert,
@@ -687,6 +739,30 @@ impl ManagedSourceReference {
                 MaterialKind::Unknown => return Err(ManagedTlsError::InvalidId("managed TLS source must include #cert, #key, #ca-bundle, #crl, #ocsp, or #jwks for unknown material kind".to_string())),
             },
         };
+        if fallback_kind != MaterialKind::Unknown && part.material_kind() != fallback_kind {
+            return Err(ManagedTlsError::IncompatibleReference(format!(
+                "fragment selects {} material, but this field expects {fallback_kind} material",
+                part.material_kind()
+            )));
+        }
+        if let Some(collection) = collection {
+            let record_kind = ManagedTlsMaterialKind::from_collection_path(collection);
+            let Some(record_kind) = record_kind else {
+                return Err(ManagedTlsError::IncompatibleReference(
+                    "collection must be one of `certificates`, `ca-bundles`, `crls`, \
+                     `ocsp-responses`, or `jwks`"
+                        .to_string(),
+                ));
+            };
+            if record_kind != part.record_kind() {
+                return Err(ManagedTlsError::IncompatibleReference(format!(
+                    "collection `{}` holds {} records, which cannot supply {} material",
+                    record_kind.collection_path(),
+                    record_kind.as_str(),
+                    part.material_kind()
+                )));
+            }
+        }
         Ok(Self { id, part })
     }
 
@@ -695,15 +771,7 @@ impl ManagedSourceReference {
         record: &ManagedTlsRecord,
         max_bytes: usize,
     ) -> Result<ManagedMaterial, ManagedTlsError> {
-        let expected_kind = match self.part {
-            ManagedMaterialPart::Cert | ManagedMaterialPart::Key => {
-                ManagedTlsMaterialKind::Certificate
-            }
-            ManagedMaterialPart::CaBundle => ManagedTlsMaterialKind::CaBundle,
-            ManagedMaterialPart::Crl => ManagedTlsMaterialKind::Crl,
-            ManagedMaterialPart::Ocsp => ManagedTlsMaterialKind::OcspResponse,
-            ManagedMaterialPart::Jwks => ManagedTlsMaterialKind::Jwks,
-        };
+        let expected_kind = self.part.record_kind();
         if record.kind != expected_kind {
             return Err(ManagedTlsError::WrongKind {
                 id: record.id.clone(),

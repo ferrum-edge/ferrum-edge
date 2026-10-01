@@ -24,6 +24,10 @@ pub mod translator;
 pub mod proto {
     // Not google.protobuf.Any/Status: these are the minimal wire-compatible
     // xDS shims Ferrum needs for Phase B.
+    //
+    // tonic's generated server traits expand through async-trait, which adds a
+    // bare `#[must_use]` to methods already returning a must-use boxed future.
+    #![allow(clippy::double_must_use)]
     tonic::include_proto!("envoy.service.discovery.v3");
 }
 

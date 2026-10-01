@@ -87,6 +87,7 @@ use super::utils::response_body::read_response_body_bounded;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::fips::approved::{HmacSha256, Sha256};
 use crate::startup::sanitize_startup_scalar;
+use crate::sync_compat::AtomicUpdate;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// The single response field this plugin writes, in the bounded form
@@ -834,7 +835,7 @@ impl RedisQuarantineSuppressor {
                 DashEntry::Vacant(vacant) => {
                     let reserved = self
                         .entry_count
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
                             (count < self.max_entries).then_some(count + 1)
                         })
                         .is_ok();
@@ -866,7 +867,7 @@ impl RedisQuarantineSuppressor {
     fn release_slot(&self) {
         let _ = self
             .entry_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             });
     }

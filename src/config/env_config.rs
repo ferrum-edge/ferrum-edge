@@ -8184,9 +8184,172 @@ impl EnvConfig {
             );
         }
 
+        // A TLS source must not select material of another kind (issue #5959).
+        self.validate_tls_source_field_kinds()?;
+
         // ACME auto-renewal that can never reach the listener (issue #4506).
         self.validate_acme_renewal_reachability()?;
 
+        Ok(())
+    }
+
+    /// Reject a TLS material setting whose source reference selects material
+    /// of a different kind than the setting expects (issue #5959).
+    ///
+    /// A `?kind=` hint, a fragment or Kubernetes data key, or a
+    /// `managed://`/`acme://` collection can each name the material a source
+    /// resolves to. They must agree with the setting: a CA setting accepts only
+    /// CA selectors, so `managed://certificates/<id>#cert` can no longer load a
+    /// leaf certificate as trust anchors. Checked here, without loading, so the
+    /// error surfaces from `ferrum-edge validate` and before any listener,
+    /// client, or reload watcher resolves the source. Loads enforce the same
+    /// rule through [`crate::tls::source::validate_source_field_kind`].
+    fn validate_tls_source_field_kinds(&self) -> Result<(), String> {
+        use crate::tls::source::MaterialKind;
+
+        let fields: [(&str, Option<&String>, MaterialKind); 27] = [
+            (
+                "FERRUM_FRONTEND_TLS_CERT_PATH",
+                self.frontend_tls_cert_path.as_ref(),
+                MaterialKind::Cert,
+            ),
+            (
+                "FERRUM_FRONTEND_TLS_KEY_PATH",
+                self.frontend_tls_key_path.as_ref(),
+                MaterialKind::Key,
+            ),
+            (
+                "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
+                self.frontend_tls_client_ca_bundle_path.as_ref(),
+                MaterialKind::CaBundle,
+            ),
+            (
+                "FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE",
+                self.frontend_tls_ocsp_response_source.as_ref(),
+                MaterialKind::Ocsp,
+            ),
+            (
+                "FERRUM_ADMIN_TLS_CERT_PATH",
+                self.admin_tls_cert_path.as_ref(),
+                MaterialKind::Cert,
+            ),
+            (
+                "FERRUM_ADMIN_TLS_KEY_PATH",
+                self.admin_tls_key_path.as_ref(),
+                MaterialKind::Key,
+            ),
+            (
+                "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH",
+                self.admin_tls_client_ca_bundle_path.as_ref(),
+                MaterialKind::CaBundle,
+            ),
+            (
+                "FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE",
+                self.admin_tls_ocsp_response_source.as_ref(),
+                MaterialKind::Ocsp,
+            ),
+            (
+                "FERRUM_DB_TLS_CA_CERT_PATH",
+                self.db_tls_ca_cert_path.as_ref(),
+                MaterialKind::CaBundle,
+            ),
+            (
+                "FERRUM_DB_TLS_CLIENT_CERT_PATH",
+                self.db_tls_client_cert_path.as_ref(),
+                MaterialKind::Cert,
+            ),
+            (
+                "FERRUM_DB_TLS_CLIENT_KEY_PATH",
+                self.db_tls_client_key_path.as_ref(),
+                MaterialKind::Key,
+            ),
+            (
+                "FERRUM_CP_GRPC_TLS_CERT_PATH",
+                self.cp_grpc_tls_cert_path.as_ref(),
+                MaterialKind::Cert,
+            ),
+            (
+                "FERRUM_CP_GRPC_TLS_KEY_PATH",
+                self.cp_grpc_tls_key_path.as_ref(),
+                MaterialKind::Key,
+            ),
+            (
+                "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH",
+                self.cp_grpc_tls_client_ca_path.as_ref(),
+                MaterialKind::CaBundle,
+            ),
+            (
+                "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
+                self.dp_grpc_tls_ca_cert_path.as_ref(),
+                MaterialKind::CaBundle,
+            ),
+            (
+                "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH",
+                self.dp_grpc_tls_client_cert_path.as_ref(),
+                MaterialKind::Cert,
+            ),
+            (
+                "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH",
+                self.dp_grpc_tls_client_key_path.as_ref(),
+                MaterialKind::Key,
+            ),
+            (
+                "FERRUM_TLS_CA_BUNDLE_PATH",
+                self.tls_ca_bundle_path.as_ref(),
+                MaterialKind::CaBundle,
+            ),
+            (
+                "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH",
+                self.backend_tls_client_cert_path.as_ref(),
+                MaterialKind::Cert,
+            ),
+            (
+                "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH",
+                self.backend_tls_client_key_path.as_ref(),
+                MaterialKind::Key,
+            ),
+            (
+                "FERRUM_GATEWAY_SVID_CERT_PATH",
+                self.gateway_svid_cert_path.as_ref(),
+                MaterialKind::Cert,
+            ),
+            (
+                "FERRUM_GATEWAY_SVID_KEY_PATH",
+                self.gateway_svid_key_path.as_ref(),
+                MaterialKind::Key,
+            ),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                self.gateway_svid_trust_bundle_path.as_ref(),
+                MaterialKind::CaBundle,
+            ),
+            (
+                "FERRUM_DTLS_CERT_PATH",
+                self.dtls_cert_path.as_ref(),
+                MaterialKind::Cert,
+            ),
+            (
+                "FERRUM_DTLS_KEY_PATH",
+                self.dtls_key_path.as_ref(),
+                MaterialKind::Key,
+            ),
+            (
+                "FERRUM_DTLS_CLIENT_CA_CERT_PATH",
+                self.dtls_client_ca_cert_path.as_ref(),
+                MaterialKind::CaBundle,
+            ),
+            (
+                "FERRUM_TLS_CRL_FILE_PATH",
+                self.tls_crl_file_path.as_ref(),
+                MaterialKind::Crl,
+            ),
+        ];
+        for (variable, configured, kind) in fields {
+            let Some(configured) = configured else {
+                continue;
+            };
+            crate::config::types::validate_tls_source_field_kind(variable, configured, kind)?;
+        }
         Ok(())
     }
 

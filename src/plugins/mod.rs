@@ -7389,6 +7389,7 @@ pub enum ResponseStreamInspectorStage {
 /// exception: a later inspector that another follows and that releases some
 /// of those bytes, then cuts in its flush, has them dropped, since the
 /// inspectors after it have not passed them.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait ResponseStreamInspector: Send {
     /// Stage used when composing multiple inspectors. Policy inspectors should
@@ -10119,6 +10120,7 @@ pub enum BackendAdmissionDecision {
 }
 
 /// Plugin lifecycle hooks.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait Plugin: Send + Sync {
     /// Returns the plugin name.

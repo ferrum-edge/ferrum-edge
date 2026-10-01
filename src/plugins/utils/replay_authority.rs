@@ -113,6 +113,7 @@
 //! so `SET … NX EX` cannot silently recreate a still-live marker after Redis
 //! evicted it. Durability and failover remain operator-owned.
 
+use crate::sync_compat::AtomicUpdate;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -606,7 +607,7 @@ impl ProcessReplayLane {
 
     fn try_reserve_slot(&self, max_entries: usize) -> bool {
         self.entry_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < max_entries).then_some(count + 1)
             })
             .is_ok()

@@ -8147,6 +8147,32 @@ fn validate_mesh_traffic_policy_tls(
     {
         errors.push(error);
     }
+    // A selector naming another material kind (`#tls.key` for the client
+    // certificate, `#tls.crt` for the key) is refused here rather than at TLS
+    // apply (issue #5959).
+    let client_material = [
+        (
+            "client_certificate",
+            tls.client_certificate.as_deref(),
+            crate::tls::source::MaterialKind::Cert,
+        ),
+        (
+            "private_key",
+            tls.private_key.as_deref(),
+            crate::tls::source::MaterialKind::Key,
+        ),
+    ];
+    for (field, value, kind) in client_material {
+        if let Some(value) = value
+            && let Err(error) = crate::config::types::validate_tls_material_source_field(
+                &format!("{context}.{field}"),
+                value,
+                kind,
+            )
+        {
+            errors.push(error);
+        }
+    }
     if let Some(error) = crate::config::types::validate_system_trust_roots_skip_verify_pairing(
         &format!("{context}.ca_certificates"),
         &format!("{context}.insecure_skip_verify"),

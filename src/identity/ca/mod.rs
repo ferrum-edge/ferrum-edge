@@ -124,6 +124,7 @@ impl PublishedJwtAuthority {
 ///
 /// Implementations are share-nothing — the Workload API server holds an
 /// `Arc<dyn CertificateAuthority>` and clones it for each request.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait CertificateAuthority: Send + Sync + 'static {
     /// Issue an SVID. The CA enforces all policy: it never trusts the

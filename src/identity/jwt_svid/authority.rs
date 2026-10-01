@@ -127,6 +127,7 @@ pub const DEFAULT_MAX_RETAINED_JWT_KEYS: usize = 3;
 /// only when it genuinely owns JWT signing material; the default is `None`,
 /// which makes `FetchJWTSVID` fail closed with `UNIMPLEMENTED` rather than
 /// inventing JWT trust for a backend that cannot supply it.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait::async_trait]
 pub trait JwtSvidSigner: Send + Sync + 'static {
     /// The trust domain this authority signs for. A mint request for any

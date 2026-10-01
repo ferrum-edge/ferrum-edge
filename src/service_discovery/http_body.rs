@@ -26,6 +26,7 @@ use http::header::CONTENT_LENGTH;
 use tracing::warn;
 
 use crate::config::env_config::{DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES, DiscoveryBodyLimits};
+use crate::sync_compat::AtomicUpdate;
 use crate::util::body_limit::{ContentLength, parse_content_length};
 
 /// Role of the response body being collected.
@@ -281,7 +282,7 @@ fn try_charge_counter(
     max: usize,
     additional: usize,
 ) -> Result<(), DiscoveryBodyError> {
-    match used_counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+    match used_counter.update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
         used.checked_add(additional).filter(|next| *next <= max)
     }) {
         Ok(_) => Ok(()),
@@ -297,7 +298,7 @@ fn release_budget_counter(used_counter: &AtomicUsize, bytes: usize) {
     if bytes == 0 {
         return;
     }
-    let _ = used_counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+    let _ = used_counter.update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
         Some(used.saturating_sub(bytes))
     });
 }
