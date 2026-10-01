@@ -3319,6 +3319,68 @@ impl http_body::Body for DirectH2RequestBody {
     }
 }
 
+/// Request body for the direct HTTP/1.1 pool (issue #5588).
+///
+/// One enum rather than a boxed trait object so the per-request dispatch does
+/// not allocate for the body. Every arm is a body the reqwest path already
+/// builds; only the transport changed.
+pub enum DirectH1RequestBody {
+    /// No body (GET/HEAD and other requests without framing).
+    Empty,
+    /// A fully prepared, already-charged buffered body.
+    Full(Option<Bytes>),
+    /// A buffered body relayed through the gateway write-watermark pump.
+    Pumped(crate::proxy::upload_pump::PumpedUploadBody),
+    /// Streaming client body under a request-size ceiling.
+    Limited(SizeLimitedIncoming),
+    /// Streaming client body without a ceiling; still counts forwarded bytes.
+    Counting(CountingIncoming),
+}
+
+impl http_body::Body for DirectH1RequestBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            DirectH1RequestBody::Empty => Poll::Ready(None),
+            DirectH1RequestBody::Full(data) => Poll::Ready(
+                data.take()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| Ok(Frame::data(b))),
+            ),
+            DirectH1RequestBody::Pumped(body) => Pin::new(body).poll_frame(cx),
+            DirectH1RequestBody::Limited(body) => Pin::new(body).poll_frame(cx),
+            DirectH1RequestBody::Counting(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            DirectH1RequestBody::Empty => true,
+            DirectH1RequestBody::Full(data) => data.as_ref().is_none_or(|b| b.is_empty()),
+            DirectH1RequestBody::Pumped(body) => body.is_end_stream(),
+            DirectH1RequestBody::Limited(body) => body.is_end_stream(),
+            DirectH1RequestBody::Counting(body) => body.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            DirectH1RequestBody::Empty => http_body::SizeHint::with_exact(0),
+            DirectH1RequestBody::Full(data) => {
+                http_body::SizeHint::with_exact(data.as_ref().map_or(0, |b| b.len() as u64))
+            }
+            DirectH1RequestBody::Pumped(body) => body.size_hint(),
+            DirectH1RequestBody::Limited(body) => body.size_hint(),
+            DirectH1RequestBody::Counting(body) => body.size_hint(),
+        }
+    }
+}
+
 /// Test hook: drive exactly one [`poll_upload_cancel`] with a no-op waker.
 ///
 /// Reached only through `crate::_test_support`, which the binary target does

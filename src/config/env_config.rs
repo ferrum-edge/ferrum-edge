@@ -3289,6 +3289,9 @@ pub struct EnvConfig {
     /// Warms HTTP, gRPC, HTTP/2, and HTTP/3 pools after DNS warmup completes.
     /// Skipped for TCP/UDP stream proxies (no persistent connection pools).
     pub pool_warmup_enabled: bool,
+    /// Dispatch HTTP/1.1 backends on Ferrum's own hyper connection pool
+    /// instead of reqwest (default: true). `false` restores the reqwest path.
+    pub pool_http1_direct: bool,
     /// Maximum concurrent connection warmup attempts at startup (default: 500).
     pub pool_warmup_concurrency: usize,
 
@@ -4330,6 +4333,7 @@ impl Default for EnvConfig {
             h3_request_body_drain_ms: 50,
             http3_initial_mtu: 1500,
             pool_warmup_enabled: true,
+            pool_http1_direct: true,
             pool_warmup_concurrency: 500,
             pool_cleanup_interval_seconds: 30,
             backend_capability_refresh_interval_secs: 86_400,
@@ -4978,6 +4982,7 @@ impl EnvConfig {
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
+            pool_http1_direct: bool = "FERRUM_POOL_HTTP1_DIRECT" => true;
             pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
             pool_cleanup_interval_seconds: u64 = "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS" => 30u64;
         }
@@ -5852,6 +5857,7 @@ impl EnvConfig {
             h3_request_body_drain_ms,
             http3_initial_mtu,
             pool_warmup_enabled,
+            pool_http1_direct,
             pool_warmup_concurrency,
             pool_cleanup_interval_seconds,
             backend_capability_refresh_interval_secs,

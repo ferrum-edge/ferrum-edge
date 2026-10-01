@@ -1216,6 +1216,7 @@ See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning gui
 |---|---|---|---|
 | `FERRUM_POOL_WARMUP_ENABLED` | No | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP stream proxies |
 | `FERRUM_POOL_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent connection warmup attempts at startup |
+| `FERRUM_POOL_HTTP1_DIRECT` | No | `true` | Dispatch HTTP/1.1 backends — plaintext `http`, and `https` backends that are HTTP/1.1-only (`pool_enable_http2: false`, `h2UpgradePolicy: DO_NOT_UPGRADE`, or a backend that negotiated HTTP/1.1) — on Ferrum's own exclusive-checkout hyper connection pool instead of reqwest. Requests that need body plugins at dispatch time and retry attempts keep the reqwest path. `false` restores reqwest for every HTTP/1.1 dispatch. Idle connections follow `FERRUM_POOL_MAX_IDLE_PER_HOST` / `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | No | `30` | Cleanup sweep interval for all connection pools |
 | `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` | No | `86400` | Background interval for reproving backend HTTP/2, HTTP/3, and h2c capabilities. Expected plaintext HTTP/1.1 h2c classification misses are debug-level; they do not emit WARN at the default `FERRUM_LOG_LEVEL` |
 | `FERRUM_POOL_MAX_IDLE_PER_HOST` | No | `64` | Maximum idle connections per backend host. Must be between 4 and 1024; malformed or out-of-range values refuse to start |
