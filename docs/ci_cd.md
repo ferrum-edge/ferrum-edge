@@ -938,7 +938,7 @@ run red on the commit that caused it. Its concurrency group follows
 
 | Workflow | Pin check | Pinned repository inputs (in its `push` paths) |
 |---|---|---|
-| `h2-guard-observation.yml` | `tests/performance/multi_protocol/h2_guard/prepare.py` | `src/admin/mod.rs` (`context_files` SHA-256 in `h2_guard/source.json`), the `h2` entry in `Cargo.lock`, the single `[patch.crates-io]` table in `Cargo.toml`, the two `cargo build` calls in `Dockerfile` |
+| `h2-guard-observation.yml` | `tests/performance/multi_protocol/h2_guard/prepare.py` | `src/admin/mod.rs` (`context_files` SHA-256 in `h2_guard/source.json`), the path-sourced `h2` entry in `Cargo.lock`, the single `[patch.crates-io]` table and its vendored `h2` line in `Cargo.toml`, the vendored h2 patch (`docs/upstream-h2-patches/001-…/*.patch`) and its `vendor/VENDOR_INTEGRITY.sha256` hashes, the two `cargo build` calls in `Dockerfile` |
 
 `h2-guard-pin-check.yml` runs the same pin and anchor validation on the pull
 request that changes one of those inputs or the H2 guard assets. Its

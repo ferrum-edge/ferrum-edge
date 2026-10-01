@@ -20,9 +20,14 @@ VENDOR = "vendor/h2-0.4.19-observation"
 # Input anchors shared by the hosted preparation and the quick pin check, so the
 # two cannot disagree about what "present" means.
 PATCH_TABLE = "[patch.crates-io]\n"
-LOCK_PIN = ('name = "h2"\nversion = "0.4.19"\n'
-            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
-            f'checksum = "{SHA256}"\n')
+# Ferrum ships a vendored h2 0.4.19 (docs/upstream-h2-patches/001-*), so the
+# root lock records it path-sourced (no source/checksum lines) and the patch
+# table already names it. The observation build replaces that one entry.
+FERRUM_VENDOR = "vendor/h2-0.4.19-ferrum-patched"
+FERRUM_PATCH = "docs/upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch"
+VENDOR_MANIFEST = "vendor/VENDOR_INTEGRITY.sha256"
+VENDORED_H2 = 'h2 = { path = "' + FERRUM_VENDOR + '" }\n'
+LOCK_PIN = 'name = "h2"\nversion = "0.4.19"\ndependencies = [\n'
 DOCKER_CARGO = 'cargo build --features "${FEATURES}"'
 METRICS_ANCHOR = b"        let mut metrics_output = registry.render();\n"
 
@@ -57,6 +62,43 @@ def extract_source(data, destination):
         raise ValueError("h2 immutable revision mismatch")
 
 
+def manifest_entries(root, prefix):
+    """Drift-manifest hashes for files under `prefix`, keyed by relative path."""
+    entries = {}
+    for line in (root / VENDOR_MANIFEST).read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        digest, _, path = line.partition("  ")
+        if path.strip().startswith(prefix):
+            entries[path.strip()[len(prefix):]] = digest.strip()
+    return entries
+
+
+def apply_ferrum_patch(source, root):
+    """Turn the verified archive into Ferrum's shipped h2 sources.
+
+    Applies Ferrum's vendored h2 patch without fuzz, then requires every file
+    under src/ to match the vendored crate's drift-manifest hash (text hashed
+    with CR stripped, as the drift guard does), so the observation build
+    measures exactly the h2 the gateway ships plus the observer.
+    """
+    patch = (root / FERRUM_PATCH).read_bytes()
+    applied = subprocess.run(["patch", "--batch", "--fuzz=0", "-p1"],
+                             input=patch, cwd=source, capture_output=True)
+    if applied.returncode != 0:
+        raise ValueError("Ferrum h2 patch does not apply to the verified archive")
+    expected = manifest_entries(root, FERRUM_VENDOR + "/src/")
+    if not expected:
+        raise ValueError("drift manifest has no vendored h2 sources")
+    actual = {}
+    for path in sorted((source / "src").rglob("*")):
+        if path.is_file():
+            data = path.read_bytes().replace(b"\r", b"")
+            actual[str(path.relative_to(source / "src")).replace("\\", "/")] = sha(data)
+    if actual != expected:
+        raise ValueError("patched archive differs from the vendored h2 sources")
+
+
 def patch_source(source, provenance):
     patch = (ASSETS / "h2-0.4.19.patch").read_bytes()
     if sha(patch) != provenance["patch_sha256"]:
@@ -83,17 +125,17 @@ def select_dependency(context, evidence, provenance):
     original = (context / "Cargo.toml").read_text()
     if original.count(PATCH_TABLE) != 1:
         raise ValueError("unexpected root patch table")
-    modified = original.replace(PATCH_TABLE, PATCH_TABLE + 'h2 = { path = "' + VENDOR + '" }\n')
+    if original.count(VENDORED_H2) != 1:
+        raise ValueError("root patch table no longer selects the vendored h2")
+    modified = original.replace(VENDORED_H2, 'h2 = { path = "' + VENDOR + '" }\n')
     (context / "Cargo.toml").write_text(modified)
     diff = "".join(difflib.unified_diff(original.splitlines(True), modified.splitlines(True),
                                        fromfile="a/Cargo.toml", tofile="b/Cargo.toml"))
+    # Both the vendored and the observation crate are path sources of h2
+    # 0.4.19, which the lock records identically: the lock stays unchanged.
     lock = (context / "Cargo.lock").read_text()
     if lock.count(LOCK_PIN) != 1:
-        raise ValueError("root lock no longer pins the approved h2 archive")
-    selected = lock.replace(LOCK_PIN, 'name = "h2"\nversion = "0.4.19"\n')
-    (context / "Cargo.lock").write_text(selected)
-    diff += "".join(difflib.unified_diff(lock.splitlines(True), selected.splitlines(True),
-                                        fromfile="a/Cargo.lock", tofile="b/Cargo.lock"))
+        raise ValueError("root lock no longer pins one path-sourced h2 0.4.19")
     # Keep the existing Docker stages/features/profile. Lock both Cargo calls in
     # this generated copy; the ordinary Dockerfile is never rewritten.
     docker = (context / "Dockerfile").read_text()
@@ -138,11 +180,15 @@ def check_pins_only(provenance):
 
     lock = (ROOT / "Cargo.lock").read_text()
     if lock.count(LOCK_PIN) != 1:
-        raise SystemExit("pin check failed: approved h2 0.4.19 lock anchor must occur once")
+        raise SystemExit("pin check failed: path-sourced h2 0.4.19 lock anchor must occur once")
 
     manifest = (ROOT / "Cargo.toml").read_text()
     if manifest.count(PATCH_TABLE) != 1:
         raise SystemExit("pin check failed: Cargo.toml [patch.crates-io] anchor must occur once")
+    if manifest.count(VENDORED_H2) != 1:
+        raise SystemExit("pin check failed: Cargo.toml vendored h2 patch entry must occur once")
+    if not (ROOT / FERRUM_PATCH).is_file() or not manifest_entries(ROOT, FERRUM_VENDOR + "/src/"):
+        raise SystemExit("pin check failed: vendored h2 patch or its drift-manifest entries are missing")
 
     docker = (ROOT / "Dockerfile").read_text()
     if docker.count(DOCKER_CARGO) != 2:
@@ -195,8 +241,10 @@ def main():
     source = context / VENDOR
     source.mkdir()
     extract_source(raw, source)
-    # Keep an unmodified copy of the verified archive for same-toolchain lint
-    # comparison. Do not alter upstream code merely to silence newer Clippy.
+    apply_ferrum_patch(source, ROOT)
+    # Keep a copy of the h2 Ferrum ships (verified archive plus Ferrum's
+    # vendored patch) for same-toolchain lint comparison, so the comparison
+    # isolates the observer. Do not alter it merely to silence newer Clippy.
     shutil.copytree(source, output / "upstream")
     patch_source(source, provenance)
     select_dependency(context, evidence, provenance)

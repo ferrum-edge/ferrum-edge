@@ -19,7 +19,7 @@ from h2_guard_observation import (
     FIELDS, GATEWAYS, TAIL_FIELDS, annotate, capture_identity, expected_sample,
     parse_line, parse_ack, sink_problems,
 )
-from prepare import SHA256, extract_source, patch_source
+from prepare import SHA256, apply_ferrum_patch, extract_source, patch_source
 from verify import verify_campaign
 from lint import compare
 
@@ -715,6 +715,10 @@ class GuardObservationTests(unittest.TestCase):
                 path.write_text("drift")
             with self.assertRaises(ValueError):
                 patch_source(source, provenance)
+            # Ferrum's vendored h2 patch must apply without fuzz and reproduce
+            # the drift-manifest sources exactly; anything else fails closed.
+            with self.assertRaises(ValueError):
+                apply_ferrum_patch(source, ROOT.parents[2])
 
     def test_campaign_index_keeps_failed_repetitions_and_rejects_missing_samples(self):
         with tempfile.TemporaryDirectory() as directory:
