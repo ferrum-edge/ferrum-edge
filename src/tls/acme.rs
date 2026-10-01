@@ -549,6 +549,11 @@ pub enum AcmeError {
     InvalidChallengeToken(String),
     #[error("ACME certificate '{id}' does not contain {kind} material")]
     MissingMaterial { id: String, kind: &'static str },
+    /// A source reference's fragment or collection contradicts the material
+    /// kind its field expects. Raised from the reference alone, before any
+    /// record is read.
+    #[error("incompatible ACME certificate source reference: {0}")]
+    IncompatibleReference(String),
     /// Material bytes exceeded `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
     ///
     /// Deliberately content-free: diagnostics must not echo PEM or key bytes.
@@ -1442,19 +1447,45 @@ impl AcmeMaterialPart {
     }
 }
 
+/// Check an `acme://` identifier's fragment and collection against the
+/// material kind its field expects, without reading the store.
+///
+/// Used by [`crate::tls::source::validate_source_field_kind`] so config
+/// validation rejects an incompatible reference at admission time; loads
+/// enforce the same rules through `AcmeSourceReference::parse`.
+pub(crate) fn validate_source_reference_kind(
+    identifier: &str,
+    field_kind: MaterialKind,
+) -> Result<(), AcmeError> {
+    AcmeSourceReference::parse(identifier, field_kind).map(|_| ())
+}
+
 impl AcmeSourceReference {
+    /// Parse `[certificates/]<id>[#cert|#key]`.
+    ///
+    /// `fallback_kind` is the material kind the owning field expects. When it
+    /// is known, an explicit fragment must select that kind, so an ACME leaf
+    /// certificate cannot be loaded into a CA field through `#cert`
+    /// (issue #5959). The only collection is `certificates`.
     fn parse(identifier: &str, fallback_kind: MaterialKind) -> Result<Self, AcmeError> {
         let (path, fragment) = match identifier.split_once('#') {
             Some((path, fragment)) => (path, Some(fragment)),
             None => (identifier, None),
         };
-        let id = path
-            .rsplit('/')
-            .next()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AcmeError::InvalidId(identifier.to_string()))?
-            .to_string();
+        let (collection, id) = match path.rsplit_once('/') {
+            Some((collection, id)) => (Some(collection), id),
+            None => (None, path),
+        };
+        if id.is_empty() {
+            return Err(AcmeError::InvalidId(identifier.to_string()));
+        }
+        let id = id.to_string();
         validate_acme_id(&id)?;
+        if collection.is_some_and(|collection| collection != "certificates") {
+            return Err(AcmeError::IncompatibleReference(
+                "collection must be `certificates`".to_string(),
+            ));
+        }
         let part = match fragment {
             Some("cert" | "certificate" | "chain") => AcmeMaterialPart::Cert,
             Some("key" | "private-key" | "private_key") => AcmeMaterialPart::Key,
@@ -1480,6 +1511,12 @@ impl AcmeSourceReference {
                 }
             },
         };
+        if fallback_kind != MaterialKind::Unknown && part.material_kind() != fallback_kind {
+            return Err(AcmeError::IncompatibleReference(format!(
+                "fragment selects {} material, but this field expects {fallback_kind} material",
+                part.material_kind()
+            )));
+        }
         Ok(Self { id, part })
     }
 

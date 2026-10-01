@@ -26,6 +26,7 @@ mod policy_log_redaction_tests;
 mod renewal_lease_tests;
 mod san_allow_list_verifier_tests;
 mod san_summary_tests;
+mod source_field_kind_tests;
 mod source_redaction_tests;
 mod store_dir_permissions_tests;
 mod store_lock_timeout_config_tests;

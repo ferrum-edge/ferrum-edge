@@ -657,9 +657,76 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
             "{owner} error must identify the CA field, got: {errors}"
         );
         assert!(
-            errors.contains("has kind ca_bundle, expected certificate"),
-            "{owner} error must explain the selected material kind is absent, got: {errors}"
+            errors.contains(
+                "fragment selects cert material, but this field expects ca_bundle material"
+            ),
+            "{owner} error must explain the fragment contradicts the CA field, got: {errors}"
         );
+    }
+
+    // Issue #5959: a certificate record must not reach a CA field through a
+    // fragment, a collection segment, or a `?kind=` hint — even when the
+    // referenced record exists and would load.
+    let cert_id = format!("ref-cert-{}", Uuid::new_v4().simple());
+    let create_cert = send_raw_admin_request(
+        addr,
+        "POST",
+        Collection::Certificate.path(),
+        &token,
+        &create_body(Collection::Certificate, &cert_id, &fixtures),
+    )
+    .await;
+    assert_eq!(
+        raw_http_status(&create_cert),
+        201,
+        "create certificate record: {create_cert}"
+    );
+    for (value, reason) in [
+        (
+            format!("managed://certificates/{cert_id}#cert"),
+            "fragment selects cert material, but this field expects ca_bundle material",
+        ),
+        (
+            format!("managed://{cert_id}#chain"),
+            "fragment selects cert material, but this field expects ca_bundle material",
+        ),
+        (
+            format!("managed://certificates/{ca_id}"),
+            "collection `certificates` holds certificate records, which cannot supply \
+             ca_bundle material",
+        ),
+        (
+            format!("managed://certificates/{cert_id}?kind=cert"),
+            "`kind` option selects cert material, but this field expects ca_bundle material",
+        ),
+    ] {
+        gateway_for_admission.proxies[0].backend_tls_server_ca_cert_path = Some(value.clone());
+        gateway_for_admission.upstreams[0].backend_tls_server_ca_cert_path = Some(value.clone());
+        let errors = gateway_for_admission
+            .validate_all_fields(30)
+            .expect_err("an incompatible CA reference must not be admitted");
+        assert_eq!(
+            errors.len(),
+            2,
+            "{value}: proxy and upstream should each report one error: {errors:?}"
+        );
+        for error in &errors {
+            assert!(
+                error.contains("backend_tls_server_ca_cert_path") && error.contains(reason),
+                "{value}: error must name the CA field and the mismatch, got: {error}"
+            );
+        }
+    }
+    for value in [
+        format!("managed://{ca_id}"),
+        format!("managed://{ca_id}#ca-bundle"),
+        format!("managed://ca-bundles/{ca_id}?kind=ca-bundle"),
+    ] {
+        gateway_for_admission.proxies[0].backend_tls_server_ca_cert_path = Some(value.clone());
+        gateway_for_admission.upstreams[0].backend_tls_server_ca_cert_path = Some(value.clone());
+        if let Err(errors) = gateway_for_admission.validate_all_fields(30) {
+            panic!("{value}: a compatible CA reference must stay admitted: {errors:?}");
+        }
     }
 
     let same_kind = send_raw_admin_request(
@@ -717,6 +784,58 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
     assert_eq!(
         delete_body["error"].as_str(),
         Some("managed TLS record is still referenced")
+    );
+
+    let _ = shutdown.send(true);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// Issue #5959 over HTTP: a proxy whose CA field selects a certificate record
+/// is refused with the ordinary `400` validation error, before anything is
+/// stored or any material is loaded.
+#[tokio::test]
+async fn proxy_create_rejects_a_certificate_selected_for_its_ca_field() {
+    let config = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("source_field_kind.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = ferrum_edge::config::db_loader::DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        ferrum_edge::config::db_loader::DbPoolConfig::default(),
+    )
+    .await
+    .expect("SQLite store connects and migrates");
+    let mut state = create_test_admin_state(&config, None);
+    state.db = Some(Arc::new(store));
+    let (addr, shutdown) = start_admin(state).await;
+    let token = generate_admin_token(&config);
+
+    let cert_id = format!("leaf-{}", Uuid::new_v4().simple());
+    let body = json!({
+        "id": "p5959-http",
+        "listen_path": "/p5959",
+        "backend_scheme": "https",
+        "backend_host": "backend.example.com",
+        "backend_port": 443,
+        "backend_tls_server_ca_cert_path": format!("managed://certificates/{cert_id}#cert"),
+    })
+    .to_string();
+    let response = send_raw_admin_request(addr, "POST", "/proxies", &token, &body).await;
+    assert_eq!(
+        raw_http_status(&response),
+        400,
+        "a certificate selected for a CA field must be a validation error: {response}"
+    );
+    let error = raw_http_json_body(&response)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("backend_tls_server_ca_cert_path")
+            && error.contains("invalid TLS material source")
+            && error.contains("this field expects ca_bundle material"),
+        "the 400 must name the CA field and the kind mismatch, got: {error}"
     );
 
     let _ = shutdown.send(true);
