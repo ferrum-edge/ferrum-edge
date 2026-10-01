@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`ai_prompt_shield` `mcp_arguments` and `mcp_gateway` refuse non-UTF-8
+  request charsets** (GHSA-4f9m-cfqg-fhx9, #5954; affects v0.9.9). Both read
+  JSON-RPC as UTF-8 and ignored the `Content-Type` `charset` parameter. A
+  `tools/call` sent as `application/json; charset=utf-7` is plain ASCII and
+  parses as JSON, so the shield scanned the encoded text and found no PII while
+  an upstream that decodes by charset (for example a `raw-body` / `iconv-lite`
+  transport) executed the real arguments. In `mcp_arguments` mode, `reject` and
+  `redact` now refuse any in-scope request whose `charset` is not `utf-8` /
+  `utf8` (case-insensitive, optionally quoted) with `400` and
+  `ai_shield_rejected=unsupported_charset`, before the body is parsed and again
+  on the final `Content-Type`; `warn` records
+  `ai_shield_warnings=unsupported_charset`. `mcp_gateway` refuses the same
+  requests with JSON-RPC `-32600` before routing. Requests with no `charset`
+  are unaffected.
 - **`ai_prompt_shield` `mcp_arguments` no longer forwards a tool-call batch it
   could not parse** (GHSA-f2jp-59r9-fp64, #5954; affects v0.9.9). The shield
   parsed the whole request body as one `serde_json::Value` and let a body it
@@ -19,11 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the gateway with its arguments never scanned. The same gap let a lenient
   upstream decoder (Python's `json`, JSON5) execute a call whose body serde
   refuses for a byte-order mark, a UTF-16 / UTF-32 or other non-UTF-8
-  encoding, `NaN`, `Infinity`, comments, or trailing commas. When the
-  whole-document parse fails, `before_proxy` and the final-body re-check now
-  refuse any body that carries a NUL byte, a byte-order mark, or a leading `/`
-  comment, or is object- or array-shaped and names `tools/call` or contains a
-  JSON escape — and the final re-check any non-UTF-8 body — with `400` and
+  encoding, `NaN`, `Infinity`, `/` or `#` comments, JSON5 whitespace (form
+  feed, no-break space, U+2028), or trailing commas. When the whole-document
+  parse fails, `before_proxy` and the final-body re-check now refuse any body
+  that carries a NUL byte or a byte-order mark, whose first byte after ASCII
+  whitespace is `/`, `#`, or non-ASCII, or that is object- or array-shaped and
+  names `tools/call` or contains a JSON escape — and the final re-check any
+  non-UTF-8 body — with `400` and
   `ai_shield_rejected=jsonrpc_request_unparseable` in `reject` / `redact`
   mode, recording `ai_shield_warnings=jsonrpc_request_unparseable` in `warn`
   mode. Bodies that cannot name a call — including the empty final body of an
@@ -41,10 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsed on their own and keyed (and, with `capture.mcp_arguments`, excerpted)
   like a parsed call's. A body the recognizer cannot read is kept with an empty
   `calls` list, and so — matching the shield's fail-closed rule — is a refused
-  body that carries a NUL byte (UTF-16 / UTF-32), a byte-order mark, or a
-  leading `/` comment, or is object- or array-shaped and names `tools/call` or
-  contains a JSON escape, since a lenient upstream decoder may still execute it
-  without `ai_prompt_shield` in front.
+  body flagged by the same test (a NUL byte, a byte-order mark, a leading `/`,
+  `#`, or non-ASCII UTF-8 character, or an object or array naming
+  `tools/call` or containing a JSON escape), since a lenient upstream decoder may still execute
+  it without `ai_prompt_shield` in front. Such bodies count against the
+  audit's staging permits.
 
 ## [0.9.9] - 2026-10-01
 

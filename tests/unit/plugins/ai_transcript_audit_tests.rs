@@ -13464,6 +13464,29 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
 }
 
 #[tokio::test]
+async fn mcp_audit_stages_content_type_less_bom_prefixed_tool_calls() {
+    // Without a Content-Type only bodies the lenient prefilter does not flag
+    // are skipped; a BOM-prefixed call is flagged, so it is still audited.
+    let body = format!(
+        "\u{feff}{}",
+        mcp_call_value(json!(77), "crm.lookup", json!({"q": "x"}))
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.headers.remove("content-type");
+    ctx.metadata
+        .insert("request_body".to_string(), body.clone());
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        body.as_bytes(),
+        &json!({"jsonrpc": "2.0", "id": 77, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(records[0]["mcp"]["calls"], json!([]), "{records:#?}");
+}
+
+#[tokio::test]
 async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
     let request = mcp_call_value(json!(73), "pets.getPet", json!({"petId": "7"}));
     let mut ctx = mcp_ctx(&request);

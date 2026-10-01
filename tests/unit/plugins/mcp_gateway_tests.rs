@@ -6652,6 +6652,43 @@ async fn transparent_batch_admits_member_past_whole_document_recursion_limit() {
 }
 
 #[tokio::test]
+async fn non_utf8_request_charsets_are_refused_before_routing() {
+    // GHSA-4f9m-cfqg-fhx9: the gateway and every governance plugin read the
+    // body as UTF-8, so a request declared in another charset would be
+    // governed as one text and decoded as another by a charset-aware upstream.
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &transparent_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    for content_type in [
+        "application/json; charset=utf-7",
+        "application/json; charset=\"UTF-16\"",
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(request.clone());
+        headers.insert("content-type".to_string(), content_type.to_string());
+        let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(status, 200, "{content_type}");
+        assert_eq!(body["error"]["code"], -32600, "{content_type}: {body}");
+        assert!(ctx.route_override_backend_host.is_none(), "{content_type}");
+    }
+    for content_type in [
+        "application/json; charset=UTF-8",
+        "application/json; charset=\"utf8\"",
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(request.clone());
+        headers.insert("content-type".to_string(), content_type.to_string());
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{content_type}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn aggregate_batch_tools_list_live_path() {
     let server = start_mcp_catalog_server().await;
     let mut config = aggregate_config(&format!("{}/mcp", server.uri()));

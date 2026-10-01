@@ -4401,11 +4401,18 @@ async fn mcp_arguments_mode_refuses_encoded_or_commented_tool_calls() {
     let bom_call = format!("\u{feff}{call}");
     let utf16_call = String::from_utf8(utf16le_bytes(&call)).unwrap();
     let comment_call = format!("/*x*/{call}");
+    let hash_comment_call = format!("# x\n{call}");
+    // JSON5 whitespace strict JSON refuses: a form feed and a no-break space.
+    let form_feed_call = format!("\x0C{call}");
+    let nbsp_call = format!("\u{a0}{call}");
 
     for body in [
         bom_call.as_str(),
         utf16_call.as_str(),
         comment_call.as_str(),
+        hash_comment_call.as_str(),
+        form_feed_call.as_str(),
+        nbsp_call.as_str(),
     ] {
         assert!(serde_json::from_str::<serde_json::Value>(body).is_err());
         for action in ["reject", "redact"] {
@@ -4471,6 +4478,109 @@ async fn mcp_arguments_mode_final_hook_refuses_non_utf8_bodies() {
         shield_metadata(&ctx, "ai_shield_warnings"),
         Some("jsonrpc_request_unparseable")
     );
+}
+
+fn content_type_headers(content_type: &str) -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), content_type.to_string())])
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_refuses_non_utf8_charsets() {
+    // GHSA-4f9m-cfqg-fhx9: UTF-7 is plain ASCII JSON (`+AGE-` is `a`), so the
+    // shield would scan encoded text while a charset-aware upstream decodes
+    // the real arguments.
+    let call = mcp_tool_call(1, json!({"e": "+AGE-lice+AEA-example.com"}));
+    let refused = [
+        "application/json; charset=utf-7",
+        "application/json;charset=UTF-16",
+        "application/json ; charset = \"utf-7\"",
+        "application/json; charset=",
+    ];
+    for content_type in refused {
+        for action in ["reject", "redact"] {
+            let plugin = mcp_shield(action);
+            let mut ctx = make_post_ctx(&call);
+            let mut headers = content_type_headers(content_type);
+            assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_rejected"),
+                Some("unsupported_charset"),
+                "{action}: {content_type}"
+            );
+
+            // A later transform that rewrites the header is refused by the
+            // final hook under the same rule.
+            let mut ctx = make_post_ctx(&call);
+            let mut headers = make_post_headers();
+            assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+            let rewritten = content_type_headers(content_type);
+            let body = call.to_string();
+            assert_reject(
+                plugin
+                    .on_final_request_body_with_context(&mut ctx, &rewritten, body.as_bytes())
+                    .await,
+                Some(400),
+            );
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_rejected"),
+                Some("unsupported_charset")
+            );
+        }
+
+        let plugin = mcp_shield("warn");
+        let mut ctx = make_post_ctx(&call);
+        let mut headers = content_type_headers(content_type);
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_warnings"),
+            Some("unsupported_charset"),
+            "{content_type}"
+        );
+    }
+
+    let accepted = [
+        "application/json",
+        "application/json; charset=UTF-8",
+        "application/json; charset=\"utf-8\"",
+        "application/json ; charset = utf8",
+    ];
+    for content_type in accepted {
+        for action in ["reject", "redact", "warn"] {
+            let plugin = mcp_shield(action);
+            let mut ctx = make_post_ctx(&call);
+            let mut headers = content_type_headers(content_type);
+            assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+            let body = call.to_string();
+            assert_continue(
+                plugin
+                    .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                    .await,
+            );
+            assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+            assert_eq!(shield_metadata(&ctx, "ai_shield_warnings"), None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_mcp_modes_still_continue_on_a_non_utf8_final_body() {
+    let prompt = json!({"messages": [{"role": "user", "content": "hello"}]});
+    for scan_fields in ["all", "content"] {
+        let plugin = AiPromptShield::new(&json!({
+            "action": "reject",
+            "scan_fields": scan_fields,
+            "patterns": ["email"]
+        }))
+        .unwrap();
+        let mut ctx = make_post_ctx(&prompt);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, b"\xFF\xFEh\x00i\x00")
+                .await,
+        );
+    }
 }
 
 #[tokio::test]
