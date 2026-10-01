@@ -82,6 +82,7 @@ Run the full local suite only for shared infrastructure, cross-module refactors,
 - Always set `validation.validate_exp = true` for JWT verification.
 - Do not log secrets, bearer tokens, cookies, private keys, or unredacted credential metadata.
 - Admin API/OpenAPI parity is mandatory: endpoint, field, status-code, or plugin schema changes must update `openapi.yaml`.
+- Edge-owned contracts (`gateway-errors`, `gateway-headers`, `provisioned-by`, `plugin-catalog`, `diagnostic-ref`) are published in ferrum-contracts. Changing `src/retry.rs`, `docs/error_classification.md`, `src/proxy/headers.rs`, `docs/admin_api.md`, `openapi.yaml`, `src/admin/provisioning.rs`, `src/plugins/mod.rs`, `src/plugins/builtin_parity.rs`, or `src/diagnostic_ref.rs` requires a ferrum-contracts update: note it in the PR.
 - New `FERRUM_*` env vars require `docs/configuration.md` and `ferrum.conf` updates.
 - Schema additions should use `#[serde(default, skip_serializing_if = "<pred>")]` when optional. Check `deny_unknown_fields` before adding fields.
 
