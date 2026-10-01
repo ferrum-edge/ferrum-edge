@@ -1269,6 +1269,21 @@ mod live_datapath {
     }
 
     #[test]
+    fn the_body_buffer_scan_considers_the_parameter_stripped_spelling() {
+        // `authorize` judges a CUSTOM rule on both spellings of a `;` path
+        // (issue #5948), so the pre-authorize scan must buffer for either.
+        let plugin = plugin(body_slice_json(9000, &["/admin/*"])).expect("generation builds");
+        assert!(
+            plugin.should_buffer_request_body(&ctx("/admin;x/reports")),
+            "the stripped /admin/reports is reachable by the body-inspecting rule"
+        );
+        assert!(
+            !plugin.should_buffer_request_body(&ctx("/public;x/upload")),
+            "neither spelling of /public;x/upload is reachable"
+        );
+    }
+
+    #[test]
     fn a_generation_with_no_body_inspecting_provider_buffers_nothing() {
         let plugin = plugin(slice_json(9000, None, false)).expect("generation builds");
         assert!(!plugin.requires_request_body_before_authorize());

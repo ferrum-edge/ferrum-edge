@@ -2292,10 +2292,16 @@ impl RouterCache {
         )
     }
 
-    /// Library/test variant of [`Self::resolve_mesh_scoped_route_in_epoch`]
-    /// on the router's own route snapshot, with no Gateway listener identity.
+    /// Test-only variant of [`Self::resolve_mesh_scoped_route_in_epoch`] on
+    /// the router's own route snapshot, with no Gateway listener identity.
+    ///
+    /// It builds a [`MeshScopedRoute`] without the request's listener and
+    /// request epoch, so request handling must never call it: the frontends
+    /// resolve through [`Self::resolve_mesh_scoped_route_in_epoch`]. It is
+    /// public only so the library's external tests can reach it.
+    #[doc(hidden)]
     #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
-    pub fn resolve_mesh_scoped_route(
+    pub fn resolve_mesh_scoped_route_for_test(
         &self,
         host: Option<&str>,
         path: &str,
@@ -3714,7 +3720,7 @@ pub struct MeshRouteScope {
 /// A route resolved the way the request frontends resolve one, mesh direction
 /// filter and mesh port-sibling selection included. Only
 /// [`RouterCache::resolve_mesh_scoped_route_in_epoch`] and
-/// [`RouterCache::resolve_mesh_scoped_route`] produce one, which is what lets
+/// [`RouterCache::resolve_mesh_scoped_route_for_test`] produce one, which is what lets
 /// [`path_parameter_scoped_route_admitted`] trust a direction-scoped mesh
 /// route it names.
 #[derive(Clone, Debug)]
@@ -3860,6 +3866,25 @@ pub fn path_parameter_scoped_route_admitted(
     request_host: Option<&str>,
 ) -> bool {
     path_parameter_route_decision(matched, &stripped_route.0, request_host, true)
+}
+
+/// Whether a request carrying `;` path parameters that the H1/H2 frontend
+/// routed by the direct Pod-IP HTTP egress decision may be served on
+/// `matched` without a stripped re-lookup (issue #5937).
+///
+/// That decision selects a route from the captured original destination
+/// before host routing and never reads the path, so the stripped path takes
+/// the same decision and reaches the same route. The shortcut applies only
+/// when the frontend took that decision (`routed_by_direct_workload`) AND the
+/// matched proxy is a direct Pod-IP route (`__mesh-outbound-http-bywl-*`);
+/// any other combination goes through
+/// [`RouterCache::resolve_mesh_scoped_route_in_epoch`].
+pub fn path_parameter_direct_workload_route_admitted(
+    matched: &Proxy,
+    routed_by_direct_workload: bool,
+) -> bool {
+    routed_by_direct_workload
+        && crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&matched.id)
 }
 
 fn path_parameter_route_decision(

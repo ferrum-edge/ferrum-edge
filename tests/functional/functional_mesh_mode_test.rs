@@ -4238,12 +4238,14 @@ async fn start_request_line_echo_backend(label: &'static str) -> u16 {
 /// sidecar's inbound listener for its local `echo` service, whose
 /// `allow_path_parameters` opt-in is `opt_in`. With `multi_port`, `echo`
 /// declares two HTTP ports (8080 → `backend-a`, 9090 → `backend-b`), else one
-/// port served by `backend-a`. Returns each request's status and response
+/// port served by `backend-a`. `extra_policies` are added to the slice next
+/// to the ALLOW for the client. Returns each request's status and response
 /// text, in order. Spawn/bind flakes and a gateway that dies mid-run are
 /// retried with fresh ports; request outcomes are not.
 async fn drive_inbound_path_parameter_requests(
     opt_in: bool,
     multi_port: bool,
+    extra_policies: &[MeshPolicy],
     requests: &[(&'static str, &'static str)],
 ) -> Result<Vec<(u16, String)>, String> {
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
@@ -4251,6 +4253,7 @@ async fn drive_inbound_path_parameter_requests(
     let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
     let label = match (opt_in, multi_port) {
         (true, true) => "opt-in-multi-port",
+        (true, false) if !extra_policies.is_empty() => "opt-in-policies",
         (true, false) => "opt-in",
         (false, _) => "default",
     };
@@ -4274,6 +4277,7 @@ async fn drive_inbound_path_parameter_requests(
             inbound_authz_slice(&node_id, server_spiffe, client_spiffe, backend_a, true)
         };
         slice.services[0].allow_path_parameters = opt_in;
+        slice.mesh_policies.extend_from_slice(extra_policies);
 
         let cp = start_static_mesh_cp(slice).await;
         let ports = reserve_mesh_ports().await;
@@ -4373,7 +4377,7 @@ const ECHO_HOST: &str = "echo.ferrum.svc.cluster.local";
 async fn functional_mesh_sidecar_inbound_opted_in_service_forwards_path_parameters() {
     let paths = ["/app/;jsessionid=abc123", "/app/page;jsessionid=abc123"];
     let requests: Vec<_> = paths.iter().map(|path| (ECHO_HOST, *path)).collect();
-    let results = drive_inbound_path_parameter_requests(true, false, &requests)
+    let results = drive_inbound_path_parameter_requests(true, false, &[], &requests)
         .await
         .expect("opted-in inbound case");
     assert_eq!(results.len(), paths.len());
@@ -4401,7 +4405,7 @@ async fn functional_mesh_sidecar_inbound_service_without_opt_in_refuses_path_par
         (ECHO_HOST, "/app/page%3Bjsessionid=abc123"),
         (ECHO_HOST, "/app/page"),
     ];
-    let results = drive_inbound_path_parameter_requests(false, false, &requests)
+    let results = drive_inbound_path_parameter_requests(false, false, &[], &requests)
         .await
         .expect("default inbound case");
     assert_eq!(results.len(), requests.len());
@@ -4462,7 +4466,7 @@ async fn functional_mesh_sidecar_inbound_path_parameters_stay_on_the_selected_po
         ),
         (502, None),
     ];
-    let results = drive_inbound_path_parameter_requests(true, true, &requests)
+    let results = drive_inbound_path_parameter_requests(true, true, &[], &requests)
         .await
         .expect("opted-in multi-port inbound case");
     assert_eq!(results.len(), requests.len());
@@ -4481,6 +4485,74 @@ async fn functional_mesh_sidecar_inbound_path_parameters_stay_on_the_selected_po
             ),
         }
     }
+}
+
+/// A DENY on `/admin/*` also refuses `/admin;x/users` on an opted-in service
+/// (issue #5948). A parameter-stripping backend executes `/admin/users` for
+/// it, so `mesh_authz` judges `paths:` and `when: request.headers[:path]` on
+/// both spellings and the request never reaches the backend. A `;jsessionid=`
+/// path neither DENY covers is still served unchanged.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_inbound_deny_covers_the_parameter_stripped_path() {
+    use ferrum_edge::modes::mesh::config::{ConditionMatch, RequestMatch};
+
+    let deny_admin = MeshPolicy {
+        name: "deny-admin".to_string(),
+        namespace: "ferrum".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            to: vec![RequestMatch {
+                paths: vec!["/admin/*".to_string()],
+                ..RequestMatch::default()
+            }],
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    };
+    // The same restriction written as a `:path` condition.
+    let deny_secret = MeshPolicy {
+        name: "deny-secret".to_string(),
+        namespace: "ferrum".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            when: vec![ConditionMatch {
+                key: "request.headers[:path]".to_string(),
+                values: vec!["/secret/*".to_string()],
+                not_values: Vec::new(),
+            }],
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    };
+    let requests = [
+        (ECHO_HOST, "/admin;x/users"),
+        (ECHO_HOST, "/admin;jsessionid=abc123/users"),
+        (ECHO_HOST, "/admin/users"),
+        (ECHO_HOST, "/secret;x/doc"),
+        (ECHO_HOST, "/app/page;jsessionid=abc123"),
+    ];
+    let policies = [deny_admin, deny_secret];
+    let results = drive_inbound_path_parameter_requests(true, false, &policies, &requests)
+        .await
+        .expect("opted-in inbound DENY case");
+    assert_eq!(results.len(), requests.len());
+    for ((_, path), (status, body)) in requests[..4].iter().zip(&results) {
+        assert_eq!(*status, 403, "a DENY must refuse {path}; body: {body:?}");
+        assert!(
+            !body.contains("backend-a"),
+            "{path} must not reach the backend: {body:?}"
+        );
+    }
+    let (status, body) = &results[4];
+    assert_eq!(
+        *status, 200,
+        "a path outside both DENY rules must be served; body: {body:?}"
+    );
+    assert!(
+        body.contains("backend-a GET /app/page;jsessionid=abc123 HTTP/1.1"),
+        "the backend must receive the path unchanged: {body:?}"
+    );
 }
 
 // ── Live OUTBOUND (egress) datapath: point A → point B over the mesh ─────────

@@ -6,6 +6,7 @@ mod admin_db_health_cache_tests;
 mod admin_jwt_auth_tests;
 mod admin_jwt_viewer_secret_tests;
 mod admin_live_apply_topology_tests;
+mod admin_mcp_tool_catalog_tests;
 mod admin_metrics_contract_tests;
 mod admin_namespace_unserved_tests;
 mod admin_read_only_tests;

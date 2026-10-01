@@ -3545,3 +3545,296 @@ fn bare_service_fqdn_sni_values_are_reported_for_the_load_time_warning() {
         "a trailing dot on the cluster domain does not change the result"
     );
 }
+
+// ── `;` path parameters on an opted-in service (issue #5948) ─────────────────
+//
+// On a route whose service opted in to path parameters
+// (`MeshService.allow_path_parameters`), a parameter-stripping backend
+// executes `/admin/users` for `/admin;x/users`. `authorize` therefore judges
+// `paths:` / `notPaths:` on both spellings: a DENY matches either, an ALLOW
+// must match both. The opt-in is read from the matched proxy.
+
+const PATH_PARAMETER_HOST: &str = "reviews.default.svc.cluster.local";
+
+/// An inbound request routed to a proxy whose `allow_path_parameters` is
+/// `opted_in`, as the frontend hands it to `authorize`.
+fn path_parameter_ctx(path: &str, opted_in: bool) -> RequestContext {
+    let mut ctx = inbound_leg_ctx("GET", path, Some(CLIENT_SPIFFE));
+    let mut proxy = super::mesh_test_support::http_proxy("reviews", PATH_PARAMETER_HOST, 8080);
+    proxy.allow_path_parameters = opted_in;
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    ctx
+}
+
+fn path_policy(name: &str, action: PolicyAction, to: RequestMatch) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            to: vec![to],
+            action,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+fn path_patterns(patterns: &[&str]) -> Vec<String> {
+    patterns.iter().map(|pattern| pattern.to_string()).collect()
+}
+
+#[tokio::test]
+async fn deny_prefix_blocks_a_parameterised_segment_on_an_opted_in_service() {
+    let deny_admin = path_policy(
+        "deny-admin",
+        PolicyAction::Deny,
+        RequestMatch {
+            paths: path_patterns(&["/admin/*"]),
+            ..RequestMatch::default()
+        },
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_admin]);
+
+    for path in ["/admin;x/users", "/admin;v=1/users", "/admin/users"] {
+        let mut ctx = path_parameter_ctx(path, true);
+        let result = plugin.authorize(&mut ctx).await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "{path} executes /admin/users on a parameter-stripping backend, got {result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh_authz.deny_policy")
+                .map(String::as_str),
+            Some("deny-admin"),
+            "{path}"
+        );
+    }
+
+    let mut ctx = path_parameter_ctx("/app/page;jsessionid=abc", true);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a path outside the DENY is served, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn allow_with_not_paths_refuses_a_parameterised_excluded_path_on_an_opted_in_service() {
+    let allow_api = path_policy(
+        "allow-api",
+        PolicyAction::Allow,
+        RequestMatch {
+            paths: path_patterns(&["/api/*"]),
+            not_paths: path_patterns(&["/api/admin/*"]),
+            ..RequestMatch::default()
+        },
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_api]);
+
+    let mut ctx = path_parameter_ctx("/api/admin;x/users", true);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "the stripped /api/admin/users is excluded from the grant, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("implicit-deny")
+    );
+
+    let mut ctx = path_parameter_ctx("/api/items;jsessionid=abc", true);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "both spellings of /api/items are granted, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_second_spelling_does_not_depend_on_the_proxy_opt_in() {
+    // The frontend refuses a `;` on a proxy without `allow_path_parameters`
+    // before any plugin runs, so this request never reaches `authorize` in
+    // production. If a future entry point let one through, it would still be
+    // judged on both spellings: the DENY holds.
+    let deny_admin = path_policy(
+        "deny-admin",
+        PolicyAction::Deny,
+        RequestMatch {
+            paths: path_patterns(&["/admin/*"]),
+            ..RequestMatch::default()
+        },
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_admin]);
+
+    let mut ctx = path_parameter_ctx("/admin;x/users", false);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "the stripped /admin/users is denied whatever the opt-in, got {result:?}"
+    );
+}
+
+// `when: request.headers[:path]` reads the canonical request path, so it is
+// judged on the same spelling as `paths:` / `notPaths:` of its rule.
+
+fn path_condition_policy(name: &str, action: PolicyAction, when: ConditionMatch) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            when: vec![when],
+            action,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+fn path_condition(values: &[&str], not_values: &[&str]) -> ConditionMatch {
+    ConditionMatch {
+        key: "request.headers[:path]".to_string(),
+        values: path_patterns(values),
+        not_values: path_patterns(not_values),
+    }
+}
+
+async fn path_parameter_decision(plugin: &MeshAuthz, path: &str) -> PluginResult {
+    let mut ctx = path_parameter_ctx(path, true);
+    plugin.authorize(&mut ctx).await
+}
+
+#[tokio::test]
+async fn a_deny_path_condition_blocks_a_parameterised_segment() {
+    let deny_admin = path_condition_policy(
+        "deny-admin-path",
+        PolicyAction::Deny,
+        path_condition(&["/admin/*"], &[]),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_admin]);
+
+    let result = path_parameter_decision(&plugin, "/admin;x/users").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "the stripped /admin/users matches the DENY condition, got {result:?}"
+    );
+    let result = path_parameter_decision(&plugin, "/app/page;jsessionid=abc").await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+}
+
+#[tokio::test]
+async fn an_allow_path_condition_suffix_must_hold_for_the_stripped_spelling() {
+    let allow_png = path_condition_policy(
+        "allow-png-path",
+        PolicyAction::Allow,
+        path_condition(&["*.png"], &[]),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_png]);
+
+    let result = path_parameter_decision(&plugin, "/admin/users;x.png").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "the backend executes /admin/users, which is not a .png, got {result:?}"
+    );
+    let result = path_parameter_decision(&plugin, "/img;v=2/logo.png").await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+}
+
+#[tokio::test]
+async fn an_allow_path_and_suffix_condition_must_hold_for_both_spellings() {
+    let allow_app_png = MeshPolicy {
+        name: "allow-app-png".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            to: vec![RequestMatch {
+                paths: path_patterns(&["/app/*"]),
+                ..RequestMatch::default()
+            }],
+            when: vec![path_condition(&["*.png"], &[])],
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_app_png]);
+
+    let result = path_parameter_decision(&plugin, "/app/a;x.png").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "the stripped /app/a does not satisfy the *.png condition, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_allow_path_condition_not_values_applies_to_either_spelling() {
+    let allow_api = path_condition_policy(
+        "allow-api-path",
+        PolicyAction::Allow,
+        path_condition(&[], &["/api/admin/*"]),
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_api]);
+
+    let result = path_parameter_decision(&plugin, "/api/admin;x/users").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "the stripped /api/admin/users is excluded from the grant, got {result:?}"
+    );
+    let result = path_parameter_decision(&plugin, "/api/items;v=1").await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+}
+
+#[tokio::test]
+async fn paths_and_a_path_condition_are_judged_on_the_same_spelling() {
+    // A DENY whose `to.paths` holds on the stripped spelling and whose `:path`
+    // condition holds on the stripped spelling too fires. One whose halves
+    // hold on different spellings does not.
+    let deny_users = MeshPolicy {
+        name: "deny-admin-users".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            to: vec![RequestMatch {
+                paths: path_patterns(&["/admin/*"]),
+                ..RequestMatch::default()
+            }],
+            when: vec![path_condition(&["*/users"], &[])],
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_users]);
+    let result = path_parameter_decision(&plugin, "/admin;x/users").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "both halves hold on the stripped /admin/users, got {result:?}"
+    );
+
+    let split = MeshPolicy {
+        name: "deny-split".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            to: vec![RequestMatch {
+                paths: path_patterns(&["/admin;x/*"]),
+                ..RequestMatch::default()
+            }],
+            when: vec![path_condition(&["/admin/users"], &[])],
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![split]);
+    let result = path_parameter_decision(&plugin, "/admin;x/users").await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "no single spelling satisfies both halves, got {result:?}"
+    );
+}

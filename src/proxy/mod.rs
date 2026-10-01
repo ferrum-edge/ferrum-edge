@@ -31176,9 +31176,10 @@ pub(crate) fn check_routed_path_parameters(
     // The direct Pod-IP HTTP egress decision reads only the captured original
     // destination, so the stripped path takes the same decision and reaches
     // this same route.
-    if scope.routed_by_direct_workload
-        && crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&proxy.id)
-    {
+    if crate::router_cache::path_parameter_direct_workload_route_admitted(
+        proxy,
+        scope.routed_by_direct_workload,
+    ) {
         return Ok(());
     }
     let stripped = crate::policy_path::strip_path_parameters(path);

@@ -8,6 +8,7 @@ pub mod config_export;
 pub mod conn_limit;
 pub(crate) mod crud;
 pub mod jwt_auth;
+mod mcp_tool_catalog;
 pub mod mesh_config_drift;
 pub mod mesh_remote_clusters;
 pub mod mesh_slice_drift;
@@ -2030,6 +2031,8 @@ fn paginated_get_list_route_role(method: &Method, segments: &[&str]) -> Option<O
         ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] | ["namespaces"] => {
             Some(None)
         }
+        // Viewer or above: every authenticated actor, so no arm-level gate.
+        ["proxies", _, "mcp", "tools"] => Some(None),
         // Trust material is security state: even the list shape is Operator-gated.
         ["gateway-trust-bundles"] => Some(Some(AdminRole::Operator)),
         ["audit"] => Some(Some(AdminRole::Admin)),
@@ -4282,6 +4285,10 @@ async fn handle_admin_request_inner(
         }
         (Method::GET, ["proxies", id]) => {
             crud::handle_get::<Proxy>(&state, id, auth.role, &namespace).await
+        }
+        (Method::GET, ["proxies", id, "mcp", "tools"]) => {
+            let pagination = route_pagination!();
+            mcp_tool_catalog::handle_get_mcp_tool_catalog(&state, id, &namespace, &pagination).await
         }
         (Method::POST, ["proxies"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {

@@ -7,7 +7,8 @@ use ferrum_edge::policy_path::strip_path_parameters;
 use ferrum_edge::proxy::build_backend_url;
 use ferrum_edge::router_cache::{
     HostRouteRank, MeshRouteScope, MeshScopedResolution, host_route_rank,
-    path_parameter_route_admitted, path_parameter_scoped_route_admitted,
+    path_parameter_direct_workload_route_admitted, path_parameter_route_admitted,
+    path_parameter_scoped_route_admitted,
 };
 
 // This suite intentionally exercises the public RouterCache facade.
@@ -2416,6 +2417,28 @@ fn inbound(authority_port: Option<u16>) -> MeshRouteScope {
     }
 }
 
+/// Resolve `path` the way a plaintext request frontend with no frontend port
+/// resolves it, mesh steps included.
+fn scoped(
+    cache: &RouterCache,
+    host: Option<&str>,
+    path: &str,
+    mesh: MeshRouteScope,
+) -> MeshScopedResolution {
+    cache.resolve_mesh_scoped_route_for_test(host, path, None, false, mesh)
+}
+
+/// [`scoped`] for a request accepted on `frontend_port`.
+fn scoped_on_port(
+    cache: &RouterCache,
+    host: Option<&str>,
+    path: &str,
+    frontend_port: Option<u16>,
+    mesh: MeshRouteScope,
+) -> MeshScopedResolution {
+    cache.resolve_mesh_scoped_route_for_test(host, path, frontend_port, false, mesh)
+}
+
 /// What the frontends decide for a `;` request, with both lookups resolved
 /// the way the request itself is (mesh direction filter and port-sibling
 /// selection included): the proxy the request reached, and whether it is
@@ -2426,9 +2449,7 @@ fn mesh_reroute(
     path: &str,
     mesh: MeshRouteScope,
 ) -> (String, bool) {
-    let MeshScopedResolution::Routed(matched) =
-        cache.resolve_mesh_scoped_route(host, path, None, false, mesh)
-    else {
+    let MeshScopedResolution::Routed(matched) = scoped(cache, host, path, mesh) else {
         panic!("request {path} must route");
     };
     let matched = matched.route_match().proxy.clone();
@@ -2436,7 +2457,7 @@ fn mesh_reroute(
         return (matched.id.clone(), false);
     }
     let stripped = strip_path_parameters(path);
-    let served = match cache.resolve_mesh_scoped_route(host, &stripped, None, false, mesh) {
+    let served = match scoped(cache, host, &stripped, mesh) {
         MeshScopedResolution::NotFound => true,
         MeshScopedResolution::Refused => false,
         MeshScopedResolution::Routed(stripped_route) => {
@@ -2529,7 +2550,7 @@ fn mesh_scoped_reroute_selects_the_port_sibling_the_request_selected() {
         .expect("representative routes");
     assert_eq!(raw.proxy.id, "__mesh-outbound-default-web-80");
     let MeshScopedResolution::Routed(sibling) =
-        cache.resolve_mesh_scoped_route(Some("web"), "/app/", None, false, outbound(Some(90)))
+        scoped(&cache, Some("web"), "/app/", outbound(Some(90)))
     else {
         panic!("the 90 sibling must route");
     };
@@ -2541,7 +2562,7 @@ fn mesh_scoped_reroute_selects_the_port_sibling_the_request_selected() {
     // Without an original destination a multi-port service is ambiguous:
     // the frontend refuses it, and so does the re-resolve.
     assert!(matches!(
-        cache.resolve_mesh_scoped_route(Some("web"), "/app/", None, false, outbound(None)),
+        scoped(&cache, Some("web"), "/app/", outbound(None)),
         MeshScopedResolution::Refused
     ));
 }
@@ -2561,7 +2582,7 @@ fn mesh_scoped_reroute_filters_the_other_direction() {
     let cache = RouterCache::new(&config, 100);
 
     assert!(matches!(
-        cache.resolve_mesh_scoped_route(Some("web"), "/api/x", None, false, outbound(None)),
+        scoped(&cache, Some("web"), "/api/x", outbound(None)),
         MeshScopedResolution::NotFound
     ));
     assert_eq!(
@@ -2570,13 +2591,7 @@ fn mesh_scoped_reroute_filters_the_other_direction() {
     );
     // A non-mesh listener sees no mesh route either.
     assert!(matches!(
-        cache.resolve_mesh_scoped_route(
-            Some("web"),
-            "/api/x",
-            None,
-            false,
-            MeshRouteScope::default()
-        ),
+        scoped(&cache, Some("web"), "/api/x", MeshRouteScope::default()),
         MeshScopedResolution::NotFound
     ));
 }
@@ -2642,9 +2657,106 @@ fn mesh_scoped_reroute_refuses_an_ambiguous_inbound_port_signal() {
         ("__mesh-inbound-default-web-90".to_string(), true)
     );
     assert!(matches!(
-        cache.resolve_mesh_scoped_route(Some("web"), "/app/", None, false, inbound(None)),
+        scoped(&cache, Some("web"), "/app/", inbound(None)),
         MeshScopedResolution::Refused
     ));
+}
+
+#[test]
+fn mesh_scoped_reroute_checks_the_dedicated_ingress_bind_port() {
+    // A dedicated Sidecar ingress bind route owns its own OS listener. The
+    // re-resolve repeats the frontend's bind-port check: the route serves only
+    // requests accepted on the port it declares.
+    let mut bind = mesh_route("__mesh-ingress-bind:default-web-16379", vec!["web"], true);
+    bind.listen_port = Some(16379);
+    // A bind-family route that declares no listener port matches on every
+    // frontend port, and the bind-port check refuses it (the frontend answers
+    // 502).
+    let unbound = mesh_route("__mesh-ingress-bind:default-api-16380", vec!["api"], true);
+    let config = test_config(vec![bind, unbound]);
+    let cache = RouterCache::new(&config, 100);
+
+    let MeshScopedResolution::Routed(route) =
+        scoped_on_port(&cache, Some("web"), "/app/", Some(16379), inbound(None))
+    else {
+        panic!("the bind route serves its own listener");
+    };
+    assert_eq!(
+        route.route_match().proxy.id,
+        "__mesh-ingress-bind:default-web-16379"
+    );
+    // The router scopes the bind route to its own listener, so on another
+    // frontend port the stripped path routes nowhere.
+    assert!(matches!(
+        scoped_on_port(&cache, Some("web"), "/app/", Some(15006), inbound(None)),
+        MeshScopedResolution::NotFound
+    ));
+    assert!(matches!(
+        scoped_on_port(&cache, Some("api"), "/app/", Some(15006), inbound(None)),
+        MeshScopedResolution::Refused
+    ));
+    assert!(matches!(
+        scoped_on_port(&cache, Some("api"), "/app/", None, inbound(None)),
+        MeshScopedResolution::Refused
+    ));
+}
+
+#[test]
+fn mesh_scoped_reroute_from_the_http3_frontend_filters_every_mesh_route() {
+    // The HTTP/3 frontend is never a mesh capture listener. It replays a `;`
+    // request with no direction and no port signals, so the stripped lookup
+    // drops every direction-scoped mesh route, as the request's own lookup
+    // does, and still refuses a stripped path owned by another route.
+    let mut versioned = opted_in_hosted("versioned", "/api;v=1", vec!["web"]);
+    versioned.namespace = MESH_NAMESPACE.to_string();
+    let config = test_config(vec![
+        mesh_route("__mesh-inbound-default-web-8080", vec!["web"], true),
+        mesh_route("__mesh-outbound-default-web-8080", vec!["web"], true),
+        versioned,
+        opted_in_hosted("catch-all", "/", vec!["h3.test"]),
+        test_proxy_with_hosts("admin", "/admin", vec!["h3.test"]),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+    let h3 = MeshRouteScope::default();
+
+    assert!(matches!(
+        scoped(&cache, Some("web"), "/app/", h3),
+        MeshScopedResolution::NotFound
+    ));
+    assert_eq!(
+        mesh_reroute(&cache, Some("web"), "/api;v=1/x", h3),
+        ("versioned".to_string(), true),
+        "the stripped /api/x reaches no mesh route on HTTP/3"
+    );
+    assert_eq!(
+        mesh_reroute(&cache, Some("h3.test"), "/admin;x/users", h3),
+        ("catch-all".to_string(), false),
+        "the stripped /admin/users belongs to /admin"
+    );
+}
+
+#[test]
+fn direct_pod_ip_routes_skip_the_stripped_lookup_only_after_the_direct_decision() {
+    // The direct Pod-IP HTTP egress decision reads only the captured original
+    // destination, never the path, so a `;` request it routed needs no
+    // stripped re-lookup. Both halves are required: the frontend took that
+    // decision, and the matched proxy is a direct Pod-IP route.
+    let bywl = mesh_route(
+        "__mesh-outbound-http-bywl-default-web-8080-10-0-0-1",
+        vec!["bywl-default-web-8080-10-0-0-1.mesh.internal"],
+        true,
+    );
+    let host_routed = mesh_route("__mesh-outbound-default-web-8080", vec!["web"], true);
+
+    assert!(path_parameter_direct_workload_route_admitted(&bywl, true));
+    assert!(
+        !path_parameter_direct_workload_route_admitted(&bywl, false),
+        "a direct Pod-IP route reached by host routing is re-resolved"
+    );
+    assert!(
+        !path_parameter_direct_workload_route_admitted(&host_routed, true),
+        "only a direct Pod-IP route may skip the re-lookup"
+    );
 }
 
 #[test]

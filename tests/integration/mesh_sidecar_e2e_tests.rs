@@ -682,6 +682,47 @@ fn sidecar_materialised_routes_carry_the_service_path_parameter_opt_in() {
     );
 }
 
+#[test]
+fn ambient_direct_pod_ip_routes_carry_the_service_path_parameter_opt_in() {
+    // Direct Pod-IP HTTP egress routes (`__mesh-outbound-http-bywl-*`, Ambient
+    // only) carry the destination service's opt-in, like its host-routed
+    // outbound route. The direct Pod-IP decision never reads the path, so the
+    // re-route check admits a `;` request on such a route without a stripped
+    // re-lookup.
+    let reviews = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.1"]);
+    let ratings = workload_for("ratings", "default", [("app", "ratings")], ["10.0.0.2"]);
+    let mut reviews_service = service_for("reviews", "default", &[&reviews]);
+    reviews_service.allow_path_parameters = true;
+    let ratings_service = service_for("ratings", "default", &[&ratings]);
+    let mesh = mesh_config_with(
+        vec![reviews, ratings],
+        vec![reviews_service, ratings_service],
+        Vec::new(),
+    );
+    let mut runtime = default_mesh_runtime();
+    runtime.topology = MeshTopology::Ambient;
+    runtime.workload_spiffe_id = Some("spiffe://cluster.local/ns/default/sa/client".to_string());
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
+
+    let opt_in = |prefix: &str| -> Vec<bool> {
+        prepared
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id.starts_with(prefix))
+            .map(|proxy| proxy.allow_path_parameters)
+            .collect()
+    };
+    assert_eq!(
+        opt_in("__mesh-outbound-http-bywl-default-reviews-8080-"),
+        vec![true]
+    );
+    assert_eq!(
+        opt_in("__mesh-outbound-http-bywl-default-ratings-8080-"),
+        vec![false]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sidecar_outbound_path_parameter_cannot_bypass_a_sibling_route_on_the_service_host() {
     let (responder, captured) = capturing_backend_handler();

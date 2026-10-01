@@ -498,6 +498,26 @@ fn policy_with_request_match(request: RequestMatch) -> MeshPolicy {
 }
 
 #[test]
+fn mesh_policy_rejects_to_headers_pseudo_headers_including_deny_rules() {
+    for header in [":path", ":method", ":authority", ":scheme", ":PATH"] {
+        let mut request = RequestMatch::default();
+        request.headers.insert(header.to_string(), "*".into());
+        let mut policy = policy_with_request_match(request);
+        policy.rules[0].action = PolicyAction::Deny;
+
+        let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("to[0].headers")
+                    && error.contains("pseudo-header")
+                    && error.contains("to.methods, to.paths, or to.hosts")
+            }),
+            "DENY using {header} must be rejected instead of silently failing open: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn mesh_policy_rejects_unsupported_when_condition_key() {
     let mut policy = policy_with_request_match(RequestMatch {
         methods: vec!["GET".into()],

@@ -2026,6 +2026,7 @@ Each `MeshRule` checks the following dimensions (all must match — a conjunctio
 - **Request principal matching**: `request_principals` glob patterns matched against the `{issuer}/{subject}` composite extracted by `jwks_auth`. On an HTTP-family path, when `request_principals` is non-empty and no JWT is present, the rule does not match (Istio semantics: anonymous requests fail the principal check). An empty `request_principals` list matches any request including unauthenticated ones, on every protocol. `requestPrincipals` is a JWT-derived **HTTP-only** field, so on a Layer-4 session (raw TCP, TLS passthrough, UDP, DTLS) it follows the same Istio non-HTTP-port model as the HTTP-only `to.operation` fields and `when: request.auth.*` conditions: a `DENY` (or `CUSTOM`) rule ignores it and still matches on its remaining constraints, while an `ALLOW`/`AUDIT` rule can never match on it.
 - **Source negation / IP blocks** (per-source, ANDed with the positive `from`): Istio `notPrincipals`, `notServiceAccounts`, `notNamespaces`, `notTrustDomains`, `notRequestPrincipals`, `ipBlocks`, `notIpBlocks`, `remoteIpBlocks`, `notRemoteIpBlocks`. These are **conjunctive** with the positive matchers. Negative identity matchers fail the rule only when the corresponding source/JWT identity is present and matches an excluded pattern; if the identity is absent, the negative matcher succeeds, so `DENY notPrincipals: ["*"]` and `DENY notRequestPrincipals: ["*"]` catch anonymous traffic. That absent-identity rule applies to `notRequestPrincipals` only where a JWT could have been observed: on a Layer-4 session the field is unevaluable, not absent, so it resolves through the same non-HTTP-port model as its positive sibling — ignored by `DENY`/`CUSTOM`, never matched by `ALLOW`/`AUDIT`. A `from:`-only `ALLOW` carrying `notRequestPrincipals` therefore does not grant a raw TCP/UDP/TLS-passthrough session. IP block matchers fail closed when the IP they test is absent, so a positive `ipBlocks`/`remoteIpBlocks` constraint with no resolved IP does not match. `ipBlocks`/`notIpBlocks` match the direct connection peer IP (`source.ip`); `remoteIpBlocks`/`notRemoteIpBlocks` match the gateway-resolved client IP (`remote.ip`, XFF-derived when trusted proxies are configured). Unsupported source fields fail the resource closed at translation time (mirroring the `to.operation` side); a malformed CIDR rejects the resource or direct plugin config.
 - **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive; `notPorts` accepts the same bounded Istio port grammar as positive `ports` (`"*"`, `"<digits>*"`, `"*<digits>"` that can match an ordinary decimal port in `1..=65535`, plus literal `1`-`65535`) and evaluates through pre-normalized `not_ports` / `not_port_patterns` without per-request allocation. ALLOW/AUDIT rules fail closed when the corresponding request attribute is absent (including an unresolved destination/listener port for `notPorts`); DENY (and `CUSTOM`) rules follow Istio and treat **unsourceable** HTTP-only operation attributes as matches, so port scoping is recommended for DENY rules that mention HTTP fields and can see TCP traffic.
+  Native `to.headers` matches only the ordinary HTTP request header map and rejects the pseudo-header names `:path`, `:method`, `:authority`, and `:scheme` during config validation, for every action. Use `to.paths`, `to.methods`, or `to.hosts` for those request facts; `when: request.headers[:path]` is also supported for path conditions and participates in the raw/stripped spelling rule below.
   **"Unsourceable" is not the same as "absent", and `headers` is where the difference is observable.** On a Layer-4 session (raw TCP, TLS passthrough, UDP, DTLS) there is no header map at all, so a `to.headers` predicate is unevaluable and a DENY/`CUSTOM` rule ignores it and still matches on its remaining constraints. On an HTTP-family request Ferrum HAS parsed the header map, so a header the client simply did not send is genuinely **absent** and fails a positive `to.headers` predicate for **every** action, DENY and `CUSTOM` included — matching Envoy's `HeaderMatcher`, where a missing field never satisfies an exact non-empty value, and matching the sibling `when: request.headers[...]` condition, which has always drawn this distinction. A DENY carrying `headers: {x-mode: blocked}` therefore refuses an HTTP request that carries `x-mode: blocked` and lets an HTTP request with no `x-mode` header through to the remaining tiers; to refuse the header-less request as well, add a second rule with no header predicate. `methods`, `paths`, `hosts` and `ports` are unaffected in practice: an HTTP-family request always carries a method and a canonical path, and a request with no resolvable authority or port has nothing for the matcher to read.
   `hosts` and `notHosts` match the literal requested hostname/authority after case, trailing-dot, and decimal-port normalization; they do not identify a service or expand its aliases. For example, one service may be reachable as `svc`, `svc.ferrum`, `svc.ferrum.svc`, and `svc.ferrum.svc.cluster.local`. A DENY naming only the FQDN does not cover the short-name aliases. To cover a destination, use an appropriately scoped policy with `to.ports`, enumerate every admitted alias, or choose a host wildcard whose breadth you intend (for example, `svc*` also covers other names beginning with `svc`). A host pattern without a port also matches that hostname with a port; explicit decimal ports are compared numerically (`svc:080` and `svc:80` are equivalent), `:*` remains a wildcard, and signed request ports are invalid. Host matching describes what the client asked for, not which service ultimately receives it.
 
@@ -2040,7 +2041,9 @@ frontend boundary — before routing, before any plugin phase, and before backen
 dispatch — so the string the policy matcher reads is the string the backend
 resolves. This is what stops a path-scoped DENY from being evaded, or a
 path-scoped ALLOW from being widened, by an alternative spelling of the same
-resource.
+resource. A path that carries a `;` parameter (only possible on a service that
+opts in) is matched on both its raw and its parameter-stripped spelling; see
+[Authorization on an opted-in service](#path-parameters-and-the-per-service-opt-in).
 
 A target that has more than one reading is **refused with `400`** rather than
 rewritten into one of them:
@@ -2113,20 +2116,61 @@ the same host either: `/admin;x/users` is refused when an `/admin` route
 exists there. Full rule:
 [request_path_canonicalization.md](request_path_canonicalization.md#mesh-materialised-routes).
 
-**Risk to account for.** On an opted-in service, `mesh_authz` evaluates
-`paths:` / `notPaths:` on the parameterised path, while a parameter-stripping
-backend executes the stripped path. A DENY rule for `/admin/*` does not match
-`/admin;x/users`, which Tomcat runs as `/admin/users`. Only exact and prefix
-`paths:` entries in ALLOW rules fail closed for a parameterised spelling. On an
-opted-in service, suffix patterns (`*.png` admits `/admin/users;x.png`),
-`notPaths:` inside an ALLOW rule (`/api/*` minus `/api/admin/*` admits
-`/api/admin;x/users`) and DENY `paths:` rules (`/api/admin/*` misses
-`/api;x/admin/users`) are not reliable, and a DENY pattern cannot cover a `;`
-in an earlier segment without blocking too much. Opt in only services whose
-backends need `;`, and review every AuthorizationPolicy that covers them,
-including mesh-wide DENY rules owned by the platform team. VirtualService
-`http[].match[].uri` matches on the service's routes read the same
-parameterised path.
+**Authorization on an opted-in service.** A `;` request to an opted-in
+service has two spellings: the raw path (`/admin;x/users`) and the path with
+its parameters stripped (`/admin/users`), which Tomcat and Spring execute.
+`mesh_authz` evaluates each `AuthorizationPolicy` rule once per spelling, with
+`to:` `paths:` / `notPaths:` and any `when: request.headers[:path]` condition
+reading the same spelling, and combines the two results by action
+(issue #5948):
+
+| Action | The rule matches when |
+|--------|-----------------------|
+| `DENY`, `CUSTOM`, `AUDIT` | it matches on either spelling |
+| `ALLOW` | it matches on both spellings |
+
+So a `notPaths:` or `notValues:` exclusion lifts a DENY only when both
+spellings are excluded, and removes an ALLOW grant when either one is. As a
+result:
+
+- a DENY on `/admin/*` refuses `/admin;x/users`, including a mesh-wide DENY
+  owned by the platform team on a service whose owner opted in, and including
+  a DENY written as `when: request.headers[:path]`;
+- a DENY on `/api/admin/*` refuses `/api;x/admin/users`;
+- an ALLOW on `*.png` does not admit `/admin/users;x.png`;
+- an ALLOW on `/api/*` with `notPaths: ["/api/admin/*"]`, or with a `:path`
+  condition `notValues: ["/api/admin/*"]`, does not admit
+  `/api/admin;x/users`;
+- a prefix ALLOW (`/app/*`) still admits `/app/page;jsessionid=abc`, and an
+  exact ALLOW (`/app/page`) still does not match `/app/page;jsessionid=abc`.
+  Write a prefix rule, such as `/app/page*`, for an exact path that must
+  accept a `;jsessionid=` suffix.
+
+The combination is per rule: the ALLOW implicit-deny floor is met only by one
+ALLOW rule that matches on both spellings, so two ALLOW rules that each match
+one spelling leave the request implicitly denied.
+
+Residual behaviour to account for:
+
+- The second spelling is built whenever the canonical path carries a `;`, and
+  only routes with `allow_path_parameters` let such a request reach
+  `mesh_authz`, so services that have not opted in are unchanged: they refuse
+  `;` with `400 path_parameter` first.
+- Other plugins that match on the request path still see the parameterised
+  path, so review path-based plugin configuration on the routes of an
+  opted-in service.
+- A CUSTOM (ext_authz) provider receives the raw path only. A provider that
+  makes its own path decisions must apply the stripped rule itself.
+- VirtualService routes never inherit the service's opt-in. A route whose own
+  `uri` literal contains `;` opts in by itself, and `mesh_authz` judges both
+  spellings on it. Any other VirtualService route refuses `;`, and a `;`
+  request whose stripped path belongs to one is refused by the re-route
+  check. A VirtualService `/` route on the service's host makes the mesh route
+  yield to it, so the service opt-in does not apply there and `;` stays
+  refused (fail closed).
+
+Full rule:
+[request_path_canonicalization.md](request_path_canonicalization.md#mesh-authorization-judges-both-spellings).
 
 #### Condition keys
 

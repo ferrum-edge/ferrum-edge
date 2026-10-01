@@ -1885,6 +1885,7 @@ fn admin_shared_namespace_or_id_400_inventory() -> BTreeSet<(String, String)> {
         ("GET", "/plugins"),
         ("GET", "/plugins/config/{id}"),
         ("GET", "/proxies/{id}"),
+        ("GET", "/proxies/{id}/mcp/tools"),
         ("GET", "/service-waypoint/services"),
         ("GET", "/upstreams/{id}"),
     ];

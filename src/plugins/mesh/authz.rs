@@ -56,10 +56,10 @@ use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
     MAX_MESH_RULE_CONDITIONS, MeshPolicy, PolicyScope, WaypointAttachment,
-    normalize_mesh_condition_values, normalize_request_match_host_pattern,
-    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
-    policy_target_attachment_applies_to_service, resolve_target_port, validate_mesh_condition,
-    workload_selector_matches,
+    bracketed_mesh_attribute_name, normalize_mesh_condition_values,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
+    resolve_target_port, validate_mesh_condition, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -461,9 +461,11 @@ impl ConditionAttributeKeys {
             ATTR_DESTINATION_PORT => self.destination_port = true,
             ATTR_CONNECTION_SNI => self.connection_sni = true,
             _ => {
-                if bracketed_attribute_name(key, ATTR_REQUEST_HEADERS_PREFIX).is_some() {
+                if bracketed_mesh_attribute_name(key, ATTR_REQUEST_HEADERS_PREFIX).is_some() {
                     self.header_keys.insert(key.to_string());
-                } else if bracketed_attribute_name(key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX).is_some() {
+                } else if bracketed_mesh_attribute_name(key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
+                    .is_some()
+                {
                     self.claim_keys.insert(key.to_string());
                 }
                 // Anything left is an `experimental.envoy.filters.*` key or a
@@ -478,13 +480,6 @@ impl ConditionAttributeKeys {
             }
         }
     }
-}
-
-/// Extract `<name>` from an Istio bracketed attribute key
-/// (`request.headers[x-foo]` ⇒ `x-foo`). Returns `None` when `key` is not a
-/// `prefix...]` form.
-fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
-    key.strip_prefix(prefix)?.strip_suffix(']')
 }
 
 fn normalize_destination_backend_host(host: &str) -> Option<String> {
@@ -1000,7 +995,10 @@ fn http_header_attribute(
         // matcher reads. Every caller runs after `authorize`'s canonical-path
         // gate has already proven `ctx.path` canonicalizes to itself, so a
         // `when: request.headers[:path]` condition and a `to.operation.paths`
-        // entry can never be evaluated against two different spellings.
+        // entry can never be evaluated against two different spellings. On a
+        // path with `;` parameters this is the raw spelling; the evaluator
+        // substitutes the parameter-stripped one when it judges the rule on
+        // that spelling (issue #5948).
         return Some(ctx.path.clone());
     }
     if name.eq_ignore_ascii_case(":scheme") {
@@ -2122,14 +2120,16 @@ impl MeshAuthz {
             attributes.insert(ATTR_DESTINATION_IP.to_string(), ip.to_string().into());
         }
         for header_key in &keys.header_keys {
-            if let Some(name) = bracketed_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
+            if let Some(name) =
+                bracketed_mesh_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
                 && let Some(value) = http_header_attribute(ctx, headers, name)
             {
                 attributes.insert(header_key.clone(), value.into());
             }
         }
         for claim_key in &keys.claim_keys {
-            if let Some(name) = bracketed_attribute_name(claim_key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
+            if let Some(name) =
+                bracketed_mesh_attribute_name(claim_key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
                 && let Some(value) = ctx.mesh_request_auth_claims.get(name)
             {
                 attributes.insert(claim_key.clone(), jwt_attribute_to_mesh_attribute(value));
@@ -3077,11 +3077,20 @@ impl Plugin for MeshAuthz {
             },
             &headers,
         );
+        // Issue #5948: a parameter-stripping backend (Tomcat, Spring) executes
+        // the path without its `;` parameters, so `paths:` / `notPaths:` and
+        // `when: request.headers[:path]` are judged on both spellings. Only a
+        // proxy with `allow_path_parameters` lets a `;` get this far today;
+        // the second spelling is built whenever the path carries one, so an
+        // entry point that skipped that refusal would still fail closed.
+        let stripped_path =
+            crate::modes::mesh::policy::mesh_authz_stripped_path(&authorization_path);
         let request = MeshAuthzRequest {
             source_principal,
             request_principal,
             method: Some(ctx.method.clone()),
             path: Some(authorization_path),
+            stripped_path,
             host,
             port,
             headers,
@@ -3562,13 +3571,22 @@ impl Plugin for MeshAuthz {
             Ok(canonical) => canonical,
             Err(_) => ctx.path.as_str(),
         };
+        // `authorize` also judges a CUSTOM rule on the parameter-stripped
+        // spelling of an opted-in `;` path (issue #5948), so the scan must too.
+        // Considering it whenever the path carries a `;` can only add buffering,
+        // never skip it.
+        let stripped = crate::policy_path::strip_path_parameters(path);
+        let stripped_spelling = (stripped != path).then_some(&*stripped);
+        let spellings = std::iter::once(path).chain(stripped_spelling);
         self.body_inspecting_custom_rules.iter().any(|rule| {
-            crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
-                rule,
-                &ctx.method,
-                path,
-                host.as_deref(),
-            )
+            spellings.clone().any(|spelling| {
+                crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
+                    rule,
+                    &ctx.method,
+                    spelling,
+                    host.as_deref(),
+                )
+            })
         })
     }
 

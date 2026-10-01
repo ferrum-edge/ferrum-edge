@@ -7,8 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-10-01
+
 ### Security
 
+- **Reject pseudo-headers in native mesh `to.headers` rules** (#5951). The
+  request header map never contains HTTP pseudo-headers, so an accepted DENY
+  predicate such as `to.headers[":path"]` could never match. Config validation
+  now rejects `:path`, `:method`, `:authority`, and `:scheme` there, and points
+  operators to `to.paths` / `to.methods` / `to.hosts` or the supported
+  `when: request.headers[:path]` condition.
+- **Mesh authorization matches both the raw and the parameter-stripped path on
+  services that allow path parameters** (#5948). On a route with
+  `allow_path_parameters` (a mesh service opted in with
+  `MeshService.allow_path_parameters` or `ferrum.io/allow-path-parameters`),
+  `mesh_authz` judged `AuthorizationPolicy` `paths:` / `notPaths:` and
+  `when: request.headers[:path]` only on the parameterised path, while a
+  parameter-stripping backend (Tomcat, Spring) executes the stripped one. A
+  DENY on `/admin/*` missed `/admin;x/users`, a nested DENY on `/api/admin/*`
+  missed `/api;x/admin/users`, an ALLOW on `*.png` admitted
+  `/admin/users;x.png`, and an ALLOW excluding `/api/admin/*` admitted
+  `/api/admin;x/users`. Each rule is now evaluated once per spelling, with its
+  `to:` paths and any `:path` condition reading the same spelling: a DENY,
+  CUSTOM, or AUDIT rule matches when it matches on either spelling, and an
+  ALLOW rule only when it matches on both, so a `notPaths:` / `notValues:`
+  exclusion lifts a DENY only when it holds for both spellings and removes an
+  ALLOW grant when it holds for either. The combination is per rule: two ALLOW
+  rules that each match one spelling leave the request implicitly denied. The
+  second spelling is built whenever the path carries a `;`, and the
+  body-buffering decision for body-inspecting CUSTOM providers considers it
+  too. Routes without the opt-in are unchanged (they refuse `;` before
+  authorization). CUSTOM providers still receive the raw path only.
+  VirtualService routes never inherit the service's opt-in: a route whose own
+  `uri` literal contains `;` opts in by itself and is judged on both
+  spellings, any other refuses `;`, and the re-route check refuses a `;` whose
+  stripped path belongs to one.
 - **Update vulnerable Rust dependencies** (`serde_with` 3.21.0 for
   GHSA-7gcf-g7xr-8hxj and `cmov` 0.5.4 for GHSA-3rjw-m598-pq24).
 - **The canonical request path refuses dot segments that carry a `;` path
@@ -89,8 +122,143 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`path_parameter_route_admitted`) still refuses every direction-scoped mesh
   route.
 
+- Admin JWT namespace ceiling for the viewer key (#5929).
+  `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` bounds which tenants a
+  `FERRUM_ADMIN_JWT_VIEWER_SECRET` holder can read, which its own `ns` claim
+  never could, because the holder chooses that claim. The refusal is a `403`
+  that depends only on the credential and the requested namespace, so it
+  reveals nothing about resources in another tenant.
+- Admin JWT role ceiling (#5904). A token signed with
+  `FERRUM_ADMIN_JWT_VIEWER_SECRET` can never reach `operator` or `admin`,
+  including when it claims `admin`, and its `scope` claims grant nothing, so it
+  cannot use `diagnostics:read`. Authorization and audit log lines carry
+  `key_tier` next to the actor, and audit records name the actor
+  `viewer-key:<sub>`, so a subject chosen by the secret's holder cannot pass
+  for a primary-key identity. A viewer-key `sub` longer than 256 bytes or
+  containing a control character is rejected, so it cannot forge log lines. The ceiling is recorded from which key
+  verified the signature and applied where the request's actor is built,
+  which is where every route reads its role. Both keys accept only `HS256`, so
+  `none`, `HS384`/`HS512`, and asymmetric algorithms are refused. The viewer key
+  is tried only after the primary key reports a signature mismatch. Startup and
+  `validate` refuse a viewer secret equal to `FERRUM_ADMIN_JWT_SECRET` or
+  `FERRUM_CP_DP_GRPC_JWT_SECRET`, and refuse one shorter than 32 characters,
+  without echoing either value. FIPS enforce mode applies its HMAC key-length
+  floor to the new secret. `GET /config/export` fingerprints are keyed from the
+  primary secret only, so a viewer-secret holder cannot compute or offline-guess
+  them.
+- Proxy and Upstream `viewer` reads, audit diffs, and the configuration
+  export now strip URL userinfo anywhere in the body (for example a Consul
+  `address` of `http://user:pass@host`), the same structural sweep plugin
+  configs already had (#5904). `operator` and `admin` reads of proxies and
+  upstreams are unchanged, so an operator's GET-then-PUT keeps the stored
+  URL. A primary-key subject that starts with `viewer-key:` or `primary-key:`
+  is recorded as `primary-key:<sub>` in audit records.
+
+- `mcp_gateway` `aggregate_router` admission now holds on the final request
+  (GHSA-3w98-6p32-8qm2). The message kind, method, selected upstream, mediated
+  upstream session, tool or prompt name, resource URI, and arguments the
+  gateway admitted are recorded privately on the request and checked again
+  over the exact request the upstream will receive, after every request-body
+  transform. A routed `tools/call`, `prompts/get`, `resources/read`, or
+  passthrough message that a later plugin changed is refused before it is sent
+  upstream with JSON-RPC `-32014`; the gateway's own public-to-upstream name
+  rewrite is the only permitted difference. The mediated upstream session
+  header is re-asserted over the final backend headers, including after a
+  `serverless_function` `pre_proxy` header overlay, and an envelope carrying
+  both `method` and `result`/`error` is refused. A client-sent JSON-RPC response
+  forwarded through `passthrough_unknown_methods` is still admitted, bound to
+  the request `id` it answers. A later route rewrite of an MCP-routed request,
+  including a `mesh_route_dispatch` destination rewrite, is now refused. The
+  check runs on HTTP/1.1, HTTP/2, and HTTP/3.
+- `mcp_gateway` sessions owned by an external identity with no Consumer
+  mapping are now bound to the authentication realm that verified that
+  identity, not only to its subject string (GHSA-wr96-j2c3-qh66). `jwks_auth`,
+  `oidc_relying_party`, `oauth2_introspection`, and `ldap_auth` commit the
+  verifying authority (issuer, key source, introspection endpoint, or
+  directory, plus the claim the identity is read from) with the identity; a
+  `jwks_auth` provider that pins no issuer also binds each token's `iss`. The
+  same `sub` from two accepted issuers, tenants, or auth plugins therefore names
+  two different session owners, and neither can use the other's session for
+  catalog listing, routed calls, the SSE listener, cancellation, or `DELETE`.
+  Consumer-mapped ownership is still bound to namespace and record id.
+  Changing a provider's issuer, key source, endpoint, or identity claim
+  changes the realm, so existing external-identity MCP sessions under the old
+  realm end and their clients must initialize again.
+- The `graphql` plugin now lexes documents exactly as the GraphQL
+  specification does and fails closed on anything it cannot measure
+  (GHSA-chqw-m79r-hgjx). Inside a block string the only escape is `\"""`,
+  which is content, and every other backslash is one byte of content; regular
+  strings keep their own escape rules. A block string could previously be
+  closed earlier than a conforming GraphQL server closes it, so the
+  introspection denial and the depth, complexity, and alias limits could be
+  measured over a different selection set from the one the backend executed.
+  A string at document level is now skipped as one token rather than read as
+  structure. The following are now refused with `400` instead of being
+  measured by a weaker scan or passed through: a string that does not lex (an
+  unterminated regular or block string, a line terminator inside a regular
+  string, an undefined escape); a character outside strings and comments that
+  is not part of a GraphQL token or ignored token (non-ASCII text such as a
+  non-breaking space, a form feed, a lone `.`) and a malformed number; an
+  unbalanced or incomplete document, which previously reached a
+  whole-document fallback scan that has been removed; a document with no
+  operation, an unexpected token between definitions, a duplicate operation or
+  fragment name, a nameless fragment, or an anonymous operation beside others;
+  a spread of a fragment the document does not define, which was previously
+  left unmeasured; and a JSON request body whose top-level object repeats
+  `query`, `operationName`, `variables`, or `extensions` (names compared after
+  JSON unescaping and ignoring ASCII case), where the gateway and the backend
+  could each read a different copy. The final request-body
+  recheck applies the same rules.
+- `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
+  says (#5767): a backend or serverless-function copy, in the headers or the
+  trailers, is stripped at every backend response boundary, as
+  `X-Gateway-Error` already is (#5759), and a plugin- or hook-written copy is
+  stripped at the final client boundary, so neither a backend nor a plugin can
+  pre-seed or forge a reference.
+- WAF normalization now matches the decoders protected backends run, closing
+  three encoding bypasses. JSON / JavaScript single-character string escapes
+  (`\t`, `\n`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`, `\'`, `\\`) are
+  decoded, so `{"q":"1 union\tselect …"}`, `admin\" or \"1\"=\"1`, and
+  `file:\/\/\/etc\/passwd` reach the SQLi, SSRF, and LFI rules as the JSON
+  parser delivers them. The IIS / classic ASP and JavaScript `unescape()` form
+  `%uXXXX` is decoded in query values and bodies, in the same single pass as
+  `%XX`, so `%2B` and `%u002B` stay `+`; the layered decode also scans its
+  second-to-last round, so a double-encoded `%252B` is seen as `+` as well as
+  a space. Cookie crumbs are scanned both raw and percent-decoded (`%XX`,
+  `%u`, `+` as a space and, when the crumb also holds a `%`, as `+`, and the
+  bounded layered percent decode), since PHP, Express `cookie-parser`, and
+  Rails unescape cookie values before binding them; an Express `j:` JSON
+  cookie (found, as Express finds it, by splitting the raw crumb at its first
+  `=`) also has its `\uXXXX` / `\xXX` escapes and its `\"`, `\'`, `\/`,
+  `\\` escapes resolved. The header is split on `;` first, so an encoded
+  `%3B` cannot forge an extra crumb.
+  `body_json_path` values, already unescaped by the JSON parser, do not have
+  their single-character escapes resolved a second time. For the
+  `FE-ENCODING-001` residual, collapsing a run of backslashes no longer counts
+  as an unreduced layer, while behind a backslash run of any length a `\u`
+  escape of any ASCII character or control character, or a `\x` escape of
+  punctuation, a space, or an ASCII control character, still does.
+
 ### Added
 
+- **Admin API: read an `mcp_gateway` proxy's tool catalog** (#5926).
+  `GET /proxies/{id}/mcp/tools` returns the tools a proxy's `mcp_gateway`
+  instances expose without an MCP session. It is a viewer-or-above,
+  namespace-scoped proxy read, so the `ns`-claim gate and the viewer-key
+  namespace ceiling apply; a proxy without an enabled `mcp_gateway` answers
+  `404`. Per tool it reports the public name, the source (upstream server
+  namespace and tool name, or the generating OpenAPI operation's method and
+  path template), description and annotations, the configured and effective
+  policy (including tools hidden by `discovery.on_new_tool` /
+  `discovery.on_schema_change: hide_until_configured`), `allowed_groups` /
+  `denied_groups`, and the gateway's stored SHA-256 `schema_hash`. Per instance
+  it reports `refreshed_at`, a `stale` flag, and each server's last
+  `tools/list` outcome as fixed text. It reads only the cached catalog (the most recently refreshed
+  session's), never calls an upstream, paginates with the shared bounds, and
+  returns every server `upstream_url` in its structural redacted form for all
+  roles. Before any session lists tools the list is empty with
+  `refreshed_at: null`; a node that does not serve the proxy reports
+  `catalog_state: not_served`.
 - **Per-service opt-in for `;` path parameters in mesh mode** (#5937). A
   `MeshService` can set `allow_path_parameters: true` (default `false`), or a
   Kubernetes Service can carry the annotation
@@ -102,11 +270,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rides the native slice and the xDS `ServicesCarrier`; stock xDS control
   planes cannot carry it. The re-route check of GHSA-fcqw-793q-wg5x applies
   unchanged, so a `;` still cannot reach a path that another route on the
-  service's hosts owns. `mesh_authz` evaluates `paths:` on the parameterised
-  path: on an opted-in service only exact and prefix ALLOW `paths:` fail
-  closed, while suffix patterns, `notPaths:` and DENY `paths:` rules can be
-  bypassed with a `;` segment. Default-off services still refuse `;`
-  with `400 path_parameter`. See `docs/mesh.md` and
+  service's hosts owns, and `mesh_authz` judges `paths:` / `notPaths:` on both
+  the raw and the parameter-stripped spelling (see Security). Default-off
+  services still refuse `;` with `400 path_parameter`. See `docs/mesh.md` and
   `docs/request_path_canonicalization.md`.
 - **AI governance for MCP tool calls** (#5908). The AI governance plugins now
   treat MCP JSON-RPC `tools/call` traffic as AI traffic, through one shared
@@ -1004,125 +1170,6 @@ outright with no deprecation period:
   checks for such a close after it records its failure and asks for a new
   reconcile itself, which restarts the listener even if its task has not
   finished exiting yet.
-
-### Security
-
-- Admin JWT namespace ceiling for the viewer key (#5929).
-  `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` bounds which tenants a
-  `FERRUM_ADMIN_JWT_VIEWER_SECRET` holder can read, which its own `ns` claim
-  never could, because the holder chooses that claim. The refusal is a `403`
-  that depends only on the credential and the requested namespace, so it
-  reveals nothing about resources in another tenant.
-- Admin JWT role ceiling (#5904). A token signed with
-  `FERRUM_ADMIN_JWT_VIEWER_SECRET` can never reach `operator` or `admin`,
-  including when it claims `admin`, and its `scope` claims grant nothing, so it
-  cannot use `diagnostics:read`. Authorization and audit log lines carry
-  `key_tier` next to the actor, and audit records name the actor
-  `viewer-key:<sub>`, so a subject chosen by the secret's holder cannot pass
-  for a primary-key identity. A viewer-key `sub` longer than 256 bytes or
-  containing a control character is rejected, so it cannot forge log lines. The ceiling is recorded from which key
-  verified the signature and applied where the request's actor is built,
-  which is where every route reads its role. Both keys accept only `HS256`, so
-  `none`, `HS384`/`HS512`, and asymmetric algorithms are refused. The viewer key
-  is tried only after the primary key reports a signature mismatch. Startup and
-  `validate` refuse a viewer secret equal to `FERRUM_ADMIN_JWT_SECRET` or
-  `FERRUM_CP_DP_GRPC_JWT_SECRET`, and refuse one shorter than 32 characters,
-  without echoing either value. FIPS enforce mode applies its HMAC key-length
-  floor to the new secret. `GET /config/export` fingerprints are keyed from the
-  primary secret only, so a viewer-secret holder cannot compute or offline-guess
-  them.
-- Proxy and Upstream `viewer` reads, audit diffs, and the configuration
-  export now strip URL userinfo anywhere in the body (for example a Consul
-  `address` of `http://user:pass@host`), the same structural sweep plugin
-  configs already had (#5904). `operator` and `admin` reads of proxies and
-  upstreams are unchanged, so an operator's GET-then-PUT keeps the stored
-  URL. A primary-key subject that starts with `viewer-key:` or `primary-key:`
-  is recorded as `primary-key:<sub>` in audit records.
-
-- `mcp_gateway` `aggregate_router` admission now holds on the final request
-  (GHSA-3w98-6p32-8qm2). The message kind, method, selected upstream, mediated
-  upstream session, tool or prompt name, resource URI, and arguments the
-  gateway admitted are recorded privately on the request and checked again
-  over the exact request the upstream will receive, after every request-body
-  transform. A routed `tools/call`, `prompts/get`, `resources/read`, or
-  passthrough message that a later plugin changed is refused before it is sent
-  upstream with JSON-RPC `-32014`; the gateway's own public-to-upstream name
-  rewrite is the only permitted difference. The mediated upstream session
-  header is re-asserted over the final backend headers, including after a
-  `serverless_function` `pre_proxy` header overlay, and an envelope carrying
-  both `method` and `result`/`error` is refused. A client-sent JSON-RPC response
-  forwarded through `passthrough_unknown_methods` is still admitted, bound to
-  the request `id` it answers. A later route rewrite of an MCP-routed request,
-  including a `mesh_route_dispatch` destination rewrite, is now refused. The
-  check runs on HTTP/1.1, HTTP/2, and HTTP/3.
-- `mcp_gateway` sessions owned by an external identity with no Consumer
-  mapping are now bound to the authentication realm that verified that
-  identity, not only to its subject string (GHSA-wr96-j2c3-qh66). `jwks_auth`,
-  `oidc_relying_party`, `oauth2_introspection`, and `ldap_auth` commit the
-  verifying authority (issuer, key source, introspection endpoint, or
-  directory, plus the claim the identity is read from) with the identity; a
-  `jwks_auth` provider that pins no issuer also binds each token's `iss`. The
-  same `sub` from two accepted issuers, tenants, or auth plugins therefore names
-  two different session owners, and neither can use the other's session for
-  catalog listing, routed calls, the SSE listener, cancellation, or `DELETE`.
-  Consumer-mapped ownership is still bound to namespace and record id.
-  Changing a provider's issuer, key source, endpoint, or identity claim
-  changes the realm, so existing external-identity MCP sessions under the old
-  realm end and their clients must initialize again.
-- The `graphql` plugin now lexes documents exactly as the GraphQL
-  specification does and fails closed on anything it cannot measure
-  (GHSA-chqw-m79r-hgjx). Inside a block string the only escape is `\"""`,
-  which is content, and every other backslash is one byte of content; regular
-  strings keep their own escape rules. A block string could previously be
-  closed earlier than a conforming GraphQL server closes it, so the
-  introspection denial and the depth, complexity, and alias limits could be
-  measured over a different selection set from the one the backend executed.
-  A string at document level is now skipped as one token rather than read as
-  structure. The following are now refused with `400` instead of being
-  measured by a weaker scan or passed through: a string that does not lex (an
-  unterminated regular or block string, a line terminator inside a regular
-  string, an undefined escape); a character outside strings and comments that
-  is not part of a GraphQL token or ignored token (non-ASCII text such as a
-  non-breaking space, a form feed, a lone `.`) and a malformed number; an
-  unbalanced or incomplete document, which previously reached a
-  whole-document fallback scan that has been removed; a document with no
-  operation, an unexpected token between definitions, a duplicate operation or
-  fragment name, a nameless fragment, or an anonymous operation beside others;
-  a spread of a fragment the document does not define, which was previously
-  left unmeasured; and a JSON request body whose top-level object repeats
-  `query`, `operationName`, `variables`, or `extensions` (names compared after
-  JSON unescaping and ignoring ASCII case), where the gateway and the backend
-  could each read a different copy. The final request-body
-  recheck applies the same rules.
-- `X-Ferrum-Diagnostic-Ref` is gateway-owned whatever `FERRUM_DIAGNOSTIC_REFS`
-  says (#5767): a backend or serverless-function copy, in the headers or the
-  trailers, is stripped at every backend response boundary, as
-  `X-Gateway-Error` already is (#5759), and a plugin- or hook-written copy is
-  stripped at the final client boundary, so neither a backend nor a plugin can
-  pre-seed or forge a reference.
-- WAF normalization now matches the decoders protected backends run, closing
-  three encoding bypasses. JSON / JavaScript single-character string escapes
-  (`\t`, `\n`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`, `\'`, `\\`) are
-  decoded, so `{"q":"1 union\tselect …"}`, `admin\" or \"1\"=\"1`, and
-  `file:\/\/\/etc\/passwd` reach the SQLi, SSRF, and LFI rules as the JSON
-  parser delivers them. The IIS / classic ASP and JavaScript `unescape()` form
-  `%uXXXX` is decoded in query values and bodies, in the same single pass as
-  `%XX`, so `%2B` and `%u002B` stay `+`; the layered decode also scans its
-  second-to-last round, so a double-encoded `%252B` is seen as `+` as well as
-  a space. Cookie crumbs are scanned both raw and percent-decoded (`%XX`,
-  `%u`, `+` as a space and, when the crumb also holds a `%`, as `+`, and the
-  bounded layered percent decode), since PHP, Express `cookie-parser`, and
-  Rails unescape cookie values before binding them; an Express `j:` JSON
-  cookie (found, as Express finds it, by splitting the raw crumb at its first
-  `=`) also has its `\uXXXX` / `\xXX` escapes and its `\"`, `\'`, `\/`,
-  `\\` escapes resolved. The header is split on `;` first, so an encoded
-  `%3B` cannot forge an extra crumb.
-  `body_json_path` values, already unescaped by the JSON parser, do not have
-  their single-character escapes resolved a second time. For the
-  `FE-ENCODING-001` residual, collapsing a run of backslashes no longer counts
-  as an unreduced layer, while behind a backslash run of any length a `\u`
-  escape of any ASCII character or control character, or a `\x` escape of
-  punctuation, a space, or an ASCII control character, still does.
 
 ### Performance
 
@@ -6016,7 +6063,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.8...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.9...HEAD
+[0.9.9]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.7
 [0.9.6]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.5...v0.9.6

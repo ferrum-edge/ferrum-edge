@@ -1506,6 +1506,7 @@ const CONDITION_DESTINATION_PORT: &str = "destination.port";
 const CONDITION_CONNECTION_SNI: &str = "connection.sni";
 const CONDITION_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
 const CONDITION_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
+const MESH_AUTHZ_PSEUDO_HEADERS: [&str; 4] = [":path", ":method", ":authority", ":scheme"];
 /// Istio's experimental Envoy-filter attribute namespace
 /// (`experimental.envoy.filters.<filter.name>[<metadata key>]`). Istio compiles
 /// these into Envoy dynamic-metadata matchers; Ferrum has no Envoy filter
@@ -1614,7 +1615,7 @@ pub fn classify_mesh_condition_key(key: &str) -> Option<MeshConditionKeyKind> {
         CONDITION_REQUEST_AUTH_PRESENTER => Some(MeshConditionKeyKind::RequestAuthPresenter),
         CONDITION_REQUEST_AUTH_AUDIENCES => Some(MeshConditionKeyKind::RequestAuthAudiences),
         _ => {
-            if bracketed_mesh_header_name(key).is_some() {
+            if bracketed_mesh_attribute_name(key, CONDITION_REQUEST_HEADERS_PREFIX).is_some() {
                 Some(MeshConditionKeyKind::RequestHeader)
             } else if bracketed_mesh_claim_path(key).is_some() {
                 Some(MeshConditionKeyKind::RequestAuthClaim)
@@ -2099,10 +2100,8 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
     }
 }
 
-fn bracketed_mesh_header_name(key: &str) -> Option<&str> {
-    let name = key
-        .strip_prefix(CONDITION_REQUEST_HEADERS_PREFIX)?
-        .strip_suffix(']')?;
+pub(crate) fn bracketed_mesh_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    let name = key.strip_prefix(prefix)?.strip_suffix(']')?;
     // Match Istio's validateMapKey shape exactly: the fixed first `[` and the
     // final `]` delimit one non-empty map key. Istio deliberately does not
     // validate the interior as an HTTP HeaderName here. Rejecting a shape it
@@ -2110,6 +2109,17 @@ fn bracketed_mesh_header_name(key: &str) -> Option<&str> {
     // rules. Known pseudo-headers are sourced from typed request facts at
     // runtime; other names that HTTP cannot carry simply remain absent.
     (!name.is_empty()).then_some(name)
+}
+
+/// Whether a `when:` condition key reads the `:path` pseudo-header
+/// (`request.headers[:path]`, any ASCII case). Mesh authorization sources it
+/// from the canonical request path, so it is judged on every spelling of that
+/// path, like `paths:` / `notPaths:` (issue #5948).
+pub(crate) fn mesh_condition_key_reads_path(key: &str) -> bool {
+    let Some(name) = bracketed_mesh_attribute_name(key, CONDITION_REQUEST_HEADERS_PREFIX) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case(":path")
 }
 
 fn bracketed_mesh_claim_path(key: &str) -> Option<&str> {
@@ -7206,6 +7216,20 @@ fn validate_mesh_config_internal(
                          counterparts must be non-empty",
                         policy.name, i, j
                     ));
+                }
+                for header in request.headers.keys() {
+                    if MESH_AUTHZ_PSEUDO_HEADERS
+                        .iter()
+                        .any(|pseudo_header| header.eq_ignore_ascii_case(pseudo_header))
+                    {
+                        errors.push(format!(
+                            "MeshPolicy {:?}.rules[{}].to[{}].headers contains pseudo-header \
+                             {:?}, which cannot match the HTTP request header map; use \
+                             to.methods, to.paths, or to.hosts, or use the corresponding \
+                             request.headers[:path] condition for :path",
+                            policy.name, i, j, header
+                        ));
+                    }
                 }
                 for (k, host) in request.hosts.iter().enumerate() {
                     if !is_valid_request_match_host_pattern(host) {

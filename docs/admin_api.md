@@ -57,7 +57,7 @@ With enforcement off — the flag unset and the CP scope single-namespace — th
 
 | Role | Access |
 | --- | --- |
-| `viewer` | Ordinary read endpoints: proxies, consumers (redacted), plugin configs, upstreams, namespaces, API spec metadata listing, the fingerprinted configuration export (`GET /config/export`), metrics, cluster, backend capabilities, and mesh introspection |
+| `viewer` | Ordinary read endpoints: proxies (including the `mcp_gateway` tool catalog), consumers (redacted), plugin configs, upstreams, namespaces, API spec metadata listing, the fingerprinted configuration export (`GET /config/export`), metrics, cluster, backend capabilities, and mesh introspection |
 | `operator` | Viewer access plus proxy, upstream, and plugin config writes; gateway trust bundle reads and status; TLS store reads, inventory, events, validation, and forced rotation; `GET /config/apply-status`; backend capability refresh; mesh egress-scope test and config-revision reset |
 | `admin` | Full access, including consumers, credentials, namespace create/rename/delete, raw API spec retrieval and mutations, gateway trust bundle writes, TLS material and ACME state management, batch/backup/restore, and audit logs |
 
@@ -705,7 +705,7 @@ JWKS-capable plugin fields can reference `managed://jwks/{id}#jwks` once the plu
 
 ## Pagination
 
-Resource and TLS list endpoints — `GET /proxies`, `/consumers`, `/plugins/config`, `/upstreams`, `/namespaces`, and the ten `GET /admin/tls/*` list routes — return a paginated envelope `{ "data": [...], "pagination": { "offset", "limit", "total" } }` and accept `limit`/`offset` query parameters. An omitted `limit` applies the default of 100 (maximum 1000; `GET /backup` is the intentional full-export mechanism), `0` is coerced to the default, and representable unsigned 64-bit values above 1000 are capped. Malformed or negative values, limits beyond the unsigned 64-bit range, and offsets beyond `2^63 - 1` are rejected with `400`. The offset is retained as a 64-bit value on every target; for an in-memory collection, an offset too large for the target's address space is a valid request beyond the collection and returns an empty page.
+Resource and TLS list endpoints — `GET /proxies`, `/consumers`, `/plugins/config`, `/upstreams`, `/namespaces`, `/proxies/{id}/mcp/tools`, and the ten `GET /admin/tls/*` list routes — return a paginated envelope `{ "data": [...], "pagination": { "offset", "limit", "total" } }` and accept `limit`/`offset` query parameters. An omitted `limit` applies the default of 100 (maximum 1000; `GET /backup` is the intentional full-export mechanism), `0` is coerced to the default, and representable unsigned 64-bit values above 1000 are capped. Malformed or negative values, limits beyond the unsigned 64-bit range, and offsets beyond `2^63 - 1` are rejected with `400`. The offset is retained as a 64-bit value on every target; for an in-memory collection, an offset too large for the target's address space is a valid request beyond the collection and returns an empty page.
 
 `pagination.limit` reports the page size the server applied, not the number of items returned: an omitted `limit` reports 100 even when fewer rows exist.
 
@@ -1021,6 +1021,83 @@ This is the opposite of `DELETE /upstreams/{id}`, which returns **409 Conflict**
 while any proxy or `mesh_route_dispatch` plugin still references the upstream
 and never cascades. See
 [Cascade and ownership summary](#cascade-and-ownership-summary).
+
+### MCP tool catalog (`GET /proxies/{id}/mcp/tools`)
+
+Reads the tools an [`mcp_gateway`](plugins.md#mcp_gateway) proxy exposes,
+without speaking MCP to it.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "X-Ferrum-Namespace: ferrum" \
+  "http://localhost:9000/proxies/{proxy_id}/mcp/tools?limit=100"
+```
+
+- **Access.** Viewer role or above. The route is namespace-scoped like
+  `GET /proxies/{id}`, so the `ns`-claim gate and the viewer-key namespace
+  ceiling (`FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`) apply before it runs: a
+  namespace outside the caller's reach is `403`, and a proxy of another
+  namespace is `404` (`Proxy not found`).
+- **Not an MCP proxy.** A proxy with no enabled `mcp_gateway` answers `404`
+  with `{"error": "Proxy has no mcp_gateway plugin"}`. The effective set
+  follows the runtime merge: associated proxy / proxy-group instances, else
+  global instances of the proxy's namespace.
+- **Database mode limitation.** The proxy row and associated plugin configs
+  are read from the store, but global `mcp_gateway` configs are discovered
+  from this node's cached namespace config. If the store contains a proxy in a
+  namespace absent from that cached config, and the proxy relies only on a
+  global `mcp_gateway`, this endpoint currently returns the `404` above rather
+  than a `not_served` catalog. A namespace-specific proxy or proxy-group
+  association is still resolved from the store.
+- **Cached only.** The response reads only what the running instances already
+  cached. It never contacts an upstream and never starts a refresh. Catalogs
+  are cached per downstream MCP session, so each instance reports the most
+  recently refreshed session's catalog. An upstream may tailor its tools to
+  the session principal, so the reported catalog can reflect one principal's
+  view. `refreshed_at` and `stale` track the tools catalog; resource-template
+  refreshes do not change them. Until a session has listed tools, `data`
+  is empty, `refreshed_at` is `null`, `stale` is `true`, and the instance's
+  `catalog_state` is `not_refreshed`. A catalog older than
+  `discovery.cache_ttl_seconds` is `stale`; the next MCP request refreshes it.
+- **Node-local.** On a control plane, or on a data plane that does not serve the
+  proxy's namespace, each instance reports `catalog_state: not_served` and no
+  tools. Query a node that serves the proxy. A `transparent_proxy` instance has
+  no catalog (`unmediated`).
+- **Per tool** (`data`, ordered by instance then public name): the public
+  namespaced `name`; `source` (`upstream` with the server id, server
+  namespace, and upstream tool name, or `openapi` with the generating
+  operation's name, `method`, and `path` template); `title`, `description`
+  (without the `[namespace]` prefix), and `annotations`; `policy` with the
+  configured `action`, whether `policy.tools` names the tool, the `effective`
+  outcome (`hidden_until_configured` under `discovery.on_new_tool:
+  hide_until_configured`, `hidden_schema_changed` under
+  `discovery.on_schema_change: hide_until_configured`, otherwise the action),
+  and whether `tools/list` lists it and `tools/call` admits it for a consumer
+  its grant admits. For OpenAPI bridge tools, both flags also account for the
+  proxy's `allowed_methods`; `allowed_groups` (`null` when not
+  group-conditioned) and `denied_groups`; `schema_hash`, the gateway's
+  lowercase hex SHA-256 schema
+  hash; and `discovered_at`. With `validation.validate_tool_results: false`,
+  this hashes the serialized `inputSchema`. With it enabled, this hashes the
+  serialized object `{ "inputSchema": ..., "outputSchema": ... }`, including
+  `outputSchema: null` when none is declared. This is the same hash used by
+  schema drift detection, `hidden_schema_changed`, and `mcp.input_schema_hash`
+  metadata.
+- **Per instance** (`catalogs`): `catalog_state`, `refreshed_at`, `stale`,
+  `catalog_version`, the number of cached sessions, the discovery and policy
+  defaults, the `validation.max_catalog_*` caps, and one entry per configured
+  server with its `tools_refresh` outcome (`ok`, `stale` when the last
+  `tools/list` failed and last-good tools are served, `failed` when it failed
+  with none, `pending`, `not_listed`, or `disabled`) and a fixed-text
+  `refresh_error`. Upstream error bodies are never returned.
+- **Bounded.** `data` uses the shared `limit` / `offset` pagination. The
+  catalog itself stays within the instance's `validation.max_catalog_items_per_list`
+  and `validation.max_catalog_bytes_per_list` caps.
+- **No secrets.** Every role receives the same projection. A server's
+  `upstream_url` is always reduced to `scheme://host[:port]` plus
+  `/[REDACTED_PATH]` when it has a path (the plugin-config endpoint projection,
+  which also masks userinfo, query, and fragment). Headers, session ids, and
+  tokens are never returned. Read the plugin config as `admin` for the stored
+  URL.
 
 ### Stream Proxy (TCP/UDP)
 
