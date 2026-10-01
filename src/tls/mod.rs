@@ -2422,8 +2422,8 @@ pub fn check_cert_expiry_for_kind(
     warning_days: u64,
 ) -> Result<(), anyhow::Error> {
     let source = CertSource::parse(pem_source, kind);
-    let material = load_material_blocking(&source, kind)
-        .map_err(|error| material_load_error(label, error))?;
+    let material =
+        load_material_blocking(&source, kind).map_err(|error| material_load_error(label, error))?;
     check_cert_expiry_from_pem_bytes(
         material.bytes.expose_secret(),
         label,

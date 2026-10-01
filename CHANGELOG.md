@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expiry checks, now resolve sources with their declared CA-bundle material
   kind. The `managed://ca-bundles/<id>` URI advertised by the managed CA API
   works without a `#ca` fragment; explicit material fragments remain honored,
-  and conflicting fragments are rejected.
+  and a fragment selecting a material part the referenced record does not hold
+  is rejected. Fragmentless `k8s://` and secret-provider CA sources in these
+  fields now check expiry against the CA data key (`ca.crt`), so a valid
+  `tls.crt` cannot mask an expired CA certificate.
 
 ## [0.9.10] - 2026-10-01
 

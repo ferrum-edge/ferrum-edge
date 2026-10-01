@@ -568,9 +568,47 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
         "create referenced CA: {create}"
     );
 
-    gateway_for_admission
+    let proxy_only = GatewayConfig {
+        proxies: vec![gateway_for_admission.proxies[0].clone()],
+        ..GatewayConfig::default()
+    };
+    proxy_only
         .validate_all_fields(30)
-        .expect("fragmentless managed CA URI is admitted by proxy and upstream validation");
+        .expect("fragmentless managed CA URI is admitted by proxy validation");
+    let upstream_only = GatewayConfig {
+        upstreams: vec![gateway_for_admission.upstreams[0].clone()],
+        ..GatewayConfig::default()
+    };
+    upstream_only
+        .validate_all_fields(30)
+        .expect("fragmentless managed CA URI is admitted by upstream validation");
+
+    let ca_uri = format!("managed://ca-bundles/{ca_id}");
+    let mut dp_env = ferrum_edge::config::env_config::EnvConfig::default();
+    dp_env.dp_grpc_tls_ca_cert_path = Some(ca_uri.clone());
+    ferrum_edge::grpc::dp_client::build_dp_grpc_tls_config(
+        &dp_env,
+        &["https://cp.example.com".to_string()],
+        "test",
+    )
+    .expect("DP gRPC CA expiry check accepts a fragmentless managed CA")
+    .expect("HTTPS CP URL enables gRPC TLS");
+
+    let mut dtls_env = ferrum_edge::config::env_config::EnvConfig::default();
+    dtls_env.dtls_cert_path = Some(fixtures.cert_pem.clone());
+    dtls_env.dtls_key_path = Some("unused-key-path-for-expiry-validation".to_string());
+    dtls_env.dtls_client_ca_cert_path = Some(ca_uri.clone());
+    ferrum_edge::modes::startup_security::validate_dtls_material(&dtls_env)
+        .expect("DTLS client CA expiry check accepts a fragmentless managed CA");
+
+    let wrong_kind = ferrum_edge::tls::check_cert_expiry_for_kind(
+        &ca_uri,
+        ferrum_edge::tls::source::MaterialKind::Cert,
+        "wrong-kind regression",
+        30,
+    )
+    .expect_err("the same managed CA must fail when checked as certificate material");
+    assert!(format!("{wrong_kind:#}").contains("invalid_source"));
 
     gateway_for_admission.proxies[0].backend_tls_server_ca_cert_path =
         Some(format!("managed://ca-bundles/{ca_id}#ca"));
@@ -584,10 +622,41 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
         Some(format!("managed://ca-bundles/{ca_id}#cert"));
     gateway_for_admission.upstreams[0].backend_tls_server_ca_cert_path =
         Some(format!("managed://ca-bundles/{ca_id}#cert"));
-    assert!(
-        gateway_for_admission.validate_all_fields(30).is_err(),
-        "a fragment selecting a conflicting material kind must be refused"
-    );
+    let proxy_errors = GatewayConfig {
+        proxies: vec![gateway_for_admission.proxies[0].clone()],
+        ..GatewayConfig::default()
+    }
+    .validate_all_fields(30)
+    .expect_err("proxy CA field must reject a fragment selecting certificate material");
+    let upstream_errors = GatewayConfig {
+        upstreams: vec![gateway_for_admission.upstreams[0].clone()],
+        ..GatewayConfig::default()
+    }
+    .validate_all_fields(30)
+    .expect_err("upstream CA field must reject a fragment selecting certificate material");
+    for (owner, errors) in [
+        ("Proxy \"ref-proxy\"", proxy_errors),
+        ("Upstream \"ref-upstream\"", upstream_errors),
+    ] {
+        assert_eq!(
+            errors.len(),
+            1,
+            "{owner} should report one wrong-kind error: {errors:?}"
+        );
+        let errors = errors.join("; ");
+        assert!(
+            errors.contains(owner),
+            "error must identify {owner}, got: {errors}"
+        );
+        assert!(
+            errors.contains("backend_tls_server_ca_cert_path"),
+            "{owner} error must identify the CA field, got: {errors}"
+        );
+        assert!(
+            errors.contains("has kind ca_bundle, expected certificate"),
+            "{owner} error must explain the selected material kind is absent, got: {errors}"
+        );
+    }
 
     let same_kind = send_raw_admin_request(
         addr,
