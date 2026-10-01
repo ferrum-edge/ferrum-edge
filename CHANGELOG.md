@@ -17,6 +17,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Edge source files whose changes require a ferrum-contracts PR, and CLAUDE.md
   notes the requirement.
 
+### Performance
+
+- **HTTP/1.1 backends are dispatched on Ferrum's own hyper connection pool
+  instead of reqwest** (#5588, #5961). This applies to plaintext `http`
+  backends and to `https` backends that speak only HTTP/1.1
+  (`pool_enable_http2: false`, `h2UpgradePolicy: DO_NOT_UPGRADE`, or a backend
+  that negotiated HTTP/1.1). The new `FERRUM_POOL_HTTP1_DIRECT` setting
+  controls it and defaults to `true`; set it to `false` to roll back to reqwest.
+  - The HTTP/1.1 codec is the same hyper connection reqwest drove. What is gone
+    is reqwest's per-request request building, URL re-parsing, header
+    conversion and its shared pool lock.
+  - Each connection is checked out exclusively and returns to the idle set
+    (`FERRUM_POOL_MAX_IDLE_PER_HOST`, `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`) only
+    after a clean exchange.
+  - Header rewriting, size limits, timeouts, `backend_write_timeout_ms`
+    (including the post-EOS drain bound), `http1MaxPendingRequests`,
+    `maxConnections`, error classes and retries keep their existing behaviour.
+  - On the hosted protocol benchmark, HTTPS/1.1 throughput rose 12.5% at
+    10 KiB, about 7% at 70 KiB and 512 KiB, and 3–5% at 1–5 MiB against the
+    reqwest path, with p99 latency lower at every size.
+  - With the flag on, streamed HTTP/1.1 responses from the Unix-socket and
+    HBONE inner HTTP/1.1 dispatch also keep the backend's verified
+    `Content-Length`, as the reqwest path already did, instead of being
+    re-framed as chunked.
+  - Requests whose body plugins still have to run at dispatch time, and retry
+    attempts, keep the reqwest path.
+
 ## [0.9.10] - 2026-10-01
 
 ### Security

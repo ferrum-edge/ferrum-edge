@@ -740,3 +740,137 @@ fn boxed_hbone_websocket_unknown_tunnel_timeout_is_reached_wire() {
          rather than retry a possibly-sent CONNECT"
     );
 }
+
+// ── Direct HTTP/1.1 pool vs reqwest: same wire failure, same class (#5588) ──
+//
+// The direct HTTP/1.1 pool drives the hyper connection reqwest used to drive.
+// Each case below runs the SAME scripted backend failure through a raw hyper
+// HTTP/1.1 client and through reqwest, and requires the two classifications to
+// agree, so retries, passive health and the circuit breaker see no change.
+
+mod direct_h1_classification_parity {
+    use super::*;
+    use bytes::Bytes;
+    use ferrum_edge::retry::{classify_hyper_client_error, classify_reqwest_error};
+    use http_body_util::Empty;
+    use hyper_util::rt::TokioIo;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        /// Read the request head, then reset the connection (SO_LINGER 0).
+        ResetAfterRequest,
+        /// Read the request head, then close cleanly without a response.
+        CloseBeforeResponse,
+    }
+
+    async fn scripted_backend(failure: Failure) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => seen.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    if let Failure::ResetAfterRequest = failure {
+                        let _ = socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO));
+                    }
+                    drop(stream);
+                });
+            }
+        });
+        port
+    }
+
+    async fn hyper_class(port: u16) -> ErrorClass {
+        let tcp = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake::<_, Empty<Bytes>>(TokioIo::new(tcp))
+            .await
+            .expect("handshake");
+        tokio::spawn(conn);
+        let request = hyper::Request::builder()
+            .uri("/")
+            .header("host", "127.0.0.1")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let err = sender
+            .send_request(request)
+            .await
+            .expect_err("scripted backend never answers");
+        classify_hyper_client_error(&err)
+    }
+
+    async fn reqwest_class(port: u16) -> ErrorClass {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .build()
+            .expect("client");
+        let err = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("scripted backend never answers");
+        classify_reqwest_error(&err)
+    }
+
+    #[tokio::test]
+    async fn reset_after_request_classifies_like_reqwest() {
+        let port = scripted_backend(Failure::ResetAfterRequest).await;
+        let direct = hyper_class(port).await;
+        let reqwest = reqwest_class(port).await;
+        assert_eq!(direct, reqwest);
+        assert!(
+            matches!(
+                direct,
+                ErrorClass::ConnectionReset | ErrorClass::ConnectionClosed
+            ),
+            "unexpected class {direct:?}"
+        );
+        assert!(request_reached_wire(direct));
+    }
+
+    #[tokio::test]
+    async fn close_before_response_classifies_like_reqwest() {
+        let port = scripted_backend(Failure::CloseBeforeResponse).await;
+        let direct = hyper_class(port).await;
+        let reqwest = reqwest_class(port).await;
+        assert_eq!(direct, reqwest);
+        assert_eq!(direct, ErrorClass::ConnectionClosed);
+    }
+
+    /// A refused dial never reaches hyper on the direct pool: it is a pool
+    /// dial error, classified by the direct-H2 pool classifier.
+    #[tokio::test]
+    async fn refused_dial_classifies_like_reqwest() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let dial_err = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect_err("nothing listens on the released port");
+        let direct = classify_http2_pool_error(&Http2PoolError::BackendUnavailable {
+            message: format!("Connection refused: {dial_err}"),
+            source: Some(BackendUnavailableSource::Io(dial_err)),
+        });
+        let reqwest = reqwest_class(port).await;
+        assert_eq!(direct, reqwest);
+        assert_eq!(direct, ErrorClass::ConnectionRefused);
+        assert!(!request_reached_wire(direct));
+    }
+}
