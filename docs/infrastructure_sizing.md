@@ -290,6 +290,13 @@ These settings control the gateway's ability to handle high connection concurren
 
 Ferrum Edge uses **jemalloc** as the global memory allocator on all non-Windows platforms. jemalloc reduces heap fragmentation and improves allocation throughput under high concurrency compared to the system allocator. This is the same allocator used by nginx, Redis, and most high-performance Rust services. No configuration is needed — it is enabled automatically at compile time.
 
+**Thread-cache size (`tcache_max`).** The binary compiles in the jemalloc option `tcache_max:131072`, which raises the largest size class jemalloc's per-thread cache serves from the default 32 KiB to 128 KiB. Each proxied request boxes its handler future, which is about 90 KiB. With the default cap, every request allocates and frees that buffer through the arena's extent path; with 128 KiB it comes from the thread cache.
+
+- **Effect:** on the hosted HTTPS/1.1 benchmark, throughput rose at 10 KiB payloads and was neutral at larger payloads (see the CHANGELOG for the measured numbers).
+- **Memory cost, measured:** gateway RSS rose by about 7–11 MiB at steady state and 2–15 MiB at peak, under a 200-connection load on a 4-vCPU runner.
+- **Memory cost, theoretical bound:** jemalloc caches at most 20 objects per large size class per thread. The 40–128 KiB classes (nine, totalling 624 KiB) are newly cacheable, so the extra cache is at most about 12.5 MiB per thread that allocates in those classes. In practice that means the Tokio worker threads, giving `12.5 MiB × FERRUM_WORKER_THREADS` as the worst case. A thread caches only the classes it actually uses, and jemalloc's incremental thread-cache GC trims idle entries.
+- **Override or revert:** the runtime environment variable `_RJEM_MALLOC_CONF` overrides compiled-in options. Set `_RJEM_MALLOC_CONF=tcache_max:32768` to restore the jemalloc default, or another value to tune it.
+
 ## Scaling Strategies
 
 ### Vertical Scaling
