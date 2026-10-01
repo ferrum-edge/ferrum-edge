@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`ai_prompt_shield` `mcp_arguments` no longer forwards a tool-call batch it
+  could not parse** (GHSA-f2jp-59r9-fp64, #5954; affects v0.9.9). The shield
+  parsed the whole request body as one `serde_json::Value` and let a body it
+  could not parse through uninspected, while `mcp_gateway` admits a JSON-RPC
+  batch member by member, each with its own recursion budget. A batch whose
+  `tools/call` member nests just under serde_json's 128-level limit therefore
+  failed the shield's whole-document parse yet was admitted and executed by
+  the gateway with its arguments never scanned. When the whole-document parse
+  fails, `before_proxy` and the final-body re-check now ask the shared bounded
+  MCP recognizer: a body that carries, or may carry, a `tools/call` (including
+  one the recognizer reports as uninspectable) is refused with `400` and
+  `ai_shield_rejected=jsonrpc_request_unparseable` in `reject` / `redact` mode,
+  and recorded as `ai_shield_warnings=jsonrpc_request_unparseable` in `warn`
+  mode. Bodies with no `tools/call` — including the empty final body of an
+  OpenAPI bridge call to a `GET` / `DELETE` operation, REST bodies, and framed
+  payloads — still pass uninspected.
+- **`ai_transcript_audit` records MCP tool calls the whole-document parse
+  refuses** (GHSA-f2jp-59r9-fp64 sibling, #5954). A request body that failed the
+  `Value` parse was discarded as non-AI without being audited, so the same deep
+  batch executed with no MCP audit record. The bounded MCP recognizer now runs
+  whenever no parsed body is available (not only past the redaction scan
+  ceiling), and a body that carries or may carry a `tools/call` stays an MCP
+  audit candidate.
+
 ## [0.9.9] - 2026-10-01
 
 ### Security

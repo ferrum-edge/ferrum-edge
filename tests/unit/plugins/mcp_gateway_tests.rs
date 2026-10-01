@@ -6602,6 +6602,55 @@ async fn transparent_batch_is_forwarded_after_admission() {
     );
 }
 
+/// A `tools/call` member whose `params.arguments` nests `depth` objects deep.
+fn deep_tools_call_member(depth: usize) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"github.create_pr","arguments":{}"x"{}}}}}"#,
+        r#"{"k":"#.repeat(depth),
+        "}".repeat(depth)
+    )
+}
+
+#[tokio::test]
+async fn transparent_batch_admits_member_past_whole_document_recursion_limit() {
+    // Raw batch admission reads the array framing as borrowed `RawValue`s and
+    // parses each member with its own serde_json recursion budget, so a member
+    // the whole-document parse cannot reach is still admitted and forwarded.
+    // This is the gateway half of GHSA-f2jp-59r9-fp64: `ai_prompt_shield`
+    // (`mcp_arguments`) and `ai_transcript_audit` must never read a
+    // whole-document parse failure as "no tools/call".
+    let batch = (1..=256)
+        .map(|depth| format!("[{}]", deep_tools_call_member(depth)))
+        .find(|batch| {
+            let member = &batch[1..batch.len() - 1];
+            serde_json::from_str::<Value>(member).is_ok()
+                && serde_json::from_str::<Value>(batch).is_err()
+        })
+        .expect("serde_json exposed no standalone-member/batch recursion boundary");
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &transparent_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch.into_bytes());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    // A refused member would fail the transparent batch closed with a
+    // synthetic JSON-RPC error array instead of forwarding it.
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "the deep member must be admitted and the batch forwarded: {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.batch").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("github-mcp.example")
+    );
+}
+
 #[tokio::test]
 async fn aggregate_batch_tools_list_live_path() {
     let server = start_mcp_catalog_server().await;

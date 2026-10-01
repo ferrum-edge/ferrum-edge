@@ -4231,13 +4231,22 @@ async fn mcp_arguments_mode_scans_every_batch_member() {
     assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), Some("email"));
 }
 
+/// A `tools/call` whose `params.arguments` is an object nested `depth` levels
+/// deep around one email address.
+fn deep_mcp_tool_call(depth: usize) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"crm.lookup","arguments":{}"alice@example.com"{}}}}}"#,
+        r#"{"k":"#.repeat(depth),
+        "}".repeat(depth)
+    )
+}
+
+/// The shallowest one-member batch whose member serde_json still parses on its
+/// own while the batch exceeds the whole-document recursion limit: exactly the
+/// shape `mcp_gateway` admits member by member (GHSA-f2jp-59r9-fp64).
 fn mcp_batch_beyond_whole_document_recursion_limit() -> String {
     for depth in 1..=256 {
-        let member = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"crm.lookup","arguments":{}"alice@example.com"{}}}}}"#,
-            "[".repeat(depth),
-            "]".repeat(depth)
-        );
+        let member = deep_mcp_tool_call(depth);
         let batch = format!("[{member}]");
         if serde_json::from_str::<serde_json::Value>(&member).is_ok()
             && serde_json::from_str::<serde_json::Value>(&batch).is_err()
@@ -4248,39 +4257,152 @@ fn mcp_batch_beyond_whole_document_recursion_limit() -> String {
     panic!("serde_json exposed no standalone-member/batch recursion boundary");
 }
 
-#[tokio::test]
-async fn mcp_arguments_mode_fails_closed_beyond_whole_document_recursion_limit() {
-    let body = mcp_batch_beyond_whole_document_recursion_limit();
+/// The shallowest singleton `tools/call` the whole-document parse refuses.
+fn mcp_singleton_beyond_whole_document_recursion_limit() -> String {
+    (1..=256)
+        .map(deep_mcp_tool_call)
+        .find(|call| serde_json::from_str::<serde_json::Value>(call).is_err())
+        .expect("serde_json exposed no singleton recursion boundary")
+}
 
-    for action in ["reject", "redact"] {
-        let plugin = mcp_shield(action);
-        let mut ctx = make_post_ctx_with_raw_body(&body);
-        let mut headers = make_post_headers();
-        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
-        assert_eq!(
-            shield_metadata(&ctx, "ai_shield_rejected"),
-            Some("jsonrpc_request_uninspectable"),
-            "{action} must not forward a batch that the whole-document parser cannot inspect"
-        );
-    }
-
-    // Final enforcement must make the same fail-closed decision if a later
-    // transformer replaces an initially clean request with the crafted batch.
-    let plugin = mcp_shield("reject");
+/// Run `before_proxy` over a clean call (setting the final-inspection marker),
+/// then the final hook over `final_body`.
+async fn mcp_final_decision(
+    plugin: &AiPromptShield,
+    final_body: &[u8],
+) -> (PluginResult, ferrum_edge::plugins::RequestContext) {
     let clean = mcp_tool_call(1, json!({"q": "weather"}));
     let mut ctx = make_post_ctx(&clean);
     let mut headers = make_post_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert_reject(
-        plugin
-            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
-            .await,
-        Some(400),
-    );
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, final_body)
+        .await;
+    (result, ctx)
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_refuses_unparseable_bodies_that_may_carry_a_tool_call() {
+    let deep_batch = mcp_batch_beyond_whole_document_recursion_limit();
+    let deep_singleton = mcp_singleton_beyond_whole_document_recursion_limit();
+    // Past the recognizer's 32-member bound, so it reports `Uninspectable`.
+    let deep_member = &deep_batch[1..deep_batch.len() - 1];
+    let oversized_batch = format!("[{}]", [deep_member; 33].join(","));
+
+    for body in [&deep_batch, &deep_singleton, &oversized_batch] {
+        assert!(serde_json::from_str::<serde_json::Value>(body).is_err());
+        for action in ["reject", "redact"] {
+            let plugin = mcp_shield(action);
+            let mut ctx = make_post_ctx_with_raw_body(body);
+            let mut headers = make_post_headers();
+            assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_rejected"),
+                Some("jsonrpc_request_unparseable"),
+                "{action} must not forward an unparseable body that may carry a tools/call"
+            );
+
+            // The final hook makes the same decision for the same bytes, e.g.
+            // when a later transformer replaced an initially clean request.
+            let (result, ctx) = mcp_final_decision(&plugin, body.as_bytes()).await;
+            assert_reject(result, Some(400));
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_rejected"),
+                Some("jsonrpc_request_unparseable"),
+                "{action} final hook"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_warns_on_unparseable_bodies_that_may_carry_a_tool_call() {
+    let body = mcp_batch_beyond_whole_document_recursion_limit();
+    let plugin = mcp_shield("warn");
+    let mut ctx = make_post_ctx_with_raw_body(&body);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
-        shield_metadata(&ctx, "ai_shield_rejected"),
-        Some("jsonrpc_request_uninspectable")
+        shield_metadata(&ctx, "ai_shield_warnings"),
+        Some("jsonrpc_request_unparseable")
     );
+    assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+
+    let (result, ctx) = mcp_final_decision(&plugin, body.as_bytes()).await;
+    assert_continue(result);
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_warnings"),
+        Some("jsonrpc_request_unparseable")
+    );
+    assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_passes_unparseable_bodies_without_a_tool_call() {
+    // Not one of these can carry a `tools/call` the gateway would execute: a
+    // REST body, malformed JSON (including a truncated envelope that names the
+    // method — `mcp_gateway` answers it with a parse error), a deep document
+    // that is not JSON-RPC, and a framed payload.
+    let deep_non_call = format!("[{}1{}]", "[".repeat(200), "]".repeat(200));
+    let bodies: [&[u8]; 5] = [
+        b"petId=7&note=alice%40example.com",
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/list""#,
+        br#"{"method":"tools/call","params":{"arguments":{"e":"alice@example.com"}}"#,
+        deep_non_call.as_bytes(),
+        b"\x00\x00\x00\x00\x02{}",
+    ];
+    for action in ["reject", "redact", "warn"] {
+        let plugin = mcp_shield(action);
+        for body in bodies {
+            if let Ok(text) = std::str::from_utf8(body) {
+                let mut ctx = make_post_ctx_with_raw_body(text);
+                let mut headers = make_post_headers();
+                assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+                assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+                assert_eq!(shield_metadata(&ctx, "ai_shield_warnings"), None);
+            }
+            let (result, ctx) = mcp_final_decision(&plugin, body).await;
+            assert_continue(result);
+            assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+            assert_eq!(shield_metadata(&ctx, "ai_shield_warnings"), None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_final_hook_passes_an_empty_bridged_body() {
+    // An OpenAPI bridge call to a GET/DELETE operation: the client POSTed a
+    // JSON-RPC envelope, `before_proxy` marked the request for final inspection,
+    // and the gateway then cleared the body and its Content-Type. The final
+    // representation is empty with no Content-Type — still in scope — and must
+    // be forwarded.
+    for action in ["reject", "redact", "warn"] {
+        let plugin = mcp_shield(action);
+        let call = mcp_tool_call(7, json!({"petId": "7"}));
+        let mut ctx = make_post_ctx(&call);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        ctx.headers.remove("content-type");
+        let bridged_headers = HashMap::new();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &bridged_headers, b"")
+                .await,
+        );
+        assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+
+        // A bodiless request is equally untouched by `before_proxy`.
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, b"")
+                .await,
+        );
+        assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+    }
 }
 
 #[tokio::test]

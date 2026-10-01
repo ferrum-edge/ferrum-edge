@@ -3778,12 +3778,20 @@ impl AiTranscriptAudit {
             serde_json::from_slice(body).ok()
         };
         let is_ai = scan_limited || parsed.as_ref().is_some_and(json_looks_like_ai_request);
-        let bounded_mcp_scan = (scan_limited && self.capture.mcp_tool_calls)
+        // Whenever no `Value` is available — the redaction scan ceiling, or a
+        // body the whole-document parse refuses — read the bytes with the
+        // bounded recognizer. `mcp_gateway` admits batch members one at a time,
+        // each with its own recursion budget, so a batch past serde_json's
+        // whole-document nesting limit still executes every member
+        // (GHSA-f2jp-59r9-fp64). A body that carries, or may carry
+        // (`Uninspectable`), a `tools/call` stays an MCP audit candidate.
+        let raw_scan = scan_limited || parsed.is_none();
+        let bounded_mcp_scan = (raw_scan && self.capture.mcp_tool_calls)
             .then(|| mcp_jsonrpc::scan_request_bytes(body));
         let carries_tool_call = parsed.as_ref().is_some_and(mcp_jsonrpc::has_tool_call)
             || bounded_mcp_scan
                 .as_ref()
-                .is_some_and(|scan| matches!(scan, mcp_jsonrpc::RequestScan::ToolCalls { .. }));
+                .is_some_and(|scan| !matches!(scan, mcp_jsonrpc::RequestScan::NoToolCall));
         let is_mcp = self.capture.mcp_tool_calls && carries_tool_call;
         if !is_ai && !is_mcp {
             self.discard_staged_candidate(ctx);
@@ -3840,13 +3848,13 @@ impl AiTranscriptAudit {
         // provisional pass (before `mcp_gateway`) that is the only view that
         // still names them publicly and carries their JSON-RPC arguments.
         let exportable = self.commit_may_emit(sample_hit);
-        let staged_mcp = if scan_limited && is_mcp {
-            // The body-redaction ceiling prevents a full Value parse. Keep an
-            // empty MCP section so the final bridge hook still emits a record;
-            // the bounded byte recognizer proves the request was a tools/call.
+        let staged_mcp = if parsed.is_none() && is_mcp {
+            // The body-redaction ceiling, or a whole-document parse failure,
+            // left no Value. Stage the MCP section from the bounded byte
+            // recognizer so the final bridge hook still emits a record.
             bounded_mcp_scan
                 .as_ref()
-                .and_then(|scan| self.mcp_section_from_scan(scan, exportable))
+                .and_then(|scan| self.mcp_section_from_scan(scan, body, exportable))
         } else {
             parsed
                 .as_ref()
@@ -4603,14 +4611,22 @@ impl AiTranscriptAudit {
     fn mcp_section_from_scan(
         &self,
         scan: &mcp_jsonrpc::RequestScan<'_>,
+        body: &[u8],
         exportable: bool,
     ) -> Option<StagedMcp> {
-        let mcp_jsonrpc::RequestScan::ToolCalls { batch, members } = scan else {
-            return None;
+        let (batch, members) = match scan {
+            mcp_jsonrpc::RequestScan::ToolCalls { batch, members } => (*batch, members.as_slice()),
+            // The recognizer could not read the calls faithfully (ambiguous
+            // member names or over the batch bounds), but the body may carry
+            // one: keep an empty section so the candidate is still audited.
+            mcp_jsonrpc::RequestScan::Uninspectable(_) => {
+                (body.trim_ascii_start().first() == Some(&b'['), &[][..])
+            }
+            mcp_jsonrpc::RequestScan::NoToolCall => return None,
         };
         let mut staged = StagedMcp {
             section: McpAuditSection {
-                batch: *batch,
+                batch,
                 ..McpAuditSection::default()
             },
             retained_bytes: 0,

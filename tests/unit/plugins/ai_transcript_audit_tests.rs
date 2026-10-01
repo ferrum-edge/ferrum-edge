@@ -13350,6 +13350,49 @@ async fn mcp_audit_recognizes_lowercase_post_and_scan_limited_bridged_calls() {
     assert_eq!(records[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
 }
 
+/// The shallowest one-member `tools/call` batch whose member serde_json parses
+/// on its own while the batch exceeds the whole-document recursion limit:
+/// `mcp_gateway` admits and executes it member by member.
+fn mcp_batch_past_whole_document_recursion_limit() -> String {
+    for depth in 1..=256 {
+        let member = format!(
+            r#"{{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{{"name":"pets.getPet","arguments":{}"7"{}}}}}"#,
+            r#"{"k":"#.repeat(depth),
+            "}".repeat(depth)
+        );
+        let batch = format!("[{member}]");
+        if serde_json::from_str::<Value>(&member).is_ok()
+            && serde_json::from_str::<Value>(&batch).is_err()
+        {
+            return batch;
+        }
+    }
+    panic!("serde_json exposed no standalone-member/batch recursion boundary");
+}
+
+#[tokio::test]
+async fn mcp_audit_records_tool_calls_the_whole_document_parse_refuses() {
+    // GHSA-f2jp-59r9-fp64 sibling: a batch past the whole-document nesting
+    // limit has no `Value`, but the gateway still executes its member, so the
+    // bounded byte recognizer must keep it an MCP audit candidate.
+    let batch = mcp_batch_past_whole_document_recursion_limit();
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), batch.clone());
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        batch.as_bytes(),
+        &json!([{"jsonrpc": "2.0", "id": 74, "result": {"isError": false}}]),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "the deep batch must be audited");
+    let mcp = &records[0]["mcp"];
+    assert!(mcp.is_object(), "{records:#?}");
+    assert_eq!(mcp["batch"], json!(true), "{mcp}");
+    assert_eq!(mcp["calls"][0]["tool"], "pets.getPet", "{mcp}");
+}
+
 #[tokio::test]
 async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
     let request = mcp_call_value(json!(73), "pets.getPet", json!({"petId": "7"}));
