@@ -1331,6 +1331,12 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
     B: Buf,
 {
+    /// FERRUM PATCH test hook: the codec's write-buffer state.
+    #[cfg(test)]
+    pub(crate) fn write_buf_state(&self) -> (usize, bool) {
+        self.inner.write_buf_state()
+    }
+
     async fn handshake2(
         mut io: T,
         builder: Builder,

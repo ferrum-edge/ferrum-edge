@@ -43,7 +43,7 @@ Ferrum relays HTTP/2 and gRPC through h2 on both legs. On the protocol benchmark
 
 The unified diff is
 [`h2-coalesce-data-frame-writes.patch`](h2-coalesce-data-frame-writes.patch),
-against h2 0.4.19. All changes are in `src/codec/framed_write.rs`.
+against h2 0.4.19. The change is in `src/codec/framed_write.rs`, plus a one-line idle hook in `src/proto/streams/streams.rs` (with its `Codec` delegate in `src/codec/mod.rs`) and test-only accessors in `src/proto/connection.rs` and `src/client.rs`.
 
 - `Encoder::buffer` copies a DATA payload into the write buffer, with its frame header, while the buffer stays within `COALESCE_LIMIT` (64 KiB, inclusive).
   - A copied frame is complete once buffered, so it is recorded in `last_data_frame` exactly as a sub-threshold frame already was, and `Prioritize` reclaims it before staging the next frame.
@@ -51,13 +51,13 @@ against h2 0.4.19. All changes are in `src/codec/framed_write.rs`.
   - The limit is approximate for the buffer as a whole: control frames encoded after copied DATA (HEADERS, RST_STREAM, PING, WINDOW_UPDATE, SETTINGS, GOAWAY) can take it past 64 KiB by at most one frame (`max_frame_size` + 9 bytes for HEADERS).
 - `Encoder::has_capacity` counts room under `COALESCE_LIMIT` as capacity, so `buffer_pending` keeps staging frames from every ready stream until the limit, then flushes them in one write.
 - When coalescing needs more room, the buffer grows once, straight to the limit, instead of doubling through several reallocations.
-- `Encoder::unset_frame` keeps a grown buffer while writes stay larger than 16 KiB. After the first write that fits in 16 KiB, it replaces the buffer with a fresh 16 KiB one. A sustained transfer therefore does not reallocate per write, and a connection whose bulk traffic has ended drops the larger allocation at its next small write (an idle connection still writes PINGs).
+- A grown buffer is kept across writes and dropped when the connection goes idle. `Streams::poll_complete`, at the point where everything staged has been flushed and nothing else is pending, calls `Codec::shrink_write_buf_if_idle`, which replaces an empty buffer larger than 16 KiB with a fresh 16 KiB one. A busy connection therefore reuses one grown buffer across writes, and an idle connection never keeps more than the initial 16 KiB. The frontend sets no HTTP/2 keepalive, so an idle connection may never write again, and shrinking on a later write would not be enough.
 
 Frame boundaries, frame sizes, flow control and the order of frames are unchanged; only how many frames share one write changes. The cost is one `memcpy` of each coalesced payload. Over TLS, rustls copies the payload once more anyway; over cleartext, the copy replaces a zero-copy `writev` segment.
 
 ### Behaviour difference: data staged before a local reset
 
-A copied frame counts as written. If a stream is reset locally after some of its DATA was staged but before the buffer reached the socket, that DATA still goes out, ahead of the `RST_STREAM`. That can be up to about 64 KiB, all of it already charged against flow control. Stock h2 sends at most the one in-flight chained frame in that case.
+A copied frame counts as written. If a stream is reset locally after some of its DATA was staged but before the buffer reached the socket, that DATA still goes out, ahead of the `RST_STREAM`. That can be up to about 64 KiB, all of it already charged against flow control. Stock h2 can stage at most one chained DATA frame plus up to 16 KiB of small (sub-256-byte) frames in its write buffer, and sends those in that case.
 
 RFC 9113 permits this: frames sent before `RST_STREAM` are valid, and a peer ignores DATA on a stream it has reset (section 5.4.2), still counting it against the connection window. The same ordering applies when the peer's `RST_STREAM` arrives while DATA for that stream is staged. Stock h2 has that race for one frame; here it covers the staged batch.
 
@@ -96,7 +96,7 @@ They check that:
 - A frame larger than the limit is chained whole without growing the buffer, with and without vectored I/O.
 - Partial writes and `Pending` neither lose, duplicate nor reorder bytes.
 - Control frames (HEADERS, RST_STREAM, PING, WINDOW_UPDATE) interleaved with copied DATA keep their order, and END_STREAM survives the copy.
-- A grown buffer is kept for large writes and dropped after a small one.
+- A grown buffer is kept across writes, is never dropped while unwritten bytes remain, and is dropped once idle. End to end, a client connection that uploaded 512 KiB (and so grew its buffer) holds only the initial 16 KiB once idle; without the idle hook this test fails with a 65,536-byte buffer.
 - A copied frame is handed back fully consumed.
 
 h2's library suite also passes, apart from the HPACK fixture tests, which read data files the published crate does not ship.

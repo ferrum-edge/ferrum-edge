@@ -225,6 +225,10 @@ where
             };
 
             if !reclaimed {
+                // FERRUM PATCH (h2-001): everything staged has been written
+                // and nothing else is pending, so the connection is idle:
+                // release a write buffer that grew to coalesce DATA frames.
+                dst.shrink_write_buf_if_idle();
                 return Poll::Ready(Ok(()));
             }
         }

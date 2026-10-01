@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -719,6 +721,19 @@ class GuardObservationTests(unittest.TestCase):
             # the drift-manifest sources exactly; anything else fails closed.
             with self.assertRaises(ValueError):
                 apply_ferrum_patch(source, ROOT.parents[2])
+        # A tree the patch applies to cleanly but that then differs from the
+        # drift manifest (here: one extra source file) also fails closed.
+        repo = ROOT.parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            shutil.copytree(repo / "vendor/h2-0.4.19-ferrum-patched/src", source / "src")
+            patch = (repo / "docs/upstream-h2-patches/001-coalesce-data-frame-writes"
+                     / "h2-coalesce-data-frame-writes.patch").read_bytes()
+            subprocess.run(["patch", "--batch", "--fuzz=0", "-R", "-p1"], input=patch,
+                           cwd=source, check=True, capture_output=True)
+            (source / "src/extra.rs").write_text("// not in the vendored crate\n")
+            with self.assertRaisesRegex(ValueError, "differs from the vendored"):
+                apply_ferrum_patch(source, repo)
 
     def test_campaign_index_keeps_failed_repetitions_and_rejects_missing_samples(self):
         with tempfile.TemporaryDirectory() as directory:

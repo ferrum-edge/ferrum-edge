@@ -124,6 +124,12 @@ where
     P: Peer,
     B: Buf,
 {
+    /// FERRUM PATCH test hook: the codec's write-buffer state.
+    #[cfg(test)]
+    pub(crate) fn write_buf_state(&self) -> (usize, bool) {
+        self.codec.write_buf_state()
+    }
+
     pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
         fn streams_config(config: &Config) -> streams::Config {
             streams::Config {

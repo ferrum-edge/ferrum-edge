@@ -121,6 +121,17 @@ impl<T, B> Codec<T, B> {
         self.framed_write().take_last_data_frame()
     }
 
+    /// FERRUM PATCH: drop a write buffer grown to coalesce DATA frames once
+    /// the connection has nothing more to write.
+    pub(crate) fn shrink_write_buf_if_idle(&mut self) {
+        self.framed_write().shrink_if_idle()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_buf_state(&self) -> (usize, bool) {
+        self.inner.get_ref().write_buf_state()
+    }
+
     fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
         self.inner.get_mut()
     }

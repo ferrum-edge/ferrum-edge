@@ -52,6 +52,10 @@ struct Encoder<B> {
 
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
+
+    /// Test-only: the buffer grew to coalesce DATA frames at least once.
+    #[cfg(test)]
+    grew_to_coalesce: bool,
 }
 
 #[derive(Debug)]
@@ -115,6 +119,8 @@ where
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+                #[cfg(test)]
+                grew_to_coalesce: false,
             },
         }
     }
@@ -215,17 +221,7 @@ where
     fn unset_frame(&mut self) -> ControlFlow {
         // Clear internal buffer
         self.buf.set_position(0);
-        // FERRUM PATCH: a buffer that grew to coalesce DATA frames is kept
-        // while writes stay large, and goes back to its initial size after the
-        // first write that fit in it, so a connection whose bulk traffic has
-        // ended (an idle one still writes PINGs) does not keep the larger
-        // allocation, and a sustained transfer does not reallocate per write.
-        let buf = self.buf.get_ref();
-        if buf.capacity() > DEFAULT_BUFFER_CAPACITY && buf.len() <= DEFAULT_BUFFER_CAPACITY {
-            *self.buf.get_mut() = BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY);
-        } else {
-            self.buf.get_mut().clear();
-        }
+        self.buf.get_mut().clear();
 
         // The data frame has been written, so unset it
         match self.next.take() {
@@ -272,6 +268,10 @@ where
                     let buf = self.buf.get_mut();
                     if buf.capacity() - buf_len < frame::HEADER_LEN + len {
                         buf.reserve(COALESCE_LIMIT - buf_len);
+                        #[cfg(test)]
+                        {
+                            self.grew_to_coalesce = true;
+                        }
                     }
                     v.encode_chunk(buf);
                     // Fully copied, so the frame is complete once buffered,
@@ -389,6 +389,27 @@ impl<T, B> FramedWrite<T, B> {
     /// Retrieve the last data frame that has been sent
     pub fn take_last_data_frame(&mut self) -> Option<frame::Data<B>> {
         self.encoder.last_data_frame.take()
+    }
+
+    /// FERRUM PATCH: drop a write buffer that grew to coalesce DATA frames,
+    /// once everything in it has been written. Called when the connection has
+    /// nothing more to write, so a busy connection keeps one grown buffer
+    /// across writes and an idle one holds only the initial 16 KiB.
+    pub(crate) fn shrink_if_idle(&mut self) {
+        let buf = self.encoder.buf.get_ref();
+        if self.encoder.next.is_none()
+            && buf.is_empty()
+            && buf.capacity() > DEFAULT_BUFFER_CAPACITY
+        {
+            self.encoder.buf = Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY));
+        }
+    }
+
+    /// Test-only view of the write buffer: (capacity, whether it ever grew to
+    /// coalesce).
+    #[cfg(test)]
+    pub(crate) fn write_buf_state(&self) -> (usize, bool) {
+        (self.encoder.buf.get_ref().capacity(), self.encoder.grew_to_coalesce)
     }
 
     pub fn get_mut(&mut self) -> &mut T {
@@ -568,19 +589,99 @@ mod ferrum_coalesce_data_frame_writes_tests {
         assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
     }
 
-    /// A grown buffer survives a large write (no reallocation per batch) and
-    /// goes back to its initial size after the first write that fits in it.
+    /// A grown buffer survives a write (no reallocation per batch); it is
+    /// dropped by `shrink_if_idle` only once nothing is left to write.
     #[test]
-    fn a_grown_buffer_is_kept_for_large_writes_and_dropped_after_a_small_one() {
+    fn a_grown_buffer_is_kept_across_writes_and_dropped_when_idle() {
         let (mut framed, _writes) = framed(true);
         send_all(&mut framed, vec![data(1, 30_000, b'a'), data(3, 30_000, b'b')]);
         assert!(framed.encoder.buf.get_ref().is_empty());
         assert!(framed.encoder.buf.get_ref().capacity() >= COALESCE_LIMIT);
-        send_all(&mut framed, vec![data(1, 30_000, b'c'), data(3, 30_000, b'd')]);
+        send_all(&mut framed, vec![data(1, 1_000, b'c')]);
         assert!(framed.encoder.buf.get_ref().capacity() >= COALESCE_LIMIT);
-        send_all(&mut framed, vec![data(1, 1_000, b'e')]);
+
+        // Unwritten bytes are never dropped.
+        framed.buffer(data(1, 30_000, b'd')).unwrap();
+        let _ = framed.take_last_data_frame();
+        framed.shrink_if_idle();
+        assert_eq!(framed.encoder.buf.get_ref().len(), frame::HEADER_LEN + 30_000);
+
+        send_all(&mut framed, vec![]);
+        framed.shrink_if_idle();
         assert!(framed.encoder.buf.get_ref().is_empty());
         assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
+    }
+
+    /// End to end: a client connection that uploaded a bulk body, which grew
+    /// its write buffer to coalesce DATA frames, holds only the initial
+    /// buffer once it goes idle. Ferrum's frontend sets no keepalive, so an
+    /// idle connection may never write again.
+    #[tokio::test]
+    async fn an_idle_connection_holds_only_the_initial_write_buffer() {
+        use std::future::{poll_fn, Future};
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            let mut conn = crate::server::Builder::new()
+                .initial_window_size(1 << 20)
+                .initial_connection_window_size(1 << 20)
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .unwrap();
+            // The server connection only makes progress while `accept` is
+            // polled, so each request is handled on its own task.
+            while let Some(request) = conn.accept().await {
+                let (request, mut respond) = request.unwrap();
+                tokio::spawn(async move {
+                    let mut body = request.into_body();
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.unwrap();
+                        body.flow_control().release_capacity(chunk.len()).unwrap();
+                    }
+                    respond
+                        .send_response(http::Response::new(()), true)
+                        .unwrap();
+                });
+            }
+        });
+
+        let (client, mut conn) = crate::client::handshake(client_io).await.unwrap();
+        let exchange = async move {
+            let mut client = client.ready().await.unwrap();
+            let request = http::Request::post("https://example.com/").body(()).unwrap();
+            let (response, mut stream) = client.send_request(request, false).unwrap();
+            stream.send_data(Bytes::from(vec![b'x'; 512 * 1024]), true).unwrap();
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK);
+            client
+        };
+        tokio::pin!(exchange);
+        let client = loop {
+            tokio::select! {
+                client = &mut exchange => break client,
+                result = poll_fn(|cx| std::pin::Pin::new(&mut conn).poll(cx)) => {
+                    panic!("connection ended early: {result:?}")
+                }
+            }
+        };
+        // Let the connection drain everything it still has to write.
+        for _ in 0..8 {
+            poll_fn(|cx| {
+                let _ = std::pin::Pin::new(&mut conn).poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            tokio::task::yield_now().await;
+        }
+        let (capacity, grew) = conn.write_buf_state();
+        assert!(grew, "the bulk upload must have coalesced DATA frames");
+        assert!(
+            capacity <= DEFAULT_BUFFER_CAPACITY,
+            "an idle connection kept a {capacity}-byte write buffer"
+        );
+        drop(client);
+        drop(conn);
+        server.await.unwrap();
     }
 
     /// The limit is inclusive: a frame that brings the buffer to exactly
