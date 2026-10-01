@@ -5,7 +5,7 @@
   "url": "https://static.crates.io/crates/h2/h2-0.4.19.crate",
   "sha256": "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16",
   "revision": "d57d1b852fec9dda6d42d3454502006d52104da8",
-  "patch_sha256": "9e64ffc335ef39c0704b01aefdca2ff2196e2e161f3d6baac2c1bb1fb1dfe3ba",
+  "patch_sha256": "b3076a728860dca539d2b43b78b3e19f3e516d1a3c590c99e9e2ea3eb2f0b064",
   "files": {
     "src/lib.rs": {
       "before": "c8680fc4eb13ccb4ce944716042bd33c6554677cf8261c371442f91fbee352e0",
@@ -29,11 +29,11 @@
     },
     "src/proto/streams/streams.rs": {
       "before": "d2f866b385ea8107ecb4a56e0089523abeabb6a5dc8e107c0a6c3eeb26955290",
-      "after": "8fa211ae3d5c1b17e87b9ec24a9dca8f79c436238786c8cfa3e9b7a24d405d64"
+      "after": "89fd8a5446143251ab7baf03f278c7ea6bd41a9452bece88cae638b4150c993e"
     }
   },
   "assets": {
-    "observer.rs": "c0f216e1cc88f3c05693c19569810d7a8a516f6c80977a9c49e61fab0169cf50",
+    "observer.rs": "23b0d7a833e12538e3516e21b12312e27bf0a53a9b4635579397cc944e6ad1b1",
     "guard_tests.rs": "48d5bb259409470d3b45aa7f11c0d88279ec628fc55de6c9bb44f9cb6c9099ec",
     "metrics-hook.txt": "c3e18b33e790351221a7383fd83e7bfa53b59a96b26e7b434a565d714454d539"
   },

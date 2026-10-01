@@ -42,7 +42,7 @@ impl PoolManager for FanoutTestManager {
         self.attempts.fetch_add(1, Ordering::Relaxed);
         if self
             .fail_creates_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 (remaining > 0).then(|| remaining - 1)
             })
             .is_ok()

@@ -59,6 +59,7 @@
 //! not evidence that two requests shared one.
 
 use crate::fips::approved::Sha256;
+use crate::sync_compat::AtomicUpdate;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -1888,7 +1889,7 @@ impl ResponseCaching {
         let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         let _ =
             self.clock_offset_nanos
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_add(nanos))
                 });
     }

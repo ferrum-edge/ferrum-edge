@@ -188,7 +188,7 @@ impl AuditEventDelivery for RecordingDelivery {
         }
         if self
             .fail_next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                 Some(value.saturating_sub(1))
             })
             .unwrap_or(0)

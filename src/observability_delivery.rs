@@ -51,6 +51,7 @@
 //! still share one generation and the first drain closes it for both. The
 //! supported in-process model is sequential: start, drain, start again.
 
+use crate::sync_compat::AtomicUpdate;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -499,7 +500,7 @@ impl DeliveryLifecycle {
         // callers must never publish a reservation depth above the configured
         // budget, not even transiently on the exported gauge.
         self.admitted_tasks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 (admitted < max_tasks).then_some(admitted + 1)
             })
             .ok()
@@ -512,7 +513,7 @@ impl DeliveryLifecycle {
     fn release_task_permit(&self) {
         let released =
             self.admitted_tasks
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                .update_with(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                     admitted.checked_sub(1)
                 });
         debug_assert!(

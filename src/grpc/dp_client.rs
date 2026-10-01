@@ -765,8 +765,9 @@ pub fn build_dp_grpc_tls_config(
     }
 
     if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
-        crate::tls::check_cert_expiry(
+        crate::tls::check_cert_expiry_for_kind(
             path,
+            MaterialKind::CaBundle,
             &format!("{label} gRPC TLS CA cert"),
             env_config.tls_cert_expiry_warning_days,
         )?;

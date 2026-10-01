@@ -1,4 +1,5 @@
 use crate::fips::approved::Sha256;
+use crate::sync_compat::AtomicUpdate;
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
@@ -226,7 +227,7 @@ impl CacheBudget {
         let budget = self.class(class);
         if budget
             .entries
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |entries| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |entries| {
                 entries
                     .checked_add(1)
                     .filter(|next| *next <= budget.max_entries)
@@ -237,7 +238,7 @@ impl CacheBudget {
         }
         if budget
             .retained_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+            .update_with(Ordering::AcqRel, Ordering::Acquire, |bytes| {
                 bytes
                     .checked_add(retained_bytes)
                     .filter(|next| *next <= budget.max_retained_bytes)
@@ -635,7 +636,7 @@ impl IntrospectionCache {
 
 fn release_atomic(counter: &AtomicUsize, amount: usize, kind: &'static str) {
     let mut underflow = false;
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = counter.update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
         underflow = current < amount;
         Some(current.saturating_sub(amount))
     });

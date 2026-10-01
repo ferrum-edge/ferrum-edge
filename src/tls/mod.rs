@@ -2409,9 +2409,21 @@ pub fn check_cert_expiry(
     label: &str,
     warning_days: u64,
 ) -> Result<(), anyhow::Error> {
-    let source = CertSource::parse(pem_source, MaterialKind::Cert);
-    let material = load_material_blocking(&source, MaterialKind::Cert)
-        .map_err(|error| material_load_error(label, error))?;
+    check_cert_expiry_for_kind(pem_source, MaterialKind::Cert, label, warning_days)
+}
+
+/// Check expiry for a certificate-bearing source using the material kind
+/// declared by its owning field. In particular, CA sources must resolve with
+/// `MaterialKind::CaBundle` so fragmentless managed CA references stay typed.
+pub fn check_cert_expiry_for_kind(
+    pem_source: &str,
+    kind: MaterialKind,
+    label: &str,
+    warning_days: u64,
+) -> Result<(), anyhow::Error> {
+    let source = CertSource::parse(pem_source, kind);
+    let material =
+        load_material_blocking(&source, kind).map_err(|error| material_load_error(label, error))?;
     check_cert_expiry_from_pem_bytes(
         material.bytes.expose_secret(),
         label,
@@ -2489,11 +2501,12 @@ pub(crate) fn check_cert_expiry_from_pem_bytes(
 /// suitable for field validation (used by per-proxy backend TLS validation).
 pub fn check_cert_expiry_for_validation(
     pem_path: &str,
+    kind: MaterialKind,
     field_name: &str,
     warning_days: u64,
 ) -> Result<(), String> {
-    let source = CertSource::parse(pem_path, MaterialKind::Cert);
-    match load_material_blocking(&source, MaterialKind::Cert) {
+    let source = CertSource::parse(pem_path, kind);
+    match load_material_blocking(&source, kind) {
         Ok(material) => check_cert_expiry_from_pem_bytes(
             material.bytes.expose_secret(),
             field_name,

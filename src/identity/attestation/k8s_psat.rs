@@ -36,6 +36,7 @@ pub struct TokenReviewResult {
 
 /// A pluggable adapter for `TokenReview` calls. Production wiring will use
 /// the existing K8s service-discovery client; tests inject mocks.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait TokenReviewer: Send + Sync + 'static {
     async fn review(&self, token: &str) -> Result<TokenReviewResult, String>;

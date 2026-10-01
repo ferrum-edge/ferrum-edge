@@ -74,6 +74,7 @@ const K8S_CONTROLLER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// directly testable with a deterministic scripted source. Production stores
 /// receive the blanket implementation below.
 #[doc(hidden)]
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait::async_trait]
 pub trait CpFullLoadSource: Send + Sync {
     async fn load_full_config_for_purpose(

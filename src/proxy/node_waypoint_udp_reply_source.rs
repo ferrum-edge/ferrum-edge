@@ -135,6 +135,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::capture::{MAX_NODE_WAYPOINT_UDP_STEER_DESTINATIONS, NodeWaypointUdpSteerDestination};
+use crate::sync_compat::AtomicUpdate;
 
 /// Directory under the pod registry root carrying the reply-source channel. A
 /// dot-prefixed sibling of the pod files, like the readiness markers, so a
@@ -764,7 +765,7 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
             }
             _ => self
                 .next_sequence
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |sequence| {
+                .update_with(Ordering::SeqCst, Ordering::SeqCst, |sequence| {
                     sequence.checked_add(1)
                 })
                 .map_err(|_| {

@@ -587,6 +587,7 @@ macro_rules! impl_auth_plugin {
 
 pub(crate) use impl_auth_plugin;
 
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait AuthMechanism: Send + Sync {
     fn mechanism_name(&self) -> &'static str;

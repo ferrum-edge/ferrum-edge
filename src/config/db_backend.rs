@@ -790,6 +790,7 @@ pub fn gateway_trust_bundle_revision_conflict(
 /// validation keeps a process-local mutex as a cheap first tier, while this
 /// lease closes races between writable gateway instances that share the same
 /// datastore.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait NamespaceConfigAdmissionLeaseBackend: Send + Sync {
     async fn try_acquire_namespace_config_admission_lease(
@@ -1521,6 +1522,7 @@ impl std::error::Error for DbTlsReconnectError {}
 /// because construction is inherently backend-specific. The trait covers only
 /// operations on an already-connected store.
 #[allow(dead_code)] // Some methods are only used through dyn dispatch or by MongoDB backend
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     // -----------------------------------------------------------------------
