@@ -13442,25 +13442,28 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
     }
 
     // Malformed JSON that names no call and carries no escape stays out of
-    // MCP scope. The shared candidate marker also covers ordinary AI
-    // candidates (all-paths capture), so check the record itself: it may be
-    // audited as an AI request, but never with an `mcp` section.
+    // MCP scope. The plugin records that decision as an explicit `"false"`
+    // candidate marker (shared with co-located instances), so check the value.
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("http://127.0.0.1:1/ingest", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
     let malformed = r#"{"jsonrpc":"2.0","id":76,"method":"tools/list","params":{"n":NaN}}"#;
     let mut ctx = mcp_ctx(&json!({}));
     ctx.metadata
         .insert("request_body".to_string(), malformed.to_string());
-    let records = mcp_roundtrip(
-        json!({}),
-        &mut ctx,
-        malformed.as_bytes(),
-        &json!({"jsonrpc": "2.0", "id": 76, "result": {}}),
-    )
-    .await;
-    assert!(
-        records
-            .iter()
-            .all(|record| record.get("mcp").is_none_or(serde_json::Value::is_null)),
-        "a malformed body that cannot name tools/call is not an MCP candidate: {records:#?}"
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a malformed body that cannot name tools/call is not an MCP candidate"
     );
 }
 
