@@ -943,7 +943,11 @@ fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
         let calls: Vec<&str> = block
             .split(delegate)
             .skip(1)
-            .map(|args| args.split("\n    )").next().unwrap_or(args))
+            .map(|args| {
+                args.split_once("\n    )")
+                    .map(|(call, _)| call)
+                    .expect("constructor call must be terminated by its closing parenthesis")
+            })
             .collect();
         assert!(
             !calls.is_empty(),

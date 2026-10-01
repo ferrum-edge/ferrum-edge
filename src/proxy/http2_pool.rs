@@ -1385,10 +1385,12 @@ impl Http1Checkout {
         self.reused
     }
 
-    /// A duplicate of the backend TCP socket, for the upload pump's post-EOS
-    /// send-queue drain bound (issue #4411). Unlike the multiplexed H2
-    /// transports, an exclusive HTTP/1.1 connection's send queue belongs to
-    /// exactly one request. `None` where the platform has no send-queue probe.
+    /// The send-queue handle for the upload pump's post-EOS drain bound (issue
+    /// #4411). It observes the transport-owned socket through a liveness cell
+    /// (issue #5963), holds no descriptor of its own, and samples `None` once
+    /// hyper drops the connection. Unlike the multiplexed H2 transports, an
+    /// exclusive HTTP/1.1 connection's send queue belongs to exactly one
+    /// request. `None` where the platform has no send-queue probe.
     pub fn backend_socket(&self) -> BackendSocket {
         self.socket.clone()
     }
