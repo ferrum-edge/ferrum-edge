@@ -26,7 +26,7 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased
+## Upgrading to 0.9.9
 
 **HBONE relay socket errors reset the CONNECT stream (#5781).** When an HBONE
 TCP or UDP relay ends on a socket error (for example the backend connection is
