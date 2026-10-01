@@ -294,7 +294,7 @@ Ferrum Edge uses **jemalloc** as the global memory allocator on all non-Windows 
 
 - **Effect:** on the hosted HTTPS/1.1 benchmark, throughput at 10 KiB payloads rose by about 2% averaged over two runs (+2.5% and +1.6%). That is inside the benchmark's ±3% resolution. Throughput was neutral at 70 KiB to 5 MiB.
 - **Memory cost, measured:** gateway RSS rose by 0–11 MiB at steady state and at most 15 MiB at peak, under a 200-connection load on a 4-vCPU runner.
-- **Memory cost, theoretical bound:** jemalloc caches at most 20 objects per large size class per thread. The 40–128 KiB classes (nine, totalling 624 KiB) are newly cacheable, so the extra cache is at most about 12.5 MiB per thread that allocates in those classes. In practice that means the Tokio worker threads, giving `12.5 MiB × FERRUM_WORKER_THREADS` as the worst case. A thread caches only the classes it actually uses, and jemalloc's incremental thread-cache GC trims idle entries.
+- **Memory cost, theoretical bound:** jemalloc caches at most 20 objects per large size class per thread. The eight 40–128 KiB classes (624 KiB in total on 4 KiB-page builds) are newly cacheable, so the extra cache is at most about 12.5 MiB per thread that allocates in those classes. In practice that means the Tokio worker threads, giving `12.5 MiB × FERRUM_WORKER_THREADS` as the worst case. A thread caches only the classes it actually uses, and jemalloc's incremental thread-cache GC trims idle entries.
 - **Override or revert:** the runtime environment variable `_RJEM_MALLOC_CONF` overrides compiled-in options. Set `_RJEM_MALLOC_CONF=tcache_max:32768` to restore the jemalloc default, or another value to tune it.
 
 ## Scaling Strategies
