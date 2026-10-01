@@ -71,23 +71,32 @@ pub(crate) fn sample_interval(write_timeout_ms: u64) -> Duration {
     Duration::from_millis(if interval == 0 { 1 } else { interval })
 }
 
-/// A duplicated handle on one backend socket, usable for send-queue sampling
-/// after the transport that owns the socket has stopped handing it to us.
+/// A handle on one backend socket, usable for send-queue sampling after the
+/// transport that owns the socket has stopped handing it to us.
 ///
-/// The fd is `dup`ed rather than borrowed on purpose. A raw fd number that the
-/// owning transport has closed can be recycled by any later socket in the
-/// process, and sampling a recycled number would read an unrelated
-/// connection's send queue. Duplicating keeps the file description alive for
-/// exactly as long as a handle exists, so a sample is always about the socket
-/// it was taken from or fails outright.
+/// A raw fd number that the owning transport has closed can be recycled by any
+/// later socket in the process, and sampling a recycled number would read an
+/// unrelated connection's send queue. Each variant rules that out:
 ///
-/// Lifetime: one handle is created per pooled backend connection and dropped
-/// with the pool entry, and the request path only ever clones the `Arc` for the
-/// duration of one response-header wait, so the duplicate never outlives the
-/// connection it describes.
+/// * [`Self::duplicate_from`] / [`Self::duplicate_from_raw_fd`] `dup` the
+///   descriptor, keeping the file description alive for exactly as long as
+///   the handle exists (the reqwest path holds one only for one dispatch).
+/// * [`Self::observe_shared`] holds a `Weak` reference to the transport's own
+///   `Arc<TcpStream>` (the direct HTTP/1.1 pool, issue #5963). A sample
+///   upgrades it for the duration of one `ioctl`, so the socket cannot close
+///   or be recycled mid-sample; once the transport drops its stream the
+///   upgrade fails and the sample reports nothing. No second descriptor
+///   exists, so a pooled connection costs one fd and closes (FIN, no
+///   `CLOSE_WAIT`) the moment hyper drops it.
 pub struct BackendSocketHandle {
     #[cfg(unix)]
-    fd: std::os::fd::OwnedFd,
+    source: SocketSource,
+}
+
+#[cfg(unix)]
+enum SocketSource {
+    Duplicated(std::os::fd::OwnedFd),
+    Shared(std::sync::Weak<tokio::net::TcpStream>),
 }
 
 impl std::fmt::Debug for BackendSocketHandle {
@@ -104,11 +113,10 @@ impl BackendSocketHandle {
     /// `None` when the platform has no send-queue query, or when the duplicate
     /// cannot be made (fd exhaustion) — in both cases the drain bound stays
     /// disarmed and the read timeout governs, which is the pre-#4411 behaviour.
-    // The direct HTTP/2 and native gRPC pools no longer publish their sockets
-    // (multiplexed connections have no per-request send queue), so this
-    // constructor has no binary caller until a per-request transport uses it;
-    // it stays as the owned-stream counterpart of `duplicate_from_raw_fd` and
-    // is exercised by the integration tests.
+    // No production transport owns a plain `TcpStream` it must keep while also
+    // publishing it: the direct HTTP/1.1 pool shares its stream through
+    // `observe_shared`, and the reqwest path reports a raw fd. Kept as the
+    // owned-stream counterpart of `duplicate_from_raw_fd` for the tests.
     #[allow(dead_code)]
     #[cfg(unix)]
     pub fn duplicate_from(stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
@@ -117,11 +125,31 @@ impl BackendSocketHandle {
         }
         use std::os::fd::AsFd;
         let fd = stream.as_fd().try_clone_to_owned().ok()?;
-        Some(Arc::new(Self { fd }))
+        Some(Arc::new(Self {
+            source: SocketSource::Duplicated(fd),
+        }))
+    }
+
+    #[allow(dead_code)]
+    #[cfg(not(unix))]
+    pub fn duplicate_from(_stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
+        None
+    }
+
+    /// Observe a transport-owned shared stream without holding its socket open
+    /// (issue #5963). See the type docs.
+    #[cfg(unix)]
+    pub fn observe_shared(stream: &Arc<tokio::net::TcpStream>) -> Option<Arc<Self>> {
+        if !crate::socket_opts::send_queue_probe_supported() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            source: SocketSource::Shared(Arc::downgrade(stream)),
+        }))
     }
 
     #[cfg(not(unix))]
-    pub fn duplicate_from(_stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
+    pub fn observe_shared(_stream: &Arc<tokio::net::TcpStream>) -> Option<Arc<Self>> {
         None
     }
 
@@ -152,20 +180,118 @@ impl BackendSocketHandle {
         // escape this expression.
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
         let fd = borrowed.try_clone_to_owned().ok()?;
-        Some(Arc::new(Self { fd }))
+        Some(Arc::new(Self {
+            source: SocketSource::Duplicated(fd),
+        }))
     }
 
     /// Current send-queue depth in bytes, or `None` when the kernel refuses to
-    /// answer (closed socket, unsupported platform).
+    /// answer (closed socket, unsupported platform) or a shared transport has
+    /// already dropped its stream.
     #[cfg(unix)]
     pub fn send_queue_bytes(&self) -> Option<u64> {
         use std::os::fd::AsRawFd;
-        crate::socket_opts::socket_send_queue_bytes(self.fd.as_raw_fd()).ok()
+        match &self.source {
+            SocketSource::Duplicated(fd) => {
+                crate::socket_opts::socket_send_queue_bytes(fd.as_raw_fd()).ok()
+            }
+            SocketSource::Shared(stream) => {
+                // Held for the duration of the `ioctl`, so the descriptor
+                // cannot be closed and recycled underneath it.
+                let stream = stream.upgrade()?;
+                crate::socket_opts::socket_send_queue_bytes(stream.as_raw_fd()).ok()
+            }
+        }
     }
 
     #[cfg(not(unix))]
     pub fn send_queue_bytes(&self) -> Option<u64> {
         None
+    }
+}
+
+/// Transport IO over a shared `Arc<TcpStream>` (issue #5963).
+///
+/// The direct HTTP/1.1 pool hands this to rustls/hyper instead of the
+/// `TcpStream` itself so a [`BackendSocketHandle::observe_shared`] handle can
+/// sample the socket without a duplicated descriptor. Reads and writes use the
+/// same readiness loop tokio's own `TcpStream` uses (`poll_*_ready`, then a
+/// non-blocking `try_*` that clears readiness on `WouldBlock`), including
+/// vectored writes.
+pub struct SharedTcpStream(Arc<tokio::net::TcpStream>);
+
+impl SharedTcpStream {
+    pub fn new(stream: Arc<tokio::net::TcpStream>) -> Self {
+        Self(stream)
+    }
+}
+
+impl tokio::io::AsyncRead for SharedTcpStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        loop {
+            std::task::ready!(self.0.poll_read_ready(cx))?;
+            match self.0.try_read_buf(buf) {
+                Ok(_) => return std::task::Poll::Ready(Ok(())),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for SharedTcpStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        loop {
+            std::task::ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write(buf) {
+                Ok(n) => return std::task::Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        loop {
+            std::task::ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write_vectored(bufs) {
+                Ok(n) => return std::task::Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(
+            socket2::SockRef::from(self.0.as_ref()).shutdown(std::net::Shutdown::Write),
+        )
     }
 }
 

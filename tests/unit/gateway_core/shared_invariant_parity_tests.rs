@@ -2896,4 +2896,11 @@ fn streaming_h2_arm_uses_the_tested_body_regime() {
     assert!(arm.contains("streaming_response_takes_direct_fast_path("));
     assert!(arm.contains("use_passthrough && coalesce_flush.is_none()"));
     assert!(arm.contains("track_streaming_response_latency("));
+    // Both coalescing constructors receive the window...
+    assert!(arm.contains("coalescing_h2_body_strip_hop_by_hop_trailers_with_flush("));
+    assert!(arm.contains("size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush("));
+    assert_eq!(arm.matches("coalesce_flush,").count(), 2);
+    // ...and the tested helper is the only source of the regime.
+    assert!(!arm.contains("grpc_streaming_response_deadline("));
+    assert!(!arm.contains("state.response_coalesce_flush("));
 }

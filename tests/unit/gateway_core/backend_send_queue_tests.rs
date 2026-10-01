@@ -147,3 +147,53 @@ fn sampling_cadence_is_the_lesser_of_100ms_and_a_quarter_watermark() {
     assert_eq!(send_queue_sample_interval_ms(1), 1);
     assert_eq!(send_queue_sample_interval_ms(0), 1);
 }
+
+/// The direct HTTP/1.1 pool's shared-stream handle (issue #5963) samples the
+/// live socket, holds no descriptor of its own, and lets the socket close the
+/// moment the transport drops its IO: the peer reads EOF at once instead of the
+/// socket lingering in CLOSE_WAIT behind a duplicate.
+#[tokio::test]
+async fn a_shared_stream_handle_samples_without_holding_the_socket_open() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if !ferrum_edge::_test_support::send_queue_probe_supported() {
+        return;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let client = tokio::net::TcpStream::connect(listener.local_addr().expect("addr"))
+        .await
+        .expect("connect");
+    let (mut server, _) = listener.accept().await.expect("accept");
+    let (mut io, handle) = ferrum_edge::_test_support::shared_tcp_stream_for_test(client);
+    let handle = handle.expect("send-queue probe supported");
+
+    // The IO works in both directions, vectored writes included.
+    io.write_all(b"ping").await.expect("write");
+    let bufs = [std::io::IoSlice::new(b"pi"), std::io::IoSlice::new(b"ng")];
+    let written = io.write_vectored(&bufs).await.expect("vectored write");
+    let mut buf = [0u8; 8];
+    server
+        .read_exact(&mut buf[..4 + written])
+        .await
+        .expect("server read");
+    server.write_all(b"pong").await.expect("server write");
+    let mut reply = [0u8; 4];
+    io.read_exact(&mut reply).await.expect("read");
+    assert_eq!(&reply, b"pong");
+    assert!(handle.send_queue_bytes().is_some(), "live socket samples");
+
+    drop(io);
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), server.read(&mut buf))
+        .await
+        .expect("peer must see the close promptly")
+        .expect("read after close");
+    assert_eq!(
+        n, 0,
+        "the socket closed with the IO: no duplicate keeps it open"
+    );
+    assert!(
+        handle.send_queue_bytes().is_none(),
+        "a dropped transport yields no sample"
+    );
+}

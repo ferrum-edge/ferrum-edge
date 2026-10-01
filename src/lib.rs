@@ -11758,6 +11758,22 @@ pub mod _test_support {
             .send_queue_bytes()
     }
 
+    /// The direct HTTP/1.1 pool's transport IO over a shared stream, and the
+    /// `Weak`-backed send-queue handle it publishes (issue #5963).
+    pub fn shared_tcp_stream_for_test(
+        stream: tokio::net::TcpStream,
+    ) -> (
+        crate::proxy::backend_send_queue::SharedTcpStream,
+        Option<std::sync::Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>,
+    ) {
+        let stream = std::sync::Arc::new(stream);
+        let handle = crate::proxy::backend_send_queue::BackendSocketHandle::observe_shared(&stream);
+        (
+            crate::proxy::backend_send_queue::SharedTcpStream::new(stream),
+            handle,
+        )
+    }
+
     /// Watch a live socket's send queue exactly as the upload pump does after a
     /// clean EOS. `true` means the drain stalled for the whole watermark.
     pub async fn await_backend_send_queue_stall(
