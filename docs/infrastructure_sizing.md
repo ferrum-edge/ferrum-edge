@@ -290,6 +290,16 @@ These settings control the gateway's ability to handle high connection concurren
 
 Ferrum Edge uses **jemalloc** as the global memory allocator on all non-Windows platforms. jemalloc reduces heap fragmentation and improves allocation throughput under high concurrency compared to the system allocator. This is the same allocator used by nginx, Redis, and most high-performance Rust services. No configuration is needed — it is enabled automatically at compile time.
 
+**Thread-cache size (`tcache_max`).** The binary compiles in the jemalloc option `tcache_max:131072`, which raises the largest size class jemalloc's per-thread cache serves from the default 32 KiB to 128 KiB. Each proxied request boxes its handler future, which is about 90 KiB. With the default cap, every request allocates and frees that buffer through the arena's extent path; with 128 KiB it comes from the thread cache.
+
+- **Effect:** on the hosted HTTPS/1.1 benchmark, throughput at 10 KiB payloads rose by about 2% averaged over two runs (+2.5% and +1.6%). That is inside the benchmark's ±3% resolution. Throughput was neutral at 70 KiB to 1 MiB. At 5 MiB, the first run had one outlier pair at 0.86 and the re-run was neutral (0.997).
+- **Memory cost, measured:** gateway RSS rose by 0–11 MiB at steady state and at most 15 MiB at peak, under a 200-connection load on a 4-vCPU runner.
+- **Memory cost, theoretical bound:** jemalloc caches at most 20 objects per large size class per thread, and a large object enters the cache when it is freed. On 4 KiB-page builds the newly cacheable classes are the eight from 40 to 128 KiB (40, 48, 56, 64, 80, 96, 112 and 128 KiB; 624 KiB in total). So each thread that frees objects in those classes can cache at most 20 × 624 KiB = 12,480 KiB, about 12.2 MiB, more than with the default cap. On 16 KiB-page builds (Apple Silicon, some arm64 Linux kernels) the large classes start at 64 KiB, and the bound is smaller. Which threads count:
+  - **Expected case:** the Tokio worker threads, `FERRUM_WORKER_THREADS`, which defaults to the CPU count. The worst case is about `12.2 MiB × worker threads`.
+  - **Additional contributors:** the blocking pool (`FERRUM_BLOCKING_THREADS`, default 512) and the side `current_thread` runtimes, when they free objects in these classes.
+  - **Trimming:** jemalloc's incremental thread-cache GC runs on a thread's own allocation activity, so an idle thread keeps its cache until it is active again or exits.
+- **Override or revert:** the runtime environment variable `_RJEM_MALLOC_CONF` overrides compiled-in options. Set `_RJEM_MALLOC_CONF=tcache_max:32768` to restore the jemalloc default, or another value to tune it.
+
 ## Scaling Strategies
 
 ### Vertical Scaling
