@@ -1224,8 +1224,11 @@ thread_local! {
     static HTTP1_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(128));
 }
 
+type BackendSocket = Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>;
+
 struct IdleH1 {
     sender: Http1Sender,
+    socket: BackendSocket,
     idle_since: std::time::Instant,
     idle_timeout: Duration,
 }
@@ -1240,14 +1243,23 @@ impl IdleH1 {
 /// one backend all check in and out of the same lane.
 struct Http1Lane {
     idle: crossbeam_queue::ArrayQueue<IdleH1>,
+    /// Bumped when a drain withdraws this lane. A checkout taken under an older
+    /// generation is never checked back in, so an exchange that outlived the
+    /// drain cannot repopulate the pool with a connection it meant to retire.
+    /// Per lane, so a reload or SVID rotation that withdraws one backend does
+    /// not discard every other backend's in-flight connections.
+    generation: AtomicU64,
+}
+
+impl Http1Lane {
+    fn retire(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        while self.idle.pop().is_some() {}
+    }
 }
 
 pub(crate) struct Http1Lanes {
     lanes: DashMap<String, Arc<Http1Lane>>,
-    /// Bumped by every drain. A checkout taken under an older generation is
-    /// never checked back in, so an exchange that outlived a drain cannot
-    /// repopulate the pool with a connection the drain meant to retire.
-    generation: AtomicU64,
     max_idle_per_host: usize,
 }
 
@@ -1255,7 +1267,6 @@ impl Http1Lanes {
     fn new(max_idle_per_host: usize, shards: usize) -> Self {
         Self {
             lanes: DashMap::with_shard_amount(shards),
-            generation: AtomicU64::new(0),
             max_idle_per_host: max_idle_per_host.max(1),
         }
     }
@@ -1267,38 +1278,71 @@ impl Http1Lanes {
         Arc::clone(&self.lanes.entry(key.to_owned()).or_insert_with(|| {
             Arc::new(Http1Lane {
                 idle: crossbeam_queue::ArrayQueue::new(self.max_idle_per_host),
+                generation: AtomicU64::new(0),
             })
         }))
     }
 
-    fn checkin(&self, checkout: Http1Checkout) {
+    /// Pool a connection whose exchange completed. A sender that is not ready
+    /// yet is NOT pooled: an early backend response (a 401/413 before the
+    /// upload finished) leaves hyper still writing the request body, and a
+    /// request that checked it out would block behind someone else's upload.
+    /// Such a connection waits off the request path and is pooled only once
+    /// hyper reports it idle — the same rule as the Unix-socket pool's
+    /// `checkin_h1_when_idle`.
+    fn checkin(checkout: Http1Checkout) {
+        if checkout.sender.is_closed()
+            || checkout.lane.generation.load(Ordering::Acquire) != checkout.generation
+        {
+            return;
+        }
+        if checkout.sender.is_ready() {
+            Self::push_idle(checkout);
+            return;
+        }
+        let mut checkout = checkout;
+        tokio::spawn(async move {
+            if checkout.sender.ready().await.is_ok()
+                && checkout.lane.generation.load(Ordering::Acquire) == checkout.generation
+            {
+                Self::push_idle(checkout);
+            }
+        });
+    }
+
+    fn push_idle(checkout: Http1Checkout) {
         let Http1Checkout {
             lane,
             sender,
-            generation,
+            socket,
             idle_timeout,
             ..
         } = checkout;
-        if sender.is_closed() || self.generation.load(Ordering::Acquire) != generation {
-            return;
-        }
         // A full lane drops the connection (the oldest-wins tradeoff of a
         // bounded idle set); `push` hands the entry back and it drops here.
         let _ = lane.idle.push(IdleH1 {
             sender,
+            socket,
             idle_since: std::time::Instant::now(),
             idle_timeout,
         });
     }
 
     fn clear(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        self.lanes.clear();
+        self.lanes.retain(|_, lane| {
+            lane.retire();
+            false
+        });
     }
 
     fn retain_keys(&self, mut keep: impl FnMut(&str) -> bool) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        self.lanes.retain(|key, _| keep(key));
+        self.lanes.retain(|key, lane| {
+            let kept = keep(key);
+            if !kept {
+                lane.retire();
+            }
+            kept
+        });
     }
 
     /// Drop expired and closed idle connections, and forget empty lanes that
@@ -1325,8 +1369,8 @@ impl Http1Lanes {
 /// One exclusively checked-out direct-H1 connection.
 pub struct Http1Checkout {
     lane: Arc<Http1Lane>,
-    lanes: Arc<Http1Lanes>,
     pub sender: Http1Sender,
+    socket: BackendSocket,
     reused: bool,
     generation: u64,
     idle_timeout: Duration,
@@ -1341,10 +1385,17 @@ impl Http1Checkout {
         self.reused
     }
 
+    /// A duplicate of the backend TCP socket, for the upload pump's post-EOS
+    /// send-queue drain bound (issue #4411). Unlike the multiplexed H2
+    /// transports, an exclusive HTTP/1.1 connection's send queue belongs to
+    /// exactly one request. `None` where the platform has no send-queue probe.
+    pub fn backend_socket(&self) -> BackendSocket {
+        self.socket.clone()
+    }
+
     /// Return a connection whose exchange completed cleanly to the idle set.
     pub fn checkin(self) {
-        let lanes = Arc::clone(&self.lanes);
-        lanes.checkin(self);
+        Http1Lanes::checkin(self);
     }
 
     /// EOF-anchored lease for a streaming response body: the connection is
@@ -1385,9 +1436,24 @@ fn write_http1_pool_key(
     append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
     let _ = write!(
         buf,
-        "|ka={}:{}|",
+        "|ka={}:{}",
         enable_tcp_keepalive as u8, tcp_keepalive_seconds
     );
+    // A per-port keepalive override changes the dialed socket, so two routes
+    // that differ only there must not share connections.
+    if let Some(ka) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|m| m.get(&proxy.backend_port))
+        .and_then(|o| o.tcp_keepalive.as_ref())
+    {
+        let _ = write!(
+            buf,
+            ":{:?}:{:?}:{:?}",
+            ka.time_seconds, ka.interval_seconds, ka.probes
+        );
+    }
+    buf.push('|');
     if tls {
         append_backend_tls_pool_key_fields(
             buf,
@@ -1491,7 +1557,7 @@ impl Http2PoolManager {
         tls: bool,
         svid_generation: Option<u64>,
         connect_timeout: Duration,
-    ) -> Result<Http1Sender, Http2PoolError> {
+    ) -> Result<(Http1Sender, BackendSocket), Http2PoolError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
@@ -1575,7 +1641,12 @@ impl Http2PoolManager {
                     enable_keepalive,
                     keepalive_seconds,
                 );
-                match tls_parts {
+                // Duplicate the raw TCP descriptor before TLS wraps it: the
+                // upload pump samples its kernel send queue to bound a
+                // never-draining backend after the upload's last byte (#4411).
+                let socket =
+                    crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(&tcp);
+                let sender = match tls_parts {
                     Some((connector, server_name)) => {
                         let tls_started = crate::plugins::otel_tracing::backend_attempt_clock();
                         let tls_stream =
@@ -1586,14 +1657,15 @@ impl Http2PoolManager {
                                 }
                             })?;
                         crate::plugins::otel_tracing::note_backend_tls_handshake_since(tls_started);
-                        http1_handshake(tls_stream, conn_slot).await
+                        http1_handshake(tls_stream, conn_slot).await?
                     }
-                    None => http1_handshake(tcp, conn_slot).await,
-                }
+                    None => http1_handshake(tcp, conn_slot).await?,
+                };
+                Ok((sender, socket))
             }
         })
         .await
-        .map(|(sender, _)| sender)
+        .map(|(established, _)| established)
         .map_err(|error| match error {
             crate::dns::CandidateConnectError::TimedOut { last_addr } => {
                 Http2PoolError::BackendTimeout {
@@ -1643,7 +1715,6 @@ impl Http2ConnectionPool {
         fresh: bool,
     ) -> Result<Http1Checkout, Http2PoolError> {
         let manager = self.pool.manager();
-        let generation = self.h1.generation.load(Ordering::Acquire);
         let svid_generation = if tls {
             manager.svid_generation_for_proxy(proxy)
         } else {
@@ -1674,36 +1745,36 @@ impl Http2ConnectionPool {
             );
             self.h1.lane_for_key(&buf)
         });
+        let generation = lane.generation.load(Ordering::Acquire);
         if !fresh {
             let now = std::time::Instant::now();
             while let Some(idle) = lane.idle.pop() {
-                if idle.sender.is_closed() || idle.expired(now) {
+                // Only ready senders are pooled; one that is no longer ready
+                // or open is closing, and waiting on it would park this
+                // request behind a connection that will never serve it.
+                if idle.sender.is_closed() || !idle.sender.is_ready() || idle.expired(now) {
                     continue;
                 }
-                let mut sender = idle.sender;
-                // Checked in right after a clean exchange; hyper's dispatcher
-                // re-arms on its next poll. A connection that is closing
-                // instead resolves `Err` here and is discarded.
-                if !sender.is_ready() && sender.ready().await.is_err() {
-                    continue;
-                }
+                crate::plugins::otel_tracing::note_backend_connection_reused();
                 return Ok(Http1Checkout {
                     lane,
-                    lanes: Arc::clone(&self.h1),
-                    sender,
+                    sender: idle.sender,
+                    socket: idle.socket,
                     reused: true,
                     generation,
                     idle_timeout,
                 });
             }
         }
-        let sender = manager
+        let setup_started = crate::plugins::otel_tracing::backend_connection_setup_clock();
+        let (sender, socket) = manager
             .create_h1_connection(proxy, tls, svid_generation, connect_timeout)
             .await?;
+        crate::plugins::otel_tracing::note_backend_connection_established_since(setup_started);
         Ok(Http1Checkout {
             lane,
-            lanes: Arc::clone(&self.h1),
             sender,
+            socket,
             reused: false,
             generation,
             idle_timeout,

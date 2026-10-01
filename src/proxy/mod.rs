@@ -42885,10 +42885,12 @@ async fn handle_proxy_request_inner(
             } else {
                 trusted_backend_content_length
             };
-            // An HTTP/1.x backend body (the direct H1 pool, the Unix-socket H1
-            // dispatch) may advertise its decoder-enforced length exactly as the
-            // reqwest arm does (issue #5588); HTTP/2 backends never do.
-            let h1_passthrough_cl = if is_head {
+            // An HTTP/1.x backend body (the direct H1 pool, and the Unix-socket
+            // and HBONE inner HTTP/1.1 dispatch) may advertise its
+            // decoder-enforced length exactly as the reqwest arm does (issue
+            // #5588); HTTP/2 backends never do. `FERRUM_POOL_HTTP1_DIRECT=false`
+            // restores the previous framing for all of them.
+            let h1_passthrough_cl = if is_head || !state.env_config.pool_http1_direct {
                 None
             } else {
                 passthrough_streaming_content_length(
@@ -49346,6 +49348,86 @@ fn direct_h1_request_body_too_large(resolved_ip: Option<String>) -> retry::Backe
     }
 }
 
+/// Check out a direct HTTP/1.1 connection under the same bounds as the reqwest
+/// send it replaces: the response-header read bound and the client RPC deadline
+/// cover the dial; the operator connect timeout bounds only the dial itself.
+/// Used for the first attempt and for the one idle-race replay alike.
+#[allow(clippy::too_many_arguments)]
+async fn direct_h1_bounded_checkout(
+    state: &ProxyState,
+    proxy: &Proxy,
+    conn_proxy: &Proxy,
+    tls: bool,
+    connect_timeout: Duration,
+    fresh: bool,
+    header_deadline_at: Option<tokio::time::Instant>,
+    request_ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    backend_url: &str,
+    resolved_ip: &Option<String>,
+    retained_body: &mut Option<Bytes>,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_started_at: &Instant,
+) -> Result<http2_pool::Http1Checkout, BackendDispatchResult> {
+    let bounded = crate::plugins::await_deadline_first(
+        header_deadline_at,
+        crate::plugins::await_grpc_deadline(
+            request_ctx.grpc_deadline_at(),
+            state
+                .http2_pool
+                .checkout_h1(conn_proxy, tls, connect_timeout, fresh),
+        ),
+    )
+    .await;
+    match bounded {
+        Ok(Ok(Ok(checkout))) => Ok(checkout),
+        Err(()) => {
+            warn!(
+                proxy_id = %proxy.id,
+                watermark = "backend_read_timeout_ms",
+                watermark_ms = proxy.backend_read_timeout_ms,
+                "direct HTTP/1.1 dispatch: per-direction watermark expired before response headers"
+            );
+            Err(backend_dispatch_response(
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip.clone(),
+                ),
+                retained_body.take(),
+                backend_admission_permits.take(),
+            ))
+        }
+        Ok(Err(())) => Err(backend_dispatch_response(
+            client_grpc_deadline_exceeded_response_for_request(
+                request_ctx,
+                headers,
+                resolved_ip.clone(),
+            ),
+            retained_body.take(),
+            backend_admission_permits.take(),
+        )),
+        Ok(Ok(Err(e))) => {
+            record_h2_pool_admission_failure(
+                backend_admission_permits,
+                backend_admission_started_at,
+                &e,
+            );
+            crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
+            Err(backend_dispatch_response(
+                direct_h1_checkout_error_response(
+                    state,
+                    proxy,
+                    backend_url,
+                    &e,
+                    resolved_ip.clone(),
+                ),
+                retained_body.take(),
+                None,
+            ))
+        }
+    }
+}
+
 /// Dispatch an HTTP/1.1 backend request on the direct hyper pool (issue #5588).
 ///
 /// Mirrors the reqwest dispatch in [`proxy_to_backend`] step for step — header
@@ -49737,56 +49819,33 @@ async fn proxy_to_backend_direct_h1(
         DIRECT_H1_UNBOUNDED_CONNECT
     };
     let header_deadline_at = absolute_response_header_read_bound(proxy.backend_read_timeout_ms);
-    let checkout_result = crate::plugins::await_deadline_first(
+    let checkout = match direct_h1_bounded_checkout(
+        state,
+        proxy,
+        conn_proxy,
+        tls,
+        connect_timeout,
+        false,
         header_deadline_at,
-        crate::plugins::await_grpc_deadline(
-            request_ctx.grpc_deadline_at(),
-            state
-                .http2_pool
-                .checkout_h1(conn_proxy, tls, connect_timeout, false),
-        ),
+        request_ctx,
+        headers,
+        backend_url,
+        &resolved_ip,
+        &mut retained_body,
+        &mut backend_admission_permits,
+        backend_admission_started_at,
     )
-    .await;
-    let Ok(checkout_result) = checkout_result else {
-        warn!(
-            proxy_id = %proxy.id,
-            watermark = "backend_read_timeout_ms",
-            watermark_ms = proxy.backend_read_timeout_ms,
-            "direct HTTP/1.1 dispatch: per-direction watermark expired before response headers"
-        );
-        return backend_dispatch_response(
-            http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip),
-            retained_body,
-            backend_admission_permits,
-        );
+    .await
+    {
+        Ok(checkout) => checkout,
+        Err(result) => return result,
     };
-    let checkout = match checkout_result {
-        Err(()) => {
-            return backend_dispatch_response(
-                client_grpc_deadline_exceeded_response_for_request(
-                    request_ctx,
-                    headers,
-                    resolved_ip,
-                ),
-                retained_body,
-                backend_admission_permits,
-            );
-        }
-        Ok(Ok(checkout)) => checkout,
-        Ok(Err(e)) => {
-            record_h2_pool_admission_failure(
-                &mut backend_admission_permits,
-                backend_admission_started_at,
-                &e,
-            );
-            crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
-            return backend_dispatch_response(
-                direct_h1_checkout_error_response(state, proxy, backend_url, &e, resolved_ip),
-                retained_body,
-                None,
-            );
-        }
-    };
+    // The exclusive connection's send queue belongs to this request alone, so
+    // the pump can bound the post-EOS drain with `backend_write_timeout_ms`
+    // (#4411). Bound before the first body frame can cross the pump's bridge.
+    if let Some(pump) = upload_pump.as_mut() {
+        pump.bind_backend_socket(checkout.backend_socket());
+    }
 
     let mut backend_req = Request::new(request_body);
     *backend_req.method_mut() = hyper_method;
@@ -49899,31 +49958,35 @@ async fn proxy_to_backend_direct_h1(
                 {
                     replayed_idle_race = true;
                     backend_req = unsent;
-                    checkout = match state
-                        .http2_pool
-                        .checkout_h1(conn_proxy, tls, connect_timeout, true)
-                        .await
+                    checkout = match direct_h1_bounded_checkout(
+                        state,
+                        proxy,
+                        conn_proxy,
+                        tls,
+                        connect_timeout,
+                        true,
+                        header_deadline_at,
+                        request_ctx,
+                        headers,
+                        backend_url,
+                        &resolved_ip,
+                        &mut retained_body,
+                        &mut backend_admission_permits,
+                        backend_admission_started_at,
+                    )
+                    .await
                     {
                         Ok(checkout) => checkout,
-                        Err(e) => {
-                            record_h2_pool_admission_failure(
-                                &mut backend_admission_permits,
-                                backend_admission_started_at,
-                                &e,
-                            );
-                            return backend_dispatch_response(
-                                direct_h1_checkout_error_response(
-                                    state,
-                                    proxy,
-                                    backend_url,
-                                    &e,
-                                    resolved_ip,
-                                ),
-                                retained_body,
-                                None,
-                            );
-                        }
+                        Err(result) => return result,
                     };
+                    // Write-once: the pump keeps the socket bound before the
+                    // first attempt. That attempt never reached the wire, so
+                    // its idle socket has an empty send queue and the drain
+                    // bound stays disarmed for this replay — the same as a
+                    // reused reqwest connection, which publishes no socket.
+                    if let Some(pump) = upload_pump.as_mut() {
+                        pump.bind_backend_socket(checkout.backend_socket());
+                    }
                     continue;
                 }
                 let never_sent = try_err.take_message().is_some();
