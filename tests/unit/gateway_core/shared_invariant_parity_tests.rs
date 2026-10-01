@@ -2897,9 +2897,20 @@ fn streaming_h2_arm_uses_the_tested_body_regime() {
     assert!(arm.contains("use_passthrough && coalesce_flush.is_none()"));
     assert!(arm.contains("track_streaming_response_latency("));
     // Both coalescing constructors receive the window...
-    assert!(arm.contains("coalescing_h2_body_strip_hop_by_hop_trailers_with_flush("));
-    assert!(arm.contains("size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush("));
-    assert_eq!(arm.matches("coalesce_flush,").count(), 2);
+    for constructor in [
+        "crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(",
+        "crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(",
+    ] {
+        let call = arm
+            .split(constructor)
+            .nth(1)
+            .and_then(|args| args.split("\n                )").next())
+            .unwrap_or_else(|| panic!("the arm must call {constructor}"));
+        assert!(
+            call.contains("coalesce_flush,"),
+            "{constructor} must receive the regime's coalesce window"
+        );
+    }
     // ...and the tested helper is the only source of the regime.
     assert!(!arm.contains("grpc_streaming_response_deadline("));
     assert!(!arm.contains("state.response_coalesce_flush("));
