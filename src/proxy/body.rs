@@ -6076,8 +6076,37 @@ where
     // idle deadline measures genuine backend-read waits and never fires while a
     // sub-target frame is buffered waiting on a slow downstream client. Only
     // the terminal-error flush hold sits outside the deadline.
+    coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
+        body,
+        content_length,
+        coalesce_target,
+        read_timeout_ms,
+        total_deadline,
+        trailer_governor,
+        None,
+    )
+}
+
+/// [`coalescing_h2_body_strip_hop_by_hop_trailers`] with the operator's
+/// `FERRUM_RESPONSE_COALESCE_FLUSH_MS` aggregation window, which the reqwest
+/// HTTP/1.1 arm already honours; HTTP/1.x backend bodies on this arm (the
+/// direct pool, Unix-socket and HBONE inner dispatch) apply it too (#5588).
+pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers_with_flush<B>(
+    body: B,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+    read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    flush_after: Option<Duration>,
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
-    let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+    let coalescing =
+        Coalescing::with_flush_after(stripped, coalesce_target, content_length, flush_after);
     wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
 }
 
@@ -6119,9 +6148,36 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     // mutually-exclusive deadline regimes (issue #1649). Either wraps the
     // coalescer so a per-frame idle deadline never fires while a buffered
     // sub-target frame is waiting on a slow downstream client.
+    size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
+        body,
+        max_bytes,
+        content_length,
+        coalesce_target,
+        read_timeout_ms,
+        total_deadline,
+        trailer_governor,
+        None,
+    )
+}
+
+/// [`size_limited_coalescing_h2_body_strip_hop_by_hop_trailers`] with a
+/// `FERRUM_RESPONSE_COALESCE_FLUSH_MS` window (see
+/// [`coalescing_h2_body_strip_hop_by_hop_trailers_with_flush`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
+    body: Incoming,
+    max_bytes: usize,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+    read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    flush_after: Option<Duration>,
+) -> ProxyBody {
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
-    let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+    let coalescing =
+        Coalescing::with_flush_after(limited, coalesce_target, content_length, flush_after);
     wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
 }
 

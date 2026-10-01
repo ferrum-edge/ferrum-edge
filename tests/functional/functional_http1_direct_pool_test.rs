@@ -156,6 +156,11 @@ async fn assert_reuses_one_backend_connection(direct: bool) {
         "the response must not be re-framed as chunked"
     );
     assert_eq!(
+        resp.headers.get("via").and_then(|v| v.to_str().ok()),
+        Some("1.1 ferrum-edge"),
+        "a streamed HTTP/1.1 backend response must carry an HTTP/1.1 Via (RFC 9110 §7.6.3)"
+    );
+    assert_eq!(
         request_conns.load(Ordering::SeqCst),
         1,
         "sequential requests must reuse one keep-alive backend connection (direct={direct})"

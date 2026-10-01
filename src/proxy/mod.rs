@@ -7320,7 +7320,11 @@ fn via_header_for_backend_response_body<'a>(
         ResponseBody::Streaming { response, .. } => {
             via_header_for_inbound_version(state, response.version())
         }
-        ResponseBody::StreamingH2(_) => &state.via_header_http2,
+        // A direct-H1, Unix-socket or HBONE inner HTTP/1.1 response rides this
+        // arm too, so the Via protocol comes from the response itself.
+        ResponseBody::StreamingH2(response) => {
+            via_header_for_inbound_version(state, response.version())
+        }
         ResponseBody::StreamingH3(_) => &state.via_header_http3,
         ResponseBody::Buffered(_) => &state.via_header_http11,
     }
@@ -42814,41 +42818,7 @@ async fn handle_proxy_request_inner(
                 }
 
                 let base = if state.env_config.enable_streaming_latency_tracking {
-                    let (tracked_body, metrics) = base.into_tracked(backend_start);
-
-                    // Spawn a lightweight deferred task to log the final streaming latency.
-                    // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
-                    // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
-                    if proxy.backend_read_timeout_ms > 0 {
-                        let deferred_proxy_id = proxy.id.clone();
-                        let deferred_backend_url = strip_query_params(&backend_url).to_string();
-                        let read_timeout_ms = proxy.backend_read_timeout_ms;
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                read_timeout_ms + 5_000,
-                            ))
-                            .await;
-                            let completed = metrics.completed();
-                            let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
-                            if completed {
-                                debug!(
-                                    proxy_id = %deferred_proxy_id,
-                                    backend_url = %deferred_backend_url,
-                                    backend_total_ms = total_ms,
-                                    "Streaming response completed"
-                                );
-                            } else {
-                                warn!(
-                                    proxy_id = %deferred_proxy_id,
-                                    backend_url = %deferred_backend_url,
-                                    backend_last_frame_ms = total_ms,
-                                    "Streaming response incomplete (client disconnect or timeout)"
-                                );
-                            }
-                        });
-                    }
-
-                    tracked_body
+                    track_streaming_response_latency(base, backend_start, &proxy, &backend_url)
                 } else {
                     base
                 };
@@ -42951,13 +42921,34 @@ async fn handle_proxy_request_inner(
                     grpc_request_deadline,
                     effective_h2_read_timeout_ms,
                 );
+            // An HTTP/1.x backend body (the direct pool, Unix-socket and HBONE
+            // inner dispatch) keeps the reqwest HTTP/1.1 arm's streaming
+            // semantics (#5588): the operator's coalesce flush window applies,
+            // and under a client gRPC deadline the per-frame idle bound stays
+            // armed beside the absolute deadline (applied below) instead of
+            // being dropped to 0.
+            let h1_backend = state.env_config.pool_http1_direct
+                && matches!(
+                    resp.version(),
+                    http::Version::HTTP_10 | http::Version::HTTP_11
+                );
+            let (h2_read_timeout_ms, coalesce_flush) = if h1_backend {
+                (
+                    effective_h2_read_timeout_ms,
+                    state.response_coalesce_flush(effective_h2_read_timeout_ms),
+                )
+            } else {
+                (h2_read_timeout_ms, None)
+            };
             // The trailer governor moves into exactly one of the four
             // mutually-exclusive body constructors below, so every direct /
             // size-limited / coalescing variant of this arm enforces the same
             // response-trailer policy boundary.
-            let body = if state.response_buffer_cutoff_bytes == 0
-                && effective_max_response_body_size_bytes == 0
-            {
+            let body = if streaming_response_takes_direct_fast_path(
+                state.response_buffer_cutoff_bytes,
+                effective_max_response_body_size_bytes,
+                coalesce_flush,
+            ) {
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     advertised_cl,
@@ -42974,7 +42965,7 @@ async fn handle_proxy_request_inner(
                 // responses, without buffering the whole backend response
                 // into memory. A hook-authored Content-Length cannot take
                 // this branch off.
-                crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
+                crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
                     resp.into_body(),
                     effective_max_response_body_size_bytes,
                     advertised_cl,
@@ -42982,8 +42973,9 @@ async fn handle_proxy_request_inner(
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
+                    coalesce_flush,
                 )
-            } else if use_passthrough {
+            } else if use_passthrough && coalesce_flush.is_none() {
                 // Response too large to benefit from coalescing — stream
                 // direct, let hyper forward 1 MiB frames as-is. Saves the
                 // `BytesMut::extend_from_slice` copy that CoalescingH2Body
@@ -42997,13 +42989,14 @@ async fn handle_proxy_request_inner(
                     streaming_trailer_governor.take(),
                 )
             } else {
-                crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
+                crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
                     resp.into_body(),
                     advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
+                    coalesce_flush,
                 )
             };
             // Anchor the sidecar-ingress Unix HTTP/1.1 lease to the
@@ -43042,8 +43035,16 @@ async fn handle_proxy_request_inner(
                 ));
                 crate::proxy::body::inspected_streaming_body(rx)
             } else {
-                body.with_lb_connection_guard(lb_connection_guard)
-                    .with_success_on_drop_after_response_bytes(h1_passthrough_cl)
+                let body = body
+                    .with_lb_connection_guard(lb_connection_guard)
+                    .with_success_on_drop_after_response_bytes(h1_passthrough_cl);
+                // HTTP/1.x backend bodies honour latency tracking exactly as the
+                // reqwest HTTP/1.1 arm does (#5588).
+                if h1_backend && state.env_config.enable_streaming_latency_tracking {
+                    track_streaming_response_latency(body, backend_start, &proxy, &backend_url)
+                } else {
+                    body
+                }
             };
             // The absolute wrapper must observe the inspector's OUTPUT, not
             // the backend frames it consumed. An inspector may hold a chunk by
@@ -49162,6 +49163,48 @@ async fn proxy_to_backend(
     backend_dispatch_response(response, retained_body, backend_admission_permits)
 }
 
+/// `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING`: wrap a streaming response body
+/// in latency tracking and, when a backend read timeout is configured, spawn a
+/// lightweight deferred task that wakes once after `read_timeout + 5s`, reads
+/// one atomic and logs whether the stream completed. Shared by the reqwest
+/// HTTP/1.1 arm and HTTP/1.x backend bodies on the `StreamingH2` arm (#5588).
+#[inline(never)]
+fn track_streaming_response_latency(
+    base: ProxyBody,
+    backend_start: Instant,
+    proxy: &Proxy,
+    backend_url: &str,
+) -> ProxyBody {
+    let (tracked_body, metrics) = base.into_tracked(backend_start);
+    // Skipped when the read timeout is disabled (0): no meaningful deadline.
+    if proxy.backend_read_timeout_ms > 0 {
+        let deferred_proxy_id = proxy.id.clone();
+        let deferred_backend_url = strip_query_params(backend_url).to_string();
+        let read_timeout_ms = proxy.backend_read_timeout_ms;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
+            let completed = metrics.completed();
+            let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+            if completed {
+                debug!(
+                    proxy_id = %deferred_proxy_id,
+                    backend_url = %deferred_backend_url,
+                    backend_total_ms = total_ms,
+                    "Streaming response completed"
+                );
+            } else {
+                warn!(
+                    proxy_id = %deferred_proxy_id,
+                    backend_url = %deferred_backend_url,
+                    backend_last_frame_ms = total_ms,
+                    "Streaming response incomplete (client disconnect or timeout)"
+                );
+            }
+        });
+    }
+    tracked_body
+}
+
 /// Whether the direct HTTP/1.1 pool may serve this dispatch (issue #5588).
 ///
 /// The pool replaces reqwest only where reqwest would speak HTTP/1.1 anyway —
@@ -49225,7 +49268,7 @@ fn direct_h1_origin_form_uri(backend_url: &str) -> Option<hyper::Uri> {
     let after_scheme = backend_url
         .find("://")
         .map_or(backend_url, |i| &backend_url[i + 3..]);
-    let target = match after_scheme.find(['/', '?', '#']) {
+    let target = match after_scheme.find(['/', '?', '#', '\\']) {
         Some(i) => &after_scheme[i..],
         None => "",
     };

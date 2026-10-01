@@ -892,17 +892,53 @@ fn direct_h1_request_target_matches_url_serialization() {
         "http://127.0.0.1:8080?only=query",
         "http://127.0.0.1:8080/frag#ment",
         "https://backend.test/api/v1/items?id=42",
+        // Malformed and unusual percent escapes.
+        "http://127.0.0.1:8080/%zz",
+        "http://127.0.0.1:8080/a%",
+        // Matrix-style segments.
+        "http://127.0.0.1:8080/a/..;/b",
+        "http://127.0.0.1:8080/a;x/b",
+        // Dot segments, encoded and trailing.
+        "http://127.0.0.1:8080/a/.%2e/b",
+        "http://127.0.0.1:8080/a/%2E./b",
+        "http://127.0.0.1:8080/a/.",
+        "http://127.0.0.1:8080/a/..",
+        "http://127.0.0.1:8080/a/...",
+        // Tab, CR, LF and DEL.
+        "http://127.0.0.1:8080/a\tb",
+        "http://127.0.0.1:8080/a\rb",
+        "http://127.0.0.1:8080/a\nb",
+        "http://127.0.0.1:8080/a\u{7f}b",
+        // Bytes url leaves alone in a path.
+        "http://127.0.0.1:8080/a^b|c[d]e",
+        // `'` and `\` in the query.
+        "http://127.0.0.1:8080/p?q='x'",
+        "http://127.0.0.1:8080/p?q=a\\b",
+        // Query and fragment edges.
+        "http://127.0.0.1:8080/p?a?b",
+        "http://127.0.0.1:8080/p?q#f",
+        "http://127.0.0.1:8080/#f",
+        // Empty segments.
+        "http://127.0.0.1:8080//x",
+        "http://127.0.0.1:8080/a/..//x",
+        // Userinfo never reaches the request target.
+        "http://user:pw@127.0.0.1:8080/p?q=1",
     ] {
         let parsed = url::Url::parse(backend_url).expect("valid URL");
-        let mut expected = parsed.path().to_string();
-        if let Some(query) = parsed.query() {
-            expected.push('?');
-            expected.push_str(query);
+        // What reqwest actually puts on the wire: hyper's origin form of the
+        // `http::Uri` it builds from the serialized `url::Url`.
+        let reqwest_target = parsed.as_str().parse::<http::Uri>().ok().map(|uri| {
+            uri.path_and_query()
+                .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string())
+        });
+        assert_eq!(target(backend_url), reqwest_target, "{backend_url:?}");
+        if let Some(sent) = &reqwest_target {
+            let mut url_target = parsed.path().to_string();
+            if let Some(query) = parsed.query() {
+                url_target.push('?');
+                url_target.push_str(query);
+            }
+            assert_eq!(sent, &url_target, "{backend_url:?}");
         }
-        assert_eq!(
-            target(backend_url).as_deref(),
-            Some(expected.as_str()),
-            "{backend_url}"
-        );
     }
 }
