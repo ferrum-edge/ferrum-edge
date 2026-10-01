@@ -3319,6 +3319,68 @@ impl http_body::Body for DirectH2RequestBody {
     }
 }
 
+/// Request body for the direct HTTP/1.1 pool (issue #5588).
+///
+/// One enum rather than a boxed trait object so the per-request dispatch does
+/// not allocate for the body. Every arm is a body the reqwest path already
+/// builds; only the transport changed.
+pub enum DirectH1RequestBody {
+    /// No body (GET/HEAD and other requests without framing).
+    Empty,
+    /// A fully prepared, already-charged buffered body.
+    Full(Option<Bytes>),
+    /// A buffered body relayed through the gateway write-watermark pump.
+    Pumped(crate::proxy::upload_pump::PumpedUploadBody),
+    /// Streaming client body under a request-size ceiling.
+    Limited(SizeLimitedIncoming),
+    /// Streaming client body without a ceiling; still counts forwarded bytes.
+    Counting(CountingIncoming),
+}
+
+impl http_body::Body for DirectH1RequestBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            DirectH1RequestBody::Empty => Poll::Ready(None),
+            DirectH1RequestBody::Full(data) => Poll::Ready(
+                data.take()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| Ok(Frame::data(b))),
+            ),
+            DirectH1RequestBody::Pumped(body) => Pin::new(body).poll_frame(cx),
+            DirectH1RequestBody::Limited(body) => Pin::new(body).poll_frame(cx),
+            DirectH1RequestBody::Counting(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            DirectH1RequestBody::Empty => true,
+            DirectH1RequestBody::Full(data) => data.as_ref().is_none_or(|b| b.is_empty()),
+            DirectH1RequestBody::Pumped(body) => body.is_end_stream(),
+            DirectH1RequestBody::Limited(body) => body.is_end_stream(),
+            DirectH1RequestBody::Counting(body) => body.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            DirectH1RequestBody::Empty => http_body::SizeHint::with_exact(0),
+            DirectH1RequestBody::Full(data) => {
+                http_body::SizeHint::with_exact(data.as_ref().map_or(0, |b| b.len() as u64))
+            }
+            DirectH1RequestBody::Pumped(body) => body.size_hint(),
+            DirectH1RequestBody::Limited(body) => body.size_hint(),
+            DirectH1RequestBody::Counting(body) => body.size_hint(),
+        }
+    }
+}
+
 /// Test hook: drive exactly one [`poll_upload_cancel`] with a no-op waker.
 ///
 /// Reached only through `crate::_test_support`, which the binary target does
@@ -6014,8 +6076,37 @@ where
     // idle deadline measures genuine backend-read waits and never fires while a
     // sub-target frame is buffered waiting on a slow downstream client. Only
     // the terminal-error flush hold sits outside the deadline.
+    coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
+        body,
+        content_length,
+        coalesce_target,
+        read_timeout_ms,
+        total_deadline,
+        trailer_governor,
+        None,
+    )
+}
+
+/// [`coalescing_h2_body_strip_hop_by_hop_trailers`] with the operator's
+/// `FERRUM_RESPONSE_COALESCE_FLUSH_MS` aggregation window, which the reqwest
+/// HTTP/1.1 arm already honours; HTTP/1.x backend bodies on this arm (the
+/// direct pool, Unix-socket and HBONE inner dispatch) apply it too (#5588).
+pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers_with_flush<B>(
+    body: B,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+    read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    flush_after: Option<Duration>,
+) -> ProxyBody
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
-    let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+    let coalescing =
+        Coalescing::with_flush_after(stripped, coalesce_target, content_length, flush_after);
     wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
 }
 
@@ -6057,9 +6148,36 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     // mutually-exclusive deadline regimes (issue #1649). Either wraps the
     // coalescer so a per-frame idle deadline never fires while a buffered
     // sub-target frame is waiting on a slow downstream client.
+    size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
+        body,
+        max_bytes,
+        content_length,
+        coalesce_target,
+        read_timeout_ms,
+        total_deadline,
+        trailer_governor,
+        None,
+    )
+}
+
+/// [`size_limited_coalescing_h2_body_strip_hop_by_hop_trailers`] with a
+/// `FERRUM_RESPONSE_COALESCE_FLUSH_MS` window (see
+/// [`coalescing_h2_body_strip_hop_by_hop_trailers_with_flush`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
+    body: Incoming,
+    max_bytes: usize,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+    read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    flush_after: Option<Duration>,
+) -> ProxyBody {
     let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
-    let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+    let coalescing =
+        Coalescing::with_flush_after(limited, coalesce_target, content_length, flush_after);
     wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
 }
 

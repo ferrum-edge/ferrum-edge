@@ -103,6 +103,13 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// The origin-form request target the direct HTTP/1.1 pool sends for an
+    /// absolute backend URL (issue #5588), for parity checks against the `url`
+    /// serialization reqwest used.
+    pub fn direct_h1_origin_form_target_for_test(backend_url: &str) -> Option<String> {
+        crate::proxy::direct_h1_origin_form_target_for_test(backend_url)
+    }
+
     /// Build the inner HTTP/1.1 request body the Ambient HBONE dispatch
     /// constructs, so an external test can drive a real pooled inner exchange
     /// end to end (issue #5042 step 2).
@@ -15090,6 +15097,35 @@ pub mod _test_support {
         read_timeout_ms: u64,
     ) -> Option<std::time::Duration> {
         crate::proxy::coalesce_flush_window(flush_ms, read_timeout_ms)
+    }
+
+    /// The `StreamingH2` response-arm regime (issue #5588), as
+    /// `(read_timeout_ms, total_deadline, coalesce_flush, h1_backend)`.
+    pub fn streaming_h2_body_regime_for_test(
+        backend_version: http::Version,
+        pool_http1_direct: bool,
+        grpc_request_deadline: Option<tokio::time::Instant>,
+        read_timeout_ms: u64,
+        coalesce_flush_ms: u64,
+    ) -> (
+        u64,
+        Option<tokio::time::Instant>,
+        Option<std::time::Duration>,
+        bool,
+    ) {
+        let regime = crate::proxy::streaming_h2_body_regime(
+            backend_version,
+            pool_http1_direct,
+            grpc_request_deadline,
+            read_timeout_ms,
+            coalesce_flush_ms,
+        );
+        (
+            regime.read_timeout_ms,
+            regime.total_deadline,
+            regime.coalesce_flush,
+            regime.h1_backend,
+        )
     }
 
     /// Direct-H2 large-response passthrough predicate. Callers must pass the

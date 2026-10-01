@@ -2151,6 +2151,61 @@ pub(crate) fn passthrough_streaming_content_length(
     }
 }
 
+/// Read bound, absolute deadline and coalesce window for a body on the
+/// `StreamingH2` response arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamingH2BodyRegime {
+    /// Per-frame idle read bound for the body constructor (`0` = none).
+    pub(crate) read_timeout_ms: u64,
+    /// Client gRPC absolute deadline, applied by `with_client_grpc_deadline`.
+    pub(crate) total_deadline: Option<tokio::time::Instant>,
+    /// `FERRUM_RESPONSE_COALESCE_FLUSH_MS` aggregation window, if any.
+    pub(crate) coalesce_flush: Option<std::time::Duration>,
+    /// Whether the body is an HTTP/1.x backend body given the reqwest
+    /// HTTP/1.1 arm's semantics.
+    pub(crate) h1_backend: bool,
+}
+
+/// Decide the streaming regime for a `StreamingH2` response body.
+///
+/// HTTP/2 and native-gRPC bodies keep `grpc_streaming_response_deadline`: under
+/// a client deadline the absolute deadline replaces the per-frame bound, and no
+/// coalesce window applies. An HTTP/1.x backend body on this arm — the direct
+/// HTTP/1.1 pool, Unix-socket and HBONE inner dispatch — keeps what the reqwest
+/// HTTP/1.1 arm does (#5588) while `FERRUM_POOL_HTTP1_DIRECT` is on: the
+/// per-frame bound stays armed beside the absolute deadline, and the operator's
+/// coalesce window applies (clamped as `coalesce_flush_window` clamps it).
+pub(crate) fn streaming_h2_body_regime(
+    backend_version: http::Version,
+    pool_http1_direct: bool,
+    grpc_request_deadline: Option<tokio::time::Instant>,
+    read_timeout_ms: u64,
+    coalesce_flush_ms: u64,
+) -> StreamingH2BodyRegime {
+    let (h2_read_timeout_ms, total_deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(grpc_request_deadline, read_timeout_ms);
+    let h1_backend = pool_http1_direct
+        && matches!(
+            backend_version,
+            http::Version::HTTP_10 | http::Version::HTTP_11
+        );
+    if h1_backend {
+        StreamingH2BodyRegime {
+            read_timeout_ms,
+            total_deadline,
+            coalesce_flush: coalesce_flush_window(coalesce_flush_ms, read_timeout_ms),
+            h1_backend,
+        }
+    } else {
+        StreamingH2BodyRegime {
+            read_timeout_ms: h2_read_timeout_ms,
+            total_deadline,
+            coalesce_flush: None,
+            h1_backend,
+        }
+    }
+}
+
 /// Resolve the configured response-coalescing window against the proxy's
 /// per-frame idle read timeout (issue #5588).
 ///
@@ -7320,7 +7375,11 @@ fn via_header_for_backend_response_body<'a>(
         ResponseBody::Streaming { response, .. } => {
             via_header_for_inbound_version(state, response.version())
         }
-        ResponseBody::StreamingH2(_) => &state.via_header_http2,
+        // A direct-H1, Unix-socket or HBONE inner HTTP/1.1 response rides this
+        // arm too, so the Via protocol comes from the response itself.
+        ResponseBody::StreamingH2(response) => {
+            via_header_for_inbound_version(state, response.version())
+        }
         ResponseBody::StreamingH3(_) => &state.via_header_http3,
         ResponseBody::Buffered(_) => &state.via_header_http11,
     }
@@ -42814,41 +42873,13 @@ async fn handle_proxy_request_inner(
                 }
 
                 let base = if state.env_config.enable_streaming_latency_tracking {
-                    let (tracked_body, metrics) = base.into_tracked(backend_start);
-
-                    // Spawn a lightweight deferred task to log the final streaming latency.
-                    // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
-                    // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
-                    if proxy.backend_read_timeout_ms > 0 {
-                        let deferred_proxy_id = proxy.id.clone();
-                        let deferred_backend_url = strip_query_params(&backend_url).to_string();
-                        let read_timeout_ms = proxy.backend_read_timeout_ms;
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                read_timeout_ms + 5_000,
-                            ))
-                            .await;
-                            let completed = metrics.completed();
-                            let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
-                            if completed {
-                                debug!(
-                                    proxy_id = %deferred_proxy_id,
-                                    backend_url = %deferred_backend_url,
-                                    backend_total_ms = total_ms,
-                                    "Streaming response completed"
-                                );
-                            } else {
-                                warn!(
-                                    proxy_id = %deferred_proxy_id,
-                                    backend_url = %deferred_backend_url,
-                                    backend_last_frame_ms = total_ms,
-                                    "Streaming response incomplete (client disconnect or timeout)"
-                                );
-                            }
-                        });
-                    }
-
-                    tracked_body
+                    track_streaming_response_latency(
+                        base,
+                        backend_start,
+                        &proxy,
+                        &backend_url,
+                        proxy.backend_read_timeout_ms,
+                    )
                 } else {
                     base
                 };
@@ -42885,7 +42916,24 @@ async fn handle_proxy_request_inner(
             } else {
                 trusted_backend_content_length
             };
-            let advertised_cl = advertised_streaming_content_length;
+            // An HTTP/1.x backend body (the direct H1 pool, and the Unix-socket
+            // and HBONE inner HTTP/1.1 dispatch) may advertise its
+            // decoder-enforced length exactly as the reqwest arm does (issue
+            // #5588); HTTP/2 backends never do. `FERRUM_POOL_HTTP1_DIRECT=false`
+            // restores the previous framing for all of them.
+            let h1_passthrough_cl = if is_head || !state.env_config.pool_http1_direct {
+                None
+            } else {
+                passthrough_streaming_content_length(
+                    resp.version(),
+                    http_body::Body::size_hint(resp.body()).exact(),
+                    cl,
+                    declared_streaming_content_length,
+                    response_status,
+                    ctx.grpc_deadline_at().is_some(),
+                )
+            };
+            let advertised_cl = advertised_streaming_content_length.or(h1_passthrough_cl);
             // Plain-HTTPS direct-H2 large-response fast path.
             //
             // The backend's H2 writer already emits `http2_max_frame_size`
@@ -42929,18 +42977,29 @@ async fn handle_proxy_request_inner(
             // client set no deadline.
             let effective_h2_read_timeout_ms =
                 streaming_h2_read_timeout_ms.unwrap_or(proxy.backend_read_timeout_ms);
-            let (h2_read_timeout_ms, h2_total_deadline) =
-                grpc_proxy::grpc_streaming_response_deadline(
-                    grpc_request_deadline,
-                    effective_h2_read_timeout_ms,
-                );
+            // See `streaming_h2_body_regime`: an HTTP/1.x backend body keeps the
+            // reqwest HTTP/1.1 arm's streaming semantics (#5588).
+            let StreamingH2BodyRegime {
+                read_timeout_ms: h2_read_timeout_ms,
+                total_deadline: h2_total_deadline,
+                coalesce_flush,
+                h1_backend,
+            } = streaming_h2_body_regime(
+                resp.version(),
+                state.env_config.pool_http1_direct,
+                grpc_request_deadline,
+                effective_h2_read_timeout_ms,
+                state.response_coalesce_flush_ms,
+            );
             // The trailer governor moves into exactly one of the four
             // mutually-exclusive body constructors below, so every direct /
             // size-limited / coalescing variant of this arm enforces the same
             // response-trailer policy boundary.
-            let body = if state.response_buffer_cutoff_bytes == 0
-                && effective_max_response_body_size_bytes == 0
-            {
+            let body = if streaming_response_takes_direct_fast_path(
+                state.response_buffer_cutoff_bytes,
+                effective_max_response_body_size_bytes,
+                coalesce_flush,
+            ) {
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     advertised_cl,
@@ -42957,7 +43016,7 @@ async fn handle_proxy_request_inner(
                 // responses, without buffering the whole backend response
                 // into memory. A hook-authored Content-Length cannot take
                 // this branch off.
-                crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
+                crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
                     resp.into_body(),
                     effective_max_response_body_size_bytes,
                     advertised_cl,
@@ -42965,8 +43024,9 @@ async fn handle_proxy_request_inner(
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
+                    coalesce_flush,
                 )
-            } else if use_passthrough {
+            } else if use_passthrough && coalesce_flush.is_none() {
                 // Response too large to benefit from coalescing — stream
                 // direct, let hyper forward 1 MiB frames as-is. Saves the
                 // `BytesMut::extend_from_slice` copy that CoalescingH2Body
@@ -42980,13 +43040,14 @@ async fn handle_proxy_request_inner(
                     streaming_trailer_governor.take(),
                 )
             } else {
-                crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
+                crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
                     resp.into_body(),
                     advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
+                    coalesce_flush,
                 )
             };
             // Anchor the sidecar-ingress Unix HTTP/1.1 lease to the
@@ -43025,7 +43086,22 @@ async fn handle_proxy_request_inner(
                 ));
                 crate::proxy::body::inspected_streaming_body(rx)
             } else {
-                body.with_lb_connection_guard(lb_connection_guard)
+                let body = body
+                    .with_lb_connection_guard(lb_connection_guard)
+                    .with_success_on_drop_after_response_bytes(h1_passthrough_cl);
+                // HTTP/1.x backend bodies honour latency tracking exactly as the
+                // reqwest HTTP/1.1 arm does (#5588).
+                if h1_backend && state.env_config.enable_streaming_latency_tracking {
+                    track_streaming_response_latency(
+                        body,
+                        backend_start,
+                        &proxy,
+                        &backend_url,
+                        h2_read_timeout_ms,
+                    )
+                } else {
+                    body
+                }
             };
             // The absolute wrapper must observe the inspector's OUTPUT, not
             // the backend frames it consumed. An inspector may hold a chunk by
@@ -47692,6 +47768,51 @@ async fn proxy_to_backend(
     // client and a URL whose authority is the overridden TLS server name. Only
     // the dial is rewritten: the logging/telemetry sites below keep using
     // `backend_url`, which names the real backend target the socket reaches.
+    // Direct HTTP/1.1 pool (issue #5588): where reqwest would speak HTTP/1.1
+    // anyway, dispatch on Ferrum's own exclusive-checkout hyper connections.
+    let direct_h1_has_body = request_may_have_body(method, headers);
+    if sni_reqwest_dial.is_none()
+        && direct_h1_dispatch_eligible(
+            state,
+            proxy,
+            upstream_target,
+            &client_request_body,
+            direct_h1_has_body,
+            stream_request_body,
+            request_body_prepared,
+        )
+    {
+        return proxy_to_backend_direct_h1(
+            state,
+            proxy,
+            upstream_target,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            plugins,
+            backend_admission_plugins,
+            preacquired_backend_admission,
+            request_ctx,
+            response_decision_ctx,
+            stream_response,
+            retain_request_body,
+            direct_h1_has_body,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            inbound_version,
+            resolved_ip,
+            ctx_bytes_sent_observed,
+            effective_host,
+            effective_port,
+            effective_max_request_body_size_bytes,
+            effective_max_response_body_size_bytes,
+            backend_admission_started_at,
+            backend_attempt_handoff,
+        )
+        .await;
+    }
     let (dial_proxy, dial_url): (&Proxy, &str) = match sni_reqwest_dial.as_ref() {
         Some((sni_proxy, sni_url)) => (sni_proxy.as_ref(), sni_url.as_str()),
         None => (proxy, backend_url),
@@ -49096,6 +49217,1092 @@ async fn proxy_to_backend(
         }
     };
 
+    backend_dispatch_response(response, retained_body, backend_admission_permits)
+}
+
+/// `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING`: wrap a streaming response body
+/// in latency tracking and, when a backend read timeout is configured, spawn a
+/// lightweight deferred task that wakes once after `read_timeout + 5s`, reads
+/// one atomic and logs whether the stream completed. Shared by the reqwest
+/// HTTP/1.1 arm and HTTP/1.x backend bodies on the `StreamingH2` arm (#5588).
+#[inline(never)]
+fn track_streaming_response_latency(
+    base: ProxyBody,
+    backend_start: Instant,
+    proxy: &Proxy,
+    backend_url: &str,
+    read_timeout_ms: u64,
+) -> ProxyBody {
+    let (tracked_body, metrics) = base.into_tracked(backend_start);
+    // Skipped when the read timeout is disabled (0): no meaningful deadline.
+    if read_timeout_ms > 0 {
+        let deferred_proxy_id = proxy.id.clone();
+        let deferred_backend_url = strip_query_params(backend_url).to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
+            let completed = metrics.completed();
+            let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+            if completed {
+                debug!(
+                    proxy_id = %deferred_proxy_id,
+                    backend_url = %deferred_backend_url,
+                    backend_total_ms = total_ms,
+                    "Streaming response completed"
+                );
+            } else {
+                warn!(
+                    proxy_id = %deferred_proxy_id,
+                    backend_url = %deferred_backend_url,
+                    backend_last_frame_ms = total_ms,
+                    "Streaming response incomplete (client disconnect or timeout)"
+                );
+            }
+        });
+    }
+    tracked_body
+}
+
+/// Whether the direct HTTP/1.1 pool may serve this dispatch (issue #5588).
+///
+/// The pool replaces reqwest only where reqwest would speak HTTP/1.1 anyway —
+/// exactly [`reqwest_dispatch_is_http1_only`], computed without cloning the
+/// pool config — and only for request bodies that need no plugin work at this
+/// point: no body, a streaming body the handler already admitted for
+/// streaming, or a buffered body whose plugins already ran. Everything else
+/// keeps the reqwest path unchanged.
+fn direct_h1_dispatch_eligible(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    client_request_body: &ClientRequestBody,
+    has_body: bool,
+    stream_request_body: bool,
+    request_body_prepared: bool,
+) -> bool {
+    if !state.env_config.pool_http1_direct {
+        return false;
+    }
+    let body_ok = !has_body
+        || match client_request_body {
+            ClientRequestBody::Streaming(_) => stream_request_body,
+            ClientRequestBody::Buffered(_) => request_body_prepared,
+        };
+    if !body_ok {
+        return false;
+    }
+    if proxy.forces_backend_http1_only() || !proxy.dispatch_kind.is_tls_backend() {
+        return true;
+    }
+    if !state
+        .connection_pool
+        .global_pool_config()
+        .effective_enable_http2(proxy)
+    {
+        return true;
+    }
+    get_backend_capability_for_target(state.backend_capabilities.as_ref(), proxy, upstream_target)
+        .is_some_and(|record| {
+            matches!(
+                record.plain_http.h2_tls,
+                crate::proxy::backend_capabilities::ProtocolSupport::Unsupported
+            )
+        })
+}
+
+/// Dial budget for a route with `backend_connect_timeout_ms: 0`: no operator
+/// bound, matching reqwest, which then sets no connect timeout at all.
+const DIRECT_H1_UNBOUNDED_CONNECT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Origin-form request target (`/path?query`) of an absolute backend URL,
+/// serialized exactly as reqwest put it on the wire.
+///
+/// reqwest parses every backend URL with the `url` crate, which percent-encodes
+/// non-ASCII and other bytes outside the WHATWG path/query sets and resolves
+/// dot segments. A target made only of bytes `url` leaves untouched — the
+/// ordinary case — is used as is; anything else is serialized by `url` itself,
+/// so the backend receives byte-for-byte what the reqwest path sent.
+fn direct_h1_origin_form_uri(backend_url: &str) -> Option<hyper::Uri> {
+    let after_scheme = backend_url
+        .find("://")
+        .map_or(backend_url, |i| &backend_url[i + 3..]);
+    let target = match after_scheme.find(['/', '?', '#', '\\']) {
+        Some(i) => &after_scheme[i..],
+        None => "",
+    };
+    if direct_h1_target_needs_url_serialization(target) {
+        let parsed = url::Url::parse(backend_url).ok()?;
+        let mut origin = String::with_capacity(target.len() + 16);
+        origin.push_str(parsed.path());
+        if let Some(query) = parsed.query() {
+            origin.push('?');
+            origin.push_str(query);
+        }
+        return origin.parse().ok();
+    }
+    target.parse().ok()
+}
+
+/// Test hook: the origin-form target the direct HTTP/1.1 pool sends for a
+/// backend URL (issue #5588).
+pub(crate) fn direct_h1_origin_form_target_for_test(backend_url: &str) -> Option<String> {
+    direct_h1_origin_form_uri(backend_url).map(|uri| uri.to_string())
+}
+
+/// Whether `url` would rewrite this request target: any byte it percent-encodes
+/// in a path or a special-scheme query (controls, space, non-ASCII, `"` `#`
+/// `<` `>` `` ` `` `{` `}` `'`), a backslash it treats as a separator, a
+/// possible dot segment (`/.`, or `%2e` in either case), or a target that does
+/// not start with `/`. Over-matching only takes the slower, exact path.
+fn direct_h1_target_needs_url_serialization(target: &str) -> bool {
+    !target.starts_with('/')
+        || target.bytes().any(|b| {
+            b <= b' '
+                || b >= 0x7f
+                || matches!(
+                    b,
+                    b'"' | b'#' | b'<' | b'>' | b'`' | b'{' | b'}' | b'\\' | b'\''
+                )
+        })
+        || target.contains("/.")
+        || target.contains("%2e")
+        || target.contains("%2E")
+}
+
+fn direct_h1_send_error_response(
+    proxy: &Proxy,
+    backend_url: &str,
+    error_class: retry::ErrorClass,
+    err: &hyper::Error,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    error!(
+        proxy_id = %proxy.id,
+        backend_url = %strip_query_params(backend_url),
+        error_kind = retry::error_class_log_kind(error_class),
+        error = %err,
+        "Backend request failed"
+    );
+    http_backend_dispatch_error_response(error_class, resolved_ip)
+}
+
+/// Dial/checkout failure on the direct HTTP/1.1 pool. Same class mapping as the
+/// direct H2 pool, logged with the reqwest dispatch's wording and `error_kind`.
+fn direct_h1_checkout_error_response(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    err: &http2_pool::Http2PoolError,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let error_class = http2_pool::classify_http2_pool_error(err);
+    if matches!(error_class, retry::ErrorClass::PortExhaustion) {
+        state.overload.record_port_exhaustion();
+    }
+    https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+        proxy,
+        strip_query_params(backend_url),
+        err,
+    );
+    error!(
+        proxy_id = %proxy.id,
+        backend_url = %strip_query_params(backend_url),
+        error_kind = retry::error_class_log_kind(error_class),
+        error = %err.message(),
+        "Backend request failed"
+    );
+    http_backend_dispatch_error_response(error_class, resolved_ip)
+}
+
+fn direct_h1_collect_error_response(
+    proxy: &Proxy,
+    err: HyperBodyCollectError,
+    resolved_ip: Option<String>,
+    max_response_body_size_bytes: usize,
+) -> retry::BackendResponse {
+    match err {
+        HyperBodyCollectError::TooLarge => {
+            warn_sampled!(
+                proxy_id = %proxy.id,
+                max_response_body_size_bytes,
+                "Backend response body exceeded the retained response ceiling while buffering"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::buffered(
+                    r#"{"error":"Backend response body exceeds maximum size"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                buffered_trailers: None,
+            }
+        }
+        HyperBodyCollectError::BudgetExhausted => {
+            response_buffer_capacity_response(proxy, resolved_ip, "direct_h1")
+        }
+        HyperBodyCollectError::Read(e) => {
+            let (status_code, error_class) =
+                eager_buffer_body_read_status_and_class(retry::classify_hyper_client_error(&e));
+            warn!(
+                proxy_id = %proxy.id,
+                error_kind = retry::error_class_log_kind(error_class),
+                error = %e,
+                "Failed to read backend response body"
+            );
+            retry::BackendResponse {
+                status_code,
+                body: ResponseBody::buffered(eager_buffer_body_read_error_body(status_code)),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(error_class),
+                buffered_trailers: None,
+            }
+        }
+        HyperBodyCollectError::ReadTimeout { timeout_ms } => {
+            warn!(
+                proxy_id = %proxy.id,
+                timeout_ms,
+                "Backend response body read timed out while buffering"
+            );
+            http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
+        }
+    }
+}
+
+fn direct_h1_request_body_too_large(resolved_ip: Option<String>) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: 413,
+        body: ResponseBody::buffered(
+            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+        buffered_trailers: None,
+    }
+}
+
+/// Check out a direct HTTP/1.1 connection under the same bounds as the reqwest
+/// send it replaces: the response-header read bound and the client RPC deadline
+/// cover the dial; the operator connect timeout bounds only the dial itself.
+/// Used for the first attempt and for the one idle-race replay alike.
+#[allow(clippy::too_many_arguments)]
+async fn direct_h1_bounded_checkout(
+    state: &ProxyState,
+    proxy: &Proxy,
+    conn_proxy: &Proxy,
+    tls: bool,
+    connect_timeout: Duration,
+    fresh: bool,
+    header_deadline_at: Option<tokio::time::Instant>,
+    request_ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    backend_url: &str,
+    resolved_ip: &Option<String>,
+    retained_body: &mut Option<Bytes>,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_started_at: &Instant,
+) -> Result<http2_pool::Http1Checkout, BackendDispatchResult> {
+    let bounded = crate::plugins::await_deadline_first(
+        header_deadline_at,
+        crate::plugins::await_grpc_deadline(
+            request_ctx.grpc_deadline_at(),
+            state
+                .http2_pool
+                .checkout_h1(conn_proxy, tls, connect_timeout, fresh),
+        ),
+    )
+    .await;
+    match bounded {
+        Ok(Ok(Ok(checkout))) => Ok(checkout),
+        Err(()) => {
+            warn!(
+                proxy_id = %proxy.id,
+                watermark = "backend_read_timeout_ms",
+                watermark_ms = proxy.backend_read_timeout_ms,
+                "direct HTTP/1.1 dispatch: per-direction watermark expired before response headers"
+            );
+            Err(backend_dispatch_response(
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip.clone(),
+                ),
+                retained_body.take(),
+                backend_admission_permits.take(),
+            ))
+        }
+        Ok(Err(())) => Err(backend_dispatch_response(
+            client_grpc_deadline_exceeded_response_for_request(
+                request_ctx,
+                headers,
+                resolved_ip.clone(),
+            ),
+            retained_body.take(),
+            backend_admission_permits.take(),
+        )),
+        Ok(Ok(Err(e))) => {
+            record_h2_pool_admission_failure(
+                backend_admission_permits,
+                backend_admission_started_at,
+                &e,
+            );
+            crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
+            Err(backend_dispatch_response(
+                direct_h1_checkout_error_response(
+                    state,
+                    proxy,
+                    backend_url,
+                    &e,
+                    resolved_ip.clone(),
+                ),
+                retained_body.take(),
+                None,
+            ))
+        }
+    }
+}
+
+/// Dispatch an HTTP/1.1 backend request on the direct hyper pool (issue #5588).
+///
+/// Mirrors the reqwest dispatch in [`proxy_to_backend`] step for step — header
+/// rewriting, body accounting and size limits, the gateway write-watermark
+/// pump, `http1MaxPendingRequests`, backend admission, the response-header and
+/// authorization bounds, and the response buffering decisions — on an
+/// exclusively checked-out hyper connection instead of a reqwest client.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_direct_h1(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: ClientRequestBody,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    backend_admission_plugins: &[Arc<dyn crate::plugins::Plugin>],
+    mut preacquired_backend_admission: PreacquiredBackendAdmission,
+    request_ctx: &RequestContext,
+    response_decision_ctx: Option<&RequestContext>,
+    stream_response: bool,
+    retain_request_body: bool,
+    has_body: bool,
+    client_ip: &str,
+    xff_append_ip: &str,
+    request_is_secure: bool,
+    inbound_version: hyper::Version,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    effective_host: &str,
+    effective_port: u16,
+    effective_max_request_body_size_bytes: usize,
+    effective_max_response_body_size_bytes: usize,
+    backend_admission_started_at: &mut Instant,
+    backend_attempt_handoff: &BackendAttemptHandoff,
+) -> BackendDispatchResult {
+    let Some(origin_form_uri) = direct_h1_origin_form_uri(backend_url) else {
+        error!(proxy_id = %proxy.id, "Invalid backend URL");
+        return backend_dispatch_response(
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::buffered(
+                    r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+                buffered_trailers: None,
+            },
+            None,
+            None,
+        );
+    };
+    let hyper_method = match parse_hyper_method(method) {
+        Ok(m) => m,
+        Err(()) => {
+            warn_invalid_backend_method(&proxy.id, "direct_h1", method);
+            return backend_dispatch_response(
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                    buffered_trailers: None,
+                },
+                None,
+                None,
+            );
+        }
+    };
+    if request_ctx
+        .grpc_deadline_at()
+        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    {
+        return backend_dispatch_response(
+            client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, resolved_ip),
+            None,
+            None,
+        );
+    }
+
+    // ── Request head: same rewrite rules as the reqwest path ──────────────
+    let mut out_headers = hyper::HeaderMap::with_capacity(headers.len() + 4);
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
+    let remaining_grpc_timeout_header = request_ctx
+        .grpc_deadline_at()
+        .filter(|_| {
+            !connection_listed_strip
+                .iter()
+                .any(|name| name == "grpc-timeout")
+        })
+        .map(grpc_proxy::remaining_grpc_timeout_header_value);
+    let scheme = backend_url_scheme_for_dispatch(proxy);
+    for (k, v) in headers {
+        match k.as_str() {
+            "host" => {
+                if proxy.preserve_host_header {
+                    insert_outbound_header_or_warn(
+                        &mut out_headers,
+                        &proxy.id,
+                        "direct_h1",
+                        "client_host",
+                        "host",
+                        v,
+                    );
+                } else {
+                    let outbound_host =
+                        outbound_host_header_value(effective_host, effective_port, Some(scheme));
+                    insert_outbound_header_or_warn(
+                        &mut out_headers,
+                        &proxy.id,
+                        "direct_h1",
+                        "backend_host",
+                        "host",
+                        &outbound_host,
+                    );
+                }
+            }
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
+            n if headers_mod::is_untrusted_real_ip_header(n, peer_trusted) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            "grpc-timeout" if remaining_grpc_timeout_header.is_some() => continue,
+            _ => {
+                insert_outbound_header_or_warn(
+                    &mut out_headers,
+                    &proxy.id,
+                    "direct_h1",
+                    "client",
+                    k,
+                    v,
+                );
+            }
+        }
+    }
+    if let Some(value) = remaining_grpc_timeout_header {
+        out_headers.insert(
+            hyper::header::HeaderName::from_static("grpc-timeout"),
+            value,
+        );
+    }
+    if !out_headers.contains_key(hyper::header::HOST) {
+        // reqwest derives Host from the request URL when the map carries none.
+        let outbound_host =
+            outbound_host_header_value(effective_host, effective_port, Some(scheme));
+        insert_outbound_header_or_warn(
+            &mut out_headers,
+            &proxy.id,
+            "direct_h1",
+            "backend_host",
+            "host",
+            &outbound_host,
+        );
+    }
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+        xff_append_ip,
+        &state.trusted_proxies,
+    );
+    let proto_str = if request_is_secure { "https" } else { "http" };
+    insert_outbound_header_or_warn(
+        &mut out_headers,
+        &proxy.id,
+        "direct_h1",
+        "generated_x_forwarded_for",
+        "x-forwarded-for",
+        &xff_val,
+    );
+    insert_outbound_header_or_warn(
+        &mut out_headers,
+        &proxy.id,
+        "direct_h1",
+        "generated_x_forwarded_proto",
+        "x-forwarded-proto",
+        proto_str,
+    );
+    if let Some(host) = headers.get("host") {
+        insert_outbound_header_or_warn(
+            &mut out_headers,
+            &proxy.id,
+            "direct_h1",
+            "client_host_forwarded",
+            "x-forwarded-host",
+            host,
+        );
+    }
+    if let Some(via) = via_header_for_inbound_version(state, inbound_version) {
+        insert_outbound_header_or_warn(
+            &mut out_headers,
+            &proxy.id,
+            "direct_h1",
+            "configured_via",
+            "via",
+            via,
+        );
+    }
+    if state.add_forwarded_header {
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        insert_outbound_header_or_warn(
+            &mut out_headers,
+            &proxy.id,
+            "direct_h1",
+            "generated_forwarded",
+            "forwarded",
+            &fwd,
+        );
+    }
+
+    // ── Request body ──────────────────────────────────────────────────────
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut upload_pump: Option<upload_pump::UploadPumpJoin> = None;
+    let mut retained_body: Option<Bytes> = None;
+    let request_body = if !has_body {
+        body::DirectH1RequestBody::Empty
+    } else {
+        if declared_request_content_length_over_limit(
+            headers,
+            effective_max_request_body_size_bytes,
+        ) {
+            return backend_dispatch_response(
+                direct_h1_request_body_too_large(resolved_ip),
+                None,
+                None,
+            );
+        }
+        match client_request_body {
+            ClientRequestBody::Buffered(buffered) => {
+                // Eligibility guarantees the body plugins already ran.
+                let buffered = *buffered;
+                crate::plugins::grpc_web::record_request_grpc_message_count(
+                    request_ctx,
+                    &buffered.body,
+                );
+                let body_bytes = match buffered.budget {
+                    Some(permit) => permit.into_charged_bytes(buffered.body),
+                    None => Bytes::from(buffered.body),
+                };
+                if body_bytes.is_empty() {
+                    body::DirectH1RequestBody::Empty
+                } else {
+                    if retain_request_body {
+                        retained_body = Some(body_bytes.clone());
+                    }
+                    match upload_pump::spawn_buffered_upload_pump(
+                        body_bytes,
+                        proxy.backend_write_timeout_ms,
+                    ) {
+                        Ok((pumped, join)) => {
+                            upload_pump = Some(join);
+                            body::DirectH1RequestBody::Pumped(pumped)
+                        }
+                        Err(body_bytes) => body::DirectH1RequestBody::Full(Some(body_bytes)),
+                    }
+                }
+            }
+            ClientRequestBody::Streaming(original_req) => {
+                let incoming = (*original_req).into_body();
+                let upload_auth_deadline = request_upload_auth_deadline(
+                    Some(request_ctx),
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                );
+                let grpc_tap =
+                    crate::plugins::grpc_web::request_stream_grpc_message_tap(request_ctx);
+                if effective_max_request_body_size_bytes > 0 {
+                    let limited = body::SizeLimitedIncoming::new_with_counter(
+                        incoming,
+                        effective_max_request_body_size_bytes,
+                        Arc::clone(&body_size_exceeded),
+                        Arc::clone(ctx_bytes_sent_observed),
+                    );
+                    let (limited, pump) = install_streaming_upload_authorization(
+                        limited,
+                        upload_auth_deadline.as_ref(),
+                        proxy.backend_write_timeout_ms,
+                    );
+                    upload_pump = pump;
+                    body::DirectH1RequestBody::Limited(match grpc_tap {
+                        Some(tap) => limited.with_grpc_message_tap(tap),
+                        None => limited,
+                    })
+                } else {
+                    let counting = body::CountingIncoming::new_with_counter(
+                        incoming,
+                        Arc::clone(ctx_bytes_sent_observed),
+                    );
+                    let (counting, pump) = install_counting_upload_authorization(
+                        counting,
+                        upload_auth_deadline.as_ref(),
+                        proxy.backend_write_timeout_ms,
+                    );
+                    upload_pump = pump;
+                    body::DirectH1RequestBody::Counting(match grpc_tap {
+                        Some(tap) => counting.with_grpc_message_tap(tap),
+                        None => counting,
+                    })
+                }
+            }
+        }
+    };
+
+    // ── Dispatch policy, admission ────────────────────────────────────────
+    let pending_dial_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
+    let pending_policy_port = dispatch_policy_port_for_target(proxy, upstream_target);
+    let pending_slot = if let Some(cap) =
+        resolve_backend_http1_max_pending_requests(proxy, pending_policy_port)
+    {
+        let pending_scope = pending_limit_scope_for_proxy(proxy);
+        match state.backend_pending_limit.try_acquire(
+            pending_scope.as_ref(),
+            pending_policy_port,
+            Some(cap),
+        ) {
+            Ok(slot) => slot,
+            Err(limit) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = pending_dial_port,
+                    pending_policy_port = pending_policy_port,
+                    pending_scope_digest = pending_scope.digest(),
+                    in_flight_requests = limit.current,
+                    max_in_flight_requests = limit.cap,
+                    "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+                );
+                return backend_dispatch_response(
+                    retry::BackendResponse {
+                        status_code: 503,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        buffered_trailers: None,
+                    },
+                    None,
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let mut backend_admission_permits = match preacquired_backend_admission.take_or_run(
+        state,
+        backend_admission_plugins,
+        request_ctx,
+        proxy,
+        upstream_target,
+        ProxyProtocol::Http,
+    ) {
+        Ok(permits) => permits,
+        Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+    };
+    *backend_admission_started_at = Instant::now();
+    backend_attempt_handoff.mark_handed_to_backend(retained_body.as_ref());
+
+    // ── Connection checkout ───────────────────────────────────────────────
+    let conn_effective_proxy = resolve_backend_connection_proxy_for_target(proxy, upstream_target);
+    let conn_proxy = conn_effective_proxy.as_ref();
+    let tls = conn_proxy.dispatch_kind.is_tls_backend();
+    // Same budgets as the reqwest send: the operator connect timeout bounds
+    // only the dial (`0` = none), while the client RPC deadline and the
+    // response-header read bound cover the whole exchange, dial included —
+    // so an expiring client deadline still answers as the client's deadline,
+    // never as a backend connect timeout.
+    let connect_timeout = if proxy.backend_connect_timeout_ms > 0 {
+        Duration::from_millis(proxy.backend_connect_timeout_ms)
+    } else {
+        DIRECT_H1_UNBOUNDED_CONNECT
+    };
+    let header_deadline_at = absolute_response_header_read_bound(proxy.backend_read_timeout_ms);
+    let checkout = match direct_h1_bounded_checkout(
+        state,
+        proxy,
+        conn_proxy,
+        tls,
+        connect_timeout,
+        false,
+        header_deadline_at,
+        request_ctx,
+        headers,
+        backend_url,
+        &resolved_ip,
+        &mut retained_body,
+        &mut backend_admission_permits,
+        backend_admission_started_at,
+    )
+    .await
+    {
+        Ok(checkout) => checkout,
+        Err(result) => return result,
+    };
+    // The exclusive connection's send queue belongs to this request alone, so
+    // the pump can bound the post-EOS drain with `backend_write_timeout_ms`
+    // (#4411). Bound before the first body frame can cross the pump's bridge.
+    if let Some(pump) = upload_pump.as_mut() {
+        pump.bind_backend_socket(checkout.backend_socket());
+    }
+
+    let mut backend_req = Request::new(request_body);
+    *backend_req.method_mut() = hyper_method;
+    *backend_req.uri_mut() = origin_form_uri;
+    *backend_req.version_mut() = hyper::Version::HTTP_11;
+    *backend_req.headers_mut() = out_headers;
+
+    // ── Send under the response-header, client and authorization bounds ──
+    let send_auth_deadline = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let send_bound = compose_dispatch_phase_auth_bound(
+        request_ctx.grpc_deadline_at(),
+        send_auth_deadline.as_ref(),
+    );
+    let mut checkout = checkout;
+    let mut replayed_idle_race = false;
+    let (response, checkout) = loop {
+        let reused = checkout.reused();
+        let send_fut = checkout.sender.try_send_request(backend_req);
+        let send_fut =
+            h1_send_release::await_h1_response_or_release(send_fut, checkout, |lease, cx| {
+                lease.sender.poll_ready(cx).map_err(|_| ())
+            });
+        let bounded = await_upload_write_watermark_first(
+            crate::plugins::await_deadline_first(
+                header_deadline_at,
+                crate::plugins::await_deadline_first(send_bound.at, send_fut),
+            ),
+            upload_pump.as_mut(),
+        )
+        .await;
+        let write_watermark_expired = bounded.is_err();
+        let (send_result, lease) = match bounded {
+            Ok(Ok(Ok(outcome))) => outcome,
+            Ok(Ok(Err(()))) => {
+                // Client RPC deadline or authorization lifetime.
+                if let Some(pump) = upload_pump.as_mut() {
+                    pump.cancel();
+                }
+                if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
+                    .is_some()
+                {
+                    return authorization_expired_backend_dispatch(
+                        resolved_ip,
+                        retained_body,
+                        backend_admission_permits,
+                    );
+                }
+                return backend_dispatch_response(
+                    client_grpc_deadline_exceeded_response_for_request(
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                    ),
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
+            Ok(Err(())) | Err(()) => {
+                if let Some(pump) = upload_pump.as_mut() {
+                    pump.cancel();
+                }
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return backend_dispatch_response(
+                        direct_h1_request_body_too_large(resolved_ip),
+                        retained_body,
+                        backend_admission_permits,
+                    );
+                }
+                let (watermark, watermark_ms) = if write_watermark_expired {
+                    ("backend_write_timeout_ms", proxy.backend_write_timeout_ms)
+                } else {
+                    ("backend_read_timeout_ms", proxy.backend_read_timeout_ms)
+                };
+                warn!(
+                    proxy_id = %proxy.id,
+                    watermark,
+                    watermark_ms,
+                    upload_pump = upload_pump.is_some(),
+                    "direct HTTP/1.1 dispatch: per-direction watermark expired before response headers"
+                );
+                return backend_dispatch_response(
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
+        };
+        match send_result {
+            Ok(response) => break (response, lease),
+            Err(mut try_err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return backend_dispatch_response(
+                        direct_h1_request_body_too_large(resolved_ip),
+                        retained_body,
+                        backend_admission_permits,
+                    );
+                }
+                // An idle keep-alive connection the backend closed between
+                // check-in and this write: the request never reached the wire,
+                // so replay it once on a fresh connection.
+                if reused
+                    && !replayed_idle_race
+                    && let Some(unsent) = try_err.take_message()
+                {
+                    replayed_idle_race = true;
+                    backend_req = unsent;
+                    checkout = match direct_h1_bounded_checkout(
+                        state,
+                        proxy,
+                        conn_proxy,
+                        tls,
+                        connect_timeout,
+                        true,
+                        header_deadline_at,
+                        request_ctx,
+                        headers,
+                        backend_url,
+                        &resolved_ip,
+                        &mut retained_body,
+                        &mut backend_admission_permits,
+                        backend_admission_started_at,
+                    )
+                    .await
+                    {
+                        Ok(checkout) => checkout,
+                        Err(result) => return result,
+                    };
+                    // Write-once: the pump keeps the socket bound before the
+                    // first attempt. That attempt never reached the wire, so
+                    // its idle socket has an empty send queue and the drain
+                    // bound stays disarmed for this replay — the same as a
+                    // reused reqwest connection, which publishes no socket.
+                    if let Some(pump) = upload_pump.as_mut() {
+                        pump.bind_backend_socket(checkout.backend_socket());
+                    }
+                    continue;
+                }
+                let never_sent = try_err.take_message().is_some();
+                let err = try_err.into_error();
+                // A request hyper handed back unsent never reached the wire.
+                let class = if never_sent {
+                    retry::ErrorClass::ConnectionPoolError
+                } else {
+                    retry::classify_hyper_client_error(&err)
+                };
+                if class == retry::ErrorClass::PortExhaustion {
+                    state.overload.record_port_exhaustion();
+                }
+                https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+                    proxy,
+                    strip_query_params(backend_url),
+                    &err,
+                );
+                return backend_dispatch_response(
+                    direct_h1_send_error_response(proxy, backend_url, class, &err, resolved_ip),
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
+        }
+    };
+    drop(pending_slot);
+
+    if body_size_exceeded.load(Ordering::Acquire) {
+        warn_sampled!(
+            proxy_id = %proxy.id,
+            backend_url = %strip_query_params(backend_url),
+            max_body_size = effective_max_request_body_size_bytes,
+            backend_status = response.status().as_u16(),
+            "Streaming request body exceeded maximum size (backend responded before body error surfaced)"
+        );
+        return backend_dispatch_response(
+            direct_h1_request_body_too_large(resolved_ip),
+            retained_body,
+            backend_admission_permits,
+        );
+    }
+
+    // ── Response ──────────────────────────────────────────────────────────
+    let status = response.status().as_u16();
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+    let stream_response = refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        response_decision_ctx,
+        status,
+        &resp_headers,
+    );
+    if effective_max_response_body_size_bytes > 0
+        && let Some(len) = declared_response_length_exceeds_limit(
+            method,
+            status,
+            &resp_headers,
+            effective_max_response_body_size_bytes,
+        )
+    {
+        warn_sampled!(
+            "Backend response body ({} bytes) exceeds limit ({} bytes)",
+            len,
+            effective_max_response_body_size_bytes
+        );
+        return backend_dispatch_response(
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::buffered(
+                    r#"{"error":"Backend response body exceeds maximum size"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                buffered_trailers: None,
+            },
+            retained_body,
+            backend_admission_permits,
+        );
+    }
+    let content_length = canonical_header_content_length(response.headers())
+        .and_then(|len| usize::try_from(len).ok());
+    // Same eager-buffer rule as the reqwest arms: a small, declared,
+    // non-streaming-type response is collected here.
+    let eager_buffer = stream_response
+        && state.response_buffer_cutoff_bytes > 0
+        && content_length.is_some_and(|len| len <= state.response_buffer_cutoff_bytes)
+        && !is_streaming_content_type(&resp_headers);
+    if stream_response && !eager_buffer {
+        let mut response = response;
+        if let Some(checkout) = checkout {
+            if http_body::Body::is_end_stream(response.body()) {
+                checkout.checkin();
+            } else {
+                response
+                    .extensions_mut()
+                    .insert(body::PooledBackendLeaseSlot::new(
+                        checkout.into_streaming_lease(),
+                    ));
+            }
+        }
+        return BackendDispatchResult::Response {
+            response: Box::new(retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+                buffered_trailers: None,
+            }),
+            retained_body,
+            backend_admission_permits,
+            request_body_exceeded: Some(body_size_exceeded),
+            streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
+        };
+    }
+    let collected = match collect_response_under_authorization(
+        request_ctx.grpc_deadline_at(),
+        send_auth_deadline.as_ref(),
+        collect_hyper_body_and_trailers_with_limit(
+            response.into_body(),
+            effective_max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(ResponseCollectBound::RpcDeadline) => {
+            return backend_dispatch_response(
+                client_grpc_deadline_exceeded_response_for_request(
+                    request_ctx,
+                    headers,
+                    resolved_ip,
+                ),
+                retained_body,
+                backend_admission_permits,
+            );
+        }
+        Err(ResponseCollectBound::AuthorizationExpired) => {
+            return authorization_expired_backend_dispatch(
+                resolved_ip,
+                retained_body,
+                backend_admission_permits,
+            );
+        }
+    };
+    let response = match collected {
+        Ok((body_bytes, trailers)) => {
+            if let Some(checkout) = checkout {
+                checkout.checkin();
+            }
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+                buffered_trailers: trailers.filter(|t| !t.is_empty()).map(Box::new),
+            }
+        }
+        Err(err) => direct_h1_collect_error_response(
+            proxy,
+            err,
+            resolved_ip,
+            effective_max_response_body_size_bytes,
+        ),
+    };
     backend_dispatch_response(response, retained_body, backend_admission_permits)
 }
 
@@ -63845,8 +65052,9 @@ mod tests {
     /// A refactor that drops the `refine_stream_response_for_content_type` call
     /// site would regress the binary case back to `Buffered` and fail here —
     /// which the helper-level unit tests cannot catch.
-    #[tokio::test]
-    async fn proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection() {
+    async fn proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection_case(
+        direct: bool,
+    ) {
         async fn dispatch_body(
             state: &ProxyState,
             proxy: &Proxy,
@@ -63920,7 +65128,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let state = make_test_proxy_state(GatewayConfig::default());
+        let state = make_test_proxy_state_with_env(
+            GatewayConfig::default(),
+            crate::config::env_config::EnvConfig {
+                pool_http1_direct: direct,
+                ..Default::default()
+            },
+        );
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.backend_host = server.address().ip().to_string();
@@ -63943,7 +65157,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(binary, ResponseBody::Streaming { .. }),
+            streams_on_h1_dispatch_path(&binary, direct),
             "non-inspectable (octet-stream) response should be downgraded to streaming"
         );
 
@@ -63955,11 +65169,18 @@ mod tests {
         );
     }
 
+    /// Runs on both HTTP/1.1 dispatch paths: reqwest (`FERRUM_POOL_HTTP1_DIRECT=false`)
+    /// and the direct hyper pool, which streams as `ResponseBody::StreamingH2`.
+    #[tokio::test]
+    async fn proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection() {
+        proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection_case(false).await;
+        proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection_case(true).await;
+    }
+
     /// body_validator must release large non-matching responses on the
     /// reqwest (HTTP/1.1 / H2) path while keeping matching JSON buffered for
     /// validation. Mirrors the WAF wiring guard for #2323.
-    #[tokio::test]
-    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response() {
+    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response_case(direct: bool) {
         async fn dispatch_body(
             state: &ProxyState,
             proxy: &Proxy,
@@ -64042,7 +65263,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut state = make_test_proxy_state(GatewayConfig::default());
+        let mut state = make_test_proxy_state_with_env(
+            GatewayConfig::default(),
+            crate::config::env_config::EnvConfig {
+                pool_http1_direct: direct,
+                ..Default::default()
+            },
+        );
         state.max_response_body_size_bytes = 2_000_000;
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
@@ -64064,7 +65291,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(binary, ResponseBody::Streaming { .. }),
+            streams_on_h1_dispatch_path(&binary, direct),
             "non-matching image/png above the eager cutoff must stream"
         );
 
@@ -64104,8 +65331,17 @@ mod tests {
         }
     }
 
+    /// Runs on both HTTP/1.1 dispatch paths: reqwest (`FERRUM_POOL_HTTP1_DIRECT=false`)
+    /// and the direct hyper pool, which streams as `ResponseBody::StreamingH2`.
     #[tokio::test]
-    async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
+    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response() {
+        proxy_to_backend_downgrades_irrelevant_body_validator_response_case(false).await;
+        proxy_to_backend_downgrades_irrelevant_body_validator_response_case(true).await;
+    }
+
+    async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers_case(
+        direct: bool,
+    ) {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::path("/events"))
             .respond_with(
@@ -64116,7 +65352,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let state = make_test_proxy_state(GatewayConfig::default());
+        let state = make_test_proxy_state_with_env(
+            GatewayConfig::default(),
+            crate::config::env_config::EnvConfig {
+                pool_http1_direct: direct,
+                ..Default::default()
+            },
+        );
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.backend_host = server.address().ip().to_string();
@@ -64167,10 +65409,7 @@ mod tests {
                 panic!("test does not configure backend admission plugins")
             }
         };
-        assert!(matches!(
-            initial_response.body,
-            ResponseBody::Streaming { .. }
-        ));
+        assert!(streams_on_h1_dispatch_path(&initial_response.body, direct));
 
         let retry_response = proxy_to_backend_retry(
             &state,
@@ -64193,6 +65432,14 @@ mod tests {
             retry_response.body,
             ResponseBody::Streaming { .. }
         ));
+    }
+
+    /// Runs on both HTTP/1.1 dispatch paths: reqwest (`FERRUM_POOL_HTTP1_DIRECT=false`)
+    /// and the direct hyper pool, which streams as `ResponseBody::StreamingH2`.
+    #[tokio::test]
+    async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
+        retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers_case(false).await;
+        retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers_case(true).await;
     }
 
     #[tokio::test]
@@ -69584,6 +70831,16 @@ mod tests {
     //
     // See `validate_full_config()` rustdoc for the warn-vs-reject
     // categorization and rationale.
+
+    /// The streaming response variant each HTTP/1.1 dispatch path produces:
+    /// reqwest's `Streaming`, or the direct hyper pool's `StreamingH2`.
+    fn streams_on_h1_dispatch_path(body: &ResponseBody, direct: bool) -> bool {
+        if direct {
+            matches!(body, ResponseBody::StreamingH2(_))
+        } else {
+            matches!(body, ResponseBody::Streaming { .. })
+        }
+    }
 
     fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {
         make_test_proxy_state_with_env(

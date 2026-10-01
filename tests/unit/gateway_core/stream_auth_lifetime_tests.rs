@@ -2330,21 +2330,22 @@ fn the_direct_h2_upload_join_reports_authorization_rather_than_an_indeterminate_
 
 #[test]
 fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
-    // The definition, five composed header waits (the reqwest initial attempt,
-    // the reqwest retry attempt, mesh mTLS, HBONE, and the Unix-socket pool),
-    // and the shared buffered-RESPONSE collect composer. Direct-H2 composes
+    // The definition, six composed header waits (the reqwest initial attempt,
+    // the reqwest retry attempt, the direct HTTP/1.1 pool (#5588), mesh mTLS,
+    // HBONE, and the Unix-socket pool), and the shared buffered-RESPONSE
+    // collect composer. Direct-H2 composes
     // through `authorization_bounded_header_deadline` instead, because it
     // carries a typed bound source.
     assert_eq!(
         PROXY_SOURCE
             .matches("compose_dispatch_phase_auth_bound(")
             .count(),
-        7,
+        8,
         "an H1/H2 response-header wait lost its authorization bound"
     );
     assert!(PROXY_SOURCE.contains("authorization_bounded_header_deadline("));
     assert!(PROXY_SOURCE.contains("ResponseHeaderDeadlineSource::Authorization => {"));
-    // The definition plus eight attributions: those five waits, the direct-H2
+    // The definition plus nine attributions: those six waits, the direct-H2
     // header wait, the direct-H2 early-response upload join, and the shared
     // buffered-response collect composer. Each attributes the fired bound, so an
     // authorization expiry is never reported as a backend timeout or a client
@@ -2353,7 +2354,7 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         PROXY_SOURCE
             .matches("dispatch_phase_authorization_expiry(")
             .count(),
-        9,
+        10,
         "an H1/H2 dispatch phase lost its authorization attribution"
     );
     // Every one of those exits returns the health-neutral placeholder. Sixteen
@@ -2376,12 +2377,13 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         16,
         "an H1/H2 authorization exit stopped being health-neutral"
     );
-    // The wrapper's definition plus its six `proxy_to_backend` call sites.
+    // The wrapper's definition plus its six `proxy_to_backend` call sites and
+    // the direct HTTP/1.1 pool's two (#5588).
     assert_eq!(
         PROXY_SOURCE
             .matches("authorization_expired_backend_dispatch(")
             .count(),
-        7,
+        9,
         "a reqwest-dispatch authorization exit stopped being health-neutral"
     );
     // The counts above are a tripwire for a LOST exit; this is the check that
@@ -2417,15 +2419,15 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
 /// `backend_read_timeout_ms`, which `0` disables outright.
 #[test]
 fn every_buffered_response_collect_is_authorization_bounded() {
-    // Ten call sites, one per buffered response arm: two reqwest retry arms,
-    // four reqwest first-attempt arms, direct-H2, HBONE, the Unix-socket pool,
-    // and the mesh-mTLS gRPC-Web arm. (The generic definition itself carries a
-    // `<F>` and is not counted.)
+    // Eleven call sites, one per buffered response arm: two reqwest retry arms,
+    // four reqwest first-attempt arms, direct-H2, the direct HTTP/1.1 pool
+    // (#5588), HBONE, the Unix-socket pool, and the mesh-mTLS gRPC-Web arm.
+    // (The generic definition itself carries a `<F>` and is not counted.)
     assert_eq!(
         PROXY_SOURCE
             .matches("collect_response_under_authorization(")
             .count(),
-        10,
+        11,
         "a buffered response collect lost its authorization bound"
     );
     for arm in PROXY_SOURCE
@@ -4441,21 +4443,21 @@ async fn a_buffered_collect_reports_the_earlier_protocol_bound_even_when_both_ha
 
 #[test]
 fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
-    // reqwest size-limited, reqwest unlimited, HBONE, Unix, mesh mTLS,
-    // direct-H2 — plus the two definitions.
+    // reqwest size-limited, reqwest unlimited, the direct HTTP/1.1 pool
+    // (#5588), HBONE, Unix, mesh mTLS, direct-H2 — plus the two definitions.
     assert_eq!(
         PROXY_SOURCE
             .matches("install_streaming_upload_authorization(")
             .count(),
-        7,
+        8,
         "an H1/H2 streaming upload lost its gateway-owned lifecycle"
     );
     assert_eq!(
         PROXY_SOURCE
             .matches("install_counting_upload_authorization(")
             .count(),
-        2,
-        "the unlimited-size reqwest upload lost its gateway-owned lifecycle"
+        3,
+        "the unlimited-size reqwest or direct HTTP/1.1 upload lost its gateway-owned lifecycle"
     );
     // Native gRPC keeps its own body type, so it installs the pump directly on
     // the shared upload source rather than through the H1/H2 adapters.
@@ -4891,7 +4893,9 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
     for (callee, expected_calls) in [
         ("apply_precommit_authorization_terminal(", 2),
         ("install_response_authorization_deadline(", 2),
-        ("authorization_expired_backend_dispatch(", 6),
+        // Six reqwest cold arms plus the direct HTTP/1.1 pool's send-phase
+        // and buffered-collect arms (#5588).
+        ("authorization_expired_backend_dispatch(", 8),
     ] {
         let definition = format!("fn {callee}");
         let before_definition = PROXY_SOURCE

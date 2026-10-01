@@ -534,6 +534,7 @@ fn apply_env_overrides(
             "FERRUM_LOG_LEVEL" => env_config.log_level = v.clone(),
             "FERRUM_TLS_NO_VERIFY" => env_config.tls_no_verify = parse_bool(k, v)?,
             "FERRUM_POOL_WARMUP_ENABLED" => env_config.pool_warmup_enabled = parse_bool(k, v)?,
+            "FERRUM_POOL_HTTP1_DIRECT" => env_config.pool_http1_direct = parse_bool(k, v)?,
             "FERRUM_TRUSTED_PROXIES" => env_config.trusted_proxies = v.clone(),
             "FERRUM_BACKEND_ALLOW_IPS" => {
                 env_config.backend_allow_ips = match v.trim().to_ascii_lowercase().as_str() {

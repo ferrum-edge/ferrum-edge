@@ -6,7 +6,7 @@ use ferrum_edge::_test_support::{
     canonical_header_content_length_from_map_for_test, coalesce_flush_window_for_test,
     passthrough_streaming_content_length_for_test, preserved_response_content_length_for_test,
     run_after_proxy_hooks_for_test, should_bypass_h2_coalesce_for_large_response_for_test,
-    streaming_response_requires_size_limit_for_test,
+    streaming_h2_body_regime_for_test, streaming_response_requires_size_limit_for_test,
     streaming_response_takes_direct_fast_path_for_test,
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
@@ -559,5 +559,52 @@ fn passthrough_content_length_refuses_every_unverifiable_shape() {
     assert_eq!(
         refuse(Version::HTTP_11, Some(0), Some(0), Some(0), 200, false),
         None
+    );
+}
+
+/// HTTP/1.x backend bodies on the `StreamingH2` arm keep the reqwest HTTP/1.1
+/// arm's regime while the direct pool flag is on (#5588); HTTP/2 bodies, and
+/// HTTP/1.x bodies with the flag off, keep `grpc_streaming_response_deadline`.
+#[tokio::test(start_paused = true)]
+async fn streaming_h2_body_regime_keeps_reqwest_h1_semantics_only_for_h1_backends() {
+    use http::Version;
+    use std::time::Duration;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+    // HTTP/1.1 backend, flag on, no client deadline: per-frame bound, clamped window.
+    assert_eq!(
+        streaming_h2_body_regime_for_test(Version::HTTP_11, true, None, 5_000, 40),
+        (5_000, None, Some(Duration::from_millis(40)), true)
+    );
+    // ...under a client deadline the per-frame bound stays armed beside it.
+    assert_eq!(
+        streaming_h2_body_regime_for_test(Version::HTTP_11, true, Some(deadline), 5_000, 0),
+        (5_000, Some(deadline), None, true)
+    );
+    // HTTP/1.0 counts as HTTP/1.x; a window above half the read bound is clamped.
+    assert_eq!(
+        streaming_h2_body_regime_for_test(Version::HTTP_10, true, None, 100, 400),
+        (100, None, Some(Duration::from_millis(50)), true)
+    );
+    // HTTP/2 backend: the absolute deadline replaces the per-frame bound and no
+    // window applies, flag or not.
+    for flag in [true, false] {
+        assert_eq!(
+            streaming_h2_body_regime_for_test(Version::HTTP_2, flag, Some(deadline), 5_000, 40),
+            (0, Some(deadline), None, false)
+        );
+        assert_eq!(
+            streaming_h2_body_regime_for_test(Version::HTTP_2, flag, None, 5_000, 40),
+            (5_000, None, None, false)
+        );
+    }
+    // Flag off: an HTTP/1.1 body falls back to the HTTP/2 regime.
+    assert_eq!(
+        streaming_h2_body_regime_for_test(Version::HTTP_11, false, Some(deadline), 5_000, 40),
+        (0, Some(deadline), None, false)
+    );
+    assert_eq!(
+        streaming_h2_body_regime_for_test(Version::HTTP_11, false, None, 5_000, 40),
+        (5_000, None, None, false)
     );
 }

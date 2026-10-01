@@ -740,3 +740,207 @@ fn boxed_hbone_websocket_unknown_tunnel_timeout_is_reached_wire() {
          rather than retry a possibly-sent CONNECT"
     );
 }
+
+// ── Direct HTTP/1.1 pool vs reqwest: same wire failure, same class (#5588) ──
+//
+// The direct HTTP/1.1 pool drives the hyper connection reqwest used to drive.
+// Each case below runs the SAME scripted backend failure through a raw hyper
+// HTTP/1.1 client and through reqwest, and requires the two classifications to
+// agree, so retries, passive health and the circuit breaker see no change.
+
+mod direct_h1_classification_parity {
+    use super::*;
+    use bytes::Bytes;
+    use ferrum_edge::retry::{classify_hyper_client_error, classify_reqwest_error};
+    use http_body_util::Empty;
+    use hyper_util::rt::TokioIo;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        /// Read the request head, then reset the connection (SO_LINGER 0).
+        ResetAfterRequest,
+        /// Read the request head, then close cleanly without a response.
+        CloseBeforeResponse,
+    }
+
+    async fn scripted_backend(failure: Failure) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => seen.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    if let Failure::ResetAfterRequest = failure {
+                        let _ = socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO));
+                    }
+                    drop(stream);
+                });
+            }
+        });
+        port
+    }
+
+    async fn hyper_class(port: u16) -> ErrorClass {
+        let tcp = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake::<_, Empty<Bytes>>(TokioIo::new(tcp))
+            .await
+            .expect("handshake");
+        tokio::spawn(conn);
+        let request = hyper::Request::builder()
+            .uri("/")
+            .header("host", "127.0.0.1")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let err = sender
+            .send_request(request)
+            .await
+            .expect_err("scripted backend never answers");
+        classify_hyper_client_error(&err)
+    }
+
+    async fn reqwest_class(port: u16) -> ErrorClass {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .build()
+            .expect("client");
+        let err = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("scripted backend never answers");
+        classify_reqwest_error(&err)
+    }
+
+    #[tokio::test]
+    async fn reset_after_request_classifies_like_reqwest() {
+        let port = scripted_backend(Failure::ResetAfterRequest).await;
+        let direct = hyper_class(port).await;
+        let reqwest = reqwest_class(port).await;
+        assert_eq!(direct, reqwest);
+        assert!(
+            matches!(
+                direct,
+                ErrorClass::ConnectionReset | ErrorClass::ConnectionClosed
+            ),
+            "unexpected class {direct:?}"
+        );
+        assert!(request_reached_wire(direct));
+    }
+
+    #[tokio::test]
+    async fn close_before_response_classifies_like_reqwest() {
+        let port = scripted_backend(Failure::CloseBeforeResponse).await;
+        let direct = hyper_class(port).await;
+        let reqwest = reqwest_class(port).await;
+        assert_eq!(direct, reqwest);
+        assert_eq!(direct, ErrorClass::ConnectionClosed);
+    }
+
+    /// A refused dial never reaches hyper on the direct pool: it is a pool
+    /// dial error, classified by the direct-H2 pool classifier.
+    #[tokio::test]
+    async fn refused_dial_classifies_like_reqwest() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let dial_err = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect_err("nothing listens on the released port");
+        let direct = classify_http2_pool_error(&Http2PoolError::BackendUnavailable {
+            message: format!("Connection refused: {dial_err}"),
+            source: Some(BackendUnavailableSource::Io(dial_err)),
+        });
+        let reqwest = reqwest_class(port).await;
+        assert_eq!(direct, reqwest);
+        assert_eq!(direct, ErrorClass::ConnectionRefused);
+        assert!(!request_reached_wire(direct));
+    }
+}
+
+// ── Direct HTTP/1.1 request target matches reqwest's `url` serialization ──
+
+#[test]
+fn direct_h1_request_target_matches_url_serialization() {
+    use ferrum_edge::_test_support::direct_h1_origin_form_target_for_test as target;
+    for backend_url in [
+        "http://127.0.0.1:8080/base/check/é/€",
+        "http://127.0.0.1:8080/a b/\"q\"/<x>/`y`/{z}?k=v w&q='1'",
+        "http://127.0.0.1:8080/a/./b/../c",
+        "http://127.0.0.1:8080/a/%2e%2E/b",
+        "http://127.0.0.1:8080/a\\b",
+        "http://127.0.0.1:8080/plain/path?x=1&y=%20",
+        "http://127.0.0.1:8080/.well-known/x",
+        "http://127.0.0.1:8080",
+        "http://127.0.0.1:8080?only=query",
+        "http://127.0.0.1:8080/frag#ment",
+        "https://backend.test/api/v1/items?id=42",
+        // Malformed and unusual percent escapes.
+        "http://127.0.0.1:8080/%zz",
+        "http://127.0.0.1:8080/a%",
+        // Matrix-style segments.
+        "http://127.0.0.1:8080/a/..;/b",
+        "http://127.0.0.1:8080/a;x/b",
+        // Dot segments, encoded and trailing.
+        "http://127.0.0.1:8080/a/.%2e/b",
+        "http://127.0.0.1:8080/a/%2E./b",
+        "http://127.0.0.1:8080/a/.",
+        "http://127.0.0.1:8080/a/..",
+        "http://127.0.0.1:8080/a/...",
+        // Tab, CR, LF and DEL.
+        "http://127.0.0.1:8080/a\tb",
+        "http://127.0.0.1:8080/a\rb",
+        "http://127.0.0.1:8080/a\nb",
+        "http://127.0.0.1:8080/a\u{7f}b",
+        // Bytes url leaves alone in a path.
+        "http://127.0.0.1:8080/a^b|c[d]e",
+        // `'` and `\` in the query.
+        "http://127.0.0.1:8080/p?q='x'",
+        "http://127.0.0.1:8080/p?q=a\\b",
+        // Query and fragment edges.
+        "http://127.0.0.1:8080/p?a?b",
+        "http://127.0.0.1:8080/p?q#f",
+        "http://127.0.0.1:8080/#f",
+        // Empty segments.
+        "http://127.0.0.1:8080//x",
+        "http://127.0.0.1:8080/a/..//x",
+        // Userinfo never reaches the request target.
+        "http://user:pw@127.0.0.1:8080/p?q=1",
+        // A backslash ends the authority exactly as `/` does.
+        "http://127.0.0.1:8080\\a/b",
+    ] {
+        let parsed = url::Url::parse(backend_url).expect("valid URL");
+        // What reqwest actually puts on the wire: hyper's origin form of the
+        // `http::Uri` it builds from the serialized `url::Url`.
+        let reqwest_target = parsed.as_str().parse::<http::Uri>().ok().map(|uri| {
+            uri.path_and_query()
+                .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string())
+        });
+        assert_eq!(target(backend_url), reqwest_target, "{backend_url:?}");
+        if let Some(sent) = &reqwest_target {
+            let mut url_target = parsed.path().to_string();
+            if let Some(query) = parsed.query() {
+                url_target.push('?');
+                url_target.push_str(query);
+            }
+            assert_eq!(sent, &url_target, "{backend_url:?}");
+        }
+    }
+}

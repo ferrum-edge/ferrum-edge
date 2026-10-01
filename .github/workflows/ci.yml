@@ -2002,6 +2002,7 @@ jobs:
               functional_tcp_splice_backend_timeout_test
               functional_udp_proxy_test
               functional_unix_backend_test
+              functional_http1_direct_pool_test
               functional_websocket_test
               scripted_backend_h2_tests
               scripted_backend_h3_tests

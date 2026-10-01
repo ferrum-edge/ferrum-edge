@@ -290,10 +290,21 @@ async fn http1_status_retry_exports_one_client_span_per_attempt() {
         assert_eq!(string_attr(span, "http.request.method"), Some("GET"));
         assert_eq!(string_attr(span, "server.address"), Some("127.0.0.1"));
         assert_eq!(int_attr(span, "server.port"), Some(i64::from(backend_port)));
-        assert!(
-            attr(span, "gateway.backend.connection.reused").is_none(),
-            "the bundled HTTP/1.1 client does not expose reuse, so none is reported"
-        );
+        if index == 0 {
+            // The first attempt runs on the direct HTTP/1.1 pool (#5588), which
+            // reports its freshly dialed connection like the direct H2 pool.
+            assert_eq!(
+                bool_attr(span, "gateway.backend.connection.reused"),
+                Some(false)
+            );
+            let setup_ms = double_attr(span, "gateway.backend.connection.setup_ms")
+                .unwrap_or_else(|| panic!("setup_ms missing: {span:#}"));
+            assert!(setup_ms >= 0.0, "setup_ms={setup_ms}");
+        } else {
+            // Retry attempts still go through the bundled HTTP/1.1 client,
+            // which does not expose reuse, so none is reported.
+            assert!(attr(span, "gateway.backend.connection.reused").is_none());
+        }
     }
     let first = clients[0];
     assert_eq!(int_attr(first, "http.response.status_code"), Some(503));

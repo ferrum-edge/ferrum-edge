@@ -1589,6 +1589,30 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     ErrorClass::RequestError
 }
 
+/// Classify a post-connect hyper HTTP/1.1 client error exactly as
+/// [`classify_reqwest_error`] classifies the same failure when reqwest wraps
+/// it: the direct HTTP/1.1 pool (issue #5588) sends on the same hyper client
+/// connection reqwest used, so the same wire failure must keep the same class
+/// for retries, passive health, and the circuit breaker.
+pub fn classify_hyper_client_error(e: &hyper::Error) -> ErrorClass {
+    if e.is_timeout() {
+        return ErrorClass::ReadWriteTimeout;
+    }
+    if let Some(class) = classify_typed_chain(Some(e), false) {
+        return class;
+    }
+    let source_chain = format!("{:?}", e);
+    if source_chain.contains("closed before")
+        || source_chain.contains("incomplete message")
+        || source_chain.contains("IncompleteMessage")
+        || source_chain.contains("unexpected end")
+        || source_chain.contains("UnexpectedEof")
+    {
+        return ErrorClass::ConnectionClosed;
+    }
+    ErrorClass::RequestError
+}
+
 /// Whether the error chain contains a native-H3 stream error
 /// (`h3::error::StreamError`), i.e. it came from the native-H3 response body
 /// rather than a reqwest/hyper/io path. Used to route H3 body errors through the
