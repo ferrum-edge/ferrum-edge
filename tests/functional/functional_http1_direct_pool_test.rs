@@ -465,21 +465,22 @@ async fn direct_h1_isolates_tls_settings_and_never_negotiates_h2() {
         }
     }
 
-    let connections = connections.lock().expect("record");
-    assert_eq!(
-        connections.len(),
-        2,
-        "two TLS settings must use two pooled connections, each reused"
-    );
-    for (alpn, served) in connections.iter() {
+    {
+        let connections = connections.lock().expect("record");
         assert_eq!(
-            alpn.as_deref(),
-            Some(&b"http/1.1"[..]),
-            "the direct HTTP/1.1 pool must never offer h2"
+            connections.len(),
+            2,
+            "two TLS settings must use two pooled connections, each reused"
         );
-        assert_eq!(served.load(Ordering::SeqCst), 3);
+        for (alpn, served) in connections.iter() {
+            assert_eq!(
+                alpn.as_deref(),
+                Some(&b"http/1.1"[..]),
+                "the direct HTTP/1.1 pool must never offer h2"
+            );
+            assert_eq!(served.load(Ordering::SeqCst), 3);
+        }
     }
-    drop(connections);
     assert_transport(&harness, true).await;
 }
 
