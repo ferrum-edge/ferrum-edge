@@ -128,6 +128,24 @@ fn may_name_tools_call(body: &[u8]) -> bool {
         || memchr::memmem::find(body, TOOLS_CALL_METHOD.as_bytes()).is_some()
 }
 
+/// Whether `body` could name a `tools/call` to SOME JSON parser: its first
+/// non-whitespace byte opens an object or array, and it contains the literal
+/// method name or a JSON escape that could spell it.
+///
+/// This is deliberately looser than [`scan_request_bytes`], which only reports
+/// what a strict parser reads. A body strict parsing refuses — `NaN`,
+/// `Infinity`, comments, trailing commas — can still be accepted by a lenient
+/// upstream (Python's `json`, JSON5), so a policy that must not forward an
+/// uninspected call treats such a body as possibly carrying one. One `memchr`
+/// pass; nothing is parsed.
+pub fn may_carry_tool_call(body: &[u8]) -> bool {
+    let first = body
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+    matches!(first, Some(b'{' | b'[')) && may_name_tools_call(body)
+}
+
 /// Recognize the `tools/call` members of a request body.
 pub fn scan_request_bytes(body: &[u8]) -> RequestScan<'_> {
     let Some(first) = body

@@ -69,17 +69,19 @@
 //! only for bare JSON bodies; framed payloads fail parsing and pass uninspected
 //! (`mcp_gateway` refuses them).
 //!
-//! A body the whole-document JSON parse refuses passes uninspected only when
-//! the shared bounded recognizer finds no `tools/call` in it (an empty bridged
-//! body, a REST body, a framed payload, malformed JSON). `mcp_gateway` admits
-//! batch members one at a time, each with its own parser recursion budget, so
-//! a batch can exceed the whole-document limit while every member is admitted
-//! (GHSA-f2jp-59r9-fp64). A body that may carry a `tools/call`, including one
-//! the recognizer reports as uninspectable, is therefore refused with `400`
-//! (`ai_shield_rejected=jsonrpc_request_unparseable`) by `reject` and `redact`,
-//! and recorded as `ai_shield_warnings=jsonrpc_request_unparseable` by `warn`.
-//! `before_proxy` and `on_final_request_body` decide the same bytes the same
-//! way.
+//! A body the whole-document JSON parse refuses passes uninspected only when it
+//! cannot name a `tools/call` at all: it does not open with `{` or `[`, or it
+//! contains neither the literal `tools/call` nor a JSON escape (an empty
+//! bridged body, a REST body, a framed payload, malformed JSON naming no call).
+//! Anything else may still be executed: `mcp_gateway` admits batch members one
+//! at a time, each with its own parser recursion budget, so a batch can exceed
+//! the whole-document limit while every member is admitted
+//! (GHSA-f2jp-59r9-fp64), and a lenient upstream parser accepts `NaN`,
+//! comments, or trailing commas that serde refuses. Such a body is refused
+//! with `400` (`ai_shield_rejected=jsonrpc_request_unparseable`) by `reject`
+//! and `redact`, and recorded as `ai_shield_warnings=jsonrpc_request_unparseable`
+//! by `warn`. `before_proxy` and `on_final_request_body` decide the same bytes
+//! the same way.
 //!
 //! Redaction rewrites argument values in place; an OpenAPI bridge call carries
 //! the redacted arguments into its REST request or is refused by the gateway,
@@ -1225,7 +1227,8 @@ impl AiPromptShield {
     /// whole-document parse failed but which may still carry a `tools/call`
     /// (see [`mcp_body_may_carry_tool_call`]). Its arguments were never
     /// inspected, so enforcing actions fail closed rather than forward a call
-    /// the gateway may still admit member by member (GHSA-f2jp-59r9-fp64).
+    /// the gateway may admit member by member (GHSA-f2jp-59r9-fp64) or a
+    /// lenient upstream parser may accept.
     fn handle_unparseable_mcp_body(&self, ctx: &mut RequestContext) -> PluginResult {
         const REASON: &str = "jsonrpc_request_unparseable";
         if self.action == ShieldAction::Warn {
@@ -1748,19 +1751,19 @@ impl AiPromptShield {
 /// Whether an `mcp_arguments` body that the whole-document `Value` parse
 /// refused may still carry a `tools/call`.
 ///
-/// `mcp_gateway` admits a batch member by member, each with its own serde
-/// recursion budget, so a batch can exceed the whole-document limit while every
-/// member is admitted. The shared bounded recognizer reads the same framing the
-/// gateway does: `NoToolCall` (an empty bridged body, a REST body, framed
-/// gRPC-Web, malformed JSON) passes as before; `ToolCalls` or `Uninspectable`
-/// means a call may reach a server uninspected. The scan never builds a `Value`
-/// tree and is bounded by `max_scan_bytes`, which every caller checks first,
-/// and by the recognizer's own batch caps.
+/// Two readers can execute a call this shield never inspected. `mcp_gateway`
+/// admits a batch member by member, each with its own serde recursion budget,
+/// so a batch can exceed the whole-document limit while every member is
+/// admitted (GHSA-f2jp-59r9-fp64). And a lenient upstream (Python's `json`,
+/// JSON5) accepts `NaN`, `Infinity`, comments, or trailing commas that serde
+/// refuses. Neither can be ruled out from strict parsing, so any object- or
+/// array-shaped body that names `tools/call` or contains a JSON escape counts
+/// ([`mcp_jsonrpc::may_carry_tool_call`]). Bodies that cannot — an empty
+/// bridged body, a REST body, framed gRPC-Web, malformed JSON naming no call —
+/// pass as before. A single `memchr` pass, bounded by `max_scan_bytes`, which
+/// every caller checks first; nothing is parsed.
 fn mcp_body_may_carry_tool_call(body: &[u8]) -> bool {
-    !matches!(
-        mcp_jsonrpc::scan_request_bytes(body),
-        mcp_jsonrpc::RequestScan::NoToolCall
-    )
+    mcp_jsonrpc::may_carry_tool_call(body)
 }
 
 /// JSON-RPC numeric ids are wire tokens. Refuse redaction if serde's Value
@@ -1978,11 +1981,10 @@ impl Plugin for AiPromptShield {
                 Err(_) => return PluginResult::Continue,
             },
             // A JSON-RPC envelope carries no `stream` flag. A body the
-            // whole-document parse refuses usually carries no call either and
-            // passes, but the bounded recognizer still decides whether it may:
-            // `mcp_gateway` admits each batch member with its own recursion
-            // budget, so a batch can cross serde_json's whole-document limit
-            // while every member is admitted (GHSA-f2jp-59r9-fp64).
+            // whole-document parse refuses passes only when it cannot name a
+            // call: `mcp_gateway` admits each batch member with its own
+            // recursion budget (GHSA-f2jp-59r9-fp64), and a lenient upstream
+            // parser accepts what serde refuses.
             ScanMode::McpArguments => match serde_json::from_str::<Value>(body) {
                 Ok(json) => (self.detect_pii_mcp_arguments(&json), false),
                 Err(_) => {
@@ -2325,9 +2327,9 @@ impl Plugin for AiPromptShield {
                 }
                 // Same mirroring: `ScanMode::All` falls back to a raw-body scan
                 // for non-redact actions, Content mode continues, and
-                // `mcp_arguments` asks the bounded recognizer exactly as
-                // `before_proxy` does — an empty bridged body or a body with no
-                // `tools/call` continues, one that may carry a call is refused.
+                // `mcp_arguments` applies exactly the `before_proxy` test — an
+                // empty bridged body or a body that cannot name a `tools/call`
+                // continues, one that may carry a call is refused.
                 let detected = match self.scan_mode {
                     ScanMode::All => self.detect_pii_raw_fallback(body_text),
                     ScanMode::Content => Vec::new(),

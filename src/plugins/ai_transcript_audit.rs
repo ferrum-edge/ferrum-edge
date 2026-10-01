@@ -3851,10 +3851,12 @@ impl AiTranscriptAudit {
         let staged_mcp = if parsed.is_none() && is_mcp {
             // The body-redaction ceiling, or a whole-document parse failure,
             // left no Value. Stage the MCP section from the bounded byte
-            // recognizer so the final bridge hook still emits a record.
+            // recognizer so the final bridge hook still emits a record; only a
+            // body within the scan ceiling has its arguments hashed.
+            let hash_args = !scan_limited;
             bounded_mcp_scan
                 .as_ref()
-                .and_then(|scan| self.mcp_section_from_scan(scan, body, exportable))
+                .and_then(|scan| self.mcp_section_from_scan(scan, body, hash_args, exportable))
         } else {
             parsed
                 .as_ref()
@@ -4562,7 +4564,6 @@ impl AiTranscriptAudit {
         }
         let harvests = self.mode.harvests_metadata();
         let redact_names = self.mode != AuditMode::FullBody;
-        let max_request_bytes = self.limits.max_request_bytes;
         let empty_arguments = Value::Object(serde_json::Map::new());
         let mut name_bytes = 0usize;
         for call in calls {
@@ -4579,24 +4580,10 @@ impl AiTranscriptAudit {
             let mut entry = McpAuditCall {
                 tool,
                 tool_truncated,
-                arguments_hash: self.redactor.keyed_hash_hex(serialized.as_bytes()),
                 id_key: mcp_correlation_key(call.id),
                 ..McpAuditCall::default()
             };
-            if self.capture.mcp_arguments {
-                let budget = max_request_bytes.saturating_sub(staged.arguments_bytes);
-                if budget == 0 {
-                    entry.arguments_truncated = true;
-                    entry.arguments_omitted_reason = Some(OMIT_REASON_MCP_ARGUMENTS_BUDGET);
-                } else {
-                    let shaped = self.shape_body(serialized.as_bytes(), budget);
-                    let excerpt_bytes = shaped.excerpt.as_deref().map_or(0, str::len);
-                    staged.arguments_bytes = staged.arguments_bytes.saturating_add(excerpt_bytes);
-                    entry.arguments = shaped.excerpt;
-                    entry.arguments_truncated = shaped.truncated;
-                    entry.arguments_omitted_reason = shaped.omitted_reason;
-                }
-            }
+            self.attach_mcp_arguments(&mut entry, &serialized, &mut staged.arguments_bytes);
             let entry_bytes = mcp_call_retained_bytes(&entry);
             staged.retained_bytes = staged.retained_bytes.saturating_add(entry_bytes);
             staged.section.calls.push(entry);
@@ -4604,14 +4591,51 @@ impl AiTranscriptAudit {
         Some(staged)
     }
 
-    /// Retain bounded tool names and ids from a scan-limited raw request. The
-    /// scanner can identify those fields without building a full JSON Value;
-    /// arguments remain unhashed and omitted because redacted mode's scan
-    /// ceiling forbids walking their contents.
+    /// Key the call's serialized `arguments` into `entry`, and with
+    /// `capture.mcp_arguments` attach an excerpt charged to `arguments_bytes`
+    /// within `limits.max_request_bytes`.
+    fn attach_mcp_arguments(
+        &self,
+        entry: &mut McpAuditCall,
+        serialized: &str,
+        arguments_bytes: &mut usize,
+    ) {
+        entry.arguments_hash = self.redactor.keyed_hash_hex(serialized.as_bytes());
+        if !self.capture.mcp_arguments {
+            return;
+        }
+        let max_request_bytes = self.limits.max_request_bytes;
+        let budget = max_request_bytes.saturating_sub(*arguments_bytes);
+        if budget == 0 {
+            entry.arguments_truncated = true;
+            entry.arguments_omitted_reason = Some(OMIT_REASON_MCP_ARGUMENTS_BUDGET);
+            return;
+        }
+        let shaped = self.shape_body(serialized.as_bytes(), budget);
+        let excerpt_bytes = shaped.excerpt.as_deref().map_or(0, str::len);
+        *arguments_bytes = arguments_bytes.saturating_add(excerpt_bytes);
+        entry.arguments = shaped.excerpt;
+        entry.arguments_truncated = shaped.truncated;
+        entry.arguments_omitted_reason = shaped.omitted_reason;
+    }
+
+    /// Summarize the MCP calls of a request no whole-document `Value` exists
+    /// for, from the bounded byte recognizer: past `max_redaction_scan_bytes`,
+    /// or refused by the whole-document parse (a batch past serde_json's
+    /// recursion limit that `mcp_gateway` still admits member by member,
+    /// GHSA-f2jp-59r9-fp64). Tool names and ids come from the recognizer's
+    /// borrowed raw fields.
+    ///
+    /// With `hash_arguments` (the body is within the scan ceiling) each call's
+    /// `arguments` is parsed on its own and hashed and excerpted exactly like
+    /// [`Self::mcp_section`]. Past the ceiling, redacted mode forbids walking
+    /// argument contents, so they stay unhashed and omitted. A body the
+    /// recognizer reports as `Uninspectable` keeps an empty `calls` list.
     fn mcp_section_from_scan(
         &self,
         scan: &mcp_jsonrpc::RequestScan<'_>,
         body: &[u8],
+        hash_arguments: bool,
         exportable: bool,
     ) -> Option<StagedMcp> {
         let (batch, members) = match scan {
@@ -4654,12 +4678,27 @@ impl AiTranscriptAudit {
             } else {
                 (None, false)
             };
-            let entry = McpAuditCall {
+            let mut entry = McpAuditCall {
                 tool,
                 tool_truncated,
                 id_key: mcp_correlation_key_raw(member.id),
                 ..McpAuditCall::default()
             };
+            if hash_arguments {
+                // A member the gateway admits parsed within its own recursion
+                // budget, so its `arguments` (a sub-tree of it) parse on their
+                // own here. Arguments that do not parse on their own belong to a
+                // member the gateway refuses; they stay unhashed rather than
+                // keying bytes no tool receives.
+                let arguments = match call.arguments {
+                    Some(raw) => serde_json::from_str::<Value>(raw.get()).ok(),
+                    None => Some(Value::Object(serde_json::Map::new())),
+                };
+                if let Some(arguments) = arguments {
+                    let text = arguments.to_string();
+                    self.attach_mcp_arguments(&mut entry, &text, &mut staged.arguments_bytes);
+                }
+            }
             staged.retained_bytes = staged
                 .retained_bytes
                 .saturating_add(mcp_call_retained_bytes(&entry));

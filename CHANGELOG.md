@@ -16,22 +16,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batch member by member, each with its own recursion budget. A batch whose
   `tools/call` member nests just under serde_json's 128-level limit therefore
   failed the shield's whole-document parse yet was admitted and executed by
-  the gateway with its arguments never scanned. When the whole-document parse
-  fails, `before_proxy` and the final-body re-check now ask the shared bounded
-  MCP recognizer: a body that carries, or may carry, a `tools/call` (including
-  one the recognizer reports as uninspectable) is refused with `400` and
-  `ai_shield_rejected=jsonrpc_request_unparseable` in `reject` / `redact` mode,
-  and recorded as `ai_shield_warnings=jsonrpc_request_unparseable` in `warn`
-  mode. Bodies with no `tools/call` — including the empty final body of an
-  OpenAPI bridge call to a `GET` / `DELETE` operation, REST bodies, and framed
-  payloads — still pass uninspected.
+  the gateway with its arguments never scanned. The same gap let a lenient
+  upstream parser (Python's `json`, JSON5) execute a call whose body serde
+  refuses for `NaN`, `Infinity`, comments, or trailing commas. When the
+  whole-document parse fails, `before_proxy` and the final-body re-check now
+  refuse any object- or array-shaped body that names `tools/call` or contains a
+  JSON escape with `400` and `ai_shield_rejected=jsonrpc_request_unparseable`
+  in `reject` / `redact` mode, and record
+  `ai_shield_warnings=jsonrpc_request_unparseable` in `warn` mode. Bodies that
+  cannot name a call — including the empty final body of an OpenAPI bridge
+  call to a `GET` / `DELETE` operation, REST bodies, framed payloads, and
+  malformed JSON naming no call — still pass uninspected.
 - **`ai_transcript_audit` records MCP tool calls the whole-document parse
   refuses** (GHSA-f2jp-59r9-fp64 sibling, #5954). A request body that failed the
   `Value` parse was discarded as non-AI without being audited, so the same deep
   batch executed with no MCP audit record. The bounded MCP recognizer now runs
   whenever no parsed body is available (not only past the redaction scan
   ceiling), and a body that carries or may carry a `tools/call` stays an MCP
-  audit candidate.
+  audit candidate. Within the scan ceiling each recognized call's arguments are
+  parsed on their own and keyed (and, with `capture.mcp_arguments`, excerpted)
+  like a parsed call's; a body the recognizer cannot read is kept with an empty
+  `calls` list.
 
 ## [0.9.9] - 2026-10-01
 

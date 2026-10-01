@@ -13356,7 +13356,7 @@ async fn mcp_audit_recognizes_lowercase_post_and_scan_limited_bridged_calls() {
 fn mcp_batch_past_whole_document_recursion_limit() -> String {
     for depth in 1..=256 {
         let member = format!(
-            r#"{{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{{"name":"pets.getPet","arguments":{}"7"{}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{{"name":"pets.getPet","arguments":{}"alice@example.com"{}}}}}"#,
             r#"{"k":"#.repeat(depth),
             "}".repeat(depth)
         );
@@ -13374,23 +13374,35 @@ fn mcp_batch_past_whole_document_recursion_limit() -> String {
 async fn mcp_audit_records_tool_calls_the_whole_document_parse_refuses() {
     // GHSA-f2jp-59r9-fp64 sibling: a batch past the whole-document nesting
     // limit has no `Value`, but the gateway still executes its member, so the
-    // bounded byte recognizer must keep it an MCP audit candidate.
+    // bounded byte recognizer must keep it an MCP audit candidate, and the
+    // member's arguments (which parse on their own) are still keyed.
     let batch = mcp_batch_past_whole_document_recursion_limit();
-    let mut ctx = mcp_ctx(&json!({}));
-    ctx.metadata
-        .insert("request_body".to_string(), batch.clone());
-    let records = mcp_roundtrip(
-        json!({}),
-        &mut ctx,
-        batch.as_bytes(),
-        &json!([{"jsonrpc": "2.0", "id": 74, "result": {"isError": false}}]),
-    )
-    .await;
-    assert_eq!(records.len(), 1, "the deep batch must be audited");
-    let mcp = &records[0]["mcp"];
-    assert!(mcp.is_object(), "{records:#?}");
-    assert_eq!(mcp["batch"], json!(true), "{mcp}");
-    assert_eq!(mcp["calls"][0]["tool"], "pets.getPet", "{mcp}");
+    let response = json!([{"jsonrpc": "2.0", "id": 74, "result": {"isError": false}}]);
+    for capture_arguments in [false, true] {
+        let mut ctx = mcp_ctx(&json!({}));
+        ctx.metadata
+            .insert("request_body".to_string(), batch.clone());
+        let overrides = json!({ "capture": { "mcp_arguments": capture_arguments } });
+        let records = mcp_roundtrip(overrides, &mut ctx, batch.as_bytes(), &response).await;
+        assert_eq!(records.len(), 1, "the deep batch must be audited");
+        let mcp = &records[0]["mcp"];
+        assert!(mcp.is_object(), "{records:#?}");
+        assert_eq!(mcp["batch"], json!(true), "{mcp}");
+        let call = &mcp["calls"][0];
+        assert_eq!(call["tool"], "pets.getPet", "{mcp}");
+        assert_eq!(
+            call["arguments_hash"].as_str().map(str::len),
+            Some(64),
+            "the member's arguments are keyed like a parsed call's: {call}"
+        );
+        if capture_arguments {
+            let excerpt = call["arguments"].as_str().expect("arguments excerpt");
+            assert!(excerpt.contains(r#""k""#), "{excerpt}");
+            assert!(!excerpt.contains("alice@example.com"), "{excerpt}");
+        } else {
+            assert!(call.get("arguments").is_none(), "arguments are opt-in");
+        }
+    }
 }
 
 #[tokio::test]

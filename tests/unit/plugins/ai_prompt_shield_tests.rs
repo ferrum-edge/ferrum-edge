@@ -4288,8 +4288,24 @@ async fn mcp_arguments_mode_refuses_unparseable_bodies_that_may_carry_a_tool_cal
     // Past the recognizer's 32-member bound, so it reports `Uninspectable`.
     let deep_member = &deep_batch[1..deep_batch.len() - 1];
     let oversized_batch = format!("[{}]", [deep_member; 33].join(","));
+    // serde refuses `NaN`, but a lenient upstream parser (Python's `json`)
+    // accepts it and executes the call with the unscanned arguments.
+    let nan_call = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"crm.lookup","#,
+        r#""arguments":{"e":"alice@example.com","n":NaN}}}"#
+    );
+    // A truncated envelope that names the method: refused rather than guessed
+    // about, since it is object-shaped and spells `tools/call`.
+    let truncated_call =
+        r#"{"method":"tools/call","params":{"arguments":{"e":"alice@example.com"}}"#;
 
-    for body in [&deep_batch, &deep_singleton, &oversized_batch] {
+    for body in [
+        deep_batch.as_str(),
+        deep_singleton.as_str(),
+        oversized_batch.as_str(),
+        nan_call,
+        truncated_call,
+    ] {
         assert!(serde_json::from_str::<serde_json::Value>(body).is_err());
         for action in ["reject", "redact"] {
             let plugin = mcp_shield(action);
@@ -4317,37 +4333,39 @@ async fn mcp_arguments_mode_refuses_unparseable_bodies_that_may_carry_a_tool_cal
 
 #[tokio::test]
 async fn mcp_arguments_mode_warns_on_unparseable_bodies_that_may_carry_a_tool_call() {
-    let body = mcp_batch_beyond_whole_document_recursion_limit();
+    let deep_batch = mcp_batch_beyond_whole_document_recursion_limit();
+    let nan_call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"n":NaN}}"#;
     let plugin = mcp_shield("warn");
-    let mut ctx = make_post_ctx_with_raw_body(&body);
-    let mut headers = make_post_headers();
-    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert_eq!(
-        shield_metadata(&ctx, "ai_shield_warnings"),
-        Some("jsonrpc_request_unparseable")
-    );
-    assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+    for body in [deep_batch.as_str(), nan_call] {
+        let mut ctx = make_post_ctx_with_raw_body(body);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_warnings"),
+            Some("jsonrpc_request_unparseable")
+        );
+        assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
 
-    let (result, ctx) = mcp_final_decision(&plugin, body.as_bytes()).await;
-    assert_continue(result);
-    assert_eq!(
-        shield_metadata(&ctx, "ai_shield_warnings"),
-        Some("jsonrpc_request_unparseable")
-    );
-    assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+        let (result, ctx) = mcp_final_decision(&plugin, body.as_bytes()).await;
+        assert_continue(result);
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_warnings"),
+            Some("jsonrpc_request_unparseable")
+        );
+        assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), None);
+    }
 }
 
 #[tokio::test]
 async fn mcp_arguments_mode_passes_unparseable_bodies_without_a_tool_call() {
-    // Not one of these can carry a `tools/call` the gateway would execute: a
-    // REST body, malformed JSON (including a truncated envelope that names the
-    // method — `mcp_gateway` answers it with a parse error), a deep document
+    // Not one of these can name a `tools/call` to any parser: a REST body,
+    // malformed JSON that spells no call and has no escape, a deep document
     // that is not JSON-RPC, and a framed payload.
     let deep_non_call = format!("[{}1{}]", "[".repeat(200), "]".repeat(200));
     let bodies: [&[u8]; 5] = [
         b"petId=7&note=alice%40example.com",
-        br#"{"jsonrpc":"2.0","id":1,"method":"tools/list""#,
-        br#"{"method":"tools/call","params":{"arguments":{"e":"alice@example.com"}}"#,
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"n":NaN"#,
+        br#"[{"jsonrpc":"2.0","id":1,"method":"ping",}]"#,
         deep_non_call.as_bytes(),
         b"\x00\x00\x00\x00\x02{}",
     ];
