@@ -874,3 +874,35 @@ mod direct_h1_classification_parity {
         assert!(!request_reached_wire(direct));
     }
 }
+
+// ── Direct HTTP/1.1 request target matches reqwest's `url` serialization ──
+
+#[test]
+fn direct_h1_request_target_matches_url_serialization() {
+    use ferrum_edge::_test_support::direct_h1_origin_form_target_for_test as target;
+    for backend_url in [
+        "http://127.0.0.1:8080/base/check/é/€",
+        "http://127.0.0.1:8080/a b/\"q\"/<x>/`y`/{z}?k=v w&q='1'",
+        "http://127.0.0.1:8080/a/./b/../c",
+        "http://127.0.0.1:8080/a/%2e%2E/b",
+        "http://127.0.0.1:8080/a\\b",
+        "http://127.0.0.1:8080/plain/path?x=1&y=%20",
+        "http://127.0.0.1:8080/.well-known/x",
+        "http://127.0.0.1:8080",
+        "http://127.0.0.1:8080?only=query",
+        "http://127.0.0.1:8080/frag#ment",
+        "https://backend.test/api/v1/items?id=42",
+    ] {
+        let parsed = url::Url::parse(backend_url).expect("valid URL");
+        let mut expected = parsed.path().to_string();
+        if let Some(query) = parsed.query() {
+            expected.push('?');
+            expected.push_str(query);
+        }
+        assert_eq!(
+            target(backend_url).as_deref(),
+            Some(expected.as_str()),
+            "{backend_url}"
+        );
+    }
+}

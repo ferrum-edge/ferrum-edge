@@ -102,6 +102,13 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// The origin-form request target the direct HTTP/1.1 pool sends for an
+    /// absolute backend URL (issue #5588), for parity checks against the `url`
+    /// serialization reqwest used.
+    pub fn direct_h1_origin_form_target_for_test(backend_url: &str) -> Option<String> {
+        crate::proxy::direct_h1_origin_form_target_for_test(backend_url)
+    }
+
     /// Build the inner HTTP/1.1 request body the Ambient HBONE dispatch
     /// constructs, so an external test can drive a real pooled inner exchange
     /// end to end (issue #5042 step 2).

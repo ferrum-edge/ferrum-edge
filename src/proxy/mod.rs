@@ -49213,20 +49213,59 @@ fn direct_h1_dispatch_eligible(
 /// bound, matching reqwest, which then sets no connect timeout at all.
 const DIRECT_H1_UNBOUNDED_CONNECT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-/// Origin-form request target (`/path?query`) of an absolute backend URL.
+/// Origin-form request target (`/path?query`) of an absolute backend URL,
+/// serialized exactly as reqwest put it on the wire.
+///
+/// reqwest parses every backend URL with the `url` crate, which percent-encodes
+/// non-ASCII and other bytes outside the WHATWG path/query sets and resolves
+/// dot segments. A target made only of bytes `url` leaves untouched — the
+/// ordinary case — is used as is; anything else is serialized by `url` itself,
+/// so the backend receives byte-for-byte what the reqwest path sent.
 fn direct_h1_origin_form_uri(backend_url: &str) -> Option<hyper::Uri> {
     let after_scheme = backend_url
         .find("://")
         .map_or(backend_url, |i| &backend_url[i + 3..]);
-    let target = match after_scheme.find(['/', '?']) {
-        Some(i) if after_scheme.as_bytes()[i] == b'/' => &after_scheme[i..],
-        Some(i) => {
-            // `host?query` — origin form still needs the leading slash.
-            return format!("/{}", &after_scheme[i..]).parse().ok();
-        }
-        None => "/",
+    let target = match after_scheme.find(['/', '?', '#']) {
+        Some(i) => &after_scheme[i..],
+        None => "",
     };
+    if direct_h1_target_needs_url_serialization(target) {
+        let parsed = url::Url::parse(backend_url).ok()?;
+        let mut origin = String::with_capacity(target.len() + 16);
+        origin.push_str(parsed.path());
+        if let Some(query) = parsed.query() {
+            origin.push('?');
+            origin.push_str(query);
+        }
+        return origin.parse().ok();
+    }
     target.parse().ok()
+}
+
+/// Test hook: the origin-form target the direct HTTP/1.1 pool sends for a
+/// backend URL (issue #5588).
+pub(crate) fn direct_h1_origin_form_target_for_test(backend_url: &str) -> Option<String> {
+    direct_h1_origin_form_uri(backend_url).map(|uri| uri.to_string())
+}
+
+/// Whether `url` would rewrite this request target: any byte it percent-encodes
+/// in a path or a special-scheme query (controls, space, non-ASCII, `"` `#`
+/// `<` `>` `` ` `` `{` `}` `'`), a backslash it treats as a separator, a
+/// possible dot segment (`/.`, or `%2e` in either case), or a target that does
+/// not start with `/`. Over-matching only takes the slower, exact path.
+fn direct_h1_target_needs_url_serialization(target: &str) -> bool {
+    !target.starts_with('/')
+        || target.bytes().any(|b| {
+            b <= b' '
+                || b >= 0x7f
+                || matches!(
+                    b,
+                    b'"' | b'#' | b'<' | b'>' | b'`' | b'{' | b'}' | b'\\' | b'\''
+                )
+        })
+        || target.contains("/.")
+        || target.contains("%2e")
+        || target.contains("%2E")
 }
 
 fn direct_h1_send_error_response(
@@ -64913,8 +64952,9 @@ mod tests {
     /// A refactor that drops the `refine_stream_response_for_content_type` call
     /// site would regress the binary case back to `Buffered` and fail here —
     /// which the helper-level unit tests cannot catch.
-    #[tokio::test]
-    async fn proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection() {
+    async fn proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection_case(
+        direct: bool,
+    ) {
         async fn dispatch_body(
             state: &ProxyState,
             proxy: &Proxy,
@@ -64988,7 +65028,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let state = make_test_proxy_state(GatewayConfig::default());
+        let state = make_test_proxy_state_with_env(
+            GatewayConfig::default(),
+            crate::config::env_config::EnvConfig {
+                pool_http1_direct: direct,
+                ..Default::default()
+            },
+        );
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.backend_host = server.address().ip().to_string();
@@ -65011,7 +65057,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(binary, ResponseBody::Streaming { .. }),
+            streams_on_h1_dispatch_path(&binary, direct),
             "non-inspectable (octet-stream) response should be downgraded to streaming"
         );
 
@@ -65023,11 +65069,18 @@ mod tests {
         );
     }
 
+    /// Runs on both HTTP/1.1 dispatch paths: reqwest (`FERRUM_POOL_HTTP1_DIRECT=false`)
+    /// and the direct hyper pool, which streams as `ResponseBody::StreamingH2`.
+    #[tokio::test]
+    async fn proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection() {
+        proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection_case(false).await;
+        proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection_case(true).await;
+    }
+
     /// body_validator must release large non-matching responses on the
     /// reqwest (HTTP/1.1 / H2) path while keeping matching JSON buffered for
     /// validation. Mirrors the WAF wiring guard for #2323.
-    #[tokio::test]
-    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response() {
+    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response_case(direct: bool) {
         async fn dispatch_body(
             state: &ProxyState,
             proxy: &Proxy,
@@ -65110,7 +65163,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut state = make_test_proxy_state(GatewayConfig::default());
+        let mut state = make_test_proxy_state_with_env(
+            GatewayConfig::default(),
+            crate::config::env_config::EnvConfig {
+                pool_http1_direct: direct,
+                ..Default::default()
+            },
+        );
         state.max_response_body_size_bytes = 2_000_000;
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
@@ -65132,7 +65191,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(binary, ResponseBody::Streaming { .. }),
+            streams_on_h1_dispatch_path(&binary, direct),
             "non-matching image/png above the eager cutoff must stream"
         );
 
@@ -65172,8 +65231,17 @@ mod tests {
         }
     }
 
+    /// Runs on both HTTP/1.1 dispatch paths: reqwest (`FERRUM_POOL_HTTP1_DIRECT=false`)
+    /// and the direct hyper pool, which streams as `ResponseBody::StreamingH2`.
     #[tokio::test]
-    async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
+    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response() {
+        proxy_to_backend_downgrades_irrelevant_body_validator_response_case(false).await;
+        proxy_to_backend_downgrades_irrelevant_body_validator_response_case(true).await;
+    }
+
+    async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers_case(
+        direct: bool,
+    ) {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::path("/events"))
             .respond_with(
@@ -65184,7 +65252,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let state = make_test_proxy_state(GatewayConfig::default());
+        let state = make_test_proxy_state_with_env(
+            GatewayConfig::default(),
+            crate::config::env_config::EnvConfig {
+                pool_http1_direct: direct,
+                ..Default::default()
+            },
+        );
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.backend_host = server.address().ip().to_string();
@@ -65235,10 +65309,7 @@ mod tests {
                 panic!("test does not configure backend admission plugins")
             }
         };
-        assert!(matches!(
-            initial_response.body,
-            ResponseBody::Streaming { .. }
-        ));
+        assert!(streams_on_h1_dispatch_path(&initial_response.body, direct));
 
         let retry_response = proxy_to_backend_retry(
             &state,
@@ -65261,6 +65332,14 @@ mod tests {
             retry_response.body,
             ResponseBody::Streaming { .. }
         ));
+    }
+
+    /// Runs on both HTTP/1.1 dispatch paths: reqwest (`FERRUM_POOL_HTTP1_DIRECT=false`)
+    /// and the direct hyper pool, which streams as `ResponseBody::StreamingH2`.
+    #[tokio::test]
+    async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
+        retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers_case(false).await;
+        retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers_case(true).await;
     }
 
     #[tokio::test]
@@ -70652,6 +70731,16 @@ mod tests {
     //
     // See `validate_full_config()` rustdoc for the warn-vs-reject
     // categorization and rationale.
+
+    /// The streaming response variant each HTTP/1.1 dispatch path produces:
+    /// reqwest's `Streaming`, or the direct hyper pool's `StreamingH2`.
+    fn streams_on_h1_dispatch_path(body: &ResponseBody, direct: bool) -> bool {
+        if direct {
+            matches!(body, ResponseBody::StreamingH2(_))
+        } else {
+            matches!(body, ResponseBody::Streaming { .. })
+        }
+    }
 
     fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {
         make_test_proxy_state_with_env(

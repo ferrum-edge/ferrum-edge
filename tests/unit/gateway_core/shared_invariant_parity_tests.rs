@@ -2645,15 +2645,16 @@ fn every_pre_relay_write_flushes_before_the_relay_starts() {
 }
 
 /// Every direct hyper HTTP/1.1 dispatch that holds its connection's only
-/// `SendRequest` across the response wait (issue #5720): the HBONE inner pool
-/// and the Unix-socket pool, both in `src/proxy/mod.rs`. A request tokio
+/// `SendRequest` across the response wait (issue #5720): the HBONE inner pool,
+/// the Unix-socket pool, and the direct HTTP/1.1 pool (#5588), all in
+/// `src/proxy/mod.rs`. A request tokio
 /// publishes just after the connection task drained its queue stays stranded
 /// until that sender drops, so each site must await its response through the
 /// release helper. The reqwest HTTP/1.1 path carries the same fix inside the
 /// vendored hyper-util (issue #5714). HTTP/2 senders are clones shared with
 /// their pool, so dropping one cannot release the channel, and they are not
 /// sites of this invariant.
-const DIRECT_H1_DISPATCH_SITES: &[(&str, usize)] = &[("src/proxy/mod.rs", 2)];
+const DIRECT_H1_DISPATCH_SITES: &[(&str, usize)] = &[("src/proxy/mod.rs", 3)];
 
 #[test]
 fn every_direct_h1_dispatch_awaits_through_the_sender_release() {

@@ -2170,8 +2170,8 @@ fn test_reqwest_grpc_timeout_forwarding_uses_remaining_deadline_on_every_attempt
     assert_eq!(
         src.matches(".map(grpc_proxy::remaining_grpc_timeout_header_value)")
             .count(),
-        2,
-        "initial and retry reqwest dispatch must derive the outbound header from the absolute deadline"
+        3,
+        "the reqwest initial and retry dispatches and the direct HTTP/1.1 dispatch must derive the outbound header from the absolute deadline"
     );
     assert_eq!(
         src.matches("\"grpc-timeout\" if remaining_grpc_timeout_header.is_some() => continue")
