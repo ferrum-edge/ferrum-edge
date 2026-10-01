@@ -74,8 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     70 KiB to 1 MiB. At 5 MiB, the first run had one outlier pair at 0.86 and the
     re-run was neutral (0.997).
   - **Memory:** gateway RSS rose by 0–11 MiB at steady state and at most 15 MiB at
-    peak under a 200-connection load. The theoretical bound is about 12.5 MiB per
-    Tokio worker thread (see docs/infrastructure_sizing.md).
+    peak under a 200-connection load. The theoretical bound, on 4 KiB-page builds,
+    is 20 cached objects × the eight newly cacheable 40–128 KiB classes
+    (624 KiB) = 12,480 KiB, about 12.2 MiB per thread that frees objects in
+    those classes: the Tokio workers in the expected case. It is smaller on
+    16 KiB-page builds (see docs/infrastructure_sizing.md).
   - **Override or revert:** set `_RJEM_MALLOC_CONF=tcache_max:32768` to restore
     the jemalloc default; `_RJEM_MALLOC_CONF` overrides any compiled-in option.
     Windows builds, which do not use jemalloc, are unaffected.
