@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Reject pseudo-headers in native mesh `to.headers` rules** (#5951). The
+  request header map never contains HTTP pseudo-headers, so an accepted DENY
+  predicate such as `to.headers[":path"]` could never match. Config validation
+  now rejects `:path`, `:method`, `:authority`, and `:scheme` there, and points
+  operators to `to.paths` / `to.methods` / `to.hosts` or the supported
+  `when: request.headers[:path]` condition.
 - **Mesh authorization matches both the raw and the parameter-stripped path on
   services that allow path parameters** (#5948). On a route with
   `allow_path_parameters` (a mesh service opted in with

@@ -56,10 +56,10 @@ use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
     MAX_MESH_RULE_CONDITIONS, MeshPolicy, PolicyScope, WaypointAttachment,
-    normalize_mesh_condition_values, normalize_request_match_host_pattern,
-    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
-    policy_target_attachment_applies_to_service, resolve_target_port, validate_mesh_condition,
-    workload_selector_matches,
+    bracketed_mesh_attribute_name, normalize_mesh_condition_values,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
+    resolve_target_port, validate_mesh_condition, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -461,9 +461,11 @@ impl ConditionAttributeKeys {
             ATTR_DESTINATION_PORT => self.destination_port = true,
             ATTR_CONNECTION_SNI => self.connection_sni = true,
             _ => {
-                if bracketed_attribute_name(key, ATTR_REQUEST_HEADERS_PREFIX).is_some() {
+                if bracketed_mesh_attribute_name(key, ATTR_REQUEST_HEADERS_PREFIX).is_some() {
                     self.header_keys.insert(key.to_string());
-                } else if bracketed_attribute_name(key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX).is_some() {
+                } else if bracketed_mesh_attribute_name(key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
+                    .is_some()
+                {
                     self.claim_keys.insert(key.to_string());
                 }
                 // Anything left is an `experimental.envoy.filters.*` key or a
@@ -478,13 +480,6 @@ impl ConditionAttributeKeys {
             }
         }
     }
-}
-
-/// Extract `<name>` from an Istio bracketed attribute key
-/// (`request.headers[x-foo]` ⇒ `x-foo`). Returns `None` when `key` is not a
-/// `prefix...]` form.
-fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
-    key.strip_prefix(prefix)?.strip_suffix(']')
 }
 
 fn normalize_destination_backend_host(host: &str) -> Option<String> {
@@ -2125,14 +2120,16 @@ impl MeshAuthz {
             attributes.insert(ATTR_DESTINATION_IP.to_string(), ip.to_string().into());
         }
         for header_key in &keys.header_keys {
-            if let Some(name) = bracketed_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
+            if let Some(name) =
+                bracketed_mesh_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
                 && let Some(value) = http_header_attribute(ctx, headers, name)
             {
                 attributes.insert(header_key.clone(), value.into());
             }
         }
         for claim_key in &keys.claim_keys {
-            if let Some(name) = bracketed_attribute_name(claim_key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
+            if let Some(name) =
+                bracketed_mesh_attribute_name(claim_key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
                 && let Some(value) = ctx.mesh_request_auth_claims.get(name)
             {
                 attributes.insert(claim_key.clone(), jwt_attribute_to_mesh_attribute(value));

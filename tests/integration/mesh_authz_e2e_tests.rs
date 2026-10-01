@@ -3749,6 +3749,31 @@ async fn an_allow_path_condition_suffix_must_hold_for_the_stripped_spelling() {
 }
 
 #[tokio::test]
+async fn an_allow_path_and_suffix_condition_must_hold_for_both_spellings() {
+    let allow_app_png = MeshPolicy {
+        name: "allow-app-png".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            to: vec![RequestMatch {
+                paths: path_patterns(&["/app/*"]),
+                ..RequestMatch::default()
+            }],
+            when: vec![path_condition(&["*.png"], &[])],
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_app_png]);
+
+    let result = path_parameter_decision(&plugin, "/app/a;x.png").await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "the stripped /app/a does not satisfy the *.png condition, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_allow_path_condition_not_values_applies_to_either_spelling() {
     let allow_api = path_condition_policy(
         "allow-api-path",
