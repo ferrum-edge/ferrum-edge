@@ -378,6 +378,55 @@ fn provider_and_file_selectors_must_agree_with_the_field_kind() {
 }
 
 #[test]
+fn provider_well_known_field_names_must_agree_with_the_field_kind() {
+    let cases = [
+        (
+            "vault://secret/data/edge#tls.crt",
+            CA,
+            "secret field selects cert material, but this field expects ca_bundle material",
+        ),
+        (
+            "aws://edge-tls#tls.crt",
+            CA,
+            "secret field selects cert material, but this field expects ca_bundle material",
+        ),
+        (
+            "vault://secret/data/edge#tls.key",
+            CERT,
+            "secret field selects key material, but this field expects cert material",
+        ),
+        (
+            "aws://edge-tls#tls.key",
+            CERT,
+            "secret field selects key material, but this field expects cert material",
+        ),
+        (
+            "vault://secret/data/edge#ca.crt",
+            KEY,
+            "secret field selects ca_bundle material, but this field expects key material",
+        ),
+    ];
+    for (value, kind, reason) in cases {
+        assert_rejected(value, kind, reason);
+    }
+
+    for value in [
+        "vault://secret/data/edge#ca.crt",
+        "aws://edge-tls#ca.crt",
+        "vault://secret/data/edge#custom-ca.pem",
+        "aws://edge-tls#trust.pem",
+    ] {
+        assert_admitted(value, CA);
+    }
+    for value in ["vault://secret/edge#tls.crt", "aws://edge-tls#tls.crt"] {
+        assert_admitted(value, CERT);
+    }
+    for value in ["vault://secret/edge#tls.key", "aws://edge-tls#tls.key"] {
+        assert_admitted(value, KEY);
+    }
+}
+
+#[test]
 fn provider_file_path_and_inline_sources_stay_admitted() {
     for value in [
         "vault://secret/data/edge#ca",

@@ -2708,6 +2708,25 @@ fn translate_client_tls_settings(
     {
         return Err(invalid_resource(object, error));
     }
+    let client_material = [
+        (
+            "trafficPolicy.tls.clientCertificate",
+            client_certificate.as_deref(),
+            crate::tls::source::MaterialKind::Cert,
+        ),
+        (
+            "trafficPolicy.tls.privateKey",
+            private_key.as_deref(),
+            crate::tls::source::MaterialKind::Key,
+        ),
+    ];
+    for (field, value, kind) in client_material {
+        if let Some(value) = value
+            && let Err(error) = validate_tls_material_source_field(field, value, kind)
+        {
+            return Err(invalid_resource(object, error));
+        }
+    }
     if let Some(error) = validate_system_trust_roots_skip_verify_pairing(
         "trafficPolicy.tls.caCertificates",
         "trafficPolicy.tls.insecureSkipVerify",

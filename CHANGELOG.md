@@ -30,10 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collections, `acme://` collections other than `certificates`, and
   unrecognized `?kind=` values are refused. The check covers `managed://`,
   `acme://`, `k8s://`, `vault://` / `aws://` secret fields, and `?kind=` on
-  every scheme. It runs at config admission (proxy, upstream, Gateway frontend
-  certificates, mesh/Istio `caCertificates`, and every `FERRUM_*` TLS
-  material setting, so `ferrum-edge validate` reports it) and again at every
-  material load. Breaking: references that relied on a contradictory selector
+  every scheme. Kubernetes data keys and `vault://` / `aws://` secret fields
+  share one well-known key map (`tls.crt`, `tls.key`, `ca.crt`, …, plus keys
+  spelled as a material kind), so `vault://…#tls.crt` in
+  `FERRUM_TLS_CA_BUNDLE_PATH` is refused just like `k8s://…#tls.crt`. It runs
+  at config admission (proxy, upstream, Gateway frontend certificates,
+  mesh/Istio DestinationRule `caCertificates`, `clientCertificate`, and
+  `privateKey`, and every `FERRUM_*` TLS material setting, so
+  `ferrum-edge validate` reports it; the Admin API returns its usual `400`
+  validation error) and again at every material load. Breaking: references that relied on a contradictory selector
   must be corrected.
 
 ### Changed

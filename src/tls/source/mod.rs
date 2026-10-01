@@ -995,13 +995,13 @@ pub fn validate_source_field_kind(
         SourceScheme::K8sSecret => K8sSecretReference::parse(uri, field_kind).map(|_| ()),
         // Vault and AWS select a field of the stored secret with `#<field>`.
         // Field names are operator-chosen; only one that names a material kind
-        // is a selector this check can contradict.
+        // (a material-kind word or a well-known key such as `tls.crt`) is a
+        // selector this check can contradict.
         SourceScheme::Vault | SourceScheme::Aws => {
             let selected = uri
                 .identifier
                 .split_once('#')
-                .and_then(|(_, field)| MaterialKind::parse(field))
-                .filter(|kind| *kind != MaterialKind::Unknown);
+                .and_then(|(_, field)| well_known_material_key_kind(field));
             match selected {
                 Some(kind) if kind != field_kind => {
                     let details = format!(
@@ -1013,7 +1013,14 @@ pub fn validate_source_field_kind(
                 _ => Ok(()),
             }
         }
-        _ => Ok(()),
+        // These schemes carry no kind selector beyond the `kind` option
+        // checked above (`System` already returned). Listed explicitly so a
+        // new scheme must decide how its selectors are checked.
+        SourceScheme::File
+        | SourceScheme::Azure
+        | SourceScheme::Gcp
+        | SourceScheme::Pkcs11
+        | SourceScheme::System => Ok(()),
     }
 }
 
@@ -1885,7 +1892,7 @@ impl K8sSecretReference {
         // A well-known data key names its material; it must be the kind the
         // field expects, so `#tls.crt` cannot feed a CA field (issue #5959).
         if kind != MaterialKind::Unknown
-            && let Some(selected) = k8s_data_key_material_kind(&data_key)
+            && let Some(selected) = well_known_material_key_kind(&data_key)
             && selected != kind
         {
             return Err(MaterialError::InvalidSource {
@@ -1958,12 +1965,12 @@ fn default_k8s_secret_key(
     }
 }
 
-/// Material kind a Kubernetes Secret data key names: the standard
-/// `kubernetes.io/tls` keys, the defaults [`default_k8s_secret_key`] selects,
-/// or a key spelled as a material kind (`ca`, `cert`, `key`). Any other key is
-/// operator naming and names no kind.
-fn k8s_data_key_material_kind(data_key: &str) -> Option<MaterialKind> {
-    match data_key {
+/// Material kind a Kubernetes Secret data key or a Vault/AWS secret field
+/// names: the standard `kubernetes.io/tls` keys, the defaults
+/// [`default_k8s_secret_key`] selects, or a key spelled as a material kind
+/// (`ca`, `cert`, `key`). Any other key is operator naming and names no kind.
+fn well_known_material_key_kind(key: &str) -> Option<MaterialKind> {
+    match key {
         "tls.crt" => Some(MaterialKind::Cert),
         "tls.key" => Some(MaterialKind::Key),
         "ca.crt" => Some(MaterialKind::CaBundle),
