@@ -1165,7 +1165,7 @@ run_bench() {
         mkdir -p "$OUTPUT_DIR/perf"
         (
             sleep "$window"
-            sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_futex,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_sched_yield -p "$gpid" \
+            sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_futex,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_sched_yield,cpu-migrations -p "$gpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             local bpid cpid
             bpid=$(pgrep -x proto_backend | head -1)
@@ -1175,8 +1175,13 @@ run_bench() {
             [ -n "$cpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$cpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_clientproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             if [ "$gateway" = ferrum ]; then
-                sudo "$perf_bin" record -F 997 -p "$gpid" -o "/tmp/perf_${gateway}_${payload}.data" \
-                    -- sleep "$window" >/dev/null 2>&1
+                # On-CPU call graphs (the experiment image is built with frame
+                # pointers) plus an off-CPU view: every context switch-out of a
+                # gateway thread with the user stack it blocked in.
+                sudo "$perf_bin" record -F 997 -g -p "$gpid" -o "/tmp/perf_${gateway}_${payload}.data" \
+                    -- sleep "$window" >/dev/null 2>&1 &
+                sudo "$perf_bin" record -e sched:sched_switch -g -p "$gpid" -o "/tmp/perfoff_${gateway}_${payload}.data" \
+                    -- sleep "$window" >/dev/null 2>&1 &
             fi
             wait
         ) &
@@ -1228,7 +1233,14 @@ run_bench() {
                 | grep -v '^#' | grep -v '^$' | head -150 | cut -c1-200 > "$OUTPUT_DIR/perf/${gateway}_${payload}_symbols.txt" || true
             sudo "$perf_bin" report -i "/tmp/perf_${gateway}_${payload}.data" --no-children --sort dso --stdio 2>/dev/null \
                 | grep -v '^#' | grep -v '^$' | head -20 > "$OUTPUT_DIR/perf/${gateway}_${payload}_dso.txt" || true
+            sudo "$perf_bin" script -i "/tmp/perf_${gateway}_${payload}.data" 2>/dev/null \
+                | python3 "$SCRIPT_DIR/perf_fold.py" | gzip > "$OUTPUT_DIR/perf/${gateway}_${payload}_oncpu_folded.txt.gz" || true
             sudo rm -f "/tmp/perf_${gateway}_${payload}.data"
+        fi
+        if [ -f "/tmp/perfoff_${gateway}_${payload}.data" ]; then
+            sudo "$perf_bin" script -i "/tmp/perfoff_${gateway}_${payload}.data" 2>/dev/null \
+                | python3 "$SCRIPT_DIR/perf_fold.py" | gzip > "$OUTPUT_DIR/perf/${gateway}_${payload}_offcpu_folded.txt.gz" || true
+            sudo rm -f "/tmp/perfoff_${gateway}_${payload}.data"
         fi
     fi
     true
