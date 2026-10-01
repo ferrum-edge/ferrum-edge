@@ -440,6 +440,15 @@ fn https_proxy_referencing_ca(id: &str, ca_id: &str) -> Proxy {
     }
 }
 
+fn upstream_referencing_ca(id: &str, ca_uri: &str) -> ferrum_edge::config::types::Upstream {
+    serde_json::from_value(json!({
+        "id": id,
+        "targets": [{"host": "backend.example.com", "port": 443, "weight": 1}],
+        "backend_tls_server_ca_cert_path": ca_uri,
+    }))
+    .expect("valid upstream fixture")
+}
+
 #[tokio::test]
 async fn pairwise_routes_reject_cross_kind_create_overwrite_and_put() {
     let config = TestConfig::default();
@@ -530,8 +539,13 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
     let ca_id = format!("ref-ca-{}", Uuid::new_v4().simple());
     let gateway = GatewayConfig {
         proxies: vec![https_proxy_referencing_ca("ref-proxy", &ca_id)],
+        upstreams: vec![upstream_referencing_ca(
+            "ref-upstream",
+            &format!("managed://ca-bundles/{ca_id}"),
+        )],
         ..GatewayConfig::default()
     };
+    let mut gateway_for_admission = gateway.clone();
     let (addr, shutdown) = start_admin(create_test_admin_state(
         &config,
         Some(Arc::new(ArcSwap::new(Arc::new(gateway)))),
@@ -552,6 +566,27 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
         raw_http_status(&create),
         201,
         "create referenced CA: {create}"
+    );
+
+    gateway_for_admission
+        .validate_all_fields(30)
+        .expect("fragmentless managed CA URI is admitted by proxy and upstream validation");
+
+    gateway_for_admission.proxies[0].backend_tls_server_ca_cert_path =
+        Some(format!("managed://ca-bundles/{ca_id}#ca"));
+    gateway_for_admission.upstreams[0].backend_tls_server_ca_cert_path =
+        Some(format!("managed://ca-bundles/{ca_id}#ca"));
+    gateway_for_admission
+        .validate_all_fields(30)
+        .expect("explicit #ca fragment remains admitted for both fields");
+
+    gateway_for_admission.proxies[0].backend_tls_server_ca_cert_path =
+        Some(format!("managed://ca-bundles/{ca_id}#cert"));
+    gateway_for_admission.upstreams[0].backend_tls_server_ca_cert_path =
+        Some(format!("managed://ca-bundles/{ca_id}#cert"));
+    assert!(
+        gateway_for_admission.validate_all_fields(30).is_err(),
+        "a fragment selecting a conflicting material kind must be refused"
     );
 
     let same_kind = send_raw_admin_request(
