@@ -1713,8 +1713,10 @@ async fn relay_backend_write_sizes(buf_size: usize, client_reads: Vec<usize>) ->
     backend_writes.lock().unwrap().clone()
 }
 
-/// One maximum TLS record's plaintext: the read size that starts a top-up.
+/// One maximum TLS record's plaintext.
 const TLS_RECORD: usize = 16 * 1024;
+/// The smallest read that starts a top-up: half a maximum record.
+const TOP_UP_MIN: usize = 8 * 1024;
 
 /// Issue #5588: a userspace TLS reader hands the relay one 16 KiB record per
 /// read. While more is ready, the relay tops its buffer up and writes the
@@ -1725,6 +1727,14 @@ async fn full_record_reads_are_batched_into_one_write() {
     assert_eq!(writes, vec![2 * 16 * 1024 + 5_000]);
 }
 
+/// A peer that writes 8 KiB slices (`tokio::io::copy`) sends 8 KiB records.
+/// They batch too: the default 64 KiB buffer takes eight of them per write.
+#[tokio::test]
+async fn half_record_reads_are_batched_into_one_write() {
+    let writes = relay_backend_write_sizes(64 * 1024, vec![TOP_UP_MIN; 10]).await;
+    assert_eq!(writes, vec![65_536, 16_384]);
+}
+
 /// A short read ends the batch at once: no speculative extra read.
 #[tokio::test]
 async fn a_short_read_is_written_without_topping_up() {
@@ -1732,11 +1742,12 @@ async fn a_short_read_is_written_without_topping_up() {
     assert_eq!(writes, vec![1_000, 2_000]);
 }
 
-/// One byte under a full record is a short read: it is written on its own.
+/// One byte under the top-up threshold is a short read: it is written on its
+/// own.
 #[tokio::test]
-async fn a_read_one_byte_under_a_full_record_does_not_top_up() {
-    let writes = relay_backend_write_sizes(64 * 1024, vec![TLS_RECORD - 1, TLS_RECORD]).await;
-    assert_eq!(writes, vec![TLS_RECORD - 1, TLS_RECORD]);
+async fn a_read_one_byte_under_the_threshold_does_not_top_up() {
+    let writes = relay_backend_write_sizes(64 * 1024, vec![TOP_UP_MIN - 1, TOP_UP_MIN]).await;
+    assert_eq!(writes, vec![TOP_UP_MIN - 1, TOP_UP_MIN]);
 }
 
 /// A batch stops when the buffer is full: the default adaptive 64 KiB buffer

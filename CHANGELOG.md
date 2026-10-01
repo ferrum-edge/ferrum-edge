@@ -61,6 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **TCP and WebSocket relays batch TLS records of 8 KiB and up** (#5588). A
+  relay read that returns at least 8 KiB is now topped up with the reads
+  already waiting before the batch is written, down from 16 KiB. Peers that
+  write in 8 KiB slices, such as anything built on `tokio::io::copy`, send
+  8 KiB TLS records, which the 16 KiB threshold forwarded one write per
+  record; the far side then woke and decrypted once per record. On the
+  TCP-TLS benchmark, whose backend echoes with `tokio::io::copy`, throughput
+  rose 14–31% at every payload size (0.89–0.95× Envoy to 1.01–1.20×), with
+  lower p99. Reads under 8 KiB are still written at once.
 - **jemalloc's thread cache now serves allocations up to 128 KiB** (#5588). The
   binary compiles in the jemalloc option `tcache_max:131072`; the jemalloc default
   is 32 KiB. Each proxied request boxes its handler future, which is about 90 KiB,
