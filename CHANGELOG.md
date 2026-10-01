@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is rejected. Fragmentless `k8s://` and secret-provider CA sources in these
   fields now check expiry against the CA data key (`ca.crt`), so a valid
   `tls.crt` cannot mask an expired CA certificate.
+
 ### Changed
 
 - Documented the Edge-owned contract vocabularies (`gateway-errors`,
