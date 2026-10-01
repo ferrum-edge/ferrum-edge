@@ -277,6 +277,7 @@ pub(crate) struct ResolvedPendingSecret {
     suffixed_key: String,
 }
 
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub(crate) trait SecretBackend: Sync + Send {
     fn kind(&self) -> BackendKind;

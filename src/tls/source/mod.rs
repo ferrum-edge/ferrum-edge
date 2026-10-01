@@ -842,6 +842,7 @@ pub enum MaterialWatch {
 }
 
 #[allow(dead_code)]
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait::async_trait]
 pub trait MaterialLoader: Send + Sync + 'static {
     fn scheme(&self) -> SourceScheme;

@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by consumers via `contracts-edge-<edge-version>` tags. The README lists the
   Edge source files whose changes require a ferrum-contracts PR, and CLAUDE.md
   notes the requirement.
+- Suppressed Rust 1.99's `clippy::double_must_use` on `#[async_trait]` traits
+  and tonic-generated proto modules, and dropped needless borrows flagged by
+  `clippy::needless_borrows_for_generic_args`.
+- Routed atomic read-modify-write updates through a crate-private
+  `sync_compat::AtomicUpdate::update_with` shim, so the crate builds without
+  Rust 1.99's `fetch_update` deprecation while the fuzz lanes stay on pinned
+  `nightly-2025-07-01`, where `try_update` is unstable. The h2 guard observer
+  uses an equivalent compare-exchange loop, with its pinned hashes refreshed.
 
 ## [0.9.10] - 2026-10-01
 

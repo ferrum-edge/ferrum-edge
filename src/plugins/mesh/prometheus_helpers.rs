@@ -20,6 +20,7 @@ use crate::modes::mesh::metric_tag_cel::{
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
+use crate::sync_compat::AtomicUpdate;
 
 const MESH_CERT_EXPIRY_STALE_RETENTION_SECONDS: u64 = 6 * 60 * 60;
 const MESH_CERT_EXPIRY_EVICTION_INTERVAL_SECONDS: u64 = 60;
@@ -1118,7 +1119,7 @@ fn apply_admission_gauge_delta(gauge: &AtomicU64, delta: i64) {
         gauge.fetch_add(delta as u64, Ordering::Relaxed);
     } else {
         let amount = (-delta) as u64;
-        let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = gauge.update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(amount))
         });
     }
@@ -1241,7 +1242,7 @@ pub fn increment_workload_api_active_connections() {
 /// release (which the permit's `Drop` makes unreachable) could never wrap the
 /// gauge to `u64::MAX`.
 pub fn decrement_workload_api_active_connections() {
-    let _ = WORKLOAD_API_ACTIVE_CONNECTIONS.fetch_update(
+    let _ = WORKLOAD_API_ACTIVE_CONNECTIONS.update_with(
         Ordering::Relaxed,
         Ordering::Relaxed,
         |current| Some(current.saturating_sub(1)),
@@ -1288,10 +1289,9 @@ pub fn increment_workload_api_active_rpcs() {
 
 /// Release one admitted Workload API RPC.
 pub fn decrement_workload_api_active_rpcs() {
-    let _ =
-        WORKLOAD_API_ACTIVE_RPCS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_sub(1))
-        });
+    let _ = WORKLOAD_API_ACTIVE_RPCS.update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
 }
 
 /// Count a Workload API RPC shed by RPC admission — the service-wide ceiling,
@@ -1927,7 +1927,7 @@ fn intern_label(value: &str) -> Arc<str> {
         return Arc::clone(existing.value());
     }
     if MESH_LABEL_INTERN_COUNT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        .update_with(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < MESH_LABEL_INTERN_CAP).then_some(count + 1)
         })
         .is_err()

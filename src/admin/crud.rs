@@ -2462,6 +2462,7 @@ impl ValidationError {
     }
 }
 
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait::async_trait]
 pub(crate) trait AdminResource:
     Send + Sync + Serialize + DeserializeOwned + Clone + Sized + 'static

@@ -6,8 +6,12 @@
 //! rest of the crate uses a stable path:
 //! `crate::identity::workload_api::proto::*`.
 
+// `clippy::double_must_use`: tonic's generated server trait expands through
+// async-trait, which adds a bare `#[must_use]` to methods already returning a
+// must-use boxed future.
 #![allow(
     missing_docs,
+    clippy::double_must_use,
     clippy::large_enum_variant,
     clippy::derive_partial_eq_without_eq
 )]

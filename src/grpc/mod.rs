@@ -20,5 +20,8 @@ pub mod mesh_server;
 pub mod mesh_slice_drift;
 
 pub mod proto {
+    // tonic's generated server traits expand through async-trait, which adds a
+    // bare `#[must_use]` to methods already returning a must-use boxed future.
+    #![allow(clippy::double_must_use)]
     tonic::include_proto!("ferrum");
 }
