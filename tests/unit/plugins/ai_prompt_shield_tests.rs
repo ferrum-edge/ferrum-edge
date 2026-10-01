@@ -4231,6 +4231,58 @@ async fn mcp_arguments_mode_scans_every_batch_member() {
     assert_eq!(shield_metadata(&ctx, "ai_shield_rejected"), Some("email"));
 }
 
+fn mcp_batch_beyond_whole_document_recursion_limit() -> String {
+    for depth in 1..=256 {
+        let member = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"crm.lookup","arguments":{}"alice@example.com"{}}}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        let batch = format!("[{member}]");
+        if serde_json::from_str::<serde_json::Value>(&member).is_ok()
+            && serde_json::from_str::<serde_json::Value>(&batch).is_err()
+        {
+            return batch;
+        }
+    }
+    panic!("serde_json exposed no standalone-member/batch recursion boundary");
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_fails_closed_beyond_whole_document_recursion_limit() {
+    let body = mcp_batch_beyond_whole_document_recursion_limit();
+
+    for action in ["reject", "redact"] {
+        let plugin = mcp_shield(action);
+        let mut ctx = make_post_ctx_with_raw_body(&body);
+        let mut headers = make_post_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_rejected"),
+            Some("jsonrpc_request_uninspectable"),
+            "{action} must not forward a batch that the whole-document parser cannot inspect"
+        );
+    }
+
+    // Final enforcement must make the same fail-closed decision if a later
+    // transformer replaces an initially clean request with the crafted batch.
+    let plugin = mcp_shield("reject");
+    let clean = mcp_tool_call(1, json!({"q": "weather"}));
+    let mut ctx = make_post_ctx(&clean);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_rejected"),
+        Some("jsonrpc_request_uninspectable")
+    );
+}
+
 #[tokio::test]
 async fn mcp_arguments_mode_follows_the_mcp_gateway_media_types() {
     let plugin = mcp_shield("reject");

@@ -1922,10 +1922,17 @@ impl Plugin for AiPromptShield {
                 Err(_) => return PluginResult::Continue,
             },
             // A JSON-RPC envelope carries no `stream` flag. A malformed body
-            // carries no call either (`mcp_gateway` refuses it).
+            // normally carries no call either. Fail closed for enforcing
+            // actions, however, because `mcp_gateway` parses batch members
+            // independently and can accept a member whose enclosing array
+            // crosses serde_json's whole-document recursion limit.
             ScanMode::McpArguments => match serde_json::from_str::<Value>(body) {
                 Ok(json) => (self.detect_pii_mcp_arguments(&json), false),
-                Err(_) => return PluginResult::Continue,
+                Err(_) if self.action == ShieldAction::Warn => return PluginResult::Continue,
+                Err(_) => {
+                    return self
+                        .reject_uninspectable_mcp_body(ctx, "jsonrpc_request_uninspectable");
+                }
             },
         };
 
@@ -2262,7 +2269,12 @@ impl Plugin for AiPromptShield {
                 // for non-redact actions, and Content mode continues.
                 let detected = match self.scan_mode {
                     ScanMode::All => self.detect_pii_raw_fallback(body_text),
-                    ScanMode::Content | ScanMode::McpArguments => Vec::new(),
+                    ScanMode::Content => Vec::new(),
+                    ScanMode::McpArguments if self.action == ShieldAction::Warn => Vec::new(),
+                    ScanMode::McpArguments => {
+                        return self
+                            .reject_uninspectable_mcp_body(ctx, "jsonrpc_request_uninspectable");
+                    }
                 };
                 return self.decide_final_request_body(ctx, detected);
             }
