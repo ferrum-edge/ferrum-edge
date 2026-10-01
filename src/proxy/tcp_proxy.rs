@@ -8490,6 +8490,13 @@ enum CarriedRead {
 /// the buffer up the relay wrote each 16 KiB record separately: about twice
 /// the writes, and the per-write kernel cost, of a relay that batches.
 const RELAY_TOP_UP_MIN: usize = 16 * 1024;
+// Bench-only experiment knob (not for merge).
+static RELAY_TOP_UP_MIN_EXP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("FERRUM_BENCH_RELAY_TOP_UP_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RELAY_TOP_UP_MIN)
+});
 /// Bound on extra reads per batch. The relay buffer is usually the real
 /// limit: the default adaptive 64 KiB buffer holds four records, so a batch
 /// makes at most 3 extra reads; a buffer of 16 KiB or less never batches (a
@@ -8839,7 +8846,7 @@ where
                             // written first.
                             let mut last = read_buf.filled().len();
                             let mut rounds = 0;
-                            while last >= RELAY_TOP_UP_MIN
+                            while last >= *RELAY_TOP_UP_MIN_EXP
                                 && read_buf.remaining() > 0
                                 && rounds < RELAY_TOP_UP_MAX_ROUNDS
                             {
