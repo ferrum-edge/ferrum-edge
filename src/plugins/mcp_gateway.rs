@@ -1666,8 +1666,10 @@ impl McpGateway {
     /// keeping a second, stricter copy: `application/vnd.audit+JSON` names the
     /// same media type as `application/vnd.audit+json` and must be admitted
     /// identically. A request with no `Content-Type` at all is still admitted.
+    /// A `charset` other than UTF-8 is refused (see
+    /// [`mcp_request_content_type_is_json`]).
     fn content_type_is_json(headers: &HashMap<String, String>) -> bool {
-        header_value(headers, "content-type").is_none_or(mcp_content_type_is_json)
+        header_value(headers, "content-type").is_none_or(mcp_request_content_type_is_json)
     }
 
     /// Whether the raw request body is shaped like a JSON-RPC batch, decided
@@ -7929,6 +7931,15 @@ enum ResponseRewriteOutcome {
 
 fn mcp_content_type_is_json(value: &str) -> bool {
     mcp_jsonrpc::content_type_is_json(value)
+}
+
+/// Request-side admission: a JSON media type with no `charset` or a UTF-8 one.
+/// The gateway reads JSON-RPC as UTF-8; a body declared in another charset
+/// (UTF-7 is plain ASCII and still parses) would be routed, policy-checked,
+/// and governed as one text and decoded as another by a charset-aware upstream
+/// (GHSA-4f9m-cfqg-fhx9). Responses keep the plain media-type check.
+fn mcp_request_content_type_is_json(value: &str) -> bool {
+    mcp_content_type_is_json(value) && mcp_jsonrpc::content_type_charset_is_utf8(value)
 }
 
 pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {

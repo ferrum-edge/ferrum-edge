@@ -17,8 +17,9 @@
 //! gRPC-Web still rides the composed HTTP/gRPC-Web view. Ordinary scan modes
 //! skip its framed `application/grpc-web*` bodies. In `mcp_arguments` mode,
 //! `+json` gRPC-Web media types are in scope only when the body is bare JSON.
-//! Framed payloads fail JSON parsing and pass uninspected; `mcp_gateway`
-//! refuses those frames.
+//! Framed payloads fail JSON parsing and pass uninspected unless they look
+//! like a JSON document that could carry a `tools/call` (see "MCP tool
+//! arguments"); `mcp_gateway` refuses frames.
 //!
 //! ## The final backend-visible body is authoritative
 //!
@@ -65,10 +66,39 @@
 //! `Content-Type`, and a body with duplicate member names is refused by
 //! enforcing actions instead of being read one way here and another way by the
 //! server that executes the call. `+json` gRPC-Web media types are accepted
-//! only for bare JSON bodies; framed payloads fail parsing and pass uninspected
-//! (`mcp_gateway` refuses them). Redaction rewrites argument values in place;
-//! an OpenAPI bridge call carries the redacted arguments into its REST request
-//! or is refused by the gateway, never forwarded with the originals.
+//! only for bare JSON bodies (`mcp_gateway` refuses framed payloads).
+//!
+//! A body the whole-document JSON parse refuses passes uninspected only when it
+//! is not recognizable as a JSON document that could carry a `tools/call` (an
+//! empty bridged body, a REST body, base64 `grpc-web-text`, malformed JSON
+//! naming no call): it has no byte-order mark, no NUL byte ahead of a
+//! JSON-shaped first character (`{`, `[`, `/`, `#` — UTF-16 / UTF-32 JSON),
+//! its first byte after ASCII whitespace is not `/`, `#`, or a non-ASCII
+//! character, and it either does not open with `{` or `[` or contains neither
+//! the literal `tools/call` nor a JSON escape. Anything else may still be
+//! executed: `mcp_gateway` admits batch members one at a time, each with its own parser recursion budget, so a
+//! batch can exceed the whole-document limit while every member is admitted
+//! (GHSA-f2jp-59r9-fp64), and a lenient upstream decoder accepts a BOM,
+//! UTF-16 / UTF-32, `NaN`, comments, or trailing commas that serde refuses.
+//! Such a body is refused with `400`
+//! (`ai_shield_rejected=jsonrpc_request_unparseable`) by `reject` and `redact`,
+//! and recorded as `ai_shield_warnings=jsonrpc_request_unparseable` by `warn`;
+//! a non-UTF-8 body is treated the same way. `before_proxy` and
+//! `on_final_request_body` decide the same bytes the same way, except that a
+//! non-UTF-8 body is first seen by the final hook (the proxy publishes no UTF-8
+//! view for `before_proxy` to inspect, so it decided nothing about it).
+//! Configure `mcp_arguments` on MCP routes only.
+//!
+//! The body is read as UTF-8, so an in-scope request whose `Content-Type`
+//! declares any other `charset` (UTF-7 is plain ASCII and still parses) is
+//! refused with `400` (`ai_shield_rejected=unsupported_charset`) by `reject`
+//! and `redact` before any parse, and recorded as
+//! `ai_shield_warnings=unsupported_charset` by `warn` (GHSA-4f9m-cfqg-fhx9).
+//! Both hooks apply the same rule to the same `Content-Type`.
+//!
+//! Redaction rewrites argument values in place; an OpenAPI bridge call carries
+//! the redacted arguments into its REST request or is refused by the gateway,
+//! never forwarded with the originals.
 //!
 //! ## Bounded redaction output
 //!
@@ -1206,6 +1236,63 @@ impl AiPromptShield {
         }
     }
 
+    /// Whether this `mcp_arguments` instance must refuse the request's
+    /// declared `charset`: anything other than UTF-8 (see
+    /// [`mcp_jsonrpc::content_type_charset_is_utf8`]).
+    fn has_unsupported_mcp_charset(&self, headers: &HashMap<String, String>) -> bool {
+        self.scan_mode == ScanMode::McpArguments
+            && headers
+                .get("content-type")
+                .is_some_and(|value| !mcp_jsonrpc::content_type_charset_is_utf8(value))
+    }
+
+    /// Refuse (or, in warn mode, record) an `mcp_arguments` request whose
+    /// `Content-Type` declares a non-UTF-8 `charset`. The shield reads the body
+    /// as UTF-8; an upstream that decodes by the declared charset (UTF-7 is
+    /// plain ASCII JSON) would execute arguments this shield never saw
+    /// (GHSA-4f9m-cfqg-fhx9). Decided from headers alone, before any parse.
+    fn handle_unsupported_mcp_charset(&self, ctx: &mut RequestContext) -> PluginResult {
+        const REASON: &str = "unsupported_charset";
+        if self.action == ShieldAction::Warn {
+            warn_sampled!(
+                reason = REASON,
+                "ai_prompt_shield: MCP request declares a non-UTF-8 charset (warn mode)"
+            );
+            ctx.metadata
+                .insert("ai_shield_warnings".to_string(), REASON.to_string());
+            return PluginResult::Continue;
+        }
+        warn_sampled!(
+            reason = REASON,
+            "ai_prompt_shield: rejecting MCP request that declares a non-UTF-8 charset"
+        );
+        self.reject_uninspectable_mcp_body(ctx, REASON)
+    }
+
+    /// Refuse (or, in warn mode, record) an `mcp_arguments` body whose
+    /// whole-document parse failed but which may still carry a `tools/call`
+    /// (see [`mcp_body_may_carry_tool_call`]). Its arguments were never
+    /// inspected, so enforcing actions fail closed rather than forward a call
+    /// the gateway may admit member by member (GHSA-f2jp-59r9-fp64) or a
+    /// lenient upstream parser may accept.
+    fn handle_unparseable_mcp_body(&self, ctx: &mut RequestContext) -> PluginResult {
+        const REASON: &str = "jsonrpc_request_unparseable";
+        if self.action == ShieldAction::Warn {
+            warn_sampled!(
+                reason = REASON,
+                "ai_prompt_shield: MCP request body could not be parsed for inspection (warn mode)"
+            );
+            ctx.metadata
+                .insert("ai_shield_warnings".to_string(), REASON.to_string());
+            return PluginResult::Continue;
+        }
+        warn_sampled!(
+            reason = REASON,
+            "ai_prompt_shield: rejecting MCP request body that could not be parsed for inspection"
+        );
+        self.reject_uninspectable_mcp_body(ctx, REASON)
+    }
+
     /// Whether the ORIGINAL request contains a raw-body match that token
     /// rewriting cannot remove — i.e. an individual match in the serialized body
     /// whose matched byte span is not fully contained inside the serialized span
@@ -1707,6 +1794,28 @@ impl AiPromptShield {
     }
 }
 
+/// Whether an `mcp_arguments` body that the whole-document `Value` parse
+/// refused may still carry a `tools/call`.
+///
+/// Two readers can execute a call this shield never inspected. `mcp_gateway`
+/// admits a batch member by member, each with its own serde recursion budget,
+/// so a batch can exceed the whole-document limit while every member is
+/// admitted (GHSA-f2jp-59r9-fp64). And a lenient upstream (Python's `json`,
+/// JSON5) accepts `NaN`, `Infinity`, comments, or trailing commas that serde
+/// refuses. Neither can be ruled out from strict parsing, so any object- or
+/// array-shaped body that names `tools/call` or contains a JSON escape counts
+/// ([`mcp_jsonrpc::may_carry_tool_call`]), as does UTF-16 / UTF-32 JSON (NUL
+/// bytes ahead of a JSON-shaped first character), a byte-order mark, or a first
+/// byte after ASCII whitespace that is `/`, `#` (a comment), or non-ASCII.
+/// Bodies not recognizable as such a document — an empty bridged body, a REST
+/// body, base64 gRPC-Web text, malformed JSON naming no call — pass as before.
+/// The cost is a BOM prefix check, a leading-whitespace scan, and `memchr` /
+/// `memmem` passes, all bounded by `max_scan_bytes`, which every caller checks
+/// first; nothing is parsed.
+fn mcp_body_may_carry_tool_call(body: &[u8]) -> bool {
+    mcp_jsonrpc::may_carry_tool_call(body)
+}
+
 /// JSON-RPC numeric ids are wire tokens. Refuse redaction if serde's Value
 /// representation would rewrite an exponent, fraction, or integer outside its
 /// exact signed/unsigned range.
@@ -1858,6 +1967,13 @@ impl Plugin for AiPromptShield {
             return self.reject_uninspectable_mcp_body(ctx, "unsupported_content_encoding");
         }
 
+        // A non-UTF-8 `charset` is decided from headers, before any parse. Warn
+        // mode records it and leaves the request unmarked: the body is not read
+        // as the text an upstream will decode, so there is nothing to scan.
+        if self.has_unsupported_mcp_charset(headers) {
+            return self.handle_unsupported_mcp_charset(ctx);
+        }
+
         // This instance owns the request from here on. Carry that scope into
         // `on_final_request_body` so a later body transform cannot change
         // policy-relevant content after this hook decided (see the
@@ -1921,11 +2037,20 @@ impl Plugin for AiPromptShield {
                 }
                 Err(_) => return PluginResult::Continue,
             },
-            // A JSON-RPC envelope carries no `stream` flag. A malformed body
-            // carries no call either (`mcp_gateway` refuses it).
+            // A JSON-RPC envelope carries no `stream` flag. A body the
+            // whole-document parse refuses passes only when it is not
+            // recognizable as a JSON document that could carry a call:
+            // `mcp_gateway` admits each batch member with its own recursion
+            // budget (GHSA-f2jp-59r9-fp64), and a lenient upstream parser
+            // accepts what serde refuses.
             ScanMode::McpArguments => match serde_json::from_str::<Value>(body) {
                 Ok(json) => (self.detect_pii_mcp_arguments(&json), false),
-                Err(_) => return PluginResult::Continue,
+                Err(_) => {
+                    if mcp_body_may_carry_tool_call(body.as_bytes()) {
+                        return self.handle_unparseable_mcp_body(ctx);
+                    }
+                    return PluginResult::Continue;
+                }
             },
         };
 
@@ -2221,6 +2346,14 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
+        // The same `Content-Type` gets the same charset decision as in
+        // `before_proxy`: a request that hook passed still passes, one it
+        // refused never reaches here, and only a header a later transform
+        // rewrote to a non-UTF-8 charset is refused at this point.
+        if self.has_unsupported_mcp_charset(headers) {
+            return self.handle_unsupported_mcp_charset(ctx);
+        }
+
         // Read through the shared gate: when a content coding is present on a
         // claimed request the gate has already staged the decoded plaintext, and
         // scanning the encoded octets instead would find nothing.
@@ -2246,10 +2379,19 @@ impl Plugin for AiPromptShield {
             if deferred {
                 return self.handle_uninspectable_deferred_body(ctx, "non_utf8_body");
             }
-            // `before_proxy` reads the UTF-8 `request_body` metadata view, which
-            // the proxy does not publish for non-UTF-8 bytes, so it continued on
-            // exactly this condition. Mirror it rather than inventing a new
-            // rejection class on revalidation.
+            // A non-UTF-8 `mcp_arguments` body (UTF-16 / UTF-32, a UTF-16 BOM,
+            // Latin-1) may be decoded by a lenient upstream into a call this
+            // shield never inspected, so it takes the unparseable-body path.
+            // This does not contradict `before_proxy`: the proxy publishes no
+            // UTF-8 `request_body` view for such bytes, so `before_proxy` never
+            // inspected them and decided nothing about them (it continued for
+            // want of a body); this hook is the first to see them.
+            if self.scan_mode == ScanMode::McpArguments {
+                return self.handle_unparseable_mcp_body(ctx);
+            }
+            // Other modes mirror `before_proxy`, which continued on exactly
+            // this condition, rather than inventing a new rejection class on
+            // revalidation.
             return PluginResult::Continue;
         };
         let json = match serde_json::from_str::<Value>(body_text) {
@@ -2259,10 +2401,19 @@ impl Plugin for AiPromptShield {
                     return self.handle_uninspectable_deferred_body(ctx, "malformed_json");
                 }
                 // Same mirroring: `ScanMode::All` falls back to a raw-body scan
-                // for non-redact actions, and Content mode continues.
+                // for non-redact actions, Content mode continues, and
+                // `mcp_arguments` applies exactly the `before_proxy` test — an
+                // empty bridged body or one not recognizable as a document that
+                // could carry a `tools/call` continues; one that may is refused.
                 let detected = match self.scan_mode {
                     ScanMode::All => self.detect_pii_raw_fallback(body_text),
-                    ScanMode::Content | ScanMode::McpArguments => Vec::new(),
+                    ScanMode::Content => Vec::new(),
+                    ScanMode::McpArguments => {
+                        if mcp_body_may_carry_tool_call(body) {
+                            return self.handle_unparseable_mcp_body(ctx);
+                        }
+                        Vec::new()
+                    }
                 };
                 return self.decide_final_request_body(ctx, detected);
             }

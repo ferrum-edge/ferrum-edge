@@ -1,8 +1,9 @@
 //! Tests for the shared MCP JSON-RPC `tools/call` recognizer (issue #5908).
 
 use ferrum_edge::plugins::utils::mcp_jsonrpc::{
-    MAX_BATCH_BYTES, MAX_BATCH_ITEM_BYTES, MAX_BATCH_ITEMS, RequestScan, content_type_is_json,
-    for_each_tool_call_arguments_mut, has_tool_call, scan_request_bytes, tool_calls_in_value,
+    MAX_BATCH_BYTES, MAX_BATCH_ITEM_BYTES, MAX_BATCH_ITEMS, RequestScan,
+    content_type_charset_is_utf8, content_type_is_json, for_each_tool_call_arguments_mut,
+    has_tool_call, may_carry_tool_call, scan_request_bytes, tool_calls_in_value,
 };
 use serde_json::{Value, json};
 
@@ -185,6 +186,89 @@ fn mcp_json_media_types_match_mcp_gateway_admission() {
         "application/jsonx",
     ] {
         assert!(!content_type_is_json(refused), "{refused}");
+    }
+}
+
+#[test]
+fn only_utf8_charsets_are_admitted() {
+    for accepted in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "Application/JSON; Charset=UTF-8",
+        "application/json;charset=\"utf-8\"",
+        "application/json ; charset = utf8",
+        "application/json; profile=x",
+    ] {
+        assert!(content_type_charset_is_utf8(accepted), "{accepted}");
+    }
+    for refused in [
+        "application/json; charset=utf-7",
+        "application/json; charset=UTF-16LE",
+        "application/json; charset=iso-8859-1",
+        "application/json; charset=\"utf-7\"",
+        "application/json; charset=",
+        "application/json; charset=\"utf-8",
+        "application/json; charset=utf-8; charset=utf-7",
+        "application/json; charset*=utf-8''utf-7",
+        "application/json; charset*0=utf-7",
+        "application/json; CHARSET*0*=utf-8''utf-8",
+        "application/json; charset=utf-8; charset*=utf-8''shift_jis",
+    ] {
+        assert!(!content_type_charset_is_utf8(refused), "{refused}");
+    }
+}
+
+fn utf16_be(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_be_bytes).collect()
+}
+
+fn utf32(text: &str, encode: fn(u32) -> [u8; 4]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for character in text.chars() {
+        bytes.extend(encode(u32::from(character)));
+    }
+    bytes
+}
+
+#[test]
+fn lenient_tool_call_prefilter_flags_encodings_comments_and_json5_whitespace() {
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#;
+    let mut flagged: Vec<Vec<u8>> = vec![
+        call.as_bytes().to_vec(),
+        format!("\u{feff}{call}").into_bytes(),
+        format!("/*x*/{call}").into_bytes(),
+        format!("# x\n{call}").into_bytes(),
+        format!("\x0B{call}").into_bytes(),
+        format!("\x0C{call}").into_bytes(),
+        format!("\u{a0}{call}").into_bytes(),
+        format!("\u{2028}{call}").into_bytes(),
+        format!(" \u{feff}{call}").into_bytes(),
+        br#"{"m":"t\u006fols/call"}"#.to_vec(),
+    ];
+    flagged.push(call.encode_utf16().flat_map(u16::to_le_bytes).collect());
+    let mut utf16_bom = vec![0xFE, 0xFF];
+    utf16_bom.extend(call.encode_utf16().flat_map(u16::to_be_bytes));
+    flagged.push(utf16_bom);
+    // Without a BOM: UTF-16BE (`00 7B`) and UTF-32 in either byte order.
+    flagged.push(utf16_be(r#"{"method":"tools/call"}"#));
+    flagged.push(utf32(call, u32::to_le_bytes));
+    flagged.push(utf32(call, u32::to_be_bytes));
+    for body in &flagged {
+        assert!(may_carry_tool_call(body), "{body:?}");
+    }
+    // The last two are binary uploads (JPEG and PNG magic): a high byte that
+    // does not open a valid UTF-8 character is not JSON5 whitespace, and NUL
+    // bytes count only ahead of a JSON-shaped lead character.
+    let unflagged: [&[u8]; 6] = [
+        b"",
+        b"petId=7",
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"n":NaN"#,
+        b"AAAAAAJ7fQ==",
+        b"\xFF\xD8\xFF\xE0",
+        b"\x89PNG\r\n\x1A\n\x00\x00\x00\x0DIHDR",
+    ];
+    for body in unflagged {
+        assert!(!may_carry_tool_call(body), "{body:?}");
     }
 }
 

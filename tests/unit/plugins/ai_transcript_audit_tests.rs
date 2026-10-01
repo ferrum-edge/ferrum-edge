@@ -13350,6 +13350,150 @@ async fn mcp_audit_recognizes_lowercase_post_and_scan_limited_bridged_calls() {
     assert_eq!(records[0]["mcp"]["calls"][0]["tool"], "pets.getPet");
 }
 
+/// The shallowest one-member `tools/call` batch whose member serde_json parses
+/// on its own while the batch exceeds the whole-document recursion limit:
+/// `mcp_gateway` admits and executes it member by member.
+fn mcp_batch_past_whole_document_recursion_limit() -> String {
+    for depth in 1..=256 {
+        let member = format!(
+            r#"{{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{{"name":"pets.getPet","arguments":{}"alice@example.com"{}}}}}"#,
+            r#"{"k":"#.repeat(depth),
+            "}".repeat(depth)
+        );
+        let batch = format!("[{member}]");
+        if serde_json::from_str::<Value>(&member).is_ok()
+            && serde_json::from_str::<Value>(&batch).is_err()
+        {
+            return batch;
+        }
+    }
+    panic!("serde_json exposed no standalone-member/batch recursion boundary");
+}
+
+#[tokio::test]
+async fn mcp_audit_records_tool_calls_the_whole_document_parse_refuses() {
+    // GHSA-f2jp-59r9-fp64 sibling: a batch past the whole-document nesting
+    // limit has no `Value`, but the gateway still executes its member, so the
+    // bounded byte recognizer must keep it an MCP audit candidate, and the
+    // member's arguments (which parse on their own) are still keyed.
+    let batch = mcp_batch_past_whole_document_recursion_limit();
+    let response = json!([{"jsonrpc": "2.0", "id": 74, "result": {"isError": false}}]);
+    for capture_arguments in [false, true] {
+        let mut ctx = mcp_ctx(&json!({}));
+        ctx.metadata
+            .insert("request_body".to_string(), batch.clone());
+        let overrides = json!({ "capture": { "mcp_arguments": capture_arguments } });
+        let records = mcp_roundtrip(overrides, &mut ctx, batch.as_bytes(), &response).await;
+        assert_eq!(records.len(), 1, "the deep batch must be audited");
+        let mcp = &records[0]["mcp"];
+        assert!(mcp.is_object(), "{records:#?}");
+        assert_eq!(mcp["batch"], json!(true), "{mcp}");
+        let call = &mcp["calls"][0];
+        assert_eq!(call["tool"], "pets.getPet", "{mcp}");
+        assert_eq!(
+            call["arguments_hash"].as_str().map(str::len),
+            Some(64),
+            "the member's arguments are keyed like a parsed call's: {call}"
+        );
+        if capture_arguments {
+            let excerpt = call["arguments"].as_str().expect("arguments excerpt");
+            assert!(excerpt.contains(r#""k""#), "{excerpt}");
+            assert!(!excerpt.contains("alice@example.com"), "{excerpt}");
+        } else {
+            assert!(call.get("arguments").is_none(), "arguments are opt-in");
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
+    // serde and the strict recognizer refuse `NaN`, but a lenient upstream
+    // parser (Python's `json`) executes this call, so it is audited as an MCP
+    // candidate whose calls could not be read.
+    let nan_call = concat!(
+        r#"{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"crm.lookup","#,
+        r#""arguments":{"e":"alice@example.com","n":NaN}}}"#
+    );
+    // A UTF-8 byte-order mark: strict JSON refuses it, lenient decoders strip it.
+    let bom_call = format!(
+        "\u{feff}{}",
+        mcp_call_value(json!(75), "crm.lookup", json!({"e": "alice@example.com"}))
+    );
+    for body in [nan_call, bom_call.as_str()] {
+        let mut ctx = mcp_ctx(&json!({}));
+        ctx.metadata
+            .insert("request_body".to_string(), body.to_string());
+        let records = mcp_roundtrip(
+            json!({}),
+            &mut ctx,
+            body.as_bytes(),
+            &json!({"jsonrpc": "2.0", "id": 75, "result": {"isError": false}}),
+        )
+        .await;
+        assert_eq!(records.len(), 1, "the lenient-parser call must be audited");
+        let mcp = &records[0]["mcp"];
+        assert!(mcp.is_object(), "{records:#?}");
+        assert_eq!(mcp["batch"], json!(false), "{mcp}");
+        assert_eq!(mcp["calls"], json!([]), "{mcp}");
+        assert!(
+            !records[0].to_string().contains("alice@example.com"),
+            "{records:#?}"
+        );
+    }
+
+    // Malformed JSON that names no call and carries no escape stays out of
+    // MCP scope. The plugin records that decision as an explicit `"false"`
+    // candidate marker (shared with co-located instances), so check the value.
+    // The plugin is started like the positive cases above, so the decline is
+    // the classification and not an idle plugin.
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("http://127.0.0.1:1/ingest", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let malformed = r#"{"jsonrpc":"2.0","id":76,"method":"tools/list","params":{"n":NaN}}"#;
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), malformed.to_string());
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a malformed body that cannot name tools/call is not an MCP candidate"
+    );
+}
+
+#[tokio::test]
+async fn mcp_audit_stages_content_type_less_bom_prefixed_tool_calls() {
+    // Without a Content-Type only bodies the lenient prefilter does not flag
+    // are skipped; a BOM-prefixed call is flagged, so it is still audited.
+    let body = format!(
+        "\u{feff}{}",
+        mcp_call_value(json!(77), "crm.lookup", json!({"q": "x"}))
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.headers.remove("content-type");
+    ctx.metadata
+        .insert("request_body".to_string(), body.clone());
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        body.as_bytes(),
+        &json!({"jsonrpc": "2.0", "id": 77, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(records[0]["mcp"]["calls"], json!([]), "{records:#?}");
+}
+
 #[tokio::test]
 async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
     let request = mcp_call_value(json!(73), "pets.getPet", json!({"petId": "7"}));

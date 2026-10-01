@@ -64,6 +64,41 @@ pub fn content_type_is_json(value: &str) -> bool {
             .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
 }
 
+/// Whether a request `Content-Type` value declares no `charset` parameter, or
+/// declares UTF-8 (`utf-8` / `utf8`, case-insensitive, optionally quoted, with
+/// whitespace tolerated around `;` and `=`).
+///
+/// MCP JSON-RPC is read as UTF-8 by every governance plugin and by
+/// `mcp_gateway`. A body under another charset — UTF-7 is plain ASCII and still
+/// parses as JSON — would be inspected as one text here and decoded as another
+/// by an upstream that honours the charset (GHSA-4f9m-cfqg-fhx9), so callers
+/// refuse it. A parameter that cannot be read as one of those spellings
+/// (an empty value, an unterminated quote) counts as non-UTF-8, and so does
+/// any RFC 2231 form (`charset*`, `charset*0`, ...): Go's `mime` package and
+/// Werkzeug decode it into the charset and let it override a plain one.
+pub fn content_type_charset_is_utf8(value: &str) -> bool {
+    value.split(';').skip(1).all(|parameter| {
+        let Some((name, charset)) = parameter.split_once('=') else {
+            return true;
+        };
+        let name = name.trim();
+        let base = name.split('*').next().unwrap_or(name);
+        if !base.eq_ignore_ascii_case("charset") {
+            return true;
+        }
+        if base.len() != name.len() {
+            return false;
+        }
+        let charset = charset.trim();
+        let charset = charset
+            .strip_prefix('"')
+            .and_then(|quoted| quoted.strip_suffix('"'))
+            .unwrap_or(charset)
+            .trim();
+        charset.eq_ignore_ascii_case("utf-8") || charset.eq_ignore_ascii_case("utf8")
+    })
+}
+
 /// One `tools/call` request read from the wire bytes.
 #[derive(Debug)]
 pub struct ToolCallRef<'a> {
@@ -126,6 +161,84 @@ impl<'a> RequestScan<'a> {
 fn may_name_tools_call(body: &[u8]) -> bool {
     memchr::memchr(b'\\', body).is_some()
         || memchr::memmem::find(body, TOOLS_CALL_METHOD.as_bytes()).is_some()
+}
+
+/// Whether `body` may carry a `tools/call` that some lenient JSON reader could
+/// execute, so a policy that failed to parse it strictly must not forward it.
+///
+/// True when the body
+///
+/// - contains a NUL byte and its first byte that is neither NUL nor ASCII
+///   whitespace is `{`, `[`, `/`, or `#` (UTF-16 / UTF-32 JSON in either byte
+///   order interleaves `0x00` with ASCII, so a `tools/call` spelled in it hides
+///   from a UTF-8 search; a binary upload that merely contains NULs is not
+///   flagged);
+/// - starts with a byte-order mark (UTF-8 `EF BB BF`, UTF-16 `FE FF` /
+///   `FF FE`, UTF-32 `00 00 FE FF`), which strict JSON refuses but lenient
+///   decoders strip;
+/// - opens, after JSON and JSON5 ASCII whitespace (including `\v` and `\f`),
+///   with `/` or `#` (a comment), or with a valid UTF-8 non-ASCII character (a
+///   BOM after whitespace, a no-break space, U+2028, …); or
+/// - opens with `{` or `[` and contains the literal method name or a JSON
+///   escape that could spell it.
+///
+/// Strict UTF-8 JSON never legitimately contains a NUL byte, a BOM, or those
+/// lead characters. A body this
+/// returns false for is not proven call-free to every reader; it is simply not
+/// recognizable as a JSON document that could carry one. This is
+/// deliberately looser than [`scan_request_bytes`], which only reports what a
+/// strict parser reads: a body strict parsing refuses — an encoding or BOM,
+/// `NaN`, `Infinity`, comments, trailing commas — can still be accepted by a
+/// lenient upstream (Python's `json`, JSON5), so a policy that must not forward
+/// an uninspected call treats such a body as possibly carrying one. The cost is
+/// a prefix check, a leading-whitespace scan, and `memchr` / `memmem` passes
+/// over the body; nothing is parsed.
+pub fn may_carry_tool_call(body: &[u8]) -> bool {
+    const BYTE_ORDER_MARKS: [&[u8]; 4] = [
+        b"\xEF\xBB\xBF",
+        b"\xFE\xFF",
+        b"\xFF\xFE",
+        b"\x00\x00\xFE\xFF",
+    ];
+    if BYTE_ORDER_MARKS.iter().any(|bom| body.starts_with(bom)) {
+        return true;
+    }
+    // UTF-16 / UTF-32 JSON: NUL bytes interleaved with an ASCII document whose
+    // first real character opens a value or a comment, in either byte order.
+    // A binary upload (PNG, JPEG, …) that merely contains NULs is not flagged.
+    if memchr::memchr(0, body).is_some() {
+        let lead = body
+            .iter()
+            .copied()
+            .find(|byte| !matches!(byte, 0 | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C));
+        if matches!(lead, Some(b'{' | b'[' | b'/' | b'#')) {
+            return true;
+        }
+    }
+    let start = body
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C))
+        .unwrap_or(body.len());
+    let rest = &body[start..];
+    match rest.first().copied() {
+        Some(b'{' | b'[') => may_name_tools_call(body),
+        Some(b'/' | b'#') => true,
+        // A non-ASCII character a lenient reader may skip as whitespace (a
+        // no-break space, U+2028, a BOM after whitespace). Only a valid UTF-8
+        // character counts: UTF-16 / UTF-32 are caught above by their NUL
+        // bytes, and a stray high byte opens a binary upload, not JSON.
+        Some(0x80..=0xFF) => starts_with_utf8_char(rest),
+        _ => false,
+    }
+}
+
+/// Whether `bytes` opens with one complete, valid UTF-8 character.
+fn starts_with_utf8_char(bytes: &[u8]) -> bool {
+    let prefix = bytes.get(..4).unwrap_or(bytes);
+    match std::str::from_utf8(prefix) {
+        Ok(text) => !text.is_empty(),
+        Err(error) => error.valid_up_to() > 0,
+    }
 }
 
 /// Recognize the `tools/call` members of a request body.

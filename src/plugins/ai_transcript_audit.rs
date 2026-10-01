@@ -3778,12 +3778,31 @@ impl AiTranscriptAudit {
             serde_json::from_slice(body).ok()
         };
         let is_ai = scan_limited || parsed.as_ref().is_some_and(json_looks_like_ai_request);
-        let bounded_mcp_scan = (scan_limited && self.capture.mcp_tool_calls)
+        // Whenever no `Value` is available — the redaction scan ceiling, or a
+        // body the whole-document parse refuses — read the bytes with the
+        // bounded recognizer. `mcp_gateway` admits batch members one at a time,
+        // each with its own recursion budget, so a batch past serde_json's
+        // whole-document nesting limit still executes every member
+        // (GHSA-f2jp-59r9-fp64). A body that carries, or may carry
+        // (`Uninspectable`), a `tools/call` stays an MCP audit candidate.
+        let raw_scan = scan_limited || parsed.is_none();
+        let bounded_mcp_scan = (raw_scan && self.capture.mcp_tool_calls)
             .then(|| mcp_jsonrpc::scan_request_bytes(body));
+        // A body the whole-document parse refused may still be accepted by a
+        // lenient upstream decoder (a BOM, UTF-16 / UTF-32 or other non-UTF-8
+        // bytes, `NaN`, comments, trailing commas) that the strict recognizer
+        // cannot read. Like `ai_prompt_shield`, err toward auditing: a body
+        // `mcp_jsonrpc::may_carry_tool_call` flags stays an MCP candidate (with
+        // empty `calls`, staged by `empty_mcp_section`).
+        let lenient_tool_call = self.capture.mcp_tool_calls
+            && !scan_limited
+            && parsed.is_none()
+            && mcp_jsonrpc::may_carry_tool_call(body);
         let carries_tool_call = parsed.as_ref().is_some_and(mcp_jsonrpc::has_tool_call)
             || bounded_mcp_scan
                 .as_ref()
-                .is_some_and(|scan| matches!(scan, mcp_jsonrpc::RequestScan::ToolCalls { .. }));
+                .is_some_and(|scan| !matches!(scan, mcp_jsonrpc::RequestScan::NoToolCall))
+            || lenient_tool_call;
         let is_mcp = self.capture.mcp_tool_calls && carries_tool_call;
         if !is_ai && !is_mcp {
             self.discard_staged_candidate(ctx);
@@ -3840,13 +3859,18 @@ impl AiTranscriptAudit {
         // provisional pass (before `mcp_gateway`) that is the only view that
         // still names them publicly and carries their JSON-RPC arguments.
         let exportable = self.commit_may_emit(sample_hit);
-        let staged_mcp = if scan_limited && is_mcp {
-            // The body-redaction ceiling prevents a full Value parse. Keep an
-            // empty MCP section so the final bridge hook still emits a record;
-            // the bounded byte recognizer proves the request was a tools/call.
+        let staged_mcp = if parsed.is_none() && is_mcp {
+            // The body-redaction ceiling, or a whole-document parse failure,
+            // left no Value. Stage the MCP section from the bounded byte
+            // recognizer so the final bridge hook still emits a record; only a
+            // body within the scan ceiling has its arguments hashed.
+            // A body only a lenient parser could read as a call gets an empty
+            // section of its own.
+            let hash_args = !scan_limited;
             bounded_mcp_scan
                 .as_ref()
-                .and_then(|scan| self.mcp_section_from_scan(scan, exportable))
+                .and_then(|scan| self.mcp_section_from_scan(scan, body, hash_args, exportable))
+                .or_else(|| lenient_tool_call.then(|| empty_mcp_section(body)))
         } else {
             parsed
                 .as_ref()
@@ -4554,7 +4578,6 @@ impl AiTranscriptAudit {
         }
         let harvests = self.mode.harvests_metadata();
         let redact_names = self.mode != AuditMode::FullBody;
-        let max_request_bytes = self.limits.max_request_bytes;
         let empty_arguments = Value::Object(serde_json::Map::new());
         let mut name_bytes = 0usize;
         for call in calls {
@@ -4571,24 +4594,10 @@ impl AiTranscriptAudit {
             let mut entry = McpAuditCall {
                 tool,
                 tool_truncated,
-                arguments_hash: self.redactor.keyed_hash_hex(serialized.as_bytes()),
                 id_key: mcp_correlation_key(call.id),
                 ..McpAuditCall::default()
             };
-            if self.capture.mcp_arguments {
-                let budget = max_request_bytes.saturating_sub(staged.arguments_bytes);
-                if budget == 0 {
-                    entry.arguments_truncated = true;
-                    entry.arguments_omitted_reason = Some(OMIT_REASON_MCP_ARGUMENTS_BUDGET);
-                } else {
-                    let shaped = self.shape_body(serialized.as_bytes(), budget);
-                    let excerpt_bytes = shaped.excerpt.as_deref().map_or(0, str::len);
-                    staged.arguments_bytes = staged.arguments_bytes.saturating_add(excerpt_bytes);
-                    entry.arguments = shaped.excerpt;
-                    entry.arguments_truncated = shaped.truncated;
-                    entry.arguments_omitted_reason = shaped.omitted_reason;
-                }
-            }
+            self.attach_mcp_arguments(&mut entry, &serialized, &mut staged.arguments_bytes);
             let entry_bytes = mcp_call_retained_bytes(&entry);
             staged.retained_bytes = staged.retained_bytes.saturating_add(entry_bytes);
             staged.section.calls.push(entry);
@@ -4596,26 +4605,64 @@ impl AiTranscriptAudit {
         Some(staged)
     }
 
-    /// Retain bounded tool names and ids from a scan-limited raw request. The
-    /// scanner can identify those fields without building a full JSON Value;
-    /// arguments remain unhashed and omitted because redacted mode's scan
-    /// ceiling forbids walking their contents.
+    /// Key the call's serialized `arguments` into `entry`, and with
+    /// `capture.mcp_arguments` attach an excerpt charged to `arguments_bytes`
+    /// within `limits.max_request_bytes`.
+    fn attach_mcp_arguments(
+        &self,
+        entry: &mut McpAuditCall,
+        serialized: &str,
+        arguments_bytes: &mut usize,
+    ) {
+        entry.arguments_hash = self.redactor.keyed_hash_hex(serialized.as_bytes());
+        if !self.capture.mcp_arguments {
+            return;
+        }
+        let max_request_bytes = self.limits.max_request_bytes;
+        let budget = max_request_bytes.saturating_sub(*arguments_bytes);
+        if budget == 0 {
+            entry.arguments_truncated = true;
+            entry.arguments_omitted_reason = Some(OMIT_REASON_MCP_ARGUMENTS_BUDGET);
+            return;
+        }
+        let shaped = self.shape_body(serialized.as_bytes(), budget);
+        let excerpt_bytes = shaped.excerpt.as_deref().map_or(0, str::len);
+        *arguments_bytes = arguments_bytes.saturating_add(excerpt_bytes);
+        entry.arguments = shaped.excerpt;
+        entry.arguments_truncated = shaped.truncated;
+        entry.arguments_omitted_reason = shaped.omitted_reason;
+    }
+
+    /// Summarize the MCP calls of a request no whole-document `Value` exists
+    /// for, from the bounded byte recognizer: past `max_redaction_scan_bytes`,
+    /// or refused by the whole-document parse (a batch past serde_json's
+    /// recursion limit that `mcp_gateway` still admits member by member,
+    /// GHSA-f2jp-59r9-fp64). Tool names and ids come from the recognizer's
+    /// borrowed raw fields.
+    ///
+    /// With `hash_arguments` (the body is within the scan ceiling) each call's
+    /// `arguments` is parsed on its own and hashed and excerpted exactly like
+    /// [`Self::mcp_section`]. Past the ceiling, redacted mode forbids walking
+    /// argument contents, so they stay unhashed and omitted. A body the
+    /// recognizer reports as `Uninspectable` keeps an empty `calls` list;
+    /// `NoToolCall` yields `None` (the lenient-parser candidate is staged by
+    /// the caller with [`empty_mcp_section`]).
     fn mcp_section_from_scan(
         &self,
         scan: &mcp_jsonrpc::RequestScan<'_>,
+        body: &[u8],
+        hash_arguments: bool,
         exportable: bool,
     ) -> Option<StagedMcp> {
-        let mcp_jsonrpc::RequestScan::ToolCalls { batch, members } = scan else {
-            return None;
+        let members = match scan {
+            mcp_jsonrpc::RequestScan::ToolCalls { members, .. } => members.as_slice(),
+            // The recognizer could not read the calls faithfully (ambiguous
+            // member names or over the batch bounds), but the body may carry
+            // one: keep an empty section so the candidate is still audited.
+            mcp_jsonrpc::RequestScan::Uninspectable(_) => return Some(empty_mcp_section(body)),
+            mcp_jsonrpc::RequestScan::NoToolCall => return None,
         };
-        let mut staged = StagedMcp {
-            section: McpAuditSection {
-                batch: *batch,
-                ..McpAuditSection::default()
-            },
-            retained_bytes: 0,
-            arguments_bytes: 0,
-        };
+        let mut staged = empty_mcp_section(body);
         if !exportable {
             return Some(staged);
         }
@@ -4638,12 +4685,27 @@ impl AiTranscriptAudit {
             } else {
                 (None, false)
             };
-            let entry = McpAuditCall {
+            let mut entry = McpAuditCall {
                 tool,
                 tool_truncated,
                 id_key: mcp_correlation_key_raw(member.id),
                 ..McpAuditCall::default()
             };
+            if hash_arguments {
+                // A member the gateway admits parsed within its own recursion
+                // budget, so its `arguments` (a sub-tree of it) parse on their
+                // own here. Arguments that do not parse on their own belong to a
+                // member the gateway refuses; they stay unhashed rather than
+                // keying bytes no tool receives.
+                let arguments = match call.arguments {
+                    Some(raw) => serde_json::from_str::<Value>(raw.get()).ok(),
+                    None => Some(Value::Object(serde_json::Map::new())),
+                };
+                if let Some(arguments) = arguments {
+                    let text = arguments.to_string();
+                    self.attach_mcp_arguments(&mut entry, &text, &mut staged.arguments_bytes);
+                }
+            }
             staged.retained_bytes = staged
                 .retained_bytes
                 .saturating_add(mcp_call_retained_bytes(&entry));
@@ -5896,20 +5958,33 @@ impl Plugin for AiTranscriptAudit {
     }
 }
 
+/// An MCP section that describes no calls yet: the start of every scanned
+/// section, and the whole section for a candidate whose calls could not be read
+/// (an `Uninspectable` body, or one only a lenient parser could read as a call).
+/// `batch` follows the body's first non-whitespace byte.
+fn empty_mcp_section(body: &[u8]) -> StagedMcp {
+    StagedMcp {
+        section: McpAuditSection {
+            batch: body.trim_ascii_start().first() == Some(&b'['),
+            ..McpAuditSection::default()
+        },
+        retained_bytes: 0,
+        arguments_bytes: 0,
+    }
+}
+
 /// Keep no-Content-Type POSTs available to the MCP audit path without staging
-/// ordinary uploads as possible AI requests. The bounded recognizer classifies
-/// bodies that do not contain a `tools/call` as `NoToolCall`.
+/// ordinary uploads as possible AI requests. Only a body
+/// [`mcp_jsonrpc::may_carry_tool_call`] does not flag (no BOM, no UTF-16 / UTF-32
+/// JSON, no leading comment or non-ASCII character, no object/array naming the
+/// method or carrying an escape) is skipped, so a BOM-prefixed or UTF-16 call
+/// is still staged while a PNG or JPEG upload is not.
 fn skip_content_type_less_non_mcp(
     content_type: Option<&str>,
     mcp_tool_calls: bool,
     body: &[u8],
 ) -> bool {
-    content_type.is_none()
-        && mcp_tool_calls
-        && matches!(
-            mcp_jsonrpc::scan_request_bytes(body),
-            mcp_jsonrpc::RequestScan::NoToolCall
-        )
+    content_type.is_none() && mcp_tool_calls && !mcp_jsonrpc::may_carry_tool_call(body)
 }
 
 /// Tees streaming (SSE) response bytes into a bounded, revocable accumulator
