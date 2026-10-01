@@ -15097,6 +15097,35 @@ pub mod _test_support {
         crate::proxy::coalesce_flush_window(flush_ms, read_timeout_ms)
     }
 
+    /// The `StreamingH2` response-arm regime (issue #5588), as
+    /// `(read_timeout_ms, total_deadline, coalesce_flush, h1_backend)`.
+    pub fn streaming_h2_body_regime_for_test(
+        backend_version: http::Version,
+        pool_http1_direct: bool,
+        grpc_request_deadline: Option<tokio::time::Instant>,
+        read_timeout_ms: u64,
+        coalesce_flush_ms: u64,
+    ) -> (
+        u64,
+        Option<tokio::time::Instant>,
+        Option<std::time::Duration>,
+        bool,
+    ) {
+        let regime = crate::proxy::streaming_h2_body_regime(
+            backend_version,
+            pool_http1_direct,
+            grpc_request_deadline,
+            read_timeout_ms,
+            coalesce_flush_ms,
+        );
+        (
+            regime.read_timeout_ms,
+            regime.total_deadline,
+            regime.coalesce_flush,
+            regime.h1_backend,
+        )
+    }
+
     /// Direct-H2 large-response passthrough predicate. Callers must pass the
     /// trusted backend-observed length, never a post-hook header.
     pub fn should_bypass_h2_coalesce_for_large_response_for_test(

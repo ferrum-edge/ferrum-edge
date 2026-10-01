@@ -2151,6 +2151,61 @@ pub(crate) fn passthrough_streaming_content_length(
     }
 }
 
+/// Read bound, absolute deadline and coalesce window for a body on the
+/// `StreamingH2` response arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamingH2BodyRegime {
+    /// Per-frame idle read bound for the body constructor (`0` = none).
+    pub(crate) read_timeout_ms: u64,
+    /// Client gRPC absolute deadline, applied by `with_client_grpc_deadline`.
+    pub(crate) total_deadline: Option<tokio::time::Instant>,
+    /// `FERRUM_RESPONSE_COALESCE_FLUSH_MS` aggregation window, if any.
+    pub(crate) coalesce_flush: Option<std::time::Duration>,
+    /// Whether the body is an HTTP/1.x backend body given the reqwest
+    /// HTTP/1.1 arm's semantics.
+    pub(crate) h1_backend: bool,
+}
+
+/// Decide the streaming regime for a `StreamingH2` response body.
+///
+/// HTTP/2 and native-gRPC bodies keep `grpc_streaming_response_deadline`: under
+/// a client deadline the absolute deadline replaces the per-frame bound, and no
+/// coalesce window applies. An HTTP/1.x backend body on this arm — the direct
+/// HTTP/1.1 pool, Unix-socket and HBONE inner dispatch — keeps what the reqwest
+/// HTTP/1.1 arm does (#5588) while `FERRUM_POOL_HTTP1_DIRECT` is on: the
+/// per-frame bound stays armed beside the absolute deadline, and the operator's
+/// coalesce window applies (clamped as `coalesce_flush_window` clamps it).
+pub(crate) fn streaming_h2_body_regime(
+    backend_version: http::Version,
+    pool_http1_direct: bool,
+    grpc_request_deadline: Option<tokio::time::Instant>,
+    read_timeout_ms: u64,
+    coalesce_flush_ms: u64,
+) -> StreamingH2BodyRegime {
+    let (h2_read_timeout_ms, total_deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(grpc_request_deadline, read_timeout_ms);
+    let h1_backend = pool_http1_direct
+        && matches!(
+            backend_version,
+            http::Version::HTTP_10 | http::Version::HTTP_11
+        );
+    if h1_backend {
+        StreamingH2BodyRegime {
+            read_timeout_ms,
+            total_deadline,
+            coalesce_flush: coalesce_flush_window(coalesce_flush_ms, read_timeout_ms),
+            h1_backend,
+        }
+    } else {
+        StreamingH2BodyRegime {
+            read_timeout_ms: h2_read_timeout_ms,
+            total_deadline,
+            coalesce_flush: None,
+            h1_backend,
+        }
+    }
+}
+
 /// Resolve the configured response-coalescing window against the proxy's
 /// per-frame idle read timeout (issue #5588).
 ///
@@ -42818,7 +42873,13 @@ async fn handle_proxy_request_inner(
                 }
 
                 let base = if state.env_config.enable_streaming_latency_tracking {
-                    track_streaming_response_latency(base, backend_start, &proxy, &backend_url)
+                    track_streaming_response_latency(
+                        base,
+                        backend_start,
+                        &proxy,
+                        &backend_url,
+                        proxy.backend_read_timeout_ms,
+                    )
                 } else {
                     base
                 };
@@ -42916,30 +42977,20 @@ async fn handle_proxy_request_inner(
             // client set no deadline.
             let effective_h2_read_timeout_ms =
                 streaming_h2_read_timeout_ms.unwrap_or(proxy.backend_read_timeout_ms);
-            let (h2_read_timeout_ms, h2_total_deadline) =
-                grpc_proxy::grpc_streaming_response_deadline(
-                    grpc_request_deadline,
-                    effective_h2_read_timeout_ms,
-                );
-            // An HTTP/1.x backend body (the direct pool, Unix-socket and HBONE
-            // inner dispatch) keeps the reqwest HTTP/1.1 arm's streaming
-            // semantics (#5588): the operator's coalesce flush window applies,
-            // and under a client gRPC deadline the per-frame idle bound stays
-            // armed beside the absolute deadline (applied below) instead of
-            // being dropped to 0.
-            let h1_backend = state.env_config.pool_http1_direct
-                && matches!(
-                    resp.version(),
-                    http::Version::HTTP_10 | http::Version::HTTP_11
-                );
-            let (h2_read_timeout_ms, coalesce_flush) = if h1_backend {
-                (
-                    effective_h2_read_timeout_ms,
-                    state.response_coalesce_flush(effective_h2_read_timeout_ms),
-                )
-            } else {
-                (h2_read_timeout_ms, None)
-            };
+            // See `streaming_h2_body_regime`: an HTTP/1.x backend body keeps the
+            // reqwest HTTP/1.1 arm's streaming semantics (#5588).
+            let StreamingH2BodyRegime {
+                read_timeout_ms: h2_read_timeout_ms,
+                total_deadline: h2_total_deadline,
+                coalesce_flush,
+                h1_backend,
+            } = streaming_h2_body_regime(
+                resp.version(),
+                state.env_config.pool_http1_direct,
+                grpc_request_deadline,
+                effective_h2_read_timeout_ms,
+                state.response_coalesce_flush_ms,
+            );
             // The trailer governor moves into exactly one of the four
             // mutually-exclusive body constructors below, so every direct /
             // size-limited / coalescing variant of this arm enforces the same
@@ -43041,7 +43092,13 @@ async fn handle_proxy_request_inner(
                 // HTTP/1.x backend bodies honour latency tracking exactly as the
                 // reqwest HTTP/1.1 arm does (#5588).
                 if h1_backend && state.env_config.enable_streaming_latency_tracking {
-                    track_streaming_response_latency(body, backend_start, &proxy, &backend_url)
+                    track_streaming_response_latency(
+                        body,
+                        backend_start,
+                        &proxy,
+                        &backend_url,
+                        h2_read_timeout_ms,
+                    )
                 } else {
                     body
                 }
@@ -49174,13 +49231,13 @@ fn track_streaming_response_latency(
     backend_start: Instant,
     proxy: &Proxy,
     backend_url: &str,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     let (tracked_body, metrics) = base.into_tracked(backend_start);
     // Skipped when the read timeout is disabled (0): no meaningful deadline.
-    if proxy.backend_read_timeout_ms > 0 {
+    if read_timeout_ms > 0 {
         let deferred_proxy_id = proxy.id.clone();
         let deferred_backend_url = strip_query_params(backend_url).to_string();
-        let read_timeout_ms = proxy.backend_read_timeout_ms;
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
             let completed = metrics.completed();

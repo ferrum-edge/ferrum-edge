@@ -2878,12 +2878,12 @@ fn no_production_boundary_reserves_only_the_two_consumer_identity_names() {
     );
 }
 
-/// HTTP/1.x backend bodies on the `StreamingH2` response arm (the direct pool,
-/// Unix-socket and HBONE inner dispatch) honour `FERRUM_RESPONSE_COALESCE_FLUSH_MS`
-/// exactly as the reqwest HTTP/1.1 arm does (#5588): the direct fast path must
-/// consult the window, and both coalescing constructors must receive it.
+/// The `StreamingH2` response arm takes its read bound, deadline and coalesce
+/// window from `streaming_h2_body_regime` (unit-tested in
+/// `response_body_mode_tests`), and consumes the window in every coalescing
+/// path (#5588).
 #[test]
-fn streaming_h2_arm_honours_the_coalesce_flush_window_for_h1_backends() {
+fn streaming_h2_arm_uses_the_tested_body_regime() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let arm = source
         .split("ResponseBody::StreamingH2(mut resp) => {")
@@ -2892,13 +2892,8 @@ fn streaming_h2_arm_honours_the_coalesce_flush_window_for_h1_backends() {
         .split("ResponseBody::StreamingH3(")
         .next()
         .expect("bounded StreamingH2 arm");
-    assert!(arm.contains("state.response_coalesce_flush("));
+    assert!(arm.contains("streaming_h2_body_regime("));
     assert!(arm.contains("streaming_response_takes_direct_fast_path("));
-    assert!(arm.contains("coalescing_h2_body_strip_hop_by_hop_trailers_with_flush("));
-    assert!(arm.contains("size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush("));
     assert!(arm.contains("use_passthrough && coalesce_flush.is_none()"));
-    assert!(
-        arm.contains("track_streaming_response_latency("),
-        "HTTP/1.x backend bodies must honour streaming latency tracking"
-    );
+    assert!(arm.contains("track_streaming_response_latency("));
 }

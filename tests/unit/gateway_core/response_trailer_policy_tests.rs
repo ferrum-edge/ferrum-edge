@@ -913,10 +913,40 @@ fn streaming_h2_body_reconciles_after_the_hop_by_hop_strip() {
 #[test]
 fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
     let src = include_str!("../../../src/proxy/body.rs");
+    // The plain coalescing constructors delegate to their `_with_flush`
+    // variants (the `FERRUM_RESPONSE_COALESCE_FLUSH_MS` window, #5588), which
+    // build the wrappers; each must forward the governor it was given.
+    for (constructor, delegate) in [
+        (
+            "pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(",
+            "size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(",
+        ),
+        (
+            "pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers<B>(",
+            "coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(",
+        ),
+    ] {
+        let body = src
+            .split(constructor)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing constructor {constructor}"));
+        let signature = body.split(") -> ProxyBody").next().expect("signature");
+        assert!(
+            signature.contains(
+                "trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>"
+            ),
+            "{constructor} must accept the streaming trailer governor"
+        );
+        let block = body.split("\n}\n").next().expect("constructor body");
+        assert!(
+            block.contains(delegate) && block.contains("trailer_governor,"),
+            "{constructor} must forward the governor to {delegate}"
+        );
+    }
     for constructor in [
         "pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers<B>(",
-        "pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(",
-        "pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers<B>(",
+        "pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(",
+        "pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers_with_flush<B>(",
     ] {
         let body = src
             .split(constructor)
@@ -1132,7 +1162,10 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
         .expect("plain streaming H2 arm");
     let constructors = h2_arm
         .matches("_h2_body_strip_hop_by_hop_trailers(")
-        .count();
+        .count()
+        + h2_arm
+            .matches("_h2_body_strip_hop_by_hop_trailers_with_flush(")
+            .count();
     let governed = h2_arm.matches("streaming_trailer_governor.take()").count();
     assert_eq!(
         constructors, 4,

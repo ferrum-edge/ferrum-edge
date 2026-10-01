@@ -923,6 +923,8 @@ fn direct_h1_request_target_matches_url_serialization() {
         "http://127.0.0.1:8080/a/..//x",
         // Userinfo never reaches the request target.
         "http://user:pw@127.0.0.1:8080/p?q=1",
+        // A backslash ends the authority exactly as `/` does.
+        "http://127.0.0.1:8080\\a/b",
     ] {
         let parsed = url::Url::parse(backend_url).expect("valid URL");
         // What reqwest actually puts on the wire: hyper's origin form of the

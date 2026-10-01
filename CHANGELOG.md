@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     re-framed as chunked.
   - Requests whose body plugins still have to run at dispatch time, and retry
     attempts, keep the reqwest path.
+  - A streamed HTTP/1.1 backend response now always carries an HTTP/1.1 `Via`
+    (`1.1 ferrum-edge`), as reqwest-path and buffered responses already did.
+    Streamed Unix-socket and HBONE inner HTTP/1.1 responses used to get the
+    HTTP/2 `Via`. This fix applies even with `FERRUM_POOL_HTTP1_DIRECT=false`.
 
 ## [0.9.10] - 2026-10-01
 
