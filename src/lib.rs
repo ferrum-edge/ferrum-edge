@@ -11760,6 +11760,17 @@ pub mod _test_support {
             .send_queue_bytes()
     }
 
+    /// The direct HTTP/1.1 pool's observed transport IO and the send-queue
+    /// handle it publishes (issue #5963).
+    pub fn observed_tcp_stream_for_test(
+        stream: tokio::net::TcpStream,
+    ) -> (
+        crate::proxy::backend_send_queue::ObservedTcpStream,
+        Option<std::sync::Arc<crate::proxy::backend_send_queue::BackendSocketHandle>>,
+    ) {
+        crate::proxy::backend_send_queue::ObservedTcpStream::new(stream)
+    }
+
     /// Watch a live socket's send queue exactly as the upload pump does after a
     /// clean EOS. `true` means the drain stalled for the whole watermark.
     pub async fn await_backend_send_queue_stall(

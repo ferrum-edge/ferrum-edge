@@ -50118,14 +50118,13 @@ async fn proxy_to_backend_direct_h1(
                         Ok(checkout) => checkout,
                         Err(result) => return result,
                     };
-                    // Write-once: the pump keeps the socket bound before the
-                    // first attempt. That attempt never reached the wire, so
-                    // its idle socket has an empty send queue and the drain
-                    // bound stays disarmed for this replay — the same as a
-                    // reused reqwest connection, which publishes no socket.
-                    if let Some(pump) = upload_pump.as_mut() {
-                        pump.bind_backend_socket(checkout.backend_socket());
-                    }
+                    // No rebind: the pump's socket slot is write-once and still
+                    // holds the first attempt's socket. That attempt never
+                    // reached the wire and its connection is gone, so the
+                    // sample fails open and the drain bound stays disarmed for
+                    // this replay; `backend_read_timeout_ms` still governs —
+                    // the same as a reused reqwest connection, which publishes
+                    // no socket at all.
                     continue;
                 }
                 let never_sent = try_err.take_message().is_some();

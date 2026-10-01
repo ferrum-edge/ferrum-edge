@@ -118,9 +118,37 @@ async fn spawn_gateway(backend_port: u16, direct: bool) -> GatewayHarness {
             if direct { "true" } else { "false" },
         )
         .pool_warmup_enabled(false)
+        .log_level("debug")
+        .capture_output()
         .spawn()
         .await
         .expect("spawn gateway")
+}
+
+/// Logged once per dial by the direct HTTP/1.1 pool only, so a test can prove
+/// which transport served it (the reqwest path never logs it).
+const DIRECT_H1_DIAL_MARKER: &str = "direct HTTP/1.1 pool dialed a backend connection";
+
+async fn assert_transport(harness: &GatewayHarness, direct: bool) {
+    let logs = if direct {
+        harness
+            .wait_for_log_contains(
+                |logs| logs.contains(DIRECT_H1_DIAL_MARKER),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+    } else {
+        // Give the log writer time to flush, so capture lag cannot hide a
+        // marker the reqwest path should never have logged.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        harness.captured_combined().expect("captured gateway logs")
+    };
+    assert_eq!(
+        logs.contains(DIRECT_H1_DIAL_MARKER),
+        direct,
+        "the request must have been served by the {} HTTP/1.1 transport",
+        if direct { "direct" } else { "reqwest" }
+    );
 }
 
 async fn assert_reuses_one_backend_connection(direct: bool) {
@@ -165,6 +193,7 @@ async fn assert_reuses_one_backend_connection(direct: bool) {
         1,
         "sequential requests must reuse one keep-alive backend connection (direct={direct})"
     );
+    assert_transport(&harness, direct).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -421,6 +450,8 @@ async fn direct_h1_isolates_tls_settings_and_never_negotiates_h2() {
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .pool_warmup_enabled(false)
+        .log_level("debug")
+        .capture_output()
         .spawn()
         .await
         .expect("spawn gateway");
@@ -437,20 +468,23 @@ async fn direct_h1_isolates_tls_settings_and_never_negotiates_h2() {
         }
     }
 
-    let connections = connections.lock().expect("record");
-    assert_eq!(
-        connections.len(),
-        2,
-        "two TLS settings must use two pooled connections, each reused"
-    );
-    for (alpn, served) in connections.iter() {
+    {
+        let connections = connections.lock().expect("record");
         assert_eq!(
-            alpn.as_deref(),
-            Some(&b"http/1.1"[..]),
-            "the direct HTTP/1.1 pool must never offer h2"
+            connections.len(),
+            2,
+            "two TLS settings must use two pooled connections, each reused"
         );
-        assert_eq!(served.load(Ordering::SeqCst), 3);
+        for (alpn, served) in connections.iter() {
+            assert_eq!(
+                alpn.as_deref(),
+                Some(&b"http/1.1"[..]),
+                "the direct HTTP/1.1 pool must never offer h2"
+            );
+            assert_eq!(served.load(Ordering::SeqCst), 3);
+        }
     }
+    assert_transport(&harness, true).await;
 }
 
 /// A backend that answers before reading the whole upload leaves the gateway's
@@ -571,4 +605,5 @@ async fn direct_h1_early_response_mid_upload_is_not_reused() {
     if let Ok(status) = early_status {
         assert_eq!(status, 401);
     }
+    assert_transport(&harness, true).await;
 }

@@ -938,8 +938,21 @@ fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
             "{constructor} must accept the streaming trailer governor"
         );
         let block = body.split("\n}\n").next().expect("constructor body");
+        // Every delegate call itself must carry the governor: each bounded from
+        // the call to its closing parenthesis.
+        let calls: Vec<&str> = block
+            .split(delegate)
+            .skip(1)
+            .map(|args| args.split("\n    )").next().unwrap_or(args))
+            .collect();
         assert!(
-            block.contains(delegate) && block.contains("trailer_governor,"),
+            !calls.is_empty(),
+            "{constructor} must delegate to {delegate}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.contains("\n        trailer_governor,")),
             "{constructor} must forward the governor to {delegate}"
         );
     }

@@ -71,24 +71,39 @@ pub(crate) fn sample_interval(write_timeout_ms: u64) -> Duration {
     Duration::from_millis(if interval == 0 { 1 } else { interval })
 }
 
-/// A duplicated handle on one backend socket, usable for send-queue sampling
-/// after the transport that owns the socket has stopped handing it to us.
+/// A handle on one backend socket, usable for send-queue sampling after the
+/// transport that owns the socket has stopped handing it to us.
 ///
-/// The fd is `dup`ed rather than borrowed on purpose. A raw fd number that the
-/// owning transport has closed can be recycled by any later socket in the
-/// process, and sampling a recycled number would read an unrelated
-/// connection's send queue. Duplicating keeps the file description alive for
-/// exactly as long as a handle exists, so a sample is always about the socket
-/// it was taken from or fails outright.
+/// A raw fd number that the owning transport has closed can be recycled by any
+/// later socket in the process, and sampling a recycled number would read an
+/// unrelated connection's send queue. Each variant rules that out:
 ///
-/// Lifetime: one handle is created per pooled backend connection and dropped
-/// with the pool entry, and the request path only ever clones the `Arc` for the
-/// duration of one response-header wait, so the duplicate never outlives the
-/// connection it describes.
+/// * [`Self::duplicate_from`] / [`Self::duplicate_from_raw_fd`] `dup` the
+///   descriptor, keeping the file description alive for exactly as long as
+///   the handle exists (the reqwest path holds one only for one dispatch).
+/// * [`ObservedTcpStream::new`] shares only a liveness cell with the transport
+///   that owns the socket (the direct HTTP/1.1 pool, issue #5963). The
+///   transport's IO clears the cell under its write lock before its stream —
+///   and so the descriptor — drops, and a sample holds the read lock across
+///   its one `ioctl`, so the socket cannot close or be recycled mid-sample;
+///   once the transport is gone the sample reports nothing. No second
+///   descriptor exists, so a pooled connection costs one fd and closes (FIN,
+///   no `CLOSE_WAIT`) the moment hyper drops it.
 pub struct BackendSocketHandle {
     #[cfg(unix)]
-    fd: std::os::fd::OwnedFd,
+    source: SocketSource,
 }
+
+#[cfg(unix)]
+enum SocketSource {
+    Duplicated(std::os::fd::OwnedFd),
+    Observed(Arc<SocketLiveness>),
+}
+
+/// The descriptor of a socket some transport still owns, or `None` once that
+/// transport has dropped it (issue #5963).
+#[cfg(unix)]
+type SocketLiveness = std::sync::RwLock<Option<std::os::fd::RawFd>>;
 
 impl std::fmt::Debug for BackendSocketHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,11 +119,10 @@ impl BackendSocketHandle {
     /// `None` when the platform has no send-queue query, or when the duplicate
     /// cannot be made (fd exhaustion) — in both cases the drain bound stays
     /// disarmed and the read timeout governs, which is the pre-#4411 behaviour.
-    // The direct HTTP/2 and native gRPC pools no longer publish their sockets
-    // (multiplexed connections have no per-request send queue), so this
-    // constructor has no binary caller until a per-request transport uses it;
-    // it stays as the owned-stream counterpart of `duplicate_from_raw_fd` and
-    // is exercised by the integration tests.
+    // No production transport owns a plain `TcpStream` it must keep while also
+    // publishing it: the direct HTTP/1.1 pool wraps its stream in
+    // `ObservedTcpStream`, and the reqwest path reports a raw fd. Kept as the
+    // owned-stream counterpart of `duplicate_from_raw_fd` for the tests.
     #[allow(dead_code)]
     #[cfg(unix)]
     pub fn duplicate_from(stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
@@ -117,9 +131,12 @@ impl BackendSocketHandle {
         }
         use std::os::fd::AsFd;
         let fd = stream.as_fd().try_clone_to_owned().ok()?;
-        Some(Arc::new(Self { fd }))
+        Some(Arc::new(Self {
+            source: SocketSource::Duplicated(fd),
+        }))
     }
 
+    #[allow(dead_code)]
     #[cfg(not(unix))]
     pub fn duplicate_from(_stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
         None
@@ -152,20 +169,141 @@ impl BackendSocketHandle {
         // escape this expression.
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
         let fd = borrowed.try_clone_to_owned().ok()?;
-        Some(Arc::new(Self { fd }))
+        Some(Arc::new(Self {
+            source: SocketSource::Duplicated(fd),
+        }))
     }
 
     /// Current send-queue depth in bytes, or `None` when the kernel refuses to
-    /// answer (closed socket, unsupported platform).
+    /// answer (closed socket, unsupported platform) or an observed transport
+    /// has already dropped its stream.
     #[cfg(unix)]
     pub fn send_queue_bytes(&self) -> Option<u64> {
         use std::os::fd::AsRawFd;
-        crate::socket_opts::socket_send_queue_bytes(self.fd.as_raw_fd()).ok()
+        match &self.source {
+            SocketSource::Duplicated(fd) => {
+                crate::socket_opts::socket_send_queue_bytes(fd.as_raw_fd()).ok()
+            }
+            SocketSource::Observed(liveness) => {
+                // The read lock is held across the `ioctl`: the owning IO
+                // cannot clear the cell — and so cannot close the descriptor
+                // for the kernel to recycle — until this sample returns.
+                let fd = liveness.read().unwrap_or_else(|p| p.into_inner());
+                crate::socket_opts::socket_send_queue_bytes((*fd)?).ok()
+            }
+        }
     }
 
     #[cfg(not(unix))]
     pub fn send_queue_bytes(&self) -> Option<u64> {
         None
+    }
+}
+
+/// A transport-owned `TcpStream` whose send queue a [`BackendSocketHandle`] may
+/// sample without holding the socket open (issue #5963).
+///
+/// The direct HTTP/1.1 pool hands this to rustls/hyper. It still owns its
+/// stream, so reads and writes are tokio's own `TcpStream` path unchanged
+/// (`PollEvented`, which also clears readiness after a short read or write and
+/// skips the extra `EAGAIN` syscall). Only a liveness cell is shared: `Drop`
+/// clears it under the write lock before the stream field drops, so the
+/// descriptor closes only after every in-flight sample has finished.
+pub struct ObservedTcpStream {
+    stream: tokio::net::TcpStream,
+    #[cfg(unix)]
+    liveness: Option<Arc<SocketLiveness>>,
+}
+
+impl ObservedTcpStream {
+    /// Wrap `stream`, returning the handle the upload pump samples, or `None`
+    /// where the platform has no send-queue probe.
+    pub fn new(stream: tokio::net::TcpStream) -> (Self, Option<Arc<BackendSocketHandle>>) {
+        #[cfg(unix)]
+        {
+            if !crate::socket_opts::send_queue_probe_supported() {
+                return (
+                    Self {
+                        stream,
+                        liveness: None,
+                    },
+                    None,
+                );
+            }
+            use std::os::fd::AsRawFd;
+            let liveness = Arc::new(std::sync::RwLock::new(Some(stream.as_raw_fd())));
+            let handle = Arc::new(BackendSocketHandle {
+                source: SocketSource::Observed(Arc::clone(&liveness)),
+            });
+            (
+                Self {
+                    stream,
+                    liveness: Some(liveness),
+                },
+                Some(handle),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            (Self { stream }, None)
+        }
+    }
+}
+
+impl Drop for ObservedTcpStream {
+    fn drop(&mut self) {
+        // Runs before the `stream` field drops: once the cell is cleared under
+        // the write lock, no sample can still be reading this descriptor.
+        #[cfg(unix)]
+        if let Some(liveness) = &self.liveness {
+            *liveness.write().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ObservedTcpStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for ObservedTcpStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 

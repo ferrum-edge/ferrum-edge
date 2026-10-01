@@ -1641,11 +1641,17 @@ impl Http2PoolManager {
                     enable_keepalive,
                     keepalive_seconds,
                 );
-                // Duplicate the raw TCP descriptor before TLS wraps it: the
-                // upload pump samples its kernel send queue to bound a
-                // never-draining backend after the upload's last byte (#4411).
-                let socket =
-                    crate::proxy::backend_send_queue::BackendSocketHandle::duplicate_from(&tcp);
+                // Observe the stream rather than duplicating its descriptor
+                // (issue #5963): the upload pump samples the kernel send queue
+                // to bound a never-draining backend after the upload's last
+                // byte (#4411) through a liveness cell, so the pooled
+                // connection holds one fd and closes with hyper's IO.
+                let (tcp, socket) = crate::proxy::backend_send_queue::ObservedTcpStream::new(tcp);
+                debug!(
+                    backend = %sock_addr,
+                    tls = tls_parts.is_some(),
+                    "direct HTTP/1.1 pool dialed a backend connection"
+                );
                 let sender = match tls_parts {
                     Some((connector, server_name)) => {
                         let tls_started = crate::plugins::otel_tracing::backend_attempt_clock();
@@ -1767,9 +1773,12 @@ impl Http2ConnectionPool {
             }
         }
         let setup_started = crate::plugins::otel_tracing::backend_connection_setup_clock();
-        let (sender, socket) = manager
-            .create_h1_connection(proxy, tls, svid_generation, connect_timeout)
-            .await?;
+        // Boxed: the dial (DNS, TCP, TLS handshake) is the cold path, and
+        // inlining its state would grow every request's checkout future — and
+        // each deadline wrapper around it — by the size of a TLS handshake.
+        let (sender, socket) =
+            Box::pin(manager.create_h1_connection(proxy, tls, svid_generation, connect_timeout))
+                .await?;
         crate::plugins::otel_tracing::note_backend_connection_established_since(setup_started);
         Ok(Http1Checkout {
             lane,
