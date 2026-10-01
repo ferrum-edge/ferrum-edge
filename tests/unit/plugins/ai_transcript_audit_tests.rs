@@ -13444,11 +13444,15 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
     // Malformed JSON that names no call and carries no escape stays out of
     // MCP scope. The plugin records that decision as an explicit `"false"`
     // candidate marker (shared with co-located instances), so check the value.
+    // The plugin is started like the positive cases above, so the decline is
+    // the classification and not an idle plugin.
     let plugin = AiTranscriptAudit::new(
         &config_with_sink("http://127.0.0.1:1/ingest", json!({})),
         loopback_http_client(),
     )
     .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let malformed = r#"{"jsonrpc":"2.0","id":76,"method":"tools/list","params":{"n":NaN}}"#;
     let mut ctx = mcp_ctx(&json!({}));
     ctx.metadata
