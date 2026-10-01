@@ -201,6 +201,13 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
   [PR text](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/pr-description.md),
   [patch](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/hyper-upgraded-h2-connect-error-reset.patch))
 
+### h2
+
+- 001 — [coalesce DATA frames into one write](upstream-h2-patches/001-coalesce-data-frame-writes/README.md)
+  ([issue text](upstream-h2-patches/001-coalesce-data-frame-writes/issue.md),
+  [PR text](upstream-h2-patches/001-coalesce-data-frame-writes/pr-description.md),
+  [patch](upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch))
+
 ### hyper-util
 
 - 001 — [release an HTTP/1 sender once its dispatcher stops reading](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md)

@@ -692,6 +692,19 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # `vendor/hyper-1.9.0-ferrum-patched/`, move the HBONE relays to the upstream
 # API, and update the three lockfiles and the drift manifest. See
 # `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md`.
+#
+# We also carry a vendored copy of h2 0.4.19 whose frame writer copies DATA
+# payloads into its write buffer, up to 64 KiB, instead of holding one DATA
+# frame at a time (issue #5588). Stock h2 wrote every DATA frame with its own
+# `writev`, and over TLS each frame's 9-byte header spilled into a short extra
+# record, so a busy HTTP/2 or gRPC connection paid a syscall, and woke its
+# peer, once per frame. Coalescing made HTTP/2 5–16% faster against Envoy on
+# the protocol benchmark.
+#
+# Retirement plan: when an h2 release batches DATA frames into one write
+# (or Ferrum moves off h2), remove the `h2` line below, drop
+# `vendor/h2-0.4.19-ferrum-patched/`, and update both lockfiles and the drift
+# manifest. See `docs/upstream-h2-patches/001-coalesce-data-frame-writes/README.md`.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
@@ -702,3 +715,4 @@ tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }
 hyper-util = { path = "vendor/hyper-util-0.1.21-ferrum-patched" }
 hyper = { path = "vendor/hyper-1.9.0-ferrum-patched" }
+h2 = { path = "vendor/h2-0.4.19-ferrum-patched" }

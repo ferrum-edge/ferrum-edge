@@ -1,0 +1,247 @@
+diff --git a/src/codec/framed_write.rs b/src/codec/framed_write.rs
+index efd1966cf..3defb01e6 100644
+--- a/src/codec/framed_write.rs
++++ b/src/codec/framed_write.rs
+@@ -76,6 +76,18 @@ const CHAIN_THRESHOLD: usize = 256;
+ /// fragmented data being sent, and hereby improve the throughput.
+ const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
+ 
++/// FERRUM PATCH (h2-001-coalesce-data-frame-writes): copy a DATA payload into
++/// the write buffer, instead of chaining it as the single in-flight frame,
++/// while the buffer stays within this many bytes.
++///
++/// Chaining holds one DATA frame at a time, so every frame cost its own
++/// write: one `writev` per frame, and over TLS one short record for each
++/// frame's 9-byte header (a 16 KiB payload plus its header does not fit one
++/// record). Copying lets the frames popped in one pass, across streams, leave
++/// in one write, as an event-loop proxy batches them. Larger payloads are
++/// still chained without a copy.
++const COALESCE_LIMIT: usize = 64 * 1_024;
++
+ // TODO: Make generic
+ impl<T, B> FramedWrite<T, B>
+ where
+@@ -199,7 +211,14 @@ where
+     fn unset_frame(&mut self) -> ControlFlow {
+         // Clear internal buffer
+         self.buf.set_position(0);
+-        self.buf.get_mut().clear();
++        // FERRUM PATCH: a buffer that grew to coalesce DATA frames goes back
++        // to its initial size once written, so an idle connection does not
++        // keep the larger allocation.
++        if self.buf.get_ref().capacity() > DEFAULT_BUFFER_CAPACITY {
++            *self.buf.get_mut() = BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY);
++        } else {
++            self.buf.get_mut().clear();
++        }
+ 
+         // The data frame has been written, so unset it
+         match self.next.take() {
+@@ -237,7 +256,21 @@ where
+                     return Err(PayloadTooBig);
+                 }
+ 
+-                if len >= self.chain_threshold {
++                let buf_len = self.buf.get_ref().len();
++                if len >= self.chain_threshold
++                    && buf_len + frame::HEADER_LEN + len <= COALESCE_LIMIT
++                {
++                    // FERRUM PATCH: coalesce. Grow once, straight to the
++                    // limit, rather than by doubling across several frames.
++                    let buf = self.buf.get_mut();
++                    if buf.capacity() - buf_len < frame::HEADER_LEN + len {
++                        buf.reserve(COALESCE_LIMIT - buf_len);
++                    }
++                    v.encode_chunk(buf);
++                    // Fully copied, so the frame is complete once buffered,
++                    // the same as a frame under the chain threshold.
++                    self.last_data_frame = Some(v);
++                } else if len >= self.chain_threshold {
+                     let head = v.head();
+ 
+                     // Encode the frame head to the buffer
+@@ -307,9 +340,12 @@ where
+     }
+ 
+     fn has_capacity(&self) -> bool {
++        let buf = self.buf.get_ref();
++        // FERRUM PATCH: the buffer may grow up to `COALESCE_LIMIT`, so room
++        // under that limit counts even before the allocation exists.
+         self.next.is_none()
+-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
+-                >= self.min_buffer_capacity)
++            && (buf.capacity() - buf.len() >= self.min_buffer_capacity
++                || buf.len() + self.min_buffer_capacity <= COALESCE_LIMIT)
+     }
+ 
+     fn is_empty(&self) -> bool {
+@@ -376,3 +412,169 @@ mod unstable {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod ferrum_coalesce_data_frame_writes_tests {
++    //! FERRUM PATCH (h2-001-coalesce-data-frame-writes).
++    use super::*;
++    use bytes::Bytes;
++    use std::sync::{Arc, Mutex};
++
++    /// Records every write call; accepts everything.
++    struct RecordingIo {
++        vectored: bool,
++        writes: Arc<Mutex<Vec<Vec<u8>>>>,
++    }
++
++    impl AsyncWrite for RecordingIo {
++        fn poll_write(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            self.writes.lock().unwrap().push(buf.to_vec());
++            Poll::Ready(Ok(buf.len()))
++        }
++
++        fn poll_write_vectored(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            bufs: &[io::IoSlice<'_>],
++        ) -> Poll<io::Result<usize>> {
++            let joined: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
++            let n = joined.len();
++            self.writes.lock().unwrap().push(joined);
++            Poll::Ready(Ok(n))
++        }
++
++        fn is_write_vectored(&self) -> bool {
++            self.vectored
++        }
++
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    fn framed(vectored: bool) -> (FramedWrite<RecordingIo, Bytes>, Arc<Mutex<Vec<Vec<u8>>>>) {
++        let writes = Arc::new(Mutex::new(Vec::new()));
++        let io = RecordingIo {
++            vectored,
++            writes: Arc::clone(&writes),
++        };
++        let mut framed = FramedWrite::new(io);
++        framed.set_max_frame_size(frame::MAX_MAX_FRAME_SIZE as usize);
++        (framed, writes)
++    }
++
++    fn data(stream: u32, len: usize, fill: u8) -> Frame<Bytes> {
++        frame::Data::new(stream.into(), Bytes::from(vec![fill; len])).into()
++    }
++
++    /// Wire bytes of one DATA frame without flags.
++    fn wire(stream: u32, len: usize, fill: u8) -> Vec<u8> {
++        let mut out = Vec::with_capacity(frame::HEADER_LEN + len);
++        out.extend_from_slice(&(len as u32).to_be_bytes()[1..]);
++        out.push(0x0); // DATA
++        out.push(0x0); // no flags
++        out.extend_from_slice(&stream.to_be_bytes());
++        out.extend(std::iter::repeat(fill).take(len));
++        out
++    }
++
++    /// Buffer every frame the way `Prioritize::buffer_pending` does (checking
++    /// capacity and taking back the completed frame), flushing whenever the
++    /// codec is full, then flush the rest.
++    fn send_all(framed: &mut FramedWrite<RecordingIo, Bytes>, frames: Vec<Frame<Bytes>>) {
++        let waker = futures_util_noop_waker();
++        let mut cx = Context::from_waker(&waker);
++        for f in frames {
++            while !framed.has_capacity() {
++                assert!(framed.flush(&mut cx).is_ready());
++                let _ = framed.take_last_data_frame();
++            }
++            framed.buffer(f).unwrap();
++            let _ = framed.take_last_data_frame();
++        }
++        assert!(framed.flush(&mut cx).is_ready());
++        let _ = framed.take_last_data_frame();
++    }
++
++    /// Compare recorded writes by size and content without dumping payloads.
++    fn assert_writes(writes: &[Vec<u8>], expected: &[Vec<u8>], what: &str) {
++        let sizes: Vec<usize> = writes.iter().map(Vec::len).collect();
++        let want: Vec<usize> = expected.iter().map(Vec::len).collect();
++        assert_eq!(sizes, want, "{what}: write sizes");
++        assert!(writes == expected, "{what}: write contents differ");
++    }
++
++    fn futures_util_noop_waker() -> std::task::Waker {
++        use std::task::{RawWaker, RawWakerVTable};
++        fn clone(_: *const ()) -> RawWaker {
++            RawWaker::new(std::ptr::null(), &VTABLE)
++        }
++        fn noop(_: *const ()) {}
++        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
++        // SAFETY: every vtable entry ignores the data pointer.
++        unsafe { std::task::Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
++    }
++
++    #[test]
++    fn data_frames_within_the_limit_leave_in_one_write() {
++        for vectored in [true, false] {
++            let (mut framed, writes) = framed(vectored);
++            send_all(
++                &mut framed,
++                vec![data(1, 16_384, b'a'), data(3, 16_384, b'b'), data(1, 10_000, b'c')],
++            );
++            let mut expected = wire(1, 16_384, b'a');
++            expected.extend(wire(3, 16_384, b'b'));
++            expected.extend(wire(1, 10_000, b'c'));
++            assert_writes(&writes.lock().unwrap(), &[expected], &format!("vectored={vectored}"));
++        }
++    }
++
++    /// A frame that no longer fits is chained behind the copied ones, so with
++    /// vectored I/O both still leave in one write, and the third frame waits
++    /// for the next one.
++    #[test]
++    fn a_frame_past_the_limit_is_chained_behind_the_copied_ones() {
++        let (mut framed, writes) = framed(true);
++        send_all(
++            &mut framed,
++            vec![data(1, 40_000, b'a'), data(1, 40_000, b'b'), data(1, 1_000, b'c')],
++        );
++        let mut first = wire(1, 40_000, b'a');
++        first.extend(wire(1, 40_000, b'b'));
++        assert_writes(&writes.lock().unwrap(), &[first, wire(1, 1_000, b'c')], "vectored");
++    }
++
++    #[test]
++    fn a_frame_larger_than_the_limit_is_chained_whole() {
++        let (mut framed, writes) = framed(true);
++        send_all(&mut framed, vec![data(5, 100_000, b'z')]);
++        assert_writes(&writes.lock().unwrap(), &[wire(5, 100_000, b'z')], "large frame");
++        assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
++    }
++
++    #[test]
++    fn the_buffer_returns_to_its_initial_size_after_a_coalesced_write() {
++        let (mut framed, _writes) = framed(true);
++        send_all(&mut framed, vec![data(1, 30_000, b'a'), data(3, 30_000, b'b')]);
++        assert!(framed.encoder.buf.get_ref().is_empty());
++        assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
++    }
++
++    #[test]
++    fn a_copied_frame_is_handed_back_fully_consumed() {
++        let (mut framed, _writes) = framed(true);
++        framed.buffer(data(1, 20_000, b'a')).unwrap();
++        let reclaimed = framed.take_last_data_frame().expect("copied frame");
++        assert!(!reclaimed.payload().has_remaining());
++        assert!(framed.has_capacity());
++    }
++}

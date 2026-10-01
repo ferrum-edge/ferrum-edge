@@ -816,6 +816,36 @@
       "regression_tests": [
         "vendor/hyper-1.9.0-ferrum-patched (proto::h1::io::tests::ferrum_greedy_read_*)"
       ]
+    },
+    {
+      "id": "h2-001-coalesce-data-frame-writes",
+      "label": "h2 writes several DATA frames per write call",
+      "crate": "h2",
+      "vendored_version": "0.4.19",
+      "vendor_path": "vendor/h2-0.4.19-ferrum-patched",
+      "docs_path": "docs/upstream-h2-patches/001-coalesce-data-frame-writes/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "h2's FramedWrite held one chained DATA frame at a time, so every DATA frame cost its own writev and peer wakeup, and over TLS a 9-byte record for each maximum-size frame's header; copying payloads into the write buffer up to 64 KiB made HTTP/2 through Ferrum 5-16% faster on the protocol benchmark (#5588).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h2",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "An h2 release batches DATA frames into one write (this patch or an equivalent), or Ferrum stops using h2.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/h2-0.4.19-ferrum-patched (codec::framed_write::ferrum_coalesce_data_frame_writes_tests)"
+      ]
     }
   ]
 }
