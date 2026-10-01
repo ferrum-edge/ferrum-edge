@@ -61,6 +61,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **jemalloc's thread cache now serves allocations up to 128 KiB** (#5588). The
+  binary compiles in the jemalloc option `tcache_max:131072`; the jemalloc default
+  is 32 KiB. Each proxied request boxes its handler future, which is about 90 KiB,
+  so with the default every request allocated and freed through the arena's
+  extent path.
+  - **Throughput:** on the hosted HTTPS/1.1 protocol benchmark (same-image A/B,
+    2 iterations × 2 pairs per run), 10 KiB payloads gained +2.5% in one run
+    (all four pairs positive) and +1.6% in a re-run (three pairs within ±0.6%,
+    one +6.4%). That is about +2%, inside the benchmark's ±3% resolution, so the
+    gain is small and not established beyond noise. Throughput was neutral at
+    70 KiB to 1 MiB. At 5 MiB, the first run had one outlier pair at 0.86 and the
+    re-run was neutral (0.997).
+  - **Memory:** gateway RSS rose by 0–11 MiB at steady state and at most 15 MiB at
+    peak under a 200-connection load. The theoretical bound is about 12.5 MiB per
+    Tokio worker thread (see docs/infrastructure_sizing.md).
+  - **Override or revert:** set `_RJEM_MALLOC_CONF=tcache_max:32768` to restore
+    the jemalloc default; `_RJEM_MALLOC_CONF` overrides any compiled-in option.
+    Windows builds, which do not use jemalloc, are unaffected.
+
 - **HTTP/1.1 backends are dispatched on Ferrum's own hyper connection pool
   instead of reqwest** (#5588, #5961). This applies to plaintext `http`
   backends and to `https` backends that speak only HTTP/1.1

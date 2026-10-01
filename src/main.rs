@@ -23,8 +23,9 @@ static GLOBAL: h1_profile::ForwardingAllocator<tikv_jemallocator::Jemalloc> =
 /// by default). Each proxied request boxes its handler future, which is about
 /// 90 KiB, so with the default every request allocates and frees through the
 /// arena's extent path. Raising the cap to 128 KiB serves those allocations
-/// from the thread cache: +2.5% HTTPS/1.1 throughput at 10 KiB payloads on the
-/// protocol benchmark, neutral at larger sizes. The cache holds only size
+/// from the thread cache. On the protocol benchmark that measured about +2%
+/// HTTPS/1.1 throughput at 10 KiB payloads (inside the benchmark's ±3%
+/// resolution) and was neutral at larger sizes. The cache holds only size
 /// classes a thread actually uses and is trimmed by jemalloc's incremental
 /// thread-cache GC. `_RJEM_MALLOC_CONF` still overrides any option at runtime.
 #[cfg(not(windows))]
