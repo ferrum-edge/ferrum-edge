@@ -8484,18 +8484,26 @@ enum CarriedRead {
     Err(std::io::Error),
 }
 
-/// A relay read at least this large (one maximum TLS record's plaintext)
-/// suggests more is ready behind it (issue #5588). Userspace TLS readers
-/// (tokio-rustls) return one decrypted record per read, so without topping
-/// the buffer up the relay wrote each 16 KiB record separately: about twice
-/// the writes, and the per-write kernel cost, of a relay that batches.
-const RELAY_TOP_UP_MIN: usize = 16 * 1024;
+/// A relay read at least this large suggests more is ready behind it (issue
+/// #5588). Userspace TLS readers (tokio-rustls) return about one decrypted
+/// record per read, so without topping the buffer up the relay wrote each
+/// record separately: more writes, and the per-write kernel cost, than a
+/// relay that batches, plus one receiver wakeup per record on the far side.
+///
+/// Half a maximum record (8 KiB), not a full one: senders that write in 8 KiB
+/// slices emit 8 KiB records — `tokio::io::copy`'s default buffer, for one —
+/// and a 16 KiB threshold forwarded those 1:1. Measured on the TCP-TLS echo
+/// benchmark, whose backend echoes with `tokio::io::copy`, 8 KiB was 16–31%
+/// faster than 16 KiB at every payload size, and as fast as topping up after
+/// every read. Small interactive reads still go out at once, with no
+/// speculative extra read.
+const RELAY_TOP_UP_MIN: usize = 8 * 1024;
 /// Bound on extra reads per batch. The relay buffer is usually the real
-/// limit: the default adaptive 64 KiB buffer holds four records, so a batch
-/// makes at most 3 extra reads; a buffer of 16 KiB or less never batches (a
-/// full first read leaves no room); and a peer that sends records smaller
-/// than 16 KiB never triggers a top-up at all. This cap only binds on buffers
-/// larger than 144 KiB.
+/// limit: the default adaptive 64 KiB buffer holds four full 16 KiB records
+/// (three extra reads) or eight 8 KiB ones (seven); a buffer of 8 KiB or less
+/// never batches (a qualifying first read leaves no room); and a peer whose
+/// records are all smaller than [`RELAY_TOP_UP_MIN`] never triggers a top-up.
+/// With full records this cap only binds on buffers larger than 144 KiB.
 const RELAY_TOP_UP_MAX_ROUNDS: usize = 8;
 
 impl CopyDirectionState {
@@ -8776,7 +8784,7 @@ fn relay_watchdog(interval: Duration) -> tokio::time::Interval {
 /// rather than as a clean completion ([`finish_half_close`]).
 ///
 /// **Read batching (issue #5588):** a read that returns at least
-/// [`RELAY_TOP_UP_MIN`] bytes (one full TLS record's plaintext) is topped up
+/// [`RELAY_TOP_UP_MIN`] bytes (half a full TLS record's plaintext) is topped up
 /// with further reads into the same buffer, while it has room and for at most
 /// [`RELAY_TOP_UP_MAX_ROUNDS`] extra reads, so a userspace TLS reader's
 /// back-to-back records reach the writer as one write. A short read, `Pending`
