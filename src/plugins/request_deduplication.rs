@@ -110,6 +110,7 @@
 //! through the rules above.
 
 use crate::fips::approved::Sha256;
+use crate::sync_compat::AtomicUpdate;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -297,7 +298,7 @@ fn cleanup_due(last: u64, now_secs: u64, interval_secs: u64) -> bool {
 
 fn decrement_atomic(value: &AtomicUsize) -> usize {
     value
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(1))
         })
         .map(|previous| previous.saturating_sub(1))
@@ -1295,7 +1296,7 @@ impl RequestDeduplication {
     fn try_reserve_execution_barrier(&self) -> bool {
         self.local
             .execution_barrier_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (current < self.max_entries).then_some(current + 1)
             })
             .is_ok()

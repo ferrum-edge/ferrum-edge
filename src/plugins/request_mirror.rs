@@ -269,6 +269,7 @@
 //! panic, and cannot bias a complete sampling cycle.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
+use crate::sync_compat::AtomicUpdate;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1027,7 +1028,7 @@ impl MirrorBodyBudget {
         if bytes > 0
             && let Err(current) =
                 self.used
-                    .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                    .update_with(Ordering::SeqCst, Ordering::Relaxed, |current| {
                         current.checked_sub(bytes)
                     })
         {

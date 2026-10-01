@@ -69,6 +69,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::audit::{AuditEvent, AuditOutcome};
+use crate::sync_compat::AtomicUpdate;
 
 /// On-disk record format version. A record with any other version is corrupt.
 pub const AUDIT_SPOOL_RECORD_VERSION: u32 = 2;
@@ -961,7 +962,7 @@ fn uuid_text() -> String {
 
 /// Saturating decrement for an admission counter.
 fn decrement(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = counter.update_with(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(1))
     });
 }

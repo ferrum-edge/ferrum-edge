@@ -174,7 +174,7 @@
 +static GENERATION: AtomicU64 = AtomicU64::new(0);
 +
 +pub(crate) fn guard_snapshot() -> String {
-+    use super::guard_observe::{MEMORY_OVERFLOW, SEQUENCE, TARGET};
++    use super::guard_observe::{update, MEMORY_OVERFLOW, SEQUENCE, TARGET};
 +    if !tracing::enabled!(target: TARGET, tracing::Level::DEBUG) {
 +        return "# H2_GUARD_ACK_V2 ack=0\n".into();
 +    }
@@ -184,7 +184,7 @@
 +    };
 +    // Five calls cover smoke + before/after both gRPC sizes. Sixteen is a
 +    // bounded diagnostic request allowance, not a transport retry budget.
-+    let previous = match GENERATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
++    let previous = match update(&GENERATION,
 +        |n| (n < 16).then_some(n + 1)) {
 +        Ok(previous) => previous,
 +        Err(_) => return "# H2_GUARD_ACK_V2 ack=0\n".into(),

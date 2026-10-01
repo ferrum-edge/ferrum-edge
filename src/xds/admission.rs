@@ -24,6 +24,7 @@ pub use crate::grpc::admission::{
 };
 
 use crate::grpc::admission::{CpGrpcAdmissionController, CpGrpcStreamPermit, node_state_key};
+use crate::sync_compat::AtomicUpdate;
 
 /// Preserve the historical xDS state-key helper and byte-for-byte key shape.
 pub fn xds_state_key(namespace: &str, principal_key: &str, node_id: &str) -> String {
@@ -183,7 +184,7 @@ impl XdsStreamPermit {
 impl Drop for XdsStreamPermit {
     fn drop(&mut self) {
         let _ = self.release_node();
-        let _ = self.controller.xds_streams.fetch_update(
+        let _ = self.controller.xds_streams.update_with(
             Ordering::AcqRel,
             Ordering::Acquire,
             |current| Some(current.saturating_sub(1)),

@@ -1,5 +1,6 @@
 //! H1 publication algorithm with an independent pool schema and TLS slots.
 //! Bounded, single-writer thread slots. No thread IDs or request labels escape.
+use crate::sync_compat::AtomicUpdate;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -67,7 +68,7 @@ static LOST: AtomicU64 = AtomicU64::new(0);
 
 fn lost() {
     // Exceptional path only. Saturation is sticky and rejects completeness.
-    let _ = LOST.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+    let _ = LOST.update_with(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(1))
     });
 }

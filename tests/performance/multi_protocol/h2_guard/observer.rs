@@ -13,14 +13,25 @@ pub(super) const SLOTS: usize = 64;
 static LIVE: AtomicU64 = AtomicU64::new(0);
 pub(super) static MEMORY_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
+// Relaxed `fetch_update` as its own compare-exchange loop: Rust 1.99
+// deprecates `fetch_update`, and `try_update` is newer than h2's MSRV.
+pub(super) fn update(atomic: &AtomicU64, mut f: impl FnMut(u64) -> Option<u64>) -> Result<u64, u64> {
+    let mut prev = atomic.load(Ordering::Relaxed);
+    while let Some(next) = f(prev) {
+        match atomic.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Ok(previous),
+            Err(current) => prev = current,
+        }
+    }
+    Err(prev)
+}
+
 #[derive(Debug)]
 struct Permit;
 
 impl Permit {
     fn take() -> Option<Self> {
-        if LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            (n < SLOTS as u64).then_some(n + 1)
-        }).is_err() {
+        if update(&LIVE, |n| (n < SLOTS as u64).then_some(n + 1)).is_err() {
             MEMORY_OVERFLOW.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -69,16 +80,10 @@ impl Limit {
     }
 
     pub(super) fn take(&self, records: u64) -> Result<u64, u64> {
-        match self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            n.checked_add(records).filter(|&next| next <= self.cap)
-        }) {
+        match update(&self.used, |n| n.checked_add(records).filter(|&next| next <= self.cap)) {
             Ok(n) => Ok(n + records),
             Err(_) => {
-                let old = self.suppressed.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |n| Some(n.saturating_add(1)),
-                );
+                let old = update(&self.suppressed, |n| Some(n.saturating_add(1)));
                 // The closure always returns Some: both arms avoid a panic.
                 Err(old.unwrap_or_else(|n| n).saturating_add(1))
             }

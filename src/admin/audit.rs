@@ -71,6 +71,7 @@ use crate::admin::audit_spool::{
 };
 use crate::admin::jwt_auth::{AdminKeyTier, AdminRole, VerifiedAdminToken, ViewerNamespaceCeiling};
 use crate::config::db_backend::DatabaseBackend;
+use crate::sync_compat::AtomicUpdate;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -980,7 +981,7 @@ pub struct AuditPipelineMetricsSnapshot {
 
 /// Saturating decrement for a gauge that several tasks adjust concurrently.
 fn saturating_decrement(gauge: &AtomicU64) {
-    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = gauge.update_with(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(1))
     });
 }
