@@ -73,14 +73,21 @@ pub fn content_type_is_json(value: &str) -> bool {
 /// parses as JSON — would be inspected as one text here and decoded as another
 /// by an upstream that honours the charset (GHSA-4f9m-cfqg-fhx9), so callers
 /// refuse it. A parameter that cannot be read as one of those spellings
-/// (an empty value, an unterminated quote) counts as non-UTF-8.
+/// (an empty value, an unterminated quote) counts as non-UTF-8, and so does
+/// any RFC 2231 form (`charset*`, `charset*0`, ...): Go's `mime` package and
+/// Werkzeug decode it into the charset and let it override a plain one.
 pub fn content_type_charset_is_utf8(value: &str) -> bool {
     value.split(';').skip(1).all(|parameter| {
         let Some((name, charset)) = parameter.split_once('=') else {
             return true;
         };
-        if !name.trim().eq_ignore_ascii_case("charset") {
+        let name = name.trim();
+        let base = name.split('*').next().unwrap_or(name);
+        if !base.eq_ignore_ascii_case("charset") {
             return true;
+        }
+        if base.len() != name.len() {
+            return false;
         }
         let charset = charset.trim();
         let charset = charset

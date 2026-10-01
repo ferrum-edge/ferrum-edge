@@ -209,6 +209,10 @@ fn only_utf8_charsets_are_admitted() {
         "application/json; charset=",
         "application/json; charset=\"utf-8",
         "application/json; charset=utf-8; charset=utf-7",
+        "application/json; charset*=utf-8''utf-7",
+        "application/json; charset*0=utf-7",
+        "application/json; CHARSET*0*=utf-8''utf-8",
+        "application/json; charset=utf-8; charset*=utf-8''shift_jis",
     ] {
         assert!(!content_type_charset_is_utf8(refused), "{refused}");
     }

@@ -75,8 +75,8 @@
 //! JSON-shaped first character (`{`, `[`, `/`, `#` — UTF-16 / UTF-32 JSON),
 //! its first byte after ASCII whitespace is not `/`, `#`, or a non-ASCII
 //! character, and it either does not open with `{` or `[` or contains neither
-//! the literal `tools/call` nor a JSON escape. Anything else may still be executed: `mcp_gateway` admits batch
-//! members one at a time, each with its own parser recursion budget, so a
+//! the literal `tools/call` nor a JSON escape. Anything else may still be
+//! executed: `mcp_gateway` admits batch members one at a time, each with its own parser recursion budget, so a
 //! batch can exceed the whole-document limit while every member is admitted
 //! (GHSA-f2jp-59r9-fp64), and a lenient upstream decoder accepts a BOM,
 //! UTF-16 / UTF-32, `NaN`, comments, or trailing commas that serde refuses.
@@ -1809,8 +1809,9 @@ impl AiPromptShield {
 /// byte after ASCII whitespace that is `/`, `#` (a comment), or non-ASCII.
 /// Bodies not recognizable as such a document — an empty bridged body, a REST
 /// body, base64 gRPC-Web text, malformed JSON naming no call — pass as before.
-/// The cost is a BOM prefix check, a leading-whitespace scan, and `memchr` / `memmem` passes, all bounded by
-/// `max_scan_bytes`, which every caller checks first; nothing is parsed.
+/// The cost is a BOM prefix check, a leading-whitespace scan, and `memchr` /
+/// `memmem` passes, all bounded by `max_scan_bytes`, which every caller checks
+/// first; nothing is parsed.
 fn mcp_body_may_carry_tool_call(body: &[u8]) -> bool {
     mcp_jsonrpc::may_carry_tool_call(body)
 }

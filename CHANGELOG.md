@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an upstream that decodes by charset (for example a `raw-body` / `iconv-lite`
   transport) executed the real arguments. In `mcp_arguments` mode, `reject` and
   `redact` now refuse any in-scope request whose `charset` is not `utf-8` /
-  `utf8` (case-insensitive, optionally quoted) with `400` and
+  `utf8` (case-insensitive, optionally quoted), or that uses an RFC 2231
+  `charset*` form, with `400` and
   `ai_shield_rejected=unsupported_charset`, before the body is parsed and again
   on the final `Content-Type`; `warn` records
   `ai_shield_warnings=unsupported_charset`. `mcp_gateway` refuses the same
