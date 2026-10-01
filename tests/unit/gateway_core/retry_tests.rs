@@ -2176,8 +2176,8 @@ fn test_reqwest_grpc_timeout_forwarding_uses_remaining_deadline_on_every_attempt
     assert_eq!(
         src.matches("\"grpc-timeout\" if remaining_grpc_timeout_header.is_some() => continue")
             .count(),
-        2,
-        "initial and retry reqwest dispatch must suppress the stale relative header"
+        3,
+        "the reqwest initial and retry dispatches and the direct HTTP/1.1 dispatch must suppress the stale relative header"
     );
     assert_eq!(
         src.matches("req_builder = req_builder.header(\"grpc-timeout\", value);")

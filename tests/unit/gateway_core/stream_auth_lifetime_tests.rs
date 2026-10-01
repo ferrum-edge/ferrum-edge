@@ -2345,7 +2345,7 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
     );
     assert!(PROXY_SOURCE.contains("authorization_bounded_header_deadline("));
     assert!(PROXY_SOURCE.contains("ResponseHeaderDeadlineSource::Authorization => {"));
-    // The definition plus eight attributions: those five waits, the direct-H2
+    // The definition plus nine attributions: those six waits, the direct-H2
     // header wait, the direct-H2 early-response upload join, and the shared
     // buffered-response collect composer. Each attributes the fired bound, so an
     // authorization expiry is never reported as a backend timeout or a client
@@ -2354,7 +2354,7 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         PROXY_SOURCE
             .matches("dispatch_phase_authorization_expiry(")
             .count(),
-        9,
+        10,
         "an H1/H2 dispatch phase lost its authorization attribution"
     );
     // Every one of those exits returns the health-neutral placeholder. Sixteen
@@ -2377,12 +2377,13 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         16,
         "an H1/H2 authorization exit stopped being health-neutral"
     );
-    // The wrapper's definition plus its six `proxy_to_backend` call sites.
+    // The wrapper's definition plus its six `proxy_to_backend` call sites and
+    // the direct HTTP/1.1 pool's two (#5588).
     assert_eq!(
         PROXY_SOURCE
             .matches("authorization_expired_backend_dispatch(")
             .count(),
-        7,
+        9,
         "a reqwest-dispatch authorization exit stopped being health-neutral"
     );
     // The counts above are a tripwire for a LOST exit; this is the check that
@@ -4455,8 +4456,8 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         PROXY_SOURCE
             .matches("install_counting_upload_authorization(")
             .count(),
-        2,
-        "the unlimited-size reqwest upload lost its gateway-owned lifecycle"
+        3,
+        "the unlimited-size reqwest or direct HTTP/1.1 upload lost its gateway-owned lifecycle"
     );
     // Native gRPC keeps its own body type, so it installs the pump directly on
     // the shared upload source rather than through the H1/H2 adapters.
