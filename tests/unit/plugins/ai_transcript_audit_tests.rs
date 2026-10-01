@@ -13406,6 +13406,57 @@ async fn mcp_audit_records_tool_calls_the_whole_document_parse_refuses() {
 }
 
 #[tokio::test]
+async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
+    // serde and the strict recognizer refuse `NaN`, but a lenient upstream
+    // parser (Python's `json`) executes this call, so it is audited as an MCP
+    // candidate whose calls could not be read.
+    let nan_call = concat!(
+        r#"{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"crm.lookup","#,
+        r#""arguments":{"e":"alice@example.com","n":NaN}}}"#
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), nan_call.to_string());
+    let records = mcp_roundtrip(
+        json!({}),
+        &mut ctx,
+        nan_call.as_bytes(),
+        &json!({"jsonrpc": "2.0", "id": 75, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "the lenient-parser call must be audited");
+    let mcp = &records[0]["mcp"];
+    assert!(mcp.is_object(), "{records:#?}");
+    assert_eq!(mcp["batch"], json!(false), "{mcp}");
+    assert_eq!(mcp["calls"], json!([]), "{mcp}");
+    assert!(
+        !records[0].to_string().contains("alice@example.com"),
+        "{records:#?}"
+    );
+
+    // Malformed JSON that names no call and carries no escape stays out of
+    // MCP scope.
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("http://127.0.0.1:1/ingest", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let malformed = r#"{"jsonrpc":"2.0","id":76,"method":"tools/list","params":{"n":NaN}}"#;
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), malformed.to_string());
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !ctx.metadata.contains_key("ai_transcript_audit.candidate"),
+        "a malformed body that cannot name tools/call is not an MCP candidate"
+    );
+}
+
+#[tokio::test]
 async fn mcp_audit_defaults_content_type_less_tool_calls_to_all_paths() {
     let request = mcp_call_value(json!(73), "pets.getPet", json!({"petId": "7"}));
     let mut ctx = mcp_ctx(&request);

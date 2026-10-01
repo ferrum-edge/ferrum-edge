@@ -3788,10 +3788,20 @@ impl AiTranscriptAudit {
         let raw_scan = scan_limited || parsed.is_none();
         let bounded_mcp_scan = (raw_scan && self.capture.mcp_tool_calls)
             .then(|| mcp_jsonrpc::scan_request_bytes(body));
+        // A body the whole-document parse refused may still be accepted by a
+        // lenient upstream parser (`NaN`, comments, trailing commas) that the
+        // strict recognizer cannot read. Like `ai_prompt_shield`, err toward
+        // auditing: an object- or array-shaped body that names `tools/call` or
+        // carries a JSON escape stays an MCP candidate (with empty `calls`).
+        let lenient_tool_call = self.capture.mcp_tool_calls
+            && !scan_limited
+            && parsed.is_none()
+            && mcp_jsonrpc::may_carry_tool_call(body);
         let carries_tool_call = parsed.as_ref().is_some_and(mcp_jsonrpc::has_tool_call)
             || bounded_mcp_scan
                 .as_ref()
-                .is_some_and(|scan| !matches!(scan, mcp_jsonrpc::RequestScan::NoToolCall));
+                .is_some_and(|scan| !matches!(scan, mcp_jsonrpc::RequestScan::NoToolCall))
+            || lenient_tool_call;
         let is_mcp = self.capture.mcp_tool_calls && carries_tool_call;
         if !is_ai && !is_mcp {
             self.discard_staged_candidate(ctx);
@@ -4626,11 +4636,14 @@ impl AiTranscriptAudit {
     /// GHSA-f2jp-59r9-fp64). Tool names and ids come from the recognizer's
     /// borrowed raw fields.
     ///
-    /// With `hash_arguments` (the body is within the scan ceiling) each call's
-    /// `arguments` is parsed on its own and hashed and excerpted exactly like
+    /// With `hash_arguments` (the body is within the scan ceiling, so the
+    /// whole-document parse was tried and failed) each call's `arguments` is
+    /// parsed on its own and hashed and excerpted exactly like
     /// [`Self::mcp_section`]. Past the ceiling, redacted mode forbids walking
     /// argument contents, so they stay unhashed and omitted. A body the
-    /// recognizer reports as `Uninspectable` keeps an empty `calls` list.
+    /// recognizer reports as `Uninspectable` keeps an empty `calls` list, and
+    /// so does a refused body it reads as `NoToolCall` that a lenient upstream
+    /// parser could still read as a call ([`mcp_jsonrpc::may_carry_tool_call`]).
     fn mcp_section_from_scan(
         &self,
         scan: &mcp_jsonrpc::RequestScan<'_>,
@@ -4638,15 +4651,20 @@ impl AiTranscriptAudit {
         hash_arguments: bool,
         exportable: bool,
     ) -> Option<StagedMcp> {
+        if matches!(scan, mcp_jsonrpc::RequestScan::NoToolCall)
+            && !(hash_arguments && mcp_jsonrpc::may_carry_tool_call(body))
+        {
+            return None;
+        }
         let (batch, members) = match scan {
             mcp_jsonrpc::RequestScan::ToolCalls { batch, members } => (*batch, members.as_slice()),
             // The recognizer could not read the calls faithfully (ambiguous
-            // member names or over the batch bounds), but the body may carry
-            // one: keep an empty section so the candidate is still audited.
-            mcp_jsonrpc::RequestScan::Uninspectable(_) => {
+            // member names, over the batch bounds, or syntax only a lenient
+            // parser accepts), but the body may carry one: keep an empty
+            // section so the candidate is still audited.
+            mcp_jsonrpc::RequestScan::Uninspectable(_) | mcp_jsonrpc::RequestScan::NoToolCall => {
                 (body.trim_ascii_start().first() == Some(&b'['), &[][..])
             }
-            mcp_jsonrpc::RequestScan::NoToolCall => return None,
         };
         let mut staged = StagedMcp {
             section: McpAuditSection {

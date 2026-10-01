@@ -35,8 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ceiling), and a body that carries or may carry a `tools/call` stays an MCP
   audit candidate. Within the scan ceiling each recognized call's arguments are
   parsed on their own and keyed (and, with `capture.mcp_arguments`, excerpted)
-  like a parsed call's; a body the recognizer cannot read is kept with an empty
-  `calls` list.
+  like a parsed call's. A body the recognizer cannot read is kept with an empty
+  `calls` list, and so — matching the shield's fail-closed rule — is a refused
+  object- or array-shaped body that names `tools/call` or contains a JSON
+  escape, since a lenient upstream parser may still execute it without
+  `ai_prompt_shield` in front.
 
 ## [0.9.9] - 2026-10-01
 
