@@ -128,22 +128,47 @@ fn may_name_tools_call(body: &[u8]) -> bool {
         || memchr::memmem::find(body, TOOLS_CALL_METHOD.as_bytes()).is_some()
 }
 
-/// Whether `body` could name a `tools/call` to SOME JSON parser: its first
-/// non-whitespace byte opens an object or array, and it contains the literal
-/// method name or a JSON escape that could spell it.
+/// Whether `body` could name a `tools/call` to SOME JSON parser.
 ///
-/// This is deliberately looser than [`scan_request_bytes`], which only reports
-/// what a strict parser reads. A body strict parsing refuses — `NaN`,
-/// `Infinity`, comments, trailing commas — can still be accepted by a lenient
-/// upstream (Python's `json`, JSON5), so a policy that must not forward an
-/// uninspected call treats such a body as possibly carrying one. One `memchr`
-/// pass; nothing is parsed.
+/// True when the body
+///
+/// - contains a NUL byte (UTF-16 / UTF-32 code units interleave `0x00` with
+///   ASCII, so a `tools/call` spelled in them hides from a UTF-8 search);
+/// - starts with a byte-order mark (UTF-8 `EF BB BF`, UTF-16 `FE FF` /
+///   `FF FE`, UTF-32 `00 00 FE FF`), which strict JSON refuses but lenient
+///   decoders strip;
+/// - opens, after whitespace, with `/` (a JSON5 / JavaScript comment); or
+/// - opens with `{` or `[` and contains the literal method name or a JSON
+///   escape that could spell it.
+///
+/// Strict UTF-8 JSON never legitimately contains the first three. This is
+/// deliberately looser than [`scan_request_bytes`], which only reports what a
+/// strict parser reads: a body strict parsing refuses — an encoding or BOM,
+/// `NaN`, `Infinity`, comments, trailing commas — can still be accepted by a
+/// lenient upstream (Python's `json`, JSON5), so a policy that must not forward
+/// an uninspected call treats such a body as possibly carrying one. The cost is
+/// a prefix check, a leading-whitespace scan, and `memchr` / `memmem` passes
+/// over the body; nothing is parsed.
 pub fn may_carry_tool_call(body: &[u8]) -> bool {
+    const BYTE_ORDER_MARKS: [&[u8]; 4] = [
+        b"\xEF\xBB\xBF",
+        b"\xFE\xFF",
+        b"\xFF\xFE",
+        b"\x00\x00\xFE\xFF",
+    ];
+    let has_bom = BYTE_ORDER_MARKS.iter().any(|bom| body.starts_with(bom));
+    if has_bom || memchr::memchr(0, body).is_some() {
+        return true;
+    }
     let first = body
         .iter()
         .copied()
         .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
-    matches!(first, Some(b'{' | b'[')) && may_name_tools_call(body)
+    match first {
+        Some(b'/') => true,
+        Some(b'{' | b'[') => may_name_tools_call(body),
+        _ => false,
+    }
 }
 
 /// Recognize the `tools/call` members of a request body.

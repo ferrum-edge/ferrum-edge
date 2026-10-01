@@ -17,16 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tools/call` member nests just under serde_json's 128-level limit therefore
   failed the shield's whole-document parse yet was admitted and executed by
   the gateway with its arguments never scanned. The same gap let a lenient
-  upstream parser (Python's `json`, JSON5) execute a call whose body serde
-  refuses for `NaN`, `Infinity`, comments, or trailing commas. When the
+  upstream decoder (Python's `json`, JSON5) execute a call whose body serde
+  refuses for a byte-order mark, a UTF-16 / UTF-32 or other non-UTF-8
+  encoding, `NaN`, `Infinity`, comments, or trailing commas. When the
   whole-document parse fails, `before_proxy` and the final-body re-check now
-  refuse any object- or array-shaped body that names `tools/call` or contains a
-  JSON escape with `400` and `ai_shield_rejected=jsonrpc_request_unparseable`
-  in `reject` / `redact` mode, and record
-  `ai_shield_warnings=jsonrpc_request_unparseable` in `warn` mode. Bodies that
-  cannot name a call — including the empty final body of an OpenAPI bridge
-  call to a `GET` / `DELETE` operation, REST bodies, framed payloads, and
-  malformed JSON naming no call — still pass uninspected.
+  refuse any body that carries a NUL byte, a byte-order mark, or a leading `/`
+  comment, or is object- or array-shaped and names `tools/call` or contains a
+  JSON escape — and the final re-check any non-UTF-8 body — with `400` and
+  `ai_shield_rejected=jsonrpc_request_unparseable` in `reject` / `redact`
+  mode, recording `ai_shield_warnings=jsonrpc_request_unparseable` in `warn`
+  mode. Bodies that cannot name a call — including the empty final body of an
+  OpenAPI bridge call to a `GET` / `DELETE` operation, REST bodies, base64
+  `grpc-web-text` payloads, and malformed JSON naming no call — still pass
+  uninspected; binary gRPC-Web frames (NUL bytes in their length prefix) are
+  now refused. Scope `scan_fields: mcp_arguments` to MCP routes.
 - **`ai_transcript_audit` records MCP tool calls the whole-document parse
   refuses** (GHSA-f2jp-59r9-fp64 sibling, #5954). A request body that failed the
   `Value` parse was discarded as non-AI without being audited, so the same deep
@@ -37,9 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsed on their own and keyed (and, with `capture.mcp_arguments`, excerpted)
   like a parsed call's. A body the recognizer cannot read is kept with an empty
   `calls` list, and so — matching the shield's fail-closed rule — is a refused
-  object- or array-shaped body that names `tools/call` or contains a JSON
-  escape, since a lenient upstream parser may still execute it without
-  `ai_prompt_shield` in front.
+  body that carries a NUL byte (UTF-16 / UTF-32), a byte-order mark, or a
+  leading `/` comment, or is object- or array-shaped and names `tools/call` or
+  contains a JSON escape, since a lenient upstream decoder may still execute it
+  without `ai_prompt_shield` in front.
 
 ## [0.9.9] - 2026-10-01
 

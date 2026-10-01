@@ -4360,14 +4360,16 @@ async fn mcp_arguments_mode_warns_on_unparseable_bodies_that_may_carry_a_tool_ca
 async fn mcp_arguments_mode_passes_unparseable_bodies_without_a_tool_call() {
     // Not one of these can name a `tools/call` to any parser: a REST body,
     // malformed JSON that spells no call and has no escape, a deep document
-    // that is not JSON-RPC, and a framed payload.
+    // that is not JSON-RPC, a base64 `grpc-web-text` payload, and strict JSON
+    // that is not MCP at all.
     let deep_non_call = format!("[{}1{}]", "[".repeat(200), "]".repeat(200));
-    let bodies: [&[u8]; 5] = [
+    let bodies: [&[u8]; 6] = [
         b"petId=7&note=alice%40example.com",
         br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"n":NaN"#,
         br#"[{"jsonrpc":"2.0","id":1,"method":"ping",}]"#,
         deep_non_call.as_bytes(),
-        b"\x00\x00\x00\x00\x02{}",
+        b"AAAAAAJ7fQ==",
+        br#"{"model":"gpt-4o","messages":[]}"#,
     ];
     for action in ["reject", "redact", "warn"] {
         let plugin = mcp_shield(action);
@@ -4385,6 +4387,90 @@ async fn mcp_arguments_mode_passes_unparseable_bodies_without_a_tool_call() {
             assert_eq!(shield_metadata(&ctx, "ai_shield_warnings"), None);
         }
     }
+}
+
+/// The same `tools/call` as UTF-16LE code units: valid UTF-8 bytes (ASCII
+/// interleaved with NULs) that no UTF-8 search for `tools/call` matches.
+fn utf16le_bytes(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_refuses_encoded_or_commented_tool_calls() {
+    let call = mcp_tool_call(1, json!({"q": "x"})).to_string();
+    let bom_call = format!("\u{feff}{call}");
+    let utf16_call = String::from_utf8(utf16le_bytes(&call)).unwrap();
+    let comment_call = format!("/*x*/{call}");
+
+    for body in [
+        bom_call.as_str(),
+        utf16_call.as_str(),
+        comment_call.as_str(),
+    ] {
+        assert!(serde_json::from_str::<serde_json::Value>(body).is_err());
+        for action in ["reject", "redact"] {
+            let plugin = mcp_shield(action);
+            let mut ctx = make_post_ctx_with_raw_body(body);
+            let mut headers = make_post_headers();
+            assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_rejected"),
+                Some("jsonrpc_request_unparseable"),
+                "{action}: {body:?}"
+            );
+            let (result, ctx) = mcp_final_decision(&plugin, body.as_bytes()).await;
+            assert_reject(result, Some(400));
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_rejected"),
+                Some("jsonrpc_request_unparseable"),
+                "{action} final hook: {body:?}"
+            );
+        }
+
+        let plugin = mcp_shield("warn");
+        let mut ctx = make_post_ctx_with_raw_body(body);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_warnings"),
+            Some("jsonrpc_request_unparseable")
+        );
+        let (result, ctx) = mcp_final_decision(&plugin, body.as_bytes()).await;
+        assert_continue(result);
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_warnings"),
+            Some("jsonrpc_request_unparseable")
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_arguments_mode_final_hook_refuses_non_utf8_bodies() {
+    // A UTF-16 BOM body is not UTF-8, so the proxy publishes no `request_body`
+    // view and `before_proxy` never inspects it: the final hook is the first
+    // to see these bytes and must not wave them through.
+    let call = mcp_tool_call(1, json!({"q": "x"})).to_string();
+    let mut utf16_bom_call = vec![0xFF, 0xFE];
+    utf16_bom_call.extend(utf16le_bytes(&call));
+    assert!(std::str::from_utf8(&utf16_bom_call).is_err());
+
+    for action in ["reject", "redact"] {
+        let plugin = mcp_shield(action);
+        let (result, ctx) = mcp_final_decision(&plugin, &utf16_bom_call).await;
+        assert_reject(result, Some(400));
+        assert_eq!(
+            shield_metadata(&ctx, "ai_shield_rejected"),
+            Some("jsonrpc_request_unparseable"),
+            "{action}"
+        );
+    }
+    let plugin = mcp_shield("warn");
+    let (result, ctx) = mcp_final_decision(&plugin, &utf16_bom_call).await;
+    assert_continue(result);
+    assert_eq!(
+        shield_metadata(&ctx, "ai_shield_warnings"),
+        Some("jsonrpc_request_unparseable")
+    );
 }
 
 #[tokio::test]

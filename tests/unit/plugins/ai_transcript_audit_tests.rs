@@ -13414,25 +13414,32 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
         r#"{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"crm.lookup","#,
         r#""arguments":{"e":"alice@example.com","n":NaN}}}"#
     );
-    let mut ctx = mcp_ctx(&json!({}));
-    ctx.metadata
-        .insert("request_body".to_string(), nan_call.to_string());
-    let records = mcp_roundtrip(
-        json!({}),
-        &mut ctx,
-        nan_call.as_bytes(),
-        &json!({"jsonrpc": "2.0", "id": 75, "result": {"isError": false}}),
-    )
-    .await;
-    assert_eq!(records.len(), 1, "the lenient-parser call must be audited");
-    let mcp = &records[0]["mcp"];
-    assert!(mcp.is_object(), "{records:#?}");
-    assert_eq!(mcp["batch"], json!(false), "{mcp}");
-    assert_eq!(mcp["calls"], json!([]), "{mcp}");
-    assert!(
-        !records[0].to_string().contains("alice@example.com"),
-        "{records:#?}"
+    // A UTF-8 byte-order mark: strict JSON refuses it, lenient decoders strip it.
+    let bom_call = format!(
+        "\u{feff}{}",
+        mcp_call_value(json!(75), "crm.lookup", json!({"e": "alice@example.com"}))
     );
+    for body in [nan_call, bom_call.as_str()] {
+        let mut ctx = mcp_ctx(&json!({}));
+        ctx.metadata
+            .insert("request_body".to_string(), body.to_string());
+        let records = mcp_roundtrip(
+            json!({}),
+            &mut ctx,
+            body.as_bytes(),
+            &json!({"jsonrpc": "2.0", "id": 75, "result": {"isError": false}}),
+        )
+        .await;
+        assert_eq!(records.len(), 1, "the lenient-parser call must be audited");
+        let mcp = &records[0]["mcp"];
+        assert!(mcp.is_object(), "{records:#?}");
+        assert_eq!(mcp["batch"], json!(false), "{mcp}");
+        assert_eq!(mcp["calls"], json!([]), "{mcp}");
+        assert!(
+            !records[0].to_string().contains("alice@example.com"),
+            "{records:#?}"
+        );
+    }
 
     // Malformed JSON that names no call and carries no escape stays out of
     // MCP scope.

@@ -17,9 +17,10 @@
 //! gRPC-Web still rides the composed HTTP/gRPC-Web view. Ordinary scan modes
 //! skip its framed `application/grpc-web*` bodies. In `mcp_arguments` mode,
 //! `+json` gRPC-Web media types are in scope only when the body is bare JSON.
-//! Framed payloads fail JSON parsing and pass uninspected; `mcp_gateway`
-//! refuses those frames. (A bare-JSON body that fails the whole-document parse
-//! but may carry a `tools/call` is refused instead; see "MCP tool arguments".)
+//! Base64 `grpc-web-text` payloads fail JSON parsing and pass uninspected;
+//! `mcp_gateway` refuses those frames. Binary frames carry NUL bytes in their
+//! length prefix and, like any body that may carry a `tools/call`, are refused
+//! by enforcing actions (see "MCP tool arguments").
 //!
 //! ## The final backend-visible body is authoritative
 //!
@@ -66,22 +67,26 @@
 //! `Content-Type`, and a body with duplicate member names is refused by
 //! enforcing actions instead of being read one way here and another way by the
 //! server that executes the call. `+json` gRPC-Web media types are accepted
-//! only for bare JSON bodies; framed payloads fail parsing and pass uninspected
-//! (`mcp_gateway` refuses them).
+//! only for bare JSON bodies (`mcp_gateway` refuses framed payloads).
 //!
 //! A body the whole-document JSON parse refuses passes uninspected only when it
-//! cannot name a `tools/call` at all: it does not open with `{` or `[`, or it
-//! contains neither the literal `tools/call` nor a JSON escape (an empty
-//! bridged body, a REST body, a framed payload, malformed JSON naming no call).
-//! Anything else may still be executed: `mcp_gateway` admits batch members one
-//! at a time, each with its own parser recursion budget, so a batch can exceed
-//! the whole-document limit while every member is admitted
-//! (GHSA-f2jp-59r9-fp64), and a lenient upstream parser accepts `NaN`,
-//! comments, or trailing commas that serde refuses. Such a body is refused
-//! with `400` (`ai_shield_rejected=jsonrpc_request_unparseable`) by `reject`
-//! and `redact`, and recorded as `ai_shield_warnings=jsonrpc_request_unparseable`
-//! by `warn`. `before_proxy` and `on_final_request_body` decide the same bytes
-//! the same way.
+//! cannot name a `tools/call` to any parser (an empty bridged body, a REST
+//! body, base64 `grpc-web-text`, malformed JSON naming no call): it carries no
+//! NUL byte, no byte-order mark, no leading `/` comment, and either does not
+//! open with `{` or `[` or contains neither the literal `tools/call` nor a JSON
+//! escape. Anything else may still be executed: `mcp_gateway` admits batch
+//! members one at a time, each with its own parser recursion budget, so a
+//! batch can exceed the whole-document limit while every member is admitted
+//! (GHSA-f2jp-59r9-fp64), and a lenient upstream decoder accepts a BOM,
+//! UTF-16 / UTF-32, `NaN`, comments, or trailing commas that serde refuses.
+//! Such a body is refused with `400`
+//! (`ai_shield_rejected=jsonrpc_request_unparseable`) by `reject` and `redact`,
+//! and recorded as `ai_shield_warnings=jsonrpc_request_unparseable` by `warn`;
+//! a non-UTF-8 body is treated the same way. `before_proxy` and
+//! `on_final_request_body` decide the same bytes the same way, except that a
+//! non-UTF-8 body is first seen by the final hook (the proxy publishes no UTF-8
+//! view for `before_proxy` to inspect, so it decided nothing about it).
+//! Configure `mcp_arguments` on MCP routes only.
 //!
 //! Redaction rewrites argument values in place; an OpenAPI bridge call carries
 //! the redacted arguments into its REST request or is refused by the gateway,
@@ -1758,10 +1763,12 @@ impl AiPromptShield {
 /// JSON5) accepts `NaN`, `Infinity`, comments, or trailing commas that serde
 /// refuses. Neither can be ruled out from strict parsing, so any object- or
 /// array-shaped body that names `tools/call` or contains a JSON escape counts
-/// ([`mcp_jsonrpc::may_carry_tool_call`]). Bodies that cannot — an empty
-/// bridged body, a REST body, framed gRPC-Web, malformed JSON naming no call —
-/// pass as before. A single `memchr` pass, bounded by `max_scan_bytes`, which
-/// every caller checks first; nothing is parsed.
+/// ([`mcp_jsonrpc::may_carry_tool_call`]), as does any body carrying a NUL byte
+/// (UTF-16 / UTF-32), a byte-order mark, or a leading `/` comment. Bodies that
+/// cannot — an empty bridged body, a REST body, framed gRPC-Web, malformed JSON
+/// naming no call — pass as before. The cost is a BOM prefix check, a
+/// leading-whitespace scan, and `memchr` / `memmem` passes, all bounded by
+/// `max_scan_bytes`, which every caller checks first; nothing is parsed.
 fn mcp_body_may_carry_tool_call(body: &[u8]) -> bool {
     mcp_jsonrpc::may_carry_tool_call(body)
 }
@@ -2313,10 +2320,19 @@ impl Plugin for AiPromptShield {
             if deferred {
                 return self.handle_uninspectable_deferred_body(ctx, "non_utf8_body");
             }
-            // `before_proxy` reads the UTF-8 `request_body` metadata view, which
-            // the proxy does not publish for non-UTF-8 bytes, so it continued on
-            // exactly this condition. Mirror it rather than inventing a new
-            // rejection class on revalidation.
+            // A non-UTF-8 `mcp_arguments` body (UTF-16 / UTF-32, a UTF-16 BOM,
+            // Latin-1) may be decoded by a lenient upstream into a call this
+            // shield never inspected, so it takes the unparseable-body path.
+            // This does not contradict `before_proxy`: the proxy publishes no
+            // UTF-8 `request_body` view for such bytes, so `before_proxy` never
+            // inspected them and decided nothing about them (it continued for
+            // want of a body); this hook is the first to see them.
+            if self.scan_mode == ScanMode::McpArguments {
+                return self.handle_unparseable_mcp_body(ctx);
+            }
+            // Other modes mirror `before_proxy`, which continued on exactly
+            // this condition, rather than inventing a new rejection class on
+            // revalidation.
             return PluginResult::Continue;
         };
         let json = match serde_json::from_str::<Value>(body_text) {
