@@ -584,8 +584,10 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
         .expect("fragmentless managed CA URI is admitted by upstream validation");
 
     let ca_uri = format!("managed://ca-bundles/{ca_id}");
-    let mut dp_env = ferrum_edge::config::env_config::EnvConfig::default();
-    dp_env.dp_grpc_tls_ca_cert_path = Some(ca_uri.clone());
+    let dp_env = ferrum_edge::config::env_config::EnvConfig {
+        dp_grpc_tls_ca_cert_path: Some(ca_uri.clone()),
+        ..Default::default()
+    };
     ferrum_edge::grpc::dp_client::build_dp_grpc_tls_config(
         &dp_env,
         &["https://cp.example.com".to_string()],
@@ -594,10 +596,12 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
     .expect("DP gRPC CA expiry check accepts a fragmentless managed CA")
     .expect("HTTPS CP URL enables gRPC TLS");
 
-    let mut dtls_env = ferrum_edge::config::env_config::EnvConfig::default();
-    dtls_env.dtls_cert_path = Some(fixtures.cert_pem.clone());
-    dtls_env.dtls_key_path = Some("unused-key-path-for-expiry-validation".to_string());
-    dtls_env.dtls_client_ca_cert_path = Some(ca_uri.clone());
+    let dtls_env = ferrum_edge::config::env_config::EnvConfig {
+        dtls_cert_path: Some(fixtures.cert_pem.clone()),
+        dtls_key_path: Some("unused-key-path-for-expiry-validation".to_string()),
+        dtls_client_ca_cert_path: Some(ca_uri.clone()),
+        ..Default::default()
+    };
     ferrum_edge::modes::startup_security::validate_dtls_material(&dtls_env)
         .expect("DTLS client CA expiry check accepts a fragmentless managed CA");
 
