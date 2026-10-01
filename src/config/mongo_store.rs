@@ -13179,7 +13179,7 @@ mod inner {
                 }
             };
             let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
-            mtls_lease.release().await.map_err(&delete_error)?;
+            mtls_lease.release().await.map_err(delete_error)?;
             info!(
                 "All MongoDB resources deleted (namespace={})",
                 crate::startup::sanitize_startup_scalar(namespace)

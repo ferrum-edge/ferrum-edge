@@ -413,6 +413,7 @@ impl RateLimitDecision {
     }
 }
 
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait RateLimitAlgorithm: Send + Sync + 'static {
     type State: Send + Sync + 'static;

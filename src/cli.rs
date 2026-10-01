@@ -1576,7 +1576,7 @@ fn parse_response_status_line(status_line: &str) -> Result<u16, String> {
         return Err(malformed());
     }
 
-    let (version, remainder) = status_line.split_once(' ').ok_or_else(&malformed)?;
+    let (version, remainder) = status_line.split_once(' ').ok_or_else(malformed)?;
     let version = version.as_bytes();
     if version.len() != 8
         || &version[..5] != b"HTTP/"
@@ -1610,7 +1610,7 @@ fn validate_response_header_line(header: &str) -> Result<(), String> {
         return Err(malformed());
     }
 
-    let (name, _value) = header.split_once(':').ok_or_else(&malformed)?;
+    let (name, _value) = header.split_once(':').ok_or_else(malformed)?;
     if name.is_empty() || !name.bytes().all(is_http_token_byte) {
         return Err(malformed());
     }

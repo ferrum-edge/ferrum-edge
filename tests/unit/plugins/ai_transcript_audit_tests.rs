@@ -182,6 +182,7 @@ async fn mock_sink() -> MockServer {
     server
 }
 
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 trait AuditBufferedResponseTestExt {
     async fn capture_final_response_body(

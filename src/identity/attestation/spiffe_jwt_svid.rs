@@ -16,6 +16,7 @@ use super::{AttestError, Attestor, PeerInfo, WorkloadIdentity};
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
 
 /// JWKS validator interface — pluggable so tests don't need real keys.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait JwtSvidValidator: Send + Sync + 'static {
     /// Validate a JWT-SVID and return the embedded SPIFFE ID.

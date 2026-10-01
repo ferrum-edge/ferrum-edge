@@ -644,6 +644,7 @@ pub struct AuditListFilter {
 /// implementation must be **insert-only and idempotent on `event.id`**, because
 /// replay after a crash or a partial failure re-delivers the same identity and
 /// an audit row is immutable.
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait AuditEventDelivery: Send + Sync {
     async fn deliver(&self, event: &AuditEvent) -> Result<(), anyhow::Error>;

@@ -302,6 +302,7 @@ pub fn remaining_connect_timeout(
     connect_timeout.checked_sub(connect_started.elapsed())
 }
 
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait PoolManager: Send + Sync + 'static {
     type Connection: Send + Sync + Clone + 'static;
