@@ -1,35 +1,42 @@
 diff --git a/src/codec/framed_write.rs b/src/codec/framed_write.rs
-index efd1966cf..3defb01e6 100644
+index efd1966cf..8d4e15123 100644
 --- a/src/codec/framed_write.rs
 +++ b/src/codec/framed_write.rs
-@@ -76,6 +76,18 @@ const CHAIN_THRESHOLD: usize = 256;
+@@ -76,6 +76,22 @@ const CHAIN_THRESHOLD: usize = 256;
  /// fragmented data being sent, and hereby improve the throughput.
  const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
  
 +/// FERRUM PATCH (h2-001-coalesce-data-frame-writes): copy a DATA payload into
 +/// the write buffer, instead of chaining it as the single in-flight frame,
-+/// while the buffer stays within this many bytes.
++/// while the buffer stays within about this many bytes. (Control frames
++/// encoded after the copied DATA can take it past the limit, by at most one
++/// frame.)
 +///
 +/// Chaining holds one DATA frame at a time, so every frame cost its own
-+/// write: one `writev` per frame, and over TLS one short record for each
-+/// frame's 9-byte header (a 16 KiB payload plus its header does not fit one
-+/// record). Copying lets the frames popped in one pass, across streams, leave
-+/// in one write, as an event-loop proxy batches them. Larger payloads are
-+/// still chained without a copy.
++/// write: one `writev` per frame, and over TLS one extra short record per
++/// maximum-size frame (a 16 KiB payload plus its 9-byte header is 9 bytes too
++/// long for one record). Copying lets the frames popped in one pass, across
++/// streams, leave in one write, as an event-loop proxy batches them. Larger
++/// payloads are still chained without a copy. Upstream tracks the same
++/// problem as hyperium/h2#902; hyperium/h2#903 batches frames without
++/// copying.
 +const COALESCE_LIMIT: usize = 64 * 1_024;
 +
  // TODO: Make generic
  impl<T, B> FramedWrite<T, B>
  where
-@@ -199,7 +211,14 @@ where
+@@ -199,7 +215,17 @@ where
      fn unset_frame(&mut self) -> ControlFlow {
          // Clear internal buffer
          self.buf.set_position(0);
 -        self.buf.get_mut().clear();
-+        // FERRUM PATCH: a buffer that grew to coalesce DATA frames goes back
-+        // to its initial size once written, so an idle connection does not
-+        // keep the larger allocation.
-+        if self.buf.get_ref().capacity() > DEFAULT_BUFFER_CAPACITY {
++        // FERRUM PATCH: a buffer that grew to coalesce DATA frames is kept
++        // while writes stay large, and goes back to its initial size after the
++        // first write that fit in it, so a connection whose bulk traffic has
++        // ended (an idle one still writes PINGs) does not keep the larger
++        // allocation, and a sustained transfer does not reallocate per write.
++        let buf = self.buf.get_ref();
++        if buf.capacity() > DEFAULT_BUFFER_CAPACITY && buf.len() <= DEFAULT_BUFFER_CAPACITY {
 +            *self.buf.get_mut() = BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY);
 +        } else {
 +            self.buf.get_mut().clear();
@@ -37,7 +44,7 @@ index efd1966cf..3defb01e6 100644
  
          // The data frame has been written, so unset it
          match self.next.take() {
-@@ -237,7 +256,21 @@ where
+@@ -237,7 +263,21 @@ where
                      return Err(PayloadTooBig);
                  }
  
@@ -60,7 +67,7 @@ index efd1966cf..3defb01e6 100644
                      let head = v.head();
  
                      // Encode the frame head to the buffer
-@@ -307,9 +340,12 @@ where
+@@ -307,9 +347,12 @@ where
      }
  
      fn has_capacity(&self) -> bool {
@@ -75,7 +82,7 @@ index efd1966cf..3defb01e6 100644
      }
  
      fn is_empty(&self) -> bool {
-@@ -376,3 +412,169 @@ mod unstable {
+@@ -376,3 +419,335 @@ mod unstable {
          }
      }
  }
@@ -228,12 +235,178 @@ index efd1966cf..3defb01e6 100644
 +        assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
 +    }
 +
++    /// A grown buffer survives a large write (no reallocation per batch) and
++    /// goes back to its initial size after the first write that fits in it.
 +    #[test]
-+    fn the_buffer_returns_to_its_initial_size_after_a_coalesced_write() {
++    fn a_grown_buffer_is_kept_for_large_writes_and_dropped_after_a_small_one() {
 +        let (mut framed, _writes) = framed(true);
 +        send_all(&mut framed, vec![data(1, 30_000, b'a'), data(3, 30_000, b'b')]);
 +        assert!(framed.encoder.buf.get_ref().is_empty());
++        assert!(framed.encoder.buf.get_ref().capacity() >= COALESCE_LIMIT);
++        send_all(&mut framed, vec![data(1, 30_000, b'c'), data(3, 30_000, b'd')]);
++        assert!(framed.encoder.buf.get_ref().capacity() >= COALESCE_LIMIT);
++        send_all(&mut framed, vec![data(1, 1_000, b'e')]);
++        assert!(framed.encoder.buf.get_ref().is_empty());
 +        assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
++    }
++
++    /// The limit is inclusive: a frame that brings the buffer to exactly
++    /// `COALESCE_LIMIT` bytes is copied, one byte more is chained.
++    #[test]
++    fn the_limit_is_inclusive() {
++        let fits = COALESCE_LIMIT - frame::HEADER_LEN;
++        let (mut copied, _writes) = framed(true);
++        copied.buffer(data(1, fits, b'a')).unwrap();
++        assert!(copied.encoder.next.is_none(), "a frame filling the limit is copied");
++        assert_eq!(copied.encoder.buf.get_ref().len(), COALESCE_LIMIT);
++        assert!(copied.take_last_data_frame().is_some());
++
++        let (mut chained, _writes) = framed(true);
++        chained.buffer(data(1, fits + 1, b'a')).unwrap();
++        assert!(
++            matches!(chained.encoder.next, Some(Next::Data(_))),
++            "one byte over the limit is chained"
++        );
++        // Stock chaining: the head plus enough payload to reach the chain
++        // threshold sit in the buffer, the rest stays in the frame.
++        assert_eq!(chained.encoder.buf.get_ref().len(), chained.encoder.chain_threshold);
++    }
++
++    /// Without vectored I/O a chained frame still goes out whole and in order.
++    #[test]
++    fn a_chained_frame_without_vectored_io_is_written_whole() {
++        let (mut framed, writes) = framed(false);
++        send_all(&mut framed, vec![data(1, 2_000, b'a'), data(1, 100_000, b'b')]);
++        let joined: Vec<u8> = writes.lock().unwrap().concat();
++        let mut expected = wire(1, 2_000, b'a');
++        expected.extend(wire(1, 100_000, b'b'));
++        assert_eq!(joined.len(), expected.len());
++        assert!(joined == expected, "non-vectored chained bytes differ");
++    }
++
++    /// A transport that takes at most `max` bytes per call and answers every
++    /// other call with `Pending` (waking itself).
++    struct ChokedIo {
++        max: usize,
++        pend: bool,
++        written: Vec<u8>,
++    }
++
++    impl AsyncWrite for ChokedIo {
++        fn poll_write(
++            mut self: Pin<&mut Self>,
++            cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            self.pend = !self.pend;
++            if self.pend {
++                cx.waker().wake_by_ref();
++                return Poll::Pending;
++            }
++            let n = buf.len().min(self.max);
++            self.written.extend_from_slice(&buf[..n]);
++            Poll::Ready(Ok(n))
++        }
++
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    /// Partial writes and `Pending` neither lose, duplicate nor reorder bytes,
++    /// and new frames are refused until the coalesced batch has drained.
++    #[test]
++    fn partial_writes_and_pending_keep_the_byte_stream_intact() {
++        let waker = futures_util_noop_waker();
++        let mut cx = Context::from_waker(&waker);
++        let io = ChokedIo {
++            max: 1_000,
++            pend: false,
++            written: Vec::new(),
++        };
++        let mut framed: FramedWrite<ChokedIo, Bytes> = FramedWrite::new(io);
++        framed.set_max_frame_size(frame::MAX_MAX_FRAME_SIZE as usize);
++        let frames = vec![
++            data(1, 20_000, b'a'),
++            data(3, 20_000, b'b'),
++            data(5, 30_000, b'c'),
++            data(1, 7, b'd'),
++        ];
++        let mut expected = Vec::new();
++        for (stream, len, fill) in [(1, 20_000, b'a'), (3, 20_000, b'b'), (5, 30_000, b'c'), (1, 7, b'd')] {
++            expected.extend(wire(stream, len, fill));
++        }
++        for f in frames {
++            while !framed.has_capacity() {
++                while framed.flush(&mut cx).is_pending() {}
++                let _ = framed.take_last_data_frame();
++            }
++            framed.buffer(f).unwrap();
++            if let Some(reclaimed) = framed.take_last_data_frame() {
++                assert!(!reclaimed.payload().has_remaining());
++            }
++        }
++        while framed.flush(&mut cx).is_pending() {}
++        let _ = framed.take_last_data_frame();
++        let written = &framed.get_mut().written;
++        assert_eq!(written.len(), expected.len());
++        assert!(*written == expected, "partial-write byte stream differs");
++    }
++
++    /// (type, flags, stream id, payload length) of every frame in `bytes`.
++    fn frame_heads(bytes: &[u8]) -> Vec<(u8, u8, u32, usize)> {
++        let mut heads = Vec::new();
++        let mut at = 0;
++        while at < bytes.len() {
++            let len = u32::from_be_bytes([0, bytes[at], bytes[at + 1], bytes[at + 2]]) as usize;
++            let stream = u32::from_be_bytes([
++                bytes[at + 5] & 0x7f,
++                bytes[at + 6],
++                bytes[at + 7],
++                bytes[at + 8],
++            ]);
++            heads.push((bytes[at + 3], bytes[at + 4], stream, len));
++            at += frame::HEADER_LEN + len;
++        }
++        assert_eq!(at, bytes.len(), "trailing partial frame");
++        heads
++    }
++
++    /// Control frames buffered between copied DATA frames keep their order,
++    /// and END_STREAM survives the copy.
++    #[test]
++    fn control_frames_interleave_in_order_and_end_stream_is_kept() {
++        let (mut framed, writes) = framed(true);
++        let headers = frame::Headers::new(
++            1.into(),
++            frame::Pseudo::response(http::StatusCode::OK),
++            http::HeaderMap::new(),
++        );
++        let mut last = frame::Data::new(3.into(), Bytes::from(vec![b'z'; 3_000]));
++        last.set_end_stream(true);
++        send_all(
++            &mut framed,
++            vec![
++                headers.into(),
++                data(1, 10_000, b'a'),
++                frame::Reset::new(5.into(), frame::Reason::CANCEL).into(),
++                frame::Ping::new([7; 8]).into(),
++                frame::WindowUpdate::new(0.into(), 65_535).into(),
++                last.into(),
++            ],
++        );
++        let writes = writes.lock().unwrap();
++        assert_eq!(writes.len(), 1, "everything leaves in one write");
++        let heads = frame_heads(&writes[0]);
++        let kinds: Vec<u8> = heads.iter().map(|h| h.0).collect();
++        // HEADERS, DATA, RST_STREAM, PING, WINDOW_UPDATE, DATA
++        assert_eq!(kinds, vec![0x1, 0x0, 0x3, 0x6, 0x8, 0x0]);
++        assert_eq!(heads[1], (0x0, 0x0, 1, 10_000));
++        assert_eq!(heads[5], (0x0, 0x1, 3, 3_000), "END_STREAM flag kept");
 +    }
 +
 +    #[test]

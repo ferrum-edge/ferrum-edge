@@ -63,12 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **HTTP/2 and gRPC write several DATA frames per write call** (#5588). Ferrum
   now carries a vendored h2 0.4.19 whose frame writer copies DATA payloads into
-  its write buffer, up to 64 KiB, instead of writing each DATA frame with its
-  own `writev`. Over TLS each maximum-size frame also no longer spills its
-  9-byte header into a separate record. This applies to every h2 connection,
+  its write buffer, up to about 64 KiB, instead of writing each DATA frame with
+  its own `writev`. Over TLS a maximum-size frame (16 KiB plus its 9-byte
+  header) no longer costs a second, 9-byte record. This applies to every h2 connection,
   frontend and backend. On the protocol benchmark, HTTP/2 was 5–16% faster
   and gRPC 0.5–4% faster than the unpatched build. A write buffer that grew to
-  coalesce frames shrinks back to 16 KiB once written. See
+  coalesce frames shrinks back to 16 KiB after the next write that fits
+  in 16 KiB. DATA already staged in that buffer when a stream is reset still
+  goes out ahead of the `RST_STREAM`. See
   `docs/upstream-h2-patches/001-coalesce-data-frame-writes/`.
 - **jemalloc's thread cache now serves allocations up to 128 KiB** (#5588). The
   binary compiles in the jemalloc option `tcache_max:131072`; the jemalloc default

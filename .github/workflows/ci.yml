@@ -1868,6 +1868,10 @@ jobs:
           # Patch 003: an HTTP/1 read that returned a full TLS record keeps
           # reading while more is ready (issue #5588).
           cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
+          # The gateway runs hyper on the vendored h2 (h2-001), so run every
+          # Ferrum hyper regression on that combination as well.
+          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_ \
+            --config 'patch.crates-io.h2.path="vendor/h2-0.4.19-ferrum-patched"'
 
       - name: Run vendored h2 DATA-frame coalescing regressions
         # DATA frames staged together leave in one write, byte-exact, while

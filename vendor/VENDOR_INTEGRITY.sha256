@@ -153,7 +153,7 @@ b21623012e6c453d944b0342c515b631cfcbf30704c2621b291526b69c10724d  vendor/h2-0.4.
 f64c9089838886bb38aa6b2eaf7e10f84a98fbcdf06d6c4df6fae317de03377e  vendor/h2-0.4.19-ferrum-patched/src/client.rs
 4384868a883fc21676888f61380ddf43cd15703bd6377b79d2eec2183e8edecf  vendor/h2-0.4.19-ferrum-patched/src/codec/error.rs
 061131d2280ec0903507eb73b675791b79643ec312cefd5b8bf46dbe3b7707d2  vendor/h2-0.4.19-ferrum-patched/src/codec/framed_read.rs
-dd49be06e38ae7740d2952ce5c84e88f5b92f71df36df3035e58a4eb49c17339  vendor/h2-0.4.19-ferrum-patched/src/codec/framed_write.rs
+bea9d9f35d7bc41b0aeea1a2daaede8933522cd0f7c7780bf00e196cd1818493  vendor/h2-0.4.19-ferrum-patched/src/codec/framed_write.rs
 806fc32706d789f8e48a6867df014d945c438334e981205ff8f43d5b7f8ce0ef  vendor/h2-0.4.19-ferrum-patched/src/codec/mod.rs
 b05dc52f36a29b29b1b3e0705a3f1ecf102a89896e173356f3e5fb1165dd6090  vendor/h2-0.4.19-ferrum-patched/src/error.rs
 2fb968f754829fc50392b6ccb4b90cc4c8b88657a5e3a7259f53916e13dc1c91  vendor/h2-0.4.19-ferrum-patched/src/ext.rs

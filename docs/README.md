@@ -204,8 +204,8 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
 ### h2
 
 - 001 — [coalesce DATA frames into one write](upstream-h2-patches/001-coalesce-data-frame-writes/README.md)
-  ([issue text](upstream-h2-patches/001-coalesce-data-frame-writes/issue.md),
-  [PR text](upstream-h2-patches/001-coalesce-data-frame-writes/pr-description.md),
+  (upstream [hyperium/h2#902](https://github.com/hyperium/h2/issues/902) /
+  [#903](https://github.com/hyperium/h2/pull/903),
   [patch](upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch))
 
 ### hyper-util
