@@ -8604,6 +8604,7 @@ impl Proxy {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
+                    crate::tls::source::MaterialKind::Cert,
                     "backend_tls_client_cert_path",
                     cert_expiry_warning_days,
                 ) {
@@ -8637,6 +8638,7 @@ impl Proxy {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
+                    crate::tls::source::MaterialKind::CaBundle,
                     "backend_tls_server_ca_cert_path",
                     cert_expiry_warning_days,
                 ) {
@@ -10057,6 +10059,7 @@ impl Upstream {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
+                    crate::tls::source::MaterialKind::Cert,
                     "backend_tls_client_cert_path",
                     cert_expiry_warning_days,
                 ) {
@@ -10086,6 +10089,7 @@ impl Upstream {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
+                    crate::tls::source::MaterialKind::CaBundle,
                     "backend_tls_server_ca_cert_path",
                     cert_expiry_warning_days,
                 ) {

@@ -590,8 +590,9 @@ pub fn validate_dtls_material(env_config: &EnvConfig) -> Result<(), anyhow::Erro
     .map_err(|e| e.context("Invalid DTLS frontend cert"))?;
 
     if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
-        tls::check_cert_expiry(
+        tls::check_cert_expiry_for_kind(
             ca_path,
+            MaterialKind::CaBundle,
             "DTLS client CA cert",
             env_config.tls_cert_expiry_warning_days,
         )
