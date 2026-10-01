@@ -214,6 +214,18 @@ fn only_utf8_charsets_are_admitted() {
     }
 }
 
+fn utf16_be(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_be_bytes).collect()
+}
+
+fn utf32(text: &str, encode: fn(u32) -> [u8; 4]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for character in text.chars() {
+        bytes.extend(encode(u32::from(character)));
+    }
+    bytes
+}
+
 #[test]
 fn lenient_tool_call_prefilter_flags_encodings_comments_and_json5_whitespace() {
     let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#;
@@ -233,17 +245,23 @@ fn lenient_tool_call_prefilter_flags_encodings_comments_and_json5_whitespace() {
     let mut utf16_bom = vec![0xFE, 0xFF];
     utf16_bom.extend(call.encode_utf16().flat_map(u16::to_be_bytes));
     flagged.push(utf16_bom);
+    // Without a BOM: UTF-16BE (`00 7B`) and UTF-32 in either byte order.
+    flagged.push(utf16_be(r#"{"method":"tools/call"}"#));
+    flagged.push(utf32(call, u32::to_le_bytes));
+    flagged.push(utf32(call, u32::to_be_bytes));
     for body in &flagged {
         assert!(may_carry_tool_call(body), "{body:?}");
     }
-    // The last is a binary upload (JPEG magic): a high byte that does not
-    // open a valid UTF-8 character is not JSON5 whitespace.
-    let unflagged: [&[u8]; 5] = [
+    // The last two are binary uploads (JPEG and PNG magic): a high byte that
+    // does not open a valid UTF-8 character is not JSON5 whitespace, and NUL
+    // bytes count only ahead of a JSON-shaped lead character.
+    let unflagged: [&[u8]; 6] = [
         b"",
         b"petId=7",
         br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"n":NaN"#,
         b"AAAAAAJ7fQ==",
         b"\xFF\xD8\xFF\xE0",
+        b"\x89PNG\r\n\x1A\n\x00\x00\x00\x0DIHDR",
     ];
     for body in unflagged {
         assert!(!may_carry_tool_call(body), "{body:?}");

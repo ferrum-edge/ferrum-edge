@@ -161,8 +161,11 @@ fn may_name_tools_call(body: &[u8]) -> bool {
 ///
 /// True when the body
 ///
-/// - contains a NUL byte (UTF-16 / UTF-32 code units interleave `0x00` with
-///   ASCII, so a `tools/call` spelled in them hides from a UTF-8 search);
+/// - contains a NUL byte and its first byte that is neither NUL nor ASCII
+///   whitespace is `{`, `[`, `/`, or `#` (UTF-16 / UTF-32 JSON in either byte
+///   order interleaves `0x00` with ASCII, so a `tools/call` spelled in it hides
+///   from a UTF-8 search; a binary upload that merely contains NULs is not
+///   flagged);
 /// - starts with a byte-order mark (UTF-8 `EF BB BF`, UTF-16 `FE FF` /
 ///   `FF FE`, UTF-32 `00 00 FE FF`), which strict JSON refuses but lenient
 ///   decoders strip;
@@ -172,7 +175,8 @@ fn may_name_tools_call(body: &[u8]) -> bool {
 /// - opens with `{` or `[` and contains the literal method name or a JSON
 ///   escape that could spell it.
 ///
-/// Strict UTF-8 JSON never legitimately contains the first three. A body this
+/// Strict UTF-8 JSON never legitimately contains a NUL byte, a BOM, or those
+/// lead characters. A body this
 /// returns false for is not proven call-free to every reader; it is simply not
 /// recognizable as a JSON document that could carry one. This is
 /// deliberately looser than [`scan_request_bytes`], which only reports what a
@@ -189,9 +193,20 @@ pub fn may_carry_tool_call(body: &[u8]) -> bool {
         b"\xFF\xFE",
         b"\x00\x00\xFE\xFF",
     ];
-    let has_bom = BYTE_ORDER_MARKS.iter().any(|bom| body.starts_with(bom));
-    if has_bom || memchr::memchr(0, body).is_some() {
+    if BYTE_ORDER_MARKS.iter().any(|bom| body.starts_with(bom)) {
         return true;
+    }
+    // UTF-16 / UTF-32 JSON: NUL bytes interleaved with an ASCII document whose
+    // first real character opens a value or a comment, in either byte order.
+    // A binary upload (PNG, JPEG, …) that merely contains NULs is not flagged.
+    if memchr::memchr(0, body).is_some() {
+        let lead = body
+            .iter()
+            .copied()
+            .find(|byte| !matches!(byte, 0 | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C));
+        if matches!(lead, Some(b'{' | b'[' | b'/' | b'#')) {
+            return true;
+        }
     }
     let start = body
         .iter()

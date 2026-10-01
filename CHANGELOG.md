@@ -36,17 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encoding, `NaN`, `Infinity`, `/` or `#` comments, JSON5 whitespace (form
   feed, no-break space, U+2028), or trailing commas. When the whole-document
   parse fails, `before_proxy` and the final-body re-check now refuse any body
-  that carries a NUL byte or a byte-order mark, whose first byte after ASCII
-  whitespace is `/`, `#`, or non-ASCII, or that is object- or array-shaped and
-  names `tools/call` or contains a JSON escape — and the final re-check any
-  non-UTF-8 body — with `400` and
+  that starts with a byte-order mark, is UTF-16 / UTF-32 JSON (NUL bytes ahead
+  of a `{`, `[`, `/`, or `#` first character), whose first byte after ASCII
+  whitespace is `/`, `#`, or a non-ASCII character, or that is object- or
+  array-shaped and names `tools/call` or contains a JSON escape — and the
+  final re-check any non-UTF-8 body — with `400` and
   `ai_shield_rejected=jsonrpc_request_unparseable` in `reject` / `redact`
   mode, recording `ai_shield_warnings=jsonrpc_request_unparseable` in `warn`
   mode. Bodies that cannot name a call — including the empty final body of an
   OpenAPI bridge call to a `GET` / `DELETE` operation, REST bodies, base64
-  `grpc-web-text` payloads, and malformed JSON naming no call — still pass
-  uninspected; binary gRPC-Web frames (NUL bytes in their length prefix) are
-  now refused. Scope `scan_fields: mcp_arguments` to MCP routes.
+  `grpc-web-text` payloads, binary uploads, and malformed JSON naming no call
+  — still pass uninspected. Scope `scan_fields: mcp_arguments` to MCP routes.
 - **`ai_transcript_audit` records MCP tool calls the whole-document parse
   refuses** (GHSA-f2jp-59r9-fp64 sibling, #5954). A request body that failed the
   `Value` parse was discarded as non-AI without being audited, so the same deep
@@ -57,11 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsed on their own and keyed (and, with `capture.mcp_arguments`, excerpted)
   like a parsed call's. A body the recognizer cannot read is kept with an empty
   `calls` list, and so — matching the shield's fail-closed rule — is a refused
-  body flagged by the same test (a NUL byte, a byte-order mark, a leading `/`,
-  `#`, or non-ASCII UTF-8 character, or an object or array naming
-  `tools/call` or containing a JSON escape), since a lenient upstream decoder may still execute
-  it without `ai_prompt_shield` in front. Such bodies count against the
-  audit's staging permits.
+  body flagged by the same test (a byte-order mark, UTF-16 / UTF-32 JSON, a
+  leading `/`, `#`, or non-ASCII UTF-8 character, or an object or array naming
+  `tools/call` or containing a JSON escape), since a lenient upstream decoder
+  may still execute it without `ai_prompt_shield` in front. Such bodies count
+  against the audit's staging permits; binary uploads such as PNG or JPEG are
+  not flagged.
 
 ## [0.9.9] - 2026-10-01
 

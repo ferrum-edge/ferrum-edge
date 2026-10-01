@@ -5975,9 +5975,10 @@ fn empty_mcp_section(body: &[u8]) -> StagedMcp {
 
 /// Keep no-Content-Type POSTs available to the MCP audit path without staging
 /// ordinary uploads as possible AI requests. Only a body
-/// [`mcp_jsonrpc::may_carry_tool_call`] does not flag (no NUL or BOM, no leading
-/// comment or non-ASCII byte, no object/array naming the method or carrying an
-/// escape) is skipped, so a BOM-prefixed or UTF-16 call is still staged.
+/// [`mcp_jsonrpc::may_carry_tool_call`] does not flag (no BOM, no UTF-16 / UTF-32
+/// JSON, no leading comment or non-ASCII character, no object/array naming the
+/// method or carrying an escape) is skipped, so a BOM-prefixed or UTF-16 call
+/// is still staged while a PNG or JPEG upload is not.
 fn skip_content_type_less_non_mcp(
     content_type: Option<&str>,
     mcp_tool_calls: bool,

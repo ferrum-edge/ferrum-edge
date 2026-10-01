@@ -17,10 +17,9 @@
 //! gRPC-Web still rides the composed HTTP/gRPC-Web view. Ordinary scan modes
 //! skip its framed `application/grpc-web*` bodies. In `mcp_arguments` mode,
 //! `+json` gRPC-Web media types are in scope only when the body is bare JSON.
-//! Base64 `grpc-web-text` payloads fail JSON parsing and pass uninspected;
-//! `mcp_gateway` refuses those frames. Binary frames carry NUL bytes in their
-//! length prefix and, like any body that may carry a `tools/call`, are refused
-//! by enforcing actions (see "MCP tool arguments").
+//! Framed payloads fail JSON parsing and pass uninspected unless they look
+//! like a JSON document that could carry a `tools/call` (see "MCP tool
+//! arguments"); `mcp_gateway` refuses frames.
 //!
 //! ## The final backend-visible body is authoritative
 //!
@@ -72,10 +71,11 @@
 //! A body the whole-document JSON parse refuses passes uninspected only when it
 //! is not recognizable as a JSON document that could carry a `tools/call` (an
 //! empty bridged body, a REST body, base64 `grpc-web-text`, malformed JSON
-//! naming no call): it carries no NUL byte or byte-order mark, its first byte
-//! after ASCII whitespace is not `/`, `#`, or non-ASCII, and it either does not
-//! open with `{` or `[` or contains neither the literal `tools/call` nor a
-//! JSON escape. Anything else may still be executed: `mcp_gateway` admits batch
+//! naming no call): it has no byte-order mark, no NUL byte ahead of a
+//! JSON-shaped first character (`{`, `[`, `/`, `#` — UTF-16 / UTF-32 JSON),
+//! its first byte after ASCII whitespace is not `/`, `#`, or a non-ASCII
+//! character, and it either does not open with `{` or `[` or contains neither
+//! the literal `tools/call` nor a JSON escape. Anything else may still be executed: `mcp_gateway` admits batch
 //! members one at a time, each with its own parser recursion budget, so a
 //! batch can exceed the whole-document limit while every member is admitted
 //! (GHSA-f2jp-59r9-fp64), and a lenient upstream decoder accepts a BOM,
@@ -1804,12 +1804,12 @@ impl AiPromptShield {
 /// JSON5) accepts `NaN`, `Infinity`, comments, or trailing commas that serde
 /// refuses. Neither can be ruled out from strict parsing, so any object- or
 /// array-shaped body that names `tools/call` or contains a JSON escape counts
-/// ([`mcp_jsonrpc::may_carry_tool_call`]), as does any body carrying a NUL byte
-/// (UTF-16 / UTF-32) or a byte-order mark, or whose first byte after ASCII
-/// whitespace is `/`, `#` (a comment), or non-ASCII. Bodies not recognizable as
-/// such a document — an empty bridged body, a REST body, base64 gRPC-Web text,
-/// malformed JSON naming no call — pass as before. The cost is a BOM prefix check, a
-/// leading-whitespace scan, and `memchr` / `memmem` passes, all bounded by
+/// ([`mcp_jsonrpc::may_carry_tool_call`]), as does UTF-16 / UTF-32 JSON (NUL
+/// bytes ahead of a JSON-shaped first character), a byte-order mark, or a first
+/// byte after ASCII whitespace that is `/`, `#` (a comment), or non-ASCII.
+/// Bodies not recognizable as such a document — an empty bridged body, a REST
+/// body, base64 gRPC-Web text, malformed JSON naming no call — pass as before.
+/// The cost is a BOM prefix check, a leading-whitespace scan, and `memchr` / `memmem` passes, all bounded by
 /// `max_scan_bytes`, which every caller checks first; nothing is parsed.
 fn mcp_body_may_carry_tool_call(body: &[u8]) -> bool {
     mcp_jsonrpc::may_carry_tool_call(body)
