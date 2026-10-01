@@ -8493,7 +8493,7 @@ enum CarriedRead {
 /// Half a maximum record (8 KiB), not a full one: senders that write in 8 KiB
 /// slices emit 8 KiB records — `tokio::io::copy`'s default buffer, for one —
 /// and a 16 KiB threshold forwarded those 1:1. Measured on the TCP-TLS echo
-/// benchmark, whose backend echoes with `tokio::io::copy`, 8 KiB was 14–31%
+/// benchmark, whose backend echoes with `tokio::io::copy`, 8 KiB was 16–31%
 /// faster than 16 KiB at every payload size, and as fast as topping up after
 /// every read. Small interactive reads still go out at once, with no
 /// speculative extra read.

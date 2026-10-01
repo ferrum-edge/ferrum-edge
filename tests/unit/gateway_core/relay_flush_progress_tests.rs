@@ -1758,8 +1758,9 @@ async fn a_full_buffer_ends_the_batch() {
     assert_eq!(writes, vec![65_536, 16_384]);
 }
 
-/// The round cap binds only on a buffer larger than 144 KiB: a batch is the
-/// first read plus at most `RELAY_TOP_UP_MAX_ROUNDS` (8) extra reads.
+/// With full 16 KiB records, the round cap binds only on a buffer larger than
+/// 144 KiB: a batch is the first read plus at most `RELAY_TOP_UP_MAX_ROUNDS`
+/// (8) extra reads.
 #[tokio::test]
 async fn the_round_cap_ends_the_batch_on_a_large_buffer() {
     let writes = relay_backend_write_sizes(256 * 1024, vec![TLS_RECORD; 12]).await;
