@@ -138,6 +138,9 @@ async fn assert_transport(harness: &GatewayHarness, direct: bool) {
             )
             .await
     } else {
+        // Give the log writer time to flush, so capture lag cannot hide a
+        // marker the reqwest path should never have logged.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         harness.captured_combined().expect("captured gateway logs")
     };
     assert_eq!(

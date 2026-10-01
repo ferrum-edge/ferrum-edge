@@ -1641,15 +1641,12 @@ impl Http2PoolManager {
                     enable_keepalive,
                     keepalive_seconds,
                 );
-                // Share the stream rather than duplicating its descriptor
+                // Observe the stream rather than duplicating its descriptor
                 // (issue #5963): the upload pump samples the kernel send queue
                 // to bound a never-draining backend after the upload's last
-                // byte (#4411) through a `Weak`, so the pooled connection holds
-                // one fd and closes with hyper's IO.
-                let tcp = Arc::new(tcp);
-                let socket =
-                    crate::proxy::backend_send_queue::BackendSocketHandle::observe_shared(&tcp);
-                let tcp = crate::proxy::backend_send_queue::SharedTcpStream::new(tcp);
+                // byte (#4411) through a liveness cell, so the pooled
+                // connection holds one fd and closes with hyper's IO.
+                let (tcp, socket) = crate::proxy::backend_send_queue::ObservedTcpStream::new(tcp);
                 debug!(
                     backend = %sock_addr,
                     tls = tls_parts.is_some(),

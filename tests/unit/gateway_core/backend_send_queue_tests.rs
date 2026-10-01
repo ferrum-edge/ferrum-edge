@@ -148,12 +148,12 @@ fn sampling_cadence_is_the_lesser_of_100ms_and_a_quarter_watermark() {
     assert_eq!(send_queue_sample_interval_ms(0), 1);
 }
 
-/// The direct HTTP/1.1 pool's shared-stream handle (issue #5963) samples the
+/// The direct HTTP/1.1 pool's observed-stream handle (issue #5963) samples the
 /// live socket, holds no descriptor of its own, and lets the socket close the
 /// moment the transport drops its IO: the peer reads EOF at once instead of the
 /// socket lingering in CLOSE_WAIT behind a duplicate.
 #[tokio::test]
-async fn a_shared_stream_handle_samples_without_holding_the_socket_open() {
+async fn an_observed_stream_handle_samples_without_holding_the_socket_open() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if !ferrum_edge::_test_support::send_queue_probe_supported() {
         return;
@@ -165,7 +165,7 @@ async fn a_shared_stream_handle_samples_without_holding_the_socket_open() {
         .await
         .expect("connect");
     let (mut server, _) = listener.accept().await.expect("accept");
-    let (mut io, handle) = ferrum_edge::_test_support::shared_tcp_stream_for_test(client);
+    let (mut io, handle) = ferrum_edge::_test_support::observed_tcp_stream_for_test(client);
     let handle = handle.expect("send-queue probe supported");
 
     // The IO works in both directions, vectored writes included.
