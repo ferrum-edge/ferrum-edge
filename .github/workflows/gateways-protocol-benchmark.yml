@@ -246,7 +246,7 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          ref: perf/5588-direct-h1-pool
+          ref: 8538da7ab54754fd6168a876ae4e562b2b14bcd8
           path: baseline-src
 
       - name: Build baseline Ferrum image (experiment)
