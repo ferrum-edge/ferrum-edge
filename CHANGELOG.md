@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Documented the Edge-owned contract vocabularies (`gateway-errors`,
+  `gateway-headers`, `provisioned-by`, `plugin-catalog`, `diagnostic-ref`) as
+  published in
+  [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts) and pinned
+  by consumers via `contracts-edge-<edge-version>` tags. The README lists the
+  Edge source files whose changes require a ferrum-contracts PR, and CLAUDE.md
+  notes the requirement.
+
 ## [0.9.10] - 2026-10-01
 
 ### Security

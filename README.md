@@ -583,6 +583,29 @@ Start at the [documentation index](docs/README.md) — every document under
 | Gateway API conformance | [docs/gateway_api_conformance.md](docs/gateway_api_conformance.md) (canonical) — indexed from [CONFORMANCE.md](CONFORMANCE.md) |
 | Istio + xDS conformance matrix | [CONFORMANCE.md](CONFORMANCE.md) (run `cargo test --test conformance_tests` to refresh `target/conformance/coverage.md`) |
 
+## Contracts
+
+Ferrum Edge owns five shared vocabularies — gateway errors, gateway headers,
+`provisioned-by`, the plugin catalog, and the gateway diagnostic reference — and
+publishes them in
+[ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
+Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
+`contracts-edge-<edge-version>` tags from that repository rather than reading
+Edge source. The latest published tag is **contracts-edge-0.9.9**; it also
+applies to **v0.9.10**, which changed no contract source.
+
+Changing any of the Edge source files below changes an Edge-owned contract and
+requires a matching ferrum-contracts PR that refreshes the vocabulary from the
+new release tag:
+
+| Contract | Edge sources |
+|----------|--------------|
+| `gateway-errors` | `src/retry.rs` (`ErrorClass`, `OBS_*`, `x_gateway_error_token_for_class`, `token_for_rejection_phase`), `docs/error_classification.md` |
+| `gateway-headers` | `src/proxy/headers.rs`, `docs/admin_api.md`, `openapi.yaml` |
+| `provisioned-by` | `src/admin/provisioning.rs`, `docs/admin_api.md` |
+| `plugin-catalog` | `src/plugins/mod.rs` (`BUILTIN_PLUGIN_REGISTRATIONS`, `REMOVED_PLUGIN_REGISTRATIONS`), `src/plugins/builtin_parity.rs`, and the `PluginConfigBase` `if`/`then` blocks in `openapi.yaml` |
+| `diagnostic-ref` | `src/diagnostic_ref.rs`, `openapi.yaml` (`DiagnosticRefLookup` family of component schemas) |
+
 ## CI/CD
 
 On every PR and push to `main`: format check, clippy, and unit, integration, and functional (E2E) tests. Performance regression suites run on a schedule rather than per PR. Version tags trigger multi-platform release builds with Docker images.
