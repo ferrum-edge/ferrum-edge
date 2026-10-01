@@ -49207,6 +49207,10 @@ fn direct_h1_dispatch_eligible(
         })
 }
 
+/// Dial budget for a route with `backend_connect_timeout_ms: 0`: no operator
+/// bound, matching reqwest, which then sets no connect timeout at all.
+const DIRECT_H1_UNBOUNDED_CONNECT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// Origin-form request target (`/path?query`) of an absolute backend URL.
 fn direct_h1_origin_form_uri(backend_url: &str) -> Option<hyper::Uri> {
     let after_scheme = backend_url
@@ -49225,20 +49229,45 @@ fn direct_h1_origin_form_uri(backend_url: &str) -> Option<hyper::Uri> {
 
 fn direct_h1_send_error_response(
     proxy: &Proxy,
-    err: hyper::Error,
+    backend_url: &str,
+    error_class: retry::ErrorClass,
+    err: &hyper::Error,
     resolved_ip: Option<String>,
-    never_sent: bool,
 ) -> retry::BackendResponse {
-    let error_class = if never_sent {
-        retry::ErrorClass::ConnectionPoolError
-    } else {
-        http2_pool::classify_pooled_h2_send_request_error(&err)
-    };
     error!(
         proxy_id = %proxy.id,
+        backend_url = %strip_query_params(backend_url),
         error_kind = retry::error_class_log_kind(error_class),
         error = %err,
-        "HTTP/1.1 backend request failed"
+        "Backend request failed"
+    );
+    http_backend_dispatch_error_response(error_class, resolved_ip)
+}
+
+/// Dial/checkout failure on the direct HTTP/1.1 pool. Same class mapping as the
+/// direct H2 pool, logged with the reqwest dispatch's wording and `error_kind`.
+fn direct_h1_checkout_error_response(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    err: &http2_pool::Http2PoolError,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let error_class = http2_pool::classify_http2_pool_error(err);
+    if matches!(error_class, retry::ErrorClass::PortExhaustion) {
+        state.overload.record_port_exhaustion();
+    }
+    https_to_plaintext::maybe_warn_https_to_plaintext_backend(
+        proxy,
+        strip_query_params(backend_url),
+        err,
+    );
+    error!(
+        proxy_id = %proxy.id,
+        backend_url = %strip_query_params(backend_url),
+        error_kind = retry::error_class_log_kind(error_class),
+        error = %err.message(),
+        "Backend request failed"
     );
     http_backend_dispatch_error_response(error_class, resolved_ip)
 }
@@ -49274,9 +49303,8 @@ fn direct_h1_collect_error_response(
             response_buffer_capacity_response(proxy, resolved_ip, "direct_h1")
         }
         HyperBodyCollectError::Read(e) => {
-            let (status_code, error_class) = eager_buffer_body_read_status_and_class(
-                http2_pool::classify_pooled_h2_send_request_error(&e),
-            );
+            let (status_code, error_class) =
+                eager_buffer_body_read_status_and_class(retry::classify_hyper_client_error(&e));
             warn!(
                 proxy_id = %proxy.id,
                 error_kind = retry::error_class_log_kind(error_class),
@@ -49394,24 +49422,16 @@ async fn proxy_to_backend_direct_h1(
             );
         }
     };
-    let client_deadline_remaining = match request_ctx.grpc_deadline_at() {
-        Some(deadline) => {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return backend_dispatch_response(
-                    client_grpc_deadline_exceeded_response_for_request(
-                        request_ctx,
-                        headers,
-                        resolved_ip,
-                    ),
-                    None,
-                    None,
-                );
-            }
-            Some(remaining)
-        }
-        None => None,
-    };
+    if request_ctx
+        .grpc_deadline_at()
+        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    {
+        return backend_dispatch_response(
+            client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, resolved_ip),
+            None,
+            None,
+        );
+    }
 
     // ── Request head: same rewrite rules as the reqwest path ──────────────
     let mut out_headers = hyper::HeaderMap::with_capacity(headers.len() + 4);
@@ -49706,21 +49726,41 @@ async fn proxy_to_backend_direct_h1(
     let conn_effective_proxy = resolve_backend_connection_proxy_for_target(proxy, upstream_target);
     let conn_proxy = conn_effective_proxy.as_ref();
     let tls = conn_proxy.dispatch_kind.is_tls_backend();
-    let mut connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-    if let Some(remaining) = client_deadline_remaining
-        && (connect_timeout.is_zero() || remaining < connect_timeout)
-    {
-        connect_timeout = remaining;
-    }
+    // Same budgets as the reqwest send: the operator connect timeout bounds
+    // only the dial (`0` = none), while the client RPC deadline and the
+    // response-header read bound cover the whole exchange, dial included —
+    // so an expiring client deadline still answers as the client's deadline,
+    // never as a backend connect timeout.
+    let connect_timeout = if proxy.backend_connect_timeout_ms > 0 {
+        Duration::from_millis(proxy.backend_connect_timeout_ms)
+    } else {
+        DIRECT_H1_UNBOUNDED_CONNECT
+    };
     let header_deadline_at = absolute_response_header_read_bound(proxy.backend_read_timeout_ms);
-    let checkout = match crate::plugins::await_grpc_deadline(
-        request_ctx.grpc_deadline_at(),
-        state
-            .http2_pool
-            .checkout_h1(conn_proxy, tls, connect_timeout, false),
+    let checkout_result = crate::plugins::await_deadline_first(
+        header_deadline_at,
+        crate::plugins::await_grpc_deadline(
+            request_ctx.grpc_deadline_at(),
+            state
+                .http2_pool
+                .checkout_h1(conn_proxy, tls, connect_timeout, false),
+        ),
     )
-    .await
-    {
+    .await;
+    let Ok(checkout_result) = checkout_result else {
+        warn!(
+            proxy_id = %proxy.id,
+            watermark = "backend_read_timeout_ms",
+            watermark_ms = proxy.backend_read_timeout_ms,
+            "direct HTTP/1.1 dispatch: per-direction watermark expired before response headers"
+        );
+        return backend_dispatch_response(
+            http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip),
+            retained_body,
+            backend_admission_permits,
+        );
+    };
+    let checkout = match checkout_result {
         Err(()) => {
             return backend_dispatch_response(
                 client_grpc_deadline_exceeded_response_for_request(
@@ -49741,7 +49781,7 @@ async fn proxy_to_backend_direct_h1(
             );
             crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
             return backend_dispatch_response(
-                http2_pool_sender_error_response(state, proxy, &e, resolved_ip),
+                direct_h1_checkout_error_response(state, proxy, backend_url, &e, resolved_ip),
                 retained_body,
                 None,
             );
@@ -49872,7 +49912,13 @@ async fn proxy_to_backend_direct_h1(
                                 &e,
                             );
                             return backend_dispatch_response(
-                                http2_pool_sender_error_response(state, proxy, &e, resolved_ip),
+                                direct_h1_checkout_error_response(
+                                    state,
+                                    proxy,
+                                    backend_url,
+                                    &e,
+                                    resolved_ip,
+                                ),
                                 retained_body,
                                 None,
                             );
@@ -49882,10 +49928,11 @@ async fn proxy_to_backend_direct_h1(
                 }
                 let never_sent = try_err.take_message().is_some();
                 let err = try_err.into_error();
+                // A request hyper handed back unsent never reached the wire.
                 let class = if never_sent {
                     retry::ErrorClass::ConnectionPoolError
                 } else {
-                    http2_pool::classify_pooled_h2_send_request_error(&err)
+                    retry::classify_hyper_client_error(&err)
                 };
                 if class == retry::ErrorClass::PortExhaustion {
                     state.overload.record_port_exhaustion();
@@ -49896,7 +49943,7 @@ async fn proxy_to_backend_direct_h1(
                     &err,
                 );
                 return backend_dispatch_response(
-                    direct_h1_send_error_response(proxy, err, resolved_ip, never_sent),
+                    direct_h1_send_error_response(proxy, backend_url, class, &err, resolved_ip),
                     retained_body,
                     backend_admission_permits,
                 );
