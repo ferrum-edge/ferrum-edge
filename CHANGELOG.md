@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The default-off `bench-h1-profile` observer missed every response streamed
+  by the direct HTTP/1.1 pool since it became the default (#5961); only the
+  responses still dispatched through reqwest (retries, body plugins) counted.
+  Its two input boundaries wrapped only reqwest byte streams, and direct-pool
+  responses stream a hyper body on the `StreamingH2` arm. That arm now applies
+  the same boundaries to HTTP/1.x backend bodies (direct adapters as `direct`,
+  the coalescer as `coalesced`), which restores the H1 Internal Profile
+  cadence lane's branch evidence. The exported metric names are unchanged; see
+  `docs/h1_internal_profile.md`. Builds without the feature are unaffected.
 - The libFuzzer builds (CI `fuzz-smoke` on `main` and the scheduled Fuzz
   lane) failed to compile the vendored h2 since #5969: cargo-fuzz's
   `--cfg fuzzing` compiles h2's undocumented `fuzz_bridge` module, and as a
