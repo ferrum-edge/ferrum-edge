@@ -61,6 +61,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **HTTP/2 and gRPC write several DATA frames per write call** (#5588). Ferrum
+  now carries a vendored h2 0.4.19 whose frame writer copies DATA payloads into
+  its write buffer, up to about 64 KiB, instead of writing each DATA frame with
+  its own `writev`. Over TLS a maximum-size frame (16 KiB plus its 9-byte
+  header) no longer costs a second, 9-byte record. This applies to every h2 connection,
+  frontend and backend. On the protocol benchmark, HTTP/2 was 8–24% faster
+  (0.85–0.98× Envoy to 1.01–1.13×) and gRPC 5–7% faster than the unpatched
+  build. A write buffer that grew to
+  coalesce frames is kept while the connection keeps writing and dropped back
+  to 16 KiB once it has nothing more to write, so idle connections hold no
+  extra memory. DATA already staged in that buffer when a stream is reset still
+  goes out ahead of the `RST_STREAM`. See
+  `docs/upstream-h2-patches/001-coalesce-data-frame-writes/`.
 - **Byte relays batch reads of 8 KiB and up** (#5588). A relay read that
   returns at least 8 KiB is now topped up with the reads already waiting before
   the batch is written, down from 16 KiB. This covers the TCP/TLS stream proxy,

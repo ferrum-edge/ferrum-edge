@@ -16,9 +16,14 @@ it did not capture live successful backend histories or establish a repair.
 The ordinary Cargo manifests, lockfiles, vendored inventory and published
 images continue to use the existing dependency graph. `prepare.py` requires a
 GitHub-hosted Linux runner, copies the checkout into a new temporary directory,
-verifies the immutable h2 0.4.19 archive/revision and every modified preimage,
-applies the reviewed patch without fuzz, verifies postimages and injected
-assets, and selects the result only in that copy. The generated Dockerfile
+verifies the immutable h2 0.4.19 archive/revision, applies Ferrum's vendored
+h2 patch (`docs/upstream-h2-patches/001-coalesce-data-frame-writes/`) without
+fuzz and requires every `src/` file to match `vendor/h2-0.4.19-ferrum-patched`'s
+drift-manifest hash, so the observed crate is the h2 the gateway ships. It then
+verifies every observer preimage, applies the reviewed observer patch without
+fuzz, verifies postimages and injected assets, and selects the result only in
+that copy by replacing the vendored `h2` entry in `[patch.crates-io]`. The
+lint baseline is the shipped crate, so the comparison isolates the observer. The generated Dockerfile
 retains the ordinary stages/features and adds `--locked` to its Cargo builds.
 The manual job loads its image locally and does not publish it or export its
 cache. Graph verification requires both transport paths to select the patched

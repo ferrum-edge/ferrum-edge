@@ -15,10 +15,14 @@ on:
       - Cargo.toml
       - Cargo.lock
       - Dockerfile
+      - vendor/h2-0.4.19-ferrum-patched/**
+      - vendor/VENDOR_INTEGRITY.sha256
+      - docs/upstream-h2-patches/**
   # prepare.py fails closed when a repository file it pins drifts: the
   # src/admin/mod.rs SHA-256 in h2_guard/source.json, the h2 entry in
-  # Cargo.lock, the single [patch.crates-io] table in Cargo.toml, and the two
-  # Dockerfile cargo build calls. Ordinary source PRs do not run this lane, so
+  # Cargo.lock, the single [patch.crates-io] table and its vendored h2 entry
+  # in Cargo.toml, the vendored h2 patch and its drift-manifest hashes, and the
+  # two Dockerfile cargo build calls. Ordinary source PRs do not run this lane, so
   # re-verify every main push that touches a pinned input; a stale pin turns
   # that push's run red instead of surfacing on a later unrelated PR.
   push:
@@ -36,6 +40,9 @@ on:
       - Cargo.toml
       - Cargo.lock
       - Dockerfile
+      - vendor/h2-0.4.19-ferrum-patched/**
+      - vendor/VENDOR_INTEGRITY.sha256
+      - docs/upstream-h2-patches/**
   workflow_dispatch:
     inputs:
       run_campaign:

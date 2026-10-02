@@ -26,6 +26,17 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased
+
+**Dependencies**
+
+- **Vendored h2:** h2 0.4.19 is now a path-sourced fork
+  (`vendor/h2-0.4.19-ferrum-patched/`) that writes several DATA frames per
+  write call; see the
+  [patch README](upstream-h2-patches/001-coalesce-data-frame-writes/README.md).
+  `cargo deny` may not match RUSTSEC `h2` advisories against a path source, so
+  h2 advisories are checked manually.
+
 ## Upgrading to 0.9.9
 
 **HBONE relay socket errors reset the CONNECT stream (#5781).** When an HBONE

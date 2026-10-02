@@ -1868,6 +1868,25 @@ jobs:
           # Patch 003: an HTTP/1 read that returned a full TLS record keeps
           # reading while more is ready (issue #5588).
           cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
+          # The gateway runs hyper on the vendored h2 (h2-001), so run every
+          # Ferrum hyper regression on that combination as well.
+          h2_vendored='patch.crates-io.h2.path="vendor/h2-0.4.19-ferrum-patched"'
+          # Fail unless the combination really resolves the vendored h2.
+          cargo tree -i h2 --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full \
+            --config "$h2_vendored" | grep -F 'h2 v0.4.19 (' | grep -F 'vendor/h2-0.4.19-ferrum-patched)'
+          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_ \
+            --config "$h2_vendored"
+
+      - name: Run vendored h2 DATA-frame coalescing regressions
+        # DATA frames staged together leave in one write, byte-exact, while
+        # the write buffer stays within about 64 KiB; a larger payload is
+        # still chained without a copy, and a grown buffer is dropped once the
+        # connection has nothing more to write (issue #5588). Cap lints for
+        # the same reason as hyper above.
+        env:
+          RUSTFLAGS: "--cap-lints=warn"
+        run: |
+          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_coalesce_data_frame_writes
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

@@ -1,0 +1,604 @@
+diff --git a/src/client.rs b/src/client.rs
+index cb7e677ae..7cba12550 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -1331,6 +1331,12 @@ where
+     T: AsyncRead + AsyncWrite + Unpin,
+     B: Buf,
+ {
++    /// FERRUM PATCH test hook: the codec's write-buffer state.
++    #[cfg(test)]
++    pub(crate) fn write_buf_state(&self) -> (usize, bool) {
++        self.inner.write_buf_state()
++    }
++
+     async fn handshake2(
+         mut io: T,
+         builder: Builder,
+diff --git a/src/codec/framed_write.rs b/src/codec/framed_write.rs
+index efd1966cf..d72a3ce56 100644
+--- a/src/codec/framed_write.rs
++++ b/src/codec/framed_write.rs
+@@ -52,6 +52,10 @@ struct Encoder<B> {
+ 
+     /// Min buffer required to attempt to write a frame
+     min_buffer_capacity: usize,
++
++    /// Test-only: the buffer grew to coalesce DATA frames at least once.
++    #[cfg(test)]
++    grew_to_coalesce: bool,
+ }
+ 
+ #[derive(Debug)]
+@@ -76,6 +80,22 @@ const CHAIN_THRESHOLD: usize = 256;
+ /// fragmented data being sent, and hereby improve the throughput.
+ const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
+ 
++/// FERRUM PATCH (h2-001-coalesce-data-frame-writes): copy a DATA payload into
++/// the write buffer, instead of chaining it as the single in-flight frame,
++/// while the buffer stays within about this many bytes. (Control frames
++/// encoded after the copied DATA can take it past the limit, by at most one
++/// frame.)
++///
++/// Chaining holds one DATA frame at a time, so every frame cost its own
++/// write: one `writev` per frame, and over TLS one extra short record per
++/// maximum-size frame (a 16 KiB payload plus its 9-byte header is 9 bytes too
++/// long for one record). Copying lets the frames popped in one pass, across
++/// streams, leave in one write, as an event-loop proxy batches them. Larger
++/// payloads are still chained without a copy. Upstream tracks the same
++/// problem as hyperium/h2#902; hyperium/h2#903 batches frames without
++/// copying.
++const COALESCE_LIMIT: usize = 64 * 1_024;
++
+ // TODO: Make generic
+ impl<T, B> FramedWrite<T, B>
+ where
+@@ -99,6 +119,8 @@ where
+                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
+                 chain_threshold,
+                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
++                #[cfg(test)]
++                grew_to_coalesce: false,
+             },
+         }
+     }
+@@ -237,7 +259,25 @@ where
+                     return Err(PayloadTooBig);
+                 }
+ 
+-                if len >= self.chain_threshold {
++                let buf_len = self.buf.get_ref().len();
++                if len >= self.chain_threshold
++                    && buf_len + frame::HEADER_LEN + len <= COALESCE_LIMIT
++                {
++                    // FERRUM PATCH: coalesce. Grow once, straight to the
++                    // limit, rather than by doubling across several frames.
++                    let buf = self.buf.get_mut();
++                    if buf.capacity() - buf_len < frame::HEADER_LEN + len {
++                        buf.reserve(COALESCE_LIMIT - buf_len);
++                        #[cfg(test)]
++                        {
++                            self.grew_to_coalesce = true;
++                        }
++                    }
++                    v.encode_chunk(buf);
++                    // Fully copied, so the frame is complete once buffered,
++                    // the same as a frame under the chain threshold.
++                    self.last_data_frame = Some(v);
++                } else if len >= self.chain_threshold {
+                     let head = v.head();
+ 
+                     // Encode the frame head to the buffer
+@@ -307,9 +347,12 @@ where
+     }
+ 
+     fn has_capacity(&self) -> bool {
++        let buf = self.buf.get_ref();
++        // FERRUM PATCH: the buffer may grow up to `COALESCE_LIMIT`, so room
++        // under that limit counts even before the allocation exists.
+         self.next.is_none()
+-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
+-                >= self.min_buffer_capacity)
++            && (buf.capacity() - buf.len() >= self.min_buffer_capacity
++                || buf.len() + self.min_buffer_capacity <= COALESCE_LIMIT)
+     }
+ 
+     fn is_empty(&self) -> bool {
+@@ -348,6 +391,27 @@ impl<T, B> FramedWrite<T, B> {
+         self.encoder.last_data_frame.take()
+     }
+ 
++    /// FERRUM PATCH: drop a write buffer that grew to coalesce DATA frames,
++    /// once everything in it has been written. Called when the connection has
++    /// nothing more to write, so a busy connection keeps one grown buffer
++    /// across writes and an idle one holds only the initial 16 KiB.
++    pub(crate) fn shrink_if_idle(&mut self) {
++        let buf = self.encoder.buf.get_ref();
++        if self.encoder.next.is_none()
++            && buf.is_empty()
++            && buf.capacity() > DEFAULT_BUFFER_CAPACITY
++        {
++            self.encoder.buf = Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY));
++        }
++    }
++
++    /// Test-only view of the write buffer: (capacity, whether it ever grew to
++    /// coalesce).
++    #[cfg(test)]
++    pub(crate) fn write_buf_state(&self) -> (usize, bool) {
++        (self.encoder.buf.get_ref().capacity(), self.encoder.grew_to_coalesce)
++    }
++
+     pub fn get_mut(&mut self) -> &mut T {
+         &mut self.inner
+     }
+@@ -376,3 +440,415 @@ mod unstable {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod ferrum_coalesce_data_frame_writes_tests {
++    //! FERRUM PATCH (h2-001-coalesce-data-frame-writes).
++    use super::*;
++    use bytes::Bytes;
++    use std::sync::{Arc, Mutex};
++
++    /// Records every write call; accepts everything.
++    struct RecordingIo {
++        vectored: bool,
++        writes: Arc<Mutex<Vec<Vec<u8>>>>,
++    }
++
++    impl AsyncWrite for RecordingIo {
++        fn poll_write(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            self.writes.lock().unwrap().push(buf.to_vec());
++            Poll::Ready(Ok(buf.len()))
++        }
++
++        fn poll_write_vectored(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            bufs: &[io::IoSlice<'_>],
++        ) -> Poll<io::Result<usize>> {
++            let joined: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
++            let n = joined.len();
++            self.writes.lock().unwrap().push(joined);
++            Poll::Ready(Ok(n))
++        }
++
++        fn is_write_vectored(&self) -> bool {
++            self.vectored
++        }
++
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    fn framed(vectored: bool) -> (FramedWrite<RecordingIo, Bytes>, Arc<Mutex<Vec<Vec<u8>>>>) {
++        let writes = Arc::new(Mutex::new(Vec::new()));
++        let io = RecordingIo {
++            vectored,
++            writes: Arc::clone(&writes),
++        };
++        let mut framed = FramedWrite::new(io);
++        framed.set_max_frame_size(frame::MAX_MAX_FRAME_SIZE as usize);
++        (framed, writes)
++    }
++
++    fn data(stream: u32, len: usize, fill: u8) -> Frame<Bytes> {
++        frame::Data::new(stream.into(), Bytes::from(vec![fill; len])).into()
++    }
++
++    /// Wire bytes of one DATA frame without flags.
++    fn wire(stream: u32, len: usize, fill: u8) -> Vec<u8> {
++        let mut out = Vec::with_capacity(frame::HEADER_LEN + len);
++        out.extend_from_slice(&(len as u32).to_be_bytes()[1..]);
++        out.push(0x0); // DATA
++        out.push(0x0); // no flags
++        out.extend_from_slice(&stream.to_be_bytes());
++        out.extend(std::iter::repeat(fill).take(len));
++        out
++    }
++
++    /// Buffer every frame the way `Prioritize::buffer_pending` does (checking
++    /// capacity and taking back the completed frame), flushing whenever the
++    /// codec is full, then flush the rest.
++    fn send_all(framed: &mut FramedWrite<RecordingIo, Bytes>, frames: Vec<Frame<Bytes>>) {
++        let waker = futures_util_noop_waker();
++        let mut cx = Context::from_waker(&waker);
++        for f in frames {
++            while !framed.has_capacity() {
++                assert!(framed.flush(&mut cx).is_ready());
++                let _ = framed.take_last_data_frame();
++            }
++            framed.buffer(f).unwrap();
++            let _ = framed.take_last_data_frame();
++        }
++        assert!(framed.flush(&mut cx).is_ready());
++        let _ = framed.take_last_data_frame();
++    }
++
++    /// Compare recorded writes by size and content without dumping payloads.
++    fn assert_writes(writes: &[Vec<u8>], expected: &[Vec<u8>], what: &str) {
++        let sizes: Vec<usize> = writes.iter().map(Vec::len).collect();
++        let want: Vec<usize> = expected.iter().map(Vec::len).collect();
++        assert_eq!(sizes, want, "{what}: write sizes");
++        assert!(writes == expected, "{what}: write contents differ");
++    }
++
++    fn futures_util_noop_waker() -> std::task::Waker {
++        use std::task::{RawWaker, RawWakerVTable};
++        fn clone(_: *const ()) -> RawWaker {
++            RawWaker::new(std::ptr::null(), &VTABLE)
++        }
++        fn noop(_: *const ()) {}
++        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
++        // SAFETY: every vtable entry ignores the data pointer.
++        unsafe { std::task::Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
++    }
++
++    #[test]
++    fn data_frames_within_the_limit_leave_in_one_write() {
++        for vectored in [true, false] {
++            let (mut framed, writes) = framed(vectored);
++            send_all(
++                &mut framed,
++                vec![data(1, 16_384, b'a'), data(3, 16_384, b'b'), data(1, 10_000, b'c')],
++            );
++            let mut expected = wire(1, 16_384, b'a');
++            expected.extend(wire(3, 16_384, b'b'));
++            expected.extend(wire(1, 10_000, b'c'));
++            assert_writes(&writes.lock().unwrap(), &[expected], &format!("vectored={vectored}"));
++        }
++    }
++
++    /// A frame that no longer fits is chained behind the copied ones, so with
++    /// vectored I/O both still leave in one write, and the third frame waits
++    /// for the next one.
++    #[test]
++    fn a_frame_past_the_limit_is_chained_behind_the_copied_ones() {
++        let (mut framed, writes) = framed(true);
++        send_all(
++            &mut framed,
++            vec![data(1, 40_000, b'a'), data(1, 40_000, b'b'), data(1, 1_000, b'c')],
++        );
++        let mut first = wire(1, 40_000, b'a');
++        first.extend(wire(1, 40_000, b'b'));
++        assert_writes(&writes.lock().unwrap(), &[first, wire(1, 1_000, b'c')], "vectored");
++    }
++
++    #[test]
++    fn a_frame_larger_than_the_limit_is_chained_whole() {
++        let (mut framed, writes) = framed(true);
++        send_all(&mut framed, vec![data(5, 100_000, b'z')]);
++        assert_writes(&writes.lock().unwrap(), &[wire(5, 100_000, b'z')], "large frame");
++        assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
++    }
++
++    /// A grown buffer survives a write (no reallocation per batch); it is
++    /// dropped by `shrink_if_idle` only once nothing is left to write.
++    #[test]
++    fn a_grown_buffer_is_kept_across_writes_and_dropped_when_idle() {
++        let (mut framed, _writes) = framed(true);
++        send_all(&mut framed, vec![data(1, 30_000, b'a'), data(3, 30_000, b'b')]);
++        assert!(framed.encoder.buf.get_ref().is_empty());
++        assert!(framed.encoder.buf.get_ref().capacity() >= COALESCE_LIMIT);
++        send_all(&mut framed, vec![data(1, 1_000, b'c')]);
++        assert!(framed.encoder.buf.get_ref().capacity() >= COALESCE_LIMIT);
++
++        // Unwritten bytes are never dropped.
++        framed.buffer(data(1, 30_000, b'd')).unwrap();
++        let _ = framed.take_last_data_frame();
++        framed.shrink_if_idle();
++        assert_eq!(framed.encoder.buf.get_ref().len(), frame::HEADER_LEN + 30_000);
++
++        send_all(&mut framed, vec![]);
++        framed.shrink_if_idle();
++        assert!(framed.encoder.buf.get_ref().is_empty());
++        assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
++    }
++
++    /// End to end: a client connection that uploaded a bulk body, which grew
++    /// its write buffer to coalesce DATA frames, holds only the initial
++    /// buffer once it goes idle. Ferrum's frontend sets no keepalive, so an
++    /// idle connection may never write again.
++    #[tokio::test]
++    async fn an_idle_connection_holds_only_the_initial_write_buffer() {
++        use std::future::{poll_fn, Future};
++
++        let (client_io, server_io) = tokio::io::duplex(1 << 20);
++        let server = tokio::spawn(async move {
++            let mut conn = crate::server::Builder::new()
++                .initial_window_size(1 << 20)
++                .initial_connection_window_size(1 << 20)
++                .handshake::<_, Bytes>(server_io)
++                .await
++                .unwrap();
++            // The server connection only makes progress while `accept` is
++            // polled, so each request is handled on its own task.
++            while let Some(request) = conn.accept().await {
++                let (request, mut respond) = request.unwrap();
++                tokio::spawn(async move {
++                    let mut body = request.into_body();
++                    while let Some(chunk) = body.data().await {
++                        let chunk = chunk.unwrap();
++                        body.flow_control().release_capacity(chunk.len()).unwrap();
++                    }
++                    respond
++                        .send_response(http::Response::new(()), true)
++                        .unwrap();
++                });
++            }
++        });
++
++        let (client, mut conn) = crate::client::handshake(client_io).await.unwrap();
++        let exchange = async move {
++            let mut client = client.ready().await.unwrap();
++            let request = http::Request::post("https://example.com/").body(()).unwrap();
++            let (response, mut stream) = client.send_request(request, false).unwrap();
++            stream.send_data(Bytes::from(vec![b'x'; 512 * 1024]), true).unwrap();
++            let response = response.await.unwrap();
++            assert_eq!(response.status(), http::StatusCode::OK);
++            client
++        };
++        tokio::pin!(exchange);
++        let client = loop {
++            tokio::select! {
++                client = &mut exchange => break client,
++                result = poll_fn(|cx| std::pin::Pin::new(&mut conn).poll(cx)) => {
++                    panic!("connection ended early: {result:?}")
++                }
++            }
++        };
++        // Let the connection drain everything it still has to write.
++        for _ in 0..8 {
++            poll_fn(|cx| {
++                let _ = std::pin::Pin::new(&mut conn).poll(cx);
++                Poll::Ready(())
++            })
++            .await;
++            tokio::task::yield_now().await;
++        }
++        let (capacity, grew) = conn.write_buf_state();
++        assert!(grew, "the bulk upload must have coalesced DATA frames");
++        assert!(
++            capacity <= DEFAULT_BUFFER_CAPACITY,
++            "an idle connection kept a {capacity}-byte write buffer"
++        );
++        drop(client);
++        drop(conn);
++        server.await.unwrap();
++    }
++
++    /// The limit is inclusive: a frame that brings the buffer to exactly
++    /// `COALESCE_LIMIT` bytes is copied, one byte more is chained.
++    #[test]
++    fn the_limit_is_inclusive() {
++        let fits = COALESCE_LIMIT - frame::HEADER_LEN;
++        let (mut copied, _writes) = framed(true);
++        copied.buffer(data(1, fits, b'a')).unwrap();
++        assert!(copied.encoder.next.is_none(), "a frame filling the limit is copied");
++        assert_eq!(copied.encoder.buf.get_ref().len(), COALESCE_LIMIT);
++        assert!(copied.take_last_data_frame().is_some());
++
++        let (mut chained, _writes) = framed(true);
++        chained.buffer(data(1, fits + 1, b'a')).unwrap();
++        assert!(
++            matches!(chained.encoder.next, Some(Next::Data(_))),
++            "one byte over the limit is chained"
++        );
++        // Stock chaining: the head plus enough payload to reach the chain
++        // threshold sit in the buffer, the rest stays in the frame.
++        assert_eq!(chained.encoder.buf.get_ref().len(), chained.encoder.chain_threshold);
++    }
++
++    /// Without vectored I/O a chained frame still goes out whole and in order.
++    #[test]
++    fn a_chained_frame_without_vectored_io_is_written_whole() {
++        let (mut framed, writes) = framed(false);
++        send_all(&mut framed, vec![data(1, 2_000, b'a'), data(1, 100_000, b'b')]);
++        let joined: Vec<u8> = writes.lock().unwrap().concat();
++        let mut expected = wire(1, 2_000, b'a');
++        expected.extend(wire(1, 100_000, b'b'));
++        assert_eq!(joined.len(), expected.len());
++        assert!(joined == expected, "non-vectored chained bytes differ");
++    }
++
++    /// A transport that takes at most `max` bytes per call and answers every
++    /// other call with `Pending` (waking itself).
++    struct ChokedIo {
++        max: usize,
++        pend: bool,
++        written: Vec<u8>,
++    }
++
++    impl AsyncWrite for ChokedIo {
++        fn poll_write(
++            mut self: Pin<&mut Self>,
++            cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            self.pend = !self.pend;
++            if self.pend {
++                cx.waker().wake_by_ref();
++                return Poll::Pending;
++            }
++            let n = buf.len().min(self.max);
++            self.written.extend_from_slice(&buf[..n]);
++            Poll::Ready(Ok(n))
++        }
++
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    /// Partial writes and `Pending` neither lose, duplicate nor reorder bytes,
++    /// and new frames are refused until the coalesced batch has drained.
++    #[test]
++    fn partial_writes_and_pending_keep_the_byte_stream_intact() {
++        let waker = futures_util_noop_waker();
++        let mut cx = Context::from_waker(&waker);
++        let io = ChokedIo {
++            max: 1_000,
++            pend: false,
++            written: Vec::new(),
++        };
++        let mut framed: FramedWrite<ChokedIo, Bytes> = FramedWrite::new(io);
++        framed.set_max_frame_size(frame::MAX_MAX_FRAME_SIZE as usize);
++        let frames = vec![
++            data(1, 20_000, b'a'),
++            data(3, 20_000, b'b'),
++            data(5, 30_000, b'c'),
++            data(1, 7, b'd'),
++        ];
++        let mut expected = Vec::new();
++        for (stream, len, fill) in [(1, 20_000, b'a'), (3, 20_000, b'b'), (5, 30_000, b'c'), (1, 7, b'd')] {
++            expected.extend(wire(stream, len, fill));
++        }
++        for f in frames {
++            while !framed.has_capacity() {
++                while framed.flush(&mut cx).is_pending() {}
++                let _ = framed.take_last_data_frame();
++            }
++            framed.buffer(f).unwrap();
++            if let Some(reclaimed) = framed.take_last_data_frame() {
++                assert!(!reclaimed.payload().has_remaining());
++            }
++        }
++        while framed.flush(&mut cx).is_pending() {}
++        let _ = framed.take_last_data_frame();
++        let written = &framed.get_mut().written;
++        assert_eq!(written.len(), expected.len());
++        assert!(*written == expected, "partial-write byte stream differs");
++    }
++
++    /// (type, flags, stream id, payload length) of every frame in `bytes`.
++    fn frame_heads(bytes: &[u8]) -> Vec<(u8, u8, u32, usize)> {
++        let mut heads = Vec::new();
++        let mut at = 0;
++        while at < bytes.len() {
++            let len = u32::from_be_bytes([0, bytes[at], bytes[at + 1], bytes[at + 2]]) as usize;
++            let stream = u32::from_be_bytes([
++                bytes[at + 5] & 0x7f,
++                bytes[at + 6],
++                bytes[at + 7],
++                bytes[at + 8],
++            ]);
++            heads.push((bytes[at + 3], bytes[at + 4], stream, len));
++            at += frame::HEADER_LEN + len;
++        }
++        assert_eq!(at, bytes.len(), "trailing partial frame");
++        heads
++    }
++
++    /// Control frames buffered between copied DATA frames keep their order,
++    /// and END_STREAM survives the copy.
++    #[test]
++    fn control_frames_interleave_in_order_and_end_stream_is_kept() {
++        let (mut framed, writes) = framed(true);
++        let headers = frame::Headers::new(
++            1.into(),
++            frame::Pseudo::response(http::StatusCode::OK),
++            http::HeaderMap::new(),
++        );
++        let mut last = frame::Data::new(3.into(), Bytes::from(vec![b'z'; 3_000]));
++        last.set_end_stream(true);
++        send_all(
++            &mut framed,
++            vec![
++                headers.into(),
++                data(1, 10_000, b'a'),
++                frame::Reset::new(5.into(), frame::Reason::CANCEL).into(),
++                frame::Ping::new([7; 8]).into(),
++                frame::WindowUpdate::new(0.into(), 65_535).into(),
++                last.into(),
++            ],
++        );
++        let writes = writes.lock().unwrap();
++        assert_eq!(writes.len(), 1, "everything leaves in one write");
++        let heads = frame_heads(&writes[0]);
++        let kinds: Vec<u8> = heads.iter().map(|h| h.0).collect();
++        // HEADERS, DATA, RST_STREAM, PING, WINDOW_UPDATE, DATA
++        assert_eq!(kinds, vec![0x1, 0x0, 0x3, 0x6, 0x8, 0x0]);
++        assert_eq!(heads[1], (0x0, 0x0, 1, 10_000));
++        assert_eq!(heads[5], (0x0, 0x1, 3, 3_000), "END_STREAM flag kept");
++    }
++
++    #[test]
++    fn a_copied_frame_is_handed_back_fully_consumed() {
++        let (mut framed, _writes) = framed(true);
++        framed.buffer(data(1, 20_000, b'a')).unwrap();
++        let reclaimed = framed.take_last_data_frame().expect("copied frame");
++        assert!(!reclaimed.payload().has_remaining());
++        assert!(framed.has_capacity());
++    }
++}
+diff --git a/src/codec/mod.rs b/src/codec/mod.rs
+index d7aecee91..c01a69295 100644
+--- a/src/codec/mod.rs
++++ b/src/codec/mod.rs
+@@ -121,6 +121,17 @@ impl<T, B> Codec<T, B> {
+         self.framed_write().take_last_data_frame()
+     }
+ 
++    /// FERRUM PATCH: drop a write buffer grown to coalesce DATA frames once
++    /// the connection has nothing more to write.
++    pub(crate) fn shrink_write_buf_if_idle(&mut self) {
++        self.framed_write().shrink_if_idle()
++    }
++
++    #[cfg(test)]
++    pub(crate) fn write_buf_state(&self) -> (usize, bool) {
++        self.inner.get_ref().write_buf_state()
++    }
++
+     fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
+         self.inner.get_mut()
+     }
+diff --git a/src/proto/connection.rs b/src/proto/connection.rs
+index 757e2b275..38a08a91a 100644
+--- a/src/proto/connection.rs
++++ b/src/proto/connection.rs
+@@ -124,6 +124,12 @@ where
+     P: Peer,
+     B: Buf,
+ {
++    /// FERRUM PATCH test hook: the codec's write-buffer state.
++    #[cfg(test)]
++    pub(crate) fn write_buf_state(&self) -> (usize, bool) {
++        self.codec.write_buf_state()
++    }
++
+     pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+         fn streams_config(config: &Config) -> streams::Config {
+             streams::Config {
+diff --git a/src/proto/streams/streams.rs b/src/proto/streams/streams.rs
+index 1b73b3339..a8761ec48 100644
+--- a/src/proto/streams/streams.rs
++++ b/src/proto/streams/streams.rs
+@@ -225,6 +225,10 @@ where
+             };
+ 
+             if !reclaimed {
++                // FERRUM PATCH (h2-001): everything staged has been written
++                // and nothing else is pending, so the connection is idle:
++                // release a write buffer that grew to coalesce DATA frames.
++                dst.shrink_write_buf_if_idle();
+                 return Poll::Ready(Ok(()));
+             }
+         }
