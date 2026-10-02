@@ -3916,7 +3916,7 @@ CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly-2025-07-01
+          toolchain: nightly-2026-09-30
 
       # The repository's own checksum-pinned sccache installer, and the only
       # local action this contract admits. It never enables the
@@ -4221,7 +4221,7 @@ CI_FUZZ_SMOKE_PRE_BORINGCACHE_JOB = r"""  fuzz-smoke:
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly-2025-07-01
+          toolchain: nightly-2026-09-30
 
       # The repository's own checksum-pinned sccache installer, and the only
       # local action this contract admits. It never enables the
@@ -4527,7 +4527,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly-2025-07-01
+          toolchain: nightly-2026-09-30
 
       # The repository's own checksum-pinned sccache installer never enables the
       # credential-bearing sccache GHA backend, never persists
@@ -4968,7 +4968,7 @@ jobs:
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly-2025-07-01
+          toolchain: nightly-2026-09-30
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -30510,7 +30510,7 @@ pre_build = []
             "protobuf-compiler\n\n",
             "",
         ),
-        "mutable toolchain pin": ("nightly-2025-07-01", "nightly"),
+        "mutable toolchain pin": ("nightly-2026-09-30", "nightly"),
         "repository-supplied script": (
             ('cargo fuzz run --codegen-units 16 "$fuzz_target" -- \\',
              CI_FUZZ_CARGO_PREFIX + ' --skip-restore --skip-save fuzz run --codegen-units 16 "$fuzz_target" -- \\'),

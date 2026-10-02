@@ -115,7 +115,7 @@ crash locally:
 
 ```bash
 cd fuzz
-rustup toolchain install nightly-2025-07-01
+rustup toolchain install nightly-2026-09-30
 cargo install cargo-fuzz --locked --version 0.13.1
 cargo fuzz run traceparent corpus/traceparent/ -- -runs=0   # replay seeds
 cargo fuzz run traceparent -- -max_total_time=60
@@ -137,7 +137,7 @@ traffic into `corpus/`.
 
 | Component | Pin |
 |-----------|-----|
-| Rust (fuzz) | `nightly-2025-07-01` (`fuzz/rust-toolchain.toml`) |
+| Rust (fuzz) | `nightly-2026-09-30` (`fuzz/rust-toolchain.toml`) |
 | `cargo-fuzz` | `0.13.1` (pinned in admitted CI workflows) |
 | `libfuzzer-sys` | `0.4.9` (`fuzz/Cargo.toml`) |
 | `proptest` (smoke only) | `1.6.0` (`fuzz/Cargo.toml` dev-dep) |

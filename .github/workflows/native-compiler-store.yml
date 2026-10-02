@@ -65,7 +65,7 @@ jobs:
       - name: Install the pinned property-suite toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly-2025-07-01
+          toolchain: nightly-2026-09-30
       - name: Install the required property-suite build dependency
         run: |
           set -euo pipefail
