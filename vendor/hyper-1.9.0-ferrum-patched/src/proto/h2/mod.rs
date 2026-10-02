@@ -100,12 +100,19 @@ pin_project! {
 }
 
 /// FERRUM PATCH 004: the running state of an `Http2BodyWriteTimeout`.
+///
+/// A window-limited upload stalls many times per request (each wait for a
+/// WINDOW_UPDATE), so a stall must not touch the timer driver. A stall only
+/// records when it started. The one sleep, allocated on the first stall, is
+/// left alone between stalls: its deadline was set from an earlier stall, so
+/// it can only fire early, never late. When it fires, the real deadline is
+/// checked and the sleep re-armed once if the current stall started later.
+/// That is at most one timer-driver update per timeout period.
 pub(crate) struct WriteTimeout {
     signal: crate::ext::Http2BodyWriteTimeout,
     timer: crate::common::time::Time,
-    // Allocated on the first stall and re-armed in place afterwards.
     sleep: Option<Pin<Box<dyn crate::rt::Sleep>>>,
-    armed: bool,
+    stalled_since: Option<std::time::Instant>,
 }
 
 impl WriteTimeout {
@@ -118,30 +125,35 @@ impl WriteTimeout {
             signal,
             timer,
             sleep: None,
-            armed: false,
+            stalled_since: None,
         }
     }
 
-    /// Called while a chunk is ready but cannot be written. Arms the timer at
-    /// the start of the stall and reports whether it has fired.
+    /// Called while a chunk is ready but cannot be written. Reports whether
+    /// the current stall has lasted the full bound.
     fn poll_stalled(&mut self, cx: &mut Context<'_>) -> bool {
-        if !self.armed {
-            let deadline = self.timer.now() + self.signal.timeout();
-            match self.sleep.as_mut() {
-                Some(sleep) => self.timer.reset(sleep, deadline),
-                None => self.sleep = Some(self.timer.sleep(self.signal.timeout())),
+        let timeout = self.signal.timeout();
+        let since = *self.stalled_since.get_or_insert_with(|| self.timer.now());
+        let deadline = since + timeout;
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| self.timer.sleep(timeout));
+        loop {
+            if sleep.as_mut().poll(cx).is_pending() {
+                return false;
             }
-            self.armed = true;
-        }
-        match self.sleep.as_mut() {
-            Some(sleep) => sleep.as_mut().poll(cx).is_ready(),
-            None => false,
+            if self.timer.now() >= deadline {
+                return true;
+            }
+            // Fired for an earlier stall: re-arm for this one and poll again
+            // so the waker is registered.
+            self.timer.reset(sleep, deadline);
         }
     }
 
     /// A chunk was handed to h2: the stall, if any, is over.
     fn progressed(&mut self) {
-        self.armed = false;
+        self.stalled_since = None;
     }
 }
 

@@ -161,10 +161,10 @@ index bf154e458..bdabd4e5d 100644
  
                      // Check poll_ready() again.
 diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
-index 9292b3524..02f5f8192 100644
+index 9292b3524..d60eb4140 100644
 --- a/src/proto/h2/mod.rs
 +++ b/src/proto/h2/mod.rs
-@@ -91,11 +91,60 @@ pin_project! {
+@@ -91,11 +91,72 @@ pin_project! {
          // FERRUM PATCH 002: a polled DATA chunk (and its end-of-stream flag)
          // waiting for enough assigned capacity to avoid a sliver frame.
          pending_data: Option<(S::Data, bool)>,
@@ -177,12 +177,19 @@ index 9292b3524..02f5f8192 100644
  }
  
 +/// FERRUM PATCH 004: the running state of an `Http2BodyWriteTimeout`.
++///
++/// A window-limited upload stalls many times per request (each wait for a
++/// WINDOW_UPDATE), so a stall must not touch the timer driver. A stall only
++/// records when it started. The one sleep, allocated on the first stall, is
++/// left alone between stalls: its deadline was set from an earlier stall, so
++/// it can only fire early, never late. When it fires, the real deadline is
++/// checked and the sleep re-armed once if the current stall started later.
++/// That is at most one timer-driver update per timeout period.
 +pub(crate) struct WriteTimeout {
 +    signal: crate::ext::Http2BodyWriteTimeout,
 +    timer: crate::common::time::Time,
-+    // Allocated on the first stall and re-armed in place afterwards.
 +    sleep: Option<Pin<Box<dyn crate::rt::Sleep>>>,
-+    armed: bool,
++    stalled_since: Option<std::time::Instant>,
 +}
 +
 +impl WriteTimeout {
@@ -195,37 +202,42 @@ index 9292b3524..02f5f8192 100644
 +            signal,
 +            timer,
 +            sleep: None,
-+            armed: false,
++            stalled_since: None,
 +        }
 +    }
 +
-+    /// Called while a chunk is ready but cannot be written. Arms the timer at
-+    /// the start of the stall and reports whether it has fired.
++    /// Called while a chunk is ready but cannot be written. Reports whether
++    /// the current stall has lasted the full bound.
 +    fn poll_stalled(&mut self, cx: &mut Context<'_>) -> bool {
-+        if !self.armed {
-+            let deadline = self.timer.now() + self.signal.timeout();
-+            match self.sleep.as_mut() {
-+                Some(sleep) => self.timer.reset(sleep, deadline),
-+                None => self.sleep = Some(self.timer.sleep(self.signal.timeout())),
++        let timeout = self.signal.timeout();
++        let since = *self.stalled_since.get_or_insert_with(|| self.timer.now());
++        let deadline = since + timeout;
++        let sleep = self
++            .sleep
++            .get_or_insert_with(|| self.timer.sleep(timeout));
++        loop {
++            if sleep.as_mut().poll(cx).is_pending() {
++                return false;
 +            }
-+            self.armed = true;
-+        }
-+        match self.sleep.as_mut() {
-+            Some(sleep) => sleep.as_mut().poll(cx).is_ready(),
-+            None => false,
++            if self.timer.now() >= deadline {
++                return true;
++            }
++            // Fired for an earlier stall: re-arm for this one and poll again
++            // so the waker is registered.
++            self.timer.reset(sleep, deadline);
 +        }
 +    }
 +
 +    /// A chunk was handed to h2: the stall, if any, is over.
 +    fn progressed(&mut self) {
-+        self.armed = false;
++        self.stalled_since = None;
 +    }
 +}
 +
  /// FERRUM PATCH 002: smallest DATA frame worth cutting while more of the
  /// chunk is still waiting for capacity. h2 cuts a frame from whatever capacity
  /// a stream holds, so on a connection whose window is nearly spent a chunk can
-@@ -115,10 +164,18 @@ where
+@@ -115,10 +176,18 @@ where
              body_tx: tx,
              data_done: false,
              pending_data: None,
@@ -244,7 +256,7 @@ index 9292b3524..02f5f8192 100644
      #[cfg(feature = "client")]
      fn send_reset(self: Pin<&mut Self>, reason: h2::Reason) {
          self.project().body_tx.send_reset(reason);
-@@ -143,6 +200,18 @@ where
+@@ -143,6 +212,18 @@ where
                  while me.body_tx.capacity() < needed {
                      match me.body_tx.poll_capacity(cx) {
                          Poll::Pending => {
@@ -263,7 +275,7 @@ index 9292b3524..02f5f8192 100644
                              *me.pending_data = Some((chunk, is_eos));
                              return Poll::Pending;
                          }
-@@ -160,6 +229,9 @@ where
+@@ -160,6 +241,9 @@ where
                  me.body_tx
                      .send_data(SendBuf::Buf(chunk), is_eos)
                      .map_err(crate::Error::new_body_write)?;
@@ -273,7 +285,7 @@ index 9292b3524..02f5f8192 100644
                  if is_eos {
                      return Poll::Ready(Ok(()));
                  }
-@@ -171,7 +243,11 @@ where
+@@ -171,7 +255,11 @@ where
              // for the actual body chunk.
              me.body_tx.reserve_capacity(1);
  
@@ -286,7 +298,7 @@ index 9292b3524..02f5f8192 100644
                  loop {
                      match ready!(me.body_tx.poll_capacity(cx)) {
                          Some(Ok(0)) => {}
-@@ -403,3 +479,231 @@ mod ferrum_min_data_frame_capacity_tests {
+@@ -403,3 +491,231 @@ mod ferrum_min_data_frame_capacity_tests {
          );
      }
  }
