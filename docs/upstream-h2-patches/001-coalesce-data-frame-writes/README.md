@@ -69,16 +69,18 @@ This is the one result that differs in h2's own integration suite (`tests/h2-tes
 
 ## Measured effect
 
-Same-runner A/B against the unpatched build of the same commit, Envoy 1.39.1
-as the anchor (run
-[36923833476](https://github.com/ferrum-edge/ferrum-edge/actions/runs/36923833476),
-30 s, 200 streams, two iterations):
+Same-runner A/B of this revision against `main` (bbc3efb64) built in the same job, with Envoy 1.39.1 as the anchor. Run [36942760993](https://github.com/ferrum-edge/ferrum-edge/actions/runs/36942760993): 30 s, 200 streams, two iterations, every iteration positive, no Ferrum errors.
 
 | Protocol | 10 KiB | 70 KiB | 512 KiB | 1 MiB | 5 MiB |
 |---|---|---|---|---|---|
-| HTTP/2, patched vs unpatched | +5.5% | +8.7% | +16.1% | +10.6% | +6.0% |
-| HTTP/2 vs Envoy, unpatched → patched | 0.99 → 1.04 | 1.02 → 1.11 | 0.90 → 1.05 | 0.94 → 1.04 | 0.91 → 0.97 |
-| gRPC, patched vs unpatched | +3.6% | +4.1% | +1.9% | +1.2% | +0.5% |
+| HTTP/2, patched vs unpatched | +8.0% | +16.2% | +23.6% | +18.2% | +14.1% |
+| HTTP/2 vs Envoy, unpatched → patched | 0.98 → 1.06 | 0.98 → 1.13 | 0.85 → 1.06 | 0.90 → 1.06 | 0.88 → 1.01 |
+| gRPC, patched vs unpatched | +5.4% | +5.3% | +6.5% | +7.2% | +7.2% |
+| gRPC vs Envoy, unpatched → patched | 0.88 → 0.93 | 1.01 → 1.07 | 1.04 → 1.11 | 1.02 → 1.10 | 1.01 → 1.08 |
+
+Earlier revisions measured HTTP/2 +5.5–16.1% (run 36923833476) and +5.3–14.6% (run 36938522623) on other runners.
+
+HBONE sanity check (cross-run, so errors and gross regressions only): `mesh-performance-baselines` with suite `hbone` ran on `main` (36938582398) and on the previous revision (36938584841). Both had zero errors and zero shape failures in all three scenarios. Gateway-to-direct throughput ratios were 7.1–8.2% and 7.9–8.4%, on different runner CPUs.
 
 ## Regression tests
 

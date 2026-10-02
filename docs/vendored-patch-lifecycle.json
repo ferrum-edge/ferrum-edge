@@ -826,7 +826,7 @@
       "docs_path": "docs/upstream-h2-patches/001-coalesce-data-frame-writes/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "h2's FramedWrite held one chained DATA frame at a time, so every DATA frame cost its own writev and peer wakeup, and over TLS a second, 9-byte record for each maximum-size frame; copying payloads into the write buffer up to about 64 KiB made HTTP/2 through Ferrum 5-16% faster on the protocol benchmark (#5588). Upstream tracks the problem as hyperium/h2#902; hyperium/h2#903 (third-party, open) batches frames without copying.",
+      "reason": "h2's FramedWrite held one chained DATA frame at a time, so every DATA frame cost its own writev and peer wakeup, and over TLS a second, 9-byte record for each maximum-size frame; copying payloads into the write buffer up to about 64 KiB made HTTP/2 through Ferrum 8-24% faster on the protocol benchmark (#5588). Upstream tracks the problem as hyperium/h2#902; hyperium/h2#903 (third-party, open) batches frames without copying.",
       "upstream": {
         "filing": "filed",
         "github_repo": "hyperium/h2",

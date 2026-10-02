@@ -66,8 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its write buffer, up to about 64 KiB, instead of writing each DATA frame with
   its own `writev`. Over TLS a maximum-size frame (16 KiB plus its 9-byte
   header) no longer costs a second, 9-byte record. This applies to every h2 connection,
-  frontend and backend. On the protocol benchmark, HTTP/2 was 5–16% faster
-  and gRPC 0.5–4% faster than the unpatched build. A write buffer that grew to
+  frontend and backend. On the protocol benchmark, HTTP/2 was 8–24% faster
+  (0.85–0.98× Envoy to 1.01–1.13×) and gRPC 5–7% faster than the unpatched
+  build. A write buffer that grew to
   coalesce frames is kept while the connection keeps writing and dropped back
   to 16 KiB once it has nothing more to write, so idle connections hold no
   extra memory. DATA already staged in that buffer when a stream is reset still
