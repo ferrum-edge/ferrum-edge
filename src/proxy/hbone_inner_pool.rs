@@ -293,7 +293,6 @@ use crate::plugins::prometheus_metrics::HboneInnerPoolEvent;
 use crate::proxy::body::{ReplayableRequestBody, SizeLimitedIncoming};
 use crate::proxy::grpc_proxy::GrpcBody;
 use crate::proxy::hbone_pool::{entry_idle_expired, unix_secs, write_pool_config_key};
-use crate::sync_compat::AtomicUpdate;
 
 /// Most idle HTTP/1.1 inner connections retained for ONE key.
 ///
@@ -1171,7 +1170,7 @@ impl HboneInnerConnectionPool {
     fn release_pooled(&self, count: usize) {
         let _ = self
             .pooled
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(count))
             });
     }
@@ -1186,7 +1185,7 @@ impl HboneInnerConnectionPool {
     /// refused for any other reason.
     fn reserve_pooled(&self) -> bool {
         self.pooled
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < MAX_POOLED_INNER_CONNECTIONS).then_some(current + 1)
             })
             .is_ok()

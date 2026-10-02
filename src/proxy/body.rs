@@ -2641,6 +2641,42 @@ impl UploadSource {
         (source, join)
     }
 
+    /// Build the source for a fully streamed native-gRPC upload (issue #5588).
+    ///
+    /// An upload with an authorization lifetime keeps the gateway-owned pump
+    /// ([`Self::for_streaming_upload_with_deferred_write`]): its absolute
+    /// deadline must release the client body even while hyper's HTTP/2 pipe
+    /// is parked on flow control. Without one, the pump's only job would be
+    /// `backend_write_timeout_ms`, which hyper's pipe enforces itself, where
+    /// the stall happens, from a [`hyper::ext::Http2BodyWriteTimeout`] on the
+    /// backend request (vendored hyper patch 004). That keeps the client body
+    /// polled in place, with no task, channel, or cross-task hop per frame.
+    ///
+    /// Returns the source, the pump join (authorization lifetime only), and
+    /// the write timeout to attach to the backend request (otherwise).
+    pub(crate) fn for_streaming_grpc_upload(
+        incoming: Incoming,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
+    ) -> (
+        Self,
+        Option<crate::proxy::upload_pump::UploadPumpJoin>,
+        Option<hyper::ext::Http2BodyWriteTimeout>,
+    ) {
+        if auth.is_some() {
+            let (source, join) =
+                Self::for_streaming_upload_with_deferred_write(incoming, auth, write_timeout_ms);
+            return (source, join, None);
+        }
+        let write_timeout = (write_timeout_ms > 0 && !http_body::Body::is_end_stream(&incoming))
+            .then(|| {
+                hyper::ext::Http2BodyWriteTimeout::new(std::time::Duration::from_millis(
+                    write_timeout_ms,
+                ))
+            });
+        (UploadSource::Direct(incoming), None, write_timeout)
+    }
+
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
@@ -6179,6 +6215,27 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flu
     let coalescing =
         Coalescing::with_flush_after(limited, coalesce_target, content_length, flush_after);
     wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
+}
+
+/// `bench-h1-profile` input boundary for an HTTP/1.x backend body streamed on
+/// the `StreamingH2` arm (the direct HTTP/1.1 pool, issue #5588): `0` before
+/// the direct adapter, `1` before the coalescer, mirroring the reqwest arm's
+/// [`direct_streaming_body`] / [`coalescing_body`]. HTTP/2 backend bodies
+/// (`h1_backend == false`) pass through unobserved. Without the feature this
+/// is the identity, so default builds construct exactly the same body.
+#[cfg(feature = "bench-h1-profile")]
+pub(crate) fn observe_h1_backend_input<B>(
+    body: B,
+    h1_backend: bool,
+    boundary: usize,
+) -> crate::h1_profile::ObservedBody<B> {
+    crate::h1_profile::ObservedBody::new(body, h1_backend.then_some(boundary))
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+#[inline]
+pub(crate) fn observe_h1_backend_input<B>(body: B, _h1_backend: bool, _boundary: usize) -> B {
+    body
 }
 
 /// Direct (non-coalesced) HTTP/2 streaming body wrapped in

@@ -54,6 +54,11 @@ mod h1_reason_phrase;
 #[cfg(any(feature = "http1", feature = "ffi"))]
 pub use h1_reason_phrase::ReasonPhrase;
 
+#[cfg(feature = "http2")]
+mod h2_body_write_timeout;
+#[cfg(feature = "http2")]
+pub use h2_body_write_timeout::Http2BodyWriteTimeout;
+
 #[cfg(all(feature = "http1", feature = "client"))]
 mod informational;
 #[cfg(all(feature = "http1", feature = "client"))]

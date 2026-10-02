@@ -4,7 +4,6 @@
 //! instances and reloads. The gate and counter allocate nothing, use no map or
 //! lock, and never depend on a client identity. Detailed events remain at debug.
 
-use crate::sync_compat::AtomicUpdate;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Minimum spacing between warnings from the same source site.
@@ -45,7 +44,7 @@ impl WarningSampler {
         }
         let _ = self
             .suppressed
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 Some(count.saturating_add(1))
             });
         None

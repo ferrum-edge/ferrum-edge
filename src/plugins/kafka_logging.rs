@@ -61,7 +61,6 @@ use super::utils::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, LoggerHooks, PluginHttpClient, RetryPolicy,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
-use crate::sync_compat::AtomicUpdate;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Hard ceiling for Ferrum's userspace admission channel (record count).
@@ -1011,7 +1010,7 @@ impl KafkaByteBudget {
         let process = self.ceiling.try_acquire(bytes)?;
         let reserved = self
             .used_bytes
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= self.max_bytes)
             });

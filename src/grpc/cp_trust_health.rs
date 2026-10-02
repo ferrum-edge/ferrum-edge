@@ -67,7 +67,6 @@ use tokio::time::{Duration, Instant, Sleep};
 
 use crate::fips::approved::HmacSha256Key;
 use crate::grpc::cp_trust::TrustBundleRejectReason;
-use crate::sync_compat::AtomicUpdate;
 
 /// Versioned domain-separation prefix for the replica-stable generation
 /// identifier. The private configuration fingerprint is concatenated after
@@ -608,7 +607,7 @@ impl CpDpTrustReloadStatus {
         // word only ever grows, which is what makes publication monotonic.
         let _ = self
             .state
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(((current >> 1) + 1) << 1)
             });
         self.publish_generation_id(fingerprint);

@@ -4310,9 +4310,17 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
         core.contains("pump.cancel_and_join().await;"),
         "a won watermark must cancel and join the gateway-owned pump"
     );
+    let write_timeout_error = GRPC_PROXY_SOURCE
+        .split("fn grpc_backend_write_timeout_error(")
+        .nth(1)
+        .expect("shared gRPC write-timeout terminal")
+        .split("\n}\n")
+        .next()
+        .expect("bounded gRPC write-timeout terminal");
     assert!(
-        core.contains("kind: GrpcTimeoutKind::Read,")
-            && core.contains("gRPC backend request body write timeout after {}ms"),
+        core.contains("grpc_backend_write_timeout_error(")
+            && write_timeout_error.contains("kind: GrpcTimeoutKind::Read,")
+            && write_timeout_error.contains("gRPC backend request body write timeout after {}ms"),
         "the watermark must surface the typed backend-timeout family that classifies as \
          ReadWriteTimeout"
     );
@@ -4460,12 +4468,34 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         "the unlimited-size reqwest or direct HTTP/1.1 upload lost its gateway-owned lifecycle"
     );
     // Native gRPC keeps its own body type, so it installs the pump directly on
-    // the shared upload source rather than through the H1/H2 adapters.
+    // the shared upload source rather than through the H1/H2 adapters. An
+    // upload with an authorization lifetime always gets the pump; without
+    // one, hyper's HTTP/2 pipe enforces `backend_write_timeout_ms` from a
+    // request extension (vendored hyper patch 004, #5588).
     assert!(
-        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload_with_deferred_write(")
+        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_grpc_upload(")
             && GRPC_PROXY_SOURCE.contains("proxy.backend_write_timeout_ms")
-            && GRPC_PROXY_SOURCE.contains("pump.arm_write_watermark();"),
+            && GRPC_PROXY_SOURCE.contains("pump.arm_write_watermark();")
+            && GRPC_PROXY_SOURCE
+                .contains("backend_req.extensions_mut().insert(write_timeout.clone());"),
         "the fully-streamed native-gRPC upload lost its gateway-owned lifecycle"
+    );
+    let grpc_installer = PROXY_BODY_SOURCE
+        .split("pub(crate) fn for_streaming_grpc_upload(")
+        .nth(1)
+        .expect("native gRPC upload installer")
+        .split("\n    }\n")
+        .next()
+        .expect("bounded native gRPC upload installer");
+    let auth_branch = grpc_installer
+        .find("if auth.is_some() {")
+        .expect("authorization lifetimes keep the pump");
+    let pump_install = grpc_installer
+        .find("Self::for_streaming_upload_with_deferred_write(incoming, auth, write_timeout_ms)")
+        .expect("the authenticated branch installs the pump");
+    assert!(
+        auth_branch < pump_install && grpc_installer.contains("Http2BodyWriteTimeout::new("),
+        "native gRPC must keep the pump for authorization lifetimes and bound the write otherwise"
     );
     let native_grpc_poll = GRPC_PROXY_SOURCE
         .split("impl http_body::Body for GrpcBody")
@@ -4751,9 +4781,11 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
         .next()
         .expect("bounded native gRPC streaming entry");
     assert!(
-        native_grpc.contains("let (body, upload_pump)")
-            && native_grpc.contains("held_frontend_upload,\n        upload_pump,"),
-        "native gRPC must retain the upload-pump join through dispatch"
+        native_grpc.contains("let (body, upload_pump, body_write_timeout)")
+            && native_grpc.contains(
+                "held_frontend_upload,\n        upload_pump,\n        body_write_timeout,"
+            ),
+        "native gRPC must retain the upload-pump join and the write timeout through dispatch"
     );
     let native_grpc_dispatch = GRPC_PROXY_SOURCE
         .split("async fn proxy_grpc_streaming_dispatch(")
@@ -4767,7 +4799,9 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
             && native_grpc_dispatch.contains("upload_pump.as_mut()")
             && native_grpc_dispatch.contains("pump.cancel_and_join().await;")
             && native_grpc_dispatch
-                .contains("gRPC backend write watermark expired before response headers"),
+                .contains("gRPC backend write watermark expired before response headers")
+            && native_grpc_dispatch
+                .contains("is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)"),
         "native gRPC must surface backend_write_timeout_ms before the later read/client deadline"
     );
 }

@@ -12,7 +12,6 @@ use crate::config::types::{
     parse_failover_priority_entry,
 };
 use crate::health_check::{ActiveUnhealthyTargets, ProxyHealthState};
-use crate::sync_compat::AtomicUpdate;
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -3345,7 +3344,7 @@ impl TargetRuntimeState {
     #[inline]
     fn close_connection(&self) {
         let count = &self.active_connections;
-        let _ = count.update_with(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let _ = count.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             if v > 0 { Some(v - 1) } else { None }
         });
     }

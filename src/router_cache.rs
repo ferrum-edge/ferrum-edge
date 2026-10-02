@@ -24,7 +24,6 @@ use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, Upstream, wildcard_matches};
 use crate::proxy::gateway_listener::{GatewayListenerAdmissionBasis, GatewayListenerIdentity};
-use crate::sync_compat::AtomicUpdate;
 
 thread_local! {
     /// Thread-local buffer for router cache key construction.
@@ -1370,7 +1369,7 @@ impl CountMinSketch {
             } else {
                 &self.row1.0[flat - width]
             };
-            let _ = cell.update_with(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
+            let _ = cell.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
         }
     }
 
@@ -1387,12 +1386,12 @@ impl CountMinSketch {
 
         // Saturating increment: cap at 255 to avoid wrap-around
         let v0 = self.row0.0[h0]
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 if v < 255 { Some(v + 1) } else { None }
             })
             .unwrap_or(255);
         let v1 = self.row1.0[h1]
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 if v < 255 { Some(v + 1) } else { None }
             })
             .unwrap_or(255);
@@ -3932,7 +3931,7 @@ fn resolve_auto_router_cache_entries(proxy_count: usize) -> usize {
 }
 
 fn subtract_cache_entries(counter: &AtomicUsize, removed: usize) {
-    let _ = counter.update_with(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
         Some(entries.saturating_sub(removed))
     });
 }
@@ -3953,7 +3952,7 @@ fn subtract_cache_entries(counter: &AtomicUsize, removed: usize) {
 /// in `insert_*_cache_entry`), so an under-count delays eviction and lets the
 /// cache overshoot its configured bound until later inserts refill the deficit.
 ///
-/// `DashMap::len()` read *inside* the `update_with` closure is a valid lower
+/// `DashMap::len()` read *inside* the `try_update` closure is a valid lower
 /// bound on the resident set at that instant (it sums shard lengths; an entry is
 /// counted iff its insert has landed, and every entry's counter `fetch_add`
 /// follows its map insert). Flooring at `len()` therefore guarantees the
@@ -3969,7 +3968,7 @@ fn reconcile_cache_entries_after_clear<V>(
     map: &DashMap<String, V>,
     removed: usize,
 ) {
-    let _ = counter.update_with(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
         Some(entries.saturating_sub(removed).max(map.len()))
     });
 }

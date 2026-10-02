@@ -76,7 +76,6 @@ pub mod secrets;
 pub mod service_discovery;
 pub mod socket_opts;
 pub mod startup;
-pub(crate) mod sync_compat;
 pub mod system_metrics;
 pub mod tls;
 pub mod tls_offload;
@@ -5543,13 +5542,12 @@ pub mod _test_support {
     /// standalone counter so tests can prove a drift larger than the current
     /// total saturates at `0` instead of wrapping to `usize::MAX`.
     pub fn response_caching_sub_total_size(total: &std::sync::atomic::AtomicUsize, n: usize) {
-        use crate::sync_compat::AtomicUpdate;
         use std::sync::atomic::Ordering;
 
         if n == 0 {
             return;
         }
-        let _ = total.update_with(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let _ = total.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(n))
         });
     }
