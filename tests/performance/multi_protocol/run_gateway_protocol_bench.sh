@@ -1165,6 +1165,7 @@ run_bench() {
         mkdir -p "$OUTPUT_DIR/perf"
         (
             sleep "$window"
+            sudo "$perf_bin" stat -a -e cpu-clock,context-switches -o "$OUTPUT_DIR/perf/${gateway}_${payload}_systemwide_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_recvfrom,syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg,syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_sendto,syscalls:sys_enter_sendmsg,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_futex,syscalls:sys_enter_sched_yield,cpu-migrations -p "$gpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             local bpid cpid
@@ -1176,7 +1177,7 @@ run_bench() {
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_clientproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             # Read/write size histograms per process (experiment): how many
             # syscalls and bytes per syscall each side of the gateway sees.
-            if command -v bpftrace >/dev/null 2>&1 && [ -n "$bpid" ] && [ -n "$cpid" ]; then
+            if [ -z "${PERF_STAT_ONLY:-}" ] && command -v bpftrace >/dev/null 2>&1 && [ -n "$bpid" ] && [ -n "$cpid" ]; then
                 local bt=""
                 local role rpid
                 for role in gw:$gpid backend:$bpid client:$cpid; do
@@ -1193,7 +1194,7 @@ run_bench() {
                 printf '%s' "$bt" > "/tmp/bt_${gateway}_${payload}.bt"
                 sudo bpftrace "/tmp/bt_${gateway}_${payload}.bt" > "$OUTPUT_DIR/perf/${gateway}_${payload}_iosizes.txt" 2>&1 &
             fi
-            if [ "$gateway" = ferrum ]; then
+            if [ -z "${PERF_STAT_ONLY:-}" ] && [ "$gateway" = ferrum ]; then
                 # On-CPU call graphs (the experiment image is built with frame
                 # pointers) plus an off-CPU view: every context switch-out of a
                 # gateway thread with the user stack it blocked in.

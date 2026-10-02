@@ -278,6 +278,7 @@ jobs:
           ITERATIONS: ${{ inputs.iterations }}
           FERRUM_IMAGE: ferrum-edge:bench
           PERF_PROFILE: "1"
+          PERF_STAT_ONLY: "1"
         run: |
           mkdir -p results/${{ matrix.protocol }}
           for run in $(seq 1 "$ITERATIONS"); do
