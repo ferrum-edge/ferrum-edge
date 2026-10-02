@@ -187,6 +187,17 @@ Gateway coverage, run with `--ignored`:
 - the source guards in `tests/unit/gateway_core/stream_auth_lifetime_tests.rs`
   and `tests/unit/gateway_core/proxy_tests.rs`.
 
+## Filing upstream
+
+Before proposing this to hyper:
+
+- Rewrite the `let ... else` in `WriteTimeout::poll_stalled`
+  (`src/proto/h2/mod.rs`) as a `match`. `let`-`else` needs Rust 1.65, and hyper
+  declares `rust-version = "1.63"`. Ferrum's toolchain is far newer, so the
+  vendored copy is unaffected.
+- Drop the Ferrum-specific `REARMS` test counter, or replace it with a check
+  that does not need crate-level test state.
+
 ## Retirement
 
 Retire when hyper offers an equivalent per-request bound on HTTP/2 body write

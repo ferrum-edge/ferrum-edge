@@ -59112,6 +59112,7 @@ async fn proxy_to_backend_http2(
             DirectH2UploadGate::BackendWriteTimeout => {
                 warn!(
                     proxy_id = %proxy.id,
+                    write_bound = "upload_pump",
                     "HTTP/2: backend response arrived before the upload finished, then the backend stopped reading the request body ({}ms)",
                     proxy.backend_write_timeout_ms
                 );

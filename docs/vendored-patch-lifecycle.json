@@ -845,7 +845,7 @@
       },
       "regression_tests": [
         "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_body_write_timeout_tests)",
-        "tests/functional/scripted_backend_h2_tests.rs (grpc_streaming_backend_write_timeout_maps_to_deadline_exceeded, h2_direct_passthrough_backend_write_timeout_maps_to_504)"
+        "tests/functional/scripted_backend_h2_tests.rs (grpc_streaming_backend_write_timeout_maps_to_deadline_exceeded, h2_direct_passthrough_backend_write_timeout_maps_to_504, grpc_streaming_zero_write_timeout_is_not_cut)"
       ]
     },
     {
