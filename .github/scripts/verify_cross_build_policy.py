@@ -4966,6 +4966,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # The cold AddressSanitizer release compile of the ferrum-edge library is
+      # one rustc process. The byte-identical build in CI `fuzz-smoke` measured
+      # a 14.6 GiB RSS peak and about 22 GiB of RAM plus swap in use, beyond the
+      # hosted runner's 16 GiB RAM and 3 GiB swap. Without this the lane died
+      # with "The runner has received a shutdown signal" (exit 143) inside that
+      # compile on 2026-09-14, -21 and -28. Add the same bounded 12 GiB swap
+      # file `fuzz-smoke` provisions; compiler, profile, sanitizer, targets and
+      # every libFuzzer bound are unchanged.
+      - name: Extend runner swap for sanitizer compilation
+        run: |
+          set -euo pipefail
+          free -h
+          df -h /mnt
+          sudo fallocate -l 12G /mnt/ferrum-fuzz-swapfile
+          sudo chmod 600 /mnt/ferrum-fuzz-swapfile
+          sudo mkswap /mnt/ferrum-fuzz-swapfile
+          sudo swapon /mnt/ferrum-fuzz-swapfile
+          free -h
+          swapon --show
+
       - name: Install required build dependency
         run: |
           set -euo pipefail
