@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped reading was only caught by `backend_read_timeout_ms`. hyper's HTTP/2
   body pipe now enforces it there, with the same `504` /
   `X-Gateway-Error: backend_timeout` / `read_write_timeout` result as the other
-  arms.
+  arms. The bound costs this path about 1–2.5% throughput on the protocol
+  benchmark. Set the route's `backend_write_timeout_ms` to `0` to opt out.
 - The libFuzzer builds (CI `fuzz-smoke` on `main` and the scheduled Fuzz
   lane) failed to compile the vendored h2 since #5969: cargo-fuzz's
   `--cfg fuzzing` compiles h2's undocumented `fuzz_bridge` module, and as a
@@ -95,7 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `grpc_send_timeout` bounds the time between two writes. The timer runs only
   while a chunk of the upload is ready and cannot be written. The gateway no
   longer moves those uploads through its upload pump, so each frame skips a task
-  boundary and a channel. The client-visible result of a timeout is unchanged:
+  boundary and a channel. Native gRPC got 2–8% faster on the protocol
+  benchmark. The client-visible result of a timeout is unchanged:
   `grpc-status: 4` / `read_write_timeout`. Uploads with an authorization
   lifetime keep the pump.
 - **HTTP/2 and gRPC write several DATA frames per write call** (#5588). Ferrum

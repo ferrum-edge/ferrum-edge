@@ -77,6 +77,42 @@ terminal: grpc-status 4 / `read_write_timeout` for gRPC, and 504 /
 authorization lifetime keeps the pump, whose absolute deadline must release
 the client body even while the pipe is parked.
 
+## Measured effect
+
+All runs use Ferrum's protocol benchmark: 30 s per cell, 200 streams, two
+iterations, with Envoy 1.39.1 as the anchor on the same runner.
+
+- **Native gRPC** (the upload pump removed) was faster than a `main` image
+  built in the same job, in every cell of both iterations:
+  - +4.1% to +8.3% in run
+    [36974026712](https://github.com/ferrum-edge/ferrum-edge/actions/runs/36974026712)
+    (first revision);
+  - +0.4% to +5.6% in run
+    [36985819539](https://github.com/ferrum-edge/ferrum-edge/actions/runs/36985819539)
+    (the lazy timer below).
+
+  10 KiB moved from 0.93–0.99× Envoy to 0.96–1.04×.
+- **Direct-HTTP/2 passthrough** (which gains a write bound it did not have)
+  costs about 1–2.5%. In the same-image run
+  [36998884115](https://github.com/ferrum-edge/ferrum-edge/actions/runs/36998884115),
+  against an arm that attaches no timeout, the median ratios at 10 KiB / 70 KiB
+  / 512 KiB / 1 MiB / 5 MiB were −2.4 / +0.2 / −1.6 / −3.7 / −2.2%.
+  Individual iterations swung ±4–7%.
+  - About half of that comes from polling the body before waiting for
+    capacity. Keeping stock ordering measured −1.4 / +0.5 / −0.8 / −1.5 /
+    −0.6%, but it would leave a pipe parked on a fully exhausted window with
+    no chunk in hand, and so no running timer. That is exactly the stall the
+    bound exists for.
+  - A route can opt out with `backend_write_timeout_ms: 0`.
+
+The first revision armed the timer on every stall. A window-limited upload
+stalls once per WINDOW_UPDATE round trip, and that per-stall arming cost
+HTTP/2 up to about 16% in one iteration. The current timer is lazy:
+
+- A stall only records its start time.
+- The one sleep is re-armed at most once per timeout period. It can only fire
+  early, and then re-checks the real deadline.
+
 ### What the bound cannot see
 
 h2 accepts a whole chunk into its send buffer once the pipe hands it over, and
