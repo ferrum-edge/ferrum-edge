@@ -195,4 +195,17 @@ fails visibly if allocation or activation fails. The observer records whether
 this adds useful headroom, and a fresh full run must validate it. Paging may
 increase wall time; this is not a measured latency improvement. Compiler/profile/
 cache settings, AddressSanitizer, all seven targets and every libFuzzer bound
-remain unchanged. The scheduled longer discovery workflow is unchanged.
+remain unchanged.
+
+The scheduled sanitizer lane (`fuzz.yml`) builds the same AddressSanitizer
+release library with the same profile and `--codegen-units 16`, but had only
+the runner's 3 GiB swap. On 2026-10-01 the `fuzz-smoke` observer recorded a
+14.6 GiB rustc RSS peak and about 22-23 GiB of RAM plus swap in use (up to
+7.9 GiB of swap) during that compile, which a 16 GiB RAM + 3 GiB swap runner
+cannot hold. As `ferrum-edge` grew (the `src/` tree is about 10% larger than on
+2026-09-07, the last all-green week), scheduled lanes started dying inside that
+compile with the runner shutdown signal: 1/7 on 2026-09-14, 7/7 on 09-21, 3/7
+on 09-28, and 7/7 on the first `nightly-2026-09-30` dispatch. The lane now adds
+the same bounded 12 GiB `/mnt` swap file before building; the toolchain,
+profile, sanitizer, targets, matrix concurrency and every libFuzzer bound are
+unchanged.

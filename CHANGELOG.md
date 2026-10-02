@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The scheduled Fuzz sanitizer lane (`fuzz.yml`) no longer loses its hosted
+  runner ("The runner has received a shutdown signal", exit 143) while
+  compiling the AddressSanitizer build of the `ferrum-edge` library. That
+  single rustc process needs about 22 GiB of RAM plus swap (measured by the
+  byte-identical CI `fuzz-smoke` build), more than the runner's 16 GiB RAM and
+  3 GiB swap; it failed 1/7, 7/7 and 3/7 lanes on 2026-09-14, -21 and -28 as
+  the crate grew. The lane now provisions the same bounded 12 GiB swap file
+  `fuzz-smoke` already uses, mirrored in the trusted Cross build policy's
+  frozen `FUZZ_WORKFLOW`. Toolchain, profile, sanitizer, targets and every
+  libFuzzer bound are unchanged.
 - The libFuzzer builds (CI `fuzz-smoke` on `main` and the scheduled Fuzz
   lane) failed to compile the vendored h2 since #5969: cargo-fuzz's
   `--cfg fuzzing` compiles h2's undocumented `fuzz_bridge` module, and as a
