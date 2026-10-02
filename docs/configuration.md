@@ -1502,7 +1502,8 @@ proxies it has three roles:
 
 `backend_write_timeout_ms` defaults to `30000` (30 seconds) and is the
 per-direction *idle* bound on writing the request body to the backend. HTTP-family
-uploads arm it in the gateway-owned upload pump (H1/H2/reqwest and native gRPC)
+uploads arm it in the gateway-owned upload pump (H1/H2/reqwest and native gRPC;
+two HTTP/2 uploads are bounded inside hyper instead, see below)
 or on each native-H3 `send_data`/`finish` — streaming uploads through their body
 adapter, and buffered uploads (retries, body-processing policy, retry replays)
 by handing the collected buffer to the same pump in bounded slices. `0` disables
@@ -1514,7 +1515,26 @@ deadline above.
 
 The bound is on transport write *progress*, so it fires while the upload pump is
 blocked on bridge capacity — that expiry surfaces as `504` /
-`X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout`.
+`X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout` (native
+gRPC: `grpc-status: 4` / `DEADLINE_EXCEEDED`, `error_class=read_write_timeout`).
+
+Two HTTP/2 uploads with no authorization lifetime need no pump for it: the
+fully streamed native gRPC upload, and the direct-HTTP/2 upload with no
+request-size limit (the passthrough arm). For those, hyper's own HTTP/2 body
+pipe enforces the bound (vendored hyper patch 004,
+[`docs/upstream-hyper-patches/004-h2-body-write-timeout/`](upstream-hyper-patches/004-h2-body-write-timeout/README.md)),
+the way nginx's `grpc_send_timeout` bounds "two successive write operations".
+The timer runs only while the pipe holds a chunk of the upload that it cannot
+yet hand to the HTTP/2 stream — the stream or connection flow-control window
+is exhausted, or the stream's send buffer is full — and every chunk handed over
+re-arms it. Time spent waiting for the client to send more is never counted.
+When it fires, the stream is reset with `RST_STREAM(CANCEL)` and the request
+ends with the same terminal as above. One chunk already handed to the stream
+(at most one inbound client DATA frame) is buffered inside h2 and is not
+observable, which matches what the pump observes from its side of the pipe.
+An upload with an authorization lifetime keeps the gateway-owned pump, whose
+absolute deadline must release the client body even while hyper's pipe is
+parked on flow control.
 
 Write progress includes the **post-end-of-stream drain of the local send queue**
 (issue [#4411](https://github.com/ferrum-edge/ferrum-edge/issues/4411)). Once the

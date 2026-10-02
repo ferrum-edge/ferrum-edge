@@ -4306,6 +4306,150 @@ async fn h2_reqwest_kernel_absorb_write_timeout_maps_to_504() {
     );
 }
 
+// #5588: the fully streamed native-gRPC upload with no authorization lifetime
+// is bounded by hyper's HTTP/2 pipe (vendored hyper patch 004) instead of the
+// gateway upload pump. A backend with a 1-byte window that never reads must
+// end the RPC at `backend_write_timeout_ms` with DEADLINE_EXCEEDED, well
+// before the much longer read timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_streaming_backend_write_timeout_maps_to_deadline_exceeded() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let settings = ConnectionSettings {
+        initial_window_size: Some(1),
+        initial_connection_window_size: Some(1),
+        max_concurrent_streams: Some(16),
+    };
+    let _backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+        .with_settings(settings)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::StallWindowFor(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn backend");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = grpc_file_config(
+        backend_port,
+        json!({
+            "backend_read_timeout_ms": 8_000,
+            "backend_write_timeout_ms": write_timeout_ms,
+        }),
+    );
+    let harness = spawn_grpc_harness(yaml).await;
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let started = Instant::now();
+    let response = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from(vec![b'x'; 64 * 1024]))
+        .await
+        .expect("gateway returns a gRPC response");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.grpc_status(),
+        Some(4),
+        "a backend that stops reading the upload must end the RPC with DEADLINE_EXCEEDED"
+    );
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+    let logs = harness
+        .wait_for_log_contains(
+            |logs: &str| {
+                logs.contains("gRPC backend write watermark expired before response headers")
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        logs.contains("gRPC backend write watermark expired before response headers"),
+        "expected the write-timeout warning; elapsed={elapsed:?}, logs:\n{logs}"
+    );
+}
+
+// #5588: with no request-size limit and no authorization lifetime the
+// direct-H2 upload takes the passthrough arm, which has no pump. hyper's
+// HTTP/2 pipe now enforces `backend_write_timeout_ms` there too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_direct_passthrough_backend_write_timeout_maps_to_504() {
+    let ca = TestCa::new("h2-passthrough-write-timeout").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let settings = ConnectionSettings {
+        initial_window_size: Some(1),
+        initial_connection_window_size: Some(1),
+        max_concurrent_streams: Some(16),
+    };
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .with_settings(settings)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::StallWindowFor(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn backend");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = http_timeout_access_log_yaml(
+        backend_port,
+        8_000,
+        write_timeout_ms,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        // No request-size limit: the direct-H2 upload takes the passthrough arm.
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .pool_warmup_enabled(true)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(format!("{}/api/twrite", harness.proxy_base_url()))
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; H2_UPLOAD_STALL_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "direct-H2 passthrough write timeout must be 504, got {status} body={body}"
+    );
+    assert_eq!(gateway_error.as_deref(), Some("backend_timeout"));
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+}
+
 // #4055 direct-H2 pool: HTTPS backend with a 1-byte window that never reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

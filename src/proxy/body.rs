@@ -2641,6 +2641,42 @@ impl UploadSource {
         (source, join)
     }
 
+    /// Build the source for a fully streamed native-gRPC upload (issue #5588).
+    ///
+    /// An upload with an authorization lifetime keeps the gateway-owned pump
+    /// ([`Self::for_streaming_upload_with_deferred_write`]): its absolute
+    /// deadline must release the client body even while hyper's HTTP/2 pipe
+    /// is parked on flow control. Without one, the pump's only job would be
+    /// `backend_write_timeout_ms`, which hyper's pipe enforces itself, where
+    /// the stall happens, from a [`hyper::ext::Http2BodyWriteTimeout`] on the
+    /// backend request (vendored hyper patch 004). That keeps the client body
+    /// polled in place, with no task, channel, or cross-task hop per frame.
+    ///
+    /// Returns the source, the pump join (authorization lifetime only), and
+    /// the write timeout to attach to the backend request (otherwise).
+    pub(crate) fn for_streaming_grpc_upload(
+        incoming: Incoming,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
+    ) -> (
+        Self,
+        Option<crate::proxy::upload_pump::UploadPumpJoin>,
+        Option<hyper::ext::Http2BodyWriteTimeout>,
+    ) {
+        if auth.is_some() {
+            let (source, join) =
+                Self::for_streaming_upload_with_deferred_write(incoming, auth, write_timeout_ms);
+            return (source, join, None);
+        }
+        let write_timeout = (write_timeout_ms > 0 && !http_body::Body::is_end_stream(&incoming))
+            .then(|| {
+                hyper::ext::Http2BodyWriteTimeout::new(std::time::Duration::from_millis(
+                    write_timeout_ms,
+                ))
+            });
+        (UploadSource::Direct(incoming), None, write_timeout)
+    }
+
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,

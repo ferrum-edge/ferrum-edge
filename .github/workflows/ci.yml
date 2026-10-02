@@ -1868,6 +1868,10 @@ jobs:
           # Patch 003: an HTTP/1 read that returned a full TLS record keeps
           # reading while more is ready (issue #5588).
           cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
+          # Patch 004: an HTTP/2 request body that stops being written past
+          # its Http2BodyWriteTimeout resets the stream; a slow client never
+          # trips it (issue #5588).
+          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
           # The gateway runs hyper on the vendored h2 (h2-001), so run every
           # Ferrum hyper regression on that combination as well.
           h2_vendored='patch.crates-io.h2.path="vendor/h2-0.4.19-ferrum-patched"'

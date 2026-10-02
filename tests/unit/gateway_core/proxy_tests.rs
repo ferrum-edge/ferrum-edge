@@ -3932,6 +3932,18 @@ fn test_direct_h2_dispatch_uses_passthrough_body_when_unlimited() {
         dispatch.contains("DirectH2RequestBody::Passthrough"),
         "unlimited direct-H2 must construct DirectH2RequestBody::Passthrough"
     );
+    // The passthrough arm has no pump, so hyper's HTTP/2 pipe enforces
+    // `backend_write_timeout_ms` from a request extension (#5588), and an
+    // expiry maps to the same 504 / ReadWriteTimeout as the pump's watermark.
+    assert!(
+        dispatch
+            .contains("passthrough_write_timeout = Some(hyper::ext::Http2BodyWriteTimeout::new(")
+            && dispatch.contains("parts.extensions.insert(write_timeout.clone());")
+            && dispatch.contains(
+                "passthrough_write_timeout.is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)"
+            ),
+        "unlimited direct-H2 must bound the upload write through hyper's pipe"
+    );
     assert!(
         dispatch.contains("DirectH2RequestBody::Limited"),
         "limited / gated direct-H2 must still wrap SizeLimitedIncoming"

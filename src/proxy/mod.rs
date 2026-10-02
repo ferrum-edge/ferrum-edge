@@ -58435,6 +58435,7 @@ async fn proxy_to_backend_http2(
         needs_upload_completion_gate,
         observe_grpc.is_some(),
     );
+    let mut passthrough_write_timeout: Option<hyper::ext::Http2BodyWriteTimeout> = None;
     let (body, body_completion_rx, mut upload_pump) =
         if use_limit_adapter && needs_upload_completion_gate {
             let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
@@ -58509,6 +58510,14 @@ async fn proxy_to_backend_http2(
             // deliberately None here. Summaries wait on `latch` instead.
             let latch = Arc::new(body::DirectH2BytesLatch::new());
             *passthrough_request_bytes = Some(Arc::clone(&latch));
+            // `backend_write_timeout_ms` with no pump: hyper's HTTP/2 pipe
+            // bounds how long a ready chunk may wait to be written and resets
+            // the stream when it fires (vendored hyper patch 004, #5588).
+            if proxy.backend_write_timeout_ms > 0 && !http_body::Body::is_end_stream(&body) {
+                passthrough_write_timeout = Some(hyper::ext::Http2BodyWriteTimeout::new(
+                    Duration::from_millis(proxy.backend_write_timeout_ms),
+                ));
+            }
             (
                 body::DirectH2RequestBody::Passthrough {
                     inner: body,
@@ -58674,6 +58683,9 @@ async fn proxy_to_backend_http2(
         proxy.preserve_host_header,
     );
 
+    if let Some(write_timeout) = passthrough_write_timeout.as_ref() {
+        parts.extensions.insert(write_timeout.clone());
+    }
     let backend_req = Request::from_parts(parts, body);
 
     // Post-EOS transport-drain bound (issue #4411): publish the backend socket
@@ -58710,6 +58722,8 @@ async fn proxy_to_backend_http2(
         // would be pure hot-path waste.
         let proxy_id = proxy.id.as_str();
         let body_size_exceeded = Arc::clone(&body_size_exceeded);
+        let passthrough_write_timeout = passthrough_write_timeout.as_ref();
+        let write_timeout_ms = proxy.backend_write_timeout_ms;
         move |e: hyper::Error| {
             // A locally-generated 413 is not a wire failure: keep
             // connection_error=false so retry policy treats it as a terminal
@@ -58727,6 +58741,22 @@ async fn proxy_to_backend_http2(
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                         buffered_trailers: None,
                     },
+                    None,
+                );
+            }
+            // hyper's pipe reset the stream because the backend stopped taking
+            // the upload: the same terminal as the pump's write watermark.
+            if passthrough_write_timeout.is_some_and(hyper::ext::Http2BodyWriteTimeout::expired) {
+                warn!(
+                    proxy_id = %proxy_id,
+                    "HTTP/2: backend stopped reading the request body ({}ms write watermark) before response headers",
+                    write_timeout_ms
+                );
+                return (
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
                     None,
                 );
             }

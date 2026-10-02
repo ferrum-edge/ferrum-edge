@@ -172,7 +172,7 @@ where
 
     let (conn, ping) = if ping_config.is_enabled() {
         let pp = conn.ping_pong().expect("conn.ping_pong");
-        let (recorder, ponger) = ping::channel(pp, ping_config, timer);
+        let (recorder, ponger) = ping::channel(pp, ping_config, timer.clone());
 
         let conn: Conn<_, B> = Conn::new(ponger, conn);
         (Either::left(conn), recorder)
@@ -190,6 +190,7 @@ where
 
     Ok(ClientTask {
         ping,
+        timer,
         conn_drop_ref,
         conn_eof,
         executor: exec,
@@ -413,6 +414,8 @@ where
     body_tx: SendStream<SendBuf<B::Data>>,
     body: B,
     cb: Callback<Request<B>, Response<IncomingBody>>,
+    // FERRUM PATCH 004: the request's `Http2BodyWriteTimeout`, if any.
+    write_timeout: Option<crate::ext::Http2BodyWriteTimeout>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -423,6 +426,9 @@ where
     E: Unpin,
 {
     ping: ping::Recorder,
+    // FERRUM PATCH 004: the connection's timer, for request body write
+    // timeouts.
+    timer: Time,
     conn_drop_ref: ConnDropRef,
     conn_eof: ConnEof,
     executor: E,
@@ -528,6 +534,12 @@ where
         let send_stream = if !f.is_connect {
             if !f.eos {
                 let mut pipe = PipeToSendStream::new(f.body, f.body_tx);
+                if let Some(signal) = f.write_timeout {
+                    pipe = pipe.with_write_timeout(super::WriteTimeout::new(
+                        signal,
+                        self.timer.clone(),
+                    ));
+                }
 
                 // eagerly see if the body pipe is ready and
                 // can thus skip allocating in the executor
@@ -727,6 +739,23 @@ where
                         req.extensions_mut().insert(protocol.into_inner());
                     }
 
+                    // FERRUM PATCH 004: a body write timeout needs the
+                    // connection's timer. Without one, fail the request rather
+                    // than send a body that nothing bounds.
+                    let write_timeout = req
+                        .extensions_mut()
+                        .remove::<crate::ext::Http2BodyWriteTimeout>();
+                    if write_timeout.is_some() && matches!(self.timer, Time::Empty) {
+                        debug!("h2 body write timeout requested without a timer");
+                        cb.send(Err(TrySendError {
+                            error: crate::Error::new_body_write(
+                                "HTTP/2 body write timeout requires a timer",
+                            ),
+                            message: None,
+                        }));
+                        continue;
+                    }
+
                     let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
                         Ok(ok) => ok,
                         Err(err) => {
@@ -746,6 +775,7 @@ where
                         body_tx,
                         body,
                         cb,
+                        write_timeout,
                     };
 
                     // Check poll_ready() again.

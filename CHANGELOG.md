@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Direct HTTP/2 uploads with no request-size limit now honor
+  `backend_write_timeout_ms`** (#5588). The passthrough arm (taken when
+  `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` and the route limit are `0` and the
+  request has no authorization lifetime) had no write bound, so a backend that
+  stopped reading was only caught by `backend_read_timeout_ms`. hyper's HTTP/2
+  body pipe now enforces it there, with the same `504` /
+  `X-Gateway-Error: backend_timeout` / `read_write_timeout` result as the other
+  arms.
 - **Fragmentless managed CA references now pass backend TLS expiry admission**
   (#5957). Proxy and upstream CA fields, as well as DP gRPC and DTLS client-CA
   expiry checks, now resolve sources with their declared CA-bundle material
@@ -61,6 +69,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **HTTP/2 backend write timeouts run inside hyper instead of a gateway pump**
+  (#5588). `backend_write_timeout_ms` on the fully streamed native gRPC upload
+  (with no authorization lifetime) is now enforced by hyper's HTTP/2 body pipe
+  through a new request extension (vendored hyper patch 004), the way nginx's
+  `grpc_send_timeout` bounds the time between two writes. The timer runs only
+  while a chunk of the upload is ready and cannot be written. The gateway no
+  longer moves those uploads through its upload pump, so each frame skips a task
+  boundary and a channel. The client-visible result of a timeout is unchanged:
+  `grpc-status: 4` / `read_write_timeout`. Uploads with an authorization
+  lifetime keep the pump.
 - **HTTP/2 and gRPC write several DATA frames per write call** (#5588). Ferrum
   now carries a vendored h2 0.4.19 whose frame writer copies DATA payloads into
   its write buffer, up to about 64 KiB, instead of writing each DATA frame with
