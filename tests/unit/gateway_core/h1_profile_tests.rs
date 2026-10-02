@@ -451,6 +451,53 @@ fn h1_profile_body_boundaries_preserve_all_poll_results() {
 }
 
 #[test]
+fn h1_profile_body_input_observer_counts_only_an_h1_boundary() {
+    // The direct HTTP/1.1 pool streams a hyper body, not a reqwest stream; its
+    // input boundary must count like `ObservedStream` and forward the body's
+    // framing signals unchanged, while an HTTP/2 body (`None`) stays uncounted.
+    use ferrum_edge::h1_profile::ObservedBody;
+    use http_body::Body;
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let base = schema::BODY_BASE + schema::BODY_FIELDS;
+
+    let before = current_thread_counters();
+    let body = http_body_util::Full::new(Bytes::from_static(b"hello"));
+    let mut observed = ObservedBody::new(body, Some(1));
+    assert_eq!(observed.size_hint().exact(), Some(5));
+    assert!(!observed.is_end_stream());
+    let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut observed).poll_frame(&mut cx) else {
+        panic!("first poll must yield the DATA frame");
+    };
+    assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"hello"));
+    assert!(observed.is_end_stream());
+    assert!(matches!(
+        Pin::new(&mut observed).poll_frame(&mut cx),
+        Poll::Ready(None)
+    ));
+    let after = current_thread_counters();
+    for (offset, amount) in [(0, 2), (1, 1), (2, 5), (5, 1), (8, 1)] {
+        assert_eq!(after[base + offset] - before[base + offset], amount);
+    }
+    let direct = schema::BODY_BASE;
+    assert_eq!(after[direct + 2], before[direct + 2]);
+
+    let before = current_thread_counters();
+    let body = http_body_util::Full::new(Bytes::from_static(b"h2"));
+    let mut unobserved = ObservedBody::new(body, None);
+    assert!(matches!(
+        Pin::new(&mut unobserved).poll_frame(&mut cx),
+        Poll::Ready(Some(Ok(_)))
+    ));
+    let after = current_thread_counters();
+    for boundary in [schema::BODY_BASE, base] {
+        assert_eq!(after[boundary], before[boundary]);
+        assert_eq!(after[boundary + 2], before[boundary + 2]);
+    }
+}
+
+#[test]
 fn h1_profile_copy_sites_count_payload_copies_only() {
     use ferrum_edge::_test_support::{CoalesceProbe, CoalesceStep};
     let before = current_thread_counters();
