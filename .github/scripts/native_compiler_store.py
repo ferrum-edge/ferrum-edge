@@ -15,7 +15,7 @@ MAX_MANIFEST = 8 * 1024 * 1024
 MAX_PAYLOAD = 3 * 1024 * 1024 * 1024
 MAX_FILES = 32768
 CHUNK = 1024 * 1024
-BUILD_SPEC = "fuzz-properties-nightly-2025-07-01-locked-v1"
+BUILD_SPEC = "fuzz-properties-nightly-2026-09-30-locked-v3"
 IDENTITY_KEYS = {"snapshot_sha", "run_id", "run_attempt", "platform", "build_spec"}
 
 

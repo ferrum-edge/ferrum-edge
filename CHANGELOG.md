@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body pipe now enforces it there, with the same `504` /
   `X-Gateway-Error: backend_timeout` / `read_write_timeout` result as the other
   arms.
+- The libFuzzer builds (CI `fuzz-smoke` on `main` and the scheduled Fuzz
+  lane) failed to compile the vendored h2 since #5969: cargo-fuzz's
+  `--cfg fuzzing` compiles h2's undocumented `fuzz_bridge` module, and as a
+  path dependency h2's `#![deny(missing_docs)]` is no longer capped. The fuzz
+  workspace now enables h2's `unstable` feature, as h2's own fuzz crate does,
+  which allows that module's missing docs and only widens visibility of h2
+  internals. The compiler-store build spec moves to
+  `fuzz-properties-nightly-2026-09-30-locked-v3`.
 - **Fragmentless managed CA references now pass backend TLS expiry admission**
   (#5957). Proxy and upstream CA fields, as well as DP gRPC and DTLS client-CA
   expiry checks, now resolve sources with their declared CA-bundle material
@@ -66,6 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rust 1.99's `fetch_update` deprecation while the fuzz lanes stay on pinned
   `nightly-2025-07-01`, where `try_update` is unstable. The h2 guard observer
   uses an equivalent compare-exchange loop, with its pinned hashes refreshed.
+- Moved the fuzz lanes' pinned toolchain from `nightly-2025-07-01` (Rust 1.90)
+  to `nightly-2026-09-30` (rustc 1.101.0-nightly), where `try_update` is
+  stable (#5965). The pin changes in `fuzz/rust-toolchain.toml`, the CI
+  `fuzz-smoke` job, the scheduled Fuzz lane, the native compiler-store
+  producer, and the trusted Cross build policy's frozen copies of those
+  workflows. The compiler-store build spec is now
+  `fuzz-properties-nightly-2026-09-30-locked-v2`. On the new nightly a cold
+  property-suite compile at full parallelism ran the hosted runner out of
+  memory (exit 143), so the `fuzz-smoke` property step and the compiler-store
+  producer now cap `CARGO_BUILD_JOBS` at 2. A follow-up removes the
+  `sync_compat` shim.
 
 ### Performance
 

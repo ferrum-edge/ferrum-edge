@@ -408,17 +408,36 @@ async fn http_get_host(port: u16, path: &str, host: &str) -> (u16, String) {
         .unwrap_or_else(|e| panic!("request to port {port} host {host} failed: {e}"))
 }
 
-/// A withdrawn Gateway listener must not serve its old route. Connect refusal,
-/// an empty/closed response (status sentinel 0), and HTTP 404 are the precise
-/// closed outcomes; anything else — especially 200 — is a stale-route leak.
+/// The compiled-in body of the retired-listener fence (issue #5921).
+const RETIRED_LISTENER_BODY: &str = r#"{"error":"Misdirected Request"}"#;
+
+/// A withdrawn Gateway listener must not serve its old route, on any fresh
+/// connection made after the withdrawal was reconciled. The precise closed
+/// outcomes are:
+///
+/// - connect refusal, or an empty/closed response (status sentinel 0), once
+///   the retired accept loop has dropped its socket;
+/// - HTTP 404, while the socket is still accepting under an identity that is
+///   not (yet) retired — the config swap alone already withdrew admission;
+/// - HTTP 421 with exactly the compiled-in Misdirected body, while the socket
+///   is still accepting after reconcile retired its identity. A pure
+///   withdrawal signals the accept loop and leaves it draining rather than
+///   awaiting it, so a connection that wins that race is accepted under the
+///   retired identity and fenced before routing (issue #5921).
+///
+/// Anything else — especially 200, or a 421 carrying any other body — is a
+/// stale-route leak. Before reconcile the identity is never retired, so
+/// callers there assert the exact 404 instead of using this helper.
 async fn assert_withdrawn_listener_fail_closed(port: u16) {
     match try_http_get(port, "/api/x").await {
         Err(_) => {}
         Ok((0, _)) => {}
         Ok((404, _)) => {}
+        Ok((421, body)) if body == RETIRED_LISTENER_BODY => {}
         Ok((status, body)) => panic!(
             "a withdrawn listener must fail closed while its socket drains \
-             (HTTP 404 or transport close), got status {status} body {body:?}"
+             (HTTP 404, HTTP 421 {RETIRED_LISTENER_BODY}, or transport close), \
+             got status {status} body {body:?}"
         ),
     }
 }
@@ -588,11 +607,14 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
         );
         wait_for_listener_ports(&handles, &[listener_b_port]).await;
 
-        // Routing is withdrawn by the config swap itself. While the accept socket
-        // is still draining it answers HTTP 404 (never stale-route). Once the
-        // accept loop has observed shutdown, the kernel may complete a handshake
-        // and then close without an HTTP response (`try_http_get` status 0) or
-        // refuse the connect entirely. All three are fail-closed; 200 is not.
+        // Routing is withdrawn by the config swap itself, and the reconcile
+        // that dropped the port retired its identity but does not await the
+        // accept loop. A connection that loop still accepts is answered 421
+        // Misdirected Request by the retired-listener fence (issue #5921), or
+        // 404 if it raced ahead of that reconcile. Once the accept loop has
+        // observed shutdown, the kernel may complete a handshake and then close
+        // without an HTTP response (`try_http_get` status 0) or refuse the
+        // connect entirely. All of these are fail-closed; 200 is not.
         assert_withdrawn_listener_fail_closed(listener_a_port).await;
         assert_eq!(
             http_get(listener_b_port, "/api/x").await.1,
@@ -1497,13 +1519,19 @@ async fn withdrawn_listener_fails_closed_before_reconcile_while_sibling_serves()
     ]));
     assert!(outcome.applied(), "withdrawal must apply: {outcome:?}");
 
-    // No reconcile yet: listener A's socket still accepts.
+    // No reconcile yet: listener A's socket still accepts and its identity is
+    // not retired (only reconcile retires it), so the publication's withdrawn
+    // admission answers exactly 404.
     assert!(!routes_on(&harness.state, HOST, port_a, false));
     assert!(
         !routes_on(&harness.state, ANY_HOST, port_a, false),
         "a withdrawn listener must not fall back to port-agnostic routes"
     );
-    assert_withdrawn_listener_fail_closed(port_a).await;
+    assert_eq!(
+        http_get(port_a, "/api/x").await.0,
+        404,
+        "the withdrawn listener's still-open socket must fail closed before reconcile"
+    );
     assert_eq!(
         http_get_host(port_a, "/api/x", ANY_HOST).await.0,
         404,
@@ -1518,6 +1546,9 @@ async fn withdrawn_listener_fails_closed_before_reconcile_while_sibling_serves()
         (200, "listener-b".to_string())
     );
 
+    // Reconcile retires listener A's identity and signals its accept loop but
+    // leaves it draining, so a fresh connection may still be accepted and
+    // fenced with 421 rather than refused.
     let failures = harness.manager.reconcile().await;
     assert!(failures.is_empty(), "{failures:?}");
     assert_eq!(harness.manager.active_ports().await, vec![port_b]);

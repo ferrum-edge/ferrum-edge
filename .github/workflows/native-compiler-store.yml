@@ -50,8 +50,12 @@ jobs:
     timeout-minutes: 45
     # Match the isolated production Fuzz lane: it installs no mold linker.
     # An explicit empty RUSTFLAGS overrides root .cargo/config.toml flags.
+    # CARGO_BUILD_JOBS matches the fuzz-smoke property step: on
+    # nightly-2026-09-30 a full-parallel cold compile is killed by the hosted
+    # runner (exit 143, reproduced twice on #5971). It changes no build output.
     env:
       RUSTFLAGS: ""
+      CARGO_BUILD_JOBS: "2"
     outputs:
       archive-sha256: ${{ steps.capture.outputs.sha256 }}
       artifact-id: ${{ steps.handoff.outputs.artifact-id }}
@@ -65,7 +69,7 @@ jobs:
       - name: Install the pinned property-suite toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly-2025-07-01
+          toolchain: nightly-2026-09-30
       - name: Install the required property-suite build dependency
         run: |
           set -euo pipefail
