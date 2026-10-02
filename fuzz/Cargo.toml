@@ -15,6 +15,14 @@ ferrum-edge = { path = "..", features = ["fuzzing"] }
 # disabled macro. Activate the real vendored curl headers only in this isolated
 # fuzz dependency graph so the frozen hosted lanes remain hermetic.
 rdkafka = { version = "0.39", features = ["curl-static"] }
+# cargo-fuzz builds with `--cfg fuzzing`, which compiles h2's `fuzz_bridge`
+# module. Since the root and this workspace patch h2 to the vendored path
+# crate, Cargo no longer caps its lints, and h2's `#![deny(missing_docs)]`
+# rejects that undocumented module unless `unstable` is on (the attribute is
+# `cfg_attr(feature = "unstable", allow(missing_docs))`). h2's own fuzz crate
+# enables it the same way. `unstable` only widens visibility of h2 internals;
+# it changes no runtime behaviour.
+h2 = { version = "0.4.19", features = ["unstable"] }
 
 [dev-dependencies]
 proptest = "=1.6.0"
