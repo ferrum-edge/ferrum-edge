@@ -259,7 +259,11 @@ where
             // waiting for capacity, so the timer runs only while a chunk is
             // actually ready (a slow client is never a write stall). At most
             // one chunk is held, as when a 1-byte claim admits a whole chunk.
-            if me.body_tx.capacity() == 0 && me.write_timeout.is_none() {
+            // BENCH EXPERIMENT (not for merge).
+            static BENCH_POLL_FIRST: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var("FERRUM_BENCH_HYPER_POLL_FIRST").map_or(true, |v| v != "0")
+            });
+            if me.body_tx.capacity() == 0 && (me.write_timeout.is_none() || !*BENCH_POLL_FIRST) {
                 loop {
                     match ready!(me.body_tx.poll_capacity(cx)) {
                         Some(Ok(0)) => {}

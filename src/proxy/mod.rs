@@ -58513,7 +58513,14 @@ async fn proxy_to_backend_http2(
             // `backend_write_timeout_ms` with no pump: hyper's HTTP/2 pipe
             // bounds how long a ready chunk may wait to be written and resets
             // the stream when it fires (vendored hyper patch 004, #5588).
-            if proxy.backend_write_timeout_ms > 0 && !http_body::Body::is_end_stream(&body) {
+            // BENCH EXPERIMENT (not for merge).
+            static BENCH_PASSTHROUGH_WT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var("FERRUM_BENCH_PASSTHROUGH_WT").map_or(true, |v| v != "0")
+            });
+            if *BENCH_PASSTHROUGH_WT
+                && proxy.backend_write_timeout_ms > 0
+                && !http_body::Body::is_end_stream(&body)
+            {
                 passthrough_write_timeout = Some(hyper::ext::Http2BodyWriteTimeout::new(
                     Duration::from_millis(proxy.backend_write_timeout_ms),
                 ));
