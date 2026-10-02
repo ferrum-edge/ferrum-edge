@@ -121,7 +121,9 @@ where
         let Some(boundary) = this.boundary else {
             return Pin::new(&mut this.inner).poll_frame(cx);
         };
-        let result = in_scope(Scope::BodyInput, || Pin::new(&mut this.inner).poll_frame(cx));
+        let result = in_scope(Scope::BodyInput, || {
+            Pin::new(&mut this.inner).poll_frame(cx)
+        });
         body_poll(boundary, &result);
         result
     }
