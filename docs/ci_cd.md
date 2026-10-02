@@ -2146,7 +2146,7 @@ shapes and nothing else:
   request may neither remove nor alter it. Its surfaces, and only its surfaces,
   are then withheld from the `ci.yml` surface comparison; a top-level surface
   and every other job's surfaces are unaffected. Every command, action pin,
-  toolchain pin (`nightly-2025-07-01`), tool version (`cargo-fuzz 0.13.1`),
+  toolchain pin (`nightly-2026-09-30`), tool version (`cargo-fuzz 0.13.1`),
   target name, and libFuzzer bound (`-runs`, `-max_total_time`, `-max_len`,
   `-timeout`, `-rss_limit_mb`) is part of the contract. All automation commands
   are inline and cannot be redirected through a repository-supplied script;

@@ -15,7 +15,7 @@ cache limit and the zero-dollar spending budget remain unchanged.
 
 ## Data boundary
 
-The producer installs `nightly-2025-07-01` and the existing checksum-pinned
+The producer installs `nightly-2026-09-30` and the existing checksum-pinned
 sccache wrapper, runs `cargo test --locked` in `fuzz/`, then stops its
 compiler-cache server before snapshotting only `.cache/sccache`. Its explicit
 empty `RUSTFLAGS` matches the production Fuzz lane and clears the root Cargo
