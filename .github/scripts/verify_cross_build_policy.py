@@ -4562,6 +4562,13 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
 
       - name: Run deterministic property smoke tests
         working-directory: fuzz
+        # From nightly-2026-09-30 the cold property-suite compile exhausts the
+        # hosted runner's memory at full parallelism ("The runner has received
+        # a shutdown signal" + exit 143, reproduced twice on #5971 while the
+        # fuzz crate overlapped the ferrum-edge lib codegen). Cap jobs as the
+        # coverage shard does (#4368); output and fingerprints are unchanged.
+        env:
+          CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
 

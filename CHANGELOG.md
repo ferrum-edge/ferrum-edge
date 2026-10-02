@@ -64,7 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fuzz-smoke` job, the scheduled Fuzz lane, the native compiler-store
   producer, and the trusted Cross build policy's frozen copies of those
   workflows. The compiler-store build spec is now
-  `fuzz-properties-nightly-2026-09-30-locked-v2`. A follow-up removes the
+  `fuzz-properties-nightly-2026-09-30-locked-v2`. On the new nightly a cold
+  property-suite compile at full parallelism ran the hosted runner out of
+  memory (exit 143), so the `fuzz-smoke` property step and the compiler-store
+  producer now cap `CARGO_BUILD_JOBS` at 2. A follow-up removes the
   `sync_compat` shim.
 
 ### Performance
