@@ -4310,9 +4310,17 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
         core.contains("pump.cancel_and_join().await;"),
         "a won watermark must cancel and join the gateway-owned pump"
     );
+    let write_timeout_error = GRPC_PROXY_SOURCE
+        .split("fn grpc_backend_write_timeout_error(")
+        .nth(1)
+        .expect("shared gRPC write-timeout terminal")
+        .split("\n}\n")
+        .next()
+        .expect("bounded gRPC write-timeout terminal");
     assert!(
-        core.contains("kind: GrpcTimeoutKind::Read,")
-            && core.contains("gRPC backend request body write timeout after {}ms"),
+        core.contains("grpc_backend_write_timeout_error(")
+            && write_timeout_error.contains("kind: GrpcTimeoutKind::Read,")
+            && write_timeout_error.contains("gRPC backend request body write timeout after {}ms"),
         "the watermark must surface the typed backend-timeout family that classifies as \
          ReadWriteTimeout"
     );
