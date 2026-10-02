@@ -1,5 +1,4 @@
 use crate::fips::approved::Sha256;
-use crate::sync_compat::AtomicUpdate;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -2819,7 +2818,7 @@ impl StateCache {
         self.evict_expired();
         if self
             .active_entries
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.max_entries).then_some(active + 1)
             })
             .is_err()
@@ -2898,7 +2897,7 @@ impl StateCache {
     fn record_spent_best_effort(&self, state: &str, expires_at: Instant) {
         if self
             .active_spent
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.max_entries).then_some(active + 1)
             })
             .is_err()
@@ -3019,7 +3018,7 @@ impl StateCache {
 }
 
 fn decrement_atomic(value: &AtomicUsize) {
-    let _ = value.update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = value.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         (current > 0).then_some(current - 1)
     });
 }

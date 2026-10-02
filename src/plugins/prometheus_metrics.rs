@@ -22,7 +22,6 @@ use super::{
 use crate::ebpf::NodeAgentMetrics;
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::retry::ErrorClass;
-use crate::sync_compat::AtomicUpdate;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Authoritative closed set of top-level `prometheus_metrics` configuration keys.
@@ -543,7 +542,7 @@ impl TimestampedCounter {
     fn saturating_add(&self, value: u64, epoch: Instant) {
         let _ = self
             .value
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(value))
             });
         self.last_updated
@@ -580,7 +579,7 @@ impl TimestampedCostCounter {
     fn add_microunits(&self, value: u64) {
         let _ = self
             .microunits
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(value))
             });
     }
@@ -596,7 +595,7 @@ impl TimestampedCostCounter {
             let mut carried = false;
             let _ =
                 self.submicrounits
-                    .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                         let sum = current + submicrounits;
                         carried = sum >= AI_COST_SUBMICRO_SCALE;
                         Some(sum % AI_COST_SUBMICRO_SCALE)
@@ -764,7 +763,7 @@ fn oauth2_introspection_cache_eviction_reason_index(reason: &str) -> Option<usiz
 }
 
 fn adjust_nonnegative_metric(counter: &AtomicI64, delta: i64) {
-    let _ = counter.update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(delta).max(0))
     });
 }
@@ -1892,7 +1891,7 @@ impl MetricsRegistry {
     }
 
     pub fn record_ai_federation_circuit_closed(&self) {
-        let _ = self.ai_federation_circuits_open.update_with(
+        let _ = self.ai_federation_circuits_open.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_sub(1)),
@@ -1903,7 +1902,7 @@ impl MetricsRegistry {
     }
 
     pub fn release_ai_federation_open_circuit(&self) {
-        let _ = self.ai_federation_circuits_open.update_with(
+        let _ = self.ai_federation_circuits_open.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_sub(1)),
@@ -2652,7 +2651,7 @@ impl MetricsRegistry {
         let limit = self.mesh_series_budget_per_family.load(Ordering::Acquire);
         self.mesh_series_budgets[family.index()]
             .live
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < limit).then_some(count + 1)
             })
             .is_ok()
@@ -2662,7 +2661,7 @@ impl MetricsRegistry {
         // Removal and admission use the same DashMap shard lock, so a zero
         // count would indicate an invariant violation. Refuse to wrap the
         // live count to `usize::MAX` even under that defensive case.
-        let _ = self.mesh_series_budgets[family.index()].live.update_with(
+        let _ = self.mesh_series_budgets[family.index()].live.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |count| count.checked_sub(1),

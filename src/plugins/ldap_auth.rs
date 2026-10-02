@@ -45,7 +45,6 @@
 
 use crate::fips::approved::HmacSha256;
 use crate::fips::backend::rand::SecureRandom;
-use crate::sync_compat::AtomicUpdate;
 use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
@@ -668,7 +667,7 @@ impl LdapAuth {
     fn release_cache_slot(&self) {
         if self
             .cache_entries
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_sub(1)
             })
             .is_err()

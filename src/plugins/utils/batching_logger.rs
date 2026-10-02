@@ -1,5 +1,4 @@
 use crate::plugins::utils::log_sampling::warn_sampled;
-use crate::sync_compat::AtomicUpdate;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -1093,13 +1092,13 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
 }
 
 fn decrement_queue_depth(queue_depth: &AtomicUsize) {
-    let _ = queue_depth.update_with(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = queue_depth.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(1))
     });
 }
 
 fn decrement_outstanding_by(outstanding_count: &AtomicUsize, count: usize) {
-    let _ = outstanding_count.update_with(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = outstanding_count.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(count))
     });
 }

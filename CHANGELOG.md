@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory (exit 143), so the `fuzz-smoke` property step and the compiler-store
   producer now cap `CARGO_BUILD_JOBS` at 2. A follow-up removes the
   `sync_compat` shim.
+- Removed the crate-private `sync_compat::AtomicUpdate` shim now that every
+  toolchain the repo builds on has `Atomic*::try_update` stable (since Rust
+  1.95) (#5965). All 91 `src/` call sites call std `try_update` directly with
+  the same orderings and closures; on Rust 1.99 `fetch_update` is itself a
+  passthrough to `try_update`, so behaviour is unchanged.
 
 ### Performance
 

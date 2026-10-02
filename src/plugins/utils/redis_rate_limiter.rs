@@ -363,7 +363,6 @@
 
 use crate::dns::DnsCache;
 use crate::plugins::utils::log_sampling::warn_sampled;
-use crate::sync_compat::AtomicUpdate;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use arc_swap::ArcSwap;
 use std::fmt::Write as _;
@@ -2195,7 +2194,7 @@ pub(crate) fn shared_replay_health_counts() -> (u64, u64) {
 }
 
 fn bump_shared_replay_health(authorities_delta: i8, unavailable_delta: i8) {
-    let _ = SHARED_REPLAY_HEALTH.update_with(Ordering::AcqRel, Ordering::Acquire, |raw| {
+    let _ = SHARED_REPLAY_HEALTH.try_update(Ordering::AcqRel, Ordering::Acquire, |raw| {
         let (mut authorities, mut unavailable) = unpack_shared_replay_health(raw);
         match authorities_delta {
             1 => authorities = authorities.saturating_add(1),

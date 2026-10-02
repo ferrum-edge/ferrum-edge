@@ -65,7 +65,6 @@ use url::{Host, Url};
 
 use crate::dns::DnsCacheResolver;
 use crate::retry::classify_reqwest_error;
-use crate::sync_compat::AtomicUpdate;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
@@ -532,7 +531,7 @@ impl SpecExpose {
     fn record_failure(&self, mut failure: FetchFailure) -> FetchFailure {
         let previous = self
             .consecutive_failures
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_add(1))
             })
             .unwrap_or_else(|value| value);

@@ -22,7 +22,6 @@
 //! last-constructor-wins singleton.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
-use crate::sync_compat::AtomicUpdate;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -5859,12 +5858,12 @@ impl SpoolUsageCounters {
     fn account_add(&self, files: u64, bytes: u64) {
         let _ = self
             .files
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(files))
             });
         let _ = self
             .bytes
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(bytes))
             });
     }
@@ -5873,12 +5872,12 @@ impl SpoolUsageCounters {
         // Filesystem races (peer unlink, duplicate finalize) must never wrap.
         let _ = self
             .files
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(files))
             });
         let _ = self
             .bytes
-            .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(bytes))
             });
     }
@@ -14470,7 +14469,7 @@ impl SnapshotAtomicTotals {
         let added_calls = charge.call_count as u64;
         let previous =
             self.call_count
-                .update_with(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     current.checked_add(added_calls)
                 });
         if previous.is_err() {
@@ -14716,7 +14715,7 @@ impl SnapshotAccumulator {
     fn try_reserve_identity(&self, entry_bytes: usize) -> bool {
         if self
             .reserved_entries
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < self.max_entries).then_some(count + 1)
             })
             .is_err()
@@ -14742,7 +14741,7 @@ impl SnapshotAccumulator {
         }
         if self
             .retained_bytes
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= self.max_retained_bytes)
             })

@@ -1200,7 +1200,6 @@ mod tests {
     use crate::config::types::{
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
-    use crate::sync_compat::AtomicUpdate;
     use chrono::Utc;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
@@ -1233,11 +1232,11 @@ mod tests {
             self.attempts.fetch_add(1, Ordering::Relaxed);
             // `Bool::then` is lazy — `remaining - 1` only evaluates when
             // remaining > 0. The `.then_some(remaining - 1)` form was eager
-            // and overflowed when update_with was retried after a CAS race
+            // and overflowed when try_update was retried after a CAS race
             // observed `remaining == 0`.
             if self
                 .fail_creates_remaining
-                .update_with(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                     (remaining > 0).then(|| remaining - 1)
                 })
                 .is_ok()
@@ -1252,7 +1251,7 @@ mod tests {
             // Same lazy-vs-eager fix as `create()` above.
             if self
                 .unhealthy_checks_remaining
-                .update_with(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                     (remaining > 0).then(|| remaining - 1)
                 })
                 .is_ok()

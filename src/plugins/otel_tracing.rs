@@ -24,7 +24,6 @@
 //! - Exporter queues are count- and byte-bounded; diagnostics use redacted URLs.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
-use crate::sync_compat::AtomicUpdate;
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
@@ -1358,7 +1357,7 @@ impl BufferedTraceExporter {
             )
         })?;
         self.queued_bytes
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(bytes)
                     .filter(|next| *next <= self.buffer_max_bytes)
@@ -1948,7 +1947,7 @@ async fn trace_export_flush_loop(
 }
 
 fn decrement_queued_spans(queued_spans: &AtomicUsize, count: usize) {
-    let _ = queued_spans.update_with(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = queued_spans.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(count))
     });
 }
