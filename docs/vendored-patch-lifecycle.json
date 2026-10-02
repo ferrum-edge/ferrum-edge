@@ -818,6 +818,37 @@
       ]
     },
     {
+      "id": "hyper-004-h2-body-write-timeout",
+      "label": "hyper HTTP/2 client bounds request body write stalls",
+      "crate": "hyper",
+      "vendored_version": "1.9.0",
+      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/004-h2-body-write-timeout/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 body pipe parks in poll_capacity before it polls the request body, so a backend that stops granting flow-control window was invisible to anything in the body; Ferrum enforced backend_write_timeout_ms with a gateway-owned upload pump (a task boundary and channel per frame, about 3.5% gateway CPU at 10 KiB gRPC) and left direct-H2 passthrough unbounded. hyper::ext::Http2BodyWriteTimeout runs a timer in the pipe only while a ready chunk cannot be written and resets the stream with CANCEL when it fires (#5588).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "hyper offers an equivalent per-request bound on HTTP/2 request body write stalls, or Ferrum's HTTP/2 client moves off hyper.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_body_write_timeout_tests)",
+        "tests/functional/scripted_backend_h2_tests.rs (grpc_streaming_backend_write_timeout_maps_to_deadline_exceeded, h2_direct_passthrough_backend_write_timeout_maps_to_504)"
+      ]
+    },
+    {
       "id": "h2-001-coalesce-data-frame-writes",
       "label": "h2 writes several DATA frames per write call",
       "crate": "h2",

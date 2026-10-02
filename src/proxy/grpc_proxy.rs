@@ -4642,8 +4642,10 @@ pub async fn proxy_grpc_request_streaming(
     // write watermark remains observable while hyper is parked outside a body
     // poll. After headers, the RPC's response side can keep streaming and the
     // transport body plus `UploadPumpSource` abort guard own upload teardown.
-    let (body, upload_pump) =
-        crate::proxy::body::UploadSource::for_streaming_upload_with_deferred_write(
+    // An upload with no authorization lifetime needs no pump: hyper's HTTP/2
+    // pipe bounds the write itself (issue #5588).
+    let (body, upload_pump, body_write_timeout) =
+        crate::proxy::body::UploadSource::for_streaming_grpc_upload(
             body,
             auth,
             proxy.backend_write_timeout_ms,
@@ -4680,6 +4682,7 @@ pub async fn proxy_grpc_request_streaming(
         grpc_deadline_at,
         held_frontend_upload,
         upload_pump,
+        body_write_timeout,
     )
     .await
 }
@@ -4748,8 +4751,22 @@ pub async fn proxy_grpc_request_streaming_channel(
         grpc_deadline_at,
         held_frontend_upload,
         None,
+        None,
     )
     .await
+}
+
+/// The terminal for a backend that stopped taking the request body for
+/// `backend_write_timeout_ms`, whether the upload pump or hyper's HTTP/2 pipe
+/// detected it.
+fn grpc_backend_write_timeout_error(write_timeout_ms: u64) -> GrpcProxyError {
+    GrpcProxyError::BackendTimeout {
+        kind: GrpcTimeoutKind::Read,
+        message: format!(
+            "gRPC backend request body write timeout after {}ms",
+            write_timeout_ms
+        ),
+    }
 }
 
 /// Shared dispatch for the streaming gRPC request entry points
@@ -4775,6 +4792,7 @@ async fn proxy_grpc_streaming_dispatch(
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
     mut upload_pump: Option<crate::proxy::upload_pump::UploadPumpJoin>,
+    body_write_timeout: Option<hyper::ext::Http2BodyWriteTimeout>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     // Build headers: merge plugin/proxy headers on top of the inbound
     // request's headers, then run the gRPC-specific strip on the union.
@@ -4888,6 +4906,12 @@ async fn proxy_grpc_streaming_dispatch(
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
+    // `backend_write_timeout_ms` without a pump: hyper's HTTP/2 pipe runs it
+    // while a ready chunk cannot be written, and resets the stream when it
+    // fires (issue #5588). The clone reports whether it fired.
+    if let Some(write_timeout) = body_write_timeout.as_ref() {
+        backend_req.extensions_mut().insert(write_timeout.clone());
+    }
 
     // Authorization ownership was armed before pool acquisition, but a slow
     // connect is not backend-body write inactivity. Start the write watermark
@@ -4935,6 +4959,20 @@ async fn proxy_grpc_streaming_dispatch(
                         max_grpc_recv_size_bytes
                     ));
                 }
+                // hyper's pipe reset the stream because the backend stopped
+                // taking the upload: the same terminal as the pump's write
+                // watermark below.
+                if body_write_timeout
+                    .as_ref()
+                    .is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)
+                {
+                    warn_sampled!(
+                        watermark_ms = proxy.backend_write_timeout_ms,
+                        write_bound = "h2_pipe",
+                        "gRPC backend write watermark expired before response headers"
+                    );
+                    return grpc_backend_write_timeout_error(proxy.backend_write_timeout_ms);
+                }
                 // Streaming / channel uploads are unreplayable — keep post-wire
                 // classification even when hyper reports `is_canceled`, but still
                 // drop the stale pooled sender so the next RPC dials fresh.
@@ -4967,15 +5005,12 @@ async fn proxy_grpc_streaming_dispatch(
                 }
                 warn_sampled!(
                     watermark_ms = proxy.backend_write_timeout_ms,
+                    write_bound = "upload_pump",
                     "gRPC backend write watermark expired before response headers"
                 );
-                return Err(GrpcProxyError::BackendTimeout {
-                    kind: GrpcTimeoutKind::Read,
-                    message: format!(
-                        "gRPC backend request body write timeout after {}ms",
-                        proxy.backend_write_timeout_ms
-                    ),
-                });
+                return Err(grpc_backend_write_timeout_error(
+                    proxy.backend_write_timeout_ms,
+                ));
             }
         };
 
@@ -5445,15 +5480,12 @@ pub(crate) async fn proxy_grpc_request_core(
                 }
                 warn_sampled!(
                     watermark_ms = proxy.backend_write_timeout_ms,
+                    write_bound = "upload_pump",
                     "gRPC buffered backend write watermark expired before response headers"
                 );
-                return Err(GrpcProxyError::BackendTimeout {
-                    kind: GrpcTimeoutKind::Read,
-                    message: format!(
-                        "gRPC backend request body write timeout after {}ms",
-                        proxy.backend_write_timeout_ms
-                    ),
-                });
+                return Err(grpc_backend_write_timeout_error(
+                    proxy.backend_write_timeout_ms,
+                ));
             }
         };
 

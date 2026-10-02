@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Direct HTTP/2 uploads with no request-size limit now honor
+  `backend_write_timeout_ms`** (#5588). The passthrough arm (taken when
+  `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` and the route limit are `0` and the
+  request has no authorization lifetime) had no write bound, so a backend that
+  stopped reading was only caught by `backend_read_timeout_ms`. hyper's HTTP/2
+  body pipe now enforces it there, with the same `504` /
+  `X-Gateway-Error: backend_timeout` / `read_write_timeout` result as the other
+  arms when it fires before response headers. After headers (a backend that
+  answered and then stopped reading the upload), it resets the stream, ending
+  the response with a stream error. The bound costs this path about 1–2.5%
+  throughput on the protocol benchmark. Setting the route's
+  `backend_write_timeout_ms` to `0` opts out, but it also disables the write
+  bound for every other upload path on that route (the upload pump, HTTP/3, and
+  HTTP/1.1).
 - The default-off `bench-h1-profile` observer missed every response streamed
   by the direct HTTP/1.1 pool since it became the default (#5961); only the
   responses still dispatched through reqwest (retries, body plugins) counted.
@@ -94,6 +108,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **HTTP/2 backend write timeouts run inside hyper instead of a gateway pump**
+  (#5588). `backend_write_timeout_ms` on the fully streamed native gRPC upload
+  (with no authorization lifetime) is now enforced by hyper's HTTP/2 body pipe
+  through a new request extension (vendored hyper patch 004), the way nginx's
+  `grpc_send_timeout` bounds the time between two writes. The timer runs only
+  while a chunk of the upload is ready and cannot be written. The gateway no
+  longer moves those uploads through its upload pump, so each frame skips a task
+  boundary and a channel. Native gRPC got up to about 6% faster on the
+  protocol benchmark (+0.4–5.6% per payload size); 10 KiB went from 0.93× to
+  0.96× Envoy. A timeout before response headers ends the call as before, with
+  `grpc-status: 4` / `read_write_timeout`. After headers, the expiry resets the
+  stream, ending the response with a stream error. Uploads with an
+  authorization lifetime keep the pump.
 - **HTTP/2 and gRPC write several DATA frames per write call** (#5588). Ferrum
   now carries a vendored h2 0.4.19 whose frame writer copies DATA payloads into
   its write buffer, up to about 64 KiB, instead of writing each DATA frame with
