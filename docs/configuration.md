@@ -1529,9 +1529,33 @@ yet hand to the HTTP/2 stream — the stream or connection flow-control window
 is exhausted, or the stream's send buffer is full — and every chunk handed over
 re-arms it. Time spent waiting for the client to send more is never counted.
 When it fires, the stream is reset with `RST_STREAM(CANCEL)` and the request
-ends with the same terminal as above. One chunk already handed to the stream
-(at most one inbound client DATA frame) is buffered inside h2 and is not
-observable, which matches what the pump observes from its side of the pipe.
+ends with the same terminal as above.
+
+How an expiry surfaces depends on when it fires:
+
+- **Before response headers:** the request ends with the same terminal as
+  above.
+- **After response headers** (a full-duplex HTTP/2 exchange, or a gRPC
+  client/bidirectional stream whose backend answered and then stopped reading):
+  the reset ends the response too.
+  - The client sees the response end with a stream error, classified like any
+    other mid-response backend reset rather than as `read_write_timeout`.
+  - nginx behaves the same way when its send timeout closes the upstream.
+  - This is new behaviour for the direct-HTTP/2 passthrough arm, which had no
+    write bound. The upload pump never reset a parked stream either; it only
+    stopped reading the client.
+
+Bytes already handed to h2 are not observable. h2 accepts data into the
+stream's send buffer while the stream holds capacity, and it grants capacity
+up to the lower of the peer's window and the connection's send-buffer limit
+(hyper's client default: 1 MiB). Beyond that sit h2's write buffer (about
+64 KiB, see `docs/upstream-h2-patches/001-coalesce-data-frame-writes/`) and the
+kernel's socket buffers. Against a backend that advertises a large window and
+then stops reading, that much can be accepted before a chunk stalls and the
+timer starts. After the last chunk there is nothing left to bound, and the
+response wait is bounded by `backend_read_timeout_ms`. The pump had the same
+blind spot, because it measured how long hyper took to accept each frame.
+
 An upload with an authorization lifetime keeps the gateway-owned pump, whose
 absolute deadline must release the client body even while hyper's pipe is
 parked on flow control.

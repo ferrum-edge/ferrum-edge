@@ -177,6 +177,11 @@ pub enum H2Step {
     /// fails if no RST_STREAM arrives within `duration` and increments the
     /// backend's reset counter when one is observed.
     ExpectReset(Duration),
+    /// Read the current request body WITHOUT releasing flow-control capacity
+    /// (so a small window stays exhausted) until the client resets the
+    /// request stream, and record the reset's H2 error code. Fails if the
+    /// body ends cleanly or no reset arrives within `duration`.
+    ExpectRequestReset(Duration),
     /// Pause for `duration` without advancing the connection. Clients that
     /// exceed `backend_write_timeout_ms` while waiting for the next DATA
     /// frame will fire their watchdog here.
@@ -391,6 +396,7 @@ impl ScriptedH2BackendBuilder {
             goaways_sent: AtomicU32::new(0),
             stream_count: AtomicU32::new(0),
             stream_resets: AtomicU32::new(0),
+            request_reset_codes: StdMutex::new(Vec::new()),
             matcher_mismatches: AtomicU32::new(0),
             streams: Mutex::new(Vec::new()),
             step_errors: Mutex::new(Vec::new()),
@@ -555,6 +561,16 @@ impl ScriptedH2Backend {
         self.state.stream_resets.load(Ordering::SeqCst)
     }
 
+    /// H2 error codes of the request-stream resets seen by
+    /// `ExpectRequestReset`, in order.
+    pub fn request_reset_codes(&self) -> Vec<u32> {
+        self.state
+            .request_reset_codes
+            .lock()
+            .map(|codes| codes.clone())
+            .unwrap_or_default()
+    }
+
     /// Number of `ExpectHeaders` matchers that returned `false`. Tests using
     /// non-trivial matchers should call [`Self::assert_no_matcher_mismatches`].
     pub fn matcher_mismatches(&self) -> u32 {
@@ -688,6 +704,8 @@ struct H2State {
     goaways_sent: AtomicU32,
     stream_count: AtomicU32,
     stream_resets: AtomicU32,
+    /// H2 error codes of request-stream resets seen by `ExpectRequestReset`.
+    request_reset_codes: StdMutex<Vec<u32>>,
     matcher_mismatches: AtomicU32,
     streams: Mutex<Vec<ReceivedStream>>,
     step_errors: Mutex<Vec<String>>,
@@ -1266,6 +1284,43 @@ async fn run_script(
                         Err(_) => {
                             return Err(format!(
                                 "ExpectReset: no stream reset within {duration:?}"
+                            ));
+                        }
+                    }
+                }
+                H2Step::ExpectRequestReset(duration) => {
+                    let Some(cs) = current_stream.as_mut() else {
+                        return Err("ExpectRequestReset: no current stream".into());
+                    };
+                    let outcome = tokio::time::timeout(duration, async {
+                        loop {
+                            match cs.body.data().await {
+                                // Keep the window closed: never release.
+                                Some(Ok(_)) => continue,
+                                Some(Err(e)) => return Ok(e.reason()),
+                                None => {
+                                    return Err(
+                                        "ExpectRequestReset: request body ended without a reset"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(Some(reason))) => {
+                            if let Ok(mut codes) = state.request_reset_codes.lock() {
+                                codes.push(u32::from(reason));
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            return Err("ExpectRequestReset: stream error without a reason".into());
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            return Err(format!(
+                                "ExpectRequestReset: no request reset within {duration:?}"
                             ));
                         }
                     }

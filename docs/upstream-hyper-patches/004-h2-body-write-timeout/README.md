@@ -55,8 +55,12 @@ against hyper 1.9.0 with patches 001–003 applied.
   holds a polled chunk that it cannot yet hand to h2. That happens when the
   stream or connection window is exhausted, or when h2's send buffer is full
   (h2 assigns no capacity past it). Every chunk handed to `send_data` disarms
-  the timer. The sleep is allocated on the first stall and re-armed in place
-  afterwards. When the timer fires, the pipe sets the flag, sends
+  the timer. A stall only records its start time. The one sleep, allocated on
+  the first stall, is left alone between stalls. If it fires during a later
+  stall, the pipe creates a fresh sleep for the rest of that stall, rather
+  than relying on `Timer::reset`, which a custom `Timer` may leave as a no-op.
+  A bound too large to add to an `Instant` never fires. When the timer fires
+  for real, the pipe sets the flag, sends
   `RST_STREAM(CANCEL)` and fails the body. Dropping the pipe releases the
   request body.
 - **With a bound configured, the pipe polls the body before waiting for
@@ -115,14 +119,36 @@ HTTP/2 up to about 16% in one iteration. The current timer is lazy:
 
 ### What the bound cannot see
 
-h2 accepts a whole chunk into its send buffer once the pipe hands it over, and
-exposes no count of buffered-but-unsent bytes. A stall is therefore detected on
-the next chunk the pipe cannot hand over, so at most one chunk (one inbound
-client DATA frame) is not observed. After the last chunk there is nothing left
-to bound, and the response wait is bounded by `backend_read_timeout_ms`. The
-pump had the same limits: it measured how long hyper took to accept the
-previous frame, and its post-end-of-stream drain check needs a socket that
-multiplexed HTTP/2 connections never publish.
+h2 accepts each chunk into the stream's send buffer while the stream holds
+capacity, and it exposes no count of buffered-but-unsent bytes. It grants
+capacity up to the lower of the peer's window and the connection's send-buffer
+limit (`max_send_buf_size`, 1 MiB by default for a hyper client). Beyond that
+sit h2's write buffer (about 64 KiB with h2 patch 001) and the kernel's socket
+buffers.
+
+So against a backend that advertises a large window and then stops reading,
+that much is accepted before a chunk stalls and the timer starts. After the
+last chunk there is nothing left to bound, and the response wait is bounded by
+`backend_read_timeout_ms`.
+
+The pump had the same limits. It measured how long hyper took to accept each
+frame, and its post-end-of-stream drain check needs a socket that multiplexed
+HTTP/2 connections never publish.
+
+### After response headers
+
+The bound keeps running after the response headers arrive. An expiry then
+resets the stream, which ends the response as well. The client sees a
+mid-response stream error, classified like any other backend reset, not as
+`read_write_timeout` / grpc-status 4: those terminals apply only before
+headers. nginx's send timeout behaves the same way, since it closes the
+upstream.
+
+For the direct-HTTP/2 passthrough arm this is new: a backend that answers and
+then stops reading the upload for `backend_write_timeout_ms` is now cut. For
+native gRPC it replaces the pump. After headers, a pump whose timer fired
+stopped reading the client, but it could not make a pipe parked on flow
+control reset the stream.
 
 ## Regression tests
 
@@ -134,20 +160,30 @@ Run them with:
 cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
 ```
 
-They cover four cases:
+They cover five cases:
 
 - a backend that stops reading gets `RST_STREAM(CANCEL)`, and the flag reports
   it;
-- a slow client body never trips the bound, however long it pauses;
-- a backend that keeps opening the window, each time sooner than the bound,
-  completes a transfer that takes longer than the bound overall;
+- a slow client never trips the bound, even while the stream window is
+  exhausted, however long it pauses;
+- a backend that opens a one-chunk window sooner than the bound after every
+  chunk completes a 12-chunk upload lasting several bounds. Every chunk
+  stalls, and the test asserts that at least one early fire was re-armed
+  rather than expired;
+- a bound too large to represent never fires and never panics;
 - a request that carries the extension on a connection without a timer fails.
 
 Gateway coverage, run with `--ignored`:
 
 - `grpc_streaming_backend_write_timeout_maps_to_deadline_exceeded` and
   `h2_direct_passthrough_backend_write_timeout_maps_to_504`, in
-  `tests/functional/scripted_backend_h2_tests.rs`;
+  `tests/functional/scripted_backend_h2_tests.rs`. Both assert the
+  `write_bound="h2_pipe"` warning, which only the hyper path emits (the pump's
+  warning says `upload_pump`). Both also assert that the backend saw
+  `RST_STREAM(CANCEL)` on the request stream.
+- `grpc_streaming_zero_write_timeout_is_not_cut`: with
+  `backend_write_timeout_ms: 0`, the same stalled upload runs to the read
+  timeout.
 - the source guards in `tests/unit/gateway_core/stream_auth_lifetime_tests.rs`
   and `tests/unit/gateway_core/proxy_tests.rs`.
 
