@@ -42991,6 +42991,10 @@ async fn handle_proxy_request_inner(
                 effective_h2_read_timeout_ms,
                 state.response_coalesce_flush_ms,
             );
+            // `observe_h1_backend_input` is the `bench-h1-profile` input
+            // boundary for an HTTP/1.x backend body (the identity without the
+            // feature), as on the reqwest arm: the direct adapters count as
+            // boundary 0, the coalescer as 1, the size-limited adapter none.
             // The trailer governor moves into exactly one of the four
             // mutually-exclusive body constructors below, so every direct /
             // size-limited / coalescing variant of this arm enforces the same
@@ -43001,7 +43005,7 @@ async fn handle_proxy_request_inner(
                 coalesce_flush,
             ) {
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
-                    resp.into_body(),
+                    crate::proxy::body::observe_h1_backend_input(resp.into_body(), h1_backend, 0),
                     advertised_cl,
                     h2_read_timeout_ms,
                     None,
@@ -43033,7 +43037,7 @@ async fn handle_proxy_request_inner(
                 // would do on every data frame before the large-frame
                 // bypass kicks in at body.rs:~1184.
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
-                    resp.into_body(),
+                    crate::proxy::body::observe_h1_backend_input(resp.into_body(), h1_backend, 0),
                     advertised_cl,
                     h2_read_timeout_ms,
                     None,
@@ -43041,7 +43045,7 @@ async fn handle_proxy_request_inner(
                 )
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers_with_flush(
-                    resp.into_body(),
+                    crate::proxy::body::observe_h1_backend_input(resp.into_body(), h1_backend, 1),
                     advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,

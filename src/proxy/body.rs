@@ -6217,6 +6217,27 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers_with_flu
     wrap_h2_deadline_and_error_hold(coalescing, read_timeout_ms, total_deadline)
 }
 
+/// `bench-h1-profile` input boundary for an HTTP/1.x backend body streamed on
+/// the `StreamingH2` arm (the direct HTTP/1.1 pool, issue #5588): `0` before
+/// the direct adapter, `1` before the coalescer, mirroring the reqwest arm's
+/// [`direct_streaming_body`] / [`coalescing_body`]. HTTP/2 backend bodies
+/// (`h1_backend == false`) pass through unobserved. Without the feature this
+/// is the identity, so default builds construct exactly the same body.
+#[cfg(feature = "bench-h1-profile")]
+pub(crate) fn observe_h1_backend_input<B>(
+    body: B,
+    h1_backend: bool,
+    boundary: usize,
+) -> crate::h1_profile::ObservedBody<B> {
+    crate::h1_profile::ObservedBody::new(body, h1_backend.then_some(boundary))
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+#[inline]
+pub(crate) fn observe_h1_backend_input<B>(body: B, _h1_backend: bool, _boundary: usize) -> B {
+    body
+}
+
 /// Direct (non-coalesced) HTTP/2 streaming body wrapped in
 /// [`StripHopByHopTrailers`]. Counterpart of
 /// [`coalescing_h2_body_strip_hop_by_hop_trailers`] for the gRPC streaming

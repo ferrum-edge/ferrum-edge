@@ -19,7 +19,6 @@
 //! - **Authentication**: `Authorization` header for Bearer/Basic auth.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
-use crate::sync_compat::AtomicUpdate;
 
 use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use async_trait::async_trait;
@@ -216,7 +215,7 @@ impl LokiByteBudget {
         };
         let reserved = self
             .used_bytes
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= self.max_bytes)
             });
@@ -670,7 +669,7 @@ fn next_loki_emitter_id() -> Result<String, String> {
         "loki_logging: failed to generate the per-instance emitter label".to_string()
     })?;
     let instance_id = NEXT_LOKI_EMITTER_ID
-        .update_with(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| "loki_logging: emitter label counter exhausted".to_string())?;

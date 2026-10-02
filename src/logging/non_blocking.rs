@@ -19,7 +19,6 @@ use serde::Serialize;
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::secrets::LogRecordSource;
-use crate::sync_compat::AtomicUpdate;
 
 const FAILURE_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -191,7 +190,7 @@ impl SinkState {
 
         if self
             .outstanding_records
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < self.options.record_capacity).then_some(current + 1)
             })
             .is_err()
@@ -203,7 +202,7 @@ impl SinkState {
         let max_record_bytes = self.options.max_record_bytes;
         let byte_reserved = self
             .reserved_bytes
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(max_record_bytes)
                     .filter(|next| *next <= self.options.byte_capacity)
@@ -232,7 +231,7 @@ impl SinkState {
         // gauge even in optimized builds.
         let _ = self
             .reserved_bytes
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_sub(bytes)
             });
     }
@@ -251,7 +250,7 @@ impl SinkState {
     fn release_record_slot(&self) {
         let became_idle = self
             .outstanding_records
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_sub(1)
             })
             .is_ok_and(|previous| previous == 1);

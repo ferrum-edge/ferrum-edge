@@ -14,7 +14,6 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::plugins::utils::sink_loss::{SinkLossReason, SinkLossSlot};
-use crate::sync_compat::AtomicUpdate;
 
 /// Default process-wide retained-byte ceiling shared by every observability
 /// sink instance (256 MiB — one instance's `HARD_MAX_BUFFER_MAX_BYTES`).
@@ -99,7 +98,7 @@ impl RetainedByteCeiling {
         let max = self.max.load(Ordering::Acquire);
         match self
             .used
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|next| *next <= max)
             }) {
             Ok(previous) => {
@@ -353,7 +352,7 @@ impl GrowableProcessReservation {
         let mut released = 0usize;
         let _ = self
             .held
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 released = held.min(bytes);
                 Some(held - released)
             });
@@ -527,7 +526,7 @@ impl ByteBudget {
         };
         let reserved = self
             .used_bytes
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= self.max_bytes)
             });

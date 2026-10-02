@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X-Gateway-Error: backend_timeout` / `read_write_timeout` result as the other
   arms. The bound costs this path about 1–2.5% throughput on the protocol
   benchmark. Set the route's `backend_write_timeout_ms` to `0` to opt out.
+- The default-off `bench-h1-profile` observer missed every response streamed
+  by the direct HTTP/1.1 pool since it became the default (#5961); only the
+  responses still dispatched through reqwest (retries, body plugins) counted.
+  Its two input boundaries wrapped only reqwest byte streams, and direct-pool
+  responses stream a hyper body on the `StreamingH2` arm. That arm now applies
+  the same boundaries to HTTP/1.x backend bodies (direct adapters as `direct`,
+  the coalescer as `coalesced`), which restores the H1 Internal Profile
+  cadence lane's branch evidence. The exported metric names are unchanged; see
+  `docs/h1_internal_profile.md`. Builds without the feature are unaffected.
 - The libFuzzer builds (CI `fuzz-smoke` on `main` and the scheduled Fuzz
   lane) failed to compile the vendored h2 since #5969: cargo-fuzz's
   `--cfg fuzzing` compiles h2's undocumented `fuzz_bridge` module, and as a
@@ -86,6 +95,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory (exit 143), so the `fuzz-smoke` property step and the compiler-store
   producer now cap `CARGO_BUILD_JOBS` at 2. A follow-up removes the
   `sync_compat` shim.
+- Removed the crate-private `sync_compat::AtomicUpdate` shim now that every
+  toolchain that builds this crate has `Atomic*::try_update` stable (since
+  Rust 1.95) (#5965). All 91 `src/` call sites call std `try_update` directly
+  with the same orderings and closures; since Rust 1.95 std's `fetch_update`
+  is itself a passthrough to `try_update`, so behaviour is unchanged.
 
 ### Performance
 
