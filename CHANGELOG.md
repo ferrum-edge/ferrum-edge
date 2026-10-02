@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The default-off `bench-h1-profile` observer counted no HTTP/1.1 backend
-  response input since the direct HTTP/1.1 pool became the default (#5961):
-  its two input boundaries wrapped only reqwest byte streams, and direct-pool
+- The default-off `bench-h1-profile` observer missed every response streamed
+  by the direct HTTP/1.1 pool since it became the default (#5961); only the
+  responses still dispatched through reqwest (retries, body plugins) counted.
+  Its two input boundaries wrapped only reqwest byte streams, and direct-pool
   responses stream a hyper body on the `StreamingH2` arm. That arm now applies
   the same boundaries to HTTP/1.x backend bodies (direct adapters as `direct`,
   the coalescer as `coalesced`), which restores the H1 Internal Profile

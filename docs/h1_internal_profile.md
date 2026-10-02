@@ -526,8 +526,9 @@ from selecting another path. Size limiting and latency tracking are disabled.
 The fixture uses one gateway runtime worker so the existing metrics publication
 seam exposes positive direct/coalesced input evidence after completion; the
 opposite branch must stay unused. These requests take the default direct
-HTTP/1.1 pool, so the evidence comes from its `StreamingH2` input boundary. This proves branch selection, not complete
-profile accounting or coverage of multithreaded scheduling. Observer-off uses
+HTTP/1.1 pool, so the evidence comes from its `StreamingH2` input boundary.
+This proves branch selection, not complete profile accounting or coverage of
+multithreaded scheduling. Observer-off uses
 the same pinned source/config and direct/coalescing selection predicates.
 
 The policy case exercises `inspected_streaming_body`, which intentionally
