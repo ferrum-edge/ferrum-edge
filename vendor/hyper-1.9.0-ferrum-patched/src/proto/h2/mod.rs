@@ -106,8 +106,11 @@ pin_project! {
 /// records when it started. The one sleep, allocated on the first stall, is
 /// left alone between stalls: its deadline was set from an earlier stall, so
 /// it can only fire early, never late. When it fires, the real deadline is
-/// checked and the sleep re-armed once if the current stall started later.
-/// That is at most one timer-driver update per timeout period.
+/// checked and, if the current stall started later, a fresh sleep is created
+/// for the remainder. That is at most one timer-driver update per timeout
+/// period. A fresh sleep, rather than `Timer::reset`, keeps this correct with
+/// any `Timer`: a `reset` that silently does nothing would leave an elapsed
+/// sleep `Ready` forever.
 pub(crate) struct WriteTimeout {
     signal: crate::ext::Http2BodyWriteTimeout,
     timer: crate::common::time::Time,
@@ -134,21 +137,29 @@ impl WriteTimeout {
     fn poll_stalled(&mut self, cx: &mut Context<'_>) -> bool {
         let timeout = self.signal.timeout();
         let since = *self.stalled_since.get_or_insert_with(|| self.timer.now());
-        let deadline = since + timeout;
+        // A bound too large to represent never fires.
+        let Some(deadline) = since.checked_add(timeout) else {
+            return false;
+        };
         let sleep = self
             .sleep
             .get_or_insert_with(|| self.timer.sleep(timeout));
-        loop {
-            if sleep.as_mut().poll(cx).is_pending() {
-                return false;
-            }
-            if self.timer.now() >= deadline {
-                return true;
-            }
-            // Fired for an earlier stall: re-arm for this one and poll again
-            // so the waker is registered.
-            self.timer.reset(sleep, deadline);
+        if sleep.as_mut().poll(cx).is_pending() {
+            return false;
         }
+        let now = self.timer.now();
+        if now >= deadline {
+            return true;
+        }
+        // Fired for an earlier stall: sleep for the rest of this one. A fresh
+        // sleep of a positive duration is pending; polling it registers the
+        // waker. (A timer that reports it ready anyway is not trusted to
+        // expire the stall: only the deadline above does that.)
+        #[cfg(all(test, feature = "client"))]
+        ferrum_body_write_timeout_tests::REARMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *sleep = self.timer.sleep(deadline - now);
+        let _ = sleep.as_mut().poll(cx);
+        false
     }
 
     /// A chunk was handed to h2: the stall, if any, is over.
@@ -613,26 +624,56 @@ mod ferrum_body_write_timeout_tests {
         assert!(started.elapsed() >= TIMEOUT);
     }
 
+    /// The early fires that `poll_stalled` re-arms. Every pipe in this module
+    /// shares it, so tests compare deltas.
+    pub(super) static REARMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn chunks(n: usize, len: usize, fill: u8) -> http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible> {
+        let frames: Vec<Result<http_body::Frame<Bytes>, std::convert::Infallible>> = (0..n)
+            .map(|_| Ok(http_body::Frame::data(Bytes::from(vec![fill; len]))))
+            .collect();
+        StreamBody::new(futures_util::stream::iter(frames)).boxed()
+    }
+
+    /// A server whose stream window holds one chunk: every further chunk
+    /// stalls until the server releases capacity, `release_after` after it
+    /// read the previous one. Reports the bytes received.
+    async fn window_limited_server(
+        server_io: tokio::io::DuplexStream,
+        window: u32,
+        release_after: Duration,
+        done_tx: tokio::sync::oneshot::Sender<usize>,
+    ) {
+        let mut conn = h2::server::Builder::new()
+            .initial_window_size(window)
+            .handshake::<_, Bytes>(server_io)
+            .await
+            .unwrap();
+        let (req, mut respond) = conn.accept().await.unwrap().unwrap();
+        tokio::spawn(async move { while conn.accept().await.is_some() {} });
+        let mut body = req.into_body();
+        let mut received = 0;
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            received += chunk.len();
+            tokio::time::sleep(release_after).await;
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+        }
+        respond.send_response(http::Response::new(()), true).unwrap();
+        let _ = done_tx.send(received);
+    }
+
     /// Time spent waiting on the request body (a slow client) is never a
-    /// write stall, however long it lasts.
+    /// write stall, even while the stream window is exhausted: the client
+    /// fills the window and then pauses for several bounds before the
+    /// server, slower still, opens it again.
     #[tokio::test]
     async fn a_slow_client_body_never_trips_the_timeout() {
+        const CHUNK: usize = 16 * 1024;
         let (client_io, server_io) = tokio::io::duplex(1 << 20);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let mut conn = h2::server::handshake(server_io).await.unwrap();
-            let (req, mut respond) = conn.accept().await.unwrap().unwrap();
-            tokio::spawn(async move { while conn.accept().await.is_some() {} });
-            let mut body = req.into_body();
-            let mut received = 0;
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.unwrap();
-                received += chunk.len();
-                body.flow_control().release_capacity(chunk.len()).unwrap();
-            }
-            respond.send_response(http::Response::new(()), true).unwrap();
-            let _ = done_tx.send(received);
-        });
+        // The server holds the window closed for 2 bounds after each chunk.
+        tokio::spawn(window_limited_server(server_io, CHUNK as u32, TIMEOUT * 2, done_tx));
         let mut sender = client(client_io, true).await;
         let signal = Http2BodyWriteTimeout::new(TIMEOUT);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, std::convert::Infallible>>(1);
@@ -640,61 +681,79 @@ mod ferrum_body_write_timeout_tests {
         let response = sender.send_request(request(body, &signal));
         tokio::spawn(async move {
             for _ in 0..3 {
-                tx.send(Ok(http_body::Frame::data(Bytes::from(vec![b'y'; 1000]))))
+                // One chunk fills the window; the client then waits 3 bounds,
+                // longer than the server keeps the window closed, so no chunk
+                // is ever ready while capacity is missing.
+                tx.send(Ok(http_body::Frame::data(Bytes::from(vec![b'y'; CHUNK]))))
                     .await
                     .unwrap();
                 tokio::time::sleep(TIMEOUT * 3).await;
             }
         });
-        let response = tokio::time::timeout(Duration::from_secs(5), response)
+        let response = tokio::time::timeout(Duration::from_secs(10), response)
             .await
             .expect("response")
             .expect("request succeeds");
         assert_eq!(response.status(), http::StatusCode::OK);
-        assert_eq!(done_rx.await.unwrap(), 3000);
+        assert_eq!(done_rx.await.unwrap(), 3 * CHUNK);
         assert!(!signal.expired());
     }
 
     /// A backend that keeps opening the window, each time sooner than the
-    /// timeout, completes a body that takes longer than the timeout overall.
+    /// bound, completes an upload that stalls on every chunk and takes many
+    /// bounds overall. The sleep armed on the first stall fires during a later
+    /// stall and must re-arm for that stall instead of expiring it.
     #[tokio::test]
     async fn steady_progress_rearms_the_timeout() {
+        const CHUNK: usize = 16 * 1024;
+        const CHUNKS: usize = 12;
         let (client_io, server_io) = tokio::io::duplex(1 << 20);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        const LEN: usize = 256 * 1024;
-        tokio::spawn(async move {
-            let mut conn = h2::server::handshake(server_io).await.unwrap();
-            let (req, mut respond) = conn.accept().await.unwrap().unwrap();
-            tokio::spawn(async move { while conn.accept().await.is_some() {} });
-            let mut body = req.into_body();
-            let mut received = 0;
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.unwrap();
-                received += chunk.len();
-                tokio::time::sleep(TIMEOUT / 3).await;
-                body.flow_control().release_capacity(chunk.len()).unwrap();
-            }
-            respond.send_response(http::Response::new(()), true).unwrap();
-            let _ = done_tx.send(received);
-        });
+        tokio::spawn(window_limited_server(server_io, CHUNK as u32, TIMEOUT / 3, done_tx));
         let mut sender = client(client_io, true).await;
         let signal = Http2BodyWriteTimeout::new(TIMEOUT);
+        let rearms_before = REARMS.load(std::sync::atomic::Ordering::Relaxed);
         let started = Instant::now();
-        let body = Full::new(Bytes::from(vec![b'z'; LEN])).boxed();
         let response = tokio::time::timeout(
             Duration::from_secs(10),
-            sender.send_request(request(body, &signal)),
+            sender.send_request(request(chunks(CHUNKS, CHUNK, b'z'), &signal)),
         )
         .await
         .expect("response")
         .expect("request succeeds");
         assert_eq!(response.status(), http::StatusCode::OK);
-        assert_eq!(done_rx.await.unwrap(), LEN);
+        assert_eq!(done_rx.await.unwrap(), CHUNKS * CHUNK);
         assert!(!signal.expired());
         assert!(
-            started.elapsed() > TIMEOUT,
-            "the transfer must outlast one timeout for this test to mean anything"
+            started.elapsed() > TIMEOUT * 2,
+            "the upload must outlast several bounds for this test to mean anything"
         );
+        assert!(
+            REARMS.load(std::sync::atomic::Ordering::Relaxed) > rearms_before,
+            "an early fire must have been re-armed for a later stall"
+        );
+    }
+
+    /// A bound too large to represent as an instant never fires and never
+    /// panics.
+    #[tokio::test]
+    async fn an_unrepresentable_bound_never_fires() {
+        const CHUNK: usize = 16 * 1024;
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(window_limited_server(server_io, CHUNK as u32, Duration::from_millis(20), done_tx));
+        let mut sender = client(client_io, true).await;
+        let signal = Http2BodyWriteTimeout::new(Duration::MAX);
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_request(request(chunks(4, CHUNK, b'm'), &signal)),
+        )
+        .await
+        .expect("response")
+        .expect("request succeeds");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(done_rx.await.unwrap(), 4 * CHUNK);
+        assert!(!signal.expired());
     }
 
     /// Without a timer the bound cannot be enforced, so the request fails

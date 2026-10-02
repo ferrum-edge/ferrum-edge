@@ -4968,6 +4968,7 @@ async fn proxy_grpc_streaming_dispatch(
                 {
                     warn_sampled!(
                         watermark_ms = proxy.backend_write_timeout_ms,
+                        write_bound = "h2_pipe",
                         "gRPC backend write watermark expired before response headers"
                     );
                     return grpc_backend_write_timeout_error(proxy.backend_write_timeout_ms);
@@ -5004,6 +5005,7 @@ async fn proxy_grpc_streaming_dispatch(
                 }
                 warn_sampled!(
                     watermark_ms = proxy.backend_write_timeout_ms,
+                    write_bound = "upload_pump",
                     "gRPC backend write watermark expired before response headers"
                 );
                 return Err(grpc_backend_write_timeout_error(
@@ -5478,6 +5480,7 @@ pub(crate) async fn proxy_grpc_request_core(
                 }
                 warn_sampled!(
                     watermark_ms = proxy.backend_write_timeout_ms,
+                    write_bound = "upload_pump",
                     "gRPC buffered backend write watermark expired before response headers"
                 );
                 return Err(grpc_backend_write_timeout_error(

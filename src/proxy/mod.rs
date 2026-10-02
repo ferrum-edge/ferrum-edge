@@ -58753,6 +58753,7 @@ async fn proxy_to_backend_http2(
             if passthrough_write_timeout.is_some_and(hyper::ext::Http2BodyWriteTimeout::expired) {
                 warn!(
                     proxy_id = %proxy_id,
+                    write_bound = "h2_pipe",
                     "HTTP/2: backend stopped reading the request body ({}ms write watermark) before response headers",
                     write_timeout_ms
                 );
@@ -58908,6 +58909,7 @@ async fn proxy_to_backend_http2(
             }
             warn!(
                 proxy_id = %proxy.id,
+                write_bound = "upload_pump",
                 "HTTP/2: backend stopped reading the request body ({}ms write watermark) before response headers",
                 proxy.backend_write_timeout_ms
             );
