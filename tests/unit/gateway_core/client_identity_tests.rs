@@ -15,7 +15,7 @@ use ferrum_edge::util::client_identity::{
     canonical_socket_addr, parse_canonical_client_ip, parse_client_ip_literal,
 };
 use std::borrow::Cow;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn ip(value: &str) -> IpAddr {
     value.parse().expect("test IP literal")
@@ -39,6 +39,23 @@ fn mapped_and_native_ipv4_are_one_principal() {
         canonical_ip_arc(ip("::ffff:192.0.2.10")).as_ref(),
         "192.0.2.10"
     );
+}
+
+#[test]
+fn canonical_ipv4_rendering_matches_display_for_every_octet_width() {
+    // The hand-rolled IPv4 renderer must stay byte-identical to `Display`.
+    for octet in 0..=u8::MAX {
+        for addr in [
+            Ipv4Addr::new(octet, 0, 9, 10),
+            Ipv4Addr::new(99, octet, 100, 255),
+            Ipv4Addr::new(1, 10, octet, 100),
+            Ipv4Addr::new(255, 254, 0, octet),
+        ] {
+            assert_eq!(canonical_ip_string(IpAddr::V4(addr)), addr.to_string());
+            let mapped = IpAddr::V6(addr.to_ipv6_mapped());
+            assert_eq!(canonical_ip_string(mapped), addr.to_string());
+        }
+    }
 }
 
 #[test]

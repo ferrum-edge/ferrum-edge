@@ -639,9 +639,11 @@ fn strip_reserved_gateway_assertion_headers(headers: &mut http::HeaderMap) {
 /// untouched repeated sequence into one folded value.
 fn raw_header_values_match_materialized(
     headers: &http::HeaderMap,
-    name: &http::HeaderName,
+    name: &str,
     expected: &str,
 ) -> bool {
+    // A `&str` lookup normalizes the name without allocating; an invalid name
+    // finds nothing, so the caller's parse below still rejects it.
     let mut values = headers.get_all(name).iter();
     let Some(first) = values.next() else {
         return false;
@@ -652,7 +654,7 @@ fn raw_header_values_match_materialized(
     let Some(mut remaining) = expected.strip_prefix(first) else {
         return false;
     };
-    let separator = crate::plugins::repeated_request_header_separator(name.as_str());
+    let separator = crate::plugins::repeated_request_header_separator(name);
     for value in values {
         let Ok(value) = std::str::from_utf8(value.as_bytes()) else {
             return false;
@@ -749,13 +751,18 @@ pub fn merge_proxy_headers_preserving_repeated(
         headers.remove(name);
     }
 
+    // Room for the gateway-added fields (`x-forwarded-*`, `te`) up front, so
+    // the inserts below do not regrow the map one entry at a time.
+    headers.reserve(proxy_headers.len().saturating_sub(headers.len()));
     for (k, v) in proxy_headers {
+        // Most fields are unchanged: compare first, and parse (and, for a
+        // non-standard name, allocate) a `HeaderName` only to replace one.
+        if raw_header_values_match_materialized(headers, k, v) {
+            continue;
+        }
         let Ok(name) = http::HeaderName::from_bytes(k.as_bytes()) else {
             continue;
         };
-        if raw_header_values_match_materialized(headers, &name, v) {
-            continue;
-        }
         // The materialized map remains authoritative even when a plugin has
         // produced a value that cannot be represented on the wire. Remove the
         // pristine field set before parsing the replacement so invalid output

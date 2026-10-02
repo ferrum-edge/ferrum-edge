@@ -38,7 +38,7 @@
 //!   canonicalize both together, and documents that choice at the call site.
 
 use std::borrow::Cow;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 /// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its embedded IPv4
@@ -63,9 +63,33 @@ pub fn canonical_socket_addr(addr: SocketAddr) -> SocketAddr {
 }
 
 /// Render a canonical client identity. One allocation, no intermediate parse.
+///
+/// IPv4 is rendered by hand: it runs once per request, and `core::fmt`'s
+/// `Ipv4Addr` path cost about 0.5% of gateway CPU on the gRPC benchmark (issue
+/// #5588). The output is byte-identical to `Ipv4Addr`'s `Display`.
 #[inline]
 pub fn canonical_ip_string(ip: IpAddr) -> String {
-    canonical_ip(ip).to_string()
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => ipv4_string(v4),
+        v6 => v6.to_string(),
+    }
+}
+
+fn ipv4_string(ip: Ipv4Addr) -> String {
+    let mut out = String::with_capacity(15);
+    for (index, octet) in ip.octets().into_iter().enumerate() {
+        if index > 0 {
+            out.push('.');
+        }
+        if octet >= 100 {
+            out.push(char::from(b'0' + octet / 100));
+        }
+        if octet >= 10 {
+            out.push(char::from(b'0' + octet / 10 % 10));
+        }
+        out.push(char::from(b'0' + octet % 10));
+    }
+    out
 }
 
 /// Render a canonical client identity into the shared `Arc<str>` form used by
