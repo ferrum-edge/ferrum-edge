@@ -1528,8 +1528,7 @@ The timer runs only while the pipe holds a chunk of the upload that it cannot
 yet hand to the HTTP/2 stream — the stream or connection flow-control window
 is exhausted, or the stream's send buffer is full — and every chunk handed over
 re-arms it. Time spent waiting for the client to send more is never counted.
-When it fires, the stream is reset with `RST_STREAM(CANCEL)` and the request
-ends with the same terminal as above.
+When it fires, the stream is reset with `RST_STREAM(CANCEL)`.
 
 How an expiry surfaces depends on when it fires:
 

@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X-Gateway-Error: backend_timeout` / `read_write_timeout` result as the other
   arms when it fires before response headers. After headers (a backend that
   answered and then stopped reading the upload), it resets the stream, ending
-  the response with a stream error. The bound costs this path about 1–2.5%
-  throughput on the protocol benchmark. Setting the route's
+  the response with a stream error. The bound costs this path 0–3.7%
+  throughput on the protocol benchmark (median per payload size; 1 MiB was
+  the worst at −3.7%). Setting the route's
   `backend_write_timeout_ms` to `0` opts out, but it also disables the write
   bound for every other upload path on that route (the upload pump, HTTP/3, and
   HTTP/1.1).
