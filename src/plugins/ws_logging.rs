@@ -63,7 +63,6 @@ use super::{
 use crate::config::BackendEgressPolicy;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::observability_delivery::DeliveryWorkerControl;
-use crate::sync_compat::AtomicUpdate;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -413,7 +412,7 @@ impl WsByteBudget {
         };
         let reserved = self
             .used_bytes
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|next| *next <= self.max_bytes)
             });
@@ -1280,7 +1279,7 @@ async fn flush_loop(
 }
 
 fn decrement_outstanding(outstanding_count: &AtomicUsize, count: usize) {
-    let _ = outstanding_count.update_with(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    let _ = outstanding_count.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(count))
     });
 }

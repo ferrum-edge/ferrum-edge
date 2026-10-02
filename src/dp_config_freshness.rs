@@ -54,7 +54,6 @@
 //! apply always wins over every evaluation based on an older generation, and no
 //! old evaluation can re-block a recovered generation.
 
-use crate::sync_compat::AtomicUpdate;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -514,7 +513,7 @@ impl DpConfigFreshness {
         // safe against a late evaluator.
         let _ = self
             .state
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(((current >> 1) + 1) << 1)
             });
         self.wake();

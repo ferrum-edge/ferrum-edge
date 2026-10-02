@@ -1,7 +1,6 @@
 //! Shared rate-limit algorithms plus local/Redis/failover storage adapters.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
-use crate::sync_compat::AtomicUpdate;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -574,14 +573,14 @@ where
     fn release_entry_slot(&self) {
         let _ = self
             .entry_count
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             });
     }
 
     fn try_reserve_entry_slot(&self, max_entries: usize) -> bool {
         self.entry_count
-            .update_with(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < max_entries).then_some(count + 1)
             })
             .is_ok()
@@ -3865,7 +3864,7 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
 
 /// Atomically add without allowing a wrapped counter to reset enforcement.
 fn saturating_atomic_add(counter: &AtomicU64, value: u64) -> u64 {
-    match counter.update_with(Ordering::AcqRel, Ordering::Acquire, |current| {
+    match counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(value))
     }) {
         Ok(previous) => previous.saturating_add(value),

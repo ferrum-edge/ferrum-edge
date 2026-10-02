@@ -1,5 +1,4 @@
 //! TLS updates, bounded periodic publication. No shared per-event update.
-use crate::sync_compat::AtomicUpdate;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -61,7 +60,7 @@ static LOST: AtomicU64 = AtomicU64::new(0);
 
 fn lost() {
     // Exceptional loss only; no shared profiling atomic on ordinary events.
-    let _ = LOST.update_with(Ordering::Relaxed, Ordering::Relaxed, |n| {
+    let _ = LOST.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(1))
     });
 }
