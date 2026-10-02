@@ -16,9 +16,9 @@ Upstream already tracks the problem:
 
 Both were opened by a third party on 2026-05-05; the PR is open and awaiting review. The weekly lifecycle poll watches #903.
 
-#903 replaces the encoder's single `next` slot with a queue of frames written by one vectored call, adds per-stream partial-send state in `Prioritize`, and reclaims written frames in bulk (+318/−159 across five files, with merge conflicts against current h2). We carry a smaller, encoder-only patch until #903 or an equivalent ships, because:
+#903 replaces the encoder's single `next` slot with a queue of frames written by one vectored call, adds per-stream partial-send state in `Prioritize`, and reclaims written frames in bulk (+318/−159 across five files, with merge conflicts against current h2). We carry a smaller patch, confined to the encoder, until #903 or an equivalent ships, because:
 
-- it touches one file, so it is easy to review and to drop;
+- the change is in `framed_write.rs`, plus a one-line idle hook and test-only accessors in four other files, so it is easy to review and to drop;
 - it changes no stream state machinery;
 - over TLS the copy it adds is one rustls makes anyway.
 
@@ -53,6 +53,8 @@ against h2 0.4.19. The change is in `src/codec/framed_write.rs`, plus a one-line
 - When coalescing needs more room, the buffer grows once, straight to the limit, instead of doubling through several reallocations.
 - A grown buffer is kept across writes and dropped when the connection goes idle. `Streams::poll_complete`, at the point where everything staged has been flushed and nothing else is pending, calls `Codec::shrink_write_buf_if_idle`, which replaces an empty buffer larger than 16 KiB with a fresh 16 KiB one. A busy connection therefore reuses one grown buffer across writes, and an idle connection never keeps more than the initial 16 KiB. The frontend sets no HTTP/2 keepalive, so an idle connection may never write again, and shrinking on a later write would not be enough.
 
+If profiles ever show the idle shrink reallocating on a busy connection that drains between flow-control round trips, add hysteresis (shrink only after several consecutive idle polls). The A/B above shows no such cost today.
+
 Frame boundaries, frame sizes, flow control and the order of frames are unchanged; only how many frames share one write changes. The cost is one `memcpy` of each coalesced payload. Over TLS, rustls copies the payload once more anyway; over cleartext, the copy replaces a zero-copy `writev` segment.
 
 ### Behaviour difference: data staged before a local reset
@@ -80,7 +82,7 @@ Same-runner A/B of this revision against `main` (bbc3efb64) built in the same jo
 
 Earlier revisions measured HTTP/2 +5.5–16.1% (run 36923833476) and +5.3–14.6% (run 36938522623) on other runners.
 
-HBONE sanity check (cross-run, so errors and gross regressions only): `mesh-performance-baselines` with suite `hbone` ran on `main` (36938582398) and on the previous revision (36938584841). Both had zero errors and zero shape failures in all three scenarios. Gateway-to-direct throughput ratios were 7.1–8.2% and 7.9–8.4%, on different runner CPUs.
+HBONE sanity check (cross-run, so errors and gross regressions only): `mesh-performance-baselines` with suite `hbone` ran on `main` (36938582398) and on the revision before the idle-shrink change (36938584841). Both had zero errors and zero shape failures in all three scenarios. Gateway-to-direct throughput ratios were 7.1–8.2% and 7.9–8.4%, on different runner CPUs.
 
 ## Regression tests
 
