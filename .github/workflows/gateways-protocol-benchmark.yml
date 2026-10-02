@@ -265,6 +265,8 @@ jobs:
           sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y -qq linux-tools-generic
           sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
           perf --version || ls /usr/lib/linux-tools/*/perf
+          sudo apt-get install -y -qq bpftrace || true
+          bpftrace --version || true
 
       - name: Run benchmark
         if: steps.skip_check.outputs.skip != 'true'

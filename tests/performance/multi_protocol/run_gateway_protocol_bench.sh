@@ -1165,15 +1165,34 @@ run_bench() {
         mkdir -p "$OUTPUT_DIR/perf"
         (
             sleep "$window"
-            sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_futex,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_sched_yield,cpu-migrations -p "$gpid" \
+            sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_recvfrom,syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg,syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_sendto,syscalls:sys_enter_sendmsg,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_futex,syscalls:sys_enter_sched_yield,cpu-migrations -p "$gpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             local bpid cpid
             bpid=$(pgrep -x proto_backend | head -1)
             cpid=$(pgrep -x proto_bench | head -1)
-            [ -n "$bpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$bpid" \
+            [ -n "$bpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_recvfrom,syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg,syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_sendto,syscalls:sys_enter_sendmsg,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_futex -p "$bpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_backendproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
-            [ -n "$cpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$cpid" \
+            [ -n "$cpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_recvfrom,syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg,syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_sendto,syscalls:sys_enter_sendmsg,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_futex -p "$cpid" \
                 -o "$OUTPUT_DIR/perf/${gateway}_${payload}_clientproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            # Read/write size histograms per process (experiment): how many
+            # syscalls and bytes per syscall each side of the gateway sees.
+            if command -v bpftrace >/dev/null 2>&1 && [ -n "$bpid" ] && [ -n "$cpid" ]; then
+                local bt=""
+                local role rpid
+                for role in gw:$gpid backend:$bpid client:$cpid; do
+                    rpid=${role#*:}; role=${role%%:*}
+                    bt+="tracepoint:syscalls:sys_exit_read,tracepoint:syscalls:sys_exit_recvfrom,tracepoint:syscalls:sys_exit_readv,tracepoint:syscalls:sys_exit_recvmsg /pid == $rpid && args.ret > 0/ { @${role}_rd[probe] = hist(args.ret); @${role}_rd_bytes = sum(args.ret); }
+"
+                    bt+="tracepoint:syscalls:sys_exit_read,tracepoint:syscalls:sys_exit_recvfrom,tracepoint:syscalls:sys_exit_readv,tracepoint:syscalls:sys_exit_recvmsg /pid == $rpid && args.ret == -11/ { @${role}_rd_eagain = count(); }
+"
+                    bt+="tracepoint:syscalls:sys_exit_write,tracepoint:syscalls:sys_exit_writev,tracepoint:syscalls:sys_exit_sendto,tracepoint:syscalls:sys_exit_sendmsg /pid == $rpid && args.ret > 0/ { @${role}_wr[probe] = hist(args.ret); @${role}_wr_bytes = sum(args.ret); }
+"
+                done
+                bt+="interval:s:$window { exit(); }
+"
+                printf '%s' "$bt" > "/tmp/bt_${gateway}_${payload}.bt"
+                sudo bpftrace "/tmp/bt_${gateway}_${payload}.bt" > "$OUTPUT_DIR/perf/${gateway}_${payload}_iosizes.txt" 2>&1 &
+            fi
             if [ "$gateway" = ferrum ]; then
                 # On-CPU call graphs (the experiment image is built with frame
                 # pointers) plus an off-CPU view: every context switch-out of a
