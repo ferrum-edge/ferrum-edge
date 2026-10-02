@@ -79,7 +79,7 @@ Do not present these partial sums as exact process totals. Thread churn beyond
 
 The process view covers all observed Rust allocator calls, including runtime,
 administration and metrics export. Four **synchronous execution** scopes cover
-`ProxyBody::poll_kind`, the two reqwest input polls, plaintext write/flush/shutdown
+`ProxyBody::poll_kind`, the two HTTP/1.x backend input polls, plaintext write/flush/shutdown
 polls and ciphertext write/flush/shutdown polls. A closure installs/restores TLS
 on every poll, including Pending and error. A private non-Send guard never escapes
 the closure and never survives await. Nested inclusive scope counters count once
@@ -95,6 +95,7 @@ CPU time. Unscoped process traffic can be derived only from a complete snapshot.
 | --- | --- | --- |
 | `body.rs::direct_streaming_body` reqwest byte stream | input DATA/frame bytes, poll/Pending/error/EOF, disjoint size buckets | response input only; reqwest has already adapted wire framing |
 | `body.rs::coalescing_body` reqwest byte stream | same, separate counters | input before aggregation; no direct-H2/H3/upload coverage claimed |
+| `proxy/mod.rs` `StreamingH2` arm, `body.rs::observe_h1_backend_input` over an HTTP/1.x `hyper::body::Incoming` | same two boundaries: the direct adapters (cutoff 0, and the >= 512 KiB declared-length passthrough) count as `direct`, the coalescer as `coalesced` | direct HTTP/1.1 pool and Unix-socket/HBONE inner HTTP/1.1 bodies, only while `FERRUM_POOL_HTTP1_DIRECT=true`; hyper has already decoded wire framing; HTTP/2 backend bodies on that arm are not observed |
 | `body.rs::ProxyBody::poll_frame` | output DATA/non-DATA, bytes, poll/Pending/error/EOF, size buckets | shared output across protocols, not H1-only; known EOF may let Hyper skip a final poll |
 | `CoalesceBuffer::push`, Single promotion, both `extend_from_slice` calls | `first.len()` plus `data.len()` copied, after each executed call | exact explicit source copies, all coalescer users |
 | `CoalesceBuffer::push`, Merged `extend_from_slice` | appended `data.len()` copied | reserve/growth may additionally move old storage; not counted as payload copy |
@@ -102,6 +103,15 @@ CPU time. Unscoped process traffic can be derived only from a complete snapshot.
 | `handle_connection` above TCP | cleartext AsyncWrite observations | H1/h2c mixed; upgrades can outlive HTTP |
 | `handle_tls_connection`, above TLS | plaintext AsyncWrite observations, non-h2 ALPN versus ALPN h2 | non-h2 includes absent ALPN (not proof of negotiated H1); accepted bytes can still be buffered in rustls |
 | `handle_tls_connection`, below TLS before accept | ciphertext AsyncWrite observations and TLS framing | mixed ALPN/handshake/control traffic; ALPN unknown during handshake |
+
+Since #5961, HTTP/1.1 backends dispatch on the direct hyper pool by default
+(`FERRUM_POOL_HTTP1_DIRECT=true`); requests that need body plugins at dispatch
+time and retry attempts keep reqwest. The two input boundaries therefore
+observe whichever of the two dispatch paths streamed the response. Their
+exported names keep the schema-v1 `body_reqwest_{direct,coalesced}_*` spelling
+so retained artifacts and the collector stay comparable; read them as
+"HTTP/1.x backend response input", not as proof of reqwest dispatch. The
+size-limited streaming adapters remain unobserved on both paths.
 
 Size buckets are disjoint: 0, 1–1024, 1025–16384, 16385–131072,
 131073–1048576 and larger bytes. `Bytes` clones, Single ownership transfer,
@@ -515,7 +525,8 @@ An empty settings file and cleared child environment prevent inherited config
 from selecting another path. Size limiting and latency tracking are disabled.
 The fixture uses one gateway runtime worker so the existing metrics publication
 seam exposes positive direct/coalesced input evidence after completion; the
-opposite branch must stay unused. This proves branch selection, not complete
+opposite branch must stay unused. These requests take the default direct
+HTTP/1.1 pool, so the evidence comes from its `StreamingH2` input boundary. This proves branch selection, not complete
 profile accounting or coverage of multithreaded scheduling. Observer-off uses
 the same pinned source/config and direct/coalescing selection predicates.
 

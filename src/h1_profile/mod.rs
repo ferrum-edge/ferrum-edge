@@ -28,7 +28,10 @@ pub fn count(counter: usize, amount: usize) {
     store::with_local(|local| local.add(counter, amount as u64));
 }
 
-/// 0: reqwest direct input; 1: reqwest coalesced input; 2: all ProxyBody output.
+/// 0: direct (uncoalesced) HTTP/1.x backend response input; 1: coalesced
+/// HTTP/1.x backend response input; 2: all ProxyBody output. Boundaries 0 and 1
+/// cover both the reqwest dispatch and the direct HTTP/1.1 hyper pool; their
+/// exported names keep the schema-v1 `body_reqwest_*` spelling.
 pub fn body_poll<E>(boundary: usize, result: &Poll<Option<Result<Frame<Bytes>, E>>>) {
     if boundary > 2 {
         count(schema::OVERFLOW, 1);
@@ -84,6 +87,51 @@ where
         let result = in_scope(Scope::BodyInput, || Pin::new(&mut this.inner).poll_next(cx));
         body_poll(this.boundary, &result);
         result
+    }
+}
+
+/// [`ObservedStream`] for an `http_body::Body`: the HTTP/1.x backend response
+/// input of the direct hyper pool (and the Unix-socket / HBONE inner HTTP/1.1
+/// dispatch), which streams a `hyper::body::Incoming` rather than a reqwest
+/// byte stream. `None` forwards every call untouched, so HTTP/2 backend bodies
+/// sharing that arm are neither scoped nor counted.
+pub struct ObservedBody<B> {
+    inner: B,
+    boundary: Option<usize>,
+}
+
+impl<B> ObservedBody<B> {
+    pub fn new(inner: B, boundary: Option<usize>) -> Self {
+        Self { inner, boundary }
+    }
+}
+
+impl<B> http_body::Body for ObservedBody<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        let Some(boundary) = this.boundary else {
+            return Pin::new(&mut this.inner).poll_frame(cx);
+        };
+        let result = in_scope(Scope::BodyInput, || Pin::new(&mut this.inner).poll_frame(cx));
+        body_poll(boundary, &result);
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
