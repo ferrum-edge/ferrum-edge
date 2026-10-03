@@ -293,6 +293,75 @@ async fn test_accept_with_charset_passes() {
 }
 
 #[tokio::test]
+async fn test_accept_positive_quality_passes() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream; q=1.0".to_string());
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(&result);
+}
+
+#[tokio::test]
+async fn test_accept_zero_quality_rejected_406() {
+    // RFC 9110 §12.4.2: q=0 means the client explicitly does not accept the
+    // representation, so enabled SSE Accept validation must reject it.
+    for value in [
+        "text/event-stream; q=0",
+        "text/event-stream; q=0.0",
+        "text/event-stream; q=0.000",
+        "text/event-stream; Q=0",
+    ] {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_sse_ctx();
+        ctx.headers.insert("accept".to_string(), value.to_string());
+        let result = plugin.on_request_received(&mut ctx).await;
+        assert_reject(&result, 406);
+    }
+}
+
+#[tokio::test]
+async fn test_accept_invalid_or_duplicate_quality_rejected_406() {
+    for value in [
+        "text/event-stream; q=",
+        "text/event-stream; q=2",
+        "text/event-stream; q=0.0001",
+        "text/event-stream; q=1.1",
+        "text/event-stream; q=1; q=0",
+        "text/event-stream; q",
+        "text/event-stream; Q ",
+    ] {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_sse_ctx();
+        ctx.headers.insert("accept".to_string(), value.to_string());
+        let result = plugin.on_request_received(&mut ctx).await;
+        assert_reject(&result, 406);
+    }
+}
+
+#[tokio::test]
+async fn test_accept_mixed_list_with_affirmative_entry_passes() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    ctx.headers.insert(
+        "accept".to_string(),
+        "text/event-stream; q=0, application/json, text/event-stream; q=1".to_string(),
+    );
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(&result);
+}
+
+#[tokio::test]
+async fn test_accept_zero_quality_opt_out_allows_request() {
+    let plugin = make_plugin(json!({"require_accept_header": false}));
+    let mut ctx = make_sse_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream; q=0".to_string());
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(&result);
+}
+
+#[tokio::test]
 async fn test_missing_accept_header_rejected_406() {
     let plugin = make_plugin(json!({}));
     let mut ctx = RequestContext::new(
