@@ -41,6 +41,7 @@ use super::utils::jwt_verifier::{JwtVerifyParams, verify_jwt_with_jwks};
 use super::utils::log_helpers::redacted_endpoint_url_str;
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
+use super::utils::session_cookie::reject_published_session_secret;
 use super::{PluginResult, RequestContext};
 
 const CLAIM_HEADER_METADATA_PREFIX: &str = "oidc_rp.claim_header.";
@@ -1024,6 +1025,17 @@ impl OidcRelyingParty {
         let encryption_secret = required_string(session_obj, "encryption_secret", "session")?;
         let previous_secret =
             optional_string(session_obj, "encryption_secret_previous", "session")?;
+        // Reject session keys Ferrum has already published: its docs
+        // placeholder, its own example/test fixtures, the key Foundry's OIDC
+        // template shipped, and obvious placeholders. Anyone can read those, so
+        // they are not secrets. Construction fails closed, which means the
+        // shared Admin/config-load validation that builds this instance does
+        // too. Disabled configs are skipped by every caller, so a template may
+        // still be saved before the operator supplies a unique value.
+        reject_published_session_secret(&encryption_secret, "session.encryption_secret")?;
+        if let Some(previous) = previous_secret.as_deref() {
+            reject_published_session_secret(previous, "session.encryption_secret_previous")?;
+        }
         let ttl_secs = optional_u64(session_obj, "ttl_secs", DEFAULT_SESSION_TTL_SECS)?;
         let idle_ttl_secs =
             optional_u64(session_obj, "idle_ttl_secs", DEFAULT_SESSION_IDLE_TTL_SECS)?;
@@ -4874,7 +4886,7 @@ mod tests {
                 "client_auth": {"client_secret": "shhh"}
             }],
             "session": {
-                "encryption_secret": "0123456789012345678901234567890123"
+                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"
             }
         })
     }
@@ -5034,7 +5046,7 @@ mod tests {
                 "id_token_clock_skew_secs": 60
             }],
             "session": {
-                "encryption_secret": "0123456789012345678901234567890123",
+                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
                 "encryption_secret_previous": null,
                 "store": "cookie",
                 "ttl_secs": 3600,
@@ -5242,7 +5254,7 @@ mod tests {
                     "required_scopes": required_scopes
                 }],
                 "session": {
-                    "encryption_secret": "0123456789012345678901234567890123",
+                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
                     "ttl_secs": 3600,
                     "idle_ttl_secs": 1800
                 }
@@ -5267,7 +5279,7 @@ mod tests {
                     "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
                 }],
                 "session": {
-                    "encryption_secret": "0123456789012345678901234567890123",
+                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
                     "ttl_secs": 3600,
                     "idle_ttl_secs": 1800
                 }
@@ -5477,7 +5489,7 @@ mod tests {
                 "client_auth": {"method": "client_secret_basic", "client_secret": "secret"}
             }],
             "session": {
-                "encryption_secret": "0123456789012345678901234567890123"
+                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"
             }
         })
     }
@@ -5923,7 +5935,7 @@ mod tests {
                     "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
                 }],
                 "session": {
-                    "encryption_secret": "0123456789012345678901234567890123"
+                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"
                 }
             }),
             PluginHttpClient::default(),
@@ -6026,7 +6038,7 @@ mod tests {
                     "claim_headers": {"email": "X-User-Email"}
                 }],
                 "session": {
-                    "encryption_secret": "0123456789012345678901234567890123",
+                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
                     "ttl_secs": 3600,
                     "idle_ttl_secs": 1800
                 }
@@ -6340,7 +6352,7 @@ mod tests {
                         "post_logout_redirect_uri": bad,
                         "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
                     }],
-                    "session": {"encryption_secret": "0123456789012345678901234567890123"}
+                    "session": {"encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"}
                 }),
                 PluginHttpClient::default(),
             );
@@ -6368,7 +6380,7 @@ mod tests {
                     "post_logout_redirect_uri": "https://app.example.com/goodbye",
                     "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
                 }],
-                "session": {"encryption_secret": "0123456789012345678901234567890123"}
+                "session": {"encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"}
             }),
             PluginHttpClient::default(),
         );
