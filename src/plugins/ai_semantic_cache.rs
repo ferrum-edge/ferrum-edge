@@ -5125,8 +5125,7 @@ impl Plugin for AiSemanticCache {
                 &cache_key,
                 observed_generation,
                 || {},
-            )
-                && removed.embedding.is_some()
+            ) && removed.embedding.is_some()
             {
                 self.mark_vector_index_dirty();
                 self.signal_vector_index_refresh_if_due();
