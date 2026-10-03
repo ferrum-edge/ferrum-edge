@@ -2055,11 +2055,14 @@ fn index_field(value: &Value, field: &str) -> Option<usize> {
 }
 
 /// Returns `true` when an `Accept` header value (which may be a comma-separated
-/// list of media-range entries) includes `text/event-stream`. The match is
-/// exact on the media type itself: a candidate like `text/event-stream-like`
-/// is rejected, but parameters (`text/event-stream; q=1.0`) are accepted.
+/// list of media-range entries) includes `text/event-stream` with an affirmative
+/// quality. The match is exact on the media type itself: a candidate like
+/// `text/event-stream-like` is rejected, while positive parameters
+/// (`text/event-stream; q=1.0`) are accepted. An event-stream entry carrying a
+/// `q=0`, malformed, or duplicate quality parameter is not affirmative intent;
+/// another range in the list can still admit the request.
 #[inline]
-fn accept_includes_event_stream(accept: &str) -> bool {
+pub(crate) fn accept_includes_event_stream(accept: &str) -> bool {
     accept.split(',').any(|media_range| {
         let mut parts = media_range.split(';');
         if !parts.next().is_some_and(is_text_event_stream_media_type) {
