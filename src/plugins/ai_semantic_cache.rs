@@ -410,6 +410,7 @@ struct CacheEntry {
     headers: HashMap<String, String>,
     body: Bytes,
     inserted_at: Instant,
+    generation: u64,
     approx_size: usize,
     semantic_scope_key: Option<String>,
     embedding: Option<EmbeddingPoint>,
@@ -1005,6 +1006,8 @@ pub struct AiSemanticCache {
     http_client: PluginHttpClient,
     /// Local in-memory cache.
     cache: Arc<DashMap<String, CacheEntry>>,
+    /// Assigns each retained value a distinct version for conditional eviction.
+    next_entry_generation: AtomicU64,
     /// Immutable HNSW snapshot for semantic lookup.
     vector_index: Arc<ArcSwapOption<VectorSnapshot>>,
     /// First successfully admitted embedding dimension for this instance.
@@ -1258,6 +1261,7 @@ impl AiSemanticCache {
             embedding_flights: Arc::new(DashMap::with_shard_amount(shard_amount)),
             http_client,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            next_entry_generation: AtomicU64::new(1),
             vector_index: Arc::new(ArcSwapOption::empty()),
             embedding_dimension: Arc::new(OnceLock::new()),
             redis_client,
@@ -2266,6 +2270,18 @@ impl AiSemanticCache {
     /// semantic (embedded) entry was removed so callers can re-dirty the vector
     /// index. Entry byte leases release when the removed `CacheEntry` drops.
     fn run_cleanup(cache: &DashMap<String, CacheEntry>, ttl: Duration, max_entries: usize) -> bool {
+        Self::run_cleanup_with_hook(cache, ttl, max_entries, || {})
+    }
+
+    fn run_cleanup_with_hook<F>(
+        cache: &DashMap<String, CacheEntry>,
+        ttl: Duration,
+        max_entries: usize,
+        before_eviction: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
         let now = Instant::now();
         let mut removed_semantic_entry = false;
         cache.retain(|_, entry| {
@@ -2282,21 +2298,31 @@ impl AiSemanticCache {
         // sort (O(n log n)) — we only need to identify the k oldest, not
         // sort the entire cache.
         if cache.len() > max_entries {
-            let mut entries_with_time: Vec<(String, Instant)> = cache
+            let mut entries_with_version: Vec<(String, Instant, u64)> = cache
                 .iter()
-                .map(|entry| (entry.key().clone(), entry.value().inserted_at))
+                .map(|entry| {
+                    (
+                        entry.key().clone(),
+                        entry.value().inserted_at,
+                        entry.value().generation,
+                    )
+                })
                 .collect();
 
             let to_remove = cache.len().saturating_sub(max_entries);
-            if to_remove > 0 && to_remove < entries_with_time.len() {
+            if to_remove > 0 && to_remove < entries_with_version.len() {
                 // After this call, indices [0..to_remove) hold the
                 // `to_remove` oldest entries (in unspecified order among
                 // themselves), which is all we need for eviction.
-                entries_with_time.select_nth_unstable_by_key(to_remove - 1, |(_, t)| *t);
+                entries_with_version.select_nth_unstable_by_key(to_remove - 1, |(_, t, _)| *t);
             }
 
-            for (key, _) in entries_with_time.into_iter().take(to_remove) {
-                if let Some((_, removed)) = cache.remove(&key) {
+            before_eviction();
+
+            for (key, _, generation) in entries_with_version.into_iter().take(to_remove) {
+                if let Some((_, removed)) =
+                    cache.remove_if(&key, |_, entry| entry.generation == generation)
+                {
                     removed_semantic_entry |= removed.embedding.is_some();
                     // Lease releases when `removed` drops.
                 }
@@ -5348,6 +5374,7 @@ impl Plugin for AiSemanticCache {
             headers: safe_headers.clone(),
             body: Bytes::from(body.to_vec()),
             inserted_at: Instant::now(),
+            generation: self.next_entry_generation.fetch_add(1, Ordering::Relaxed),
             approx_size,
             semantic_scope_key: semantic_scope_key.clone(),
             embedding: embedding.clone(),
@@ -5745,6 +5772,7 @@ mod tests {
             body: Bytes::from_static(b"\x00\x00\x00\x00\x00\x00\x00\x00"),
             headers: HashMap::new(),
             inserted_at,
+            generation: plugin.next_entry_generation.fetch_add(1, Ordering::Relaxed),
             approx_size,
             semantic_scope_key: None,
             embedding: None,
@@ -5814,6 +5842,41 @@ mod tests {
             plugin.cache.contains_key("e"),
             "newest 'e' must be retained"
         );
+    }
+
+    #[test]
+    fn eviction_skips_entry_replaced_after_candidate_capture() {
+        let plugin = AiSemanticCache::new(
+            &json!({"ttl_seconds": 600, "max_entries": 1}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|err| panic!("test config should be valid: {err}"));
+
+        let now = Instant::now();
+        insert_synthetic(&plugin, "selected", now - Duration::from_secs(2));
+        insert_synthetic(&plugin, "other", now - Duration::from_secs(1));
+        let selected_generation = plugin
+            .cache
+            .get("selected")
+            .expect("selected entry must exist")
+            .generation;
+
+        let removed_semantic_entry = AiSemanticCache::run_cleanup_with_hook(
+            &plugin.cache,
+            plugin.ttl,
+            plugin.max_entries,
+            || insert_synthetic(&plugin, "selected", Instant::now()),
+        );
+
+        assert!(!removed_semantic_entry);
+        let selected = plugin
+            .cache
+            .get("selected")
+            .expect("fresh same-key replacement must survive");
+        assert_ne!(selected.generation, selected_generation);
+        assert!(plugin.cache.contains_key("other"));
+        assert_eq!(plugin.cache.len(), 2);
+        assert_eq!(plugin.cache_budget_used_for_tests(), 16);
     }
 
     #[test]

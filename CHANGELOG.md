@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
+  entry generation it selected. A concurrent same-key refresh survives the cleanup
+  pass instead of being removed as stale.
+
 - The scheduled Fuzz sanitizer lane (`fuzz.yml`) no longer loses its hosted
   runner ("The runner has received a shutdown signal", exit 143) while
   compiling the AddressSanitizer build of the `ferrum-edge` library. That
