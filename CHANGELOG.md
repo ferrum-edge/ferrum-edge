@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
   entry generation it selected. A concurrent same-key refresh survives the cleanup
-  pass instead of being removed as stale.
+  pass instead of being removed as stale. The expired-entry lookup path also removes
+  only the generation it observed, so a fresh same-key store survives there too.
 
 - The scheduled Fuzz sanitizer lane (`fuzz.yml`) no longer loses its hosted
   runner ("The runner has received a shutdown signal", exit 143) while

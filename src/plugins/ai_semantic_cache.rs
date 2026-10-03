@@ -2331,6 +2331,21 @@ impl AiSemanticCache {
         removed_semantic_entry
     }
 
+    fn remove_expired_entry_with_hook<F>(
+        cache: &DashMap<String, CacheEntry>,
+        key: &str,
+        observed_generation: u64,
+        after_expiry_check: F,
+    ) -> Option<CacheEntry>
+    where
+        F: FnOnce(),
+    {
+        after_expiry_check();
+        cache
+            .remove_if(key, |_, entry| entry.generation == observed_generation)
+            .map(|(_, removed)| removed)
+    }
+
     /// Synchronous cleanup used only by the external test crate's
     /// `force_cleanup_for_tests`, which wants the sweep to have completed by the
     /// time it returns (the production hot path uses [`Self::signal_cleanup_if_due`]).
@@ -5103,8 +5118,14 @@ impl Plugin for AiSemanticCache {
             }
             // Expired — remove. Lease releases when `removed` drops (including
             // when the embedding guard fails after remove succeeds).
+            let observed_generation = entry.generation;
             drop(entry);
-            if let Some((_, removed)) = self.cache.remove(&cache_key)
+            if let Some(removed) = Self::remove_expired_entry_with_hook(
+                &self.cache,
+                &cache_key,
+                observed_generation,
+                || {},
+            )
                 && removed.embedding.is_some()
             {
                 self.mark_vector_index_dirty();
@@ -5877,6 +5898,49 @@ mod tests {
         assert!(plugin.cache.contains_key("other"));
         assert_eq!(plugin.cache.len(), 2);
         assert_eq!(plugin.cache_budget_used_for_tests(), 16);
+
+        AiSemanticCache::run_cleanup(&plugin.cache, plugin.ttl, plugin.max_entries);
+
+        assert!(plugin.cache.contains_key("selected"));
+        assert!(!plugin.cache.contains_key("other"));
+        assert_eq!(plugin.cache.len(), 1);
+    }
+
+    #[test]
+    fn expired_lookup_skips_same_key_replacement_after_expiry_check() {
+        let plugin = AiSemanticCache::new(
+            &json!({"ttl_seconds": 600, "max_entries": 10}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|err| panic!("test config should be valid: {err}"));
+
+        insert_synthetic(
+            &plugin,
+            "expired",
+            Instant::now() - Duration::from_secs(601),
+        );
+        let entry = plugin
+            .cache
+            .get("expired")
+            .expect("expired entry must exist");
+        let observed_generation = entry.generation;
+        drop(entry);
+
+        let removed = AiSemanticCache::remove_expired_entry_with_hook(
+            &plugin.cache,
+            "expired",
+            observed_generation,
+            || insert_synthetic(&plugin, "expired", Instant::now()),
+        );
+
+        assert!(removed.is_none());
+        let replacement = plugin
+            .cache
+            .get("expired")
+            .expect("fresh same-key replacement must survive");
+        assert_ne!(replacement.generation, observed_generation);
+        assert!(Instant::now().duration_since(replacement.inserted_at) < plugin.ttl);
+        assert_eq!(plugin.cache.len(), 1);
     }
 
     #[test]
