@@ -36814,6 +36814,9 @@ async fn handle_proxy_request_inner(
                     grpc_should_stream,
                     effective_max_response_body_size_bytes,
                     ctx.grpc_deadline_at(),
+                    // Bounds the sender acquisition, the handoff, and the
+                    // response-header wait (GHSA-xcg4-wj3x-gjj2).
+                    grpc_buffered_upload_auth_deadline.as_ref(),
                 );
                 tokio::pin!(attempt);
                 attempt_span.scope(attempt).await
@@ -37119,6 +37122,8 @@ async fn handle_proxy_request_inner(
                                 grpc_should_stream,
                                 effective_max_response_body_size_bytes,
                                 ctx.grpc_deadline_at(),
+                                // GHSA-xcg4-wj3x-gjj2, as in the split path.
+                                grpc_buffered_upload_auth_deadline.as_ref(),
                             );
                             tokio::pin!(attempt);
                             attempt_span.scope(attempt).await
@@ -37719,6 +37724,10 @@ async fn handle_proxy_request_inner(
                         grpc_should_stream,
                         effective_max_response_body_size_bytes,
                         ctx.grpc_deadline_at(),
+                        // The SAME absolute plan as the first attempt: a retry
+                        // never re-arms the authorization lifetime
+                        // (GHSA-xcg4-wj3x-gjj2).
+                        grpc_buffered_upload_auth_deadline.as_ref(),
                     );
                     tokio::pin!(attempt);
                     attempt_span.scope(attempt).await
@@ -37790,11 +37799,16 @@ async fn handle_proxy_request_inner(
                 // here for the opposite reason: the backend answered correctly
                 // and within every configured ceiling, so a process-global
                 // memory bound must not trip its breaker (GHSA-pwcm-6rh8-f2gh).
+                //
+                // An authorization expiry before the response head is the
+                // gateway's own security decision, so it is neutral too
+                // (GHSA-xcg4-wj3x-gjj2).
                 Err(
                     GrpcProxyError::ClientDeadlineExceeded(_)
                     | GrpcProxyError::ResourceExhausted(_)
                     | GrpcProxyError::ResponseBufferCapacity(_)
-                    | GrpcProxyError::Internal(_),
+                    | GrpcProxyError::Internal(_)
+                    | GrpcProxyError::AuthorizationExpired(_),
                 ) => {
                     cb.record_neutral(cb_probe.take_slot());
                 }
@@ -39561,6 +39575,35 @@ async fn handle_proxy_request_inner(
                     )
                 }));
             }
+            // The admitted request's authorization lifetime elapsed while the
+            // sender was being acquired, at the request handoff, or while the
+            // response head was awaited (GHSA-xcg4-wj3x-gjj2). The dispatch has
+            // already latched and counted it exactly once. It is the
+            // gateway's own decision, so it trains no backend accounting: the
+            // breaker settled neutrally above, and the admission permits and
+            // least-connections guard are released without an outcome. The
+            // client gets the same fixed pre-commitment terminal as a buffered
+            // upload expiry (`grpc-status: 16`), never `DEADLINE_EXCEEDED`.
+            Err(GrpcProxyError::AuthorizationExpired(termination)) => {
+                drop(backend_admission_permits.take());
+                drop(grpc_lb_connection_guard.take());
+                let response = boxed_finalize_authorization_expired_rejection(
+                    &plugins,
+                    &mut ctx,
+                    &state,
+                    start_time,
+                    "authorization_expired_grpc_dispatch",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                    grpc_web_response_content_type,
+                    termination,
+                )
+                .await;
+                return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
+                    response,
+                    held_frontend_grpc_upload.take(),
+                ));
+            }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
                 https_to_plaintext::maybe_warn_https_to_plaintext_backend(
@@ -39642,6 +39685,10 @@ async fn handle_proxy_request_inner(
                         response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS
                     }
                     GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
+                    // Answered by its own arm above; listed for exhaustiveness.
+                    GrpcProxyError::AuthorizationExpired(_) => {
+                        grpc_proxy::grpc_status::UNAUTHENTICATED
+                    }
                 };
                 // Use a generic client-facing message to avoid leaking
                 // internal backend details (hostnames, DNS errors, etc.).

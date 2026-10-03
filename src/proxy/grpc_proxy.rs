@@ -2054,6 +2054,16 @@ pub enum GrpcProxyError {
     /// so it trips no circuit breaker and dings no passive health.
     ResponseBufferCapacity(String),
     Internal(String),
+    /// The admitted request's authorization lifetime elapsed before the backend
+    /// response head reached the gateway: while the sender was being acquired,
+    /// at the request handoff, or while the response headers were awaited
+    /// (GHSA-xcg4-wj3x-gjj2). This is the gateway's own security decision. It
+    /// has already been latched and counted exactly once for the request, it
+    /// is never retried, and it is neutral to backend health
+    /// ([`crate::retry::ErrorClass::ClientDisconnect`]). The caller answers it
+    /// with the fixed pre-commitment authorization terminal
+    /// (`grpc-status: 16`), never with `DEADLINE_EXCEEDED`.
+    AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
 }
 
 /// Failure while collecting a buffered client gRPC request before dispatch.
@@ -2155,6 +2165,7 @@ impl std::fmt::Display for GrpcProxyError {
             | Self::ResponseBufferCapacity(message)
             | Self::Internal(message) => write!(f, "{}", message),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
+            Self::AuthorizationExpired(termination) => f.write_str(termination.grpc_message()),
         }
     }
 }
@@ -2263,6 +2274,14 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
             Self::Internal(message) => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::Internal,
+                error_class,
+                None,
+            ),
+            // Raised by the dispatch, never by a pool create; mapped for
+            // exhaustiveness only.
+            Self::AuthorizationExpired(termination) => SharedPoolCreateError::new(
+                termination.grpc_message(),
+                SharedPoolCreateKind::from_error_class(error_class),
                 error_class,
                 None,
             ),
@@ -4561,6 +4580,7 @@ pub async fn proxy_grpc_request_from_bytes(
     stream_response: bool,
     max_response_body_size_bytes: usize,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     proxy_grpc_request_core(
         method,
@@ -4575,6 +4595,7 @@ pub async fn proxy_grpc_request_from_bytes(
         stream_response,
         max_response_body_size_bytes,
         grpc_deadline_at,
+        auth,
     )
     .await
 }
@@ -4683,6 +4704,7 @@ pub async fn proxy_grpc_request_streaming(
         held_frontend_upload,
         upload_pump,
         body_write_timeout,
+        auth,
     )
     .await
 }
@@ -4752,6 +4774,8 @@ pub async fn proxy_grpc_request_streaming_channel(
         held_frontend_upload,
         None,
         None,
+        // The H3 bridge's channel upload carries no authorization plan here.
+        None,
     )
     .await
 }
@@ -4765,6 +4789,259 @@ fn grpc_backend_write_timeout_error(write_timeout_ms: u64) -> GrpcProxyError {
         message: format!(
             "gRPC backend request body write timeout after {}ms",
             write_timeout_ms
+        ),
+    }
+}
+
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the client RPC deadline
+/// expired before the request was handed to the backend, during sender
+/// acquisition or at the handoff gate. Pre-wire, so it is never charged to the
+/// backend.
+const GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE: &str =
+    "gRPC deadline exceeded during backend connection acquisition";
+
+pin_project_lite::pin_project! {
+    /// A native gRPC dispatch phase held to an optional absolute bound. See
+    /// [`grpc_dispatch_bounded`].
+    pub(crate) struct GrpcDispatchBounded<F> {
+        #[pin]
+        future: F,
+        #[pin]
+        sleep: Option<tokio::time::Sleep>,
+        at: Option<tokio::time::Instant>,
+    }
+}
+
+/// Hold one pre-commitment phase of a native gRPC dispatch (the sender
+/// acquisition or the response-header wait) to an optional absolute bound
+/// (GHSA-xcg4-wj3x-gjj2). Resolves to `Err(())` when the bound ends it, after
+/// which `future` is dropped by its owner.
+///
+/// The bound is checked first. If it has already elapsed on the first poll,
+/// `future` is never polled, so once the bound has passed no sender is
+/// acquired and no request is handed to a connection. Once the timer is armed
+/// it is polled before `future`, so an exact-deadline tie goes to the bound.
+/// Unlike [`crate::plugins::await_deadline_first`], `future` is polled once
+/// BEFORE the timer is armed. In the common case, where a pooled sender is
+/// already available, the acquisition completes without registering a timer
+/// entry, so the authenticated success path takes no timer-wheel lock. With no
+/// bound there is no timer and no clock read.
+///
+/// A combinator rather than an `async fn`, so `future` is stored once: an
+/// extra coroutine layer would hold it as an argument and again inside the
+/// race, in the frame of every gRPC dispatch.
+pub(crate) fn grpc_dispatch_bounded<F>(
+    at: Option<tokio::time::Instant>,
+    future: F,
+) -> GrpcDispatchBounded<F>
+where
+    F: std::future::Future,
+{
+    GrpcDispatchBounded {
+        future,
+        sleep: None,
+        at,
+    }
+}
+
+impl<F> std::future::Future for GrpcDispatchBounded<F>
+where
+    F: std::future::Future,
+{
+    type Output = Result<F::Output, ()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let Some(at) = *this.at else {
+            return this.future.poll(cx).map(Ok);
+        };
+        if let Some(sleep) = this.sleep.as_mut().as_pin_mut() {
+            if sleep.poll(cx).is_ready() {
+                return Poll::Ready(Err(()));
+            }
+            return this.future.poll(cx).map(Ok);
+        }
+        // First poll: refuse an already-elapsed bound without polling the
+        // phase, then give the phase one poll before any timer exists.
+        if tokio::time::Instant::now() >= at {
+            return Poll::Ready(Err(()));
+        }
+        if let Poll::Ready(output) = this.future.poll(cx) {
+            return Poll::Ready(Ok(output));
+        }
+        this.sleep.set(Some(tokio::time::sleep_until(at)));
+        match this.sleep.as_pin_mut() {
+            Some(sleep) if sleep.poll(cx).is_ready() => Poll::Ready(Err(())),
+            _ => Poll::Pending,
+        }
+    }
+}
+
+/// The bounds one native gRPC dispatch attempt is held to before its request
+/// is handed to the connection (GHSA-xcg4-wj3x-gjj2): the client RPC deadline
+/// composed with the admitted request's authorization lifetime.
+///
+/// Composed ONCE per attempt, BEFORE the sender is acquired, from absolute
+/// instants. A retry composes the same instants again, so it never re-arms
+/// either one. The winning source is decided here and never re-derived from
+/// the clock. An unauthenticated request composes the client deadline alone,
+/// exactly as before.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GrpcDispatchBounds {
+    dispatch: crate::proxy::DispatchPhaseBound,
+    handoff: crate::proxy::BackendHandoffBound,
+}
+
+impl GrpcDispatchBounds {
+    #[inline]
+    pub(crate) fn compose(
+        client_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    ) -> Self {
+        let dispatch = super::compose_dispatch_phase_auth_bound(client_deadline_at, auth);
+        Self {
+            dispatch,
+            handoff: super::compose_backend_handoff_bound(None, dispatch),
+        }
+    }
+
+    /// Hold the sender acquisition (pool wait, dial, TLS and HTTP/2
+    /// handshakes) to the composed bound.
+    #[inline]
+    pub(crate) fn acquire<F>(
+        self,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        acquisition: F,
+    ) -> impl std::future::Future<Output = Result<F::Output, GrpcProxyError>>
+    where
+        F: std::future::Future,
+    {
+        let bounded = grpc_dispatch_bounded(self.handoff.at, acquisition);
+        futures_util::FutureExt::map(bounded, move |bounded| {
+            bounded.map_err(|()| self.expired(self.handoff.source, auth))
+        })
+    }
+
+    /// The fail-closed handoff gate.
+    ///
+    /// hyper enqueues a request on its connection task synchronously, on the
+    /// first poll of the send future and before any wait on the response, so
+    /// this runs immediately before that poll with nothing awaited in between.
+    /// A bound that elapsed while the sender was acquired refuses the request
+    /// with nothing handed to the connection. One clock read, and none when no
+    /// bound applies.
+    #[inline]
+    pub(crate) fn admit_handoff(
+        self,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    ) -> Result<(), GrpcProxyError> {
+        match self.handoff.elapsed() {
+            None => Ok(()),
+            Some(source) => Err(self.expired(source, auth)),
+        }
+    }
+
+    /// Settle an acquisition or handoff whose composed bound elapsed. An
+    /// authorization expiry becomes the health-neutral
+    /// [`GrpcProxyError::AuthorizationExpired`]. An earlier client RPC deadline
+    /// keeps its pre-wire `DEADLINE_EXCEEDED`, which is not charged to the
+    /// backend. Out of line because it is a cold arm.
+    #[inline(never)]
+    fn expired(
+        self,
+        source: crate::proxy::BackendHandoffBoundSource,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    ) -> GrpcProxyError {
+        if source == crate::proxy::BackendHandoffBoundSource::Authorization {
+            return grpc_dispatch_authorization_expired(self.dispatch, auth);
+        }
+        GrpcProxyError::ClientDeadlineExceeded(
+            GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE.to_string(),
+        )
+    }
+}
+
+/// The authorization bound for a native gRPC response-header wait
+/// (GHSA-xcg4-wj3x-gjj2).
+///
+/// Bounded only for an authenticated request whose authorization lifetime
+/// expires no later than the wait's own protocol bound (`phase_at`: the client
+/// RPC deadline or the operator read bound). Composed from absolute instants,
+/// so a wait that is not observed until after both instants have passed still
+/// keeps the attribution of the bound that was actually earlier. Otherwise
+/// unbounded, which leaves the wait to its existing protocol shapes.
+#[inline]
+pub(crate) fn grpc_header_wait_authorization_bound(
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    phase_at: Option<tokio::time::Instant>,
+) -> crate::proxy::DispatchPhaseBound {
+    let bound = super::compose_dispatch_phase_auth_bound(phase_at, auth);
+    if bound.authorization_wins {
+        return bound;
+    }
+    crate::proxy::DispatchPhaseBound {
+        at: None,
+        authorization_wins: false,
+    }
+}
+
+/// Hold a native gRPC response-header wait to its authorization bound
+/// (GHSA-xcg4-wj3x-gjj2). An expiry becomes the health-neutral
+/// [`GrpcProxyError::AuthorizationExpired`], and the wait (and the request it
+/// was carrying) is dropped.
+#[inline]
+pub(crate) fn grpc_header_wait_under_authorization<F, T>(
+    bound: crate::proxy::DispatchPhaseBound,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    wait: F,
+) -> impl std::future::Future<Output = Result<T, GrpcProxyError>>
+where
+    F: std::future::Future<Output = Result<T, GrpcProxyError>>,
+{
+    let bounded = grpc_dispatch_bounded(bound.at, wait);
+    futures_util::FutureExt::map(bounded, move |bounded| {
+        bounded.unwrap_or_else(|()| Err(grpc_dispatch_authorization_expired(bound, auth)))
+    })
+}
+
+/// The streaming dispatch's own response-header bound as one absolute instant:
+/// the client RPC deadline, or else the operator fallback timeout armed from
+/// now, matching the wait's protocol shapes. Only an authenticated request
+/// needs it, so an unauthenticated one pays no clock read.
+fn streaming_header_wait_protocol_at(
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    effective_timeout_ms: Option<u64>,
+) -> Option<tokio::time::Instant> {
+    auth?;
+    if grpc_deadline_at.is_some() {
+        return grpc_deadline_at;
+    }
+    let timeout_ms = effective_timeout_ms?;
+    tokio::time::Instant::now().checked_add(Duration::from_millis(timeout_ms))
+}
+
+/// Attribute a native gRPC dispatch phase whose composed bound was won by the
+/// admitted request's authorization lifetime (GHSA-xcg4-wj3x-gjj2).
+///
+/// The termination is latched and counted exactly once for the request
+/// through its shared latch. First writer wins, so an upload pump that fired
+/// first keeps its classification. Out of line because it is a cold arm.
+#[inline(never)]
+fn grpc_dispatch_authorization_expired(
+    bound: crate::proxy::DispatchPhaseBound,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+) -> GrpcProxyError {
+    // An authorization-won bound fires only once its plan has elapsed, so the
+    // fallback is not reached in practice. If it were, it fails closed on the
+    // plan's own class.
+    let termination = crate::proxy::dispatch_phase_authorization_expiry(bound, auth)
+        .or_else(|| auth.map(|(plan, _, _)| plan.termination));
+    match termination {
+        Some(termination) => GrpcProxyError::AuthorizationExpired(termination),
+        // Without a plan, authorization cannot have won the composition.
+        None => GrpcProxyError::ClientDeadlineExceeded(
+            GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE.to_string(),
         ),
     }
 }
@@ -4793,6 +5070,7 @@ async fn proxy_grpc_streaming_dispatch(
     held_frontend_upload: &mut Option<GrpcBody>,
     mut upload_pump: Option<crate::proxy::upload_pump::UploadPumpJoin>,
     body_write_timeout: Option<hyper::ext::Http2BodyWriteTimeout>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     // Build headers: merge plugin/proxy headers on top of the inbound
     // request's headers, then run the gRPC-specific strip on the union.
@@ -4867,32 +5145,23 @@ async fn proxy_grpc_streaming_dispatch(
         None
     };
 
+    // The admitted request's authorization lifetime, composed ONCE and BEFORE
+    // sender acquisition with the client RPC deadline (GHSA-xcg4-wj3x-gjj2).
+    let dispatch_bounds = GrpcDispatchBounds::compose(grpc_deadline_at, auth);
+
     // Acquire the backend sender BEFORE moving the frontend upload into the
     // outbound request. A connect/handshake failure (accept-then-RST) must
     // return the unread Incoming/Channel body so the caller owns termination:
     // H2 retains it with the response as defense-in-depth, while H3 must defer
     // channel drop/STOP_SENDING until after Trailers-Only HEADERS+FIN (#2057).
-    let mut sender = if let Some(deadline) = grpc_deadline_at {
-        match tokio::time::timeout_at(deadline, transport.get_sender(proxy)).await {
-            Err(_) => {
-                *held_frontend_upload = Some(grpc_body);
-                return Err(GrpcProxyError::ClientDeadlineExceeded(
-                    "gRPC deadline exceeded during backend connection acquisition".to_string(),
-                ));
-            }
-            Ok(Err(e)) => {
-                *held_frontend_upload = Some(grpc_body);
-                return Err(e);
-            }
-            Ok(Ok(sender)) => sender,
-        }
-    } else {
-        match transport.get_sender(proxy).await {
-            Ok(sender) => sender,
-            Err(e) => {
-                *held_frontend_upload = Some(grpc_body);
-                return Err(e);
-            }
+    // An expiry of the composed bound is pre-wire too, so it returns the body
+    // the same way.
+    let acquired = dispatch_bounds.acquire(auth, transport.get_sender(proxy)).await;
+    let mut sender = match acquired {
+        Ok(Ok(sender)) => sender,
+        Ok(Err(e)) | Err(e) => {
+            *held_frontend_upload = Some(grpc_body);
+            return Err(e);
         }
     };
 
@@ -4922,8 +5191,23 @@ async fn proxy_grpc_streaming_dispatch(
         // also bounds the post-EOS drain of the local send queue (issue #4411).
         pump.bind_backend_socket(sender.backend_socket());
     }
+    // The response-header wait is held to the authorization lifetime as well
+    // (GHSA-xcg4-wj3x-gjj2) when the credential expires before the wait's own
+    // client or operator bound.
+    let header_phase_at =
+        streaming_header_wait_protocol_at(auth, grpc_deadline_at, effective_timeout_ms);
+    let header_auth_bound = grpc_header_wait_authorization_bound(auth, header_phase_at);
+    // `send_request` is lazy: hyper enqueues the request on the connection
+    // task on the FIRST poll of this future, synchronously, before any wait on
+    // the response.
     let send_fut = sender.send_request(backend_req);
-    let send_wait = async {
+    let protocol_send_wait = async {
+        // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2). This is the
+        // first thing the first poll runs, and nothing awaits between it and
+        // the first poll of `send_fut` below. A client RPC deadline or
+        // authorization lifetime that elapsed while the sender was acquired is
+        // therefore refused here, with nothing handed to the connection.
+        dispatch_bounds.admit_handoff(auth)?;
         let send_result = if let Some(deadline) = grpc_deadline_at {
             tokio::time::timeout_at(deadline, send_fut)
                 .await
@@ -4988,6 +5272,8 @@ async fn proxy_grpc_streaming_dispatch(
             })
         })
     };
+    let send_wait =
+        grpc_header_wait_under_authorization(header_auth_bound, auth, protocol_send_wait);
     let response =
         match crate::proxy::await_upload_write_watermark_first(send_wait, upload_pump.as_mut())
             .await
@@ -5200,6 +5486,13 @@ pub(crate) fn buffered_grpc_request_body_with_write_watermark(
 /// not arrive as HTTP/2 trailers — today, a gRPC-Web body trailer frame. It is
 /// sent as a real TRAILERS frame after the buffered DATA, and it is passed to
 /// every attempt because a retry replays the same complete request.
+///
+/// `auth` is the admitted request's authorization-lifetime plan
+/// (GHSA-xcg4-wj3x-gjj2). It bounds the sender acquisition, the request
+/// handoff, and the response-header wait, and every attempt (a retry included)
+/// is held to the same absolute instant. `None` for an unauthenticated request
+/// and for a caller that carries no plan, which leaves those phases exactly as
+/// they were.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_grpc_request_core(
     method: hyper::Method,
@@ -5214,6 +5507,7 @@ pub(crate) async fn proxy_grpc_request_core(
     stream_response: bool,
     max_response_body_size_bytes: usize,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     // Build headers: merge plugin/proxy headers on top of the inbound
     // request's headers, then run the gRPC-specific strip on the union.
@@ -5295,21 +5589,18 @@ pub(crate) async fn proxy_grpc_request_core(
         streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0)
     };
 
-    // Pool acquisition is bounded by the end-to-end client deadline plus the
-    // pool's own backend_connect_timeout_ms. backend_read_timeout_ms starts only
-    // after a sender exists; applying it here would turn a read-stall policy
-    // into an unintended shorter connect timeout.
-    let mut sender = if let Some(client_deadline) = client_grpc_deadline_at {
-        tokio::time::timeout_at(client_deadline, transport.get_sender(proxy))
-            .await
-            .map_err(|_| {
-                GrpcProxyError::ClientDeadlineExceeded(
-                    "gRPC deadline exceeded during backend connection acquisition".to_string(),
-                )
-            })??
-    } else {
-        transport.get_sender(proxy).await?
-    };
+    // The admitted request's authorization lifetime, composed ONCE and BEFORE
+    // sender acquisition with the client deadline (GHSA-xcg4-wj3x-gjj2). The
+    // acquisition and the handoff gate are both held to these absolute
+    // instants, so a retry never re-arms them.
+    let dispatch_bounds = GrpcDispatchBounds::compose(client_grpc_deadline_at, auth);
+
+    // Pool acquisition is bounded by the end-to-end client deadline, the
+    // admitted request's authorization lifetime, and the pool's own
+    // backend_connect_timeout_ms. backend_read_timeout_ms starts only after a
+    // sender exists; applying it here would turn a read-stall policy into an
+    // unintended shorter connect timeout.
+    let mut sender = dispatch_bounds.acquire(auth, transport.get_sender(proxy)).await??;
 
     // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
     // acquisition. Computing it before the dial would forward a value that
@@ -5417,13 +5708,27 @@ pub(crate) async fn proxy_grpc_request_core(
     // preserving the prior per-read stall-guard semantics.
     let shared_response_deadline =
         response_deadline_at.map(|deadline| (response_deadline_ms.unwrap_or(1), deadline));
+    // The response-header wait is held to the authorization lifetime as well
+    // (GHSA-xcg4-wj3x-gjj2) when the credential expires before the wait's own
+    // bound: the shared response deadline, or else the operator per-phase read
+    // timeout, which arms now.
+    let header_phase_at = response_deadline_at.or(backend_read_deadline_at);
+    let header_auth_bound = grpc_header_wait_authorization_bound(auth, header_phase_at);
     // Every header-wait shape below is raced against the pump's write
     // watermark, not just one of them: the pump terminates the transport BODY
     // on expiry, and hyper's HTTP/2 pipe is parked in `poll_capacity` — polling
     // nothing — exactly when a backend accepts and stops reading. Without the
     // race, a configured `backend_write_timeout_ms` would keep surfacing as the
     // later client deadline or `backend_read_timeout_ms` (issue #4055).
-    let header_wait = async {
+    let protocol_header_wait = async {
+        // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2). `send_fut` is
+        // lazy, and hyper enqueues the request on the connection task on its
+        // FIRST poll, synchronously, before any wait on the response. This
+        // check is the first thing the first poll runs, and nothing awaits
+        // between it and that poll. A client deadline or authorization
+        // lifetime that elapsed while the sender was acquired is therefore
+        // refused here, with nothing handed to the connection.
+        dispatch_bounds.admit_handoff(auth)?;
         if let Some((timeout_ms, deadline)) = shared_response_deadline {
             tokio::time::timeout_at(deadline, send_fut)
                 .await
@@ -5465,6 +5770,8 @@ pub(crate) async fn proxy_grpc_request_core(
             send_fut.await.map_err(map_send_err)
         }
     };
+    let header_wait =
+        grpc_header_wait_under_authorization(header_auth_bound, auth, protocol_header_wait);
     let response =
         match crate::proxy::await_upload_write_watermark_first(header_wait, upload_pump.as_mut())
             .await
@@ -6564,9 +6871,19 @@ mod tests {
             !body.contains("grpc_deadline_at.or_else(||"),
             "must not re-parse and re-anchor grpc-timeout at dispatch time"
         );
+        // Pool acquisition is bounded by the client deadline composed with the
+        // admitted request's authorization lifetime (GHSA-xcg4-wj3x-gjj2),
+        // composed BEFORE the acquisition. The operator read timeout is not
+        // part of it.
+        let composed = body
+            .find("GrpcDispatchBounds::compose(client_grpc_deadline_at, auth)")
+            .expect("the acquisition bound must compose the client deadline and authorization");
+        let bounded_acquisition = body
+            .find(".acquire(auth, transport.get_sender(proxy))")
+            .expect("pool acquisition must be awaited under the composed bound");
         assert!(
-            body.contains("timeout_at(client_deadline, transport.get_sender(proxy))"),
-            "pool acquisition must be bounded by only the client deadline"
+            composed < bounded_acquisition,
+            "the authorization lifetime must be composed before the sender is acquired"
         );
         let sender_acquisition = body
             .find("let mut sender =")
@@ -6589,10 +6906,10 @@ mod tests {
         );
         let timeout_at = body.matches("tokio::time::timeout_at(").count();
         assert_eq!(
-            timeout_at, 3,
-            "pool acquisition must consume the client deadline while header wait \
-             and body collection consume the same response deadline; found \
-             {timeout_at} timeout_at calls."
+            timeout_at, 2,
+            "header wait and body collection must consume the same response \
+             deadline (pool acquisition uses the composed expiry-first bound); \
+             found {timeout_at} timeout_at calls."
         );
 
         // Operator backend_read_timeout Instant add must stay overflow-guarded.

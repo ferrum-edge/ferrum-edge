@@ -518,18 +518,21 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
     );
 
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    // Three native/gRPC-Web backend-error shapes plus the authorization-expiry
+    // terminal (GHSA-xcg4-wj3x-gjj2): a sender acquisition the authorization
+    // lifetime cut short is pre-wire too, so it also retains the upload.
     assert_eq!(
         proxy_src
             .matches("grpc_proxy::attach_held_frontend_grpc_upload(")
             .count(),
-        3,
-        "all three terminal native/gRPC-Web error shapes must attach the held upload"
+        4,
+        "every terminal native/gRPC-Web error shape must attach the held upload"
     );
     assert_eq!(
         proxy_src
             .matches("held_frontend_grpc_upload.take()")
             .count(),
-        3,
+        4,
         "each terminal error attachment must consume the held upload exactly once"
     );
 }
@@ -979,6 +982,7 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         &proxy_headers,
         false,
         0,
+        None,
         None,
     )
     .await;

@@ -33,7 +33,11 @@
 //! (GHSA-xcg4-wj3x-gjj2): a direct HTTP/1.1 pool checkout whose TLS handshake
 //! stalls past the credential deadline must end at that deadline with the
 //! authorization terminal, and the backend must never receive the request —
-//! not even once its stalled handshake would have completed.
+//! not even once its stalled handshake would have completed. Two more cases
+//! cover the same window on native gRPC (the buffered, replayable dispatch
+//! and the fully-streamed one): an h2c sender acquisition whose peer preface
+//! stalls past the credential deadline ends with `grpc-status: 16`, and the
+//! backend never receives the RPC.
 //!
 //! The HTTP/1.1 case runs twice, against an integer and a fractional `exp`
 //! (issue #5521). Both are conforming RFC 7519 §2 NumericDates and the JWT
@@ -648,4 +652,233 @@ async fn h1_h2_auth_lifetime_direct_h1_stalled_checkout_never_reaches_the_backen
     );
 
     assert_credential_expired_exactly(&harness, "http", 1).await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 5. A native gRPC sender acquisition that stalls past the credential deadline
+//    (GHSA-xcg4-wj3x-gjj2, native gRPC sibling; part of #5990).
+//
+//    The h2c backend accepts TCP but withholds its HTTP/2 connection preface
+//    for longer than the credential lives. The gRPC pool admits a sender only
+//    once the peer's SETTINGS arrive, so the acquisition is still in flight
+//    when the credential expires. Every operator bound that could otherwise
+//    end it is disabled or set far beyond the stall.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The gRPC method path the stalled h2c backend counts. Nothing else the
+/// gateway sends (its capability probe included) uses it.
+const STALLED_GRPC_PATH: &str = "/stalled.Acquisition/Call";
+
+/// File-mode YAML for one `jwt_auth`-protected route to an h2c gRPC backend.
+///
+/// `buffered` adds a connect-failure retry policy, which makes the request
+/// replayable and so selects the buffered dispatch (`proxy_grpc_request_core`).
+/// Without it, the upload takes the fully-streamed dispatch.
+fn stalled_grpc_proxy_yaml(backend_port: u16, buffered: bool) -> String {
+    let mut proxy = json!({
+        "id": "grpc-stalled-acquisition",
+        "listen_path": "/grpc",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "strip_listen_path": true,
+        // The dial budget outlives the stall, and neither the response-header
+        // read bound nor the write watermark is armed.
+        "backend_connect_timeout_ms": 60_000,
+        "backend_read_timeout_ms": 0,
+        "backend_write_timeout_ms": 0,
+        "plugins": [{"plugin_config_id": "grpc-stalled-acquisition-jwt"}],
+    });
+    if buffered {
+        proxy["retry"] = json!({"max_retries": 1, "retry_on_connect_failure": true});
+    }
+    let config = json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [{
+            "id": CONSUMER,
+            "username": CONSUMER,
+            "credentials": {"jwt": [{"secret": JWT_SECRET}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "grpc-stalled-acquisition-jwt",
+            "plugin_name": "jwt_auth",
+            "scope": "proxy",
+            "proxy_id": "grpc-stalled-acquisition",
+            "enabled": true,
+            "config": {
+                "token_lookup": "header:Authorization",
+                "consumer_claim_field": "sub",
+            },
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+/// h2c backend that sleeps `stall` on every accepted connection before it
+/// starts HTTP/2, and so before it sends its SETTINGS preface, then answers
+/// every RPC with `grpc-status: 0`. Returns the TCP accept count and the
+/// number of requests for [`STALLED_GRPC_PATH`] it received.
+fn spawn_stalled_preface_h2c_backend(
+    listener: tokio::net::TcpListener,
+    stall: Duration,
+) -> (Arc<AtomicU32>, Arc<AtomicU32>) {
+    let accepts = Arc::new(AtomicU32::new(0));
+    let requests = Arc::new(AtomicU32::new(0));
+    let (accept_count, request_count) = (Arc::clone(&accepts), Arc::clone(&requests));
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            accept_count.fetch_add(1, Ordering::SeqCst);
+            let request_count = Arc::clone(&request_count);
+            tokio::spawn(async move {
+                tokio::time::sleep(stall).await;
+                let service = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        if req.uri().path() == STALLED_GRPC_PATH {
+                            request_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        async {
+                            let response = hyper::Response::builder()
+                                .header("content-type", "application/grpc")
+                                .header("grpc-status", "0")
+                                .body(http_body_util::Full::new(Bytes::new()))
+                                .expect("trailers-only gRPC response");
+                            Ok::<_, std::convert::Infallible>(response)
+                        }
+                    },
+                );
+                let executor = hyper_util::rt::TokioExecutor::new();
+                let builder = hyper::server::conn::http2::Builder::new(executor);
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ = builder.serve_connection(io, service).await;
+            });
+        }
+    });
+    (accepts, requests)
+}
+
+/// The terminal `grpc-status` of a gRPC response: from a trailers-only head,
+/// or else from the trailers after the body.
+async fn grpc_status_of(response: http::Response<h2::RecvStream>) -> Option<String> {
+    let (head, mut body) = response.into_parts();
+    if let Some(status) = head.headers.get("grpc-status") {
+        return status.to_str().ok().map(str::to_owned);
+    }
+    while let Some(chunk) = body.data().await {
+        if chunk.is_err() {
+            break;
+        }
+    }
+    let trailers = body.trailers().await.ok().flatten()?;
+    trailers.get("grpc-status")?.to_str().ok().map(str::to_owned)
+}
+
+async fn assert_stalled_grpc_acquisition_never_reaches_the_backend(buffered: bool) {
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let (accepts, requests) =
+        spawn_stalled_preface_h2c_backend(reservation.into_listener(), CHECKOUT_STALL);
+
+    let harness = GatewayHarness::builder()
+        .file_config(stalled_grpc_proxy_yaml(backend_port, buffered))
+        .log_level("info")
+        .capture_output()
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let authority = proxy_authority(&harness);
+    let token = mint_short_lived_token(ExpShape::Integer);
+
+    let sent_at = std::time::Instant::now();
+    let tcp = tokio::net::TcpStream::connect(authority.as_str())
+        .await
+        .expect("connect to the gateway plaintext port");
+    let (send_request, connection) = h2::client::handshake(tcp)
+        .await
+        .expect("h2c handshake with the gateway");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://{authority}/grpc{STALLED_GRPC_PATH}"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .expect("build gRPC request");
+    let mut send_request = send_request
+        .ready()
+        .await
+        .expect("the h2 connection must accept a new stream");
+    let (response, mut upload) = send_request
+        .send_request(request, false)
+        .expect("send the authenticated gRPC request");
+    // One empty, uncompressed gRPC message, then end of stream.
+    upload
+        .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+        .expect("send the gRPC message");
+
+    // Without the fix the acquisition is not bounded by the credential, so the
+    // gateway would not answer before the stall ends.
+    let wait = CHECKOUT_STALL + TERMINATION_GRACE;
+    let Ok(response) = tokio::time::timeout(wait, response).await else {
+        panic!(
+            "the gateway never answered the stalled-acquisition RPC; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+    };
+    let response = response.expect("gRPC response head");
+    let answered_after = sent_at.elapsed();
+    let http_status = response.status().as_u16();
+    let grpc_status = grpc_status_of(response).await;
+    assert_eq!(
+        (http_status, grpc_status.as_deref()),
+        (200, Some("16")),
+        "a credential that expires while the gRPC sender acquisition is stalled must end with \
+         the fixed UNAUTHENTICATED terminal, never DEADLINE_EXCEEDED or UNAVAILABLE; answered \
+         after {answered_after:?}; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+    assert!(
+        answered_after < CHECKOUT_STALL,
+        "the stalled acquisition must be cut short at the credential deadline, not held until \
+         the backend's preface arrives; answered after {answered_after:?}"
+    );
+    assert!(
+        accepts.load(Ordering::SeqCst) >= 1,
+        "the gRPC pool must actually have dialed the stalled backend"
+    );
+
+    // Let every stalled connection start serving, then prove the backend never
+    // saw the request: the cancelled acquisition handed nothing to a
+    // connection, even once one became usable.
+    let settle_until = sent_at + CHECKOUT_STALL + Duration::from_secs(4);
+    tokio::time::sleep(settle_until.saturating_duration_since(std::time::Instant::now())).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "a gRPC request whose credential expired during sender acquisition must never reach \
+         the backend; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+
+    assert_credential_expired_exactly(&harness, "grpc", 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h1_h2_auth_lifetime_buffered_grpc_stalled_acquisition_never_reaches_the_backend() {
+    assert_stalled_grpc_acquisition_never_reaches_the_backend(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h1_h2_auth_lifetime_streamed_grpc_stalled_acquisition_never_reaches_the_backend() {
+    assert_stalled_grpc_acquisition_never_reaches_the_backend(false).await;
 }

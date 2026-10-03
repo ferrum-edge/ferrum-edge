@@ -8262,6 +8262,9 @@ where
             stream_grpc_response,
             effective_max_response_body_size_bytes,
             ctx.grpc_deadline_at(),
+            // No authorization plan on the H3 bridge's dispatch yet: its own
+            // bound is a separate follow-up to GHSA-xcg4-wj3x-gjj2.
+            None,
         );
         tokio::pin!(attempt);
         attempt_span.scope(attempt).await
@@ -8522,6 +8525,7 @@ where
                     stream_grpc_response,
                     effective_max_response_body_size_bytes,
                     ctx.grpc_deadline_at(),
+                    None,
                 );
                 tokio::pin!(attempt);
                 attempt_span.scope(attempt).await
@@ -9467,6 +9471,13 @@ where
                 grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
+                // Not raised here: this bridge passes no authorization plan to
+                // the shared dispatch. Mapped to its fixed terminal status for
+                // exhaustiveness.
+                grpc_proxy::GrpcProxyError::AuthorizationExpired(termination) => (
+                    grpc_proxy::grpc_status::UNAUTHENTICATED,
+                    termination.grpc_message(),
+                ),
             };
             // Derive `connection_error` from the unified
             // `request_reached_wire` boundary instead of hard-coding `true`.
@@ -10074,6 +10085,12 @@ pub(crate) async fn dispatch_grpc_streaming(
                     grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                     }
+                    // Not raised here: the channel-backed dispatch carries no
+                    // authorization plan. Mapped for exhaustiveness.
+                    grpc_proxy::GrpcProxyError::AuthorizationExpired(termination) => (
+                        grpc_proxy::grpc_status::UNAUTHENTICATED,
+                        termination.grpc_message(),
+                    ),
                 }
             };
             // Three pre-headers failures on this path are CLIENT/gateway-side, not

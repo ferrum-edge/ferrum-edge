@@ -623,6 +623,10 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
             GrpcTimeoutKind::Read => ErrorClass::ReadWriteTimeout,
         },
         GrpcProxyError::ClientDeadlineExceeded(_) => ErrorClass::ClientDisconnect,
+        // The gateway's own authorization-lifetime decision before the response
+        // head (GHSA-xcg4-wj3x-gjj2): never retried and backend-health neutral,
+        // the same class the H1/H2 authorization placeholder carries.
+        GrpcProxyError::AuthorizationExpired(_) => ErrorClass::ClientDisconnect,
         GrpcProxyError::BackendUnavailable {
             kind,
             message,
