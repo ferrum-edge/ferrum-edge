@@ -4595,7 +4595,7 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
         "the buffered gRPC body must be built through the shared write-watermark selection"
     );
     let sender_acquired = core
-        .find("transport.get_sender(proxy).await?")
+        .find("transport.get_sender(proxy)")
         .expect("buffered gRPC sender acquisition");
     let pump_installed = core
         .find("buffered_grpc_request_body_with_write_watermark(")

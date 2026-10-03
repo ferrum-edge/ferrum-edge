@@ -33,6 +33,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on its first poll (a pooled connection or live HTTP/2 sender) never arms a
   timer. Unauthenticated requests are unchanged. **Still unbounded**, tracked
   in #5990: sender acquisition and handoff on sidecar mesh-mTLS dispatch
+  (including the Unix-socket h2c carrier), the HTTP/3 cross-protocol gRPC
+  bridge, and possibly the native HTTP/3 backend.
+- **Native gRPC sender acquisition, request handoff, and response-header
+  wait are held to the authorization lifetime** (GHSA-xcg4-wj3x-gjj2, native
+  gRPC sibling; part of #5990). The native gRPC dispatch (the buffered,
+  replayable path and the fully-streamed one) bounded getting a sender,
+  sending, and waiting for response headers only by the client RPC deadline
+  and the operator read timeout. A credential that expired while a sender was
+  being acquired did not end the request, and the request could then be
+  handed to the connection and reach the backend. The admitted request's
+  authorization lifetime is now composed before the sender is acquired and
+  bounds the acquisition, every retry attempt at the same absolute instant,
+  and the response-header wait. It is re-checked immediately before the
+  request is handed to the connection (the send future is built only after
+  that check), so an expired request is refused with nothing sent. The expiry is the gateway's own health-neutral decision: it is
+  never retried, trains no circuit breaker, passive health, or adaptive
+  concurrency, is counted once, and is answered with the fixed
+  `grpc-status: 16` (`UNAUTHENTICATED`) terminal, never `DEADLINE_EXCEEDED`.
+  An earlier client deadline or read bound keeps its own terminal.
+  Unauthenticated requests are unchanged.
   (including the Unix-socket h2c carrier), native gRPC dispatch, and possibly
   the native HTTP/3 backend.
 

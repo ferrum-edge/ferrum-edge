@@ -11575,6 +11575,89 @@ pub mod _test_support {
         ))
     }
 
+    /// The bounds one native gRPC dispatch attempt is held to before its
+    /// request is handed to the connection (GHSA-xcg4-wj3x-gjj2).
+    #[derive(Clone, Copy, Debug)]
+    pub struct NativeGrpcDispatchBoundsForTest(crate::proxy::grpc_proxy::GrpcDispatchBounds);
+
+    /// Compose the production native gRPC dispatch bounds from a client RPC
+    /// deadline `client_deadline_after_ms` from now (`None`: no `grpc-timeout`)
+    /// and the admitted request's authorization plan (GHSA-xcg4-wj3x-gjj2).
+    pub fn compose_native_grpc_dispatch_bounds_for_test(
+        client_deadline_after_ms: Option<u64>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> NativeGrpcDispatchBoundsForTest {
+        let client_deadline_at = client_deadline_after_ms.and_then(|millis| {
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(millis))
+        });
+        NativeGrpcDispatchBoundsForTest(crate::proxy::grpc_proxy::GrpcDispatchBounds::compose(
+            client_deadline_at,
+            auth,
+        ))
+    }
+
+    /// Await a controlled sender acquisition under the production native gRPC
+    /// acquisition bound (GHSA-xcg4-wj3x-gjj2). `Err` is the production
+    /// dispatch error, and the acquisition future has then been dropped.
+    pub async fn await_native_grpc_acquisition_for_test<F>(
+        bounds: &NativeGrpcDispatchBoundsForTest,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+        acquisition: F,
+    ) -> Result<F::Output, crate::proxy::grpc_proxy::GrpcProxyError>
+    where
+        F: std::future::Future,
+    {
+        bounds.0.acquire(auth, acquisition).await
+    }
+
+    /// Run the production fail-closed native gRPC handoff gate in front of a
+    /// fake send adapter (GHSA-xcg4-wj3x-gjj2). `enqueue` stands in for the
+    /// first poll of the dispatch send future, where hyper enqueues the
+    /// request, and is called only when the gate admits the handoff.
+    pub fn native_grpc_handoff_gate_for_test<R>(
+        bounds: &NativeGrpcDispatchBoundsForTest,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+        enqueue: impl FnOnce() -> R,
+    ) -> Result<R, crate::proxy::grpc_proxy::GrpcProxyError> {
+        bounds.0.admit_handoff(auth)?;
+        Ok(enqueue())
+    }
+
+    /// Await a controlled native gRPC response-header wait under the
+    /// production authorization bound (GHSA-xcg4-wj3x-gjj2).
+    /// `phase_bound_after_ms` is the wait's own client/operator bound,
+    /// relative to now; `wait` models that protocol shape itself.
+    pub async fn await_native_grpc_header_wait_for_test<F, T>(
+        phase_bound_after_ms: Option<u64>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+        wait: F,
+    ) -> Result<T, crate::proxy::grpc_proxy::GrpcProxyError>
+    where
+        F: std::future::Future<Output = Result<T, crate::proxy::grpc_proxy::GrpcProxyError>>,
+    {
+        let phase_at = phase_bound_after_ms.and_then(|millis| {
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(millis))
+        });
+        let bound = crate::proxy::grpc_proxy::grpc_header_wait_authorization_bound(auth, phase_at);
+        crate::proxy::grpc_proxy::grpc_header_wait_under_authorization(bound, auth, wait).await
+    }
+
     /// Attribute an ALREADY-COMPOSED dispatch-phase bound whose winning source
     /// is the admitted stream's authorization lifetime (issue #3815). This is
     /// the shape the typed composers (`authorization_bounded_header_deadline`,
