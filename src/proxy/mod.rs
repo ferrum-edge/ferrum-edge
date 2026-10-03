@@ -14766,7 +14766,9 @@ async fn handle_connection(
     // count can be drained once after the connection resolves.
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = Arc::clone(&h1_framing_signals);
-    let frontend_connection = frontend_affinity::next_frontend_connection();
+    // Held for the connection's lifetime; its slot picks the backend shard.
+    let frontend_slot = frontend_affinity::FrontendConnectionSlot::acquire();
+    let frontend_connection = frontend_slot.slot();
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
@@ -23706,7 +23708,9 @@ async fn handle_tls_connection(
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = h1_framing_signals.clone();
     let service_h1_framing_signals = h1_framing_signals;
-    let frontend_connection = frontend_affinity::next_frontend_connection();
+    // Held for the connection's lifetime; its slot picks the backend shard.
+    let frontend_slot = frontend_affinity::FrontendConnectionSlot::acquire();
+    let frontend_connection = frontend_slot.slot();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
