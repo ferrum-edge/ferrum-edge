@@ -774,7 +774,11 @@ async fn grpc_status_of(response: http::Response<h2::RecvStream>) -> Option<Stri
         }
     }
     let trailers = body.trailers().await.ok().flatten()?;
-    trailers.get("grpc-status")?.to_str().ok().map(str::to_owned)
+    trailers
+        .get("grpc-status")?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 async fn assert_stalled_grpc_acquisition_never_reaches_the_backend(buffered: bool) {

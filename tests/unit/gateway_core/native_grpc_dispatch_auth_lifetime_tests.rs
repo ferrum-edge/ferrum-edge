@@ -264,10 +264,9 @@ async fn the_response_header_wait_ends_at_the_authorization_instant() {
 
     // The wait's own operator read bound is far later than the credential.
     let (wait, polled, dropped) = stalled();
-    let outcome = await_native_grpc_header_wait_for_test(Some(30_000), Some(&plan), async {
-        Ok(wait.await)
-    })
-    .await;
+    let outcome =
+        await_native_grpc_header_wait_for_test(Some(30_000), Some(&plan), async { Ok(wait.await) })
+            .await;
 
     assert_eq!(
         expired_class(outcome),

@@ -5156,7 +5156,9 @@ async fn proxy_grpc_streaming_dispatch(
     // channel drop/STOP_SENDING until after Trailers-Only HEADERS+FIN (#2057).
     // An expiry of the composed bound is pre-wire too, so it returns the body
     // the same way.
-    let acquired = dispatch_bounds.acquire(auth, transport.get_sender(proxy)).await;
+    let acquired = dispatch_bounds
+        .acquire(auth, transport.get_sender(proxy))
+        .await;
     let mut sender = match acquired {
         Ok(Ok(sender)) => sender,
         Ok(Err(e)) | Err(e) => {
@@ -5600,7 +5602,9 @@ pub(crate) async fn proxy_grpc_request_core(
     // backend_connect_timeout_ms. backend_read_timeout_ms starts only after a
     // sender exists; applying it here would turn a read-stall policy into an
     // unintended shorter connect timeout.
-    let mut sender = dispatch_bounds.acquire(auth, transport.get_sender(proxy)).await??;
+    let mut sender = dispatch_bounds
+        .acquire(auth, transport.get_sender(proxy))
+        .await??;
 
     // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
     // acquisition. Computing it before the dial would forward a value that
