@@ -41,6 +41,7 @@ pub mod backend_send_queue;
 pub mod body;
 pub mod client_ip;
 pub mod datagram_client_address;
+pub(crate) mod deferred_flush;
 pub mod deferred_log;
 /// Pre-request admission bound for the data-plane HTTP frontend (issue #4152).
 /// Covers the H1-vs-H2 version sniff and HTTP/2 SETTINGS/header windows that
@@ -23615,8 +23616,15 @@ async fn handle_tls_connection(
         .server_name()
         .and_then(crate::proxy::sni::normalize_received_server_name);
 
+    let tls_alpn_h2 = matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2"));
+    // EXPERIMENT (#5588): defer an h2 connection's first write of each batch.
+    let tls_stream = deferred_flush::DeferredFlushIo::new(
+        tls_stream,
+        tls_alpn_h2 && deferred_flush::frontend_enabled(),
+    );
+
     #[cfg(feature = "bench-h1-profile")]
-    let profile_layer = if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+    let profile_layer = if tls_alpn_h2 {
         crate::h1_profile::io::Layer::TlsH2Plain
     } else {
         crate::h1_profile::io::Layer::TlsNonH2Plain
@@ -23626,20 +23634,19 @@ async fn handle_tls_connection(
     // requests. ALPN `h2` is already HTTP/2: skip the observer so those
     // connections do not allocate `H1FramingSignals`. Otherwise wrap; the
     // adapter still disables itself if the bytes are an h2c-style preface.
-    let (tls_stream, h1_framing_signals) =
-        if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
-            (
-                h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
-                None,
-            )
-        } else {
-            let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
-                tls_stream,
-                http1_parser_max_buf_size(state.max_header_size_bytes),
-                Some(remote_addr),
-            );
-            (io, Some(signals))
-        };
+    let (tls_stream, h1_framing_signals) = if tls_alpn_h2 {
+        (
+            h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
+            None,
+        )
+    } else {
+        let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
+            tls_stream,
+            http1_parser_max_buf_size(state.max_header_size_bytes),
+            Some(remote_addr),
+        );
+        (io, Some(signals))
+    };
     #[cfg(feature = "bench-h1-profile")]
     let tls_stream = crate::h1_profile::io::ObservedIo::new(tls_stream, profile_layer);
     let io = hyper_util::rt::TokioIo::new(tls_stream);

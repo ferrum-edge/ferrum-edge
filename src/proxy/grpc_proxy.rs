@@ -1579,7 +1579,11 @@ impl GrpcPoolManager {
             ));
         }
 
-        let io = TokioIo::new(tls_stream);
+        // EXPERIMENT (#5588): defer the first write of each batch.
+        let io = TokioIo::new(super::deferred_flush::DeferredFlushIo::new(
+            tls_stream,
+            super::deferred_flush::backend_enabled(),
+        ));
         let builder = Self::build_h2_builder(pool_config);
         let (sender, conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
