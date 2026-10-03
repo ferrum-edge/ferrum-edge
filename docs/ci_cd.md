@@ -2006,11 +2006,17 @@ continue to protect the production lane.
 image is Ubuntu 16.04 (xenial, glibc 2.23), and every package `pre-build`
 installs comes from that image's own configured Ubuntu archive, signed by the
 base image's keyring. That includes bindgen's `clang-6.0` / `libclang-6.0-dev`,
-pinned to the frozen `xenial-updates` version `1:6.0-1ubuntu2~16.04.1`, which
+pinned to the exact `xenial-updates` version `1:6.0-1ubuntu2~16.04.1`, which
 installs libclang under `/usr/lib/llvm-6.0/lib` (the `LIBCLANG_PATH`
 passthrough). The release build adds no third-party apt repository and fetches
-no apt key. It previously pulled the same 6.0 toolchain from apt.llvm.org,
-which made a release depend on that host's availability (#4978, #5955). The
+no apt key. It previously pulled an LLVM 6.0.1 snapshot from apt.llvm.org,
+which made a release depend on that host's availability (#4978, #5955); the
+Ubuntu package is LLVM 6.0.0 with the same dependency set. Remaining risk: if
+Ubuntu publishes a newer llvm-6.0 build to `xenial-updates`, the pinned version
+stops being installable and the release fails at that `apt-get install` step
+(loudly, never silently with a different toolchain); if xenial moves to
+`old-releases.ubuntu.com`, every `pre-build` install breaks, as it would have
+before this change. Either case needs a reviewed `Cross.toml` policy update. The
 only other download is `protoc` from GitHub releases. No pull-request or manual
 workflow runs Cross. To validate a `pre-build` change before merging, run the
 pinned Cross 0.2.5 command from `build-release-arm64-cross` on a Linux host (see
