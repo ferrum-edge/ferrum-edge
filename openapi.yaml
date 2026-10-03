@@ -23328,12 +23328,12 @@ components:
               type: string
               minLength: 32
               format: password
-              description: AEAD key material for durable session cookies and sealed pending authorization-code correlation cookies; must be at least 32 bytes
+              description: AEAD key material for durable session cookies and sealed pending authorization-code correlation cookies; must be at least 32 bytes and must not be a known published or placeholder value (including the documented `${OIDC_SESSION_SECRET_32_BYTES_MIN}` placeholder, the key Ferrum Foundry's OIDC template published, Ferrum's own sequential example/test secrets, and obvious placeholders such as changeme, change-me, replace-me, placeholder, example, or your-secret). A rejected value returns 400 naming this field.
             encryption_secret_previous:
               type: [string, "null"]
               minLength: 32
               format: password
-              description: Previous encryption secret accepted while rotating session and pending-flow cookies within the same versioned OIDC context
+              description: Previous encryption secret accepted while rotating session and pending-flow cookies within the same versioned OIDC context; subject to the same published/placeholder rejection as encryption_secret, and a rejected value returns 400 naming this field
             cookie_name:
               type: [string, "null"]
               pattern: '^[A-Za-z0-9!#$%&''*+\-.^_`|~]+$'

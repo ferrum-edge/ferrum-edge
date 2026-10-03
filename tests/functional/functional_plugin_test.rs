@@ -1757,7 +1757,7 @@ async fn test_oidc_callback_materializes_query_in_production_pipeline() {
                     "callback_path": "/oauth/callback"
                 }],
                 "session": {
-                    "encryption_secret": "01234567890123456789012345678901"
+                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486"
                 }
             }
         })],

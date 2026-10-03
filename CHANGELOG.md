@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **OIDC session encryption secrets reject published and placeholder values**
+  (#5987; cross-repo hardening from Ferrum Foundry GHSA-hjw6-685j-p5hw). The
+  `oidc_relying_party` session config previously checked
+  `session.encryption_secret` and `session.encryption_secret_previous` only for
+  minimum length, so it accepted values that anyone can read from Ferrum's own
+  documentation and examples: the literal `${OIDC_SESSION_SECRET_32_BYTES_MIN}`
+  placeholder, the key Ferrum Foundry's OIDC template published, the sequential
+  secrets Ferrum's own tests used, and obvious placeholders (`changeme`,
+  `change-me`/`change_me`, `replace-me`/`replace_me`, `placeholder`, `example`,
+  `your-secret`). Both fields are now screened against a small documented
+  deny-list at the shared plugin-config validation entry point, so Admin API
+  create/update, batch, restore, and file/database config load all reject with a
+  `400` naming the field. Disabled configs may still be saved before an operator
+  supplies a key. Generate a unique random secret of at least 32 bytes and
+  rotate through `session.encryption_secret_previous`.
 - **Backend connection checkout and request handoff are held to the
   authorization lifetime** (GHSA-xcg4-wj3x-gjj2; regression from the direct
   HTTP/1.1 pool, #5961). The direct HTTP/1.1 pool checked out its connection

@@ -2756,8 +2756,8 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `providers[].consumer_identity_claim` | String | Claim resolved against the consumer index (default: `sub`) |
 | `providers[].consumer_header_claim` | String | Claim emitted as the consumer username header (default: `sub`) |
 | `providers[].id_token_clock_skew_secs` | u64 | ID token expiry leeway (default: `60`; `0`–`3600`) |
-| `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies |
-| `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation |
+| `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies. Published or placeholder values are rejected at admission |
+| `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation; the same published/placeholder rejection applies |
 | `session.store` | String | Session backend; only `cookie` is implemented |
 | `session.cookie_name` | String (optional) | Explicit name opts out of automatic naming and must be an RFC 6265 `cookie-name` token; an explicit `__Host-`/`__Secure-` name must satisfy that prefix's attribute rules. Default is context-derived and prefixed `__Host-` (secure, no domain, root path), `__Secure-` (secure, otherwise), or unprefixed when `session.secure` is false |
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`; `1`–`31536000`) |
@@ -2780,6 +2780,18 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`) |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
 | `behavior.trusted_redirect_hosts` | String[] | Hosts allowed for post-login redirect parameters |
+
+`session.encryption_secret` and `session.encryption_secret_previous` are checked
+at admission (Admin API create/update, batch, restore, and file/database config
+load) against a small deny-list of known-public secrets: Ferrum's documented
+`${OIDC_SESSION_SECRET_32_BYTES_MIN}` placeholder when stored literally, the key
+Ferrum Foundry's OIDC relying-party template published, the sequential secrets
+Ferrum's own examples and tests used, and obvious placeholders such as
+`changeme`, `change-me`/`change_me`, `replace-me`/`replace_me`, `placeholder`,
+`example`, and `your-secret`. A rejected value returns an Admin API `400` naming
+the offending field. Generate a unique random secret of at least 32 bytes per
+deployment, and rotate through `session.encryption_secret_previous` instead of
+reusing a published value.
 
 ```yaml
 plugin_name: oidc_relying_party

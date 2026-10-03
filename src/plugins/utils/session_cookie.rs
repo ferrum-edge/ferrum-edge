@@ -107,6 +107,61 @@ impl SessionCookieCodec {
     }
 }
 
+/// Literal OIDC session-secret values that are known to be public: Ferrum
+/// Edge's own documented placeholder, the key Ferrum Foundry's OIDC template
+/// published (GHSA-hjw6-685j-p5hw), and the sequential fixtures Edge's own
+/// tests and examples used for `session.encryption_secret`. Anyone reading the
+/// repository can hold these, so accepting one as an AEAD key would let a third
+/// party forge or decrypt session and pending-flow cookies.
+///
+/// Keep this list small and exact. Length is validated separately, and a
+/// genuinely random operator secret must never collide with an entry here.
+const DENIED_SESSION_SECRETS: &[&str] = &[
+    "${OIDC_SESSION_SECRET_32_BYTES_MIN}",
+    "change-me-32-byte-minimum-secret!!",
+    "01234567890123456789012345678901",
+    "0123456789012345678901234567890123",
+    "abcdefghijklmnopqrstuvwxyz123456",
+];
+
+/// Case-insensitive substrings that mark an obvious placeholder secret.
+const DENIED_SESSION_SECRET_SUBSTRINGS: &[&str] = &[
+    "changeme",
+    "change-me",
+    "change_me",
+    "replace-me",
+    "replace_me",
+    "placeholder",
+    "example",
+    "your-secret",
+    "your_secret",
+];
+
+/// Reject a `session.encryption_secret` or `session.encryption_secret_previous`
+/// value that is a published or placeholder secret. `field` is the dotted
+/// config path used in the error so an Admin API 400 names the offending key.
+///
+/// An unresolved `${...}` env placeholder is refused as well: the value would
+/// be stored literally rather than resolved before admission.
+pub fn reject_published_session_secret(secret: &str, field: &str) -> Result<(), String> {
+    let trimmed = secret.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    let unresolved_placeholder = trimmed.starts_with("${");
+    let denied_exact = DENIED_SESSION_SECRETS
+        .iter()
+        .any(|known| trimmed.eq_ignore_ascii_case(*known));
+    let denied_substring = DENIED_SESSION_SECRET_SUBSTRINGS
+        .iter()
+        .any(|token| lowered.contains(*token));
+    if unresolved_placeholder || denied_exact || denied_substring {
+        return Err(format!(
+            "oidc_relying_party: `{field}` must not be a published or placeholder secret; \
+             generate a unique random value"
+        ));
+    }
+    Ok(())
+}
+
 pub fn normalize_secret(secret: &str) -> Result<Vec<u8>, String> {
     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(secret)
         && decoded.len() >= 32
@@ -140,7 +195,7 @@ fn derive_key(secret: &str) -> Result<LessSafeKey, String> {
 mod tests {
     use super::*;
 
-    const SECRET: &str = "01234567890123456789012345678901";
+    const SECRET: &str = "9f3a7c1e5b2d8406a1c9e7f3b5d20486";
 
     #[test]
     fn seal_open_roundtrip_recovers_payload() {
@@ -156,7 +211,7 @@ mod tests {
     fn open_with_wrong_key_returns_none() {
         let codec = SessionCookieCodec::new(SECRET, None, 4000).expect("codec");
         let other =
-            SessionCookieCodec::new("abcdefghijklmnopqrstuvwxyz123456", None, 4000).expect("codec");
+            SessionCookieCodec::new("2d8b6f0a4c1e9375b8d2f6a0c4e19753", None, 4000).expect("codec");
         let sealed = codec.seal(b"payload").expect("seal");
         assert!(other.open(&sealed).is_none());
     }
