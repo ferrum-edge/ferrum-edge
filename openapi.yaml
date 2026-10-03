@@ -20940,7 +20940,10 @@ components:
           default: 50
           minimum: 1
           maximum: 10000
-          description: Max metric entries to batch before flushing
+          description: >-
+            Max transaction records to batch before flushing. The threshold
+            counts admitted transaction payloads (each rendering several
+            newline-separated metric lines), not individual metric lines.
         max_entry_bytes:
           type: integer
           default: 65536
@@ -28710,7 +28713,7 @@ components:
         require_accept_header:
           type: boolean
           default: true
-          description: "Require Accept: text/event-stream header (406 if missing)"
+          description: "Require an affirmative Accept: text/event-stream entry (406 otherwise; q=0, malformed, or duplicate quality is not affirmative)"
         strip_accept_encoding:
           type: boolean
           default: true
