@@ -240,6 +240,24 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         run: docker image ls ferrum-edge:bench
 
+      # EXPERIMENT ONLY (not for merge): same-run baseline image from main.
+      - name: Checkout baseline source (experiment)
+        if: steps.skip_check.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ba42ee3f3555d200f33c05b748e80519892e57e1
+          path: baseline-src
+
+      - name: Build baseline Ferrum image (experiment)
+        if: steps.skip_check.outputs.skip != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: baseline-src
+          file: baseline-src/Dockerfile
+          tags: ferrum-edge:baseline
+          load: true
+          cache-from: type=gha
+
       - name: Pre-pull competitor Docker images
         if: steps.skip_check.outputs.skip != 'true'
         run: |
@@ -267,6 +285,7 @@ jobs:
         env:
           ITERATIONS: ${{ inputs.iterations }}
           FERRUM_IMAGE: ferrum-edge:bench
+          FERRUM_BASELINE_IMAGE: ferrum-edge:baseline
         run: |
           mkdir -p results/${{ matrix.protocol }}
           for run in $(seq 1 "$ITERATIONS"); do
