@@ -53,6 +53,7 @@ mod error_classifier_tests;
 mod error_response_headers_tests;
 mod exclusive_proxy_bind_tests;
 mod forwarded_ownership_parity_tests;
+mod frontend_affinity_tests;
 mod frontend_h2_admission_tests;
 mod frontend_proxy_protocol_tests;
 mod fuzz_target_schedule_parity_tests;
