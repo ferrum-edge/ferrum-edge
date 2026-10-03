@@ -2722,6 +2722,69 @@ fn every_direct_h1_dispatch_awaits_through_the_sender_release() {
     );
 }
 
+/// Every direct hyper HTTP/1.1 dispatch (the sites above) refuses a request
+/// whose composed checkout/handoff bound has already elapsed BEFORE it calls
+/// `try_send_request` (GHSA-xcg4-wj3x-gjj2). hyper enqueues the request on the
+/// connection task synchronously, before any deadline around the response
+/// future is polled, so a bound checked only around the response wait lets an
+/// expired request reach the connection driver. The gate is the nearest
+/// preceding `handoff_bound.elapsed()` check in the same dispatch loop; its
+/// refusal arm returns, and nothing between that return and the enqueue awaits.
+#[test]
+fn every_direct_h1_dispatch_gates_its_handoff_on_the_composed_bound() {
+    const GATE: &str = "if let Some(source) = handoff_bound.elapsed() {";
+    let mut found = Vec::new();
+    for (path, text) in production_sources() {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut sites = 0;
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !line.contains(".try_send_request(") {
+                continue;
+            }
+            sites += 1;
+            let site = format!("{path}:{}", index + 1);
+            let gate = lines[..index]
+                .iter()
+                .rposition(|line| line.contains(GATE))
+                .unwrap_or_else(|| {
+                    panic!("{site}: a direct HTTP/1.1 dispatch must gate its handoff (GHSA-xcg4)")
+                });
+            assert!(
+                index - gate <= 40,
+                "{site}: the handoff gate must sit immediately before the enqueue"
+            );
+            let code: Vec<&str> = lines[gate..index]
+                .iter()
+                .copied()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect();
+            let refusal = code
+                .iter()
+                .position(|line| line.trim_start().starts_with("return "))
+                .unwrap_or_else(|| panic!("{site}: the handoff gate must refuse by returning"));
+            assert!(
+                !code[..refusal].iter().any(|line| line.contains("try_send_request")),
+                "{site}: the refusal must come before the enqueue"
+            );
+            assert!(
+                !code[refusal..].iter().any(|line| line.contains(".await")),
+                "{site}: nothing may await between the handoff gate and the synchronous enqueue"
+            );
+        }
+        if sites > 0 {
+            found.push((path, sites));
+        }
+    }
+    let expected: Vec<(String, usize)> = DIRECT_H1_DISPATCH_SITES
+        .iter()
+        .map(|(path, sites)| ((*path).to_string(), *sites))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the direct HTTP/1.1 dispatch sites changed; list the new site above"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Gateway-owned `x-consumer-*` consumer assertion namespace
 // ---------------------------------------------------------------------------

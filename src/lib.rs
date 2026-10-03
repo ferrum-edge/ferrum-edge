@@ -11419,6 +11419,103 @@ pub mod _test_support {
         crate::proxy::dispatch_phase_authorization_expiry(bound.0, auth)
     }
 
+    /// Which bound a backend connection checkout or request handoff is held to
+    /// (GHSA-xcg4-wj3x-gjj2).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BackendHandoffBoundSourceForTest {
+        /// The direct HTTP/1.1 response-header read bound.
+        ResponseHeader,
+        /// The protocol side of the composed dispatch-phase bound.
+        PhaseProtocol,
+        /// The admitted request's authorization lifetime.
+        Authorization,
+    }
+
+    fn backend_handoff_source_for_test(
+        source: crate::proxy::BackendHandoffBoundSource,
+    ) -> BackendHandoffBoundSourceForTest {
+        match source {
+            crate::proxy::BackendHandoffBoundSource::ResponseHeader => {
+                BackendHandoffBoundSourceForTest::ResponseHeader
+            }
+            crate::proxy::BackendHandoffBoundSource::PhaseProtocol => {
+                BackendHandoffBoundSourceForTest::PhaseProtocol
+            }
+            crate::proxy::BackendHandoffBoundSource::Authorization => {
+                BackendHandoffBoundSourceForTest::Authorization
+            }
+        }
+    }
+
+    /// A composed backend checkout/handoff bound (GHSA-xcg4-wj3x-gjj2).
+    #[derive(Clone, Copy, Debug)]
+    pub struct ComposedBackendHandoffBoundForTest(crate::proxy::BackendHandoffBound);
+
+    impl ComposedBackendHandoffBoundForTest {
+        /// The absolute instant every checkout and handoff is held to.
+        pub fn at(&self) -> Option<tokio::time::Instant> {
+            self.0.at
+        }
+
+        /// The bound `at` came from.
+        pub fn source(&self) -> BackendHandoffBoundSourceForTest {
+            backend_handoff_source_for_test(self.0.source)
+        }
+    }
+
+    /// Compose the production checkout/handoff bound from an absolute
+    /// response-header read bound and a composed dispatch-phase bound
+    /// (GHSA-xcg4-wj3x-gjj2).
+    pub fn compose_backend_handoff_bound_for_test(
+        response_header_at: Option<tokio::time::Instant>,
+        dispatch: &ComposedDispatchPhaseBoundForTest,
+    ) -> ComposedBackendHandoffBoundForTest {
+        ComposedBackendHandoffBoundForTest(crate::proxy::compose_backend_handoff_bound(
+            response_header_at,
+            dispatch.0,
+        ))
+    }
+
+    /// Await a controlled connection checkout under the production
+    /// checkout bound (GHSA-xcg4-wj3x-gjj2). `Err` names the bound that ended
+    /// it; the checkout future has then been dropped.
+    pub async fn await_backend_checkout_bound_for_test<F>(
+        bound: &ComposedBackendHandoffBoundForTest,
+        checkout: F,
+    ) -> Result<F::Output, BackendHandoffBoundSourceForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::proxy::await_backend_handoff_bound(bound.0, checkout)
+            .await
+            .map_err(backend_handoff_source_for_test)
+    }
+
+    /// Outcome of the production handoff gate (GHSA-xcg4-wj3x-gjj2).
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum BackendHandoffGateOutcomeForTest<R> {
+        /// The bound had time left: the request was handed to `enqueue`.
+        Enqueued(R),
+        /// The bound had elapsed: `enqueue` was never called.
+        Refused(BackendHandoffBoundSourceForTest),
+    }
+
+    /// Run the production fail-closed handoff gate in front of a fake send
+    /// adapter (GHSA-xcg4-wj3x-gjj2): `enqueue` stands in for hyper's
+    /// synchronous `try_send_request` / `send_request` and is called only when
+    /// the composed bound still has time left.
+    pub fn backend_handoff_gate_for_test<R>(
+        bound: &ComposedBackendHandoffBoundForTest,
+        enqueue: impl FnOnce() -> R,
+    ) -> BackendHandoffGateOutcomeForTest<R> {
+        match bound.0.elapsed() {
+            Some(source) => {
+                BackendHandoffGateOutcomeForTest::Refused(backend_handoff_source_for_test(source))
+            }
+            None => BackendHandoffGateOutcomeForTest::Enqueued(enqueue()),
+        }
+    }
+
     /// Attribute an ALREADY-COMPOSED dispatch-phase bound whose winning source
     /// is the admitted stream's authorization lifetime (issue #3815). This is
     /// the shape the typed composers (`authorization_bounded_header_deadline`,

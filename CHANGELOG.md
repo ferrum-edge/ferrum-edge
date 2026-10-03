@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Backend connection checkout and request handoff are held to the
+  authorization lifetime** (GHSA-xcg4-wj3x-gjj2; regression from the direct
+  HTTP/1.1 pool, #5961). The direct HTTP/1.1 pool checked out its connection
+  (pool wait, dial, TLS handshake) under the response-header and client RPC
+  deadlines only, and composed the request's authorization lifetime only
+  after the checkout. A credential that expired while the checkout was
+  stalled therefore did not end the request, and because hyper enqueues the
+  request on its connection task synchronously, before any wait on the
+  response is polled, a request whose credential had already expired could
+  be handed to the connection and reach the backend. The plan is now composed
+  before the first checkout and bounds the checkout and its idle-race replay
+  at the same absolute instant, and it is re-checked immediately before the
+  request is enqueued, so an expired request is refused with nothing sent.
+  The expiry is reported as the gateway's own health-neutral authorization
+  decision (the fixed pre-commitment terminal and one `credential_expired` /
+  `authenticated_stream_max_lifetime` count), never as a `504` or a client
+  RPC deadline; an earlier client or operator bound keeps its own terminal.
+  The same checkout bound and handoff gate now also cover the Unix-socket
+  HTTP/1.1 pool, the HBONE inner HTTP/1.1 lease (CONNECT and inner
+  handshake), and the direct-H2 sender acquisition. Unauthenticated requests
+  are unchanged.
+
 ### Fixed
 
 - The scheduled Fuzz sanitizer lane (`fuzz.yml`) no longer loses its hosted
