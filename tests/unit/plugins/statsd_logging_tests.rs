@@ -1166,6 +1166,60 @@ async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
 }
 
 #[tokio::test]
+async fn test_statsd_max_batch_lines_counts_transaction_records_not_metric_lines() {
+    // `max_batch_lines` is the shared batching logger's threshold over queued
+    // transaction payloads. One summary renders several newline-separated metric
+    // lines, so a line-count threshold would flush after the very first record.
+    // With a long timer, a threshold of two records must hold the first record
+    // (many lines, one payload) and flush once the second arrives.
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let port = socket.local_addr().expect("local addr").port();
+
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": port,
+            "prefix": "ferrum",
+            "flush_interval_ms": 600000,
+            "max_batch_lines": 2
+        }),
+        default_client(),
+    )
+    .expect("construct statsd");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let summary = create_test_transaction_summary();
+    plugin.log(&summary).await;
+
+    // The single record renders multiple metric lines but is one queued
+    // payload: the two-record threshold must not have flushed yet.
+    let mut buf = [0u8; 4096];
+    let early = timeout(Duration::from_millis(250), socket.recv_from(&mut buf)).await;
+    assert!(
+        !matches!(early, Ok(Ok(_))),
+        "size flush must count transaction records, not the metric lines inside one record"
+    );
+
+    // The second record reaches the record threshold and flushes both payloads.
+    // A batch larger than the UDP payload ceiling is split on newline
+    // boundaries, so drain every datagram and count across the whole batch.
+    plugin.log(&summary).await;
+    let mut all = String::new();
+    while let Ok(Ok((n, _))) = timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await
+    {
+        all.push_str(std::str::from_utf8(&buf[..n]).expect("utf8"));
+    }
+    assert_eq!(
+        all.matches("ferrum.request.count:1|c").count(),
+        2,
+        "both transaction records must be flushed together: {all}"
+    );
+}
+
+#[tokio::test]
 async fn test_statsd_ws_disconnect_collector_emits_session_once() {
     // #2555 composition evidence: core H1 Upgrade, H2 Extended CONNECT, and
     // native H3 paths already dispatch `on_ws_disconnect` exactly once to
