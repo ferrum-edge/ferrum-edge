@@ -675,7 +675,22 @@ fn write_grpc_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize)
 pub struct GrpcConnectionPool {
     pool: Arc<GenericPool<GrpcPoolManager>>,
     rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// Shard keys whose affinity or spill create failed recently, with the
+    /// failure time (issue #5588). Until [`SHARD_CREATE_BACKOFF`] passes, a
+    /// missing or closed shard listed here is treated like any other missing
+    /// shard: the probe borrows a ready neighbour instead of dialling again on
+    /// every call (a DestinationRule `maxConnections` below the shard count,
+    /// or a backend refusing new connections). Consulted only when the
+    /// preferred shard is missing or closed.
+    shard_create_backoff: Arc<DashMap<String, std::time::Instant>>,
 }
+
+/// How long a failed affinity or spill shard create keeps that shard on the
+/// borrow path before it is dialled again.
+const SHARD_CREATE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Above this many entries, recording a failure first drops expired ones.
+const SHARD_CREATE_BACKOFF_RETAIN_ABOVE: usize = 4096;
 
 #[derive(Clone)]
 struct GrpcPoolManager {
@@ -770,6 +785,7 @@ impl GrpcConnectionPool {
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
+            shard_create_backoff: Arc::new(DashMap::with_shard_amount(shards)),
         }
     }
 
@@ -982,6 +998,37 @@ impl GrpcConnectionPool {
         self.rr_counters.len()
     }
 
+    /// Shard keys currently backed off after a failed affinity or spill
+    /// create.
+    #[allow(dead_code)] // exercised from integration tests
+    pub fn shard_create_backoff_len(&self) -> usize {
+        self.shard_create_backoff.len()
+    }
+
+    /// Whether the shard `key` failed an affinity or spill create within
+    /// [`SHARD_CREATE_BACKOFF`]. An expired entry is removed.
+    fn shard_create_backed_off(&self, key: &str) -> bool {
+        let failed_at = match self.shard_create_backoff.get(key) {
+            Some(entry) => *entry.value(),
+            None => return false,
+        };
+        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
+            return true;
+        }
+        self.shard_create_backoff
+            .remove_if(key, |_, at| at.elapsed() >= SHARD_CREATE_BACKOFF);
+        false
+    }
+
+    fn record_shard_create_failure(&self, key: &str) {
+        if self.shard_create_backoff.len() > SHARD_CREATE_BACKOFF_RETAIN_ABOVE {
+            self.shard_create_backoff
+                .retain(|_, at| at.elapsed() < SHARD_CREATE_BACKOFF);
+        }
+        self.shard_create_backoff
+            .insert(key.to_owned(), std::time::Instant::now());
+    }
+
     #[allow(dead_code)] // exercised from unit tests
     pub fn contains_rr_counter(&self, key: &str) -> bool {
         self.rr_counters.contains_key(key)
@@ -1063,8 +1110,9 @@ impl GrpcConnectionPool {
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
         // Phase 1 (synchronous): build the pool key in the thread-local
-        // buffer, pick a starting shard via the per-host RR counter, and
-        // probe every shard for an immediately-ready sender. On a cache hit
+        // buffer, pick a starting shard (the frontend connection's affinity
+        // shard, or the per-host RR counter), and probe the shards for an
+        // immediately-ready sender. On a cache hit
         // we return early without ever cloning the key. On a miss we clone
         // the buffer once into `selected_key` so the await below has an
         // owned String to hand to `create_or_get_existing_owned`.
@@ -1077,20 +1125,37 @@ impl GrpcConnectionPool {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> GrpcPhase1 {
                 let base_len = key_buf.len();
 
+                // Where the probe starts (issue #5588, `frontend_affinity`): an
+                // HTTP/2 frontend connection under its affinity bound goes to its
+                // own shard, and one over it spills to the round-robin shard;
+                // both create their shard when it is missing or closed rather
+                // than borrowing a neighbour, so the pool still widens. A call
+                // with no frontend connection in scope keeps the original
+                // round-robin probe below.
+                //
                 // Round-robin counter is per-host, but on FIRST access we seed it
                 // with a thread-local PRNG offset so a burst of concurrent
                 // requests on a cold pool does not land all on shard 0 before
                 // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
                 // Relaxed)` is wait-free after the seed — the seed only matters
                 // for the first `shard_count` picks per host on this gateway.
-                let start = crate::profile_pool_sync!(Rr, {
-                    let rr = crate::proxy::http2_pool::get_or_seed_rr_counter(
-                        &self.rr_counters,
-                        &key_buf[..base_len],
-                        svid_generation,
-                        &self.pool.manager().backend_svid_generation,
-                    );
-                    rr.fetch_add(1, Ordering::Relaxed) % shard_count
+                let (start, create_if_missing) = crate::profile_pool_sync!(Rr, {
+                    use crate::proxy::frontend_affinity::{ShardStart, shard_start};
+                    match shard_start(shard_count) {
+                        ShardStart::Affinity(shard) => (shard, true),
+                        preference => {
+                            let rr = crate::proxy::http2_pool::get_or_seed_rr_counter(
+                                &self.rr_counters,
+                                &key_buf[..base_len],
+                                svid_generation,
+                                &self.pool.manager().backend_svid_generation,
+                            );
+                            (
+                                rr.fetch_add(1, Ordering::Relaxed) % shard_count,
+                                preference == ShardStart::Spill,
+                            )
+                        }
+                    }
                 });
 
                 // Cheap probe pass — any shard whose cached sender is
@@ -1103,9 +1168,8 @@ impl GrpcConnectionPool {
                     Self::write_shard_key_inplace(key_buf, base_len, shard);
 
                     crate::profile_pool_event!(Probe);
-                    if let Some(mut sender) =
-                        crate::profile_pool_sync!(Probe, self.pool.cached(key_buf))
-                    {
+                    let cached = crate::profile_pool_sync!(Probe, self.pool.cached(key_buf));
+                    if let Some(mut sender) = cached {
                         match crate::profile_pool_ready!(futures_util::FutureExt::now_or_never(
                             sender.ready()
                         )) {
@@ -1115,18 +1179,25 @@ impl GrpcConnectionPool {
                             }
                             Some(Err(_)) => {
                                 self.pool.invalidate(key_buf);
+                                // A closed preferred shard is recreated, as a
+                                // missing one is below.
+                                if offset == 0
+                                    && create_if_missing
+                                    && !self.shard_create_backed_off(key_buf)
+                                {
+                                    break;
+                                }
                             }
-                            // Shard exists but is mid-send. Skip — `now_or_never`
-                            // only wins on an immediately-ready sender, so a
-                            // busy-but-healthy shard falls through to phase 2.
-                            // There `create_or_get_existing_owned` checks
-                            // `cached()` first; the existing sender is still
-                            // healthy (`!is_closed()`), so the create closure
-                            // never runs and the pool does NOT grow beyond the
-                            // shard ring. Callers queue on H2 readiness /
-                            // stream-cap backpressure instead of spawning a fresh
-                            // connection. This immediate probe is intentional —
-                            // there is no operator-configurable wait on this path.
+                            // Not ready yet. A hyper HTTP/2 sender reports
+                            // ready whenever its connection is open, however
+                            // many streams it carries, so this arm is not a
+                            // load signal (the affinity bound above is what
+                            // limits one client's share of a shard). Skip — it
+                            // falls through to phase 2, where
+                            // `create_or_get_existing_owned` checks `cached()`
+                            // first; the existing sender is still healthy
+                            // (`!is_closed()`), so the create closure never runs
+                            // and the pool does NOT grow beyond the shard ring.
                             None => {
                                 #[cfg(feature = "bench-pool-profile")]
                                 {
@@ -1134,6 +1205,15 @@ impl GrpcConnectionPool {
                                 }
                             }
                         }
+                    } else if offset == 0
+                        && create_if_missing
+                        && !self.shard_create_backed_off(key_buf)
+                    {
+                        // The preferred shard does not exist yet: create it
+                        // rather than borrow a neighbour (coalesced per key, so
+                        // at most one connection per shard). A shard whose
+                        // create failed recently is borrowed around instead.
+                        break;
                     }
                 }
 
@@ -1150,11 +1230,12 @@ impl GrpcConnectionPool {
                     selected_key: key_buf.clone(),
                     base_len,
                     start,
+                    create_if_missing,
                 }
             })
         });
 
-        let (selected_key, base_len, start) = match phase1 {
+        let (selected_key, base_len, start, create_if_missing) = match phase1 {
             GrpcPhase1::Hit(sender) => {
                 crate::plugins::otel_tracing::note_backend_connection_reused();
                 return Ok(sender);
@@ -1163,7 +1244,8 @@ impl GrpcConnectionPool {
                 selected_key,
                 base_len,
                 start,
-            } => (selected_key, base_len, start),
+                create_if_missing,
+            } => (selected_key, base_len, start, create_if_missing),
         };
 
         crate::profile_pool_event!(Fallback);
@@ -1201,6 +1283,12 @@ impl GrpcConnectionPool {
                 crate::profile_pool_event!(Recovery);
                 let recovered = self.with_pool_key(proxy, svid_generation, |key_buf| {
                     debug_assert_eq!(key_buf.len(), base_len);
+                    if create_if_missing {
+                        // Back the failed affinity/spill shard off so the next
+                        // calls borrow instead of dialling it again.
+                        Self::write_shard_key_inplace(key_buf, base_len, start);
+                        self.record_shard_create_failure(key_buf);
+                    }
                     for offset in 1..shard_count {
                         let shard = (start + offset) % shard_count;
                         Self::write_shard_key_inplace(key_buf, base_len, shard);
@@ -1233,6 +1321,9 @@ enum GrpcPhase1 {
     /// `start` so the post-await error fallback can reconstruct shard
     /// keys without recomputing them.
     Miss {
+        /// Whether the start shard is an affinity or spill target, whose
+        /// failed create is backed off.
+        create_if_missing: bool,
         selected_key: String,
         base_len: usize,
         start: usize,

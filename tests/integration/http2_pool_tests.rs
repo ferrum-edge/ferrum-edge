@@ -2215,6 +2215,297 @@ async fn pool_profile_live_h2_grpc_hit_miss_and_purpose_attribution() {
     assert_eq!(grpc.pool_size(), 1);
 }
 
+// ── gRPC backend-shard affinity (issue #5588) ───────────────────────────────
+
+fn affinity_grpc_pool(shards: usize) -> GrpcConnectionPool {
+    GrpcConnectionPool::new(
+        PoolConfig {
+            http2_connections_per_host: shards,
+            ..PoolConfig::default()
+        },
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    )
+}
+
+fn affinity_slot_table() -> &'static ferrum_edge::proxy::frontend_affinity::SlotTable {
+    Box::leak(Box::new(
+        ferrum_edge::proxy::frontend_affinity::SlotTable::new(),
+    ))
+}
+
+/// h2c backend that counts accepts and can drop every live connection.
+async fn start_closable_h2c_backend() -> (
+    u16,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+) {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind h2c backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task_accepted = Arc::clone(&accepted);
+    let task_connections = Arc::clone(&connections);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            task_accepted.fetch_add(1, Ordering::Relaxed);
+            let served = tokio::spawn(async move {
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+            if let Ok(mut connections) = task_connections.lock() {
+                connections.push(served.abort_handle());
+            }
+        }
+    });
+    (port, accepted, connections)
+}
+
+#[tokio::test]
+async fn test_grpc_pool_affinity_keeps_each_frontend_connection_on_its_own_shard() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    let (port, accepted) = start_counting_h2c_backend().await;
+    let pool = affinity_grpc_pool(4);
+    let proxy = h2c_proxy_with_max_connections(port, None);
+    let table = affinity_slot_table();
+
+    // Every call of one frontend connection lands on its one shard.
+    let first = FrontendConnectionAffinity::with_table(table);
+    let first_stream = first.open_stream();
+    for _ in 0..8 {
+        first_stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("affinity sender");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+
+    // A second connection has its own shard, which is created rather than a
+    // ready neighbour borrowed, so the pool widens as connections arrive.
+    let second = FrontendConnectionAffinity::with_table(table);
+    let second_stream = second.open_stream();
+    for _ in 0..4 {
+        second_stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("second affinity sender");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+
+    // Calls with no frontend connection keep the round-robin probe, which
+    // borrows an existing ready shard on a warm pool.
+    for _ in 0..8 {
+        pool.get_sender(&proxy).await.expect("unscoped sender");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn test_grpc_pool_affinity_spills_a_heavy_connection_and_widens_the_pool() {
+    use ferrum_edge::proxy::frontend_affinity::{
+        AFFINITY_MAX_OPEN_STREAMS, FrontendConnectionAffinity,
+    };
+    let (port, accepted) = start_counting_h2c_backend().await;
+    let pool = affinity_grpc_pool(4);
+    let proxy = h2c_proxy_with_max_connections(port, None);
+    let heavy = FrontendConnectionAffinity::with_table(affinity_slot_table());
+
+    // Over the bound, calls spill round-robin and create the missing shards,
+    // so one busy client connection is not pinned to one backend connection.
+    let streams: Vec<_> = (0..=AFFINITY_MAX_OPEN_STREAMS)
+        .map(|_| heavy.open_stream())
+        .collect();
+    for _ in 0..16 {
+        streams[0]
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("spilled sender");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 4);
+
+    // Back under the bound, calls return to the connection's shard.
+    drop(streams);
+    let stream = heavy.open_stream();
+    for _ in 0..4 {
+        stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("affinity sender");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 4);
+}
+
+#[tokio::test]
+async fn test_grpc_pool_affinity_recreates_a_closed_preferred_shard() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    let (port, accepted, connections) = start_closable_h2c_backend().await;
+    let pool = affinity_grpc_pool(4);
+    let proxy = h2c_proxy_with_max_connections(port, None);
+    let table = affinity_slot_table();
+
+    // Shard 0 for the first frontend connection, and a healthy sibling shard 1
+    // for a second one.
+    let first = FrontendConnectionAffinity::with_table(table);
+    let first_stream = first.open_stream();
+    let sender = first_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("first affinity sender");
+    let second = FrontendConnectionAffinity::with_table(table);
+    let second_stream = second.open_stream();
+    second_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("second affinity sender");
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+
+    // Close only shard 0's backend connection (the first one accepted).
+    connections
+        .lock()
+        .expect("connection handles")
+        .first()
+        .expect("first backend connection")
+        .abort();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sender.is_closed() {
+        assert!(
+            Instant::now() < deadline,
+            "backend close was never observed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The closed preferred shard is recreated in place rather than the ready
+    // sibling borrowed.
+    let replacement = first_stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("recreated affinity sender");
+    assert!(!replacement.is_closed());
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+}
+
+/// h2c backend that serves connections until `stall` is set, then accepts and
+/// holds new connections without ever speaking HTTP/2.
+async fn start_stallable_h2c_backend() -> (u16, Arc<AtomicUsize>, Arc<std::sync::atomic::AtomicBool>)
+{
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind h2c backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task_accepted = Arc::clone(&accepted);
+    let task_stall = Arc::clone(&stall);
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            task_accepted.fetch_add(1, Ordering::Relaxed);
+            if task_stall.load(Ordering::Relaxed) {
+                held.push(socket);
+                continue;
+            }
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    });
+    (port, accepted, stall)
+}
+
+#[tokio::test]
+async fn test_grpc_pool_affinity_backs_off_a_shard_whose_create_failed() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    let (port, accepted, stall) = start_stallable_h2c_backend().await;
+    let pool = affinity_grpc_pool(4);
+    let mut proxy = h2c_proxy_with_max_connections(port, None);
+    proxy.backend_connect_timeout_ms = 300;
+    let table = affinity_slot_table();
+
+    let first = FrontendConnectionAffinity::with_table(table);
+    first
+        .open_stream()
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("first affinity sender");
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+
+    // New backend connections now stall until the connect timeout. The second
+    // frontend connection's own shard cannot be created: its first call pays
+    // one failed dial and then borrows the ready shard.
+    stall.store(true, Ordering::Relaxed);
+    let second = FrontendConnectionAffinity::with_table(table);
+    let stream = second.open_stream();
+    stream
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("borrowed sender after a failed create");
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(pool.shard_create_backoff_len(), 1);
+
+    // Later calls borrow straight away instead of dialling (and stalling)
+    // again on every call.
+    let started = Instant::now();
+    for _ in 0..10 {
+        stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("borrowed sender during backoff");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "calls during the backoff must not wait on a dial"
+    );
+}
+
+#[tokio::test]
+async fn test_grpc_pool_affinity_under_a_connection_cap_borrows_without_redialling() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    let (port, accepted) = start_counting_h2c_backend().await;
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = affinity_grpc_pool(4);
+    pool.attach_backend_conn_limit(Arc::clone(&limiter));
+    let proxy = h2c_proxy_with_max_connections(port, Some(1));
+    let table = affinity_slot_table();
+
+    let first = FrontendConnectionAffinity::with_table(table);
+    first
+        .open_stream()
+        .run(pool.get_sender(&proxy))
+        .await
+        .expect("first affinity sender");
+
+    // DestinationRule `maxConnections: 1` with 4 shards: the second frontend
+    // connection's own shard can never be created. Its calls are served by the
+    // admitted connection, and after the first refusal they stop re-attempting
+    // the create.
+    let second = FrontendConnectionAffinity::with_table(table);
+    let stream = second.open_stream();
+    for _ in 0..10 {
+        stream
+            .run(pool.get_sender(&proxy))
+            .await
+            .expect("capped destination keeps serving on the admitted connection");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(limiter.current("maxconn-h2c.test", port), 1);
+    assert_eq!(pool.shard_create_backoff_len(), 1);
+}
+
 /// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A
 /// checked-out connection whose request bound elapsed before the handoff never
 /// carried the request, so the gate refuses it and returns it to the idle set
