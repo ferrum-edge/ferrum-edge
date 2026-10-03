@@ -1155,6 +1155,58 @@ run_bench() {
         python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
             --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation start
     fi
+    local perf_bg=""
+    local perf_bin=""
+    perf_bin=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1)
+    if [ -n "${PERF_PROFILE:-}" ] && [ "$target" = gateway ] && [ -n "$GATEWAY_CID" ] && [ -n "$perf_bin" ]; then
+        local gpid window
+        gpid=$(docker inspect -f '{{.State.Pid}}' "$GATEWAY_CID")
+        window=$(( DURATION / 3 > 3 ? DURATION / 3 : 3 ))
+        mkdir -p "$OUTPUT_DIR/perf"
+        (
+            sleep "$window"
+            sudo "$perf_bin" stat -a -e cpu-clock,context-switches -o "$OUTPUT_DIR/perf/${gateway}_${payload}_systemwide_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_recvfrom,syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg,syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_sendto,syscalls:sys_enter_sendmsg,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_futex,syscalls:sys_enter_sched_yield,cpu-migrations -p "$gpid" \
+                -o "$OUTPUT_DIR/perf/${gateway}_${payload}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            local bpid cpid
+            bpid=$(pgrep -x proto_backend | head -1)
+            cpid=$(pgrep -x proto_bench | head -1)
+            [ -n "$bpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_recvfrom,syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg,syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_sendto,syscalls:sys_enter_sendmsg,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_futex -p "$bpid" \
+                -o "$OUTPUT_DIR/perf/${gateway}_${payload}_backendproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            [ -n "$cpid" ] && sudo "$perf_bin" stat -e task-clock,context-switches,raw_syscalls:sys_enter,syscalls:sys_enter_read,syscalls:sys_enter_recvfrom,syscalls:sys_enter_readv,syscalls:sys_enter_recvmsg,syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_sendto,syscalls:sys_enter_sendmsg,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_futex -p "$cpid" \
+                -o "$OUTPUT_DIR/perf/${gateway}_${payload}_clientproc_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            # Read/write size histograms per process (experiment): how many
+            # syscalls and bytes per syscall each side of the gateway sees.
+            if [ -z "${PERF_STAT_ONLY:-}" ] && command -v bpftrace >/dev/null 2>&1 && [ -n "$bpid" ] && [ -n "$cpid" ]; then
+                local bt=""
+                local role rpid
+                for role in gw:$gpid backend:$bpid client:$cpid; do
+                    rpid=${role#*:}; role=${role%%:*}
+                    bt+="tracepoint:syscalls:sys_exit_read,tracepoint:syscalls:sys_exit_recvfrom,tracepoint:syscalls:sys_exit_readv,tracepoint:syscalls:sys_exit_recvmsg /pid == $rpid && args.ret > 0/ { @${role}_rd[probe] = hist(args.ret); @${role}_rd_bytes = sum(args.ret); }
+"
+                    bt+="tracepoint:syscalls:sys_exit_read,tracepoint:syscalls:sys_exit_recvfrom,tracepoint:syscalls:sys_exit_readv,tracepoint:syscalls:sys_exit_recvmsg /pid == $rpid && args.ret == -11/ { @${role}_rd_eagain = count(); }
+"
+                    bt+="tracepoint:syscalls:sys_exit_write,tracepoint:syscalls:sys_exit_writev,tracepoint:syscalls:sys_exit_sendto,tracepoint:syscalls:sys_exit_sendmsg /pid == $rpid && args.ret > 0/ { @${role}_wr[probe] = hist(args.ret); @${role}_wr_bytes = sum(args.ret); }
+"
+                done
+                bt+="interval:s:$window { exit(); }
+"
+                printf '%s' "$bt" > "/tmp/bt_${gateway}_${payload}.bt"
+                sudo bpftrace "/tmp/bt_${gateway}_${payload}.bt" > "$OUTPUT_DIR/perf/${gateway}_${payload}_iosizes.txt" 2>&1 &
+            fi
+            if [ -z "${PERF_STAT_ONLY:-}" ] && [ "$gateway" = ferrum ]; then
+                # On-CPU call graphs (the experiment image is built with frame
+                # pointers) plus an off-CPU view: every context switch-out of a
+                # gateway thread with the user stack it blocked in.
+                sudo "$perf_bin" record -F 997 -g -p "$gpid" -o "/tmp/perf_${gateway}_${payload}.data" \
+                    -- sleep "$window" >/dev/null 2>&1 &
+                sudo "$perf_bin" record -e sched:sched_switch -g -p "$gpid" -o "/tmp/perfoff_${gateway}_${payload}.data" \
+                    -- sleep "$window" >/dev/null 2>&1 &
+            fi
+            wait
+        ) &
+        perf_bg=$!
+    fi
     if [ "$H1_PROFILE" = diagnostic ]; then
         # Write directly to retained raw stdout so campaign termination during
         # the client/readers/logging cannot lose the original partial output.
@@ -1188,6 +1240,30 @@ run_bench() {
         python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
             --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation end --exit-code "$rc"
     fi
+    if [ -n "$perf_bg" ]; then
+        wait "$perf_bg" || true
+        sudo chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR/perf" || true
+        local reqs
+        reqs=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('total_requests',0))" "$out" 2>/dev/null || echo 0)
+        for f in "$OUTPUT_DIR/perf/${gateway}_${payload}"_*stat.txt; do
+            echo "total_requests_full_run=$reqs duration=$DURATION" >> "$f"
+        done
+        if [ -f "/tmp/perf_${gateway}_${payload}.data" ]; then
+            sudo "$perf_bin" report -i "/tmp/perf_${gateway}_${payload}.data" --no-children --sort symbol --stdio 2>/dev/null \
+                | grep -v '^#' | grep -v '^$' | head -150 | cut -c1-200 > "$OUTPUT_DIR/perf/${gateway}_${payload}_symbols.txt" || true
+            sudo "$perf_bin" report -i "/tmp/perf_${gateway}_${payload}.data" --no-children --sort dso --stdio 2>/dev/null \
+                | grep -v '^#' | grep -v '^$' | head -20 > "$OUTPUT_DIR/perf/${gateway}_${payload}_dso.txt" || true
+            sudo "$perf_bin" script -i "/tmp/perf_${gateway}_${payload}.data" 2>/dev/null \
+                | python3 "$SCRIPT_DIR/perf_fold.py" | gzip > "$OUTPUT_DIR/perf/${gateway}_${payload}_oncpu_folded.txt.gz" || true
+            sudo rm -f "/tmp/perf_${gateway}_${payload}.data"
+        fi
+        if [ -f "/tmp/perfoff_${gateway}_${payload}.data" ]; then
+            sudo "$perf_bin" script -i "/tmp/perfoff_${gateway}_${payload}.data" 2>/dev/null \
+                | python3 "$SCRIPT_DIR/perf_fold.py" | gzip > "$OUTPUT_DIR/perf/${gateway}_${payload}_offcpu_folded.txt.gz" || true
+            sudo rm -f "/tmp/perfoff_${gateway}_${payload}.data"
+        fi
+    fi
+    true
     if [ -n "$sampler_pid" ]; then
         if [ -n "$sampler_stop_file" ]; then
             touch "$sampler_stop_file"

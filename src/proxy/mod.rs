@@ -23708,6 +23708,7 @@ async fn handle_tls_connection(
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = h1_framing_signals.clone();
     let service_h1_framing_signals = h1_framing_signals;
+    let frontend_connection = deferred_flush::next_frontend_connection();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
@@ -23746,15 +23747,18 @@ async fn handle_tls_connection(
             diagnostic_slot: None,
         };
         async move {
-            let mut response = handle_proxy_request_on_frontend_port(
-                req,
-                state,
-                addr,
-                true,
-                cert,
-                chain,
-                mtls_auth_connection_cache,
-                connection_metadata,
+            let mut response = deferred_flush::with_frontend_connection(
+                frontend_connection,
+                handle_proxy_request_on_frontend_port(
+                    req,
+                    state,
+                    addr,
+                    true,
+                    cert,
+                    chain,
+                    mtls_auth_connection_cache,
+                    connection_metadata,
+                ),
             )
             .await;
             apply_h1_framing_connection_close(&mut response, http1_framing_result);

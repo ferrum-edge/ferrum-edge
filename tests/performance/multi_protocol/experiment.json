@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "name": "5588-deferred-first-write",
+  "name": "5588-conn-affinity-deferred-write",
   "protocol": [
     "grpcs"
   ],
@@ -14,12 +14,12 @@
       "FERRUM_EXTRA_ENV": "FERRUM_BENCH_DEFER_FLUSH=frontend"
     },
     {
-      "gateway": "ferrum-exp-backend",
-      "FERRUM_EXTRA_ENV": "FERRUM_BENCH_DEFER_FLUSH=backend"
+      "gateway": "ferrum-exp-affinity",
+      "FERRUM_EXTRA_ENV": "FERRUM_BENCH_GRPC_CONN_AFFINITY=1"
     },
     {
-      "gateway": "ferrum-exp-both",
-      "FERRUM_EXTRA_ENV": "FERRUM_BENCH_DEFER_FLUSH=both"
+      "gateway": "ferrum-exp-affinity-frontend",
+      "FERRUM_EXTRA_ENV": "FERRUM_BENCH_GRPC_CONN_AFFINITY=1 FERRUM_BENCH_DEFER_FLUSH=frontend"
     }
   ]
 }

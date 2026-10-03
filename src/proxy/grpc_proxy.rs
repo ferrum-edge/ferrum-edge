@@ -1090,7 +1090,9 @@ impl GrpcConnectionPool {
                         svid_generation,
                         &self.pool.manager().backend_svid_generation,
                     );
-                    rr.fetch_add(1, Ordering::Relaxed) % shard_count
+                    let rr_start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+                    // EXPERIMENT (#5588): frontend-connection shard affinity.
+                    super::deferred_flush::affinity_shard(shard_count).unwrap_or(rr_start)
                 });
 
                 // Cheap probe pass — any shard whose cached sender is

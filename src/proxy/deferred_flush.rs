@@ -115,3 +115,37 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for DeferredFlushIo<T> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
+
+/// EXPERIMENT ONLY (not for merge): `FERRUM_BENCH_GRPC_CONN_AFFINITY=1` starts
+/// a gRPC request's backend shard probe at the shard its frontend connection
+/// maps to, so one frontend connection's streams share a backend connection.
+static GRPC_CONN_AFFINITY: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("FERRUM_BENCH_GRPC_CONN_AFFINITY").as_deref() == Ok("1"));
+
+static NEXT_FRONTEND_CONNECTION: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+tokio::task_local! {
+    static FRONTEND_CONNECTION: usize;
+}
+
+/// A fresh frontend connection number, or `None` when affinity is off.
+pub(crate) fn next_frontend_connection() -> Option<usize> {
+    GRPC_CONN_AFFINITY
+        .then(|| NEXT_FRONTEND_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Run a request future with its frontend connection number in scope.
+pub(crate) async fn with_frontend_connection<F: Future>(id: Option<usize>, fut: F) -> F::Output {
+    match id {
+        Some(id) => FRONTEND_CONNECTION.scope(id, fut).await,
+        None => fut.await,
+    }
+}
+
+/// The affinity shard for the current request, if affinity is on.
+pub(crate) fn affinity_shard(shard_count: usize) -> Option<usize> {
+    FRONTEND_CONNECTION
+        .try_with(|id| *id % shard_count.max(1))
+        .ok()
+}
