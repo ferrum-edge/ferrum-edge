@@ -1208,13 +1208,10 @@ async fn test_statsd_max_batch_lines_counts_transaction_records_not_metric_lines
     // boundaries, so drain every datagram and count across the whole batch.
     plugin.log(&summary).await;
     let mut all = String::new();
-    loop {
-        match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => {
-                all.push_str(std::str::from_utf8(&buf[..n]).expect("utf8"));
-            }
-            _ => break,
-        }
+    while let Ok(Ok((n, _))) =
+        timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await
+    {
+        all.push_str(std::str::from_utf8(&buf[..n]).expect("utf8"));
     }
     assert_eq!(
         all.matches("ferrum.request.count:1|c").count(),
