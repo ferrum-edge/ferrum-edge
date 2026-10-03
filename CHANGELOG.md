@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
+  entry generation it selected. A concurrent same-key refresh survives the cleanup
+  pass instead of being removed as stale. The expired-entry lookup path also removes
+  only the generation it observed, so a fresh same-key store survives there too.
+
 - **`response_mock` preserves mixed-case extension method spelling** (#5972).
   The constructor folded every configured `method` token to uppercase, so a
   valid case-sensitive extension method (for example `Foo`) was stored as `FOO`
