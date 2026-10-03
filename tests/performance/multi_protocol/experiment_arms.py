@@ -65,7 +65,10 @@ def parse_env(env):
         if key == "FERRUM_LOG_LEVEL" and value in ("warn,ferrum_h2_observe=debug",
                 "warn,ferrum_h2_observe=debug,ferrum_h2_guard=debug"):
             valid = True
-        if not separator or not re.fullmatch(r"FERRUM_[A-Z0-9_]+", key) or not valid:
+        # EXPERIMENT ONLY (not for merge): jemalloc runtime options.
+        if key == "_RJEM_MALLOC_CONF" and re.fullmatch(r"[a-z_]+:[a-z0-9]+(,[a-z_]+:[a-z0-9]+)*", value):
+            valid = True
+        if not separator or not (re.fullmatch(r"FERRUM_[A-Z0-9_]+", key) or key == "_RJEM_MALLOC_CONF") or not valid:
             raise ValueError("environment must contain literal space-separated KEY=VALUE entries")
         if key in result:
             raise ValueError("duplicate environment key")
