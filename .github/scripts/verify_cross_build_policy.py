@@ -39,16 +39,15 @@ EXPECTED_PRE_BUILD_COMMANDS = (
     "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/"
     "protoc-25.1-linux-x86_64.zip && unzip -o /tmp/protoc.zip -d /usr/local "
     "bin/protoc && chmod +x /usr/local/bin/protoc && rm /tmp/protoc.zip",
-    # Retry the key download and refuse an empty or non-PGP response: `apt-key`
-    # accepts an empty stream, which turns a momentary apt.llvm.org outage into
-    # an unauthenticated-package failure one step later (issue #4978).
-    "wget --tries=5 --waitretry=5 -qO /tmp/llvm-snapshot.gpg.key "
-    "https://apt.llvm.org/llvm-snapshot.gpg.key && "
-    "grep -q -- '-----BEGIN PGP PUBLIC KEY BLOCK-----' /tmp/llvm-snapshot.gpg.key && "
-    "apt-key add /tmp/llvm-snapshot.gpg.key && rm /tmp/llvm-snapshot.gpg.key",
-    "add-apt-repository "
-    "'deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-6.0 main'",
-    "apt-get update && apt-get install --assume-yes clang-6.0 libclang-6.0-dev",
+    # bindgen's clang/libclang come from the image's own signed Ubuntu 16.04
+    # archive (`xenial-updates`, already in the base image's sources.list and
+    # refreshed by the second command), pinned to the exact frozen version. The
+    # release build fetches no third-party apt repository or key: apt.llvm.org
+    # was a release-time availability and supply-chain dependency (issue #5955,
+    # after the #4978 empty-key outage). The package installs libclang under
+    # /usr/lib/llvm-6.0/lib, the unchanged LIBCLANG_PATH passthrough.
+    "apt-get install --assume-yes 'clang-6.0=1:6.0-1ubuntu2~16.04.1' "
+    "'libclang-6.0-dev=1:6.0-1ubuntu2~16.04.1'",
 )
 EXPECTED_PASSTHROUGH = (
     "LIBCLANG_PATH=/usr/lib/llvm-6.0/lib",
@@ -19581,9 +19580,9 @@ def self_test() -> list[str]:
         "command before approved list": [unapproved, *expected],
         "command inserted fourth": [*expected[:3], unapproved, *expected[3:]],
         "command inserted between later entries": [
-            *expected[:5],
+            *expected[:4],
             unapproved,
-            *expected[5:],
+            *expected[4:],
         ],
         "command appended after approved list": [*expected, unapproved],
         "changed later command": changed_later,
