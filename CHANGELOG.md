@@ -119,10 +119,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- **Less per-request work on the native gRPC path** (#5588). Three per-request
-  costs from the gRPC 10 KiB profile, about 2% of gateway CPU together:
+- **Less per-request work in the request handler** (#5588). Three per-request
+  costs found in the gRPC 10 KiB profile, about 2% of gateway CPU together. The
+  first two apply to every protocol, the third to native gRPC dispatch:
   - the request's plugin view resolves its proxy/protocol entry once instead
-    of once per field (about 16 hashed map lookups per request);
+    of once per field (about 32 hashes per request);
   - the client IP is rendered without `core::fmt`;
   - the header merge before a gRPC dispatch compares each field by name and
     parses a `HeaderName` only to replace one, and reserves room for the

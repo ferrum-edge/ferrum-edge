@@ -752,8 +752,9 @@ pub fn merge_proxy_headers_preserving_repeated(
     }
 
     // Room for the gateway-added fields (`x-forwarded-*`, `te`) up front, so
-    // the inserts below do not regrow the map one entry at a time.
-    headers.reserve(proxy_headers.len().saturating_sub(headers.len()));
+    // the inserts below do not regrow the map one entry at a time. A hint
+    // only: past `HeaderMap`'s size limit the inserts below decide as before.
+    let _ = headers.try_reserve(proxy_headers.len().saturating_sub(headers.keys_len()));
     for (k, v) in proxy_headers {
         // Most fields are unchanged: compare first, and parse (and, for a
         // non-standard name, allocate) a `HeaderName` only to replace one.
