@@ -9,8 +9,9 @@
 //! than behind a gateway that keeps a downstream connection's streams on one
 //! upstream connection (as Envoy does per worker).
 //!
-//! An HTTP/2 frontend connection now takes a slot on its first request and
-//! holds it for its lifetime. Slots are taken least-loaded, so long-lived
+//! An HTTP/2 frontend connection (ALPN `h2`, prior-knowledge h2 over TLS, or
+//! h2c) now takes a slot on its first HTTP/2 request and holds it for its
+//! lifetime; HTTP/1.x connections allocate nothing. Slots are taken least-loaded, so long-lived
 //! connections stay spread evenly however many short-lived ones come and go.
 //! Each of its streams counts as open from the request until its response body
 //! ends or is dropped ([`FrontendStream`] rides in the response body), and runs
@@ -24,16 +25,28 @@
 //!   width as connections arrive.
 //! - Beyond that, the connection is heavy enough that one backend connection
 //!   (and its peer's `SETTINGS_MAX_CONCURRENT_STREAMS`) should not carry it
-//!   alone: the call spills to the round-robin shard, which is likewise created
-//!   if missing. A heavy connection therefore pins at most
-//!   [`AFFINITY_MAX_OPEN_STREAMS`] calls on any one shard and still widens the
-//!   pool.
+//!   alone: further calls spill to the round-robin shard, which is likewise
+//!   created if missing. A heavy connection therefore pins at most
+//!   [`AFFINITY_MAX_OPEN_STREAMS`] of its calls to its own shard; the rest are
+//!   spread round-robin over all shards (its own included), and it still
+//!   widens the pool.
+//! - A shard whose affinity or spill create just failed (a DestinationRule
+//!   `maxConnections` below the shard count, or a backend refusing new
+//!   connections) is borrowed around for a short backoff instead of being
+//!   dialled again on every call.
 //! - Calls with no frontend connection in scope (HTTP/1.1 and HTTP/3
 //!   frontends, spawned work) keep the original round-robin probe.
 //!
-//! An open hyper HTTP/2 sender always reports ready, so the pool cannot see a
-//! busy backend connection; the open-stream bound above is what keeps one
-//! client from monopolising one.
+//! An open hyper HTTP/2 sender always reports ready, and hyper does not expose
+//! the peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, so the pool cannot see a busy
+//! backend connection; the open-stream bound above is what keeps one client
+//! from monopolising one. The bound is per frontend connection, not per shard:
+//! several busy connections whose slots share a shard still share its backend
+//! connection (each with at most [`AFFINITY_MAX_OPEN_STREAMS`] affinity calls),
+//! and a backend that allows fewer concurrent streams than that can queue
+//! calls that round-robin would have spread. Slots are spread evenly over
+//! shard counts that divide [`SLOTS`] (the default 2, 4 and 8); other counts
+//! are slightly uneven once more than [`SLOTS`] HTTP/2 connections are live.
 //!
 //! The direct HTTP/2 pool keeps the round-robin start for every request: on the
 //! protocol benchmark the same affinity made HTTP/2 slower (up to about 20% at
@@ -160,6 +173,28 @@ impl FrontendConnectionAffinity {
     /// The connection's slot, once its first stream opened.
     pub fn slot(&self) -> Option<usize> {
         self.slot.get().map(FrontendConnectionSlot::slot)
+    }
+}
+
+/// A frontend connection's affinity state, allocated on its first HTTP/2
+/// request: HTTP/1.x connections never allocate it or take a slot.
+#[derive(Default)]
+pub struct LazyConnectionAffinity {
+    connection: OnceLock<Arc<FrontendConnectionAffinity>>,
+}
+
+impl LazyConnectionAffinity {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open a stream for a request of `version`; HTTP/1.x requests get none.
+    pub fn open_stream(&self, version: hyper::Version) -> Option<FrontendStream> {
+        (version == hyper::Version::HTTP_2).then(|| {
+            self.connection
+                .get_or_init(FrontendConnectionAffinity::new)
+                .open_stream()
+        })
     }
 }
 

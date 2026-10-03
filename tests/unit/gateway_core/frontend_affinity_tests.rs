@@ -5,8 +5,8 @@
 //! `tests/integration/http2_pool_tests.rs`.
 
 use ferrum_edge::proxy::frontend_affinity::{
-    AFFINITY_MAX_OPEN_STREAMS, FrontendConnectionAffinity, SLOTS, ShardStart, SlotTable,
-    shard_start,
+    AFFINITY_MAX_OPEN_STREAMS, FrontendConnectionAffinity, LazyConnectionAffinity, SLOTS,
+    ShardStart, SlotTable, shard_start,
 };
 
 fn table() -> &'static SlotTable {
@@ -147,11 +147,20 @@ fn short_lived_connections_do_not_skew_long_lived_ones() {
 }
 
 #[test]
+fn http1_requests_allocate_no_affinity_state() {
+    let connection = LazyConnectionAffinity::new();
+    assert!(connection.open_stream(hyper::Version::HTTP_11).is_none());
+    assert!(connection.open_stream(hyper::Version::HTTP_10).is_none());
+    let stream = connection.open_stream(hyper::Version::HTTP_2);
+    assert!(stream.is_some());
+}
+
+#[test]
 fn both_frontends_open_a_stream_per_http2_request_and_keep_it_with_the_body() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
     for needle in [
-        ".filter(|_| req.version() == hyper::Version::HTTP_2)",
-        ".map(frontend_affinity::FrontendConnectionAffinity::open_stream);",
+        "let connection_affinity = frontend_affinity::LazyConnectionAffinity::new();",
+        "let frontend_stream = connection_affinity.open_stream(req.version());",
         "Some(stream) => stream.run(request).await,",
         "response.map(|response| response.map(|body| body.with_frontend_stream(stream)));",
     ] {
@@ -161,9 +170,6 @@ fn both_frontends_open_a_stream_per_http2_request_and_keep_it_with_the_body() {
             "plaintext and TLS frontends must both carry `{needle}`"
         );
     }
-    assert!(
-        proxy.contains("tls_alpn_h2.then(frontend_affinity::FrontendConnectionAffinity::new);")
-    );
     let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
     assert!(grpc.contains("match shard_start(shard_count) {"));
 }

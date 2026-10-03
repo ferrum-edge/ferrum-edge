@@ -675,7 +675,22 @@ fn write_grpc_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize)
 pub struct GrpcConnectionPool {
     pool: Arc<GenericPool<GrpcPoolManager>>,
     rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// Shard keys whose affinity or spill create failed recently, with the
+    /// failure time (issue #5588). Until [`SHARD_CREATE_BACKOFF`] passes, a
+    /// missing or closed shard listed here is treated like any other missing
+    /// shard: the probe borrows a ready neighbour instead of dialling again on
+    /// every call (a DestinationRule `maxConnections` below the shard count,
+    /// or a backend refusing new connections). Consulted only when the
+    /// preferred shard is missing or closed.
+    shard_create_backoff: Arc<DashMap<String, std::time::Instant>>,
 }
+
+/// How long a failed affinity or spill shard create keeps that shard on the
+/// borrow path before it is dialled again.
+const SHARD_CREATE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Above this many entries, recording a failure first drops expired ones.
+const SHARD_CREATE_BACKOFF_RETAIN_ABOVE: usize = 4096;
 
 #[derive(Clone)]
 struct GrpcPoolManager {
@@ -770,6 +785,7 @@ impl GrpcConnectionPool {
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
+            shard_create_backoff: Arc::new(DashMap::with_shard_amount(shards)),
         }
     }
 
@@ -982,6 +998,37 @@ impl GrpcConnectionPool {
         self.rr_counters.len()
     }
 
+    /// Shard keys currently backed off after a failed affinity or spill
+    /// create.
+    #[allow(dead_code)] // exercised from integration tests
+    pub fn shard_create_backoff_len(&self) -> usize {
+        self.shard_create_backoff.len()
+    }
+
+    /// Whether the shard `key` failed an affinity or spill create within
+    /// [`SHARD_CREATE_BACKOFF`]. An expired entry is removed.
+    fn shard_create_backed_off(&self, key: &str) -> bool {
+        let failed_at = match self.shard_create_backoff.get(key) {
+            Some(entry) => *entry.value(),
+            None => return false,
+        };
+        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
+            return true;
+        }
+        self.shard_create_backoff
+            .remove_if(key, |_, at| at.elapsed() >= SHARD_CREATE_BACKOFF);
+        false
+    }
+
+    fn record_shard_create_failure(&self, key: &str) {
+        if self.shard_create_backoff.len() > SHARD_CREATE_BACKOFF_RETAIN_ABOVE {
+            self.shard_create_backoff
+                .retain(|_, at| at.elapsed() < SHARD_CREATE_BACKOFF);
+        }
+        self.shard_create_backoff
+            .insert(key.to_owned(), std::time::Instant::now());
+    }
+
     #[allow(dead_code)] // exercised from unit tests
     pub fn contains_rr_counter(&self, key: &str) -> bool {
         self.rr_counters.contains_key(key)
@@ -1134,7 +1181,10 @@ impl GrpcConnectionPool {
                                 self.pool.invalidate(key_buf);
                                 // A closed preferred shard is recreated, as a
                                 // missing one is below.
-                                if offset == 0 && create_if_missing {
+                                if offset == 0
+                                    && create_if_missing
+                                    && !self.shard_create_backed_off(key_buf)
+                                {
                                     break;
                                 }
                             }
@@ -1155,10 +1205,14 @@ impl GrpcConnectionPool {
                                 }
                             }
                         }
-                    } else if offset == 0 && create_if_missing {
+                    } else if offset == 0
+                        && create_if_missing
+                        && !self.shard_create_backed_off(key_buf)
+                    {
                         // The preferred shard does not exist yet: create it
                         // rather than borrow a neighbour (coalesced per key, so
-                        // at most one connection per shard).
+                        // at most one connection per shard). A shard whose
+                        // create failed recently is borrowed around instead.
                         break;
                     }
                 }
@@ -1176,11 +1230,12 @@ impl GrpcConnectionPool {
                     selected_key: key_buf.clone(),
                     base_len,
                     start,
+                    create_if_missing,
                 }
             })
         });
 
-        let (selected_key, base_len, start) = match phase1 {
+        let (selected_key, base_len, start, create_if_missing) = match phase1 {
             GrpcPhase1::Hit(sender) => {
                 crate::plugins::otel_tracing::note_backend_connection_reused();
                 return Ok(sender);
@@ -1189,7 +1244,8 @@ impl GrpcConnectionPool {
                 selected_key,
                 base_len,
                 start,
-            } => (selected_key, base_len, start),
+                create_if_missing,
+            } => (selected_key, base_len, start, create_if_missing),
         };
 
         crate::profile_pool_event!(Fallback);
@@ -1227,6 +1283,12 @@ impl GrpcConnectionPool {
                 crate::profile_pool_event!(Recovery);
                 let recovered = self.with_pool_key(proxy, svid_generation, |key_buf| {
                     debug_assert_eq!(key_buf.len(), base_len);
+                    if create_if_missing {
+                        // Back the failed affinity/spill shard off so the next
+                        // calls borrow instead of dialling it again.
+                        Self::write_shard_key_inplace(key_buf, base_len, start);
+                        self.record_shard_create_failure(key_buf);
+                    }
                     for offset in 1..shard_count {
                         let shard = (start + offset) % shard_count;
                         Self::write_shard_key_inplace(key_buf, base_len, shard);
@@ -1259,6 +1321,9 @@ enum GrpcPhase1 {
     /// `start` so the post-await error fallback can reconstruct shard
     /// keys without recomputing them.
     Miss {
+        /// Whether the start shard is an affinity or spill target, whose
+        /// failed create is backed off.
+        create_if_missing: bool,
         selected_key: String,
         base_len: usize,
         start: usize,
