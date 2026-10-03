@@ -5897,6 +5897,8 @@ mod tests {
         assert!(plugin.cache.contains_key("other"));
         assert_eq!(plugin.cache.len(), 2);
         assert_eq!(plugin.cache_budget_used_for_tests(), 16);
+        // Release the shard read guard before cleanup takes write locks.
+        drop(selected);
 
         AiSemanticCache::run_cleanup(&plugin.cache, plugin.ttl, plugin.max_entries);
 
