@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The release ARM64 (aarch64) Cross build no longer adds the third-party
+  apt.llvm.org repository or fetches its signing key at release time (#5955).
+  bindgen's `clang-6.0` / `libclang-6.0-dev` now come from the Cross image's
+  own signed Ubuntu 16.04 `xenial-updates` archive, which pre-build already
+  uses for its other packages. They are pinned to the exact version
+  `1:6.0-1ubuntu2~16.04.1`. The LLVM major version and `LIBCLANG_PATH`
+  (`/usr/lib/llvm-6.0/lib`) are unchanged. The trusted Cross build policy's
+  frozen pre-build allowlist is updated to match.
 - **`response_mock` preserves mixed-case extension method spelling** (#5972).
   The constructor folded every configured `method` token to uppercase, so a
   valid case-sensitive extension method (for example `Foo`) was stored as `FOO`
