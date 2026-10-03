@@ -2553,7 +2553,10 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
         ),
     ] {
         let body = compact_code(source_region(PROXY_SOURCE, gate, "\n}\n"));
-        assert!(body.contains(release), "{gate} must release through {release}");
+        assert!(
+            body.contains(release),
+            "{gate} must release through {release}"
+        );
     }
 
     // ── Direct HTTP/1.1 pool ──────────────────────────────────────────────
