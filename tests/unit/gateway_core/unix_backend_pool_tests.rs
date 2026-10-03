@@ -3622,3 +3622,78 @@ async fn an_h1_reuse_disable_publication_leaves_a_live_h2c_carrier() {
         "an H1-only reuse flip must not retire a continuously-live h2c carrier"
     );
 }
+
+/// The production Unix-socket handoff gate (GHSA-xcg4-wj3x-gjj2). A lease
+/// whose request bound elapsed before the handoff never carried a byte, so the
+/// gate refuses it and checks it back in untouched: the next checkout reuses
+/// it instead of dialing, and the app sees exactly one connection.
+#[tokio::test]
+async fn a_lease_refused_by_the_handoff_gate_is_checked_back_in_untouched() {
+    use ferrum_edge::_test_support::{
+        BackendHandoffBoundSourceForTest, compose_backend_handoff_bound_for_test,
+        compose_dispatch_phase_bound_for_test, unix_h1_handoff_gate_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-handoff-gate");
+    let allowed_roots = roots(&root);
+    let checkout = || {
+        pool.checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &allowed_roots,
+            &[],
+        )
+    };
+
+    // A live bound lets the lease through to the handoff.
+    let live_plan = (
+        StreamAuthDeadline {
+            at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            termination: StreamAuthTermination::CredentialExpired,
+        },
+        StreamAuthProtocolFamily::Http,
+        StreamAuthTerminationLatch::default(),
+    );
+    let live = compose_dispatch_phase_bound_for_test(None, Some(&live_plan));
+    let live = compose_backend_handoff_bound_for_test(None, &live);
+    let lease = checkout().await.expect("first checkout dials");
+    let lease = unix_h1_handoff_gate_for_test(&pool, &live, lease)
+        .expect("a live bound hands the lease back for the send");
+    expect_accepts(&peer, 1, "one physical connection").await;
+
+    // An elapsed bound refuses the SAME lease and checks it back in.
+    let expired_plan = (
+        StreamAuthDeadline {
+            at: tokio::time::Instant::now(),
+            termination: StreamAuthTermination::CredentialExpired,
+        },
+        StreamAuthProtocolFamily::Http,
+        StreamAuthTerminationLatch::default(),
+    );
+    let expired = compose_dispatch_phase_bound_for_test(None, Some(&expired_plan));
+    let expired = compose_backend_handoff_bound_for_test(None, &expired);
+    let Err(refused) = unix_h1_handoff_gate_for_test(&pool, &expired, lease) else {
+        panic!("an elapsed bound must refuse the handoff");
+    };
+    assert_eq!(refused, BackendHandoffBoundSourceForTest::Authorization);
+
+    let reused = checkout().await.expect("next checkout");
+    assert!(
+        reused.reused(),
+        "the refused, untouched lease must go back to the idle set"
+    );
+    expect_accepts(&peer, 1, "a refused handoff must not cost a redial").await;
+    let stats = pool.stats();
+    assert_eq!(stats.physical_connects, 1);
+    assert_eq!(stats.hits, 1);
+}

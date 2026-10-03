@@ -460,6 +460,11 @@ const CHECKOUT_STALL: Duration = Duration::from_secs(16);
 /// capability refresh included) uses it.
 const STALLED_CHECKOUT_PATH: &str = "/stalled-checkout";
 
+/// Logged (at debug) by the direct HTTP/1.1 pool once its TCP connect
+/// completes and before the TLS handshake, and by no other transport: proof
+/// that the stalled checkout was the direct pool's.
+const DIRECT_H1_DIAL_MARKER: &str = "direct HTTP/1.1 pool dialed a backend connection";
+
 /// File-mode YAML for one `jwt_auth`-protected route to an HTTP/1.1-only TLS
 /// backend, which the direct HTTP/1.1 pool serves.
 fn stalled_checkout_proxy_yaml(backend_port: u16) -> String {
@@ -579,7 +584,7 @@ async fn h1_h2_auth_lifetime_direct_h1_stalled_checkout_never_reaches_the_backen
 
     let harness = GatewayHarness::builder()
         .file_config(stalled_checkout_proxy_yaml(backend_port))
-        .log_level("info")
+        .log_level("debug")
         .capture_output()
         .pool_warmup_enabled(false)
         .spawn()
@@ -631,7 +636,17 @@ async fn h1_h2_auth_lifetime_direct_h1_stalled_checkout_never_reaches_the_backen
     );
     assert!(
         accepts.load(Ordering::SeqCst) >= 1,
-        "the direct HTTP/1.1 pool must actually have dialed the stalled backend"
+        "the stalled backend must have accepted the gateway's dial"
+    );
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| logs.contains(DIRECT_H1_DIAL_MARKER),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        logs.contains(DIRECT_H1_DIAL_MARKER),
+        "the stalled checkout must have been the direct HTTP/1.1 pool's dial"
     );
 
     // Let every stalled handshake run out, then prove the backend never saw the

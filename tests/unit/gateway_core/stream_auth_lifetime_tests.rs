@@ -2489,7 +2489,6 @@ fn assert_gated_handoff(label: &str, code: &str, gate: &str, refusal_end: &str, 
 #[test]
 fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     const PLAN: &str = "letsend_auth_deadline=request_upload_auth_deadline(";
-    const GATE: &str = "ifletSome(source)=handoff_bound.elapsed(){";
     const H1_ENQUEUE: &str = "checkout.sender.try_send_request(backend_req)";
 
     // The shared gate is inclusive and reads the clock only when bounded.
@@ -2500,14 +2499,62 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     ));
     assert!(gate.contains("letat=self.at?;"));
     assert!(gate.contains("(tokio::time::Instant::now()>=at).then_some(self.source)"));
-    // The checkout wait is the expiry-first primitive, never `timeout_at`.
+    // The checkout wait: an elapsed bound refuses before the checkout is ever
+    // polled; otherwise the checkout is polled BEFORE a timer exists, so a
+    // ready pooled connection never registers with the timer driver; only a
+    // pending checkout arms `sleep_until(at)`. Never `timeout_at`.
     let checkout_wait = compact_code(source_region(
         PROXY_SOURCE,
-        "pub(crate) fn await_backend_handoff_bound<F>(",
-        "\n}",
+        "impl<F> std::future::Future for BackendHandoffBounded<F>",
+        "\n}\n",
     ));
-    assert!(checkout_wait.contains("crate::plugins::await_deadline_first(bound.at,checkout)"));
+    let precheck = offset_of(
+        &checkout_wait,
+        "iftokio::time::Instant::now()>=at{returnstd::task::Poll::Ready(Err(source));}",
+    );
+    let checkout_first = offset_of(
+        &checkout_wait,
+        "ifletstd::task::Poll::Ready(output)=this.checkout.as_mut().poll(cx)",
+    );
+    let timer = offset_of(
+        &checkout_wait,
+        "this.sleep.set(Some(tokio::time::sleep_until(at)));",
+    );
+    assert!(
+        precheck < checkout_first && checkout_first < timer,
+        "expiry pre-check, then the checkout, then (only if pending) the timer"
+    );
     assert!(!checkout_wait.contains("timeout_at("));
+    assert!(!checkout_wait.contains("select!"));
+    // The lease gate releases a refused lease untouched and enqueues nothing.
+    let lease_gate = compact_code(source_region(
+        PROXY_SOURCE,
+        "pub(crate) fn gate_backend_handoff<L>(",
+        "\n}\n",
+    ));
+    assert!(
+        lease_gate.contains(
+            "matchbound.elapsed(){None=>Ok(lease),Some(source)=>{release(lease);Err(source)}}"
+        ),
+        "the handoff gate must release the refused lease and return the source"
+    );
+    for (gate, release) in [
+        (
+            "pub(crate) fn direct_h1_handoff_gate(",
+            "gate_backend_handoff(bound,checkout,http2_pool::Http1Checkout::checkin)",
+        ),
+        (
+            "pub(crate) fn unix_h1_handoff_gate(",
+            "gate_backend_handoff(bound,checkout,|lease|pool.checkin_h1(lease))",
+        ),
+        (
+            "pub(crate) fn hbone_h1_handoff_gate(",
+            "gate_backend_handoff(bound,checkout,drop)",
+        ),
+    ] {
+        let body = compact_code(source_region(PROXY_SOURCE, gate, "\n}\n"));
+        assert!(body.contains(release), "{gate} must release through {release}");
+    }
 
     // ── Direct HTTP/1.1 pool ──────────────────────────────────────────────
     let direct_h1 = compact_code(source_region(
@@ -2546,13 +2593,13 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     assert_gated_handoff(
         "direct HTTP/1.1",
         &direct_h1,
-        GATE,
-        "checkout.checkin();returndirect_h1_handoff_bound_expired(",
+        "checkout=matchdirect_h1_handoff_gate(handoff_bound,checkout){",
+        "returndirect_h1_handoff_bound_expired(",
         H1_ENQUEUE,
     );
     assert!(
-        direct_h1.contains("await_backend_handoff_bound(handoff_bound,send_fut)"),
-        "the response-header wait is attributed from the same composed source"
+        direct_h1.contains("crate::plugins::await_deadline_first(handoff_bound.at,send_fut)"),
+        "the response-header wait is held to, and attributed from, the same composed bound"
     );
     let bounded_checkout = compact_code(source_region(
         PROXY_SOURCE,
@@ -2607,8 +2654,8 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     assert_gated_handoff(
         "Unix-socket HTTP/1.1",
         &unix,
-        GATE,
-        "state.unix_backend_pool.checkin_h1(checkout);return(mesh_h1_handoff_bound_expired(",
+        "checkout=matchunix_h1_handoff_gate(&state.unix_backend_pool,handoff_bound,checkout){",
+        "return(mesh_h1_handoff_bound_expired(",
         H1_ENQUEUE,
     );
 
@@ -2642,8 +2689,8 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     assert_gated_handoff(
         "HBONE inner HTTP/1.1",
         &hbone_post,
-        GATE,
-        "drop(checkout);return(mesh_h1_handoff_bound_expired(",
+        "checkout=matchhbone_h1_handoff_gate(handoff_bound,checkout){",
+        "return(mesh_h1_handoff_bound_expired(",
         H1_ENQUEUE,
     );
 
@@ -2667,10 +2714,19 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
         "let request_body_too_large = || {",
     ));
     // The refusal arm joins the upload pump before it returns.
+    let refusal_arm = source_region(
+        &h2,
+        "direct_h2_handoff_refusal(grpc_deadline_at,upload_auth_deadline.as_ref()){",
+        "return(direct_h2_handoff_bound_expired(",
+    );
+    assert!(
+        refusal_arm.contains("pump.cancel_and_join().await;"),
+        "the direct-H2 handoff refusal must join the gateway-owned upload"
+    );
     assert_gated_handoff(
         "direct HTTP/2",
         &h2,
-        GATE,
+        "direct_h2_handoff_refusal(grpc_deadline_at,upload_auth_deadline.as_ref()){",
         "upload_auth_deadline.as_ref(),resolved_ip,),None,);}",
         "leth2_send_fut=sender.send_request(backend_req);",
     );
@@ -4947,9 +5003,10 @@ fn only_streaming_uploads_pay_the_bridged_relay() {
 #[test]
 fn the_direct_h2_handler_joins_its_upload_before_returning() {
     // Every bounded direct-H2 exit, plus the normal completion path, joins the
-    // pump; the residual error exits are covered by `cancel_on_drop`. The three
+    // pump; the residual error exits are covered by `cancel_on_drop`. The four
     // bounded exits are the response-header deadline, the early-response upload
-    // join, and the backend write watermark (#4055).
+    // join, the backend write watermark (#4055), and the pre-enqueue handoff
+    // gate's refusal (GHSA-xcg4-wj3x-gjj2).
     let direct_h2 = PROXY_SOURCE
         .split("async fn proxy_to_backend_http2(")
         .nth(1)
@@ -4959,7 +5016,7 @@ fn the_direct_h2_handler_joins_its_upload_before_returning() {
         .expect("bounded direct-H2 dispatcher");
     assert_eq!(
         direct_h2.matches("pump.cancel_and_join().await;").count(),
-        3,
+        4,
         "a direct-H2 bounded exit stopped joining the gateway-owned upload"
     );
     assert!(

@@ -25,11 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The expiry is reported as the gateway's own health-neutral authorization
   decision (the fixed pre-commitment terminal and one `credential_expired` /
   `authenticated_stream_max_lifetime` count), never as a `504` or a client
-  RPC deadline; an earlier client or operator bound keeps its own terminal.
-  The same checkout bound and handoff gate now also cover the Unix-socket
-  HTTP/1.1 pool, the HBONE inner HTTP/1.1 lease (CONNECT and inner
-  handshake), and the direct-H2 sender acquisition. Unauthenticated requests
-  are unchanged.
+  RPC deadline; an earlier client or operator bound keeps its own terminal,
+  and an exact tie with the response-header read bound is a `504`, as on the
+  reqwest path. The same checkout bound and handoff gate now also cover the
+  Unix-socket HTTP/1.1 pool, the HBONE inner HTTP/1.1 lease (CONNECT and inner
+  handshake), and the direct-H2 sender acquisition. A checkout that is ready
+  on its first poll (a pooled connection or live HTTP/2 sender) never arms a
+  timer. Unauthenticated requests are unchanged. **Still unbounded**, tracked
+  in #5990: sender acquisition and handoff on sidecar mesh-mTLS dispatch
+  (including the Unix-socket h2c carrier), native gRPC dispatch, and possibly
+  the native HTTP/3 backend.
 
 ### Fixed
 
