@@ -1,49 +1,113 @@
-//! Backend-shard affinity for a frontend connection (issue #5588): requests of
-//! one HTTP/1.1 or HTTP/2 frontend connection start the gRPC pool's shard
-//! probe at that connection's shard; anything else keeps the
-//! round-robin start.
+//! gRPC backend-shard affinity for an HTTP/2 frontend connection (issue #5588):
+//! the slot table, the per-connection open-stream bound, the shard start the
+//! gRPC pool reads, and a source guard on the frontend wiring. The pool-level
+//! behaviour is covered against a real pool in
+//! `tests/integration/http2_pool_tests.rs`.
 
-use ferrum_edge::proxy::frontend_affinity::{SlotTable, start_shard, with_frontend_connection};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use ferrum_edge::proxy::frontend_affinity::{
+    AFFINITY_MAX_OPEN_STREAMS, FrontendConnectionAffinity, SLOTS, ShardStart, SlotTable,
+    shard_start,
+};
 
 fn table() -> &'static SlotTable {
     Box::leak(Box::new(SlotTable::new()))
 }
 
 #[test]
-fn without_a_frontend_connection_the_start_is_round_robin() {
-    let rr = AtomicUsize::new(5);
-    assert_eq!(start_shard(&rr, 4), 1);
-    assert_eq!(start_shard(&rr, 4), 2);
-    assert_eq!(rr.load(Ordering::Relaxed), 7);
+fn without_a_frontend_stream_the_start_is_unscoped() {
+    assert_eq!(shard_start(4), ShardStart::Unscoped);
+}
+
+#[test]
+fn a_connection_takes_its_slot_on_its_first_stream_only() {
+    let table = table();
+    let connection = FrontendConnectionAffinity::with_table(table);
+    assert_eq!(connection.slot(), None);
+    assert_eq!(table.live(0), 0);
+    let stream = connection.open_stream();
+    assert_eq!(connection.slot(), Some(0));
+    let second = connection.open_stream();
+    assert_eq!(connection.slot(), Some(0));
+    assert_eq!(table.live(0), 1, "one slot per connection, not per stream");
+    drop((stream, second));
+    drop(connection);
+    assert_eq!(table.live(0), 0, "the slot is released with the connection");
 }
 
 #[tokio::test]
-async fn a_frontend_connection_always_starts_at_its_own_shard() {
-    let rr = AtomicUsize::new(0);
-    let starts = with_frontend_connection(6, async {
-        [
-            start_shard(&rr, 4),
-            start_shard(&rr, 4),
-            start_shard(&rr, 4),
-        ]
-    })
-    .await;
-    assert_eq!(starts, [2, 2, 2]);
-    // The round-robin position is left for requests without a connection.
-    assert_eq!(rr.load(Ordering::Relaxed), 0);
-    // Outside the scope the start is round-robin again.
-    assert_eq!(start_shard(&rr, 4), 0);
-}
-
-#[tokio::test]
-async fn a_zero_shard_count_is_one_shard() {
-    let rr = AtomicUsize::new(3);
-    assert_eq!(start_shard(&rr, 0), 0);
+async fn a_stream_starts_at_its_connection_shard_until_the_bound() {
+    let table = table();
+    let _first = FrontendConnectionAffinity::with_table(table).open_stream();
+    let connection = FrontendConnectionAffinity::with_table(table);
+    let stream = connection.open_stream();
+    assert_eq!(connection.slot(), Some(1));
     assert_eq!(
-        with_frontend_connection(9, async { start_shard(&rr, 0) }).await,
-        0
+        stream.run(async { shard_start(4) }).await,
+        ShardStart::Affinity(1)
     );
+    assert_eq!(
+        stream.run(async { shard_start(1) }).await,
+        ShardStart::Affinity(0)
+    );
+    assert_eq!(
+        stream.run(async { shard_start(0) }).await,
+        ShardStart::Affinity(0)
+    );
+
+    // Up to the bound (this stream included) the connection keeps its shard.
+    let mut more: Vec<_> = (1..AFFINITY_MAX_OPEN_STREAMS)
+        .map(|_| connection.open_stream())
+        .collect();
+    assert_eq!(connection.open_streams(), AFFINITY_MAX_OPEN_STREAMS);
+    assert_eq!(
+        stream.run(async { shard_start(4) }).await,
+        ShardStart::Affinity(1)
+    );
+
+    // One more open stream and its calls spill round-robin.
+    more.push(connection.open_stream());
+    assert_eq!(
+        stream.run(async { shard_start(4) }).await,
+        ShardStart::Spill
+    );
+
+    // Closing streams (each exactly once) brings it back under the bound.
+    more.pop();
+    assert_eq!(connection.open_streams(), AFFINITY_MAX_OPEN_STREAMS);
+    assert_eq!(
+        stream.run(async { shard_start(4) }).await,
+        ShardStart::Affinity(1)
+    );
+    drop(more);
+    assert_eq!(connection.open_streams(), 1);
+}
+
+#[tokio::test]
+async fn a_pool_wider_than_the_slot_table_spills() {
+    let connection = FrontendConnectionAffinity::with_table(table());
+    let stream = connection.open_stream();
+    assert_eq!(
+        stream.run(async { shard_start(SLOTS) }).await,
+        ShardStart::Affinity(0)
+    );
+    assert_eq!(
+        stream.run(async { shard_start(SLOTS + 1) }).await,
+        ShardStart::Spill
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_request_closes_its_stream() {
+    let connection = FrontendConnectionAffinity::with_table(table());
+    let stream = connection.open_stream();
+    let request = tokio::spawn(async move {
+        stream.run(std::future::pending::<()>()).await;
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(connection.open_streams(), 1);
+    request.abort();
+    let _ = request.await;
+    assert_eq!(connection.open_streams(), 0);
 }
 
 #[test]
@@ -83,13 +147,23 @@ fn short_lived_connections_do_not_skew_long_lived_ones() {
 }
 
 #[test]
-fn a_closed_connection_releases_its_slot() {
-    let table = table();
-    let first = table.acquire();
-    let slot = first.slot();
-    assert_eq!(table.live(slot), 1);
-    drop(first);
-    assert_eq!(table.live(slot), 0);
-    // The freed slot is the least loaded again, so it is reused.
-    assert_eq!(table.acquire().slot(), slot);
+fn both_frontends_open_a_stream_per_http2_request_and_keep_it_with_the_body() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    for needle in [
+        ".filter(|_| req.version() == hyper::Version::HTTP_2)",
+        ".map(frontend_affinity::FrontendConnectionAffinity::open_stream);",
+        "Some(stream) => stream.run(request).await,",
+        "response.map(|response| response.map(|body| body.with_frontend_stream(stream)));",
+    ] {
+        assert_eq!(
+            proxy.matches(needle).count(),
+            2,
+            "plaintext and TLS frontends must both carry `{needle}`"
+        );
+    }
+    assert!(
+        proxy.contains("tls_alpn_h2.then(frontend_affinity::FrontendConnectionAffinity::new);")
+    );
+    let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
+    assert!(grpc.contains("match shard_start(shard_count) {"));
 }

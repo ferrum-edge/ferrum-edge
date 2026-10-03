@@ -14766,11 +14766,15 @@ async fn handle_connection(
     // count can be drained once after the connection resolves.
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = Arc::clone(&h1_framing_signals);
-    // Held for the connection's lifetime; its slot picks the backend shard.
-    let frontend_slot = frontend_affinity::FrontendConnectionSlot::acquire();
-    let frontend_connection = frontend_slot.slot();
+    // gRPC backend-shard affinity for this connection's HTTP/2 streams
+    // (issue #5588). No slot is taken until the first HTTP/2 request.
+    let connection_affinity = Some(frontend_affinity::FrontendConnectionAffinity::new());
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
+        let frontend_stream = connection_affinity
+            .as_ref()
+            .filter(|_| req.version() == hyper::Version::HTTP_2)
+            .map(frontend_affinity::FrontendConnectionAffinity::open_stream);
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let http1_framing_result =
@@ -14805,21 +14809,26 @@ async fn handle_connection(
             diagnostic_slot: None,
         };
         async move {
-            let mut response = frontend_affinity::with_frontend_connection(
-                frontend_connection,
-                handle_proxy_request_on_frontend_port(
-                    req,
-                    state,
-                    addr,
-                    false,
-                    None,
-                    None,
-                    None,
-                    connection_metadata,
-                ),
-            )
-            .await;
+            let request = handle_proxy_request_on_frontend_port(
+                req,
+                state,
+                addr,
+                false,
+                None,
+                None,
+                None,
+                connection_metadata,
+            );
+            let mut response = match frontend_stream.as_ref() {
+                Some(stream) => stream.run(request).await,
+                None => request.await,
+            };
             apply_h1_framing_connection_close(&mut response, http1_framing_result);
+            // The stream stays open until its response body ends or drops.
+            if let Some(stream) = frontend_stream {
+                response =
+                    response.map(|response| response.map(|body| body.with_frontend_stream(stream)));
+            }
             if let Some(signals) = response_h1_framing_signals.as_ref()
                 && h1_response_ends_framing_observation(&request_method, &response)
             {
@@ -23633,20 +23642,20 @@ async fn handle_tls_connection(
     // requests. ALPN `h2` is already HTTP/2: skip the observer so those
     // connections do not allocate `H1FramingSignals`. Otherwise wrap; the
     // adapter still disables itself if the bytes are an h2c-style preface.
-    let (tls_stream, h1_framing_signals) =
-        if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
-            (
-                h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
-                None,
-            )
-        } else {
-            let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
-                tls_stream,
-                http1_parser_max_buf_size(state.max_header_size_bytes),
-                Some(remote_addr),
-            );
-            (io, Some(signals))
-        };
+    let tls_alpn_h2 = matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2"));
+    let (tls_stream, h1_framing_signals) = if tls_alpn_h2 {
+        (
+            h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
+            None,
+        )
+    } else {
+        let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
+            tls_stream,
+            http1_parser_max_buf_size(state.max_header_size_bytes),
+            Some(remote_addr),
+        );
+        (io, Some(signals))
+    };
     #[cfg(feature = "bench-h1-profile")]
     let tls_stream = crate::h1_profile::io::ObservedIo::new(tls_stream, profile_layer);
     let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -23708,11 +23717,14 @@ async fn handle_tls_connection(
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = h1_framing_signals.clone();
     let service_h1_framing_signals = h1_framing_signals;
-    // Held for the connection's lifetime; its slot picks the backend shard.
-    let frontend_slot = frontend_affinity::FrontendConnectionSlot::acquire();
-    let frontend_connection = frontend_slot.slot();
+    // gRPC backend-shard affinity for an ALPN `h2` connection (issue #5588).
+    let connection_affinity = tls_alpn_h2.then(frontend_affinity::FrontendConnectionAffinity::new);
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
+        let frontend_stream = connection_affinity
+            .as_ref()
+            .filter(|_| req.version() == hyper::Version::HTTP_2)
+            .map(frontend_affinity::FrontendConnectionAffinity::open_stream);
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let cert = client_cert_der.clone();
@@ -23749,21 +23761,26 @@ async fn handle_tls_connection(
             diagnostic_slot: None,
         };
         async move {
-            let mut response = frontend_affinity::with_frontend_connection(
-                frontend_connection,
-                handle_proxy_request_on_frontend_port(
-                    req,
-                    state,
-                    addr,
-                    true,
-                    cert,
-                    chain,
-                    mtls_auth_connection_cache,
-                    connection_metadata,
-                ),
-            )
-            .await;
+            let request = handle_proxy_request_on_frontend_port(
+                req,
+                state,
+                addr,
+                true,
+                cert,
+                chain,
+                mtls_auth_connection_cache,
+                connection_metadata,
+            );
+            let mut response = match frontend_stream.as_ref() {
+                Some(stream) => stream.run(request).await,
+                None => request.await,
+            };
             apply_h1_framing_connection_close(&mut response, http1_framing_result);
+            // The stream stays open until its response body ends or drops.
+            if let Some(stream) = frontend_stream {
+                response =
+                    response.map(|response| response.map(|body| body.with_frontend_stream(stream)));
+            }
             if let Some(signals) = response_h1_framing_signals.as_ref()
                 && h1_response_ends_framing_observation(&request_method, &response)
             {
