@@ -119,6 +119,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Less per-request work on the native gRPC path** (#5588). Three per-request
+  costs from the gRPC 10 KiB profile, about 2% of gateway CPU together:
+  - the request's plugin view resolves its proxy/protocol entry once instead
+    of once per field (about 16 hashed map lookups per request);
+  - the client IP is rendered without `core::fmt`;
+  - the header merge before a gRPC dispatch compares each field by name and
+    parses a `HeaderName` only to replace one, and reserves room for the
+    gateway-added fields up front.
+
+  Same-runner A/B against `main` (run 37079943011, two iterations): gRPC
+  10 KiB +0.8% and +1.4%, other payload sizes within noise. Behavior is
+  unchanged.
 - **HTTP/2 backend write timeouts run inside hyper instead of a gateway pump**
   (#5588). `backend_write_timeout_ms` on the fully streamed native gRPC upload
   (with no authorization lifetime) is now enforced by hyper's HTTP/2 body pipe
