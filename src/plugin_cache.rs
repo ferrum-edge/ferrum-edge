@@ -5833,76 +5833,6 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
-    /// gRPC deadline plugins for a composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_grpc_deadline_plugins(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.grpc_deadline_plugins))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
-    /// Authorize-phase plugins for a composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_authorize_plugins(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.authorize_plugins))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
-    /// Backend-admission plugins for a composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_backend_admission_plugins(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.backend_admission_plugins))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
-    /// Backend-path plugins for a composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_backend_path_plugins(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.backend_path_plugins))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
-    /// Request header names to redact for a composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_request_headers_to_redact(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<String>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.request_headers_to_redact))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
     /// Initial-response-header policy plugins for a composed `proxy_key` +
     /// protocol.
     ///
@@ -5919,80 +5849,6 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
-    /// Initial-response-header policy plugin names for a composed `proxy_key` +
-    /// protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_initial_response_header_policy_names(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<String>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.initial_response_header_policy_names))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
-    /// Response-header policy names that also bind the trailer section, for a
-    /// composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_response_trailer_policy_names(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<String>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.response_trailer_policy_names))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
-    /// Case-insensitive ASCII prefixes whose response-header policy also binds
-    /// the trailer section for a composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_response_trailer_policy_prefixes(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<String>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.response_trailer_policy_prefixes))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
-    /// Instances whose unbounded trailer policy is request-conditional, for a
-    /// composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_conditional_unbounded_trailer_policy_plugins(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.conditional_unbounded_trailer_policy_plugins))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
-    /// Response-committed hook plugins for a composed `proxy_key` + protocol.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_response_committed_plugins(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_key, protocol)
-            .map(|entry| Arc::clone(&entry.phase.response_committed_plugins))
-            .unwrap_or_else(|| Arc::new(Vec::new()))
-    }
-
     /// Pre-computed capability bitset for a composed `proxy_key` + protocol.
     ///
     /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
@@ -6005,53 +5861,6 @@ impl PluginCacheInner {
         self.protocol_entry(proxy_key, protocol)
             .map(|entry| entry.phase.capabilities)
             .unwrap_or_default()
-    }
-
-    /// Effective static response-presentation policy digest, or `None` when it
-    /// cannot be established: this cache generation has no entry for the
-    /// proxy/protocol pair, or the entry's policy is unprovable because an
-    /// enrolled plugin's rewrite comes from live runtime state.
-    ///
-    /// `None` is deliberately not folded into an "empty policy" digest here.
-    /// Both causes mean the effective policy is *unknown*, and callers that
-    /// retain representations must fail closed on it rather than record a
-    /// provenance claim they cannot substantiate.
-    ///
-    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
-    /// proxy ID — see [`Self::protocol_entry`].
-    pub(crate) fn get_response_presentation_policy_digest(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Option<[u8; 32]> {
-        self.protocol_entry(proxy_key, protocol)
-            .and_then(|entry| entry.phase.response_presentation_policy_digest)
-    }
-
-    /// Strictest active client-facing request-body ceiling for a composed
-    /// `proxy_key` and protocol, or `None` when no matched plugin enforces one.
-    ///
-    /// A missing entry falls back to the global chain's value exactly like
-    /// [`Self::get_capabilities`], so a proxy served by global-only plugins still
-    /// inherits a global size-limiting instance's ceiling.
-    pub(crate) fn get_enforced_request_body_limit(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Option<u64> {
-        self.protocol_entry(proxy_key, protocol)
-            .and_then(|entry| entry.phase.enforced_request_body_limit)
-    }
-
-    /// Strictest active client-facing response-body ceiling for a composed
-    /// `proxy_key` and protocol, or `None` when no matched plugin enforces one.
-    pub(crate) fn get_enforced_response_body_limit(
-        &self,
-        proxy_key: &str,
-        protocol: ProxyProtocol,
-    ) -> Option<u64> {
-        self.protocol_entry(proxy_key, protocol)
-            .and_then(|entry| entry.phase.enforced_response_body_limit)
     }
 
     /// Response-body buffering upper bound for a composed `proxy_key`.
@@ -6128,43 +5937,85 @@ impl PluginCacheInner {
             let mut key = buf.borrow_mut();
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
             let proxy_key = key.as_str();
-            let capabilities = self.get_capabilities(proxy_key, protocol);
-            let backend_path_plugins = capabilities
-                .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
-                .then(|| self.get_backend_path_plugins(proxy_key, protocol));
-            PluginCacheRequestView {
-                plugins: self.get_plugins_for_protocol(proxy_key, protocol),
-                grpc_deadline_plugins: self.get_grpc_deadline_plugins(proxy_key, protocol),
-                auth_plugins: self.get_auth_plugins(proxy_key, protocol),
-                authorize_plugins: self.get_authorize_plugins(proxy_key, protocol),
-                backend_admission_plugins: self.get_backend_admission_plugins(proxy_key, protocol),
-                backend_path_plugins,
-                request_headers_to_redact: self.get_request_headers_to_redact(proxy_key, protocol),
-                initial_response_header_policy_plugins: self
-                    .get_initial_response_header_policy_plugins(proxy_key, protocol),
-                initial_response_header_policy_names: self
-                    .get_initial_response_header_policy_names(proxy_key, protocol),
-                response_trailer_policy_names: self
-                    .get_response_trailer_policy_names(proxy_key, protocol),
-                response_trailer_policy_prefixes: self
-                    .get_response_trailer_policy_prefixes(proxy_key, protocol),
-                conditional_unbounded_trailer_policy_plugins: self
-                    .get_conditional_unbounded_trailer_policy_plugins(proxy_key, protocol),
-                response_committed_plugins: self
-                    .get_response_committed_plugins(proxy_key, protocol),
-                response_presentation_policy_digest: self
-                    .get_response_presentation_policy_digest(proxy_key, protocol),
-                capabilities,
-                requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
-                requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
-                requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
-                uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
-                enforced_request_body_limit: self
-                    .get_enforced_request_body_limit(proxy_key, protocol),
-                enforced_response_body_limit: self
-                    .get_enforced_response_body_limit(proxy_key, protocol),
+            // One protocol lookup per request instead of one per field: every
+            // per-field getter resolves this same entry (issue #5588).
+            match self.protocol_entry(proxy_key, protocol) {
+                Some(entry) => self.request_view_from_entry(proxy_key, entry),
+                None => self.empty_request_view(proxy_key),
             }
         })
+    }
+
+    /// The request view for a resolved [`ProtocolEntry`], shared by
+    /// [`Self::request_view`] and [`Self::grpc_web_request_view`].
+    fn request_view_from_entry(
+        &self,
+        proxy_key: &str,
+        entry: &ProtocolEntry,
+    ) -> PluginCacheRequestView {
+        let capabilities = entry.phase.capabilities;
+        let backend_path_plugins = capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+            .then(|| Arc::clone(&entry.phase.backend_path_plugins));
+        PluginCacheRequestView {
+            plugins: Arc::clone(&entry.plugins),
+            grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
+            auth_plugins: Arc::clone(&entry.phase.auth_plugins),
+            authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
+            backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
+            backend_path_plugins,
+            request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
+            initial_response_header_policy_plugins: Arc::clone(
+                &entry.phase.initial_response_header_policy_plugins,
+            ),
+            initial_response_header_policy_names: Arc::clone(
+                &entry.phase.initial_response_header_policy_names,
+            ),
+            response_trailer_policy_names: Arc::clone(&entry.phase.response_trailer_policy_names),
+            response_trailer_policy_prefixes: Arc::clone(
+                &entry.phase.response_trailer_policy_prefixes,
+            ),
+            conditional_unbounded_trailer_policy_plugins: Arc::clone(
+                &entry.phase.conditional_unbounded_trailer_policy_plugins,
+            ),
+            response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
+            response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
+            capabilities,
+            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
+            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
+            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
+            enforced_request_body_limit: entry.phase.enforced_request_body_limit,
+            enforced_response_body_limit: entry.phase.enforced_response_body_limit,
+        }
+    }
+
+    /// The request view when no protocol entry resolves: every per-field
+    /// getter's `None` default.
+    fn empty_request_view(&self, proxy_key: &str) -> PluginCacheRequestView {
+        PluginCacheRequestView {
+            plugins: Arc::new(Vec::new()),
+            grpc_deadline_plugins: Arc::new(Vec::new()),
+            auth_plugins: Arc::new(Vec::new()),
+            authorize_plugins: Arc::new(Vec::new()),
+            backend_admission_plugins: Arc::new(Vec::new()),
+            backend_path_plugins: None,
+            request_headers_to_redact: Arc::new(Vec::new()),
+            initial_response_header_policy_plugins: Arc::new(Vec::new()),
+            initial_response_header_policy_names: Arc::new(Vec::new()),
+            response_trailer_policy_names: Arc::new(Vec::new()),
+            response_trailer_policy_prefixes: Arc::new(Vec::new()),
+            conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
+            response_committed_plugins: Arc::new(Vec::new()),
+            response_presentation_policy_digest: None,
+            capabilities: PluginCapabilities::default(),
+            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
+            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
+            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
+            enforced_request_body_limit: None,
+            enforced_response_body_limit: None,
+        }
     }
 
     pub(crate) fn grpc_web_request_view(
@@ -6181,45 +6032,7 @@ impl PluginCacheInner {
                 .grpc_web_proxy
                 .get(proxy_key)
                 .unwrap_or(&self.protocol_snapshot.grpc_web_global);
-            let capabilities = entry.phase.capabilities;
-            let backend_path_plugins = capabilities
-                .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
-                .then(|| Arc::clone(&entry.phase.backend_path_plugins));
-            PluginCacheRequestView {
-                plugins: Arc::clone(&entry.plugins),
-                grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
-                auth_plugins: Arc::clone(&entry.phase.auth_plugins),
-                authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
-                backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
-                backend_path_plugins,
-                request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
-                initial_response_header_policy_plugins: Arc::clone(
-                    &entry.phase.initial_response_header_policy_plugins,
-                ),
-                initial_response_header_policy_names: Arc::clone(
-                    &entry.phase.initial_response_header_policy_names,
-                ),
-                response_trailer_policy_names: Arc::clone(
-                    &entry.phase.response_trailer_policy_names,
-                ),
-                response_trailer_policy_prefixes: Arc::clone(
-                    &entry.phase.response_trailer_policy_prefixes,
-                ),
-                conditional_unbounded_trailer_policy_plugins: Arc::clone(
-                    &entry.phase.conditional_unbounded_trailer_policy_plugins,
-                ),
-                response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
-                response_presentation_policy_digest: entry
-                    .phase
-                    .response_presentation_policy_digest,
-                capabilities,
-                requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
-                requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
-                requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
-                uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
-                enforced_request_body_limit: entry.phase.enforced_request_body_limit,
-                enforced_response_body_limit: entry.phase.enforced_response_body_limit,
-            }
+            self.request_view_from_entry(proxy_key, entry)
         })
     }
 }
