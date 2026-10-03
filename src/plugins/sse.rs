@@ -15,7 +15,8 @@
 //!
 //! 1. **`on_request_received`** — Validates inbound SSE client criteria:
 //!    - Method must be GET (SSE is read-only, no request body)
-//!    - `Accept` header must include `text/event-stream`
+//!    - `Accept` header must include `text/event-stream` with an affirmative
+//!      quality (`q=0`, malformed, or duplicate quality is rejected)
 //!    - Bounds `Last-Event-ID` for reconnection (treated as sensitive)
 //!    - Rejects non-conforming requests with 405 (wrong method) or 406 (wrong Accept)
 //!
@@ -89,6 +90,7 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use super::utils::policy_digest;
+use super::utils::sse::accept_includes_event_stream;
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{BoundedResponseBodyConstruction, PluginResult, RequestContext};
 use crate::util::http_headers::headers_have_cache_control_directive;
@@ -244,11 +246,11 @@ impl SsePlugin {
         })
     }
 
-    /// Returns true if the `Accept` header includes `text/event-stream`.
+    /// Returns true if the `Accept` header includes `text/event-stream` with an
+    /// affirmative quality. A `text/event-stream` entry explicitly excluded with
+    /// `q=0` (or a malformed/duplicate quality) is not affirmative intent.
     fn accepts_event_stream(accept: &str) -> bool {
-        accept
-            .split(',')
-            .any(|part| is_text_event_stream_media_type(part.trim()))
+        accept_includes_event_stream(accept)
     }
 
     /// Returns true if the response `Content-Type` is `text/event-stream`.

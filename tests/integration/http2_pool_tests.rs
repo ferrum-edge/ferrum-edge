@@ -2505,3 +2505,89 @@ async fn test_grpc_pool_affinity_under_a_connection_cap_borrows_without_redialli
     assert_eq!(limiter.current("maxconn-h2c.test", port), 1);
     assert_eq!(pool.shard_create_backoff_len(), 1);
 }
+
+/// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A
+/// checked-out connection whose request bound elapsed before the handoff never
+/// carried the request, so the gate refuses it and returns it to the idle set
+/// untouched: the next checkout reuses it, and the backend sees one connection.
+#[tokio::test]
+async fn test_direct_h1_handoff_gate_returns_the_untouched_connection_to_the_pool() {
+    use ferrum_edge::_test_support::{
+        BackendHandoffBoundSourceForTest, compose_backend_handoff_bound_for_test,
+        compose_dispatch_phase_bound_for_test, direct_h1_handoff_gate_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&accepts);
+    let backend = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            // Hold the connection open; hyper's HTTP/1.1 client handshake
+            // writes nothing, so no HTTP exchange is needed.
+            held.push(stream);
+        }
+    });
+
+    let pool = create_default_pool();
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    let connect_timeout = Duration::from_secs(2);
+
+    let checkout = pool
+        .checkout_h1(&proxy, false, connect_timeout, false)
+        .await
+        .expect("first checkout dials the backend");
+    assert!(!checkout.reused());
+
+    let expired_plan = (
+        StreamAuthDeadline {
+            at: tokio::time::Instant::now(),
+            termination: StreamAuthTermination::CredentialExpired,
+        },
+        StreamAuthProtocolFamily::Http,
+        StreamAuthTerminationLatch::default(),
+    );
+    let dispatch = compose_dispatch_phase_bound_for_test(None, Some(&expired_plan));
+    let bound = compose_backend_handoff_bound_for_test(None, &dispatch);
+    let Err(refused) = direct_h1_handoff_gate_for_test(&bound, checkout) else {
+        panic!("an elapsed bound must refuse the handoff");
+    };
+    assert_eq!(refused, BackendHandoffBoundSourceForTest::Authorization);
+
+    // Check-in may wait for the fresh connection's dispatcher to report ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pool.h1_idle_connections() == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        pool.h1_idle_connections(),
+        1,
+        "the refused, untouched connection must be checked back in"
+    );
+    let reused = pool
+        .checkout_h1(&proxy, false, connect_timeout, false)
+        .await
+        .expect("second checkout");
+    assert!(
+        reused.reused(),
+        "the next request must reuse the connection the refused handoff returned"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while accepts.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "no redial");
+    backend.abort();
+}

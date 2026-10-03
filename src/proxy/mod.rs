@@ -47535,22 +47535,26 @@ async fn proxy_to_backend(
             *backend_admission_started_at = Instant::now();
             // The direct H2 pool streams the client body and never retains it.
             backend_attempt_handoff.mark_handed_to_backend(None);
-            let sender_result = crate::plugins::await_grpc_deadline(
-                request_ctx.grpc_deadline_at(),
+            // `get_sender()` can dial (TCP, TLS, and the HTTP/2 handshake), so
+            // it is bounded by the admitted request's authorization lifetime as
+            // well as the client RPC deadline (GHSA-xcg4-wj3x-gjj2); the
+            // handoff gate in `proxy_to_backend_http2` re-checks both before
+            // the request is enqueued on the sender.
+            let sender_bound = direct_h2_sender_bound(state, request_ctx);
+            let sender_result = await_backend_handoff_bound(
+                sender_bound,
                 state.http2_pool.get_sender(direct_h2_proxy),
             )
             .await;
             let direct_h2_sender = match sender_result {
-                Err(()) => {
+                Err(source) => {
                     drop(h2_admission_permits.take());
-                    return backend_dispatch_response(
-                        client_grpc_deadline_exceeded_response_for_request(
-                            request_ctx,
-                            headers,
-                            resolved_ip,
-                        ),
-                        None,
-                        None,
+                    return direct_h2_sender_bound_expired(
+                        state,
+                        request_ctx,
+                        headers,
+                        source,
+                        resolved_ip,
                     );
                 }
                 Ok(Ok(sender)) => Some(sender),
@@ -49516,10 +49520,71 @@ fn direct_h1_request_body_too_large(resolved_ip: Option<String>) -> retry::Backe
     }
 }
 
+/// Settle a direct HTTP/1.1 checkout, request handoff, or response-header wait
+/// whose composed bound elapsed (GHSA-xcg4-wj3x-gjj2).
+///
+/// Out of line: these are cold arms of the direct HTTP/1.1 dispatch coroutine,
+/// and the response each one builds would otherwise be a fixed frame slot in
+/// it. The source comes from the composed [`BackendHandoffBound`], never from
+/// re-reading the clock, so an authorization expiry is reported as the
+/// gateway's own health-neutral security decision — never as a backend `504`
+/// or a client RPC deadline — and an earlier protocol bound keeps its own
+/// terminal.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn direct_h1_handoff_bound_expired(
+    proxy: &Proxy,
+    source: BackendHandoffBoundSource,
+    dispatch_bound: DispatchPhaseBound,
+    send_auth_deadline: Option<&RequestAuthLifetimePlan>,
+    request_ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    resolved_ip: Option<String>,
+    retained_body: Option<Bytes>,
+    backend_admission_permits: Option<BackendAdmissionPermitSet>,
+) -> BackendDispatchResult {
+    match source {
+        BackendHandoffBoundSource::Authorization => {
+            // Latched and counted exactly once for the request; the
+            // pre-commitment terminal owns the client-visible shape.
+            let _ = dispatch_phase_authorization_expiry(dispatch_bound, send_auth_deadline);
+            authorization_expired_backend_dispatch(
+                resolved_ip,
+                retained_body,
+                backend_admission_permits,
+            )
+        }
+        BackendHandoffBoundSource::PhaseProtocol => backend_dispatch_response(
+            client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, resolved_ip),
+            retained_body,
+            backend_admission_permits,
+        ),
+        BackendHandoffBoundSource::ResponseHeader => {
+            warn!(
+                proxy_id = %proxy.id,
+                watermark = "backend_read_timeout_ms",
+                watermark_ms = proxy.backend_read_timeout_ms,
+                "direct HTTP/1.1 dispatch: per-direction watermark expired before response headers"
+            );
+            backend_dispatch_response(
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                ),
+                retained_body,
+                backend_admission_permits,
+            )
+        }
+    }
+}
+
 /// Check out a direct HTTP/1.1 connection under the same bounds as the reqwest
-/// send it replaces: the response-header read bound and the client RPC deadline
-/// cover the dial; the operator connect timeout bounds only the dial itself.
-/// Used for the first attempt and for the one idle-race replay alike.
+/// send it replaces — the response-header read bound and the client RPC
+/// deadline cover the dial; the operator connect timeout bounds only the dial
+/// itself — AND under the admitted request's authorization lifetime
+/// (GHSA-xcg4-wj3x-gjj2). All three arrive pre-composed in `handoff_bound`,
+/// built once per dispatch from absolute instants, so the first attempt and
+/// the one idle-race replay are held to the same instant.
 #[allow(clippy::too_many_arguments)]
 async fn direct_h1_bounded_checkout(
     state: &ProxyState,
@@ -49528,7 +49593,9 @@ async fn direct_h1_bounded_checkout(
     tls: bool,
     connect_timeout: Duration,
     fresh: bool,
-    header_deadline_at: Option<tokio::time::Instant>,
+    handoff_bound: BackendHandoffBound,
+    dispatch_bound: DispatchPhaseBound,
+    send_auth_deadline: Option<&RequestAuthLifetimePlan>,
     request_ctx: &RequestContext,
     headers: &HashMap<String, String>,
     backend_url: &str,
@@ -49537,44 +49604,27 @@ async fn direct_h1_bounded_checkout(
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_started_at: &Instant,
 ) -> Result<http2_pool::Http1Checkout, BackendDispatchResult> {
-    let bounded = crate::plugins::await_deadline_first(
-        header_deadline_at,
-        crate::plugins::await_grpc_deadline(
-            request_ctx.grpc_deadline_at(),
-            state
-                .http2_pool
-                .checkout_h1(conn_proxy, tls, connect_timeout, fresh),
-        ),
+    let bounded = await_backend_handoff_bound(
+        handoff_bound,
+        state
+            .http2_pool
+            .checkout_h1(conn_proxy, tls, connect_timeout, fresh),
     )
     .await;
     match bounded {
-        Ok(Ok(Ok(checkout))) => Ok(checkout),
-        Err(()) => {
-            warn!(
-                proxy_id = %proxy.id,
-                watermark = "backend_read_timeout_ms",
-                watermark_ms = proxy.backend_read_timeout_ms,
-                "direct HTTP/1.1 dispatch: per-direction watermark expired before response headers"
-            );
-            Err(backend_dispatch_response(
-                http_backend_dispatch_error_response(
-                    retry::ErrorClass::ReadWriteTimeout,
-                    resolved_ip.clone(),
-                ),
-                retained_body.take(),
-                backend_admission_permits.take(),
-            ))
-        }
-        Ok(Err(())) => Err(backend_dispatch_response(
-            client_grpc_deadline_exceeded_response_for_request(
-                request_ctx,
-                headers,
-                resolved_ip.clone(),
-            ),
+        Ok(Ok(checkout)) => Ok(checkout),
+        Err(source) => Err(direct_h1_handoff_bound_expired(
+            proxy,
+            source,
+            dispatch_bound,
+            send_auth_deadline,
+            request_ctx,
+            headers,
+            resolved_ip.clone(),
             retained_body.take(),
             backend_admission_permits.take(),
         )),
-        Ok(Ok(Err(e))) => {
+        Ok(Err(e)) => {
             record_h2_pool_admission_failure(
                 backend_admission_permits,
                 backend_admission_started_at,
@@ -49987,6 +50037,21 @@ async fn proxy_to_backend_direct_h1(
         DIRECT_H1_UNBOUNDED_CONNECT
     };
     let header_deadline_at = absolute_response_header_read_bound(proxy.backend_read_timeout_ms);
+    // The admitted request's authorization lifetime, composed ONCE and BEFORE
+    // the first checkout (GHSA-xcg4-wj3x-gjj2). The checkout, the idle-race
+    // replay checkout, the handoff gate, and the response-header wait are all
+    // held to these same absolute instants, so a stalled dial or TLS handshake
+    // cannot carry an authenticated request past its credential, and a replay
+    // cannot re-arm it.
+    let send_auth_deadline = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let send_bound = compose_dispatch_phase_auth_bound(
+        request_ctx.grpc_deadline_at(),
+        send_auth_deadline.as_ref(),
+    );
+    let handoff_bound = compose_backend_handoff_bound(header_deadline_at, send_bound);
     let checkout = match direct_h1_bounded_checkout(
         state,
         proxy,
@@ -49994,7 +50059,9 @@ async fn proxy_to_backend_direct_h1(
         tls,
         connect_timeout,
         false,
-        header_deadline_at,
+        handoff_bound,
+        send_bound,
+        send_auth_deadline.as_ref(),
         request_ctx,
         headers,
         backend_url,
@@ -50022,58 +50089,73 @@ async fn proxy_to_backend_direct_h1(
     *backend_req.headers_mut() = out_headers;
 
     // ── Send under the response-header, client and authorization bounds ──
-    let send_auth_deadline = request_upload_auth_deadline(
-        Some(request_ctx),
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
-    let send_bound = compose_dispatch_phase_auth_bound(
-        request_ctx.grpc_deadline_at(),
-        send_auth_deadline.as_ref(),
-    );
+    // `handoff_bound` (composed above, before the first checkout) carries all
+    // three, so the response-header wait is attributed from the same composed
+    // source as the checkout and the handoff gate.
     let mut checkout = checkout;
     let mut replayed_idle_race = false;
     let (response, checkout) = loop {
+        // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2).
+        // `try_send_request` enqueues the request on the connection task
+        // synchronously, before the response wait below is ever polled, and the
+        // connection driver can put an enqueued request on the wire before a
+        // dropped response future cancels it. A bound that elapsed while the
+        // checkout completed therefore refuses here, with nothing enqueued.
+        // The untouched connection never carried this request, so it goes back
+        // to the idle set.
+        checkout = match direct_h1_handoff_gate(handoff_bound, checkout) {
+            Ok(checkout) => checkout,
+            Err(source) => {
+                if let Some(pump) = upload_pump.as_mut() {
+                    pump.cancel();
+                }
+                return direct_h1_handoff_bound_expired(
+                    proxy,
+                    source,
+                    send_bound,
+                    send_auth_deadline.as_ref(),
+                    request_ctx,
+                    headers,
+                    resolved_ip,
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
+        };
         let reused = checkout.reused();
         let send_fut = checkout.sender.try_send_request(backend_req);
         let send_fut =
             h1_send_release::await_h1_response_or_release(send_fut, checkout, |lease, cx| {
                 lease.sender.poll_ready(cx).map_err(|_| ())
             });
+        // Deadline-first, unlike the checkout: the request is already enqueued,
+        // so an elapsed bound must win an exact tie with the response head.
         let bounded = await_upload_write_watermark_first(
-            crate::plugins::await_deadline_first(
-                header_deadline_at,
-                crate::plugins::await_deadline_first(send_bound.at, send_fut),
-            ),
+            crate::plugins::await_deadline_first(handoff_bound.at, send_fut),
             upload_pump.as_mut(),
         )
         .await;
         let write_watermark_expired = bounded.is_err();
         let (send_result, lease) = match bounded {
-            Ok(Ok(Ok(outcome))) => outcome,
-            Ok(Ok(Err(()))) => {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(())) if handoff_bound.source != BackendHandoffBoundSource::ResponseHeader => {
                 // Client RPC deadline or authorization lifetime.
                 if let Some(pump) = upload_pump.as_mut() {
                     pump.cancel();
                 }
-                if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
-                    .is_some()
-                {
-                    return authorization_expired_backend_dispatch(
-                        resolved_ip,
-                        retained_body,
-                        backend_admission_permits,
-                    );
-                }
-                return backend_dispatch_response(
-                    client_grpc_deadline_exceeded_response_for_request(
-                        request_ctx,
-                        headers,
-                        resolved_ip,
-                    ),
+                return direct_h1_handoff_bound_expired(
+                    proxy,
+                    handoff_bound.source,
+                    send_bound,
+                    send_auth_deadline.as_ref(),
+                    request_ctx,
+                    headers,
+                    resolved_ip,
                     retained_body,
                     backend_admission_permits,
                 );
             }
+            // The response-header read bound, or the backend write watermark.
             Ok(Err(())) | Err(()) => {
                 if let Some(pump) = upload_pump.as_mut() {
                     pump.cancel();
@@ -50126,6 +50208,10 @@ async fn proxy_to_backend_direct_h1(
                 {
                     replayed_idle_race = true;
                     backend_req = unsent;
+                    // The SAME absolute bound as the first checkout: a replay
+                    // never re-arms the authorization lifetime, the client RPC
+                    // deadline, or the response-header read bound. The loop's
+                    // handoff gate then re-checks it before the replayed send.
                     checkout = match direct_h1_bounded_checkout(
                         state,
                         proxy,
@@ -50133,7 +50219,9 @@ async fn proxy_to_backend_direct_h1(
                         tls,
                         connect_timeout,
                         true,
-                        header_deadline_at,
+                        handoff_bound,
+                        send_bound,
+                        send_auth_deadline.as_ref(),
                         request_ctx,
                         headers,
                         backend_url,
@@ -53689,7 +53777,18 @@ pub(crate) fn compose_dispatch_phase_auth_bound(
     phase_bound: Option<tokio::time::Instant>,
     auth: Option<&RequestAuthLifetimePlan>,
 ) -> DispatchPhaseBound {
-    match (phase_bound, auth.map(|(plan, _, _)| plan.at)) {
+    compose_dispatch_phase_auth_bound_at(phase_bound, auth.map(|(plan, _, _)| plan.at))
+}
+
+/// [`compose_dispatch_phase_auth_bound`] over the bare authorization instant,
+/// for a hot-path caller that needs only the composed bound and not the
+/// plan's termination latch or protocol family (GHSA-xcg4-wj3x-gjj2).
+#[inline]
+pub(crate) fn compose_dispatch_phase_auth_bound_at(
+    phase_bound: Option<tokio::time::Instant>,
+    authorization_at: Option<tokio::time::Instant>,
+) -> DispatchPhaseBound {
+    match (phase_bound, authorization_at) {
         // Authorization wins only when it is genuinely the earliest bound. A
         // tie goes to authorization, matching the biased select-arm ordering
         // every relay and H3 write seam uses.
@@ -53743,6 +53842,254 @@ impl DispatchPhaseBound {
             authorization_wins: true,
         }
     }
+}
+
+/// The source of the bound a backend connection checkout and the request
+/// handoff after it are held to (GHSA-xcg4-wj3x-gjj2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackendHandoffBoundSource {
+    /// The direct HTTP/1.1 pool's absolute response-header read bound
+    /// (`backend_read_timeout_ms`), composed outside the dispatch phase.
+    ResponseHeader,
+    /// The protocol side of the composed [`DispatchPhaseBound`]: the client RPC
+    /// deadline on the direct HTTP/1.1 and direct-H2 paths, the operator read
+    /// bound on the Unix-socket and HBONE paths.
+    PhaseProtocol,
+    /// The admitted request's authorization lifetime.
+    Authorization,
+}
+
+/// The ONE absolute bound a backend connection checkout, its idle-race replay,
+/// and the request handoff after it are held to, together with the source that
+/// set it (GHSA-xcg4-wj3x-gjj2).
+///
+/// A pooled dispatch acquires its connection BEFORE it hands the request over,
+/// and hyper's `try_send_request` / `send_request` enqueue the request on the
+/// connection task SYNCHRONOUSLY, before any deadline wrapper around the
+/// response future is first polled. The admitted request's authorization
+/// lifetime therefore has to bound the checkout itself and be re-checked at the
+/// instant of handoff; a bound armed only around the response wait is too late,
+/// because the connection driver can put an already-enqueued request on the
+/// wire before the dropped response future cancels it.
+///
+/// Composed once per dispatch from absolute instants, so the at-most-one
+/// idle-race replay is held to the same instant as the first checkout and can
+/// never extend the request's authorized lifetime. The source is decided here,
+/// where every instant is known, never re-derived from the clock after the
+/// bound fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackendHandoffBound {
+    /// The earliest absolute bound, or `None` when no bound applies.
+    pub(crate) at: Option<tokio::time::Instant>,
+    /// The bound `at` came from. Meaningful only when `at` is `Some`.
+    pub(crate) source: BackendHandoffBoundSource,
+}
+
+impl BackendHandoffBound {
+    /// The fail-closed handoff gate: the source of the bound when it has
+    /// ALREADY elapsed, `None` while time remains or when no bound applies.
+    ///
+    /// Checked synchronously, immediately before the request is enqueued on
+    /// the connection, so a bound that elapsed while the checkout completed
+    /// refuses the request without ever handing it to the connection driver.
+    /// One clock read, and none at all when no bound applies.
+    #[inline]
+    pub(crate) fn elapsed(self) -> Option<BackendHandoffBoundSource> {
+        let at = self.at?;
+        (tokio::time::Instant::now() >= at).then_some(self.source)
+    }
+}
+
+/// Compose a backend checkout/handoff bound from the direct HTTP/1.1
+/// response-header read bound and the request's composed dispatch-phase bound
+/// (GHSA-xcg4-wj3x-gjj2).
+///
+/// The earliest instant wins. The response-header read bound wins ANY tie,
+/// with the client RPC deadline or the authorization lifetime alike, so the
+/// direct HTTP/1.1 pool attributes an exact tie exactly as the reqwest
+/// dispatch's nested waits do (the outer response-header wait is checked
+/// first there): a `504`, never a different terminal depending on
+/// `FERRUM_POOL_HTTP1_DIRECT`.
+#[inline]
+pub(crate) fn compose_backend_handoff_bound(
+    response_header_at: Option<tokio::time::Instant>,
+    dispatch: DispatchPhaseBound,
+) -> BackendHandoffBound {
+    let dispatch_source = if dispatch.authorization_wins {
+        BackendHandoffBoundSource::Authorization
+    } else {
+        BackendHandoffBoundSource::PhaseProtocol
+    };
+    match (response_header_at, dispatch.at) {
+        (Some(header), Some(phase)) if header <= phase => BackendHandoffBound {
+            at: Some(header),
+            source: BackendHandoffBoundSource::ResponseHeader,
+        },
+        (_, Some(phase)) => BackendHandoffBound {
+            at: Some(phase),
+            source: dispatch_source,
+        },
+        (Some(header), None) => BackendHandoffBound {
+            at: Some(header),
+            source: BackendHandoffBoundSource::ResponseHeader,
+        },
+        (None, None) => BackendHandoffBound {
+            at: None,
+            source: BackendHandoffBoundSource::PhaseProtocol,
+        },
+    }
+}
+
+/// Await a backend connection checkout under its composed bound
+/// (GHSA-xcg4-wj3x-gjj2).
+///
+/// * An already-elapsed bound refuses without polling the checkout at all.
+/// * The checkout is polled BEFORE any timer exists, so a checkout that is
+///   ready on its first poll (a pooled connection, an idle lease, a live
+///   HTTP/2 sender) completes without ever registering with the runtime timer
+///   — no timer-driver lock on the hot path.
+/// * Only a checkout that is still pending arms a `sleep_until(at)`; a bound
+///   that elapses mid-checkout drops (cancels) the checkout at that instant.
+///
+/// `Err` names the bound that ended it. No bound keeps the timer-free,
+/// clock-free path. A checkout that completes at or after the instant on a
+/// later wake is returned, and the synchronous handoff gate
+/// ([`BackendHandoffBound::elapsed`]) every caller runs before enqueueing then
+/// refuses it — that gate, not this wait, is the fail-closed backstop.
+#[inline]
+pub(crate) fn await_backend_handoff_bound<F>(
+    bound: BackendHandoffBound,
+    checkout: F,
+) -> BackendHandoffBounded<F>
+where
+    F: std::future::Future,
+{
+    BackendHandoffBounded {
+        checkout,
+        sleep: None,
+        bound,
+        prechecked: false,
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`await_backend_handoff_bound`]. A named future
+    /// rather than an `async fn`, so `checkout` is stored once in the caller's
+    /// state machine, and the `Sleep` is constructed only for a checkout that
+    /// is actually pending.
+    pub(crate) struct BackendHandoffBounded<F> {
+        #[pin]
+        checkout: F,
+        #[pin]
+        sleep: Option<tokio::time::Sleep>,
+        bound: BackendHandoffBound,
+        prechecked: bool,
+    }
+}
+
+impl<F> std::future::Future for BackendHandoffBounded<F>
+where
+    F: std::future::Future,
+{
+    type Output = Result<F::Output, BackendHandoffBoundSource>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut this = self.project();
+        let source = this.bound.source;
+        let Some(at) = this.bound.at else {
+            return this.checkout.as_mut().poll(cx).map(Ok);
+        };
+        if !*this.prechecked {
+            *this.prechecked = true;
+            // Expiry first: an already-elapsed bound never polls the checkout.
+            if tokio::time::Instant::now() >= at {
+                return std::task::Poll::Ready(Err(source));
+            }
+        }
+        // The checkout before the timer: a ready checkout never arms one.
+        if let std::task::Poll::Ready(output) = this.checkout.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Ok(output));
+        }
+        if this.sleep.is_none() {
+            this.sleep.set(Some(tokio::time::sleep_until(at)));
+        }
+        match this.sleep.as_mut().as_pin_mut() {
+            Some(sleep) => sleep.poll(cx).map(|()| Err(source)),
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// The fail-closed handoff gate in front of a leased connection
+/// (GHSA-xcg4-wj3x-gjj2): the lease back when the bound still has time left,
+/// otherwise the lease is handed to `release` UNTOUCHED — it never carried the
+/// request — and the bound's source is returned. Every pooled HTTP/1.1
+/// dispatch runs this synchronously, immediately before `try_send_request`.
+#[inline]
+pub(crate) fn gate_backend_handoff<L>(
+    bound: BackendHandoffBound,
+    lease: L,
+    release: impl FnOnce(L),
+) -> Result<L, BackendHandoffBoundSource> {
+    match bound.elapsed() {
+        None => Ok(lease),
+        Some(source) => {
+            release(lease);
+            Err(source)
+        }
+    }
+}
+
+/// The direct HTTP/1.1 pool's handoff gate: a refused, untouched connection
+/// goes back to the idle set (GHSA-xcg4-wj3x-gjj2).
+#[inline]
+pub(crate) fn direct_h1_handoff_gate(
+    bound: BackendHandoffBound,
+    checkout: http2_pool::Http1Checkout,
+) -> Result<http2_pool::Http1Checkout, BackendHandoffBoundSource> {
+    gate_backend_handoff(bound, checkout, http2_pool::Http1Checkout::checkin)
+}
+
+/// The Unix-socket HTTP/1.1 pool's handoff gate: a refused, untouched lease
+/// is checked back in (`checkin_h1` is the pool's entry point for a lease
+/// abandoned before it was sent) (GHSA-xcg4-wj3x-gjj2).
+#[cfg(unix)]
+#[inline]
+pub(crate) fn unix_h1_handoff_gate(
+    pool: &unix_backend_pool::UnixBackendConnectionPool,
+    bound: BackendHandoffBound,
+    checkout: unix_backend_pool::UnixH1Checkout,
+) -> Result<unix_backend_pool::UnixH1Checkout, BackendHandoffBoundSource> {
+    gate_backend_handoff(bound, checkout, |lease| pool.checkin_h1(lease))
+}
+
+/// The HBONE inner HTTP/1.1 handoff gate: a refused lease is dropped, as on
+/// this path's other pre-send exits — an inner lease is itself bounded by the
+/// source credential (GHSA-xcg4-wj3x-gjj2).
+#[inline]
+pub(crate) fn hbone_h1_handoff_gate(
+    bound: BackendHandoffBound,
+    checkout: hbone_inner_pool::HboneInnerH1Checkout,
+) -> Result<hbone_inner_pool::HboneInnerH1Checkout, BackendHandoffBoundSource> {
+    gate_backend_handoff(bound, checkout, drop)
+}
+
+/// The direct-H2 handoff gate, run immediately before `send_request`
+/// (GHSA-xcg4-wj3x-gjj2). `Some` carries the source and the composed dispatch
+/// bound for attribution when the client RPC deadline or the authorization
+/// lifetime has already elapsed. A multiplexed sender has no lease to return.
+#[inline]
+pub(crate) fn direct_h2_handoff_refusal(
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    upload_auth_deadline: Option<&RequestAuthLifetimePlan>,
+) -> Option<(BackendHandoffBoundSource, DispatchPhaseBound)> {
+    let dispatch = compose_dispatch_phase_auth_bound(grpc_deadline_at, upload_auth_deadline);
+    compose_backend_handoff_bound(None, dispatch)
+        .elapsed()
+        .map(|source| (source, dispatch))
 }
 
 /// Which bound ended a buffered RESPONSE-body collection.
@@ -54145,6 +54492,110 @@ fn authorization_expired_backend_dispatch(
     )
 }
 
+/// The bound a direct-H2 sender acquisition and the request handoff after it
+/// are held to: the client RPC deadline composed with the admitted request's
+/// authorization lifetime (GHSA-xcg4-wj3x-gjj2).
+///
+/// Derived from the request context alone, and receipt-anchored, so the
+/// acquisition and the handoff gate in [`proxy_to_backend_http2`] compose the
+/// same absolute instants. Only the bare instant is read — no termination
+/// latch handle and no protocol-family header lookup on the hot path — and
+/// only the `Copy` composition is returned.
+#[inline]
+fn direct_h2_sender_bound(state: &ProxyState, ctx: &RequestContext) -> BackendHandoffBound {
+    let authorization = crate::proxy::auth_lifetime::effective_request_auth_deadline(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    compose_backend_handoff_bound(
+        None,
+        compose_dispatch_phase_auth_bound_at(
+            ctx.grpc_deadline_at(),
+            authorization.map(|plan| plan.at),
+        ),
+    )
+}
+
+/// Settle a direct-H2 sender acquisition whose composed bound elapsed
+/// (GHSA-xcg4-wj3x-gjj2). Out of line: a cold arm of `proxy_to_backend`, whose
+/// poll frame is stack-budgeted.
+#[inline(never)]
+fn direct_h2_sender_bound_expired(
+    state: &ProxyState,
+    request_ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    source: BackendHandoffBoundSource,
+    resolved_ip: Option<String>,
+) -> BackendDispatchResult {
+    if source == BackendHandoffBoundSource::Authorization {
+        // The same receipt-anchored plan the bound was composed from; latched
+        // and counted exactly once for the request.
+        let auth = request_upload_auth_deadline(
+            Some(request_ctx),
+            state.env_config.authenticated_stream_max_lifetime_seconds,
+        );
+        let _ = dispatch_phase_authorization_expiry(
+            compose_dispatch_phase_auth_bound(None, auth.as_ref()),
+            auth.as_ref(),
+        );
+        return authorization_expired_backend_dispatch(resolved_ip, None, None);
+    }
+    backend_dispatch_response(
+        client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, resolved_ip),
+        None,
+        None,
+    )
+}
+
+/// Settle a direct-H2 request handoff refused because its composed bound
+/// elapsed before `send_request` (GHSA-xcg4-wj3x-gjj2). Out of line: a cold arm
+/// of `proxy_to_backend_http2`, whose poll frame is stack-budgeted.
+#[inline(never)]
+pub(crate) fn direct_h2_handoff_bound_expired(
+    ctx: Option<&RequestContext>,
+    headers: &HashMap<String, String>,
+    source: BackendHandoffBoundSource,
+    dispatch_bound: DispatchPhaseBound,
+    upload_auth_deadline: Option<&RequestAuthLifetimePlan>,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    if source == BackendHandoffBoundSource::Authorization {
+        let _ = dispatch_phase_authorization_expiry(dispatch_bound, upload_auth_deadline);
+        return authorization_expired_dispatch_placeholder(resolved_ip);
+    }
+    client_grpc_deadline_exceeded_response_for_optional_request(ctx, headers, resolved_ip)
+}
+
+/// Settle a pooled HBONE inner or Unix-socket HTTP/1.1 checkout or request
+/// handoff whose composed bound elapsed before the request was handed to the
+/// connection (GHSA-xcg4-wj3x-gjj2).
+///
+/// An authorization expiry is the gateway's own security decision: latched and
+/// counted exactly once, and answered with the health-neutral placeholder the
+/// pre-commitment terminal replaces. The protocol side of these paths'
+/// dispatch bound is the operator read bound, which keeps its `504`.
+#[inline(never)]
+fn mesh_h1_handoff_bound_expired(
+    proxy: &Proxy,
+    transport: &'static str,
+    source: BackendHandoffBoundSource,
+    dispatch_bound: DispatchPhaseBound,
+    send_auth_deadline: Option<&RequestAuthLifetimePlan>,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    if source == BackendHandoffBoundSource::Authorization {
+        let _ = dispatch_phase_authorization_expiry(dispatch_bound, send_auth_deadline);
+        return authorization_expired_dispatch_placeholder(resolved_ip);
+    }
+    warn!(
+        proxy_id = %proxy.id,
+        transport,
+        read_timeout_ms = proxy.backend_read_timeout_ms,
+        "backend read timeout elapsed before the request was handed to the connection"
+    );
+    http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
+}
+
 fn mesh_grpc_response_body_too_large_response(
     proxy: &Proxy,
     resolved_ip: Option<String>,
@@ -54327,6 +54778,10 @@ enum HboneInnerOpenError {
     Pool(hbone_pool::HbonePoolError),
     /// The outer CONNECT succeeded and the inner HTTP/1.1 handshake failed.
     Handshake(hyper::Error),
+    /// The admitted request's authorization lifetime elapsed before the inner
+    /// lease was open (GHSA-xcg4-wj3x-gjj2). The open was cancelled; nothing
+    /// was sent on it.
+    AuthorizationExpired,
 }
 
 /// Open ONE new HBONE CONNECT and run a fresh inner HTTP/1.1 client over it,
@@ -54453,23 +54908,33 @@ fn boxed_open_hbone_inner_h1<'a>(
     expected_trust_domain: Option<&'a crate::identity::spiffe::TrustDomain>,
     sni_override: Option<&'a str>,
     asserted_source_identity: Option<&'a crate::identity::SpiffeId>,
+    authorization_at: Option<tokio::time::Instant>,
 ) -> BoxedHboneInnerH1OpenFuture<'a> {
     Box::pin(async move {
-        open_hbone_inner_h1(
-            state,
-            proxy,
-            plan,
-            dial_host,
-            app_host,
-            app_port,
-            app_policy_port,
-            hbone_port,
-            expected_peer,
-            expected_trust_domain,
-            sni_override,
-            asserted_source_identity,
+        // The CONNECT and the inner handshake are bounded by the admitted
+        // request's absolute authorization deadline (GHSA-xcg4-wj3x-gjj2), so a
+        // stalled tunnel cannot carry an authenticated request past its
+        // credential. Applied inside the boxed trampoline so the acquire frame
+        // still carries only the box.
+        crate::plugins::await_deadline_first(
+            authorization_at,
+            open_hbone_inner_h1(
+                state,
+                proxy,
+                plan,
+                dial_host,
+                app_host,
+                app_port,
+                app_policy_port,
+                hbone_port,
+                expected_peer,
+                expected_trust_domain,
+                sni_override,
+                asserted_source_identity,
+            ),
         )
         .await
+        .unwrap_or(Err(HboneInnerOpenError::AuthorizationExpired))
     })
 }
 
@@ -54782,10 +55247,36 @@ async fn proxy_to_backend_hbone(
             expected_trust_domain.as_ref(),
             sni_override,
             asserted_source_identity,
+            // The admitted request's absolute authorization deadline
+            // (GHSA-xcg4-wj3x-gjj2), the same instant the post-tunnel handoff
+            // gate and response-header wait derive from the same context.
+            request_upload_auth_deadline(
+                ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            )
+            .map(|(deadline, _, _)| deadline.at),
         )
         .await
         {
             Ok(checkout) => checkout,
+            Err(HboneInnerOpenError::AuthorizationExpired) => {
+                let auth = request_upload_auth_deadline(
+                    ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                );
+                return (
+                    mesh_h1_handoff_bound_expired(
+                        proxy,
+                        "hbone",
+                        BackendHandoffBoundSource::Authorization,
+                        compose_dispatch_phase_auth_bound(None, auth.as_ref()),
+                        auth.as_ref(),
+                        resolved_ip,
+                    ),
+                    None,
+                    None,
+                );
+            }
             Err(HboneInnerOpenError::Pool(err)) => {
                 if err.is_capability_failure() {
                     debug!(
@@ -55195,7 +55686,33 @@ async fn proxy_to_backend_hbone_after_ready(
     } else {
         None
     };
+    let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
+    let handoff_bound = compose_backend_handoff_bound(None, send_bound);
+    let authorization_at = send_auth_deadline.as_ref().map(|(plan, _, _)| plan.at);
     let (response, checkout) = loop {
+        // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2):
+        // `try_send_request` enqueues synchronously, before the bounded
+        // response wait below is first polled, so a bound that elapsed while
+        // the lease was acquired refuses here with nothing enqueued. The lease
+        // is dropped, as on this path's other pre-send exits: an inner lease
+        // is itself bounded by the source credential.
+        checkout = match hbone_h1_handoff_gate(handoff_bound, checkout) {
+            Ok(checkout) => checkout,
+            Err(source) => {
+                return (
+                    mesh_h1_handoff_bound_expired(
+                        proxy,
+                        "hbone",
+                        source,
+                        send_bound,
+                        send_auth_deadline.as_ref(),
+                        resolved_ip,
+                    ),
+                    None,
+                    None,
+                );
+            }
+        };
         let reused = checkout.reused();
         // The response wait OWNS the lease (issue #5720). If the inner
         // connection stops reading requests while this one may still be queued
@@ -55208,8 +55725,6 @@ async fn proxy_to_backend_hbone_after_ready(
         // idle-race arm below then REPLACES `checkout` exactly as it does for
         // any other pre-wire handback.
         let send_result = {
-            let send_bound =
-                compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             let send_fut = checkout.sender.try_send_request(backend_req);
             let send_fut =
                 h1_send_release::await_h1_response_or_release(send_fut, checkout, |lease, cx| {
@@ -55339,10 +55854,32 @@ async fn proxy_to_backend_hbone_after_ready(
                         plan.expected_trust_domain,
                         plan.sni_override,
                         plan.asserted_source_identity,
+                        // The SAME absolute authorization deadline as the
+                        // first lease (GHSA-xcg4-wj3x-gjj2); the loop's
+                        // handoff gate re-checks the full send bound before
+                        // the replayed send.
+                        authorization_at,
                     )
                     .await
                     {
                         Ok(checkout) => checkout,
+                        Err(HboneInnerOpenError::AuthorizationExpired) => {
+                            return (
+                                mesh_h1_handoff_bound_expired(
+                                    proxy,
+                                    "hbone",
+                                    BackendHandoffBoundSource::Authorization,
+                                    compose_dispatch_phase_auth_bound(
+                                        None,
+                                        send_auth_deadline.as_ref(),
+                                    ),
+                                    send_auth_deadline.as_ref(),
+                                    resolved_ip,
+                                ),
+                                None,
+                                None,
+                            );
+                        }
                         Err(HboneInnerOpenError::Pool(err)) => {
                             if err.is_capability_failure() {
                                 mark_hbone_unsupported_for_backend_target(
@@ -55925,19 +56462,45 @@ async fn proxy_to_backend_unix(
     let unix_conn_effective_proxy =
         resolve_backend_connection_proxy_for_target(proxy, upstream_target);
     let conn_proxy = unix_conn_effective_proxy.as_ref();
-    let mut checkout = match state
-        .unix_backend_pool
-        .checkout_h1(
+    // Authorization lifetime for the checkout, the handoff, and the
+    // response-header wait (#3815, GHSA-xcg4-wj3x-gjj2). Composed BEFORE the
+    // checkout and absolute, so neither a stalled dial nor the at-most-one
+    // idle-race replay below can carry the request past its credential. The
+    // operator read bound arms only once a connection is held.
+    let send_auth_deadline = request_upload_auth_deadline(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let checkout_bound = compose_dispatch_phase_auth_bound(None, send_auth_deadline.as_ref());
+    let checkout_handoff_bound = compose_backend_handoff_bound(None, checkout_bound);
+    let checkout = await_backend_handoff_bound(
+        checkout_handoff_bound,
+        state.unix_backend_pool.checkout_h1(
             conn_proxy,
             socket_path,
             proxy.backend_connect_timeout_ms,
             &state.env_config.mesh_unix_socket_allowed_roots,
             &state.env_config.mesh_unix_socket_allowed_uids,
-        )
-        .await
-    {
-        Ok(checkout) => checkout,
-        Err(err) => {
+        ),
+    )
+    .await;
+    let mut checkout = match checkout {
+        Ok(Ok(checkout)) => checkout,
+        Err(source) => {
+            return (
+                mesh_h1_handoff_bound_expired(
+                    proxy,
+                    "unix",
+                    source,
+                    checkout_bound,
+                    send_auth_deadline.as_ref(),
+                    resolved_ip,
+                ),
+                None,
+                None,
+            );
+        }
+        Ok(Err(err)) => {
             return (
                 unix_backend_error_response(proxy, &err, resolved_ip),
                 None,
@@ -56164,12 +56727,6 @@ async fn proxy_to_backend_unix(
     // non-idempotent request.
     let mut backend_req = Request::from_parts(parts, body);
     let mut replayed_idle_race = false;
-    // Authorization lifetime for the response-header wait (#3815). Absolute, so
-    // the at-most-one idle-race replay below cannot re-arm it.
-    let send_auth_deadline = request_upload_auth_deadline(
-        ctx,
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
     // ALSO absolute, and hoisted above the loop for exactly that reason: a
     // replayed dispatch must not get a second full `backend_read_timeout_ms`
     // window and make one request wait twice the configured budget. Kept in
@@ -56180,7 +56737,31 @@ async fn proxy_to_backend_unix(
     } else {
         None
     };
+    let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
+    let handoff_bound = compose_backend_handoff_bound(None, send_bound);
     let (response, checkout) = loop {
+        // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2):
+        // `try_send_request` enqueues synchronously, before the bounded
+        // response wait below is first polled, so a bound that elapsed while
+        // the checkout completed refuses here with nothing enqueued. The
+        // untouched lease never carried this request and is checked back in.
+        checkout = match unix_h1_handoff_gate(&state.unix_backend_pool, handoff_bound, checkout) {
+            Ok(checkout) => checkout,
+            Err(source) => {
+                return (
+                    mesh_h1_handoff_bound_expired(
+                        proxy,
+                        "unix",
+                        source,
+                        send_bound,
+                        send_auth_deadline.as_ref(),
+                        resolved_ip,
+                    ),
+                    None,
+                    None,
+                );
+            }
+        };
         let reused = checkout.reused();
         // The response wait OWNS the lease (issue #5720): if the connection
         // stops reading requests while this one may still be queued on it — the
@@ -56196,8 +56777,6 @@ async fn proxy_to_backend_unix(
                 h1_send_release::await_h1_response_or_release(send_fut, checkout, |lease, cx| {
                     lease.sender.poll_ready(cx).map_err(|_| ())
                 });
-            let send_bound =
-                compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             if let Some(send_deadline) = send_bound.at {
                 let bounded = await_upload_write_watermark_first(
                     crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
@@ -56307,19 +56886,37 @@ async fn proxy_to_backend_unix(
                 {
                     replayed_idle_race = true;
                     backend_req = unsent;
-                    checkout = match state
-                        .unix_backend_pool
-                        .checkout_fresh_h1(
+                    // The SAME absolute authorization bound as the first
+                    // checkout; the loop's handoff gate re-checks the full
+                    // send bound before the replayed send.
+                    let replay = await_backend_handoff_bound(
+                        checkout_handoff_bound,
+                        state.unix_backend_pool.checkout_fresh_h1(
                             conn_proxy,
                             socket_path,
                             proxy.backend_connect_timeout_ms,
                             &state.env_config.mesh_unix_socket_allowed_roots,
                             &state.env_config.mesh_unix_socket_allowed_uids,
-                        )
-                        .await
-                    {
-                        Ok(checkout) => checkout,
-                        Err(err) => {
+                        ),
+                    )
+                    .await;
+                    checkout = match replay {
+                        Ok(Ok(checkout)) => checkout,
+                        Err(source) => {
+                            return (
+                                mesh_h1_handoff_bound_expired(
+                                    proxy,
+                                    "unix",
+                                    source,
+                                    checkout_bound,
+                                    send_auth_deadline.as_ref(),
+                                    resolved_ip,
+                                ),
+                                None,
+                                None,
+                            );
+                        }
+                        Ok(Err(err)) => {
                             return (
                                 unix_backend_error_response(proxy, &err, resolved_ip),
                                 None,
@@ -58725,6 +59322,31 @@ async fn proxy_to_backend_http2(
     // request-side receipt to offer.
     if let Some(pump) = upload_pump.as_mut() {
         pump.bind_backend_socket(sender.backend_socket());
+    }
+    // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2). `send_request`
+    // enqueues the request on the connection task synchronously, before the
+    // bounded response-header wait below is first polled, and the connection
+    // task can open the backend stream before a dropped response future cancels
+    // it. A client RPC deadline or authorization lifetime that elapsed while the
+    // sender was acquired therefore refuses here, with nothing enqueued; the
+    // gateway-owned upload pump is joined first, as on every other bounded exit.
+    if let Some((source, handoff_dispatch_bound)) =
+        direct_h2_handoff_refusal(grpc_deadline_at, upload_auth_deadline.as_ref())
+    {
+        if let Some(pump) = upload_pump.take() {
+            pump.cancel_and_join().await;
+        }
+        return (
+            direct_h2_handoff_bound_expired(
+                ctx,
+                headers,
+                source,
+                handoff_dispatch_bound,
+                upload_auth_deadline.as_ref(),
+                resolved_ip,
+            ),
+            None,
+        );
     }
     // Send to backend with read timeout (0 = no timeout)
     let h2_send_fut = sender.send_request(backend_req);

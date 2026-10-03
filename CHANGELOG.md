@@ -7,8 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Backend connection checkout and request handoff are held to the
+  authorization lifetime** (GHSA-xcg4-wj3x-gjj2; regression from the direct
+  HTTP/1.1 pool, #5961). The direct HTTP/1.1 pool checked out its connection
+  (pool wait, dial, TLS handshake) under the response-header and client RPC
+  deadlines only, and composed the request's authorization lifetime only
+  after the checkout. A credential that expired while the checkout was
+  stalled therefore did not end the request, and because hyper enqueues the
+  request on its connection task synchronously, before any wait on the
+  response is polled, a request whose credential had already expired could
+  be handed to the connection and reach the backend. The plan is now composed
+  before the first checkout and bounds the checkout and its idle-race replay
+  at the same absolute instant, and it is re-checked immediately before the
+  request is enqueued, so an expired request is refused with nothing sent.
+  The expiry is reported as the gateway's own health-neutral authorization
+  decision (the fixed pre-commitment terminal and one `credential_expired` /
+  `authenticated_stream_max_lifetime` count), never as a `504` or a client
+  RPC deadline; an earlier client or operator bound keeps its own terminal,
+  and an exact tie with the response-header read bound is a `504`, as on the
+  reqwest path. The same checkout bound and handoff gate now also cover the
+  Unix-socket HTTP/1.1 pool, the HBONE inner HTTP/1.1 lease (CONNECT and inner
+  handshake), and the direct-H2 sender acquisition. A checkout that is ready
+  on its first poll (a pooled connection or live HTTP/2 sender) never arms a
+  timer. Unauthenticated requests are unchanged. **Still unbounded**, tracked
+  in #5990: sender acquisition and handoff on sidecar mesh-mTLS dispatch
+  (including the Unix-socket h2c carrier), native gRPC dispatch, and possibly
+  the native HTTP/3 backend.
+
 ### Fixed
 
+- **`response_mock` preserves mixed-case extension method spelling** (#5972).
+  The constructor folded every configured `method` token to uppercase, so a
+  valid case-sensitive extension method (for example `Foo`) was stored as `FOO`
+  and could never match a request whose parsed method was preserved as `Foo`;
+  the rule silently fell through to the terminal 404 or to backend passthrough.
+  Registered standard methods are still case-folded for the `get`/`GET`
+  convenience, but extension tokens now retain their configured spelling and
+  match exactly.
+- **`sse` `Accept` validation now honors `q=0`** (#5976). The enabled
+  `require_accept_header` check compared only the media type, so
+  `Accept: text/event-stream; q=0` — an explicit rejection of the
+  representation — was admitted. Request-side admission now routes through the
+  shared quality-aware SSE predicate: `q=0`, malformed, and duplicate quality
+  values return 406, while `require_accept_header: false` remains the opt-out.
+- **StatsD `max_batch_lines` documentation now matches its unit** (#5973). The
+  guide and OpenAPI described it as a metric-line threshold, but the shared
+  batching logger counts admitted transaction records, each of which renders
+  several newline-separated metric lines. The wording is corrected; the
+  configuration key and runtime behavior are unchanged.
 - The scheduled Fuzz sanitizer lane (`fuzz.yml`) no longer loses its hosted
   runner ("The runner has received a shutdown signal", exit 143) while
   compiling the AddressSanitizer build of the `ferrum-edge` library. That

@@ -498,11 +498,10 @@ pub fn effective_request_auth_deadline(
     if !request_is_authenticated(ctx) {
         return None;
     }
-    let now = tokio::time::Instant::now();
     let maximum = ctx
         .grpc_deadline_received_at
         .checked_add(std::time::Duration::from_secs(max_lifetime_seconds))
-        .unwrap_or(now);
+        .unwrap_or_else(tokio::time::Instant::now);
     Some(earliest(ctx.credential_deadline_at, maximum))
 }
 
@@ -520,10 +519,9 @@ pub fn effective_stream_auth_deadline(
     if !authenticated {
         return None;
     }
-    let now = tokio::time::Instant::now();
     let maximum = anchor
         .checked_add(std::time::Duration::from_secs(max_lifetime_seconds))
-        .unwrap_or(now);
+        .unwrap_or_else(tokio::time::Instant::now);
     Some(earliest(credential_deadline_at, maximum))
 }
 

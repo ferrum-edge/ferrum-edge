@@ -11419,6 +11419,162 @@ pub mod _test_support {
         crate::proxy::dispatch_phase_authorization_expiry(bound.0, auth)
     }
 
+    /// Which bound a backend connection checkout or request handoff is held to
+    /// (GHSA-xcg4-wj3x-gjj2).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BackendHandoffBoundSourceForTest {
+        /// The direct HTTP/1.1 response-header read bound.
+        ResponseHeader,
+        /// The protocol side of the composed dispatch-phase bound.
+        PhaseProtocol,
+        /// The admitted request's authorization lifetime.
+        Authorization,
+    }
+
+    fn backend_handoff_source_for_test(
+        source: crate::proxy::BackendHandoffBoundSource,
+    ) -> BackendHandoffBoundSourceForTest {
+        match source {
+            crate::proxy::BackendHandoffBoundSource::ResponseHeader => {
+                BackendHandoffBoundSourceForTest::ResponseHeader
+            }
+            crate::proxy::BackendHandoffBoundSource::PhaseProtocol => {
+                BackendHandoffBoundSourceForTest::PhaseProtocol
+            }
+            crate::proxy::BackendHandoffBoundSource::Authorization => {
+                BackendHandoffBoundSourceForTest::Authorization
+            }
+        }
+    }
+
+    /// A composed backend checkout/handoff bound (GHSA-xcg4-wj3x-gjj2).
+    #[derive(Clone, Copy, Debug)]
+    pub struct ComposedBackendHandoffBoundForTest(crate::proxy::BackendHandoffBound);
+
+    impl ComposedBackendHandoffBoundForTest {
+        /// The absolute instant every checkout and handoff is held to.
+        pub fn at(&self) -> Option<tokio::time::Instant> {
+            self.0.at
+        }
+
+        /// The bound `at` came from.
+        pub fn source(&self) -> BackendHandoffBoundSourceForTest {
+            backend_handoff_source_for_test(self.0.source)
+        }
+    }
+
+    /// Compose the production checkout/handoff bound from an absolute
+    /// response-header read bound and a composed dispatch-phase bound
+    /// (GHSA-xcg4-wj3x-gjj2).
+    pub fn compose_backend_handoff_bound_for_test(
+        response_header_at: Option<tokio::time::Instant>,
+        dispatch: &ComposedDispatchPhaseBoundForTest,
+    ) -> ComposedBackendHandoffBoundForTest {
+        ComposedBackendHandoffBoundForTest(crate::proxy::compose_backend_handoff_bound(
+            response_header_at,
+            dispatch.0,
+        ))
+    }
+
+    /// Await a controlled connection checkout under the production
+    /// checkout bound (GHSA-xcg4-wj3x-gjj2). `Err` names the bound that ended
+    /// it; the checkout future has then been dropped.
+    pub async fn await_backend_checkout_bound_for_test<F>(
+        bound: &ComposedBackendHandoffBoundForTest,
+        checkout: F,
+    ) -> Result<F::Output, BackendHandoffBoundSourceForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::proxy::await_backend_handoff_bound(bound.0, checkout)
+            .await
+            .map_err(backend_handoff_source_for_test)
+    }
+
+    /// Outcome of the production handoff gate (GHSA-xcg4-wj3x-gjj2).
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum BackendHandoffGateOutcomeForTest<R> {
+        /// The bound had time left: the request was handed to `enqueue`.
+        Enqueued(R),
+        /// The bound had elapsed: `enqueue` was never called.
+        Refused(BackendHandoffBoundSourceForTest),
+    }
+
+    /// Run the production fail-closed handoff gate
+    /// (`proxy::gate_backend_handoff`) in front of a fake send adapter
+    /// (GHSA-xcg4-wj3x-gjj2). `enqueue` stands in for hyper's synchronous
+    /// `try_send_request` / `send_request` and is called only when the composed
+    /// bound still has time left; otherwise the untouched `lease` goes to
+    /// `release`.
+    pub fn backend_handoff_gate_for_test<L, R>(
+        bound: &ComposedBackendHandoffBoundForTest,
+        lease: L,
+        release: impl FnOnce(L),
+        enqueue: impl FnOnce(L) -> R,
+    ) -> BackendHandoffGateOutcomeForTest<R> {
+        match crate::proxy::gate_backend_handoff(bound.0, lease, release) {
+            Ok(lease) => BackendHandoffGateOutcomeForTest::Enqueued(enqueue(lease)),
+            Err(source) => {
+                BackendHandoffGateOutcomeForTest::Refused(backend_handoff_source_for_test(source))
+            }
+        }
+    }
+
+    /// The production direct HTTP/1.1 handoff gate over a real pool checkout
+    /// (GHSA-xcg4-wj3x-gjj2): a refused, untouched connection is checked back
+    /// in to the idle set.
+    pub fn direct_h1_handoff_gate_for_test(
+        bound: &ComposedBackendHandoffBoundForTest,
+        checkout: crate::proxy::http2_pool::Http1Checkout,
+    ) -> Result<crate::proxy::http2_pool::Http1Checkout, BackendHandoffBoundSourceForTest> {
+        crate::proxy::direct_h1_handoff_gate(bound.0, checkout)
+            .map_err(backend_handoff_source_for_test)
+    }
+
+    /// A Unix-socket HTTP/1.1 pool lease.
+    #[cfg(unix)]
+    pub type UnixH1LeaseForTest = crate::proxy::unix_backend_pool::UnixH1Checkout;
+
+    /// The production Unix-socket HTTP/1.1 handoff gate over a real pool lease
+    /// (GHSA-xcg4-wj3x-gjj2): a refused, untouched lease is checked back in.
+    #[cfg(unix)]
+    pub fn unix_h1_handoff_gate_for_test(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        bound: &ComposedBackendHandoffBoundForTest,
+        checkout: UnixH1LeaseForTest,
+    ) -> Result<UnixH1LeaseForTest, BackendHandoffBoundSourceForTest> {
+        crate::proxy::unix_h1_handoff_gate(pool, bound.0, checkout)
+            .map_err(backend_handoff_source_for_test)
+    }
+
+    /// The production direct-H2 handoff gate and its settle helper
+    /// (GHSA-xcg4-wj3x-gjj2). `None` lets the request through to
+    /// `send_request`; `Some` is the refusal's source, HTTP status, and
+    /// `grpc-status`, after the authorization latch (if any) was recorded.
+    pub fn direct_h2_handoff_gate_for_test(
+        grpc_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> Option<(BackendHandoffBoundSourceForTest, u16, Option<String>)> {
+        let (source, dispatch) = crate::proxy::direct_h2_handoff_refusal(grpc_deadline_at, auth)?;
+        let response = crate::proxy::direct_h2_handoff_bound_expired(
+            None,
+            &std::collections::HashMap::new(),
+            source,
+            dispatch,
+            auth,
+            None,
+        );
+        Some((
+            backend_handoff_source_for_test(source),
+            response.status_code,
+            response.headers.get("grpc-status").cloned(),
+        ))
+    }
+
     /// Attribute an ALREADY-COMPOSED dispatch-phase bound whose winning source
     /// is the admitted stream's authorization lifetime (issue #3815). This is
     /// the shape the typed composers (`authorization_bounded_header_deadline`,

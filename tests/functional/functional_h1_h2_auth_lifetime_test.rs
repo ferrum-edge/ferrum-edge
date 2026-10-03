@@ -29,6 +29,12 @@
 //! * exactly one `credential_expired` termination is counted for the `http`
 //!   family on a freshly spawned gateway.
 //!
+//! A further case covers the window BEFORE the backend request exists
+//! (GHSA-xcg4-wj3x-gjj2): a direct HTTP/1.1 pool checkout whose TLS handshake
+//! stalls past the credential deadline must end at that deadline with the
+//! authorization terminal, and the backend must never receive the request —
+//! not even once its stalled handshake would have completed.
+//!
 //! The HTTP/1.1 case runs twice, against an integer and a fractional `exp`
 //! (issue #5521). Both are conforming RFC 7519 §2 NumericDates and the JWT
 //! layer validates both, but only the integer one used to publish a credential
@@ -44,7 +50,7 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -430,6 +436,230 @@ async fn assert_non_reading_h1_client_cannot_outlive_the_credential(exp_shape: E
         !received.ends_with(b"0\r\n\r\n"),
         "an authorization termination must NOT look like a complete chunked response: the body \
          ended with a terminating chunk"
+    );
+
+    assert_credential_expired_exactly(&harness, "http", 1).await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 4. A direct HTTP/1.1 pool checkout that stalls past the credential deadline
+//    (GHSA-xcg4-wj3x-gjj2).
+//
+//    The backend accepts TCP but holds its TLS handshake for longer than the
+//    credential lives, so the direct pool's checkout is still in flight when
+//    the credential expires. Every operator bound that could otherwise end the
+//    checkout is disabled or set far beyond the stall, so the authorization
+//    deadline is provably the bound that ends it.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// How long the backend withholds its TLS handshake on every accepted
+/// connection: far longer than the credential lives.
+const CHECKOUT_STALL: Duration = Duration::from_secs(16);
+
+/// The request path the backend counts. Nothing else the gateway sends (its
+/// capability refresh included) uses it.
+const STALLED_CHECKOUT_PATH: &str = "/stalled-checkout";
+
+/// Logged (at debug) by the direct HTTP/1.1 pool once its TCP connect
+/// completes and before the TLS handshake, and by no other transport: proof
+/// that the stalled checkout was the direct pool's.
+const DIRECT_H1_DIAL_MARKER: &str = "direct HTTP/1.1 pool dialed a backend connection";
+
+/// File-mode YAML for one `jwt_auth`-protected route to an HTTP/1.1-only TLS
+/// backend, which the direct HTTP/1.1 pool serves.
+fn stalled_checkout_proxy_yaml(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h1-direct-stalled-checkout",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            // The dial budget outlives the stall, and neither the response
+            // header read bound nor the write watermark is armed.
+            "backend_connect_timeout_ms": 60_000,
+            "backend_read_timeout_ms": 0,
+            "backend_write_timeout_ms": 0,
+            "pool_enable_http2": false,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [{"plugin_config_id": "h1-direct-stalled-checkout-jwt"}],
+        }],
+        "consumers": [{
+            "id": CONSUMER,
+            "username": CONSUMER,
+            "credentials": {"jwt": [{"secret": JWT_SECRET}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "h1-direct-stalled-checkout-jwt",
+            "plugin_name": "jwt_auth",
+            "scope": "proxy",
+            "proxy_id": "h1-direct-stalled-checkout",
+            "enabled": true,
+            "config": {
+                "token_lookup": "header:Authorization",
+                "consumer_claim_field": "sub",
+            },
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+/// HTTP/1.1-only TLS backend that sleeps `stall` on every accepted connection
+/// before it runs the TLS handshake, then serves HTTP/1.1. Returns the TCP
+/// accept count and the number of requests for [`STALLED_CHECKOUT_PATH`] it
+/// received.
+fn spawn_stalled_handshake_backend(
+    listener: tokio::net::TcpListener,
+    cert_pem: &str,
+    key_pem: &str,
+    stall: Duration,
+) -> (Arc<AtomicU32>, Arc<AtomicU32>) {
+    use rustls::pki_types::pem::PemObject;
+    let chain: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("key");
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("versions")
+    .with_no_client_auth()
+    .with_single_cert(chain, key)
+    .expect("cert");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let accepts = Arc::new(AtomicU32::new(0));
+    let requests = Arc::new(AtomicU32::new(0));
+    let (accept_count, request_count) = (Arc::clone(&accepts), Arc::clone(&requests));
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            accept_count.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            let request_count = Arc::clone(&request_count);
+            tokio::spawn(async move {
+                tokio::time::sleep(stall).await;
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        if req.uri().path() == STALLED_CHECKOUT_PATH {
+                            request_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        async {
+                            let body = http_body_util::Full::new(Bytes::from_static(b"reached"));
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(body))
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                    .await;
+            });
+        }
+    });
+    (accepts, requests)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h1_h2_auth_lifetime_direct_h1_stalled_checkout_never_reaches_the_backend() {
+    let ca = crate::scaffolding::certs::TestCa::new("h1-direct-stalled-root").expect("ca");
+    let (cert_pem, key_pem) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let (accepts, requests) = spawn_stalled_handshake_backend(
+        reservation.into_listener(),
+        &cert_pem,
+        &key_pem,
+        CHECKOUT_STALL,
+    );
+
+    let harness = GatewayHarness::builder()
+        .file_config(stalled_checkout_proxy_yaml(backend_port))
+        .log_level("debug")
+        .capture_output()
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let authority = proxy_authority(&harness);
+    let token = mint_short_lived_token(ExpShape::Integer);
+
+    let sent_at = std::time::Instant::now();
+    let mut tcp = tokio::net::TcpStream::connect(authority.as_str())
+        .await
+        .expect("connect to the gateway plaintext port");
+    let request = format!(
+        "GET /api{STALLED_CHECKOUT_PATH} HTTP/1.1\r\nHost: {authority}\r\n\
+         Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    tcp.write_all(request.as_bytes())
+        .await
+        .expect("write the authenticated request");
+    tcp.flush().await.expect("flush");
+
+    // Read the whole response. Without the fix the checkout is unbounded by
+    // the credential, so the gateway would not answer before the stall ends.
+    let mut received = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match tokio::time::timeout(CHECKOUT_STALL + TERMINATION_GRACE, tcp.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            Err(_) => panic!(
+                "the gateway never answered the stalled-checkout request; logs:\n{}",
+                harness.captured_combined().unwrap_or_default()
+            ),
+        }
+    }
+    let answered_after = sent_at.elapsed();
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        text.starts_with("HTTP/1.1 401"),
+        "a credential that expires while the direct HTTP/1.1 checkout is stalled must end \
+         with the fixed authorization terminal; got {:?} after {answered_after:?}; logs:\n{}",
+        text.chars().take(160).collect::<String>(),
+        harness.captured_combined().unwrap_or_default()
+    );
+    assert!(
+        answered_after < CHECKOUT_STALL,
+        "the stalled checkout must be cut short at the credential deadline, not held until \
+         the backend's handshake completes; answered after {answered_after:?}"
+    );
+    assert!(
+        accepts.load(Ordering::SeqCst) >= 1,
+        "the stalled backend must have accepted the gateway's dial"
+    );
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| logs.contains(DIRECT_H1_DIAL_MARKER),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        logs.contains(DIRECT_H1_DIAL_MARKER),
+        "the stalled checkout must have been the direct HTTP/1.1 pool's dial"
+    );
+
+    // Let every stalled handshake run out, then prove the backend never saw the
+    // request: the cancelled checkout took its connection down with it, and
+    // nothing was ever handed to a connection driver.
+    let settle_until = sent_at + CHECKOUT_STALL + Duration::from_secs(4);
+    tokio::time::sleep(settle_until.saturating_duration_since(std::time::Instant::now())).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "a request whose credential expired during connection checkout must never reach the \
+         backend; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
     );
 
     assert_credential_expired_exactly(&harness, "http", 1).await;

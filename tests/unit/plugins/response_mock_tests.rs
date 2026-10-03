@@ -569,6 +569,63 @@ async fn test_method_case_insensitive() {
 }
 
 #[tokio::test]
+async fn test_extension_method_matches_same_spelling_only() {
+    // A valid mixed-case extension method must match the configured spelling
+    // exactly; it must not be folded to uppercase.
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "method": "Foo",
+            "path": "/users",
+            "body": "extension-mock"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("Foo", "/api/users", "/api");
+    let mut headers = HashMap::new();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { body, .. } => assert_eq!(body, "extension-mock"),
+        _ => panic!("Expected Reject for same-spelled extension method"),
+    }
+
+    // HTTP method tokens are case-sensitive, so a differently-cased extension
+    // token does not match.
+    let mut ctx = make_ctx("FOO", "/api/users", "/api");
+    let mut headers = HashMap::new();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 404);
+            assert!(body.contains("no mock rule matched"));
+        }
+        _ => panic!("Expected 404 Reject for differently-cased extension method"),
+    }
+}
+
+#[tokio::test]
+async fn test_extension_method_mismatch_passthrough() {
+    let plugin = ResponseMock::new(&json!({
+        "passthrough_on_no_match": true,
+        "rules": [{
+            "method": "Foo",
+            "path": "/users",
+            "body": "extension-mock"
+        }]
+    }))
+    .unwrap();
+
+    // An extension-method rule must not be case-folded, so a `FOO` request is a
+    // no-match and is passed through to the backend.
+    let mut ctx = make_ctx("FOO", "/api/users", "/api");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn test_no_method_matches_all() {
     let plugin = ResponseMock::new(&json!({
         "rules": [{

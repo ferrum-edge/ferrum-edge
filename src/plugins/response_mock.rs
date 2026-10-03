@@ -64,7 +64,9 @@
 //! - **rules**: Array of mock rules evaluated in order (first match wins)
 //!   - **method**: HTTP method token to match (optional; omit to match all
 //!     methods). When supplied it must be non-empty and parse as an HTTP
-//!     method token.
+//!     method token. Registered standard methods are matched case-insensitively
+//!     (`get` matches `GET`); extension methods are case-sensitive and match
+//!     the configured spelling exactly (`Foo` matches `Foo`, not `FOO`).
 //!   - **path**: Non-empty path relative to a prefix listen_path, full path
 //!     for exact/regex/root/host-only scopes, or regex with `~` prefix
 //!     (required)
@@ -148,6 +150,18 @@ pub struct ResponseMock {
     passthrough_on_no_match: bool,
 }
 
+/// Returns `true` when `method` is one of the registered standard HTTP
+/// methods. Only these tokens are case-folded to their canonical uppercase
+/// spelling for matching; extension methods are case-sensitive per RFC 9110
+/// §9.1 and keep their configured spelling, so a rule written as `Foo` matches
+/// a request method `Foo` and never `FOO`.
+fn is_registered_standard_method(method: &str) -> bool {
+    matches!(
+        method,
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE" | "PATCH"
+    )
+}
+
 impl ResponseMock {
     pub fn new(config: &Value) -> Result<Self, String> {
         let config = config.as_object().ok_or_else(|| {
@@ -186,7 +200,17 @@ impl ResponseMock {
                             "response_mock: `rule[{i}]` `method` must be a valid HTTP method token"
                         )
                     })?;
-                    Some(method.to_ascii_uppercase())
+                    let uppercased = method.to_ascii_uppercase();
+                    // Registered standard methods are case-folded for the
+                    // convenience of lowercase configs (`get` matches `GET`).
+                    // Extension methods are case-sensitive and must keep the
+                    // configured spelling or a rule can never match.
+                    let canonical = if is_registered_standard_method(&uppercased) {
+                        uppercased
+                    } else {
+                        method.clone()
+                    };
+                    Some(canonical)
                 }
                 Some(Value::String(_)) => {
                     return Err(format!(
