@@ -2763,7 +2763,9 @@ fn every_direct_h1_dispatch_gates_its_handoff_on_the_composed_bound() {
                 .position(|line| line.trim_start().starts_with("return "))
                 .unwrap_or_else(|| panic!("{site}: the handoff gate must refuse by returning"));
             assert!(
-                !code[..refusal].iter().any(|line| line.contains("try_send_request")),
+                !code[..refusal]
+                    .iter()
+                    .any(|line| line.contains("try_send_request")),
                 "{site}: the refusal must come before the enqueue"
             );
             assert!(

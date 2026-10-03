@@ -241,11 +241,7 @@ async fn an_earlier_response_header_bound_keeps_its_attribution_under_late_obser
         backend_handoff_gate_for_test(&bound, || ()),
         BackendHandoffGateOutcomeForTest::Refused(BackendHandoffBoundSourceForTest::ResponseHeader)
     );
-    assert_eq!(
-        latch.observed(),
-        None,
-        "no authorization expiry is latched"
-    );
+    assert_eq!(latch.observed(), None, "no authorization expiry is latched");
 }
 
 #[tokio::test(start_paused = true)]
