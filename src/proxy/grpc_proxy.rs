@@ -4870,10 +4870,10 @@ where
             return Poll::Ready(Ok(output));
         }
         this.sleep.set(Some(tokio::time::sleep_until(at)));
-        match this.sleep.as_pin_mut() {
-            Some(sleep) if sleep.poll(cx).is_ready() => Poll::Ready(Err(())),
-            _ => Poll::Pending,
+        if let Some(sleep) = this.sleep.as_pin_mut() && sleep.poll(cx).is_ready() {
+            return Poll::Ready(Err(()));
         }
+        Poll::Pending
     }
 }
 
