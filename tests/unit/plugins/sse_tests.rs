@@ -296,10 +296,8 @@ async fn test_accept_with_charset_passes() {
 async fn test_accept_positive_quality_passes() {
     let plugin = make_plugin(json!({}));
     let mut ctx = make_sse_ctx();
-    ctx.headers.insert(
-        "accept".to_string(),
-        "text/event-stream; q=1.0".to_string(),
-    );
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream; q=1.0".to_string());
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(&result);
 }
@@ -357,10 +355,8 @@ async fn test_accept_mixed_list_with_affirmative_entry_passes() {
 async fn test_accept_zero_quality_opt_out_allows_request() {
     let plugin = make_plugin(json!({"require_accept_header": false}));
     let mut ctx = make_sse_ctx();
-    ctx.headers.insert(
-        "accept".to_string(),
-        "text/event-stream; q=0".to_string(),
-    );
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream; q=0".to_string());
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(&result);
 }
