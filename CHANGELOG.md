@@ -131,12 +131,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   least-loaded, so long-lived connections stay evenly spread), and its gRPC
   calls start at that slot's backend connection. A call still moves on to
   another backend connection when its own is not immediately ready.
-  - On the protocol benchmark, gRPC 10 KiB gained 1.7–6.3% in all eight A/B
-    pairs (runs 37101536905 and 37101542045). That includes the EPYC 9V74
-    runner, where it had been below Envoy and is now 1.04× Envoy.
+  - On the protocol benchmark's EPYC 9V74 runner, where gRPC 10 KiB had been
+    below Envoy, it gained 2.6–4.9% in all eight same-run A/B pairs (runs
+    37108522768 and 37108528648) and is now 1.01–1.02× Envoy.
   - CPU per call fell in the gateway, the backend and the client.
-  - Larger payloads are about flat. 5 MiB averages −2% and stays about 1.13×
+  - Larger payloads are about flat. 5 MiB averages −0.8% and stays 1.10–1.15×
     Envoy.
+  - HTTP/1.1 is unaffected.
   - The direct HTTP/2 pool keeps the round-robin start: the same change made
     HTTP/2 slower there.
 - **Less per-request work in the request handler** (#5588). Three per-request
