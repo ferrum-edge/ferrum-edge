@@ -1208,8 +1208,7 @@ async fn test_statsd_max_batch_lines_counts_transaction_records_not_metric_lines
     // boundaries, so drain every datagram and count across the whole batch.
     plugin.log(&summary).await;
     let mut all = String::new();
-    while let Ok(Ok((n, _))) =
-        timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await
+    while let Ok(Ok((n, _))) = timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await
     {
         all.push_str(std::str::from_utf8(&buf[..n]).expect("utf8"));
     }
