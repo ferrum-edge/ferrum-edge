@@ -29,7 +29,7 @@ use ferrum_edge::_test_support::{
     BackendHandoffBoundSourceForTest, BackendHandoffGateOutcomeForTest,
     attribute_dispatch_phase_bound_for_test, await_backend_checkout_bound_for_test,
     backend_handoff_gate_for_test, compose_backend_handoff_bound_for_test,
-    compose_dispatch_phase_bound_for_test,
+    compose_dispatch_phase_bound_for_test, direct_h2_handoff_gate_for_test,
 };
 use ferrum_edge::proxy::auth_lifetime::{
     StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
@@ -150,23 +150,41 @@ async fn a_bound_that_elapses_after_checkout_refuses_the_handoff_before_enqueue(
 
     // ...and the gate still lets the handoff through while time remains.
     let enqueued = Arc::new(AtomicUsize::new(0));
-    let send = || {
-        enqueued.fetch_add(1, Ordering::SeqCst);
-    };
+    let released = Arc::new(AtomicUsize::new(0));
+    let outcome = backend_handoff_gate_for_test(
+        &bound,
+        "connection",
+        |_| {
+            released.fetch_add(1, Ordering::SeqCst);
+        },
+        |lease| {
+            enqueued.fetch_add(1, Ordering::SeqCst);
+            lease
+        },
+    );
     assert_eq!(
-        backend_handoff_gate_for_test(&bound, send),
-        BackendHandoffGateOutcomeForTest::Enqueued(())
+        outcome,
+        BackendHandoffGateOutcomeForTest::Enqueued("connection")
     );
     assert_eq!(enqueued.load(Ordering::SeqCst), 1);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
 
     // Time passes between a completed checkout and the handoff (request head
     // assembly, pump binding). Once the bound has elapsed, the gate refuses
     // WITHOUT calling the send adapter, so nothing reaches the connection
-    // driver.
+    // driver, and the untouched lease goes back to its release path.
     tokio::time::advance(Duration::from_millis(60)).await;
-    let refused = backend_handoff_gate_for_test(&bound, || {
-        enqueued.fetch_add(1, Ordering::SeqCst);
-    });
+    let refused = backend_handoff_gate_for_test(
+        &bound,
+        "connection",
+        |_| {
+            released.fetch_add(1, Ordering::SeqCst);
+        },
+        |lease| {
+            enqueued.fetch_add(1, Ordering::SeqCst);
+            lease
+        },
+    );
     assert_eq!(
         refused,
         BackendHandoffGateOutcomeForTest::Refused(BackendHandoffBoundSourceForTest::Authorization),
@@ -176,6 +194,11 @@ async fn a_bound_that_elapses_after_checkout_refuses_the_handoff_before_enqueue(
         enqueued.load(Ordering::SeqCst),
         1,
         "a refused handoff must never reach the send adapter"
+    );
+    assert_eq!(
+        released.load(Ordering::SeqCst),
+        1,
+        "the refused lease is released exactly once"
     );
 }
 
@@ -238,7 +261,7 @@ async fn an_earlier_response_header_bound_keeps_its_attribution_under_late_obser
         "an already-elapsed bound must refuse without polling the checkout"
     );
     assert_eq!(
-        backend_handoff_gate_for_test(&bound, || ()),
+        backend_handoff_gate_for_test(&bound, (), drop, |()| ()),
         BackendHandoffGateOutcomeForTest::Refused(BackendHandoffBoundSourceForTest::ResponseHeader)
     );
     assert_eq!(latch.observed(), None, "no authorization expiry is latched");
@@ -287,13 +310,22 @@ async fn ties_are_decided_by_composition() {
     let start = tokio::time::Instant::now();
     let at = start + Duration::from_millis(100);
 
-    // Authorization ties the response-header bound: the security decision.
+    // Authorization ties the response-header bound: the response-header bound
+    // (a `504`), exactly as the reqwest dispatch's nested waits attribute it,
+    // so `FERRUM_POOL_HTTP1_DIRECT` cannot change the terminal at the boundary.
     let plan = plan_after(Duration::from_millis(100));
     let dispatch = compose_dispatch_phase_bound_for_test(None, Some(&plan));
     let bound = compose_backend_handoff_bound_for_test(Some(at), &dispatch);
     assert_eq!(bound.at(), Some(at));
     assert_eq!(
         bound.source(),
+        BackendHandoffBoundSourceForTest::ResponseHeader
+    );
+    // Without a response-header bound (Unix, HBONE, direct-H2), the
+    // authorization lifetime still wins a tie with the protocol bound.
+    let tied = compose_dispatch_phase_bound_for_test(Some(100), Some(&plan));
+    assert_eq!(
+        compose_backend_handoff_bound_for_test(None, &tied).source(),
         BackendHandoffBoundSourceForTest::Authorization
     );
 
@@ -321,7 +353,7 @@ async fn an_unbounded_unauthenticated_checkout_is_never_cut_short() {
     .await;
     assert_eq!(connection, Ok("connection"));
     assert_eq!(
-        backend_handoff_gate_for_test(&bound, || "sent"),
+        backend_handoff_gate_for_test(&bound, "lease", drop, |_| "sent"),
         BackendHandoffGateOutcomeForTest::Enqueued("sent")
     );
 }
@@ -343,4 +375,147 @@ async fn an_already_expired_credential_never_starts_a_checkout() {
         "cancellation wins before admission: an elapsed bound never polls the checkout"
     );
     assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ready_checkout_completes_without_waiting_on_the_bound() {
+    // The hot path: a pooled connection is ready on the first poll. The bound
+    // still has time left, so the checkout completes at once — it is polled
+    // BEFORE any timer is armed — and the handoff proceeds.
+    let start = tokio::time::Instant::now();
+    let plan = plan_after(Duration::from_secs(30));
+    let dispatch = compose_dispatch_phase_bound_for_test(None, Some(&plan));
+    let bound = compose_backend_handoff_bound_for_test(None, &dispatch);
+    let checkout = await_backend_checkout_bound_for_test(&bound, std::future::ready("pooled"));
+    assert_eq!(checkout.await, Ok("pooled"));
+    assert_eq!(tokio::time::Instant::now(), start);
+    assert_eq!(
+        backend_handoff_gate_for_test(&bound, "pooled", drop, |lease| lease),
+        BackendHandoffGateOutcomeForTest::Enqueued("pooled")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_checkout_ready_at_the_instant_is_refused_by_the_handoff_gate() {
+    // The checkout is polled before the timer on every wake, so a connection
+    // that becomes ready at exactly the authorization instant is handed back.
+    // The synchronous handoff gate is the backstop: it refuses that lease
+    // before anything is enqueued and releases it untouched.
+    let start = tokio::time::Instant::now();
+    let plan = plan_after(Duration::from_millis(100));
+    let latch = plan.2.clone();
+    let dispatch = compose_dispatch_phase_bound_for_test(None, Some(&plan));
+    let bound = compose_backend_handoff_bound_for_test(None, &dispatch);
+    let checkout = await_backend_checkout_bound_for_test(&bound, async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        "dialed"
+    })
+    .await;
+    assert_eq!(checkout, Ok("dialed"));
+    assert_eq!(
+        tokio::time::Instant::now(),
+        start + Duration::from_millis(100)
+    );
+
+    let released = Arc::new(AtomicUsize::new(0));
+    let enqueued = Arc::new(AtomicUsize::new(0));
+    let outcome = backend_handoff_gate_for_test(
+        &bound,
+        "dialed",
+        |_| {
+            released.fetch_add(1, Ordering::SeqCst);
+        },
+        |_| {
+            enqueued.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    assert_eq!(
+        outcome,
+        BackendHandoffGateOutcomeForTest::Refused(BackendHandoffBoundSourceForTest::Authorization)
+    );
+    assert_eq!(enqueued.load(Ordering::SeqCst), 0, "nothing is enqueued");
+    assert_eq!(released.load(Ordering::SeqCst), 1, "the lease is released");
+    assert_eq!(
+        attribute_dispatch_phase_bound_for_test(&dispatch, Some(&plan)),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_replay_checkout_ready_after_the_instant_is_refused_by_the_same_gate() {
+    // The idle-race replay: the first checkout completed inside the bound, the
+    // replay dial completes only after the ORIGINAL authorization instant. The
+    // replay is held to that same instant, so its handoff is refused.
+    let start = tokio::time::Instant::now();
+    let plan = plan_after(Duration::from_millis(100));
+    let dispatch = compose_dispatch_phase_bound_for_test(None, Some(&plan));
+    let bound = compose_backend_handoff_bound_for_test(None, &dispatch);
+    let first = await_backend_checkout_bound_for_test(&bound, std::future::ready("reused")).await;
+    assert_eq!(first, Ok("reused"));
+    tokio::time::advance(Duration::from_millis(60)).await;
+
+    let (replay, _, dropped) = stalled_checkout();
+    assert_eq!(
+        await_backend_checkout_bound_for_test(&bound, replay).await,
+        Err(BackendHandoffBoundSourceForTest::Authorization)
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        start + Duration::from_millis(100),
+        "the replay ends at the original instant, 40ms after it began"
+    );
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(
+        backend_handoff_gate_for_test(&bound, "replayed", drop, |lease| lease),
+        BackendHandoffGateOutcomeForTest::Refused(BackendHandoffBoundSourceForTest::Authorization)
+    );
+}
+
+// --- The direct-H2 handoff gate (`proxy_to_backend_http2`) ------------------
+
+#[tokio::test(start_paused = true)]
+async fn the_direct_h2_gate_lets_a_live_request_through() {
+    assert_eq!(direct_h2_handoff_gate_for_test(None, None), None);
+    let plan = plan_after(Duration::from_secs(1));
+    let client_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+    assert_eq!(
+        direct_h2_handoff_gate_for_test(client_deadline, Some(&plan)),
+        None
+    );
+    assert_eq!(plan.2.observed(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_direct_h2_gate_refuses_an_expired_credential_before_send_request() {
+    let plan = plan_after(Duration::from_millis(100));
+    let latch = plan.2.clone();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let refusal = direct_h2_handoff_gate_for_test(None, Some(&plan));
+    let (source, status, grpc_status) = refusal.expect("an expired plan is refused");
+    assert_eq!(source, BackendHandoffBoundSourceForTest::Authorization);
+    assert_eq!(status, 401, "the health-neutral authorization placeholder");
+    assert_eq!(grpc_status, None);
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "the expiry is latched exactly once for the request"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_direct_h2_gate_keeps_an_earlier_client_deadline_attribution() {
+    let plan = plan_after(Duration::from_millis(500));
+    let latch = plan.2.clone();
+    let client_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(50));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let refusal = direct_h2_handoff_gate_for_test(client_deadline, Some(&plan));
+    let (source, status, grpc_status) = refusal.expect("an elapsed client deadline is refused");
+    assert_eq!(source, BackendHandoffBoundSourceForTest::PhaseProtocol);
+    assert_eq!(status, 200, "gRPC deadline errors ride HTTP 200");
+    assert_eq!(grpc_status.as_deref(), Some("4"), "DEADLINE_EXCEEDED");
+    assert_eq!(latch.observed(), None, "nothing is latched");
 }

@@ -2727,12 +2727,15 @@ fn every_direct_h1_dispatch_awaits_through_the_sender_release() {
 /// `try_send_request` (GHSA-xcg4-wj3x-gjj2). hyper enqueues the request on the
 /// connection task synchronously, before any deadline around the response
 /// future is polled, so a bound checked only around the response wait lets an
-/// expired request reach the connection driver. The gate is the nearest
-/// preceding `handoff_bound.elapsed()` check in the same dispatch loop; its
-/// refusal arm returns, and nothing between that return and the enqueue awaits.
+/// expired request reach the connection driver.
+///
+/// Structural, not a line window: the gate must be a `*_handoff_gate(`
+/// call over `handoff_bound` and the leased `checkout`, inside the SAME
+/// dispatch `loop` body as the enqueue (so the idle-race replay passes it
+/// too), before the enqueue, with no `.await` between the end of the gate
+/// statement and the enqueue.
 #[test]
 fn every_direct_h1_dispatch_gates_its_handoff_on_the_composed_bound() {
-    const GATE: &str = "if let Some(source) = handoff_bound.elapsed() {";
     let mut found = Vec::new();
     for (path, text) in production_sources() {
         let lines: Vec<&str> = text.lines().collect();
@@ -2743,33 +2746,37 @@ fn every_direct_h1_dispatch_gates_its_handoff_on_the_composed_bound() {
             }
             sites += 1;
             let site = format!("{path}:{}", index + 1);
-            let gate = lines[..index]
+            let loop_start = lines[..index]
                 .iter()
-                .rposition(|line| line.contains(GATE))
-                .unwrap_or_else(|| {
-                    panic!("{site}: a direct HTTP/1.1 dispatch must gate its handoff (GHSA-xcg4)")
-                });
-            assert!(
-                index - gate <= 40,
-                "{site}: the handoff gate must sit immediately before the enqueue"
-            );
-            let code: Vec<&str> = lines[gate..index]
+                .rposition(|line| line.trim_end().ends_with("= loop {"))
+                .unwrap_or_else(|| panic!("{site}: the enqueue must sit in a dispatch loop"));
+            // Whitespace- and comment-free, so rustfmt wrapping is irrelevant.
+            let body: String = lines[loop_start..index]
                 .iter()
-                .copied()
                 .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(|line| line.chars())
+                .filter(|c| !c.is_whitespace())
                 .collect();
-            let refusal = code
-                .iter()
-                .position(|line| line.trim_start().starts_with("return "))
-                .unwrap_or_else(|| panic!("{site}: the handoff gate must refuse by returning"));
+            let Some(gate_at) = body.find("_handoff_gate(") else {
+                panic!("{site}: a direct HTTP/1.1 dispatch must gate its handoff (GHSA-xcg4)")
+            };
+            let Some((statement, after)) = body[gate_at..].split_once("};") else {
+                panic!("{site}: the handoff gate must be a match statement")
+            };
             assert!(
-                !code[..refusal]
-                    .iter()
-                    .any(|line| line.contains("try_send_request")),
-                "{site}: the refusal must come before the enqueue"
+                statement.contains("handoff_bound,checkout)"),
+                "{site}: the gate must check the composed `handoff_bound` for this lease"
             );
             assert!(
-                !code[refusal..].iter().any(|line| line.contains(".await")),
+                statement.contains("Err(source)=>{") && statement.contains("return"),
+                "{site}: a refused handoff must return"
+            );
+            assert!(
+                !body[..gate_at].contains("try_send_request"),
+                "{site}: the gate must come before the enqueue"
+            );
+            assert!(
+                !after.contains(".await"),
                 "{site}: nothing may await between the handoff gate and the synchronous enqueue"
             );
         }

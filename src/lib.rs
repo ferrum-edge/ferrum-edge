@@ -11500,20 +11500,79 @@ pub mod _test_support {
         Refused(BackendHandoffBoundSourceForTest),
     }
 
-    /// Run the production fail-closed handoff gate in front of a fake send
-    /// adapter (GHSA-xcg4-wj3x-gjj2): `enqueue` stands in for hyper's
-    /// synchronous `try_send_request` / `send_request` and is called only when
-    /// the composed bound still has time left.
-    pub fn backend_handoff_gate_for_test<R>(
+    /// Run the production fail-closed handoff gate
+    /// (`proxy::gate_backend_handoff`) in front of a fake send adapter
+    /// (GHSA-xcg4-wj3x-gjj2). `enqueue` stands in for hyper's synchronous
+    /// `try_send_request` / `send_request` and is called only when the composed
+    /// bound still has time left; otherwise the untouched `lease` goes to
+    /// `release`.
+    pub fn backend_handoff_gate_for_test<L, R>(
         bound: &ComposedBackendHandoffBoundForTest,
-        enqueue: impl FnOnce() -> R,
+        lease: L,
+        release: impl FnOnce(L),
+        enqueue: impl FnOnce(L) -> R,
     ) -> BackendHandoffGateOutcomeForTest<R> {
-        match bound.0.elapsed() {
-            Some(source) => {
+        match crate::proxy::gate_backend_handoff(bound.0, lease, release) {
+            Ok(lease) => BackendHandoffGateOutcomeForTest::Enqueued(enqueue(lease)),
+            Err(source) => {
                 BackendHandoffGateOutcomeForTest::Refused(backend_handoff_source_for_test(source))
             }
-            None => BackendHandoffGateOutcomeForTest::Enqueued(enqueue()),
         }
+    }
+
+    /// The production direct HTTP/1.1 handoff gate over a real pool checkout
+    /// (GHSA-xcg4-wj3x-gjj2): a refused, untouched connection is checked back
+    /// in to the idle set.
+    pub fn direct_h1_handoff_gate_for_test(
+        bound: &ComposedBackendHandoffBoundForTest,
+        checkout: crate::proxy::http2_pool::Http1Checkout,
+    ) -> Result<crate::proxy::http2_pool::Http1Checkout, BackendHandoffBoundSourceForTest> {
+        crate::proxy::direct_h1_handoff_gate(bound.0, checkout)
+            .map_err(backend_handoff_source_for_test)
+    }
+
+    /// A Unix-socket HTTP/1.1 pool lease.
+    #[cfg(unix)]
+    pub type UnixH1LeaseForTest = crate::proxy::unix_backend_pool::UnixH1Checkout;
+
+    /// The production Unix-socket HTTP/1.1 handoff gate over a real pool lease
+    /// (GHSA-xcg4-wj3x-gjj2): a refused, untouched lease is checked back in.
+    #[cfg(unix)]
+    pub fn unix_h1_handoff_gate_for_test(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        bound: &ComposedBackendHandoffBoundForTest,
+        checkout: UnixH1LeaseForTest,
+    ) -> Result<UnixH1LeaseForTest, BackendHandoffBoundSourceForTest> {
+        crate::proxy::unix_h1_handoff_gate(pool, bound.0, checkout)
+            .map_err(backend_handoff_source_for_test)
+    }
+
+    /// The production direct-H2 handoff gate and its settle helper
+    /// (GHSA-xcg4-wj3x-gjj2). `None` lets the request through to
+    /// `send_request`; `Some` is the refusal's source, HTTP status, and
+    /// `grpc-status`, after the authorization latch (if any) was recorded.
+    pub fn direct_h2_handoff_gate_for_test(
+        grpc_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> Option<(BackendHandoffBoundSourceForTest, u16, Option<String>)> {
+        let (source, dispatch) = crate::proxy::direct_h2_handoff_refusal(grpc_deadline_at, auth)?;
+        let response = crate::proxy::direct_h2_handoff_bound_expired(
+            None,
+            &std::collections::HashMap::new(),
+            source,
+            dispatch,
+            auth,
+            None,
+        );
+        Some((
+            backend_handoff_source_for_test(source),
+            response.status_code,
+            response.headers.get("grpc-status").cloned(),
+        ))
     }
 
     /// The bounds one native gRPC dispatch attempt is held to before its
