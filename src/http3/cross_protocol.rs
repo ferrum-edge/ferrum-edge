@@ -9474,7 +9474,7 @@ where
                 // Not raised here: this bridge passes no authorization plan to
                 // the shared dispatch. Mapped to its fixed terminal status for
                 // exhaustiveness.
-                grpc_proxy::GrpcProxyError::AuthorizationExpired(termination) => (
+                grpc_proxy::GrpcProxyError::AuthorizationExpired { termination, .. } => (
                     grpc_proxy::grpc_status::UNAUTHENTICATED,
                     termination.grpc_message(),
                 ),
@@ -10087,7 +10087,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                     }
                     // Not raised here: the channel-backed dispatch carries no
                     // authorization plan. Mapped for exhaustiveness.
-                    grpc_proxy::GrpcProxyError::AuthorizationExpired(termination) => (
+                    grpc_proxy::GrpcProxyError::AuthorizationExpired { termination, .. } => (
                         grpc_proxy::grpc_status::UNAUTHENTICATED,
                         termination.grpc_message(),
                     ),

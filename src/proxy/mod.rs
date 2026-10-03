@@ -37217,7 +37217,7 @@ async fn handle_proxy_request_inner(
                     .map(retry::classify_grpc_proxy_error);
                 ctx.record_backend_dispatch_outcome(
                     dispatch_error,
-                    dispatch_error.is_none_or(retry::request_reached_wire),
+                    grpc_proxy::grpc_dispatch_reached_wire(&grpc_result, dispatch_error),
                 );
                 // Classify the error and determine if retryable. Narrow to
                 // the connect-class kinds via `is_connect_class()` so
@@ -37385,7 +37385,7 @@ async fn handle_proxy_request_inner(
                 }
                 ctx.record_backend_attempt(
                     dispatch_error,
-                    dispatch_error.is_none_or(retry::request_reached_wire),
+                    grpc_proxy::grpc_dispatch_reached_wire(&grpc_result, dispatch_error),
                     None,
                 );
                 grpc_last_attempt_recorded = true;
@@ -37808,7 +37808,7 @@ async fn handle_proxy_request_inner(
                     | GrpcProxyError::ResourceExhausted(_)
                     | GrpcProxyError::ResponseBufferCapacity(_)
                     | GrpcProxyError::Internal(_)
-                    | GrpcProxyError::AuthorizationExpired(_),
+                    | GrpcProxyError::AuthorizationExpired { .. },
                 ) => {
                     cb.record_neutral(cb_probe.take_slot());
                 }
@@ -37850,21 +37850,19 @@ async fn handle_proxy_request_inner(
             .as_ref()
             .err()
             .map(retry::classify_grpc_proxy_error);
-        ctx.record_backend_dispatch_outcome(
-            dispatch_error,
-            dispatch_error.is_none_or(retry::request_reached_wire),
-        );
+        // A refusal the gateway made before the request was handed to the
+        // connection (GHSA-xcg4-wj3x-gjj2) never reached the wire, whatever its
+        // health-neutral class.
+        let grpc_dispatch_on_wire =
+            grpc_proxy::grpc_dispatch_reached_wire(&grpc_result, dispatch_error);
+        ctx.record_backend_dispatch_outcome(dispatch_error, grpc_dispatch_on_wire);
         if !grpc_last_attempt_recorded {
             if dispatch_error == Some(retry::ErrorClass::TlsError)
                 && let Err(error) = &grpc_result
             {
                 crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
             }
-            ctx.record_backend_attempt(
-                dispatch_error,
-                dispatch_error.is_none_or(retry::request_reached_wire),
-                None,
-            );
+            ctx.record_backend_attempt(dispatch_error, grpc_dispatch_on_wire, None);
         }
         match grpc_result {
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
@@ -39584,7 +39582,7 @@ async fn handle_proxy_request_inner(
             // least-connections guard are released without an outcome. The
             // client gets the same fixed pre-commitment terminal as a buffered
             // upload expiry (`grpc-status: 16`), never `DEADLINE_EXCEEDED`.
-            Err(GrpcProxyError::AuthorizationExpired(termination)) => {
+            Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {
                 drop(backend_admission_permits.take());
                 drop(grpc_lb_connection_guard.take());
                 let response = boxed_finalize_authorization_expired_rejection(
@@ -39686,7 +39684,7 @@ async fn handle_proxy_request_inner(
                     }
                     GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
                     // Answered by its own arm above; listed for exhaustiveness.
-                    GrpcProxyError::AuthorizationExpired(_) => {
+                    GrpcProxyError::AuthorizationExpired { .. } => {
                         grpc_proxy::grpc_status::UNAUTHENTICATED
                     }
                 };
