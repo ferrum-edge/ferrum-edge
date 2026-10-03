@@ -119,6 +119,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **gRPC keeps a client connection's calls on one backend connection** (#5588).
+  The gRPC pool spreads each host's calls over `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`
+  backend connections, and each call used to pick one round-robin. The calls
+  of one multiplexed client connection were therefore spread over every
+  backend connection, their responses came back at different times, and
+  Ferrum wrote them to the client one at a time. The benchmark client made
+  about 45% more reads per call behind Ferrum than behind Envoy, which keeps a
+  downstream connection's streams on one upstream connection per worker.
+  Each HTTP/1.1 and HTTP/2 client connection now holds a slot (taken
+  least-loaded, so long-lived connections stay evenly spread), and its gRPC
+  calls start at that slot's backend connection. A call still moves on to
+  another backend connection when its own is not immediately ready.
+  - On the protocol benchmark, gRPC 10 KiB gained 1.7–6.3% in all eight A/B
+    pairs (runs 37101536905 and 37101542045). That includes the EPYC 9V74
+    runner, where it had been below Envoy and is now 1.04× Envoy.
+  - CPU per call fell in the gateway, the backend and the client.
+  - Larger payloads are about flat. 5 MiB averages −2% and stays about 1.13×
+    Envoy.
+  - The direct HTTP/2 pool keeps the round-robin start: the same change made
+    HTTP/2 slower there.
 - **Less per-request work in the request handler** (#5588). Three per-request
   costs found in the gRPC 10 KiB profile, about 2% of gateway CPU together. The
   first two apply to every protocol, the third to native gRPC dispatch:

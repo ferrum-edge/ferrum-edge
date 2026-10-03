@@ -1,7 +1,7 @@
 //! Backend-shard affinity for a frontend connection (issue #5588).
 //!
-//! The direct HTTP/2 and gRPC pools keep `http2_connections_per_host` backend
-//! connections (shards) per host. Each request used to pick its starting
+//! The gRPC pool keeps `http2_connections_per_host` backend connections
+//! (shards) per host. Each request used to pick its starting
 //! shard round-robin, so the streams of one multiplexed frontend connection
 //! were spread across every backend connection. Their responses then arrived
 //! on different backend connections at different times, and the frontend
@@ -11,8 +11,8 @@
 //! connection (as Envoy does per worker).
 //!
 //! Each accepted HTTP/1.1 or HTTP/2 frontend connection now holds a slot for
-//! its lifetime, and its requests run with that slot in a task-local. The pools
-//! start their shard probe at `slot % shards`, so the streams of one frontend
+//! its lifetime, and its requests run with that slot in a task-local. The gRPC
+//! pool starts its shard probe at `slot % shards`, so the streams of one frontend
 //! connection share a backend connection and their responses arrive, and
 //! leave, together. A new connection takes the lowest slot with the fewest
 //! live connections, so long-lived connections stay spread evenly over the
@@ -20,6 +20,10 @@
 //! The probe still moves on to the next shard when the preferred one is not
 //! immediately ready, and a request with no frontend connection in scope
 //! (HTTP/3, spawned work) keeps the round-robin start.
+//!
+//! The direct HTTP/2 pool keeps the round-robin start for every request: on the
+//! protocol benchmark the same affinity made HTTP/2 slower (up to about 20% at
+//! 1–5 MiB on one runner type), while gRPC gained at 10 KiB on every runner.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -101,12 +105,12 @@ tokio::task_local! {
 }
 
 /// Run one request of the frontend connection holding `slot` with that slot in
-/// scope for the backend pools.
+/// scope for the gRPC pool.
 pub async fn with_frontend_connection<F: Future>(slot: usize, request: F) -> F::Output {
     FRONTEND_CONNECTION.scope(slot, request).await
 }
 
-/// The shard a pool's probe starts at: the current frontend connection's
+/// The shard the gRPC pool's probe starts at: the current frontend connection's
 /// shard when one is in scope, otherwise the next round-robin position.
 pub fn start_shard(round_robin: &AtomicUsize, shard_count: usize) -> usize {
     let shard_count = shard_count.max(1);

@@ -175,6 +175,8 @@ pool_enable_http2: false  # Better compatibility with auth plugins
 
 The dedicated `GrpcConnectionPool` selects among shard senders with an immediate `now_or_never` readiness probe — there is no operator-configurable wait. When every shard is busy, callers queue on HTTP/2 readiness and stream-capacity backpressure instead of opening connections beyond the configured shard ring.
 
+The probe starts at the frontend connection's shard. Each accepted HTTP/1.1 or HTTP/2 frontend connection holds a slot for its lifetime, taken least-loaded so long-lived connections stay spread evenly however many short-lived ones come and go, and its gRPC requests start at `slot % shards`. The streams of one multiplexed client connection therefore share a backend connection, their responses arrive together, and the frontend writes them to the client together instead of one at a time. A request with no frontend connection (HTTP/3, spawned work) starts at a round-robin shard, and every request still moves on to the next shard when its preferred one is not immediately ready. On the gRPC 10 KiB benchmark this cut CPU per request in the gateway, the client and the backend alike (issue #5588). The direct HTTP/2 pool keeps the round-robin start.
+
 ## Performance Impact
 
 In performance tests (8 threads, 100 connections, 30 seconds):

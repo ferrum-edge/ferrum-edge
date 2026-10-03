@@ -1,6 +1,6 @@
 //! Backend-shard affinity for a frontend connection (issue #5588): requests of
-//! one HTTP/1.1 or HTTP/2 frontend connection start the direct HTTP/2 and gRPC
-//! pools' shard probe at that connection's shard; anything else keeps the
+//! one HTTP/1.1 or HTTP/2 frontend connection start the gRPC pool's shard
+//! probe at that connection's shard; anything else keeps the
 //! round-robin start.
 
 use ferrum_edge::proxy::frontend_affinity::{SlotTable, start_shard, with_frontend_connection};

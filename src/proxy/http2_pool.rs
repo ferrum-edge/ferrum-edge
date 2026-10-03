@@ -1060,10 +1060,6 @@ impl Http2ConnectionPool {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> Phase1 {
                 let base_len = key_buf.len();
 
-                // A request from an HTTP/1.1 or HTTP/2 frontend connection starts
-                // at that connection's shard (`frontend_affinity`); any other
-                // request starts at the round-robin position below.
-                //
                 // Round-robin counter is per-host, but on FIRST access we seed it
                 // with a thread-local PRNG offset so a burst of concurrent
                 // requests on a cold pool does not land all on shard 0 before
@@ -1077,9 +1073,7 @@ impl Http2ConnectionPool {
                         svid_generation,
                         &self.pool.manager().backend_svid_generation,
                     );
-                    // The frontend connection's shard when one is in scope
-                    // (issue #5588), otherwise round-robin.
-                    crate::proxy::frontend_affinity::start_shard(&rr, shard_count)
+                    rr.fetch_add(1, Ordering::Relaxed) % shard_count
                 });
 
                 // Cheap probe pass — any shard whose cached sender is
