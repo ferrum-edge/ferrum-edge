@@ -3,10 +3,12 @@
 //! pools' shard probe at that connection's shard; anything else keeps the
 //! round-robin start.
 
-use ferrum_edge::proxy::frontend_affinity::{
-    next_frontend_connection, start_shard, with_frontend_connection,
-};
+use ferrum_edge::proxy::frontend_affinity::{SlotTable, start_shard, with_frontend_connection};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn table() -> &'static SlotTable {
+    Box::leak(Box::new(SlotTable::new()))
+}
 
 #[test]
 fn without_a_frontend_connection_the_start_is_round_robin() {
@@ -45,10 +47,49 @@ async fn a_zero_shard_count_is_one_shard() {
 }
 
 #[test]
-fn frontend_connection_numbers_increase() {
-    // Numbers are handed out in accept order, so consecutive connections map
-    // to consecutive shards (other tests may take numbers in between).
-    let first = next_frontend_connection();
-    let second = next_frontend_connection();
-    assert!(second > first);
+fn live_connections_spread_evenly_over_any_shard_count() {
+    let table = table();
+    let held: Vec<_> = (0..21).map(|_| table.acquire()).collect();
+    for shard_count in [1, 2, 3, 4, 6, 8, 16] {
+        let mut per_shard = vec![0usize; shard_count];
+        for slot in &held {
+            per_shard[slot.slot() % shard_count] += 1;
+        }
+        let (min, max) = (per_shard.iter().min(), per_shard.iter().max());
+        assert!(
+            max.zip(min).is_some_and(|(max, min)| max - min <= 1),
+            "{shard_count} shards: {per_shard:?}"
+        );
+    }
+}
+
+#[test]
+fn short_lived_connections_do_not_skew_long_lived_ones() {
+    // A probe connection between two long-lived ones releases its slot, so the
+    // next long-lived connection reuses it instead of shifting every later
+    // connection onto another shard.
+    let table = table();
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        held.push(table.acquire());
+        drop(table.acquire());
+        drop(table.acquire());
+    }
+    let mut per_shard = [0usize; 4];
+    for slot in &held {
+        per_shard[slot.slot() % 4] += 1;
+    }
+    assert_eq!(per_shard, [2, 2, 2, 2]);
+}
+
+#[test]
+fn a_closed_connection_releases_its_slot() {
+    let table = table();
+    let first = table.acquire();
+    let slot = first.slot();
+    assert_eq!(table.live(slot), 1);
+    drop(first);
+    assert_eq!(table.live(slot), 0);
+    // The freed slot is the least loaded again, so it is reused.
+    assert_eq!(table.acquire().slot(), slot);
 }
