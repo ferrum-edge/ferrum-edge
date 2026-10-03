@@ -5034,8 +5034,8 @@ fn grpc_dispatch_authorization_expired(
     // An authorization-won bound fires only once its plan has elapsed, so the
     // fallback is not reached in practice. If it were, it fails closed on the
     // plan's own class, and still counts the expiry exactly once.
-    let termination = crate::proxy::dispatch_phase_authorization_expiry(bound, auth)
-        .or_else(|| {
+    let termination =
+        crate::proxy::dispatch_phase_authorization_expiry(bound, auth).or_else(|| {
             let (plan, family, latch) = auth?;
             latch.record_once(plan.termination, *family);
             Some(plan.termination)
