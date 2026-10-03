@@ -127,10 +127,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ferrum wrote them to the client one at a time. The benchmark client made
   about 45% more reads per call behind Ferrum than behind Envoy, which keeps a
   downstream connection's streams on one upstream connection per worker.
-  Each HTTP/1.1 and HTTP/2 client connection now holds a slot (taken
-  least-loaded, so long-lived connections stay evenly spread), and its gRPC
-  calls start at that slot's backend connection. A call still moves on to
-  another backend connection when its own is not immediately ready.
+  Each HTTP/2 client connection now takes a slot (least-loaded, so
+  long-lived connections stay evenly spread). While it has at most 32 open
+  streams, its gRPC calls go to that slot's backend connection; further calls
+  spill round-robin, so one busy client cannot monopolise one backend
+  connection's stream limit. Both create their backend connection when it is
+  missing or closed, so the pool still widens. HTTP/1.1 and HTTP/3 frontends
+  keep the round-robin start, and so does the direct HTTP/2 pool.
   - On the protocol benchmark's EPYC 9V74 runner, where gRPC 10 KiB had been
     below Envoy, it gained 2.6–4.9% in all eight same-run A/B pairs (runs
     37108522768 and 37108528648) and is now 1.01–1.02× Envoy.

@@ -68,6 +68,9 @@ pub struct ProxyBody {
     /// Dropped when the client-visible response body finishes, decrementing
     /// per-IP in-flight request accounting.
     _per_ip_request_guard: Option<super::PerIpRequestGuard>,
+    /// Dropped when the client-visible response body finishes, closing the
+    /// stream in its HTTP/2 frontend connection's gRPC shard-affinity count.
+    _frontend_stream: Option<super::frontend_affinity::FrontendStream>,
     /// Dropped when a streaming backend response body reaches terminal state
     /// (EOF, error, or client disconnect), ensuring least-connections
     /// accounting decrements when the backend stream actually ends.
@@ -846,6 +849,7 @@ impl ProxyBody {
             _request_guard: None,
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
+            _frontend_stream: None,
             _lb_connection_guard: None,
             _backend_admission_permits: None,
             backend_admission_outcome: None,
@@ -878,6 +882,7 @@ impl ProxyBody {
             _request_guard: None,
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
+            _frontend_stream: None,
             _lb_connection_guard: None,
             _backend_admission_permits: None,
             backend_admission_outcome: None,
@@ -1099,6 +1104,14 @@ impl ProxyBody {
 
     pub(crate) fn with_per_ip_request_guard(mut self, guard: super::PerIpRequestGuard) -> Self {
         self._per_ip_request_guard = Some(guard);
+        self
+    }
+
+    pub(crate) fn with_frontend_stream(
+        mut self,
+        stream: super::frontend_affinity::FrontendStream,
+    ) -> Self {
+        self._frontend_stream = Some(stream);
         self
     }
 
@@ -1631,6 +1644,7 @@ impl ProxyBody {
             _request_guard: None,
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
+            _frontend_stream: None,
             _lb_connection_guard: None,
             _backend_admission_permits: None,
             backend_admission_outcome: None,
