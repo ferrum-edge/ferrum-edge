@@ -20,7 +20,23 @@ from typing import Any, NamedTuple
 
 
 TARGET = "aarch64-unknown-linux-gnu"
-EXPECTED_IMAGE = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
+# GHCR's published OCI index retains the existing linux/amd64 host image.
+CROSS_IMAGE_TAG = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
+CROSS_IMAGE_DIGEST = (
+    "sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c"
+)
+EXPECTED_IMAGE = f"{CROSS_IMAGE_TAG}@{CROSS_IMAGE_DIGEST}"
+# Reuse the already admitted GNU sysroot's host protoc identity (issue #4423).
+# Both consumers must retain the version, architecture, URL and digest together.
+CROSS_PROTOC_VERSION = "25.1"
+CROSS_PROTOC_ARCHIVE = "protoc-25.1-linux-x86_64.zip"
+CROSS_PROTOC_URL = (
+    "https://github.com/protocolbuffers/protobuf/releases/download/"
+    f"v{CROSS_PROTOC_VERSION}/{CROSS_PROTOC_ARCHIVE}"
+)
+CROSS_PROTOC_SHA256_PIN = (
+    "ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50"
+)
 ISOLATED_PLANNER_LAUNCHER = (
     "python3 -I -c 'import runpy, sys; "
     "sys.path.insert(0, sys.argv.pop(1)); "
@@ -35,13 +51,13 @@ EXPECTED_PRE_BUILD_COMMANDS = (
     "multiarch=$(dpkg-architecture -a 'arm64' -qDEB_HOST_MULTIARCH) && "
     'ln -sfn -- "/usr/include/${multiarch}/curl" '
     '"/usr/${multiarch}/include/curl"',
-    "wget -qO /tmp/protoc.zip "
-    "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/"
-    "protoc-25.1-linux-x86_64.zip && unzip -o /tmp/protoc.zip -d /usr/local "
+    f"wget -qO /tmp/protoc.zip {CROSS_PROTOC_URL} && "
+    f"echo '{CROSS_PROTOC_SHA256_PIN}  /tmp/protoc.zip' | "
+    "sha256sum --check --strict - && unzip -o /tmp/protoc.zip -d /usr/local "
     "bin/protoc && chmod +x /usr/local/bin/protoc && rm /tmp/protoc.zip",
     # bindgen's clang/libclang come from the image's own signed Ubuntu 16.04
     # archive (`xenial-updates`, already in the base image's sources.list and
-    # refreshed by the second command), pinned to the exact frozen version. The
+    # refreshed by the second command), pinned to the exact version. The
     # release build fetches no third-party apt repository or key: apt.llvm.org
     # was a release-time availability and supply-chain dependency (issue #5955,
     # after the #4978 empty-key outage). The package installs libclang under
@@ -13819,6 +13835,7 @@ def scan_workflow_collection_cross_surfaces(
             # outright rather than scanned.
             errors.extend(frozen_fuzz_workflow_errors(contents, f"{source}/{name}"))
             continue
+        contents = cross_image_refresh_scan_contents(name, contents)
         surface_reasons: dict[str, str] = {}
         # Exact validation runs with opaque *executable* checks off, but an
         # undecodable stdin program is opaque for every target regardless of the
@@ -13892,6 +13909,100 @@ def retired_main_publication_gate_errors(
     return errors
 
 
+# The Cross release image is a production input outside the Dockerfiles. Track
+# tag drift in the existing scheduled refresh workflow without treating a new
+# registry response as trusted policy or rewriting the admitted pin. Freeze the
+# inventory job so deleting it, floating its image or auto-adopting drift fails
+# both production validation and trusted-base PR comparison.
+CROSS_IMAGE_REFRESH_WORKFLOW = "base-image-digest-refresh.yml"
+CROSS_IMAGE_REFRESH_JOB_NAME = "cross-image-drift"
+CROSS_IMAGE_REFRESH_TRIGGER = (
+    "on:\n"
+    "  schedule:\n"
+    "    # Mondays 05:00 UTC, ahead of the weekly Dependabot run.\n"
+    '    - cron: "0 5 * * 1"\n'
+    "  workflow_dispatch:\n"
+)
+CROSS_IMAGE_REFRESH_JOB = r"""  cross-image-drift:
+    name: Inspect the admitted Cross image pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Production build-input inventory: refresh by trusted policy rotation only.
+      CROSS_IMAGE_PIN: __CROSS_IMAGE_PIN__
+    steps:
+      - name: Resolve Cross 0.2.5 without changing the admitted pin
+        run: |
+          set -euo pipefail
+          tagged="${CROSS_IMAGE_PIN%@*}"
+          admitted="${CROSS_IMAGE_PIN##*@}"
+          resolved="$(docker buildx imagetools inspect "$tagged" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          if [[ ! "$resolved" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Cross registry did not return a complete OCI digest"
+            exit 1
+          fi
+          {
+            echo '### Production Cross image inventory'
+            echo "Tag: $tagged"
+            echo "Admitted OCI index: $admitted"
+            echo "Published OCI index: $resolved"
+            echo 'Host platform: linux/amd64; target: aarch64-unknown-linux-gnu'
+            echo 'A changed index requires independent platform/input review and trusted-base policy admission.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$resolved" != "$admitted" ]; then
+            echo "::error::Cross tag drift: prepare a reviewed trusted-policy rotation; do not remove or auto-replace the pin"
+            exit 1
+          fi
+""".replace("__CROSS_IMAGE_PIN__", EXPECTED_IMAGE)
+
+
+def cross_image_refresh_errors(workflows: dict[str, str], source: str) -> list[str]:
+    contents = workflows.get(CROSS_IMAGE_REFRESH_WORKFLOW)
+    if contents is None:
+        return [
+            f"{source} is missing {CROSS_IMAGE_REFRESH_WORKFLOW}; the production "
+            "Cross image pin must remain in the refresh inventory"
+        ]
+    located = f"{source}/{CROSS_IMAGE_REFRESH_WORKFLOW}"
+    block, failures = extract_job_block(
+        contents,
+        located,
+        CROSS_IMAGE_REFRESH_JOB_NAME,
+        required=True,
+    )
+    if failures:
+        return failures
+    errors = []
+    if block != CROSS_IMAGE_REFRESH_JOB:
+        errors.append(f"{located} must retain the exact admitted Cross image inventory job")
+    trigger, trigger_failures = extract_top_level_block(contents, located, "on")
+    errors.extend(trigger_failures)
+    if not trigger_failures and trigger != CROSS_IMAGE_REFRESH_TRIGGER:
+        errors.append(f"{located} must retain the admitted scheduled refresh trigger")
+    return errors
+
+
+def cross_image_refresh_scan_contents(name: str, contents: str) -> str:
+    """Withhold only the exact frozen registry-inspection job from Cross scans.
+
+    The job names a Cross image but cannot build or run it. All other jobs and
+    inherited inputs remain scanned; a malformed or modified inventory job is
+    never withheld. The absolute collection contract also prevents deletion.
+    """
+    if name != CROSS_IMAGE_REFRESH_WORKFLOW or cross_image_refresh_errors(
+        {name: contents},
+        "Cross refresh scan",
+    ):
+        return contents
+    return contents.replace(CROSS_IMAGE_REFRESH_JOB, "", 1)
+
+
 def validate_workflow_collection(
     workflows: dict[str, str],
     source: str,
@@ -13905,6 +14016,7 @@ def validate_workflow_collection(
     """
 
     return [
+        *cross_image_refresh_errors(workflows, source),
         *retired_main_publication_gate_errors(workflows, source),
         *live_suite_relevance_errors(workflows, source),
         *node_waypoint_relevance_errors(workflows, source),
@@ -14403,6 +14515,8 @@ def scan_pr_workflow_collection_cross_surfaces(
                         "fuzz lane after the trusted base adopts it"
                     )
             continue
+        baseline_contents = cross_image_refresh_scan_contents(name, baseline_contents)
+        proposed_contents = cross_image_refresh_scan_contents(name, proposed_contents)
         # The one admitted `fips-build.yml` generation transition. Both ends are
         # complete file texts named by this trusted policy, so the only revision
         # pair that reaches `"adoption"` is the exact one it names; the reverse
@@ -14510,6 +14624,7 @@ def compare_pr_workflow_collection(
     """
 
     return [
+        *cross_image_refresh_errors(proposed_workflows, f"proposed {source}"),
         *retired_main_publication_gate_errors(
             proposed_workflows,
             f"proposed {source}",
@@ -18942,15 +19057,13 @@ LINUX_GNU_SMOKE_UBUNTU2204_IMAGE_PIN = (
     "ubuntu@sha256:"
     "2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc"
 )
-LINUX_GNU_PROTOC_SHA256_PIN = (
-    "ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50"
-)
+LINUX_GNU_PROTOC_SHA256_PIN = CROSS_PROTOC_SHA256_PIN
 # The protoc archive is fetched by URL and verified against the digest above,
 # so the host is not a confidentiality boundary — but an unconstrained host is
 # still an unnecessary fetch dependency on the publishing path, and the digest
 # alone cannot say which project's release the pin claims to be. Constrain the
-# release prefix and leave the version free: a version bump moves
-# `LINUX_GNU_PROTOC_SHA256_PIN` here anyway.
+# release URL, version and host architecture together: a version bump moves
+# the shared Cross/GNU protoc identity, not just an unconstrained URL.
 LINUX_GNU_PROTOC_URL_PREFIX = (
     "https://github.com/protocolbuffers/protobuf/releases/download/"
 )
@@ -19017,13 +19130,20 @@ def linux_gnu_contract_pin_errors(contents: str, source: str) -> list[str]:
         )
 
     protoc_url = sysroot.get("protoc_url")
-    if not isinstance(protoc_url, str) or not protoc_url.startswith(
-        LINUX_GNU_PROTOC_URL_PREFIX
-    ):
+    if protoc_url != CROSS_PROTOC_URL:
         errors.append(
-            f"{source} [sysroot] protoc_url must start with "
-            f"{LINUX_GNU_PROTOC_URL_PREFIX!r}; got {protoc_url!r}"
+            f"{source} [sysroot] protoc_url must be the trusted host-tool URL "
+            f"{CROSS_PROTOC_URL!r}; got {protoc_url!r}"
         )
+    for key, pinned in (
+        ("protoc_version", CROSS_PROTOC_VERSION),
+        ("protoc_archive", CROSS_PROTOC_ARCHIVE),
+    ):
+        if sysroot.get(key) != pinned:
+            errors.append(
+                f"{source} [sysroot] {key} must be {pinned!r}; "
+                f"got {sysroot.get(key)!r}"
+            )
 
     for table_path, _, pinned in LINUX_GNU_SMOKE_PINS:
         table: Any = parsed
@@ -19629,6 +19749,109 @@ def self_test() -> list[str]:
     }
     if validate_cross_configuration(valid_cross):
         failures.append("valid complete Cross.toml policy was rejected")
+
+    # GHSA-2q8f-75vc-v8c7: form alone is insufficient. These mutations must
+    # fail against the approved image/artifact identity and ordered commands.
+    for name, image in {
+        "floating Cross tag": CROSS_IMAGE_TAG,
+        "missing Cross image": None,
+        "different Cross repository": EXPECTED_IMAGE.replace("cross-rs/", "attacker/"),
+        "different Cross digest": f"{CROSS_IMAGE_TAG}@sha256:" + "0" * 64,
+        "truncated Cross digest": EXPECTED_IMAGE[:-1],
+    }.items():
+        changed_cross = {
+            "target": {TARGET: {**valid_cross["target"][TARGET], "image": image}}
+        }
+        if not validate_cross_configuration(changed_cross):
+            failures.append(f"{name} was not rejected")
+
+    protoc_command = expected[3]
+    checksum = (
+        f"echo '{CROSS_PROTOC_SHA256_PIN}  /tmp/protoc.zip' | "
+        "sha256sum --check --strict -"
+    )
+    download, separator, install = protoc_command.partition(f" && {checksum} && ")
+    if not separator:
+        failures.append("the protoc checksum-order self-test fixture is stale")
+    protoc_mutations = {
+        "missing protoc checksum": protoc_command.replace(f" && {checksum}", ""),
+        "wrong protoc checksum": protoc_command.replace(CROSS_PROTOC_SHA256_PIN, "0" * 64),
+        "protoc extraction before checksum": f"{download} && {install} && {checksum}",
+        "ignored protoc checksum failure": protoc_command.replace(
+            checksum,
+            f"({checksum} || true)",
+        ),
+        "checksum derived from the same download": protoc_command.replace(
+            checksum,
+            "sha256sum /tmp/protoc.zip > /tmp/protoc.sha256 && "
+            "sha256sum --check /tmp/protoc.sha256",
+        ),
+        "wrong protoc host architecture": protoc_command.replace("x86_64.zip", "aarch_64.zip"),
+        "wrong protoc version": protoc_command.replace("25.1", "25.2"),
+        "untrusted protoc host": protoc_command.replace("github.com", "download.example.invalid"),
+    }
+    for name, command in protoc_mutations.items():
+        if command == protoc_command:
+            failures.append(f"the {name} self-test mutation is stale")
+            continue
+        changed_commands = expected.copy()
+        changed_commands[3] = command
+        if not validate_pre_build(changed_commands):
+            failures.append(f"{name} was not rejected")
+
+    refresh_fixture = {
+        CROSS_IMAGE_REFRESH_WORKFLOW: "name: Cross inventory\n"
+        + CROSS_IMAGE_REFRESH_TRIGGER
+        + "jobs:\n"
+        + CROSS_IMAGE_REFRESH_JOB
+    }
+    if cross_image_refresh_errors(refresh_fixture, "self-test workflows"):
+        failures.append("the pinned Cross refresh inventory was rejected")
+    for name, original, replacement in (
+        ("floating refresh pin", EXPECTED_IMAGE, CROSS_IMAGE_TAG),
+        ("wrong refresh digest", CROSS_IMAGE_DIGEST, "sha256:" + "0" * 64),
+        ("missing refresh job", CROSS_IMAGE_REFRESH_JOB, ""),
+        ("missing scheduled refresh", CROSS_IMAGE_REFRESH_TRIGGER, "on: [workflow_dispatch]\n"),
+        ("ignored registry drift", '            exit 1\n', '            true\n'),
+    ):
+        changed = refresh_fixture[CROSS_IMAGE_REFRESH_WORKFLOW].replace(original, replacement)
+        if changed == refresh_fixture[CROSS_IMAGE_REFRESH_WORKFLOW]:
+            failures.append(f"the {name} self-test mutation is stale")
+        elif not cross_image_refresh_errors(
+            {CROSS_IMAGE_REFRESH_WORKFLOW: changed},
+            "self-test workflows",
+        ):
+            failures.append(f"{name} was not rejected")
+
+    if scan_workflow_collection_cross_surfaces(refresh_fixture, "self-test workflows"):
+        failures.append("the frozen registry-only Cross inventory was not admitted")
+    if scan_pr_workflow_collection_cross_surfaces(
+        refresh_fixture,
+        refresh_fixture,
+        "self-test workflows",
+    ):
+        failures.append("an unchanged frozen Cross inventory comparison was rejected")
+    extra_cross_job = (
+        "  untrusted-cross:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        f"      - run: cross build --target {TARGET}\n"
+    )
+    refresh_with_extra_cross = {
+        CROSS_IMAGE_REFRESH_WORKFLOW: refresh_fixture[CROSS_IMAGE_REFRESH_WORKFLOW]
+        + extra_cross_job
+    }
+    if not scan_workflow_collection_cross_surfaces(
+        refresh_with_extra_cross,
+        "self-test workflows",
+    ):
+        failures.append("Cross refresh admission hid an extra Cross build job")
+    if not scan_pr_workflow_collection_cross_surfaces(
+        refresh_fixture,
+        refresh_with_extra_cross,
+        "self-test workflows",
+    ):
+        failures.append("Cross refresh admission hid a proposed Cross build job")
 
     nested_subshell_cross_forms = {
         "nested literal subshell": (
@@ -29672,6 +29895,7 @@ pre_build = []
     for contract_name in (
         *sorted(LIVE_SUITE_RELEVANCE_CONTRACTS),
         NODE_WAYPOINT_LIVE_WORKFLOW,
+        CROSS_IMAGE_REFRESH_WORKFLOW,
     ):
         if not any(contract_name in error for error in incomplete_validation):
             failures.append(
@@ -29851,6 +30075,10 @@ pre_build = []
         **node_waypoint_fixture,
         **isolated_fixture,
         GATEWAY_WORKFLOW_FILENAME: gateway_validation_workflow,
+        CROSS_IMAGE_REFRESH_WORKFLOW: "name: Cross image inventory\n"
+        + CROSS_IMAGE_REFRESH_TRIGGER
+        + "jobs:\n"
+        + CROSS_IMAGE_REFRESH_JOB,
     }
     ownership_prose_collection = {
         **complete_collection,
@@ -31358,6 +31586,8 @@ pre_build = []
         "[sysroot]\n"
         f"image = \"{LINUX_GNU_SYSROOT_IMAGE_PIN}\"\n"
         "platform = \"linux/amd64\"\n"
+        f"protoc_version = \"{CROSS_PROTOC_VERSION}\"\n"
+        f"protoc_archive = \"{CROSS_PROTOC_ARCHIVE}\"\n"
         f"protoc_url = \"{LINUX_GNU_PROTOC_URL_PREFIX}v25.1/"
         "protoc-25.1-linux-x86_64.zip\"\n"
         f"protoc_sha256 = \"{LINUX_GNU_PROTOC_SHA256_PIN}\"\n"
@@ -31391,6 +31621,22 @@ pre_build = []
         "substituted protoc host": (
             LINUX_GNU_PROTOC_URL_PREFIX,
             "https://protobuf.example.invalid/releases/download/",
+        ),
+        "substituted protoc version": (
+            f"protoc_version = \"{CROSS_PROTOC_VERSION}\"",
+            'protoc_version = "25.2"',
+        ),
+        "missing protoc version": (
+            f"protoc_version = \"{CROSS_PROTOC_VERSION}\"\n",
+            "",
+        ),
+        "substituted protoc architecture": (
+            CROSS_PROTOC_ARCHIVE,
+            "protoc-25.1-linux-aarch_64.zip",
+        ),
+        "mismatched protoc URL version": (
+            "/v25.1/",
+            "/v25.2/",
         ),
         "substituted protoc digest": (
             f"protoc_sha256 = \"{LINUX_GNU_PROTOC_SHA256_PIN}\"",

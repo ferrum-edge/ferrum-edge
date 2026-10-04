@@ -2000,29 +2000,76 @@ full-release ABI job are removed; fast test artifacts make no production ABI
 claim. Existing frozen parser, shell, action, and artifact-ownership checks
 continue to protect the production lane.
 
-`Cross.toml` `pre-build` and `env.passthrough` are allowlisted byte for byte
-(`EXPECTED_PRE_BUILD_COMMANDS` / `EXPECTED_PASSTHROUGH` in
-`verify_cross_build_policy.py`). The `cross-rs/aarch64-unknown-linux-gnu:0.2.5`
-image is Ubuntu 16.04 (xenial, glibc 2.23), and every package `pre-build`
-installs comes from that image's own configured Ubuntu archive, signed by the
-base image's keyring. That includes bindgen's `clang-6.0` / `libclang-6.0-dev`,
-pinned to the exact `xenial-updates` version `1:6.0-1ubuntu2~16.04.1`, which
-installs libclang under `/usr/lib/llvm-6.0/lib` (the `LIBCLANG_PATH`
-passthrough). The release build adds no third-party apt repository and fetches
-no apt key. It previously pulled an LLVM 6.0.1 snapshot from apt.llvm.org,
-which made a release depend on that host's availability (#4978, #5955); the
-Ubuntu package is LLVM 6.0.0 with the same dependency set. Remaining risk: if
-Ubuntu publishes a newer llvm-6.0 build to `xenial-updates`, the pinned version
-stops being installable and the release fails at that `apt-get install` step
-(loudly, never silently with a different toolchain); if xenial moves to
-`old-releases.ubuntu.com`, every `pre-build` install breaks, as it would have
-before this change. Either case needs a reviewed `Cross.toml` policy update. The
-only other download is `protoc` from GitHub releases. No pull-request or manual
-workflow runs Cross. To validate a `pre-build` change before merging, run the
-pinned Cross 0.2.5 command from `build-release-arm64-cross` on a Linux host (see
-"If automatic release fails" below). Any `Cross.toml` change also changes the
-frozen verifier constants, so it needs a reviewed policy update rather than an
-ordinary PR.
+`Cross.toml` image, the complete ordered `pre-build` list, and
+`env.passthrough` are allowlisted by identity in `verify_cross_build_policy.py`.
+The Cross 0.2.5 image is pinned to the GHCR-published OCI index
+`sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c`.
+The index contains the existing Linux/amd64 host image
+`sha256:9e5d86740280e021e5f372afcad2eda7367676f33ec40085b49ee88a2652cfe5`,
+which cross-compiles for aarch64. The tag is retained for inventory and drift
+monitoring; the digest determines the bytes used by the release.
+
+That image is Ubuntu 16.04 (xenial, glibc 2.23). Every apt package `pre-build`
+installs comes from its own configured Ubuntu archive, verified by the base
+image's existing Ubuntu archive keyring. This includes bindgen's `clang-6.0` /
+`libclang-6.0-dev`, pinned to the exact `xenial-updates` version
+`1:6.0-1ubuntu2~16.04.1`, installing libclang under `/usr/lib/llvm-6.0/lib`.
+The LLVM 6.0 major, `LIBCLANG_PATH`, ABI contract, fixed empty environment,
+wrapper overrides, and passthrough values are retained. The release build adds
+no third-party apt repository and fetches no apt key. Removing apt.llvm.org
+addresses its release-time availability and trust dependency (#4978, #5955).
+The Ubuntu package is LLVM 6.0.0 rather than the former LLVM 6.0.1 snapshot.
+
+The other download is the Linux/x86_64 **host** protoc 25.1 archive, pinned to
+`ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50`.
+This is the previously admitted `.github/linux-gnu-abi.toml` checksum, shared
+by the GNU sysroot and Cross verifier constants. Cross checks it with
+`sha256sum --check --strict` before `unzip`, executable permission changes, or
+use. A failed download or checksum stops the command chain. The trusted policy
+also binds the GNU manifest's version, archive architecture, and complete URL
+to that same identity. A newly downloaded archive never supplies its own
+expected checksum. GHCR registry metadata and GitHub's published release asset
+were independently read when selecting these pins; GitHub's older v25.1 asset
+metadata has a null `digest`, so its downloaded bytes were compared with the
+pre-existing admitted checksum rather than treated as a new trust source.
+
+`base-image-digest-refresh.yml` includes a separately frozen, read-only
+`cross-image-drift` inventory job. It compares the published tag's OCI index
+with the admitted pin and reports drift for review; it cannot rewrite or
+approve the Cross pin. Its job and scheduled trigger are checked by both
+production validation and trusted-base PR comparison. A rotation must retain
+the Linux/amd64 host image and aarch64 target, independently inspect the
+published index and artifact identities, and update the trusted policy and
+inventory coherently. The Dockerfile refresh continues its existing path.
+
+The hosted `Candidate policy self-test` checks the pinned positive
+configuration and rejects missing/floating/substituted image pins, missing or
+incorrect protoc checksums, extraction before verification, ignored checksum
+failure, self-derived checksums, and mismatched artifact versions/architectures.
+Its additional hosted shell test uses the published archive, the admitted
+checksum, and real `sha256sum`; extraction is a marker stub. The correct bytes
+reach the marker and corrupt bytes must stop before it. No Cross build or
+protoc execution occurs in that read-only candidate lane.
+
+**Admission prerequisite.** Candidate success never authorizes a merge. The
+trusted-base `cross-build-policy.yml` rejects a PR that edits the verifier;
+`CI Plan` also rejects those frozen-file edits, and `CI Policy` validates Cross
+against the base's exact image and pre-build identities. An independently
+reviewed trusted-base policy rotation must admit these exact inputs and the
+refresh contract on `main` before an ordinary PR can pass. Do not override-merge
+a failed required check, loosen the protected-file comparison, or add a manual
+build dispatch to bypass admission. If the owner has no authorized rotation
+mechanism, park the proposal for an explicit owner decision about that
+mechanism. Once the trusted base contains the reviewed verifier, update the PR
+with a normal merge and obtain fresh required checks for its exact head.
+Publication still requires successful canonical evidence for every required
+check on the selected commit; no candidate result substitutes for it.
+
+Remaining availability risk: Ubuntu could remove this exact LLVM package
+version or move xenial to `old-releases.ubuntu.com`. Either change fails apt
+installation and requires a reviewed policy rotation. The signed apt archive
+remains a build-time dependency; this fix does not claim a fully offline build.
+No release version or build-profile change is part of this rotation.
 
 ##### Trusted-base relevance for required live gates
 
@@ -2640,8 +2687,9 @@ The identity now lives in the trusted base, in two places that must agree:
    the defect being closed. The build image, both baseline smoke images, and
    the protoc archive digest are compared for exact equality (an unqualified
    Docker Hub reference, so equality also refuses a registry-host prefix and a
-   renamed repository), and `protoc_url` must start with
-   `https://github.com/protocolbuffers/protobuf/releases/download/`.
+   renamed repository). The protoc version, archive name (Linux/x86_64 host
+   architecture), and full GitHub release URL must equal the shared Cross/GNU
+   identity; a matching checksum alone cannot admit a mismatched URL or version.
 
 A deliberate image or protoc bump is consequently a direct-to-`main`
 predecessor: the constants in `verify_cross_build_policy.py`, the two producer

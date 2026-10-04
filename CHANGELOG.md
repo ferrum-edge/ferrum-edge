@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **ARM64 Cross release inputs are pinned and verified** (#5955, #5989;
+  GHSA-2q8f-75vc-v8c7). Cross 0.2.5 now uses the published GHCR OCI index
+  digest, retaining its Linux/amd64 host image and aarch64 target. The protoc
+  25.1 host archive is checked against the already admitted GNU sysroot
+  SHA-256 before extraction or execution. Trusted policy binds the image,
+  ordered verification command, and matching protoc version/architecture;
+  hosted positive and corrupt-archive tests exercise the checksum boundary.
+  The base-image refresh inventory reports Cross tag drift for an independent
+  trusted-policy rotation. The existing admission guard remains enforced;
+  candidate CI cannot authorize a merge or release.
 - **OIDC session encryption secrets reject published and placeholder values**
   (#5987; cross-repo hardening from Ferrum Foundry GHSA-hjw6-685j-p5hw). The
   `oidc_relying_party` session config previously checked
