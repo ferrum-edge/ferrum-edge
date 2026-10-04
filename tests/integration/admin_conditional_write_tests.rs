@@ -21,7 +21,7 @@ use ferrum_edge::admin::{
     jwt_auth::{JwtConfig, JwtManager},
     serve_admin_on_listener,
 };
-use ferrum_edge::config::db_backend::DatabaseBackend;
+use ferrum_edge::config::db_backend::{DatabaseBackend, NamespaceConfigAdmissionLeaseBackend};
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Method;
@@ -1388,6 +1388,128 @@ async fn sqlite_conditional_restore_checks_state_and_lease_inside_the_transactio
     let dir = TempDir::new().unwrap();
     let db = make_store(&dir).await;
     assert_transaction_precondition(db.as_ref()).await;
+    let pool = db.pool();
+    assert_restore_renewal_and_fencing(db, move |namespace, ttl| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE config_admission_locks SET expires_at = \
+                 CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + ? \
+                 WHERE namespace = ?",
+            )
+            .bind(ttl)
+            .bind(namespace)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    })
+    .await;
+}
+
+/// Healthy keepers must extend live leases, including after a wait beyond the
+/// original server expiry. A refused renewal, even with unchanged ownership,
+/// invalidates the guard; only a fresh writer may take over and revalidate.
+async fn assert_live_keeper_renewal_and_loss<F, Fut>(db: Arc<dyn DatabaseBackend>, set_expiry: &F)
+where
+    F: Fn(String, i64) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use ferrum_edge::_test_support::{
+        TestNamespaceConfigAdmissionCompletion, lock_namespace_config_admission_db_for_test,
+        lock_namespace_config_admission_for_test,
+    };
+    use std::time::Duration;
+
+    let namespace = format!("live-keeper-{}", uuid::Uuid::new_v4());
+    assert!(
+        !db.renew_namespace_config_admission_lease(&namespace, "absent-owner")
+            .await
+            .unwrap(),
+        "renewal must never insert an absent lease"
+    );
+    let guard = lock_namespace_config_admission_db_for_test(db.clone(), &namespace)
+        .await
+        .unwrap();
+    let owner = guard.lease_ref().owner.to_string();
+    let generation = guard.lease_ref().generation;
+    set_expiry(namespace.clone(), 5_000).await;
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+    // Real datastore time passes: the original five-second deadline is now
+    // gone. No direct test renewal may mask a broken production keeper.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let competitor = uuid::Uuid::new_v4().to_string();
+    assert!(
+        db.try_acquire_namespace_config_admission_lease(&namespace, &competitor)
+            .await
+            .unwrap()
+            .is_none(),
+        "a healthy long-wait guard must keep exclusive ownership"
+    );
+    assert!(matches!(
+        guard
+            .run_to_completion_while_held(std::future::ready(()))
+            .await,
+        Ok(TestNamespaceConfigAdmissionCompletion::Held(()))
+    ));
+
+    // Refusal is definitive loss even before any other owner has appeared.
+    set_expiry(namespace.clone(), -1).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if guard
+                .run_to_completion_while_held(std::future::ready(()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the production keeper must invalidate a refused renewal");
+    assert!(
+        !db.renew_namespace_config_admission_lease(&namespace, &owner)
+            .await
+            .unwrap(),
+        "an expired same-owner row is not renewable"
+    );
+    let next_generation = db
+        .try_acquire_namespace_config_admission_lease(&namespace, &competitor)
+        .await
+        .unwrap()
+        .expect("a new writer takes the expired row");
+    assert_eq!(next_generation, generation + 1);
+    assert!(
+        !db.renew_namespace_config_admission_lease(&namespace, &owner)
+            .await
+            .unwrap()
+    );
+    drop(guard);
+    let local = tokio::time::timeout(
+        Duration::from_secs(15),
+        lock_namespace_config_admission_for_test(&namespace),
+    )
+    .await
+    .expect("old-owner cleanup releases the local shard");
+    assert!(
+        db.try_acquire_namespace_config_admission_lease(&namespace, &owner)
+            .await
+            .unwrap()
+            .is_none(),
+        "old-owner cleanup must not release the successor's live lease"
+    );
+    db.release_namespace_config_admission_lease(&namespace, &competitor)
+        .await
+        .unwrap();
+    drop(local);
 }
 
 /// Exercise the real keeper handoff, a transaction spanning its 30-second
@@ -1406,6 +1528,8 @@ where
     };
     use ferrum_edge::config::types::Consumer;
     use std::time::Duration;
+
+    assert_live_keeper_renewal_and_loss(db.clone(), &set_expiry).await;
 
     let namespace = format!("renewed-{}", uuid::Uuid::new_v4());
     let consumer: Consumer = serde_json::from_value(json!({
@@ -1544,186 +1668,115 @@ where
         .unwrap();
 }
 
-/// Cancel handoff while the datastore itself is running a renewal or reclaim.
-/// In particular, BEFORE INSERT blocks reclaim before it locks the lease row:
-/// an early release can complete, then the blocked command can revive that same
-/// owner's released lease. Merely retaining/aborting the keeper handle does not
-/// settle this already-submitted server command.
-async fn assert_postgres_cancelled_handoff_settles_operations(db: Arc<DatabaseStore>) {
-    use ferrum_edge::_test_support::lock_namespace_config_admission_db_for_test;
-    use std::future::Future;
+/// A row lock held without a server timeout blocks both renewal and release.
+/// Cleanup must free the process-local shard within its 30-second budget even
+/// while that server-side barrier remains held indefinitely.
+async fn assert_postgres_stalled_cleanup_is_bounded(db: Arc<DatabaseStore>) {
+    use ferrum_edge::_test_support::{
+        lock_namespace_config_admission_db_for_test, lock_namespace_config_admission_for_test,
+    };
     use std::time::Duration;
 
+    let namespace = format!("stalled-{}", uuid::Uuid::new_v4());
+    let guard = lock_namespace_config_admission_db_for_test(db.clone(), &namespace)
+        .await
+        .unwrap();
+    let owner = guard.lease_ref().owner.to_string();
+    let generation = guard.lease_ref().generation;
     let pool = db.pool();
-    for (reclaim, timed_out) in [(false, false), (true, false), (true, true)] {
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let namespace = format!("cancelled-{suffix}");
-        let mut guard = lock_namespace_config_admission_db_for_test(db.clone(), &namespace)
-            .await
-            .unwrap();
-        let owner = guard.lease_ref().owner.to_string();
-        let generation = guard.lease_ref().generation;
-        if reclaim {
-            // Refuse renewal without changing owner/generation. The keeper must
-            // then issue its generation-preserving reclaim.
-            sqlx::query("UPDATE config_admission_locks SET expires_at = 1 WHERE namespace = $1")
-                .bind(&namespace)
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-
-        let key = i64::from(uuid::Uuid::new_v4().as_fields().0 & 0x7fff_ffff);
-        let function = format!("pause_admission_{suffix}");
-        let trigger = format!("pause_admission_trigger_{suffix}");
-        // All interpolated identifiers/values come from generated UUIDs, never
-        // from external input. Only this namespace/owner is affected.
-        sqlx::query(&format!(
-            "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN \
-               IF NEW.namespace = '{namespace}' AND NEW.owner = '{owner}' \
-                  AND NEW.expires_at > 0 THEN \
-                 PERFORM pg_advisory_xact_lock({key}::bigint); \
-               END IF; \
-               RETURN NEW; \
-             END; $$"
-        ))
-        .execute(&pool)
+    let mut barrier = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *barrier)
         .await
         .unwrap();
-        let event = if reclaim { "INSERT" } else { "UPDATE" };
-        sqlx::query(&format!(
-            "CREATE TRIGGER {trigger} BEFORE {event} ON config_admission_locks \
-             FOR EACH ROW EXECUTE FUNCTION {function}()"
-        ))
-        .execute(&pool)
+    sqlx::query("SELECT 1 FROM config_admission_locks WHERE namespace = $1 FOR UPDATE")
+        .bind(&namespace)
+        .execute(&mut *barrier)
         .await
         .unwrap();
-        let mut barrier = pool.begin().await.unwrap();
-        sqlx::query("SELECT 1 FROM pg_advisory_xact_lock($1)")
-            .bind(key)
-            .execute(&mut *barrier)
+
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' \
+                 AND query LIKE 'UPDATE config_admission_locks SET expires_at = %'",
+            )
+            .fetch_one(&pool)
             .await
             .unwrap();
-
-        // Register the production keeper timer, then advance just that timer.
-        // Resume real time before awaiting database I/O so paused-clock auto
-        // advance cannot expire a query that is waiting on the server barrier.
-        tokio::task::yield_now().await;
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::time::resume();
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let waiting: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' \
-                     AND classid = 0 AND objid::bigint = $1 AND NOT granted",
-                )
-                .bind(key)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-                if waiting > 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
+            if waiting > 0 {
+                break;
             }
-        })
-        .await
-        .expect("keeper submitted its command and reached the server barrier");
-        if timed_out {
-            // A timeout must abandon only the response, never the submitted
-            // command. Handoff also has to join these outstanding attempts.
-            tokio::time::pause();
-            tokio::time::advance(Duration::from_secs(30)).await;
-            tokio::time::resume();
+            tokio::task::yield_now().await;
         }
-
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let handoff = tokio::spawn(async move {
-            let mut future = Box::pin(guard.hand_off_to_restore_transaction());
-            std::future::poll_fn(|context| {
-                assert!(future.as_mut().poll(context).is_pending());
-                std::task::Poll::Ready(())
-            })
-            .await;
-            entered_tx.send(()).unwrap();
-            future.await
-        });
-        entered_rx.await.unwrap();
-        handoff.abort();
-        assert!(handoff.await.unwrap_err().is_cancelled());
-
-        let next_db = db.clone();
-        let next_namespace = namespace.clone();
-        let mut next = tokio::spawn(async move {
-            lock_namespace_config_admission_db_for_test(next_db, &next_namespace).await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), &mut next)
-                .await
-                .is_err(),
-            "cleanup must retain the local admission mutex until the command settles"
-        );
-        let expiry: i64 = sqlx::query_scalar(
-            "SELECT expires_at FROM config_admission_locks WHERE namespace = $1",
+    })
+    .await
+    .expect("the production renewal reached the permanently held row lock");
+    drop(guard);
+    // Poll the detached cleanup once so its whole-cleanup deadline is armed.
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            lock_namespace_config_admission_for_test(&namespace),
         )
+        .await
+        .is_err(),
+        "the test must reach cleanup while it still owns the local shard"
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let local = tokio::time::timeout(
+        Duration::from_secs(2),
+        lock_namespace_config_admission_for_test(&namespace),
+    )
+    .await
+    .expect("stalled database I/O cannot retain the local shard past cleanup's budget");
+
+    // The server barrier is still held when the local lock is proved free.
+    // Expire the old row before allowing any queued commands to execute; none
+    // may revive it, regardless of SQL driver's cancellation semantics.
+    sqlx::query("UPDATE config_admission_locks SET expires_at = 0 WHERE namespace = $1")
         .bind(&namespace)
-        .fetch_one(&pool)
+        .execute(&mut *barrier)
         .await
         .unwrap();
-        if reclaim {
-            assert_eq!(expiry, 1, "release must not race an in-flight reclaim");
-        } else {
-            assert!(expiry > 0, "release must follow the in-flight renewal");
-        }
-
-        // The submitted write completes first, then cleanup releases it. A
-        // writer must acquire promptly without waiting out the 120-second TTL.
-        barrier.commit().await.unwrap();
-        let next = tokio::time::timeout(Duration::from_secs(15), next)
+    barrier.commit().await.unwrap();
+    drop(local);
+    let next = tokio::time::timeout(
+        Duration::from_secs(15),
+        lock_namespace_config_admission_db_for_test(db.clone(), &namespace),
+    )
+    .await
+    .expect("another writer can proceed after the stalled operation is unblocked")
+    .unwrap();
+    assert_eq!(next.lease_ref().generation, generation + 1);
+    assert_ne!(next.lease_ref().owner, owner);
+    assert!(
+        !db.renew_namespace_config_admission_lease(&namespace, &owner)
             .await
-            .expect("other writer acquired after cancellation cleanup")
-            .unwrap()
-            .unwrap();
-        assert_eq!(next.lease_ref().generation, generation + 1);
-        assert_ne!(next.lease_ref().owner, owner);
-        assert!(
-            db.try_acquire_namespace_config_admission_lease(&namespace, &owner)
-                .await
-                .unwrap()
-                .is_none(),
-            "the cancelled owner must not reclaim the next writer's live lease"
-        );
-        assert!(
-            !db.renew_namespace_config_admission_lease(&namespace, &owner)
-                .await
-                .unwrap(),
-            "the cancelled owner must remain fenced after takeover"
-        );
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT expires_at - CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) \
-             FROM config_admission_locks WHERE namespace = $1",
-        )
-        .bind(&namespace)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            remaining > 115_000,
-            "the production TTL must remain 120 seconds"
-        );
-
-        sqlx::query(&format!("DROP TRIGGER {trigger} ON config_admission_locks"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(&format!("DROP FUNCTION {function}()"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        drop(next);
-    }
+            .unwrap(),
+        "the cancelled owner remains fenced after takeover"
+    );
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT expires_at - CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) \
+         FROM config_admission_locks WHERE namespace = $1",
+    )
+    .bind(&namespace)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        remaining > 115_000,
+        "the production TTL must remain 120 seconds"
+    );
+    drop(next);
 }
 
 async fn assert_sql_restore_renewal(db: Arc<DatabaseStore>) {
@@ -1807,6 +1860,385 @@ async fn assert_http_restore_spans_keeper_renewal(db: Arc<dyn DatabaseBackend>) 
     assert_ne!(verified.body["updated_at"], expected["updated_at"]);
     expected["updated_at"] = verified.body["updated_at"].clone();
     assert_eq!(verified.body, expected);
+}
+
+/// A wire fault around the production Mongo driver and a real replica-set
+/// primary. The hosted fixture does not enable server failpoints, so hold an
+/// actual submitted OP_MSG on its already-connected upstream socket, sever
+/// the driver's socket, and execute that exact command after cleanup/takeover.
+/// Direct connection prevents discovery from bypassing the proxy; retries and
+/// compression are disabled so the fault has one unambiguous wire command.
+struct MongoLeaseWireFault {
+    namespace: String,
+    mode: std::sync::atomic::AtomicU8,
+    acquisitions: std::sync::atomic::AtomicU32,
+    renewal_entered: tokio::sync::Notify,
+    release_entered: tokio::sync::Notify,
+    disconnected: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    replayed: tokio::sync::Notify,
+    response: tokio::sync::Mutex<Option<mongodb::bson::Document>>,
+}
+
+impl MongoLeaseWireFault {
+    fn new(namespace: String) -> Self {
+        Self {
+            namespace,
+            mode: std::sync::atomic::AtomicU8::new(0),
+            acquisitions: std::sync::atomic::AtomicU32::new(0),
+            renewal_entered: tokio::sync::Notify::new(),
+            release_entered: tokio::sync::Notify::new(),
+            disconnected: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+            replayed: tokio::sync::Notify::new(),
+            response: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+struct MongoLeaseWireProxy {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MongoLeaseWireProxy {
+    fn drop(&mut self) {
+        // The accept task owns a JoinSet: aborting it also drops/aborts every
+        // fixture connection, including deliberately permanent stalls.
+        self.task.abort();
+    }
+}
+
+async fn read_mongo_wire_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut length = [0_u8; 4];
+    reader.read_exact(&mut length).await?;
+    let length = i32::from_le_bytes(length);
+    assert!((16..=8_388_608).contains(&length), "invalid fixture frame size");
+    let mut frame = vec![0_u8; length as usize];
+    frame[..4].copy_from_slice(&length.to_le_bytes());
+    reader.read_exact(&mut frame[4..]).await?;
+    Ok(frame)
+}
+
+fn mongo_wire_command(frame: &[u8]) -> Option<mongodb::bson::Document> {
+    let opcode = i32::from_le_bytes(frame[12..16].try_into().unwrap());
+    if opcode != 2013 {
+        // The driver's initial OP_QUERY hello is forwarded unchanged.
+        return None;
+    }
+    assert_eq!(frame[20], 0, "fixture expects an OP_MSG body section");
+    let length = i32::from_le_bytes(frame[21..25].try_into().unwrap()) as usize;
+    // The production driver puts update's `updates` array in the body (kind
+    // zero), and this fixture does not negotiate wire compression.
+    Some(mongodb::bson::from_slice(&frame[21..21 + length]).unwrap())
+}
+
+async fn serve_mongo_lease_wire_connection(
+    client: tokio::net::TcpStream,
+    upstream: &str,
+    fault: Arc<MongoLeaseWireFault>,
+) -> std::io::Result<()> {
+    use mongodb::bson::Bson;
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+
+    let server = tokio::net::TcpStream::connect(upstream).await?;
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut server_read, mut server_write) = server.into_split();
+    let mut requests = Box::pin(async {
+        loop {
+            let frame = read_mongo_wire_frame(&mut client_read).await?;
+            if let Some(command) = mongo_wire_command(&frame) {
+                if command.get_str("findAndModify").ok() == Some("config_admission_locks") {
+                    let query = command.get_document("query").unwrap();
+                    if query.get_str("_id").ok() == Some(fault.namespace.as_str()) {
+                        fault.acquisitions.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                if command.get_str("update").ok() == Some("config_admission_locks") {
+                    let update = command.get_array("updates").unwrap()[0]
+                        .as_document()
+                        .unwrap();
+                    let query = update.get_document("q").unwrap();
+                    if query.get_str("_id").ok() == Some(fault.namespace.as_str()) {
+                        let releasing = update
+                            .get_document("u")
+                            .ok()
+                            .and_then(|u| u.get_document("$set").ok())
+                            .and_then(|set| set.get_datetime("expires_at").ok())
+                            .is_some_and(|expiry| expiry.timestamp_millis() == 0);
+                        let mode = fault.mode.load(Ordering::SeqCst);
+                        if mode == 1 {
+                            if releasing {
+                                fault.release_entered.notify_one();
+                            } else {
+                                fault.renewal_entered.notify_one();
+                            }
+                            std::future::pending::<()>().await;
+                        }
+                        if !releasing
+                            && fault
+                                .mode
+                                .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                        {
+                            assert!(matches!(update.get("u"), Some(Bson::Array(_))));
+                            fault.renewal_entered.notify_one();
+                            return Ok::<_, std::io::Error>(frame);
+                        }
+                    }
+                }
+            }
+            server_write.write_all(&frame).await?;
+        }
+    });
+    let delayed = tokio::select! {
+        result = &mut requests => result?,
+        result = tokio::io::copy(&mut server_read, &mut client_write) => {
+            result?;
+            return Ok(());
+        }
+    };
+    drop(requests);
+    // A real disconnect, not a fabricated backend return value. Keep both
+    // upstream halves alive so the submitted command can still reach Mongo.
+    drop(client_read);
+    drop(client_write);
+    fault.disconnected.notify_one();
+    fault.resume.notified().await;
+    server_write.write_all(&delayed).await?;
+    let response = read_mongo_wire_frame(&mut server_read).await?;
+    *fault.response.lock().await = mongo_wire_command(&response);
+    fault.replayed.notify_one();
+    Ok(())
+}
+
+async fn start_mongo_lease_wire_proxy(
+    url: &str,
+    fault: Arc<MongoLeaseWireFault>,
+) -> MongoLeaseWireProxy {
+    let options = mongodb::options::ClientOptions::parse(url).await.unwrap();
+    assert!(
+        options.tls.is_none(),
+        "wire fault requires the plaintext hosted fixture"
+    );
+    let upstream = options.hosts.first().unwrap().to_string();
+    let replica_set = options.repl_set_name.as_deref().unwrap();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!(
+        "mongodb://{address}/?replicaSet={replica_set}&directConnection=true&retryWrites=false"
+    );
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (client, _) = accepted.unwrap();
+                    let upstream = upstream.clone();
+                    let fault = fault.clone();
+                    connections.spawn(async move {
+                        serve_mongo_lease_wire_connection(client, &upstream, fault).await
+                    });
+                }
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    // Driver pool/monitor shutdown may close a socket mid-frame.
+                    // A task panic is still a fixture failure; target command
+                    // errors are caught by the positive replay barrier below.
+                    let _ = joined.unwrap().unwrap();
+                }
+            }
+        }
+    });
+    MongoLeaseWireProxy { url, task }
+}
+
+async fn assert_mongo_cancelled_renewals_cannot_revive(url: &str) {
+    use ferrum_edge::_test_support::{
+        lock_namespace_config_admission_db_for_test, lock_namespace_config_admission_for_test,
+    };
+    use mongodb::bson::{Bson, Document, doc};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    for (permanently_stalled, after_takeover) in [(true, false), (false, false), (false, true)] {
+        let namespace = format!("wire-cancelled-{}", uuid::Uuid::new_v4());
+        let fault = Arc::new(MongoLeaseWireFault::new(namespace.clone()));
+        let proxy = start_mongo_lease_wire_proxy(url, fault.clone()).await;
+        let database = format!("wire_{}", uuid::Uuid::new_v4().simple());
+        let db = ferrum_edge::config::mongo_store::MongoStore::connect(
+            &proxy.url,
+            &database,
+            None,
+            None,
+            None,
+            Some(5),
+            Some(5),
+            false,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let db = Arc::new(db);
+        let raw = mongodb::Client::with_uri_str(url)
+            .await
+            .unwrap()
+            .database(&database);
+        let locks = raw.collection::<Document>("config_admission_locks");
+        let mut guard = lock_namespace_config_admission_db_for_test(db.clone(), &namespace)
+            .await
+            .unwrap();
+        let owner = guard.lease_ref().owner.to_string();
+        let generation = guard.lease_ref().generation;
+        assert_eq!(fault.acquisitions.load(Ordering::SeqCst), 1);
+        if permanently_stalled {
+            fault.mode.store(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::time::resume();
+            tokio::time::timeout(Duration::from_secs(15), fault.renewal_entered.notified())
+                .await
+                .expect("production keeper submitted the permanently stalled renewal");
+            drop(guard);
+            tokio::time::timeout(Duration::from_secs(15), fault.release_entered.notified())
+                .await
+                .expect("cleanup submitted the permanently stalled release");
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(31)).await;
+            tokio::time::resume();
+            let local = tokio::time::timeout(
+                Duration::from_secs(2),
+                lock_namespace_config_admission_for_test(&namespace),
+            )
+            .await
+            .expect("Mongo stalls cannot hold the local shard beyond cleanup's bound");
+            assert_eq!(fault.acquisitions.load(Ordering::SeqCst), 1);
+            drop(local);
+            // Neither deliberately stalled command is resumed. Fixture Drop
+            // cancels its connections; production cleanup is already finished.
+            continue;
+        }
+
+        // Stop the ordinary keeper, then submit its exact production store
+        // renewal to observe an actual driver transport error before cleanup.
+        // The server-side command must remain possible after that result.
+        guard.hand_off_to_restore_transaction().await.unwrap();
+        fault.mode.store(2, Ordering::SeqCst);
+        let renew_db = db.clone();
+        let renew_namespace = namespace.clone();
+        let renew_owner = owner.clone();
+        let renewal = tokio::spawn(async move {
+            renew_db
+                .renew_namespace_config_admission_lease(&renew_namespace, &renew_owner)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(15), fault.disconnected.notified())
+            .await
+            .expect("wire proxy severed the actual Mongo driver connection");
+        let result = tokio::time::timeout(Duration::from_secs(5), renewal)
+            .await
+            .expect("disconnected driver future returned before cleanup")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "a real driver transport error must be observed"
+        );
+        drop(guard);
+        let local = tokio::time::timeout(
+            Duration::from_secs(15),
+            lock_namespace_config_admission_for_test(&namespace),
+        )
+        .await
+        .expect("cleanup finished before the delayed command is resumed");
+        let released = locks
+            .find_one(doc! { "_id": &namespace })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.get_str("owner").unwrap(), owner);
+        assert_eq!(
+            released.get_datetime("expires_at").unwrap().timestamp_millis(),
+            0
+        );
+        drop(local);
+        if after_takeover {
+            let next = lock_namespace_config_admission_db_for_test(db.clone(), &namespace)
+                .await
+                .unwrap();
+            assert_eq!(next.lease_ref().generation, generation + 1);
+            drop(next);
+        }
+        let local = tokio::time::timeout(
+            Duration::from_secs(15),
+            lock_namespace_config_admission_for_test(&namespace),
+        )
+        .await
+        .expect("all cleanup completes before the replay");
+        let before = locks
+            .find_one(doc! { "_id": &namespace })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.get_datetime("expires_at").unwrap().timestamp_millis(),
+            0
+        );
+        let expected_generation = if after_takeover {
+            generation + 1
+        } else {
+            generation
+        };
+        let expected_acquisitions = if after_takeover { 2 } else { 1 };
+        assert_eq!(
+            fault.acquisitions.load(Ordering::SeqCst),
+            expected_acquisitions
+        );
+        fault.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(15), fault.replayed.notified())
+            .await
+            .expect("the exact delayed wire command executed on the real replica-set primary");
+        let response = fault.response.lock().await.take().unwrap();
+        assert_eq!(response.get("n"), Some(&Bson::Int32(0)), "{response:?}");
+        assert_eq!(
+            locks
+                .find_one(doc! { "_id": &namespace })
+                .await
+                .unwrap()
+                .unwrap(),
+            before,
+            "a disconnected owner's command cannot revive a released lease"
+        );
+        drop(local);
+        let final_guard = lock_namespace_config_admission_db_for_test(db.clone(), &namespace)
+            .await
+            .unwrap();
+        assert_eq!(final_guard.lease_ref().generation, expected_generation + 1);
+        assert!(
+            db.try_acquire_namespace_config_admission_lease(&namespace, &owner)
+                .await
+                .unwrap()
+                .is_none(),
+            "takeover remains exclusive after the delayed command"
+        );
+        drop(final_guard);
+        let local = tokio::time::timeout(
+            Duration::from_secs(15),
+            lock_namespace_config_admission_for_test(&namespace),
+        )
+        .await
+        .expect("final writer cleanup finishes before the proxy is stopped");
+        drop(local);
+    }
 }
 
 async fn assert_mongo_legacy_consumer_tags(db: Arc<dyn DatabaseBackend>, raw: &mongodb::Database) {
@@ -1896,6 +2328,7 @@ async fn assert_mongo_legacy_consumer_tags(db: Arc<dyn DatabaseBackend>, raw: &m
 #[ignore = "Requires a MongoDB replica set supplied by MONGO_URL"]
 async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transaction() {
     let url = std::env::var("MONGO_URL").expect("MONGO_URL with replicaSet is required");
+    assert_mongo_cancelled_renewals_cannot_revive(&url).await;
     let database = format!("conditional_{}", uuid::Uuid::new_v4().simple());
     let db = ferrum_edge::config::mongo_store::MongoStore::connect(
         &url,
@@ -1950,7 +2383,17 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
         .unwrap();
     assert_transaction_precondition(&db).await;
     let db = Arc::new(db);
-    assert_postgres_cancelled_handoff_settles_operations(db.clone()).await;
+    let stalled_db = DatabaseStore::connect_with_pool_config(
+        "postgres",
+        &url,
+        DbPoolConfig {
+            statement_timeout_seconds: 0,
+            ..DbPoolConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_postgres_stalled_cleanup_is_bounded(Arc::new(stalled_db)).await;
     assert_sql_restore_renewal(db.clone()).await;
     assert_http_restore_spans_keeper_renewal(db).await;
 }

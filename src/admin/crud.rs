@@ -182,14 +182,9 @@ const CONFIG_ADMISSION_LEASE_DURATION: Duration = Duration::from_secs(120);
 const CONFIG_ADMISSION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 const CONFIG_ADMISSION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Budget for a detached, best-effort lease release.
-///
-/// The release runs in a task nothing awaits, so it can afford to ride out the
-/// same congestion the renewer rides out. One retry interval was not enough:
-/// under the datastore stall this machinery exists to survive, a one-second
-/// release almost always times out and leaves the namespace's lease held for
-/// its full remaining TTL, which serializes every later writer behind an owner
-/// that is already gone.
+/// Total budget for stopping the keeper and releasing a dropped guard's lease.
+/// Local shard locks are released at this deadline even if datastore I/O never
+/// completes. A failed release leaves recovery to server-side lease expiry.
 const CONFIG_ADMISSION_LEASE_RELEASE_TIMEOUT: Duration = CONFIG_ADMISSION_LEASE_RENEW_INTERVAL;
 
 /// Longest a caller waits for a contended namespace admission lease before the
@@ -246,10 +241,10 @@ pub(crate) enum LeaseRenewalOutcome {
     /// The guard was dropped, or the stop signal fired, while the lease was
     /// still held.
     Stopped,
-    /// Ownership provably changed hands: the row is held by another owner, or
-    /// came back at a generation this guard never acquired.
+    /// Renewal matched no live lease. The row may be released, expired,
+    /// absent, or held by another owner; none authorizes re-acquisition.
     Lost,
-    /// The lease window closed without a successful renewal or reclaim. Fails
+    /// The lease window closed without a successful renewal. Fails
     /// closed — the guard invalidates rather than assume it still holds a row
     /// it could not prove.
     Expired,
@@ -264,8 +259,8 @@ pub(crate) struct LeaseRenewalCounters {
     /// Attempts abandoned on a datastore error or the per-attempt timeout and
     /// re-issued inside the same window.
     pub(crate) retries: u32,
-    /// Windows recovered by a generation-preserving re-acquisition after the
-    /// datastore refused the conditional renewal.
+    /// Always zero: a keeper must never re-acquire a released or absent row.
+    /// Retained for the external renewal test observation.
     pub(crate) reclaims: u32,
 }
 
@@ -280,63 +275,13 @@ pub(crate) struct LeaseRenewalReport {
     pub(crate) counters: LeaseRenewalCounters,
 }
 
-// The keeper may be aborted, but a submitted datastore command must run to a
-// result before owner-qualified release. Dropping a database future can leave
-// its server-side write running, especially a reclaim that can revive a released
-// row. The guard retains this set across keeper cancellation and handoff.
-type NamespaceLeaseOperations = Arc<Mutex<tokio::task::JoinSet<()>>>;
-
-async fn run_namespace_lease_operation<F, T>(
-    operations: &NamespaceLeaseOperations,
-    future: F,
-) -> Result<T, anyhow::Error>
-where
-    F: Future<Output = Result<T, anyhow::Error>> + Send + 'static,
-    T: Send + 'static,
-{
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    {
-        let mut tasks = operations.lock().await;
-        // Bound retained handles over a long-lived guard, including attempts
-        // whose response receiver was dropped by a timeout.
-        while let Some(result) = tasks.try_join_next() {
-            result.map_err(|_| {
-                anyhow::anyhow!("namespace admission operation stopped unexpectedly")
-            })?;
-        }
-        tasks.spawn(async move {
-            let _ = result_tx.send(future.await);
-        });
-    }
-    result_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("namespace admission operation stopped unexpectedly"))?
-}
-
-async fn settle_namespace_lease_operations(
-    operations: &NamespaceLeaseOperations,
-) -> Result<(), anyhow::Error> {
-    let mut tasks = operations.lock().await;
-    let mut failed = false;
-    // join_next is cancellation-safe: handoff retains the set if its caller
-    // disappears here, and Drop resumes joining it before release.
-    while let Some(result) = tasks.join_next().await {
-        failed |= result.is_err();
-    }
-    if failed {
-        anyhow::bail!("namespace admission operation stopped unexpectedly");
-    }
-    Ok(())
-}
-
-/// Shared view of one lease's local deadline and submitted operations.
+/// Shared view of one lease's local deadline.
 struct LeaseRenewalState {
     valid: Arc<AtomicBool>,
     valid_until_millis: Arc<AtomicU64>,
     lease_state_tx: tokio::sync::watch::Sender<u64>,
     lease_started_at: Instant,
     lease_duration_millis: u64,
-    operations: NamespaceLeaseOperations,
 }
 
 impl LeaseRenewalState {
@@ -367,18 +312,6 @@ impl LeaseRenewalState {
         self.valid_until_millis.store(0, Ordering::Release);
         let _ = self.lease_state_tx.send(0);
     }
-}
-
-/// Outcome of a generation-preserving reclaim attempt.
-enum LeaseReclaim {
-    /// The row is still this owner's, at the generation this guard acquired,
-    /// so no other writer was ever admitted.
-    SameGeneration(Instant),
-    /// Ownership provably changed hands.
-    Taken,
-    /// The reclaim itself could not be completed. Proof of nothing; the caller
-    /// retries while the window still allows it.
-    Unavailable,
 }
 
 /// Time one renewal attempt may block, or `None` when the window has closed.
@@ -420,75 +353,14 @@ async fn lease_sleep_or_stop(
     }
 }
 
-/// Re-acquire a lease the datastore just refused to renew, but only when the
-/// row proves nobody else ever held it.
-///
-/// `try_acquire_namespace_config_admission_lease` takes the row when it is
-/// unowned, expired, or already this owner's, and bumps `generation` on every
-/// ownership change while leaving it untouched for a same-owner re-take. The
-/// `config_admission_locks` row is never deleted by any code path — release
-/// only sets `expires_at = 0` — so `generation` is strictly monotonic per
-/// namespace for the life of the datastore.
-///
-/// That makes `owner == ours && generation == ours` a proof, not a heuristic:
-/// for a foreign owner to have been admitted, `generation` would have had to
-/// increase, and it can never come back down. A matching generation therefore
-/// means the lease was never handed to anyone else, so extending it cannot
-/// create a second believing writer.
-async fn reclaim_namespace_config_admission_lease<B>(
-    db: Arc<B>,
-    namespace: &str,
-    owner: &str,
-    generation: u64,
-    budget: Duration,
-    operations: &NamespaceLeaseOperations,
-) -> LeaseReclaim
-where
-    B: crate::config::db_backend::NamespaceConfigAdmissionLeaseBackend + ?Sized + 'static,
-{
-    let started_at = Instant::now();
-    let acquire_db = db.clone();
-    let acquire_namespace = namespace.to_string();
-    let acquire_owner = owner.to_string();
-    let acquired = tokio::time::timeout(
-        budget,
-        run_namespace_lease_operation(operations, async move {
-            acquire_db
-                .try_acquire_namespace_config_admission_lease(&acquire_namespace, &acquire_owner)
-                .await
-        }),
-    )
-    .await;
-    let acquired = match acquired {
-        Ok(Ok(acquired)) => acquired,
-        Ok(Err(_error)) => {
-            super::debug_persistence_failure_redacted("namespace_admission_lease_reclaim");
-            return LeaseReclaim::Unavailable;
-        }
-        Err(_elapsed) => return LeaseReclaim::Unavailable,
-    };
-    match acquired {
-        Some(reacquired) if reacquired == generation => LeaseReclaim::SameGeneration(started_at),
-        Some(_) => {
-            // The row changed hands and came back: this claim is useless to the
-            // guard, and holding it would block the rightful next writer for a
-            // whole lease duration.
-            release_namespace_config_admission_claim(
-                db.as_ref(),
-                namespace,
-                owner,
-                "a namespace config admission lease reclaimed at a foreign generation",
-                CONFIG_ADMISSION_LEASE_RETRY_INTERVAL,
-            )
-            .await;
-            LeaseReclaim::Taken
-        }
-        None => LeaseReclaim::Taken,
-    }
-}
-
 /// Keep one namespace config admission lease alive until the guard stops, the
-/// datastore hands the namespace to somebody else, or the window closes.
+/// datastore refuses renewal, or the window closes.
+///
+/// The keeper only updates an existing, live, owner-matching row. It never
+/// calls acquisition: even a completed driver future can leave a command
+/// running on the server after a disconnect. Release sets expiry to zero, so
+/// every late renewal matches nothing after release or takeover. This fence
+/// permits bounded cancellation without assuming server-side settlement.
 ///
 /// Generic over the lease backend rather than over `DatabaseBackend` so tests
 /// can drive the exact production loop against a fault-injecting fake without
@@ -532,18 +404,22 @@ where
                     counters,
                 };
             };
-            let renew_db = db.clone();
-            let renew_namespace = namespace.clone();
-            let renew_owner = owner.clone();
-            let renewed = tokio::time::timeout(
-                budget,
-                run_namespace_lease_operation(&state.operations, async move {
-                    renew_db
-                        .renew_namespace_config_admission_lease(&renew_namespace, &renew_owner)
-                        .await
-                }),
-            )
-            .await;
+            let renewed = tokio::select! {
+                biased;
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        return LeaseRenewalReport {
+                            outcome: LeaseRenewalOutcome::Stopped,
+                            counters,
+                        };
+                    }
+                    continue;
+                }
+                result = tokio::time::timeout(
+                    budget,
+                    db.renew_namespace_config_admission_lease(&namespace, &owner),
+                ) => result,
+            };
             match renewed {
                 Ok(Ok(true)) => {
                     counters.renewals = counters.renewals.saturating_add(1);
@@ -551,65 +427,21 @@ where
                     break;
                 }
                 Ok(Ok(false)) => {
-                    // The conditional renewal matched no row. That is not yet
-                    // proof of loss: the same outcome is produced by a stalled
-                    // statement that reached the datastore after this owner's
-                    // own expiry, with the row still untouched and unclaimed.
-                    // A generation-preserving reclaim tells the two apart.
-                    let reclaim = reclaim_namespace_config_admission_lease(
-                        db.clone(),
-                        &namespace,
-                        &owner,
-                        generation,
-                        budget,
-                        &state.operations,
-                    )
-                    .await;
-                    match reclaim {
-                        LeaseReclaim::SameGeneration(reclaimed_at) => {
-                            counters.reclaims = counters.reclaims.saturating_add(1);
-                            valid_until = state.publish_deadline(reclaimed_at);
-                            tracing::warn!(
-                                namespace = %namespace,
-                                generation = generation,
-                                renewals = counters.renewals,
-                                retries = counters.retries,
-                                reclaims = counters.reclaims,
-                                "Namespace config admission lease renewal was refused and the lease was re-acquired at the same generation; no other writer held it"
-                            );
-                            break;
-                        }
-                        LeaseReclaim::Taken => {
-                            state.invalidate();
-                            tracing::error!(
-                                namespace = %namespace,
-                                generation = generation,
-                                renewals = counters.renewals,
-                                retries = counters.retries,
-                                reclaims = counters.reclaims,
-                                "Namespace config admission lease renewal lost ownership to another writer"
-                            );
-                            return LeaseRenewalReport {
-                                outcome: LeaseRenewalOutcome::Lost,
-                                counters,
-                            };
-                        }
-                        LeaseReclaim::Unavailable => {
-                            counters.retries = counters.retries.saturating_add(1);
-                            tracing::warn!(
-                                namespace = %namespace,
-                                retries = counters.retries,
-                                detail_withheld = true,
-                                "Namespace config admission lease reclaim did not complete; retrying inside the remaining lease window"
-                            );
-                            if lease_sleep_or_stop(&mut stop_rx, timing.retry_interval).await {
-                                return LeaseRenewalReport {
-                                    outcome: LeaseRenewalOutcome::Stopped,
-                                    counters,
-                                };
-                            }
-                        }
-                    }
+                    // A keeper may not turn loss into an acquisition. In
+                    // particular, release preserves owner/generation but
+                    // revokes renewal by setting expiry to zero.
+                    state.invalidate();
+                    tracing::error!(
+                        namespace = %namespace,
+                        generation = generation,
+                        renewals = counters.renewals,
+                        retries = counters.retries,
+                        "Namespace config admission lease renewal matched no live lease; failing closed"
+                    );
+                    return LeaseRenewalReport {
+                        outcome: LeaseRenewalOutcome::Lost,
+                        counters,
+                    };
                 }
                 Ok(Err(_)) | Err(_) => {
                     counters.retries = counters.retries.saturating_add(1);
@@ -720,7 +552,6 @@ pub(crate) struct NamespaceConfigAdmissionGuard {
     generation: u64,
     stop_tx: Option<tokio::sync::watch::Sender<bool>>,
     renew_task: Option<tokio::task::JoinHandle<LeaseRenewalReport>>,
-    operations: NamespaceLeaseOperations,
     valid: Arc<AtomicBool>,
     lease_started_at: Instant,
     valid_until_millis: Arc<AtomicU64>,
@@ -765,10 +596,11 @@ impl NamespaceConfigAdmissionGuard {
         }
     }
 
-    /// Hand renewal to an atomic restore transaction. Join the keeper before
-    /// starting the transaction so it cannot update a repeatable-read snapshot's
-    /// lease row behind that transaction. The store must check live ownership
-    /// and pin the lease before reading any resources, then renew it at commit.
+    /// Hand renewal to an atomic restore transaction. Stop and join the local
+    /// keeper before starting the transaction so it cannot submit more renewals.
+    /// This is not proof of server settlement after a transport failure. The
+    /// store must check live ownership and pin the lease before reading any
+    /// resources, then renew it at commit.
     /// A failed transaction leaves the original expiry in place; this guard is
     /// retained for owner-qualified release and must not authorize another write.
     pub(crate) async fn hand_off_to_restore_transaction(&mut self) -> Result<(), anyhow::Error> {
@@ -778,7 +610,7 @@ impl NamespaceConfigAdmissionGuard {
         }
         if let Some(task) = self.renew_task.as_mut() {
             // Keep ownership across await so cancellation cannot detach the
-            // keeper from Drop's abort/join-before-release cleanup.
+            // keeper from Drop's bounded abort/join-and-release cleanup.
             let joined = task.await;
             // Completion has been consumed. Remove the handle without another
             // suspension so Drop cannot poll it a second time on an error path.
@@ -792,10 +624,11 @@ impl NamespaceConfigAdmissionGuard {
                 );
             }
         }
-        // Timed-out attempts still own their database futures. They must settle
-        // before the restore takes its transaction snapshot as well as before
-        // cancellation cleanup releases this owner's row.
-        settle_namespace_lease_operations(&self.operations).await?;
+        // No keeper futures remain locally. A transport failure can still
+        // leave a renewal executing on the server: SQL's entry row lock orders
+        // it before or after the restore pin; Mongo's transaction write conflict
+        // may conservatively refuse the restore. Neither may bypass the store's
+        // live owner/generation check or revive a released lease.
         let held = self.ensure_held();
         // The identity remains available for the store's authoritative entry
         // gate, but this stopped guard cannot authorize another mutation.
@@ -906,22 +739,21 @@ impl Drop for NamespaceConfigAdmissionGuard {
         if let Some(task) = &renew_task {
             task.abort();
         }
-        let operations = self.operations.clone();
         let local = std::mem::take(&mut self.local);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                if let Some(task) = renew_task {
-                    let _ = task.await;
-                }
-                // Abort prevents new submissions; joining the retained database
-                // operations prevents a late reclaim after release. Keep the
-                // local mutexes until both settlement and release finish.
-                if settle_namespace_lease_operations(&operations).await.is_err() {
-                    super::warn_persistence_failure_redacted("namespace_admission_operation_join");
-                }
+                // Bound the entire cleanup, including the keeper join. Aborting
+                // drops its database future, not necessarily the server command;
+                // the live-row renewal predicate is the release fence.
                 match tokio::time::timeout(
                     CONFIG_ADMISSION_LEASE_RELEASE_TIMEOUT,
-                    db.release_namespace_config_admission_lease(&namespace, &owner),
+                    async {
+                        if let Some(task) = renew_task {
+                            let _ = task.await;
+                        }
+                        db.release_namespace_config_admission_lease(&namespace, &owner)
+                            .await
+                    },
                 )
                 .await
                 {
@@ -934,7 +766,7 @@ impl Drop for NamespaceConfigAdmissionGuard {
                     Err(_) => {
                         tracing::warn!(
                             namespace = %namespace,
-                            "Timed out releasing namespace config admission lease; expiry will recover it"
+                            "Timed out cleaning up namespace config admission lease; expiry will recover it"
                         );
                     }
                 }
@@ -1094,14 +926,12 @@ async fn lock_namespace_config_admission_with_local(
         u64::try_from(timing.lease_duration.as_millis()).unwrap_or(u64::MAX);
     let valid_until_millis = Arc::new(AtomicU64::new(lease_duration_millis));
     let (lease_state_tx, lease_state_rx) = tokio::sync::watch::channel(lease_duration_millis);
-    let operations = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
     let state = LeaseRenewalState {
         valid: valid.clone(),
         valid_until_millis: valid_until_millis.clone(),
         lease_state_tx,
         lease_started_at,
         lease_duration_millis,
-        operations: operations.clone(),
     };
     let renew_task = tokio::spawn(run_namespace_config_admission_renewal(
         db.clone(),
@@ -1121,7 +951,6 @@ async fn lock_namespace_config_admission_with_local(
         generation,
         stop_tx: Some(stop_tx),
         renew_task: Some(renew_task),
-        operations,
         valid,
         lease_started_at,
         valid_until_millis,
@@ -1152,14 +981,12 @@ pub(crate) async fn run_namespace_config_admission_renewal_for_test(
     let valid_until_millis = Arc::new(AtomicU64::new(lease_duration_millis));
     let (lease_state_tx, _lease_state_rx) = tokio::sync::watch::channel(lease_duration_millis);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let operations = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
     let state = LeaseRenewalState {
         valid: valid.clone(),
         valid_until_millis: valid_until_millis.clone(),
         lease_state_tx,
         lease_started_at,
         lease_duration_millis,
-        operations: operations.clone(),
     };
     let mut task = tokio::spawn(run_namespace_config_admission_renewal(
         db,
@@ -1186,7 +1013,6 @@ pub(crate) async fn run_namespace_config_admission_renewal_for_test(
         counters: LeaseRenewalCounters::default(),
     };
     let report = joined.unwrap_or(stopped);
-    let _ = settle_namespace_lease_operations(&operations).await;
     let elapsed = lease_started_at.elapsed();
     let elapsed_millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     let held = valid.load(Ordering::Acquire)
