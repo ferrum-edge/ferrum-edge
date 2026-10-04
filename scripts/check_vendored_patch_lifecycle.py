@@ -1553,7 +1553,7 @@ true
             "",
             "# [patch.crates-io] in a comment must not open the block",
             "[patch.crates-io]",
-            'reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }',
+            'reqwest = { path = "vendor/reqwest-0.13.4-ferrum-patched" }',
             'tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }',
             "",
             "[profile.release]",
@@ -1562,7 +1562,7 @@ true
     )
     parsed_root = parse_patch_crates_io_text(root_manifest)
     if parsed_root != {
-        "reqwest": "vendor/reqwest-0.13.3-ferrum-patched",
+        "reqwest": "vendor/reqwest-0.13.4-ferrum-patched",
         "tokio-tungstenite": "vendor/tokio-tungstenite-0.29.0-ferrum-patched",
     }:
         failures.append(f"root [patch.crates-io] parse: got {parsed_root!r}")
@@ -1579,7 +1579,7 @@ true
     mesh_manifest = "\n".join(
         [
             "[patch.crates-io]",
-            'reqwest = { path = "../../../vendor/reqwest-0.13.3-ferrum-patched" }',
+            'reqwest = { path = "../../../vendor/reqwest-0.13.4-ferrum-patched" }',
         ]
     )
     mesh_parsed = parse_patch_crates_io_text(mesh_manifest)

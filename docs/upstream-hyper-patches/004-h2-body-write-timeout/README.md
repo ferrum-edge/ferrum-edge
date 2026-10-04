@@ -1,7 +1,7 @@
 # hyper: bound how long an HTTP/2 request body may wait to be written
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/hyper-1.9.0-ferrum-patched/` must regenerate the
+> Any change to `vendor/hyper-1.10.0-ferrum-patched/` must regenerate the
 > drift manifest (`scripts/update_vendor_integrity.sh`).
 
 ## Status
@@ -40,7 +40,7 @@ default).
 
 The unified diff is
 [`hyper-h2-body-write-timeout.patch`](hyper-h2-body-write-timeout.patch),
-against the published hyper 1.9.0 crate with patches 001–003 applied.
+against the published hyper 1.10.0 crate with patches 001–003 applied.
 Apply [the complete ordered stack](../README.md); patch 002 supplies the
 pending-body foundation and permits progress at every positive capacity.
 Patch 004 never requires or restores the former fixed 1 KiB threshold.
@@ -66,11 +66,12 @@ Patch 004 never requires or restores the former fixed 1 KiB threshold.
   for real, the pipe sets the flag, sends
   `RST_STREAM(CANCEL)` and fails the body. Dropping the pipe releases the
   request body.
-- **With a bound configured, the pipe polls the body before waiting for
-  capacity**, so time spent waiting for the client to send more is never
-  counted as a write stall. It holds at most one chunk, as stock hyper already
-  does when a 1-byte claim admits a whole chunk. Without the extension the pipe
-  behaves exactly as before.
+- **The pipe polls the body before waiting for capacity**, preserving Hyper
+  1.10's scheduling with or without the extension. Time spent waiting for the
+  client to send more is never counted as a write stall. It holds at most one
+  chunk and reserves only that chunk's actual length; an idle body cannot claim
+  connection window needed by another stream. Without the extension, the
+  pending DATA and positive-capacity behavior remain, with no write-stall timer.
 
 Ferrum attaches the extension instead of installing the pump on two paths:
 
@@ -160,7 +161,7 @@ real `hyper::client::conn::http2` connection against an in-process h2 server.
 Run them with:
 
 ```bash
-cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
+cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
 ```
 
 They cover five cases:

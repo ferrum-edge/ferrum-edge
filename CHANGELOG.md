@@ -7,14 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.11] - Unreleased
+## [0.9.11] - 2026-10-04
 
-Release draft; publication date and qualification evidence are pending. See the
-[0.9.11 release draft](docs/releases/v0.9.11.md). Dependency updates from
-[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) are not included
-until root integrates that PR into this branch through a normal merge of main.
+Release candidate prepared on 2026-10-04 UTC; this is the planned cut/preparation
+date, not an asserted publication timestamp. Root must adjust it before the
+actual cut if the calendar date changes. Publication and final qualification
+evidence remain pending. See the [0.9.11 release draft](docs/releases/v0.9.11.md).
 
 ### Security
+
+- **Upgrade the dependency security chain** (#5912,
+  GHSA-w9wp-h8wv-79jx, GHSA-8ffr-xgwf-xj56, GHSA-6g2r-675j-hx59).
+  Rebase all retained Hyper patches onto published 1.10.0 and reqwest patches
+  onto published 0.13.4, constrain the compatible GCP/OpenTelemetry and fixed
+  Smithy/xxhash versions, and add an optional hosted lockfile producer.
+  Import real root/mesh/fuzz lockfiles from the verified hosted Cargo artifact;
+  they resolve SDK 0.32.1, Smithy JSON 0.62.7 and fixed xxhash with one patched
+  Hyper/reqwest pair per production graph. The source fix was merged through
+  [PR #6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) at
+  `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; issue #5912 is closed. Its
+  exact-head hosted checks passed, but 0.9.11 qualification and publication
+  remain pending. See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
+  and [completed source integration evidence](docs/releases/v0.9.11.md#dependency-source-integration-evidence).
 
 - **Conditional admin reads and restores use authoritative strong state tags**
   (#5992). Admin-only `GET /consumers/{id}/verification` returns the complete

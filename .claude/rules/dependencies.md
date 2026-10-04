@@ -23,10 +23,10 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 ## Vendored, Patched Crates
 
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
-  `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.3`,
+  `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.4`,
   `h3 0.0.8`, `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
   `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, `hyper-util 0.1.21`,
-  `hyper 1.9.0` (patches 001–004), and `h2 0.4.19` (coalescing, runtime-budget,
+  `hyper 1.10.0` (patches 001–004), and `h2 0.4.19` (coalescing, runtime-budget,
   and stream-lifetime patches).
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
@@ -282,7 +282,7 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `backend_read_timeout_ms`.
 - hyper upgraded-stream reset (issue #5781): the vendored
   `--lib ferrum_connect_error_reset` tests in
-  `vendor/hyper-1.9.0-ferrum-patched/src/proto/h2/upgrade.rs`, run by the
+  `vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/upgrade.rs`, run by the
   `test-vendor-patches` job, plus the HBONE relay
   tests in `tests/integration/mesh_hbone_tests.rs`
   (`*_sends_rst_stream_connect_error`, `*_still_ends_stream_cleanly`). A relay

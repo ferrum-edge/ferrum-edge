@@ -30,10 +30,12 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to 0.9.11 (release draft)
 
-0.9.11 is not published or qualified yet. The guidance below covers source
-changes already on main; dependency updates from
-[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) must be integrated
-and documented before qualification. Use the
+0.9.11 is not published or qualified yet. This candidate was prepared on
+2026-10-04 UTC, the planned cut date rather than a publication timestamp; root
+must adjust the date before the actual cut if it changes. The guidance below
+covers main through `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`, including
+the merged dependency security fix
+[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004). Use the
 [release draft](releases/v0.9.11.md) for outstanding evidence and publication
 requirements. Version pins in this draft become usable only after publication.
 
@@ -91,6 +93,25 @@ Windows is unaffected by that allocator change. CP and DP must run the same
 build; follow the [upgrade order](#upgrade-order) and the build-out database
 rebuild procedure rather than treating this patch version as mixed-build or
 in-place schema compatibility.
+
+**Dependency security chain (#5912 / #6004).** The integrated Hyper 1.10.0
+and reqwest 0.13.4 vendor refresh retains every local patch and preserves the
+selected ordinary/FIPS crypto profiles. GCP uses the compatible GAX-internal
+0.7.14 / GAX 1.11.0 / OpenTelemetry 0.32 generation with SDK 0.32.1; root
+locks Smithy JSON 0.62.7, root/mesh lock xxhash 0.8.16, and fuzz retains xxhash
+0.8.18. The root, mesh and fuzz lockfiles came from the verified hosted Cargo
+producer; this release
+changes only their own `ferrum-edge` package version to 0.9.11. Dependency
+versions, checksums, graph inputs and producer provenance are unchanged from
+main's security fix. Hosted source qualification passed at the reviewed
+#6004 head and issue #5912 is closed; fresh integrated-release qualification
+and published artifacts are still pending. Cloud secrets remain unsupported
+in enforcing FIPS mode. See
+[the security upgrade record](dependency-security-upgrade-5912.md) for exact
+producer provenance and patch-port risks, and the
+[completed source integration evidence](releases/v0.9.11.md#dependency-source-integration-evidence)
+for the merge and exact-head hosted proof. Upgrade deployed binaries only after
+the release is qualified and its artifacts are verified.
 
 **Conditional admin snapshots and restore (#5992).** Use an admin-role JWT
 for `GET /consumers/{id}/verification` when checking the complete stored

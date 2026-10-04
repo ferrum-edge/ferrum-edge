@@ -1,7 +1,7 @@
 # Vendored reqwest patch: selectable rustls provider fallback
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/reqwest-0.13.3-ferrum-patched/` must refresh the drift
+> Any change to `vendor/reqwest-0.13.4-ferrum-patched/` must refresh the drift
 > manifest recorded in `vendor/VENDOR_INTEGRITY.sha256`.
 
 ## What this patches
@@ -21,7 +21,7 @@ selecting neither retains the upstream `No provider set` failure for the public
 Ferrum's normal and FIPS builds must select Ring and AWS-LC-FIPS respectively
 through one auditable cargo-feature pair. The binary installs that provider
 before startup, but library and test clients can construct reqwest before the
-binary entry point runs. Upstream reqwest 0.13.3 only has an AWS-LC fallback,
+binary entry point runs. Upstream reqwest 0.13.4 only has an AWS-LC fallback,
 so using `rustls-no-provider` made those clients panic and using `rustls` would
 silently route the ordinary profile through AWS-LC. The paired internal arm
 preserves the selected backend in both contexts.

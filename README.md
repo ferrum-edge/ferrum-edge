@@ -596,11 +596,12 @@ Edge source. The latest published tag is
 at `591c73a3f965fdab440c3a76b2707accdf491ba5`. It carries the published
 **v0.9.9/v0.9.10 contract baseline**; v0.9.10 changed no contract source.
 
-The **v0.9.11 release draft** includes new conditional admin snapshot/restore
-and backend egress discovery contracts. These additions remain pending until
-the actual Edge release, canonical release evidence, and consumer qualification
-are complete. The existing tag does not cover these new surfaces, and
-historical published tags must remain unchanged. See the
+The **v0.9.11 release draft** includes new conditional admin snapshot/restore,
+backend egress discovery, and JWT authorization lifetime/dispatch handoff
+contracts. These additions remain pending until the actual Edge release,
+canonical release evidence, and consumer qualification are complete. The
+existing tag does not cover these new surfaces, and historical published tags
+must remain unchanged. See the
 [release draft](docs/releases/v0.9.11.md) and
 [contracts handoff](docs/admin_contracts_handoff_5992_5994.md) before updating
 consumer pins.

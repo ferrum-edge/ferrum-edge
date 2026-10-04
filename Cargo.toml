@@ -96,7 +96,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 
 # HTTP
-hyper = { version = "1", features = ["full"] }
+hyper = { version = "=1.10.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 # ACME wraps hyper-rustls around Ferrum's policy-aware connector so the
 # original hostname remains the SNI/certificate identity while only screened
@@ -226,6 +226,8 @@ semver = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
 ahash = "0.8"
+# GHSA-6g2r-675j-hx59: a floor for the already-transitive xxh3 implementation.
+xxhash-rust = { version = "0.8.16", default-features = false }
 arc-swap = "1"
 # HNSW vector index used by the optional ai_semantic_cache semantic-similarity path.
 instant-distance = "0.6.1"
@@ -249,7 +251,7 @@ pin-project-lite = "0.2"
 # backend traffic through an unintended hop). Everything else from the
 # pre-0.13 default set is re-enabled explicitly. `rustls-no-provider` is
 # load-bearing: `crypto-ring` / `fips`, not reqwest, selects the provider.
-reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls-no-provider", "stream", "http2", "charset"] }
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "form", "rustls-no-provider", "stream", "http2", "charset"] }
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }
 base64 = "0.22"
 # AWS event-stream prelude/message CRC32 (ITU-T V.42). Already transitive via
@@ -316,13 +318,23 @@ aws-config = { version = "1.8", features = ["behavior-version-latest"], optional
 # -0099, -0104, -0258). The client is built from `aws_config::load_defaults`,
 # whose `default-https-client` (hyper 1.x + rustls 0.23) is what it uses.
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
-google-cloud-secretmanager-v1 = { version = "1.9", optional = true }
+google-cloud-secretmanager-v1 = { version = "=1.10.0", optional = true }
 # Provides anonymous credentials so the GCP Secret Manager client can target a
 # local fake/emulator endpoint (`FERRUM_GCP_SECRET_MANAGER_ENDPOINT`) without
 # attempting Application Default Credentials discovery. Already in the tree
 # transitively via google-cloud-secretmanager-v1 → gaxi; pinned here so the
 # direct `with_credentials(..)` call site has a declared dependency.
-google-cloud-auth = { version = "1", optional = true }
+google-cloud-auth = { version = "=1.11.0", optional = true }
+# Security-only constraints for #5912. GAX 0.7.13 requires the vulnerable
+# OpenTelemetry 0.31 line; newer GAX generations require a different reqwest
+# line. Keep this published, compatible chain on the audited vendor pair.
+# These pins add no provider features beyond the existing GCP client graph.
+google-cloud-gax-internal = { version = "=0.7.14", default-features = false, optional = true }
+google-cloud-gax = { version = "=1.11.0", default-features = false, optional = true }
+google-cloud-wkt = { version = "=1.5.0", default-features = false, optional = true }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = true }
+# GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser.
+aws-smithy-json = { version = "=0.62.7", optional = true }
 azure_security_keyvault_secrets = { version = "0.14", optional = true }
 azure_identity = { version = "0.35", optional = true }
 azure_core = { version = "0.35", optional = true }
@@ -457,8 +469,15 @@ acme = ["dep:instant-acme", "dep:hyper-rustls"]
 pkcs11 = ["dep:cryptoki"]
 cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]
 secrets-vault = ["dep:vaultrs"]
-secrets-aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
-secrets-gcp = ["dep:google-cloud-secretmanager-v1", "dep:google-cloud-auth"]
+secrets-aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager", "dep:aws-smithy-json"]
+secrets-gcp = [
+    "dep:google-cloud-secretmanager-v1",
+    "dep:google-cloud-auth",
+    "dep:google-cloud-gax-internal",
+    "dep:google-cloud-gax",
+    "dep:google-cloud-wkt",
+    "dep:opentelemetry_sdk",
+]
 secrets-azure = ["dep:azure_identity", "dep:azure_security_keyvault_secrets", "dep:azure_core"]
 ebpf = ["dep:aya", "dep:aya-log", "ferrum-ebpf-common/userspace"]
 
@@ -568,7 +587,7 @@ paste = "1"
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"] }
 
 # ── Vendored upstream patches ──────────────────────────────────────────────
-# We carry a vendored copy of reqwest 0.13.3 with PR seanmonstar/reqwest#3017
+# We carry a vendored copy of reqwest 0.13.4 with PR seanmonstar/reqwest#3017
 # applied so each request can override the client-level connect timeout via
 # `RequestBuilder::connect_timeout(Duration)`. Without the patch, two proxies
 # sharing the same connection-pool key (which intentionally excludes policy
@@ -576,7 +595,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # connect timeout the underlying `reqwest::Client` was first built with.
 #
 # Retirement plan: when reqwest#3017 merges and ships in a release we use,
-# remove this `[patch.crates-io]` entry, drop `vendor/reqwest-0.13.3-ferrum-patched/`,
+# remove this `[patch.crates-io]` entry, drop `vendor/reqwest-0.13.4-ferrum-patched/`,
 # and unpin the dependency. The call-site change in `src/connection_pool.rs`
 # uses the upstream API as proposed in the PR, so it stays intact.
 # See `docs/upstream-reqwest-patches/001-per-request-connect-timeout/README.md`.
@@ -679,7 +698,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # drift manifest. See
 # `docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md`.
 #
-# We also carry a vendored copy of hyper 1.9.0 that adds
+# We also carry a vendored copy of hyper 1.10.0 that adds
 # `Upgraded::reset_with_connect_error()`, which resets an upgraded HTTP/2
 # CONNECT stream with `RST_STREAM(CONNECT_ERROR)` (issue #5781). Stock hyper's
 # upgraded HTTP/2 stream is private, and dropping or shutting it down always
@@ -689,7 +708,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when a hyper release can reset an upgraded HTTP/2 stream
 # with a chosen error code, remove the `hyper` line below, drop
-# `vendor/hyper-1.9.0-ferrum-patched/`, move the HBONE relays to the upstream
+# `vendor/hyper-1.10.0-ferrum-patched/`, move the HBONE relays to the upstream
 # API, and update the three lockfiles and the drift manifest. See
 # `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md`.
 #
@@ -719,12 +738,12 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # `docs/upstream-h2-patches/001-coalesce-data-frame-writes/README.md`.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
-reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
+reqwest = { path = "vendor/reqwest-0.13.4-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
 h3-quinn = { path = "vendor/h3-quinn-0.0.10-ferrum-patched" }
 tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
 dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }
 hyper-util = { path = "vendor/hyper-util-0.1.21-ferrum-patched" }
-hyper = { path = "vendor/hyper-1.9.0-ferrum-patched" }
+hyper = { path = "vendor/hyper-1.10.0-ferrum-patched" }
 h2 = { path = "vendor/h2-0.4.19-ferrum-patched" }
