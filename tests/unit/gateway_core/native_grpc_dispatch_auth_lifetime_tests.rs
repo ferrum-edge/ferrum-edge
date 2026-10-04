@@ -1989,9 +1989,8 @@ fn h3_cold_connect_has_bounded_candidate(constructor: &str) -> bool {
         && body.matches("resolve_backend_addrs_cached(").count() == 1
         && body.matches("crate::dns::connect_candidates(").count() == 1
         && body.find(dns).is_some_and(|at| {
-            body.find(arm).is_some_and(|arm_at| {
-                at + dns.len() <= arm_at && arm_at + arm.len() <= call_at
-            })
+            body.find(arm)
+                .is_some_and(|arm_at| at + dns.len() <= arm_at && arm_at + arm.len() <= call_at)
         })
 }
 

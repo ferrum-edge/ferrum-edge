@@ -4747,9 +4747,7 @@ fn h3_request_fin_is_awaited_before_completion(
             "upload_complete.store(true,Ordering::Release);",
         ]
         .iter()
-        .all(|&marker| {
-            body.matches(marker).count() == completion.matches(marker).count()
-        })
+        .all(|&marker| body.matches(marker).count() == completion.matches(marker).count())
 }
 
 #[test]
@@ -4840,9 +4838,7 @@ fn the_h3_fin_source_guard_rejects_watermark_await_and_completion_bypasses() {
     for (label, start, end, fin, completion) in H3_REQUEST_FIN_ENTRY_POINTS {
         let function = compact_code(source_region(client, start, end));
         assert!(h3_request_fin_is_awaited_before_completion(
-            &function,
-            fin,
-            completion
+            &function, fin, completion
         ));
         let future = fin.split(".await").next().expect("FIN future");
         for (mutation, replacement) in [
@@ -4863,16 +4859,11 @@ fn the_h3_fin_source_guard_rejects_watermark_await_and_completion_bypasses() {
             );
         }
         if fin == H3_AUTHORIZED_UPLOAD_FIN {
-            let mutated = function.replacen(
-                fin,
-                &fin.replace("(auth,", "(H3Authorization::none(),"),
-                1,
-            );
+            let mutated =
+                function.replacen(fin, &fin.replace("(auth,", "(H3Authorization::none(),"), 1);
             assert_ne!(mutated, function);
             assert!(!h3_request_fin_is_awaited_before_completion(
-                &mutated,
-                fin,
-                completion
+                &mutated, fin, completion
             ));
         }
         let mutated = function.replacen(
@@ -4882,16 +4873,12 @@ fn the_h3_fin_source_guard_rejects_watermark_await_and_completion_bypasses() {
         );
         assert_ne!(mutated, function);
         assert!(!h3_request_fin_is_awaited_before_completion(
-            &mutated,
-            fin,
-            completion
+            &mutated, fin, completion
         ));
         if completion.contains("upload.completed=true;") {
             let mutated = function.replacen(fin, &format!("upload.completed=true;{fin}"), 1);
             assert!(!h3_request_fin_is_awaited_before_completion(
-                &mutated,
-                fin,
-                completion
+                &mutated, fin, completion
             ));
         }
     }
