@@ -149,7 +149,7 @@ pub fn reject_published_session_secret(secret: &str, field: &str) -> Result<(), 
     let unresolved_placeholder = trimmed.starts_with("${");
     let denied_exact = DENIED_SESSION_SECRETS
         .iter()
-        .any(|known| trimmed.eq_ignore_ascii_case(*known));
+        .any(|known| trimmed.eq_ignore_ascii_case(known));
     let denied_substring = DENIED_SESSION_SECRET_SUBSTRINGS
         .iter()
         .any(|token| lowered.contains(*token));
