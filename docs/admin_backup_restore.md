@@ -105,6 +105,59 @@ A filtered export that includes `api_specs` without `proxies`, `upstreams`, and 
 
 ## Restore — `POST /restore?confirm=true`
 
+### Conditional snapshots and restore
+
+Use `GET /backup?conditional=true` to plan conditional writes. This explicit
+opt-in requires a full, unfiltered export and a primary store that supports
+snapshot transactions: PostgreSQL, MySQL, SQLite, or replica-set MongoDB.
+Standalone MongoDB returns `501`; missing/unavailable stores return `503`.
+This path never substitutes a cached snapshot or an unconditional write.
+
+The response includes an `ETag` header and a `conditional` metadata object:
+
+```json
+{
+  "namespace_etag": "\"opaque-namespace-tag\"",
+  "row_etags": {
+    "proxies": {"proxy-id": "\"opaque-row-tag\""},
+    "consumers": {},
+    "upstreams": {},
+    "plugin_configs": {}
+  }
+}
+```
+
+Every row and token comes from the same database snapshot. Row tags are the
+same strong tags individual CRUD reads issue, suitable for `PUT`/`DELETE`
+with `If-Match`. Consumer credentials are copied **exactly** on this path,
+including rotation entries, password hashes, and any historical fields.
+Ordinary `/backup` retains its archival credential canonicalization; historical
+values in a conditional export may need repair before restore admits them.
+
+The namespace tag covers all four resource families, proxy/plugin associations,
+API-spec documents and ownership, gateway trust bundles, namespace registry
+metadata, and the durable namespace change watermark. The registry metadata is
+covered but is not exported or restored. Delete/recreate and reverted resource
+mutations invalidate old namespace tags. Read timestamps, lease maintenance,
+audit events, and missing-resource no-ops do not. Tokens use keyed HMACs under
+the admin JWT secret, so replicas need the same secret to share tokens; tags
+are not offline credential-guessing digests.
+
+Send the namespace tag as `If-Match` to `POST /restore?confirm=true`. Comparison,
+clear, every import chunk, ownership restoration, trust changes, config-change
+records, and admission-lease verification share **one transaction**. A stale
+tag returns `412` and changes nothing. Weak tags never match; malformed/empty
+headers and `*` return `400`. A comma-separated list matches any strong member.
+Empty replacements still evaluate the precondition. Transaction failure aborts
+the entire replacement; an ambiguous MongoDB commit acknowledgement requires
+reading the authoritative state before deciding whether to retry.
+
+`conditional` body metadata is accepted and ignored by restore and batch. It
+does not establish a precondition by itself. Omitting `If-Match` retains the
+existing unconditional restore behavior described below. Admin role, namespace
+JWT authorization, write-mode/topology restrictions, validation, audit, and live
+apply semantics still apply.
+
 Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is normalized and validated before any data is deleted:
 
 1. **Normalizes** the restore payload once with the same `normalize_fields()` admission used by CRUD, batch, file mode, and database loaders (lowercase hosts/backend hosts/upstream targets, backend TLS SNI and DNS SAN allow-list entries, blank `custom_id` / plugin `proxy_id` → omitted). That exact canonical instance is what later preparation and persistence use — credential hashing and restore timestamps do not reintroduce the discarded wire-form original.

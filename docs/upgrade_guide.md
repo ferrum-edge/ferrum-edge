@@ -28,6 +28,47 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Unreleased
 
+**Conditional admin snapshots and restore (#5992).** Use an admin-role JWT
+for `GET /consumers/{id}/verification` when checking the complete stored
+credential state. Ordinary consumer reads retain their redacted projection.
+For namespace replacement, read an unfiltered `GET /backup?conditional=true`
+and send its `ETag` (also `conditional.namespace_etag`) in `If-Match` to
+`POST /restore?confirm=true`. The per-row maps in `conditional.row_etags` are
+for individual resource `PUT`/`DELETE` operations. These are opaque keyed
+strong state tags; do not derive them from a redacted response or use a row
+tag as a namespace tag. Replicas must share `FERRUM_ADMIN_JWT_SECRET`, and
+rotating it requires fresh reads.
+
+A conditional restore returns `412` without applying the replacement when
+the namespace changed, including delete/recreate or changes later reverted.
+Re-read and re-plan against the new state before retrying. Weak tags cannot
+match; empty/malformed headers and `*` are `400` for restore. The conditional
+snapshot/restore path requires PostgreSQL, MySQL, SQLite, or replica-set
+MongoDB: standalone MongoDB is `501`, and unavailable primary state is `503`.
+Lease loss fails closed; cleanup cannot reacquire an expired identity to
+authorize another write. A long replacement uses one transaction and remains
+subject to store transaction limits. After an ambiguous MongoDB commit
+acknowledgement, read authoritative state before deciding whether to retry.
+
+Conditional exports preserve stored credential fields exactly. Repair invalid
+historical entries before restoring them through current admission rules.
+The `conditional` body member is metadata only; it does not activate a
+precondition. Omitting `If-Match` retains unconditional restore. See the
+[backup and restore contract](admin_backup_restore.md#conditional-snapshots-and-restore).
+
+**Backend egress metadata (#5994).** Control planes can read
+`GET /backend-egress-policy` with a namespace-authorized viewer, operator, or
+admin JWT to inspect the immutable loaded policy inherited by this process.
+Metrics credentials cannot read it. Require the expected `schema_version`,
+`ip_classification`, and `enforcement_scope`; CP `admission-only` metadata
+does not prove a DP's policy. `public_only_guaranteed` is false whenever an
+allow-CIDR override exists, even if that override appears harmless. The
+production default remains `both`; adopting public-only backends still
+requires explicitly configuring each serving process and restarting it.
+This discovery endpoint does not expand the existing enforcement coverage.
+See [backend egress policy](admin_api.md#backend-egress-policy) and the
+[pre-release contracts handoff](admin_contracts_handoff_5992_5994.md).
+
 **Dependencies**
 
 - **Vendored h2:** h2 0.4.19 is now a path-sourced fork

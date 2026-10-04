@@ -1419,6 +1419,15 @@ pub struct BackendEgressPolicy {
     block_dangerous: bool,
 }
 
+/// Bounded metadata from a loaded policy, without addresses, CIDRs, or raw settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendEgressPolicyMetadata {
+    pub allow_ips: BackendAllowIps,
+    pub allow_cidr_overrides_present: bool,
+    pub deny_cidr_overrides_present: bool,
+    pub dangerous_ranges_blocked: bool,
+}
+
 impl BackendEgressPolicy {
     /// A truly unrestricted policy: `both` mode, no CIDR overlays, no baseline.
     ///
@@ -1479,6 +1488,17 @@ impl BackendEgressPolicy {
     /// The underlying allow-ips mode.
     pub fn allow_ips(&self) -> &BackendAllowIps {
         &self.allow_ips
+    }
+
+    /// Describe the actual immutable policy used by address enforcement.
+    /// Does not reread environment variables or disclose operator address lists.
+    pub fn metadata(&self) -> BackendEgressPolicyMetadata {
+        BackendEgressPolicyMetadata {
+            allow_ips: self.allow_ips.clone(),
+            allow_cidr_overrides_present: !self.allow_cidrs.is_empty(),
+            deny_cidr_overrides_present: !self.deny_cidrs.is_empty(),
+            dangerous_ranges_blocked: self.block_dangerous,
+        }
     }
 
     /// Whether a resolved backend IP is permitted to be dialed.

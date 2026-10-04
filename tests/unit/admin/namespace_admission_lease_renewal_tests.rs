@@ -11,8 +11,8 @@ use ferrum_edge::_test_support::{
     TestLeaseBackend, TestLeaseRenewalOutcome, TestLeaseRenewalTiming,
     run_namespace_config_admission_renewal_for_test,
 };
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const LEASE_DURATION_MS: u64 = 2_400;
@@ -35,13 +35,9 @@ struct FakeLeaseRow {
     /// No renewal or acquisition answers before this instant. Models the
     /// datastore stall that precedes the observed lost-ownership errors.
     stalled_until: Option<Instant>,
-    /// Number of remaining renewals that report "not yours" without touching
-    /// the row. Models a late-applied statement or datastore clock skew: the
-    /// row itself is untouched and still this owner's.
+    /// Number of renewals that report no live match without touching the row.
     renew_refusals: u32,
-    /// When set, the next reclaim reports this generation instead of the
-    /// stored one, as if a foreign owner had held and released the row.
-    reclaim_generation_override: Option<u64>,
+    stalled_forever: bool,
     renew_calls: u32,
     acquire_calls: u32,
     release_calls: u32,
@@ -50,6 +46,15 @@ struct FakeLeaseRow {
 struct FakeLeaseBackend {
     lease_duration: Duration,
     row: Mutex<FakeLeaseRow>,
+    active_renewals: AtomicU32,
+}
+
+struct ActiveRenewal<'a>(&'a AtomicU32);
+
+impl Drop for ActiveRenewal<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FakeLeaseBackend {
@@ -63,11 +68,12 @@ impl FakeLeaseBackend {
                 expires_at: Instant::now() + lease_duration,
                 stalled_until: None,
                 renew_refusals: 0,
-                reclaim_generation_override: None,
+                stalled_forever: false,
                 renew_calls: 0,
                 acquire_calls: 0,
                 release_calls: 0,
             }),
+            active_renewals: AtomicU32::new(0),
         }
     }
 
@@ -91,10 +97,6 @@ impl FakeLeaseBackend {
         row.owner = owner.to_string();
         row.generation += 1;
         row.expires_at = Instant::now() + self.lease_duration;
-    }
-
-    fn override_reclaim_generation(&self, generation: u64) {
-        self.locked().reclaim_generation_override = Some(generation);
     }
 
     fn counts(&self) -> (u32, u32, u32) {
@@ -135,9 +137,6 @@ impl ferrum_edge::config::db_backend::NamespaceConfigAdmissionLeaseBackend for F
             row.generation += 1;
         }
         row.expires_at = now + self.lease_duration;
-        if let Some(generation) = row.reclaim_generation_override.take() {
-            return Ok(Some(generation));
-        }
         Ok(Some(row.generation))
     }
 
@@ -146,9 +145,18 @@ impl ferrum_edge::config::db_backend::NamespaceConfigAdmissionLeaseBackend for F
         _namespace: &str,
         owner: &str,
     ) -> Result<bool, anyhow::Error> {
+        self.active_renewals.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveRenewal(&self.active_renewals);
+        let stalled_forever = {
+            let mut row = self.locked();
+            row.renew_calls += 1;
+            row.stalled_forever
+        };
+        if stalled_forever {
+            std::future::pending::<()>().await;
+        }
         self.wait_out_stall().await;
         let mut row = self.locked();
-        row.renew_calls += 1;
         if row.renew_refusals > 0 {
             row.renew_refusals -= 1;
             return Ok(false);
@@ -264,11 +272,11 @@ async fn stall_longer_than_the_ttl_fails_closed() {
     );
 }
 
-/// A refused renewal whose row is still this owner's at the same generation is
-/// re-acquired, not treated as a loss. Generation continuity is the proof that
-/// no other writer was ever admitted.
+/// A refused renewal must fail closed even if the stored owner and generation
+/// still match. Release leaves those fields intact; reclaiming them would allow
+/// a delayed command to revive a cancelled guard after cleanup.
 #[tokio::test]
-async fn refused_renewal_is_reclaimed_at_the_same_generation() {
+async fn refused_renewal_never_reclaims_the_same_generation() {
     let backend = Arc::new(FakeLeaseBackend::new("owner-c", 11));
     backend.refuse_renewals(1);
     let lease: TestLeaseBackend = backend.clone();
@@ -283,26 +291,10 @@ async fn refused_renewal_is_reclaimed_at_the_same_generation() {
     )
     .await;
 
-    assert_eq!(
-        observed.outcome,
-        TestLeaseRenewalOutcome::Stopped,
-        "a same-generation reclaim must keep the renewer alive: {observed:?}"
-    );
-    assert!(
-        observed.still_held,
-        "a same-generation reclaim must keep the lease held: {observed:?}"
-    );
-    assert_eq!(
-        observed.reclaims, 1,
-        "exactly one reclaim should have recovered the window: {observed:?}"
-    );
-
-    let (_, acquires, releases) = backend.counts();
-    assert_eq!(acquires, 1, "the reclaim is one acquisition: {observed:?}");
-    assert_eq!(
-        releases, 0,
-        "a successful reclaim must not release the row it just proved: {observed:?}"
-    );
+    assert_eq!(observed.outcome, TestLeaseRenewalOutcome::Lost);
+    assert!(!observed.still_held);
+    assert_eq!(observed.reclaims, 0);
+    assert_eq!(backend.counts(), (1, 0, 0));
 }
 
 /// When another writer genuinely holds the namespace, the renewer fails closed
@@ -338,14 +330,12 @@ async fn ownership_taken_by_another_writer_fails_closed() {
     );
 }
 
-/// A reclaim that comes back at a generation this guard never acquired proves a
-/// foreign owner was admitted. The claim it just took is released rather than
-/// left holding the namespace for a full lease duration.
+/// Expiry without takeover is still a lost lease. The next request must obtain
+/// a fresh guard and revalidate, rather than continue using the old admission.
 #[tokio::test]
-async fn reclaim_at_a_foreign_generation_is_lost_and_releases_the_claim() {
+async fn expired_same_owner_lease_is_never_reacquired() {
     let backend = Arc::new(FakeLeaseBackend::new("owner-e", 2));
-    backend.refuse_renewals(1);
-    backend.override_reclaim_generation(9);
+    backend.locked().expires_at = Instant::now();
     let lease: TestLeaseBackend = backend.clone();
 
     let observed = run_namespace_config_admission_renewal_for_test(
@@ -358,24 +348,38 @@ async fn reclaim_at_a_foreign_generation_is_lost_and_releases_the_claim() {
     )
     .await;
 
-    assert_eq!(
-        observed.outcome,
-        TestLeaseRenewalOutcome::Lost,
-        "a generation change proves another writer was admitted: {observed:?}"
-    );
-    assert!(
-        !observed.still_held,
-        "a lost lease must never report itself as held: {observed:?}"
-    );
-    assert_eq!(
-        observed.reclaims, 0,
-        "a foreign generation is not a successful reclaim: {observed:?}"
-    );
+    assert_eq!(observed.outcome, TestLeaseRenewalOutcome::Lost);
+    assert!(!observed.still_held);
+    assert_eq!(observed.reclaims, 0);
+    assert_eq!(backend.counts(), (1, 0, 0));
+}
 
-    let (_, acquires, releases) = backend.counts();
-    assert_eq!(acquires, 1, "the reclaim attempt ran: {observed:?}");
-    assert_eq!(
-        releases, 1,
-        "the unusable claim must be released, not leaked for a lease duration: {observed:?}"
-    );
+/// Stop cancels a permanently pending renewal without retaining a task or
+/// waiting for its driver future to settle. The backend's live-row predicate,
+/// rather than a join result, must fence any server-side command left behind.
+#[tokio::test]
+async fn permanently_stalled_renewal_is_dropped_on_stop() {
+    let backend = Arc::new(FakeLeaseBackend::new("owner-f", 4));
+    backend.locked().stalled_forever = true;
+    let lease: TestLeaseBackend = backend.clone();
+
+    let observed = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_namespace_config_admission_renewal_for_test(
+            lease,
+            "ferrum",
+            "owner-f",
+            4,
+            scaled_timing(),
+            Duration::from_millis(1_500),
+        ),
+    )
+    .await
+    .expect("stop cannot wait for a permanently stalled operation");
+
+    assert_eq!(observed.outcome, TestLeaseRenewalOutcome::Stopped);
+    assert!(observed.still_held);
+    assert!(observed.retries >= 1);
+    assert_eq!(backend.active_renewals.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.counts().1, 0, "a keeper must never acquire");
 }

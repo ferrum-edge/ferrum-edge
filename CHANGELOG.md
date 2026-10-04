@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Conditional admin reads and restores use authoritative strong state tags**
+  (#5992). Admin-only `GET /consumers/{id}/verification` returns the complete
+  stored credential row with the same keyed ETag as ordinary consumer reads,
+  after security-audit admission and with `Cache-Control: no-store`.
+  `GET /backup?conditional=true` exports complete rows, per-row tags, and a
+  namespace tag from one primary transaction. `If-Match` on restore checks that
+  namespace state and replaces it in one transaction, including empty payloads,
+  API-spec ownership, trust bundles, and the admission lease. Stale state is
+  `412`; unsupported standalone MongoDB is `501`; unavailable authoritative
+  state fails closed without a cached fallback. Namespace tags also cover the
+  durable change watermark, so delete/recreate and reverted mutations invalidate
+  them. Stored historical credentials are preserved exactly for verification
+  and may need repair before restore admission.
+- **Restore admission leases cannot be revived by late keeper work** (#5992).
+  Renewal only extends a live matching owner/generation. Owner-qualified release
+  stops and joins the local keeper; bounded cleanup leaves expiry recovery when
+  it cannot settle. The
+  conditional restore transaction takes over lease renewal, verifies and pins
+  live ownership before reading state, and checks the fence at commit. Losing
+  the lease aborts the replacement rather than authorizing a later write under
+  an expired identity.
+- **JWT-authenticated backend egress discovery exposes the inherited loaded
+  process policy** (#5994). `GET /backend-egress-policy` reports the existing
+  address classifier, mode, overlay presence, evaluation order, and enforcement
+  scope under namespace authorization. It conservatively reports
+  `public_only_guaranteed` only for public mode without allow-CIDR overrides.
+  CP admission metadata does not attest a DP's enforcement. The endpoint adds
+  no DNS probes, exposes no CIDRs or credentials, and preserves the existing
+  default mode and connect-time policy.
+
 - **Pin the iproute2 runtime base to the production distroless digest**
   (GHSA-c3r8-6276-9678). `Dockerfile.iproute2-layer` now defaults
   `BASE_IMAGE` to the verified OCI index digest used by the production runtime.
@@ -71,6 +101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hosted tests cover concrete future-size budgets and real H1/H2 listener
   traffic on default worker stacks.
 
+- Conditional restore CI now pins the PostgreSQL 16 Alpine, MySQL 8, and
+  MongoDB 7 OCI indexes and confines the new fixtures to runner loopback.
+  Readiness authenticates over the published SQL TCP endpoints with the test
+  database and credentials, then verifies MongoDB's writable replica-set
+  primary. Startup and cleanup are bounded; generated credentials are masked
+  and passed through environment variables. All three live regressions remain
+  mandatory with ignored tests enabled and serial execution.
 - **Redis semantic-cache quarantine now compares the observed value atomically** (#5986). Invalid
   bounded values are deleted only if their raw bytes still match the value read, preserving a
   concurrent replacement. The dedicated watched comparison transfers at most the observed
