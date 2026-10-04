@@ -192,19 +192,198 @@ async fn functional_ai_semantic_cache_rewrites_once_across_h1_h2_h3() {
     origin.abort();
 }
 
+// This relay forwards every command to real Redis. It counts transferred reply
+// bytes and can pause WATCH or MULTI to make replacement races deterministic.
+struct SemanticCacheRedisRelay {
+    port: u16,
+    reply_bytes: Arc<AtomicUsize>,
+    get_calls: Arc<AtomicUsize>,
+    del_calls: Arc<AtomicUsize>,
+    last_range_end: Arc<AtomicUsize>,
+    pause_on: Arc<AtomicUsize>,
+    paused: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SemanticCacheRedisRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+type SemanticCacheRedisCommand = (Vec<u8>, Vec<Vec<u8>>);
+
+async fn read_semantic_cache_redis_command(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+) -> std::io::Result<Option<SemanticCacheRedisCommand>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut frame = Vec::new();
+    if reader.read_until(b'\n', &mut frame).await? == 0 {
+        return Ok(None);
+    }
+    assert!(frame.starts_with(b"*") && frame.ends_with(b"\r\n"));
+    let count: usize = std::str::from_utf8(&frame[1..frame.len() - 2])
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=32).contains(&count));
+    let mut args = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut header = Vec::new();
+        reader.read_until(b'\n', &mut header).await?;
+        assert!(header.starts_with(b"$") && header.ends_with(b"\r\n"));
+        let length: usize = std::str::from_utf8(&header[1..header.len() - 2])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(length <= 128 * 1024, "fixture commands must be bounded");
+        let mut value = vec![0; length + 2];
+        reader.read_exact(&mut value).await?;
+        assert!(value.ends_with(b"\r\n"));
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&value);
+        value.truncate(length);
+        args.push(value);
+    }
+    Ok(Some((frame, args)))
+}
+
+impl SemanticCacheRedisRelay {
+    async fn start() -> Self {
+        let reservation = crate::scaffolding::ports::reserve_port()
+            .await
+            .expect("reserve Redis relay port");
+        let port = reservation.port;
+        let listener = reservation.into_listener();
+        let reply_bytes = Arc::new(AtomicUsize::new(0));
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let del_calls = Arc::new(AtomicUsize::new(0));
+        let last_range_end = Arc::new(AtomicUsize::new(usize::MAX));
+        let pause_on = Arc::new(AtomicUsize::new(0));
+        let paused = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let state = (
+            Arc::clone(&reply_bytes),
+            Arc::clone(&get_calls),
+            Arc::clone(&del_calls),
+            Arc::clone(&last_range_end),
+            Arc::clone(&pause_on),
+            Arc::clone(&paused),
+            Arc::clone(&resume),
+        );
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((downstream, _)) = listener.accept().await {
+                let (bytes, gets, dels, range_end, pause_on, paused, resume) = state.clone();
+                connections.spawn(async move {
+                    let upstream = tokio::net::TcpStream::connect("127.0.0.1:6379")
+                        .await
+                        .expect("relay must reach real Redis");
+                    let (down_read, mut down_write) = downstream.into_split();
+                    let (mut up_read, mut up_write) = upstream.into_split();
+                    let requests = async move {
+                        let mut reader = tokio::io::BufReader::new(down_read);
+                        while let Some((frame, args)) =
+                            read_semantic_cache_redis_command(&mut reader).await?
+                        {
+                            match args[0].as_slice() {
+                                b"GET" => {
+                                    gets.fetch_add(1, Ordering::SeqCst);
+                                }
+                                b"DEL" => {
+                                    dels.fetch_add(1, Ordering::SeqCst);
+                                }
+                                b"GETRANGE" => {
+                                    assert_eq!(args[2], b"0");
+                                    let end = std::str::from_utf8(&args[3])
+                                        .unwrap()
+                                        .parse::<usize>()
+                                        .expect("GETRANGE end must be nonnegative");
+                                    range_end.store(end, Ordering::SeqCst);
+                                }
+                                _ => {}
+                            }
+                            let pause = match args[0].as_slice() {
+                                b"WATCH" => 1,
+                                b"MULTI" => 2,
+                                _ => 0,
+                            };
+                            if pause != 0
+                                && pause_on
+                                    .compare_exchange(pause, 0, Ordering::SeqCst, Ordering::SeqCst)
+                                    .is_ok()
+                            {
+                                paused.notify_one();
+                                resume.notified().await;
+                            }
+                            up_write.write_all(&frame).await?;
+                        }
+                        up_write.shutdown().await
+                    };
+                    let replies = async move {
+                        let mut buffer = [0; 8192];
+                        loop {
+                            let count = up_read.read(&mut buffer).await?;
+                            if count == 0 {
+                                break;
+                            }
+                            bytes.fetch_add(count, Ordering::SeqCst);
+                            down_write.write_all(&buffer[..count]).await?;
+                        }
+                        down_write.shutdown().await
+                    };
+                    let _: Result<_, std::io::Error> = tokio::try_join!(requests, replies);
+                });
+            }
+        });
+        Self {
+            port,
+            reply_bytes,
+            get_calls,
+            del_calls,
+            last_range_end,
+            pause_on,
+            paused,
+            resume,
+            task,
+        }
+    }
+
+    async fn wait_for_pause(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.paused.notified())
+            .await
+            .expect("plugin quarantine must reach the armed Redis barrier");
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_safe() {
+    use ferrum_edge::_test_support::{
+        ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test,
+        ai_semantic_cache_expire_redis_quarantine_for_test,
+        ai_semantic_cache_redis_quarantine_delete_failures_for_test,
+        ai_semantic_cache_redis_quarantine_suppressed_for_test,
+        ai_semantic_cache_redis_quarantine_suppressions_for_test,
+        ai_semantic_cache_staging_metadata_key_for_test,
+    };
+    use ferrum_edge::plugins::ai_semantic_cache::AiSemanticCache;
     use ferrum_edge::plugins::utils::redis_rate_limiter::{
         BoundedRedisValue, RedisConfig, RedisRateLimitClient,
     };
+    use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
     use serde_json::json;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
-    if tokio::net::TcpStream::connect("127.0.0.1:6379")
-        .await
-        .is_err()
-    {
+    let redis_ready = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect("127.0.0.1:6379"),
+    )
+    .await;
+    if !matches!(redis_ready, Ok(Ok(_))) {
         assert!(
             std::env::var("FERRUM_REDIS_REQUIRED").as_deref() != Ok("1"),
             "the Redis semantic-cache regression gate requires a reachable Redis service"
@@ -214,80 +393,313 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
     }
 
     const REDIS_URL: &str = "redis://127.0.0.1:6379/15";
+    const REQUEST: &[u8] =
+        br#"{"model":"test","messages":[{"role":"user","content":"quarantine"}]}"#;
+    const RESPONSE: &[u8] = br#"{"answer":"authenticated replacement"}"#;
+    const MALFORMED: &[u8] = b"not-json\0\xff";
+    const ENTRY_CAP: usize = 1024;
+    const READ_CAP: usize = ENTRY_CAP * 6 + 64 * 1024;
     let prefix = format!(
         "ferrum-test:ai-semantic-cache-quarantine:{}",
         Uuid::new_v4()
     );
+    let relay = SemanticCacheRedisRelay::start().await;
+    let plugin_config = json!({
+        "sync_mode": "redis",
+        "redis_url": format!("redis://127.0.0.1:{}/15", relay.port),
+        "redis_key_prefix": prefix,
+        "redis_integrity_key": "0123456789abcdef0123456789abcdef",
+        "max_entry_size_bytes": ENTRY_CAP,
+        "ttl_seconds": 60,
+        // Reply-byte assertions must not include periodic health probes.
+        "redis_health_check_interval_seconds": 3600,
+    });
+    let plugin = Arc::new(
+        AiSemanticCache::new(&plugin_config, PluginHttpClient::default())
+            .expect("construct Redis cache plugin"),
+    );
     let config = RedisConfig::from_plugin_config(
-        &json!({
-            "sync_mode": "redis",
-            "redis_url": REDIS_URL,
-            "redis_key_prefix": prefix,
-        }),
+        &json!({"sync_mode": "redis", "redis_url": REDIS_URL, "redis_key_prefix": prefix}),
         &prefix,
     )
     .expect("Redis configuration is valid")
     .expect("Redis mode is enabled");
     let redis = RedisRateLimitClient::new(config, None, false, None)
-        .expect("client construction without a CA path succeeds");
-    let key = redis.make_key(&["interleaved-entry"]);
-
-    // Read an invalid payload exactly as the plugin does. Replace it before
-    // quarantine, then ensure compare-and-delete preserves the valid writer's
-    // bytes (including arbitrary binary payloads).
-    let observed_invalid = b"not-json\0\xff";
-    let valid_replacement = b"{\"schema_version\":1,\"valid\":true}";
-    redis
-        .set_bytes_with_expire(&key, observed_invalid, 60)
-        .await
-        .expect("write initial invalid payload");
-    let BoundedRedisValue::Found(observed) = redis
-        .get_bytes_bounded(&key, 128)
-        .await
-        .expect("read invalid payload")
-    else {
-        panic!("initial payload must be returned within the read bound");
+        .expect("construct direct Redis writer");
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), REQUEST.len().to_string()),
+    ]);
+    let new_ctx = || {
+        RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        )
     };
-    assert_eq!(observed, observed_invalid);
-
-    redis
-        .set_bytes_with_expire(&key, valid_replacement, 60)
-        .await
-        .expect("write concurrent valid replacement");
-    assert!(
-        !redis
-            .delete_if_value_matches(&key, &observed)
-            .await
-            .expect("compare-and-delete succeeds")
-    );
+    let mut ctx = new_ctx();
     assert!(matches!(
-        redis.get_bytes_bounded(&key, 128).await,
-        Ok(BoundedRedisValue::Found(value)) if value.as_slice() == valid_replacement
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+            .await,
+        PluginResult::Continue
+    ));
+    let staging_key = ai_semantic_cache_staging_metadata_key_for_test(&plugin, "cache_key");
+    let cache_key = ctx.metadata[&staging_key].clone();
+    let key = redis.make_key(&[&cache_key]);
+
+    // A separate plugin produces a genuinely authenticated envelope for this
+    // exact namespace/key. The reader has no local response to mask Redis misses.
+    let mut writer_config = plugin_config.clone();
+    writer_config["redis_url"] = json!(REDIS_URL);
+    let writer = AiSemanticCache::new(&writer_config, PluginHttpClient::default()).unwrap();
+    let mut writer_ctx = new_ctx();
+    assert!(matches!(
+        writer
+            .on_final_request_body_with_context(&mut writer_ctx, &headers, REQUEST)
+            .await,
+        PluginResult::Continue
+    ));
+    let response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/json".to_string(),
+    )]);
+    writer
+        .on_final_response_body(&mut writer_ctx, 200, &response_headers, RESPONSE)
+        .await;
+    let persisted = redis.get_bytes_bounded(&key, READ_CAP).await.unwrap();
+    let BoundedRedisValue::Found(valid) = persisted else {
+        panic!("writer must persist a sealed cache envelope");
+    };
+
+    // Authenticate a JSON response admitted by a more permissive writer but
+    // over this reader's body cap. This exercises policy admission after MAC
+    // verification, rather than rejecting every envelope only at the MAC gate.
+    redis.delete(&key).await.unwrap();
+    let mut permissive_config = writer_config.clone();
+    permissive_config["max_entry_size_bytes"] = json!(ENTRY_CAP * 2);
+    let permissive = AiSemanticCache::new(&permissive_config, PluginHttpClient::default()).unwrap();
+    let mut permissive_ctx = new_ctx();
+    assert!(matches!(
+        permissive
+            .on_final_request_body_with_context(&mut permissive_ctx, &headers, REQUEST)
+            .await,
+        PluginResult::Continue
+    ));
+    let large_body = serde_json::to_vec(&json!({"answer": "x".repeat(ENTRY_CAP)})).unwrap();
+    permissive
+        .on_final_response_body(&mut permissive_ctx, 200, &response_headers, &large_body)
+        .await;
+    let persisted = redis.get_bytes_bounded(&key, READ_CAP).await.unwrap();
+    let BoundedRedisValue::Found(over_body_cap) = persisted else {
+        panic!("permissive writer must persist an authenticated over-body-cap envelope");
+    };
+    // Both malformed bytes and deserializable but inadmissible envelopes must
+    // traverse the actual plugin quarantine path. Empty keys are not misses.
+    let mut old_version: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+    old_version["version"] = json!(0);
+    let mut tampered: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+    tampered["integrity"] = json!("00");
+    for poison in [
+        MALFORMED.to_vec(),
+        Vec::new(),
+        serde_json::to_vec(&old_version).unwrap(),
+        serde_json::to_vec(&tampered).unwrap(),
+        over_body_cap,
+    ] {
+        redis.set_bytes_with_expire(&key, &poison, 60).await.unwrap();
+        let deletes = relay.del_calls.load(Ordering::SeqCst);
+        let mut ctx = new_ctx();
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            redis.get_bytes_bounded(&key, READ_CAP).await,
+            Ok(BoundedRedisValue::Missing)
+        ));
+        assert_eq!(relay.del_calls.load(Ordering::SeqCst), deletes + 1);
+        assert_eq!(
+            ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin),
+            0
+        );
+        assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
+            &plugin, &cache_key
+        ));
+    }
+
+    let start_lookup = || {
+        let reader = Arc::clone(&plugin);
+        let request_headers = headers.clone();
+        tokio::spawn(async move {
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/v1/chat/completions".to_string(),
+            );
+            reader
+                .on_final_request_body_with_context(&mut ctx, &request_headers, REQUEST)
+                .await
+        })
+    };
+    // Test replacement before WATCH and after the comparison but before EXEC.
+    // In the latter case Redis itself must abort the watched transaction.
+    for (barrier, poison) in [(1, MALFORMED), (2, MALFORMED), (1, b""), (2, b"")] {
+        redis.set_bytes_with_expire(&key, poison, 60).await.unwrap();
+        relay.pause_on.store(barrier, Ordering::SeqCst);
+        let lookup = start_lookup();
+        relay.wait_for_pause().await;
+        redis.set_bytes_with_expire(&key, &valid, 60).await.unwrap();
+        // Model another in-flight request installing a marker during lookup.
+        ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
+            &plugin,
+            &cache_key,
+            [1; 32],
+            false,
+        );
+        let failures = ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin);
+        relay.resume.notify_one();
+        assert!(matches!(lookup.await.unwrap(), PluginResult::Continue));
+        assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
+            &plugin, &cache_key
+        ));
+        assert_eq!(
+            ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin),
+            failures,
+            "a false comparison/aborted EXEC is not a delete failure"
+        );
+        assert!(matches!(
+            redis.get_bytes_bounded(&key, READ_CAP).await,
+            Ok(BoundedRedisValue::Found(value)) if value == valid
+        ));
+        let mut ctx = new_ctx();
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+                .await,
+            PluginResult::RejectBinary { status_code: 200, body, .. } if body.as_ref() == RESPONSE
+        ));
+    }
+
+    // A replacement vastly larger than the plugin read cap shares the entire
+    // observed prefix. Count real Redis reply bytes through the relay: the
+    // comparison must transfer only expected.len()+1, not this 2 MiB value.
+    let observed = MALFORMED;
+    redis.set_bytes_with_expire(&key, observed, 60).await.unwrap();
+    let persisted = redis.get_bytes_bounded(&key, READ_CAP).await.unwrap();
+    let BoundedRedisValue::Found(observed_bytes) = persisted else {
+        panic!("malformed value must be observed before replacement");
+    };
+    assert_eq!(observed_bytes, observed);
+    let mut huge = observed_bytes.clone();
+    huge.resize(2 * 1024 * 1024, b'x');
+    assert!(huge.len() > READ_CAP * 16);
+    relay.pause_on.store(1, Ordering::SeqCst);
+    let lookup = start_lookup();
+    relay.wait_for_pause().await;
+    redis.set_bytes_with_expire(&key, &huge, 60).await.unwrap();
+    let before = relay.reply_bytes.load(Ordering::SeqCst);
+    relay.resume.notify_one();
+    assert!(matches!(lookup.await.unwrap(), PluginResult::Continue));
+    assert!(relay.reply_bytes.load(Ordering::SeqCst) - before < 16 * 1024);
+    assert_eq!(relay.last_range_end.load(Ordering::SeqCst), observed.len());
+    assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, &cache_key
+    ));
+    let relay_config = RedisConfig::from_plugin_config(&plugin_config, &prefix)
+        .unwrap()
+        .unwrap();
+    let compare = RedisRateLimitClient::new(relay_config, None, false, None).unwrap();
+    let before = relay.reply_bytes.load(Ordering::SeqCst);
+    assert!(
+        !compare
+            .delete_if_value_matches(&key, &observed_bytes)
+            .await
+            .unwrap()
+    );
+    assert!(relay.reply_bytes.load(Ordering::SeqCst) - before < 16 * 1024);
+    assert_eq!(relay.last_range_end.load(Ordering::SeqCst), observed.len());
+    assert_eq!(relay.get_calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        redis.get_bytes_bounded(&key, READ_CAP).await,
+        Ok(BoundedRedisValue::Oversized { length }) if length == huge.len()
     ));
 
-    // An unchanged malformed/binary value is still removable by exact raw
-    // bytes, so quarantine does not leave known poison behind.
-    redis
-        .set_bytes_with_expire(&key, observed_invalid, 60)
-        .await
-        .expect("restore invalid binary payload");
-    let BoundedRedisValue::Found(observed) = redis
-        .get_bytes_bounded(&key, 128)
-        .await
-        .expect("read unchanged invalid payload")
-    else {
-        panic!("binary payload must be returned within the read bound");
-    };
-    assert!(
-        redis
-            .delete_if_value_matches(&key, &observed)
-            .await
-            .expect("compare-and-delete succeeds")
+    // An initial oversized plugin lookup must retain the key, install a bounded
+    // marker, and neither attempt DEL nor increment delete-failure telemetry.
+    let deletes = relay.del_calls.load(Ordering::SeqCst);
+    let failures = ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin);
+    let before = relay.reply_bytes.load(Ordering::SeqCst);
+    let mut ctx = new_ctx();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(relay.reply_bytes.load(Ordering::SeqCst) - before < READ_CAP + 4096);
+    assert_eq!(relay.last_range_end.load(Ordering::SeqCst), READ_CAP);
+    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, &cache_key
+    ));
+    assert_eq!(relay.del_calls.load(Ordering::SeqCst), deletes);
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin),
+        failures
+    );
+    let suppressions = ai_semantic_cache_redis_quarantine_suppressions_for_test(&plugin);
+    let before = relay.reply_bytes.load(Ordering::SeqCst);
+    let mut ctx = new_ctx();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(relay.reply_bytes.load(Ordering::SeqCst), before);
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_suppressions_for_test(&plugin),
+        suppressions + 1
     );
     assert!(matches!(
-        redis.get_bytes_bounded(&key, 128).await,
-        Ok(BoundedRedisValue::Missing)
+        redis.get_bytes_bounded(&key, READ_CAP).await,
+        Ok(BoundedRedisValue::Oversized { length }) if length == huge.len()
     ));
+    redis.set_bytes_with_expire(&key, &valid, 60).await.unwrap();
+    ai_semantic_cache_expire_redis_quarantine_for_test(&plugin, &cache_key);
+    let mut ctx = new_ctx();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+            .await,
+        PluginResult::RejectBinary { status_code: 200, body, .. } if body.as_ref() == RESPONSE
+    ));
+    assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, &cache_key
+    ));
+    redis.delete(&key).await.unwrap();
+    assert!(!compare.delete_if_value_matches(&key, b"").await.unwrap());
+    redis.set_bytes_with_expire(&key, b"", 60).await.unwrap();
+    assert!(compare.delete_if_value_matches(&key, b"").await.unwrap());
+    redis
+        .set_bytes_with_expire(&key, b"owner-token", 60)
+        .await
+        .unwrap();
+    assert!(
+        !compare
+            .delete_if_value_matches(&key, b"other-token")
+            .await
+            .unwrap()
+    );
+    assert!(
+        compare
+            .delete_if_value_matches(&key, b"owner-token")
+            .await
+            .unwrap()
+    );
+    assert_eq!(relay.get_calls.load(Ordering::SeqCst), 0);
 }
 
 // ============================================================================

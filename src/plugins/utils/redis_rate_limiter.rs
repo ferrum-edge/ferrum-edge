@@ -5479,9 +5479,21 @@ impl RedisRateLimitClient {
     /// never shared) non-reconnecting [`redis::aio::MultiplexedConnection`] so
     /// connection-local `WATCH` state can neither be interleaved by another
     /// command nor silently dropped by a transparent reconnect. Any I/O failure
-    /// at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
+    /// at `WATCH`, the bounded read, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
+    /// The comparison transfers at most `expected.len() + 1` bytes, including
+    /// when a small ownership token or invalid cache value was replaced by a
+    /// much larger value. `EXISTS` distinguishes an absent key from an empty
+    /// string; `STRLEN` and the full bounded prefix must both match before DEL.
     #[allow(clippy::result_unit_err)]
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
+        // Validate before dialing. For an empty expected value, end=0 reads
+        // one byte, enough to distinguish it from a nonempty replacement.
+        let end = if expected.is_empty() {
+            0
+        } else {
+            redis_getrange_end_index(expected.len()).map_err(|_| ())?
+        };
+        let max_prefix = expected.len().checked_add(1).ok_or(())?;
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
@@ -5498,10 +5510,29 @@ impl RedisRateLimitClient {
             return Err(());
         }
 
-        let current: Result<Option<Vec<u8>>, redis::RedisError> =
-            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        // WATCH covers every command through EXEC. A rewrite between these
+        // reads can only cause a false mismatch or abort the transaction; it
+        // cannot turn a matching prefix into permission to delete a replacement.
+        let current: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("EXISTS")
+            .arg(key)
+            .cmd("STRLEN")
+            .arg(key)
+            .cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(end)
+            .query_async(&mut conn)
+            .await;
         match current {
-            Ok(Some(current)) if current == expected => {}
+            Ok((_, _, prefix)) if prefix.len() > max_prefix => {
+                // A nonconforming peer must not authorize a delete. Dropping
+                // this dedicated connection also discards its WATCH state.
+                self.mark_unavailable();
+                return Err(());
+            }
+            Ok((exists, length, prefix))
+                if exists == 1 && length == expected.len() && prefix == expected => {}
             Ok(_) => {
                 let unwatch: Result<(), redis::RedisError> =
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
@@ -5521,7 +5552,7 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "compare-delete GET",
+                    operation = "compare-delete EXISTS+STRLEN+GETRANGE",
                     error = %e,
                     "Redis command failed"
                 );
