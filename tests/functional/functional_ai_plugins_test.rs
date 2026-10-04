@@ -785,7 +785,11 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             let envelope: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
             assert!(envelope["version"].as_u64().is_some());
             assert_eq!(envelope["status_code"], 200);
-            assert!(envelope["integrity"].as_str().is_some_and(|mac| !mac.is_empty()));
+            assert!(
+                envelope["integrity"]
+                    .as_str()
+                    .is_some_and(|mac| !mac.is_empty())
+            );
             let remaining_ttl: i64 = redis::cmd("TTL")
                 .arg(&key)
                 .query_async(&mut admin)
