@@ -1,28 +1,55 @@
 diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
 --- a/src/proto/h2/mod.rs
 +++ b/src/proto/h2/mod.rs
-@@ -88,6 +88,9 @@
+@@ -88,19 +88,12 @@
      {
          body_tx: SendStream<SendBuf<S::Data>>,
          data_done: bool,
+-        // A data chunk that has been polled from the body but is still waiting
+-        // for stream-level capacity before it can be shipped. Stored here so
+-        // it survives across `Poll::Pending` returns from `poll_capacity`; if
+-        // we left the chunk in a local, it would be dropped on every repoll.
+-        buffered_data: Option<Peeked<S::Data>>,
 +        // FERRUM PATCH 002: a polled DATA chunk (and its end-of-stream flag)
-+        // waiting for enough assigned capacity to avoid a sliver frame.
++        // waiting for any positive assigned capacity (empty DATA needs none).
 +        pending_data: Option<(S::Data, bool)>,
          #[pin]
          stream: S,
      }
-@@ -101,6 +104,7 @@
+-}
+-
+-struct Peeked<D> {
+-    data: D,
+-    is_eos: bool,
+ }
+ 
+ impl<S> PipeToSendStream<S>
+@@ -111,7 +104,7 @@
          PipeToSendStream {
              body_tx: tx,
              data_done: false,
+-            buffered_data: None,
 +            pending_data: None,
              stream,
          }
      }
-@@ -121,6 +125,37 @@
-     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-         let mut me = self.project();
-         loop {
+@@ -144,78 +137,55 @@
+                 return Poll::Ready(Err(crate::Error::new_body_write(::h2::Error::from(reason))));
+             }
+ 
+-            // If a previously-polled chunk is still waiting for stream-level
+-            // send capacity, drive that to completion before touching the
+-            // body again.
+-            if me.buffered_data.is_some() {
+-                while me.body_tx.capacity() == 0 {
+-                    match ready!(me.body_tx.poll_capacity(cx)) {
+-                        Some(Ok(0)) => {}
+-                        Some(Ok(_)) => break,
+-                        Some(Err(e)) => return Poll::Ready(Err(crate::Error::new_body_write(e))),
+-                        None => {
+-                            // None means the stream is no longer in a
+-                            // streaming state, we either finished it
+-                            // somehow, or the remote reset us.
 +            // FERRUM PATCH 002: a ready chunk must make progress with every
 +            // legal peer window. Waiting for a fixed minimum can deadlock when
 +            // the peer advertises a smaller stream window or only one byte of
@@ -39,46 +66,83 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
 +                            return Poll::Ready(Err(crate::Error::new_body_write(e)))
 +                        }
 +                        Poll::Ready(None) => {
-+                            return Poll::Ready(Err(crate::Error::new_body_write(
-+                                "send stream capacity unexpectedly closed",
-+                            )));
-+                        }
-+                    }
-+                }
-+                me.body_tx
-+                    .send_data(SendBuf::Buf(chunk), is_eos)
-+                    .map_err(crate::Error::new_body_write)?;
-+                if is_eos {
-+                    return Poll::Ready(Ok(()));
-+                }
-+                continue;
-+            }
-+
-             // we don't have the next chunk of data yet, so just reserve 1 byte to make
-             // sure there's some capacity available. h2 will handle the capacity management
-             // for the actual body chunk.
-@@ -162,14 +197,12 @@
-                             is_eos,
-                         );
- 
--                        let buf = SendBuf::Buf(chunk);
--                        me.body_tx
--                            .send_data(buf, is_eos)
--                            .map_err(crate::Error::new_body_write)?;
+                             return Poll::Ready(Err(crate::Error::new_body_write(
+                                 "send stream capacity unexpectedly closed",
+                             )));
+                         }
+                     }
+                 }
 -
--                        if is_eos {
--                            return Poll::Ready(Ok(()));
+-                let peeked = me.buffered_data.take().expect("checked is_some above");
+-                let buf = SendBuf::Buf(peeked.data);
+                 me.body_tx
+-                    .send_data(buf, peeked.is_eos)
++                    .send_data(SendBuf::Buf(chunk), is_eos)
+                     .map_err(crate::Error::new_body_write)?;
+-
+-                if peeked.is_eos {
++                if is_eos {
+                     return Poll::Ready(Ok(()));
+                 }
+                 continue;
+             }
+ 
+-            // Poll for the next body frame *before* reserving any connection
+-            // flow-control capacity. Reserving capacity speculatively (even a
+-            // single byte) pins that capacity on the connection-level window,
+-            // which can deadlock a second stream when talking to peers that
+-            // only emit WINDOW_UPDATE once their receive window is fully
+-            // exhausted. See #4003.
++            // Hyper 1.10: poll the body before reserving capacity. An idle
++            // body must not pin connection window needed by another stream.
+             match ready!(me.stream.as_mut().poll_frame(cx)) {
+                 Some(Ok(frame)) => {
+                     if frame.is_data() {
+                         let chunk = frame.into_data().unwrap_or_else(|_| unreachable!());
+                         let is_eos = me.stream.is_end_stream();
+-                        let len = chunk.remaining();
+-                        trace!("send body chunk: {} bytes, eos={}", len, is_eos);
+-
+-                        if len == 0 {
+-                            // Zero-length data frames need no capacity; send
+-                            // them straight through so trailing empty frames
+-                            // (e.g. an explicit end-of-stream marker) are
+-                            // delivered.
+-                            let buf = SendBuf::Buf(chunk);
+-                            me.body_tx
+-                                .send_data(buf, is_eos)
+-                                .map_err(crate::Error::new_body_write)?;
+-
+-                            if is_eos {
+-                                return Poll::Ready(Ok(()));
+-                            }
+-                            continue;
 -                        }
-+                        // FERRUM PATCH 002: retain the one-byte claim. It is
-+                        // enough to guarantee progress without assuming a
-+                        // minimum peer window. h2 expands the reservation to
-+                        // the buffered length after `send_data`.
+-
+-                        // Reserve exactly the chunk size so we never pin more
+-                        // connection-level flow-control window than we are
+-                        // about to consume. Stash the chunk in `self` so it
+-                        // survives the upcoming `poll_capacity` wait even if
+-                        // it returns `Poll::Pending`.
+-                        me.body_tx.reserve_capacity(len);
+-                        *me.buffered_data = Some(Peeked {
+-                            data: chunk,
++                        trace!(
++                            "send body chunk: {} bytes, eos={}",
++                            chunk.remaining(),
+                             is_eos,
+-                        });
++                        );
++
++                        // Reserve only real DATA, preserving Hyper 1.10
++                        // idle-stream fairness and positive-window progress.
++                        me.body_tx.reserve_capacity(chunk.remaining());
 +                        *me.pending_data = Some((chunk, is_eos));
 +                        continue;
                      } else if frame.is_trailers() {
                          // no more DATA, so give any capacity back
                          me.body_tx.reserve_capacity(0);
-@@ -262,3 +295,142 @@
+@@ -308,3 +278,142 @@
          }
      }
  }

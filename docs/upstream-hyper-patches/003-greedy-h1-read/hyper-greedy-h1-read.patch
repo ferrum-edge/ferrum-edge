@@ -1,7 +1,7 @@
 diff --git a/src/client/conn/http1.rs b/src/client/conn/http1.rs
 --- a/src/client/conn/http1.rs
 +++ b/src/client/conn/http1.rs
-@@ -69,7 +69,12 @@
+@@ -76,7 +76,12 @@
      ///
      /// Only works for HTTP/1 connections. HTTP/2 connections will panic.
      pub fn into_parts(self) -> Parts<T> {
@@ -15,16 +15,29 @@ diff --git a/src/client/conn/http1.rs b/src/client/conn/http1.rs
          Parts { io, read_buf }
      }
  
-@@ -600,8 +605,11 @@
-             match ready!(Pin::new(&mut self.inner.as_mut().unwrap().inner).poll(cx)) {
-                 Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
-                 Ok(proto::Dispatched::Upgrade(pending)) => {
--                    let Parts { io, read_buf } = self.inner.take().unwrap().into_parts();
+@@ -591,7 +596,7 @@
+ }
+ 
+ mod upgrades {
+-    use super::{Connection, Context, Future, Parts, Pin, Poll, Read, StdError, Write};
++    use super::{Connection, Context, Future, Pin, Poll, Read, StdError, Write};
+     use crate::body::Body;
+     use crate::proto::Dispatched;
+     use crate::upgrade::Upgraded;
+@@ -631,12 +636,14 @@
+             {
+                 Ok(Dispatched::Shutdown) => Poll::Ready(Ok(())),
+                 Ok(Dispatched::Upgrade(pending)) => {
+-                    let Parts { io, read_buf } = self
++                    // FERRUM PATCH 003: preserve the read-ahead error on upgrade.
++                    let (io, read_buf, read_error, _) = self
+                         .inner
+                         .take()
+                         .expect("upgradeable client connection missing after upgrade")
+-                        .into_parts();
 -                    pending.fulfill(Upgraded::new(io, read_buf));
-+                    // FERRUM PATCH 003: carry a pending read-ahead error
-+                    // into the tunnel (ferrum-edge issue #5911).
-+                    let (io, read_buf, read_error, _) =
-+                        self.inner.take().unwrap().inner.into_inner();
++                        .inner
++                        .into_inner();
 +                    pending.fulfill(Upgraded::new_with_read_error(io, read_buf, read_error));
                      Poll::Ready(Ok(()))
                  }
@@ -565,15 +578,19 @@ diff --git a/src/server/conn/http1.rs b/src/server/conn/http1.rs
          Parts {
              io,
              read_buf,
-@@ -545,8 +550,10 @@
+@@ -552,13 +557,14 @@
              match ready!(Pin::new(&mut conn.conn).poll(cx)) {
                  Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
                  Ok(proto::Dispatched::Upgrade(pending)) => {
--                    let (io, buf, _) = self.inner.take().unwrap().conn.into_inner();
+-                    let (io, buf, _) = self
++                    // FERRUM PATCH 003: preserve the read-ahead error on upgrade.
++                    let (io, buf, read_error, _) = self
+                         .inner
+                         .take()
+                         .expect("upgradeable server connection missing after upgrade")
+                         .conn
+                         .into_inner();
 -                    pending.fulfill(Upgraded::new(io, buf));
-+                    // FERRUM PATCH 003: carry a pending read-ahead error
-+                    // into the tunnel (ferrum-edge issue #5911).
-+                    let (io, buf, read_error, _) = self.inner.take().unwrap().conn.into_inner();
 +                    pending.fulfill(Upgraded::new_with_read_error(io, buf, read_error));
                      Poll::Ready(Ok(()))
                  }
@@ -581,7 +598,7 @@ diff --git a/src/server/conn/http1.rs b/src/server/conn/http1.rs
 diff --git a/src/upgrade.rs b/src/upgrade.rs
 --- a/src/upgrade.rs
 +++ b/src/upgrade.rs
-@@ -144,19 +144,43 @@
+@@ -145,19 +145,43 @@
          }
      }
  

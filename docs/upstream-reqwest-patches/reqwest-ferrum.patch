@@ -1,0 +1,901 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -88,6 +88,12 @@
+     "tokio-rustls?/aws-lc-rs",
+     "rustls?/aws-lc-rs",
+     "quinn?/rustls-aws-lc-rs",
++]
++__rustls-ring = [
++    "hyper-rustls?/ring",
++    "tokio-rustls?/ring",
++    "rustls?/ring",
++    "quinn?/rustls-ring",
+ ]
+ __tls = [
+     "dep:rustls-pki-types",
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -16,14 +16,14 @@
+ use crate::async_impl::h3_client::connect::{H3ClientConfig, H3Connector};
+ #[cfg(feature = "http3")]
+ use crate::async_impl::h3_client::H3Client;
+-use crate::config::{RequestConfig, TotalTimeout};
++use crate::config::{ConnectTimeout, RequestConfig, TotalTimeout};
+ #[cfg(unix)]
+ use crate::connect::uds::UnixSocketProvider;
+ #[cfg(target_os = "windows")]
+ use crate::connect::windows_named_pipe::WindowsNamedPipeProvider;
+ use crate::connect::{
+     sealed::{Conn, Unnameable},
+-    BoxedConnectorLayer, BoxedConnectorService, Connector, ConnectorBuilder,
++    BoxedConnectorLayer, BoxedConnectorService, ConnectionAdmission, Connector, ConnectorBuilder,
+ };
+ #[cfg(feature = "cookies")]
+ use crate::cookie;
+@@ -202,6 +202,8 @@
+     #[cfg(feature = "__tls")]
+     tls: TlsBackend,
+     connector_layers: Vec<BoxedConnectorLayer>,
++    /// Ferrum patch 003: physical-connection admission hook.
++    connection_admission: Option<Arc<dyn ConnectionAdmission>>,
+     http_version_pref: HttpVersionPref,
+     http09_responses: bool,
+     http1_title_case_headers: bool,
+@@ -329,6 +331,7 @@
+                 #[cfg(feature = "__tls")]
+                 tls: TlsBackend::default(),
+                 connector_layers: Vec::new(),
++                connection_admission: None,
+                 http_version_pref: HttpVersionPref::All,
+                 http09_responses: false,
+                 http1_title_case_headers: false,
+@@ -1008,7 +1011,9 @@
+             Some(format!("{:?}", &config.redirect_policy))
+         };
+ 
+-        let hyper_client = builder.build(connector_builder.build(config.connector_layers));
++        let hyper_client = builder.build(
++            connector_builder.build(config.connector_layers, config.connection_admission),
++        );
+         let hyper_service = HyperService {
+             hyper: hyper_client,
+         };
+@@ -1093,6 +1098,7 @@
+                 referer: config.referer,
+                 read_timeout: config.read_timeout,
+                 total_timeout: RequestConfig::new(config.timeout),
++                connect_timeout: RequestConfig::new(config.connect_timeout),
+                 hyper,
+                 proxies,
+                 proxies_maybe_http_auth,
+@@ -2468,6 +2474,25 @@
+ 
+         self
+     }
++
++    /// Ferrum patch 003 — install a physical-connection admission hook.
++    ///
++    /// The hook is consulted immediately before this client dials a **new**
++    /// physical connection, and never for a pooled-connection reuse or an
++    /// HTTP/2 stream multiplexed onto an existing connection. The token it
++    /// returns is owned by the resulting connection, so it is released exactly
++    /// when that connection dies — including handshake failure, idle eviction,
++    /// pool drain, cancellation, and shutdown.
++    ///
++    /// Sharing one hook across several clients makes them share one ceiling,
++    /// which is why this is a hook rather than a per-client counter.
++    pub fn connection_admission(
++        mut self,
++        admission: Arc<dyn ConnectionAdmission>,
++    ) -> ClientBuilder {
++        self.config.connection_admission = Some(admission);
++        self
++    }
+ }
+ 
+ type HyperClient = hyper_util::client::legacy::Client<Connector, super::Body>;
+@@ -2480,17 +2505,19 @@
+ 
+ #[cfg(feature = "__rustls")]
+ fn default_rustls_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+-    #[cfg(not(feature = "__rustls-aws-lc-rs"))]
+-    panic!(
+-        "No rustls crypto provider is configured. \
+-        When using the `rustls-no-provider` feature you must install a \
+-        crypto provider before building a Client. For example: \
+-        `rustls::crypto::aws_lc_rs::default_provider().install_default().unwrap();` \
+-        See https://docs.rs/rustls/latest/rustls/#cryptography-providers for details."
+-    );
+-
+-    #[cfg(feature = "__rustls-aws-lc-rs")]
+-    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
++    // Cargo features are additive across every reqwest consumer. A transitive
++    // consumer may therefore enable reqwest's upstream AWS-LC default while
++    // Ferrum's ordinary profile explicitly selects Ring. Ring takes precedence
++    // in that ordinary graph; the hosted FIPS feature-policy audit rejects any
++    // FIPS graph in which `__rustls-ring` is present.
++    #[cfg(feature = "__rustls-ring")]
++    return Arc::new(rustls::crypto::ring::default_provider());
++
++    #[cfg(all(not(feature = "__rustls-ring"), feature = "__rustls-aws-lc-rs"))]
++    return Arc::new(rustls::crypto::aws_lc_rs::default_provider());
++
++    #[cfg(not(any(feature = "__rustls-ring", feature = "__rustls-aws-lc-rs")))]
++    panic!("No provider set");
+ }
+ 
+ impl Client {
+@@ -2658,6 +2685,8 @@
+             .map(tokio::time::sleep)
+             .map(Box::pin);
+ 
++        let connect_timeout = self.inner.connect_timeout.fetch(&extensions).copied();
++
+         let read_timeout_fut = self
+             .inner
+             .read_timeout
+@@ -2676,6 +2705,7 @@
+                 total_timeout,
+                 read_timeout_fut,
+                 read_timeout: self.inner.read_timeout,
++                connect_timeout,
+             })),
+         }
+     }
+@@ -2947,6 +2977,7 @@
+     h3_client: Option<LayeredService<H3Client>>,
+     referer: bool,
+     total_timeout: RequestConfig<TotalTimeout>,
++    connect_timeout: RequestConfig<ConnectTimeout>,
+     read_timeout: Option<Duration>,
+     proxies: Arc<Vec<ProxyMatcher>>,
+     proxies_maybe_http_auth: bool,
+@@ -2984,6 +3015,7 @@
+         f.field("default_headers", &self.headers);
+ 
+         self.total_timeout.fmt_as_field(f);
++        self.connect_timeout.fmt_as_field(f);
+ 
+         if let Some(ref d) = self.read_timeout {
+             f.field("read_timeout", d);
+@@ -3018,6 +3050,7 @@
+         #[pin]
+         read_timeout_fut: Option<Pin<Box<Sleep>>>,
+         read_timeout: Option<Duration>,
++        connect_timeout: Option<Duration>,
+     }
+ }
+ 
+@@ -3087,20 +3120,31 @@
+             }
+         }
+ 
+-        let res = match self.as_mut().in_flight().get_mut() {
+-            ResponseFuture::Default(r) => match ready!(Pin::new(r).poll(cx)) {
+-                Err(e) => {
+-                    return Poll::Ready(Err(e.if_no_url(|| self.url.clone())));
+-                }
+-                Ok(res) => res.map(super::body::boxed),
+-            },
+-            #[cfg(feature = "http3")]
+-            ResponseFuture::H3(r) => match ready!(Pin::new(r).poll(cx)) {
+-                Err(e) => {
+-                    return Poll::Ready(Err(crate::error::request(e).with_url(self.url.clone())));
+-                }
+-                Ok(res) => res.map(super::body::boxed),
+-            },
++        let connect_timeout = {
++            let this = self.as_mut().project();
++            *this.connect_timeout
++        };
++        let res = crate::connect::with_connect_timeout_override(connect_timeout, || {
++            match self.as_mut().in_flight().get_mut() {
++                ResponseFuture::Default(r) => match Pin::new(r).poll(cx) {
++                    Poll::Pending => Poll::Pending,
++                    Poll::Ready(Err(e)) => Poll::Ready(Err(e.if_no_url(|| self.url.clone()))),
++                    Poll::Ready(Ok(res)) => Poll::Ready(Ok(res.map(super::body::boxed))),
++                },
++                #[cfg(feature = "http3")]
++                ResponseFuture::H3(r) => match Pin::new(r).poll(cx) {
++                    Poll::Pending => Poll::Pending,
++                    Poll::Ready(Err(e)) => {
++                        Poll::Ready(Err(crate::error::request(e).with_url(self.url.clone())))
++                    }
++                    Poll::Ready(Ok(res)) => Poll::Ready(Ok(res.map(super::body::boxed))),
++                },
++            }
++        });
++        let res = match res {
++            Poll::Pending => return Poll::Pending,
++            Poll::Ready(Ok(res)) => res,
++            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+         };
+ 
+         if let Some(url) = &res
+diff --git a/src/async_impl/request.rs b/src/async_impl/request.rs
+--- a/src/async_impl/request.rs
++++ b/src/async_impl/request.rs
+@@ -13,7 +13,7 @@
+ #[cfg(feature = "multipart")]
+ use super::multipart;
+ use super::response::Response;
+-use crate::config::{RequestConfig, TotalTimeout};
++use crate::config::{ConnectTimeout, RequestConfig, TotalTimeout};
+ #[cfg(feature = "multipart")]
+ use crate::header::CONTENT_LENGTH;
+ #[cfg(any(feature = "multipart", feature = "form", feature = "json"))]
+@@ -127,6 +127,18 @@
+         RequestConfig::<TotalTimeout>::get_mut(&mut self.extensions)
+     }
+ 
++    /// Get the connect timeout.
++    #[inline]
++    pub fn connect_timeout(&self) -> Option<&Duration> {
++        RequestConfig::<ConnectTimeout>::get(&self.extensions)
++    }
++
++    /// Get a mutable reference to the connect timeout.
++    #[inline]
++    pub fn connect_timeout_mut(&mut self) -> &mut Option<Duration> {
++        RequestConfig::<ConnectTimeout>::get_mut(&mut self.extensions)
++    }
++
+     /// Get the http version.
+     #[inline]
+     pub fn version(&self) -> Version {
+@@ -149,6 +161,7 @@
+         };
+         let mut req = Request::new(self.method().clone(), self.url().clone());
+         *req.timeout_mut() = self.timeout().copied();
++        *req.connect_timeout_mut() = self.connect_timeout().copied();
+         *req.headers_mut() = self.headers().clone();
+         *req.version_mut() = self.version();
+         *req.extensions_mut() = self.extensions().clone();
+@@ -298,6 +311,18 @@
+         self
+     }
+ 
++    /// Enables a request connect timeout.
++    ///
++    /// The timeout is applied while a new connection is being established. It
++    /// affects only this request and overrides the timeout configured using
++    /// `ClientBuilder::connect_timeout()`.
++    pub fn connect_timeout(mut self, timeout: Duration) -> RequestBuilder {
++        if let Ok(ref mut req) = self.request {
++            *req.connect_timeout_mut() = Some(timeout);
++        }
++        self
++    }
++
+     /// Sends a multipart/form-data body.
+     ///
+     /// ```
+diff --git a/src/blocking/request.rs b/src/blocking/request.rs
+--- a/src/blocking/request.rs
++++ b/src/blocking/request.rs
+@@ -113,6 +113,18 @@
+     #[inline]
+     pub fn timeout_mut(&mut self) -> &mut Option<Duration> {
+         self.inner.timeout_mut()
++    }
++
++    /// Get the connect timeout.
++    #[inline]
++    pub fn connect_timeout(&self) -> Option<&Duration> {
++        self.inner.connect_timeout()
++    }
++
++    /// Get a mutable reference to the connect timeout.
++    #[inline]
++    pub fn connect_timeout_mut(&mut self) -> &mut Option<Duration> {
++        self.inner.connect_timeout_mut()
+     }
+ 
+     /// Attempts to clone the `Request`.
+@@ -366,6 +378,18 @@
+         self
+     }
+ 
++    /// Enables a request connect timeout.
++    ///
++    /// The timeout is applied while a new connection is being established. It
++    /// affects only this request and overrides the timeout configured using
++    /// `ClientBuilder::connect_timeout()`.
++    pub fn connect_timeout(mut self, timeout: Duration) -> RequestBuilder {
++        if let Ok(ref mut req) = self.request {
++            *req.connect_timeout_mut() = Some(timeout);
++        }
++        self
++    }
++
+     /// Modify the query string of the URL.
+     ///
+     /// Modifies the URL of this request, adding the parameters provided.
+diff --git a/src/config.rs b/src/config.rs
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -108,3 +108,10 @@
+ impl RequestConfigValue for TotalTimeout {
+     type Value = Duration;
+ }
++
++#[derive(Clone, Copy)]
++pub(crate) struct ConnectTimeout;
++
++impl RequestConfigValue for ConnectTimeout {
++    type Value = Duration;
++}
+diff --git a/src/connect.rs b/src/connect.rs
+--- a/src/connect.rs
++++ b/src/connect.rs
+@@ -33,6 +33,73 @@
+ 
+ pub(crate) type HttpConnector = hyper_util::client::legacy::connect::HttpConnector<DynResolver>;
+ 
++use std::cell::Cell;
++
++thread_local! {
++    static REQUEST_CONNECT_TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
++}
++
++pub(crate) fn with_connect_timeout_override<T>(
++    timeout: Option<Duration>,
++    f: impl FnOnce() -> T,
++) -> T {
++    struct Restore<'a> {
++        slot: &'a Cell<Option<Duration>>,
++        previous: Option<Duration>,
++    }
++
++    impl Drop for Restore<'_> {
++        fn drop(&mut self) {
++            self.slot.set(self.previous);
++        }
++    }
++
++    REQUEST_CONNECT_TIMEOUT.with(|slot| {
++        let previous = slot.replace(timeout);
++        let _restore = Restore { slot, previous };
++        f()
++    })
++}
++
++fn effective_connect_timeout(default_timeout: Option<Duration>) -> Option<Duration> {
++    REQUEST_CONNECT_TIMEOUT.with(|slot| slot.get().or(default_timeout))
++}
++
++#[derive(Clone)]
++struct ConnectTimeoutService<S> {
++    inner: S,
++    default_timeout: Option<Duration>,
++}
++
++impl<S> ConnectTimeoutService<S> {
++    fn new(inner: S, default_timeout: Option<Duration>) -> Self {
++        Self {
++            inner,
++            default_timeout,
++        }
++    }
++}
++
++impl<S, Req> Service<Req> for ConnectTimeoutService<S>
++where
++    S: Service<Req, Response = Conn, Error = BoxError> + Clone + Send + Sync + 'static,
++    S::Future: Send + 'static,
++    Req: Send + 'static,
++{
++    type Response = Conn;
++    type Error = BoxError;
++    type Future = Connecting;
++
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.inner.poll_ready(cx)
++    }
++
++    fn call(&mut self, req: Req) -> Self::Future {
++        let timeout = effective_connect_timeout(self.default_timeout);
++        Box::pin(with_timeout(self.inner.call(req), timeout))
++    }
++}
++
+ #[derive(Clone)]
+ pub(crate) enum Connector {
+     // base service, with or without an embedded timeout
+@@ -60,6 +127,235 @@
+             Connector::WithLayers(service) => service.call(Unnameable(dst)),
+         }
+     }
++}
++
++/// Ferrum patch 003 — physical-connection admission.
++///
++/// Consulted by the connector **immediately before a new physical connection
++/// is dialed**, and only then: a checkout that reuses an already-open pooled
++/// connection never reaches the connector, and HTTP/2 streams multiplexed onto
++/// an existing connection never reach it either. The returned
++/// [`ConnectionAdmissionToken`] is moved into the connection object handed to
++/// hyper, so it is dropped exactly when that physical connection is dropped —
++/// covering handshake failure, normal close, idle eviction, pool drain,
++/// cancellation, and shutdown.
++///
++/// Returning `Err` refuses the dial; the error is surfaced to the caller as the
++/// connect error for that request, with its source chain preserved.
++pub trait ConnectionAdmission: Send + Sync + 'static {
++    /// Admit one new physical connection to `dst`, or refuse it.
++    fn admit(&self, dst: &Uri) -> Result<ConnectionAdmissionToken, BoxError>;
++
++    /// Ferrum patch 004 — the connection admitted by `admit` now exists.
++    ///
++    /// Called at most once per admitted dial, after the transport (and any TLS
++    /// handshake) has produced a socket and before the connection is handed to
++    /// hyper, so no request byte has been written yet. `fd` is the raw
++    /// descriptor of the underlying `TcpStream`, borrowed for the duration of
++    /// the call only: the connection owns it, and an implementation that needs
++    /// it afterwards must duplicate it (`dup`). A dial that produced no TCP
++    /// socket — a Unix-domain or named-pipe transport, or a connection whose
++    /// stream the connector could not reach — does not call this at all.
++    ///
++    /// `token` is the same token `admit` returned for this connection, so an
++    /// implementation can key what it records on the connection's identity.
++    ///
++    /// Only HTTP/1.1 connections are reported: a connection that negotiated
++    /// HTTP/2 over ALPN is multiplexed, and its socket cannot be attributed to
++    /// the single request that dialed it.
++    ///
++    /// The default implementation does nothing, so an existing
++    /// `ConnectionAdmission` needs no change.
++    #[cfg(unix)]
++    fn established(&self, token: &ConnectionAdmissionToken, fd: std::os::fd::RawFd) {
++        let _ = (token, fd);
++    }
++}
++
++/// Opaque handle whose `Drop` marks the end of one physical connection's
++/// lifetime. See [`ConnectionAdmission`].
++pub struct ConnectionAdmissionToken(Option<Box<dyn std::any::Any + Send + Sync>>);
++
++impl ConnectionAdmissionToken {
++    /// Wrap an arbitrary RAII value (typically a permit/guard) as a token.
++    pub fn new<T: std::any::Any + Send + Sync>(guard: T) -> Self {
++        Self(Some(Box::new(guard)))
++    }
++
++    /// A token that holds nothing — the admission hook decided this
++    /// destination is not governed by a limit.
++    pub fn unlimited() -> Self {
++        Self(None)
++    }
++}
++
++impl std::fmt::Debug for ConnectionAdmissionToken {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ConnectionAdmissionToken")
++            .field("held", &self.0.is_some())
++            .finish()
++    }
++}
++
++/// Ferrum patch 003: binds an admission token to a physical connection's
++/// lifetime by owning it alongside the connection's IO. Every trait method
++/// delegates; the token is only ever dropped.
++struct AdmittedConn {
++    inner: BoxConn,
++    _token: ConnectionAdmissionToken,
++}
++
++impl Connection for AdmittedConn {
++    fn connected(&self) -> Connected {
++        self.inner.connected()
++    }
++}
++
++impl Read for AdmittedConn {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: ReadBufCursor<'_>,
++    ) -> Poll<io::Result<()>> {
++        Read::poll_read(Pin::new(&mut self.inner), cx, buf)
++    }
++}
++
++impl Write for AdmittedConn {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<Result<usize, io::Error>> {
++        Write::poll_write(Pin::new(&mut self.inner), cx, buf)
++    }
++
++    fn poll_write_vectored(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        bufs: &[IoSlice<'_>],
++    ) -> Poll<Result<usize, io::Error>> {
++        Write::poll_write_vectored(Pin::new(&mut self.inner), cx, bufs)
++    }
++
++    fn is_write_vectored(&self) -> bool {
++        self.inner.is_write_vectored()
++    }
++
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
++        Write::poll_flush(Pin::new(&mut self.inner), cx)
++    }
++
++    fn poll_shutdown(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++    ) -> Poll<Result<(), io::Error>> {
++        Write::poll_shutdown(Pin::new(&mut self.inner), cx)
++    }
++}
++
++#[cfg(feature = "__tls")]
++impl TlsInfoFactory for AdmittedConn {
++    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
++        self.inner.tls_info()
++    }
++}
++
++/// Ferrum patch 004: one-shot cell the connect path fills with the raw
++/// descriptor of a newly dialed TCP socket.
++///
++/// The connect future is boxed and `'static`, so the descriptor cannot be
++/// returned by borrow; a cheap shared cell carries it from the branch that can
++/// still see the concrete stream out to [`with_admission`], which is the only
++/// place holding the connection's admission token. `-1` means "no TCP socket
++/// was observed" (a local-transport dial, or a stream the connector could not
++/// reach), and the hook is then not called at all.
++#[derive(Clone)]
++struct EstablishedFd(Arc<std::sync::atomic::AtomicI32>);
++
++#[allow(dead_code)]
++impl EstablishedFd {
++    fn new() -> Self {
++        Self(Arc::new(std::sync::atomic::AtomicI32::new(-1)))
++    }
++
++    /// Record the descriptor of the socket this dial produced.
++    fn set(&self, fd: i32) {
++        self.0.store(fd, std::sync::atomic::Ordering::Release);
++    }
++
++    #[cfg(unix)]
++    fn get(&self) -> Option<std::os::fd::RawFd> {
++        match self.0.load(std::sync::atomic::Ordering::Acquire) {
++            -1 => None,
++            fd => Some(fd),
++        }
++    }
++}
++
++/// Ferrum patch 004: the raw descriptor of the TCP socket underneath a stream
++/// the rustls connector just produced.
++///
++/// Both variants wrap the `HttpConnector`'s `TokioIo<TcpStream>`; the accessor
++/// chain for the TLS variant is the same one this module already uses to reach
++/// the stream for `set_nodelay`.
++#[cfg(all(unix, feature = "__rustls"))]
++fn rustls_stream_raw_fd(
++    io: &hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>,
++) -> Option<i32> {
++    use std::os::fd::AsRawFd;
++    match io {
++        hyper_rustls::MaybeHttpsStream::Http(tcp) => Some(tcp.inner().as_raw_fd()),
++        hyper_rustls::MaybeHttpsStream::Https(stream) => {
++            let (tcp, _) = stream.inner().get_ref();
++            Some(tcp.inner().inner().as_raw_fd())
++        }
++    }
++}
++
++/// Ferrum patch 003: await one connect attempt and, on success, bind the
++/// admission token to the resulting physical connection. On failure the token
++/// drops here, releasing the reservation for a handshake that never produced a
++/// socket.
++async fn with_admission<F>(
++    f: F,
++    token: Option<ConnectionAdmissionToken>,
++    hook: Option<Arc<dyn ConnectionAdmission>>,
++    established: EstablishedFd,
++) -> Result<Conn, BoxError>
++where
++    F: Future<Output = Result<Conn, BoxError>>,
++{
++    let conn = f.await?;
++    // Ferrum patch 004: report the socket before the connection reaches hyper,
++    // so the hook observes it strictly before the first request byte is
++    // written. `hook` and `token` are `Some` together or not at all.
++    //
++    // Only an HTTP/1.1 connection is reported. A connection that negotiated
++    // HTTP/2 over ALPN is multiplexed: its kernel send queue is shared by every
++    // stream hyper opens on it, so no per-request consumer of the descriptor
++    // (a send-queue drain bound, say) could attribute that queue to the request
++    // that caused the dial. Such connections leave the hook uncalled.
++    #[cfg(unix)]
++    if let (Some(hook), Some(token), Some(fd)) = (hook.as_ref(), token.as_ref(), established.get())
++    {
++        if !conn.connected().is_negotiated_h2() {
++            hook.established(token, fd);
++        }
++    }
++    #[cfg(not(unix))]
++    let _ = (&hook, &established);
++    Ok(match token {
++        None => conn,
++        Some(token) => Conn {
++            inner: Box::new(AdmittedConn {
++                inner: conn.inner,
++                _token: token,
++            }),
++            is_proxy: conn.is_proxy,
++            tls_info: conn.tls_info,
++        },
++    })
+ }
+ 
+ pub(crate) type BoxedConnectorService = BoxCloneSyncService<Unnameable, Conn, BoxError>;
+@@ -87,19 +383,27 @@
+ }
+ 
+ impl ConnectorBuilder {
+-    pub(crate) fn build(self, layers: Vec<BoxedConnectorLayer>) -> Connector
++    pub(crate) fn build(
++        self,
++        layers: Vec<BoxedConnectorLayer>,
++        // Ferrum patch 003: consulted immediately before every NEW physical
++        // connection dial; see `ConnectionAdmission`.
++        connection_admission: Option<Arc<dyn ConnectionAdmission>>,
++    ) -> Connector
+ where {
+         // construct the inner tower service
+         let mut base_service = ConnectorService {
+             inner: self.inner,
+             proxies: self.proxies,
+             verbose: self.verbose,
++            connection_admission,
+             #[cfg(feature = "__tls")]
+             nodelay: self.nodelay,
+             #[cfg(feature = "__tls")]
+             tls_info: self.tls_info,
+             #[cfg(feature = "__tls")]
+             user_agent: self.user_agent,
++            connect_timeout: None,
+             simple_timeout: None,
+             #[cfg(feature = "socks")]
+             resolver: self.resolver.unwrap_or_else(DynResolver::gai),
+@@ -138,33 +442,13 @@
+             service = ServiceBuilder::new().layer(layer).service(service);
+         }
+ 
+-        // now we handle the concrete stuff - any `connect_timeout`,
+-        // plus a final map_err layer we can use to cast default tower layer
+-        // errors to internal errors
+-        match self.timeout {
+-            Some(timeout) => {
+-                let service = ServiceBuilder::new()
+-                    .layer(TimeoutLayer::new(timeout))
+-                    .service(service);
+-                let service = ServiceBuilder::new()
+-                    .map_err(|error: BoxError| cast_to_internal_error(error))
+-                    .service(service);
+-                let service = BoxCloneSyncService::new(service);
+-
+-                Connector::WithLayers(service)
+-            }
+-            None => {
+-                // no timeout, but still map err
+-                // no named timeout layer but we still map errors since
+-                // we might have user-provided timeout layer
+-                let service = ServiceBuilder::new().service(service);
+-                let service = ServiceBuilder::new()
+-                    .map_err(|error: BoxError| cast_to_internal_error(error))
+-                    .service(service);
+-                let service = BoxCloneSyncService::new(service);
+-                Connector::WithLayers(service)
+-            }
+-        }
++        let service = ConnectTimeoutService::new(service, self.timeout);
++        let service = ServiceBuilder::new()
++            .map_err(|error: BoxError| cast_to_internal_error(error))
++            .service(service);
++        let service = BoxCloneSyncService::new(service);
++
++        Connector::WithLayers(service)
+     }
+ 
+     #[cfg(not(feature = "__tls"))]
+@@ -485,6 +769,10 @@
+     inner: Inner,
+     proxies: Arc<Vec<ProxyMatcher>>,
+     verbose: verbose::Wrapper,
++    /// Ferrum patch 003: physical-connection admission hook. `None` (the
++    /// upstream default) makes every dial unconditional.
++    connection_admission: Option<Arc<dyn ConnectionAdmission>>,
++    connect_timeout: Option<Duration>,
+     /// When there is a single timeout layer and no other layers,
+     /// we embed it directly inside our base Service::call().
+     /// This lets us avoid an extra `Box::pin` indirection layer
+@@ -534,6 +822,10 @@
+ }
+ 
+ impl ConnectorService {
++    fn request_connect_timeout(&self) -> Option<Duration> {
++        effective_connect_timeout(self.connect_timeout)
++    }
++
+     #[cfg(feature = "socks")]
+     async fn connect_socks(mut self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
+         let dns = match proxy.uri().scheme_str() {
+@@ -610,11 +902,26 @@
+             .map_err(Into::into)
+     }
+ 
+-    async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
++    async fn connect_with_maybe_proxy(
++        self,
++        dst: Uri,
++        is_proxy: bool,
++        // Ferrum patch 004: filled with the dialed socket's descriptor.
++        established: EstablishedFd,
++    ) -> Result<Conn, BoxError> {
++        // Ferrum patch 004: not every feature/target combination reaches a
++        // branch that can report a descriptor.
++        let _ = &established;
+         match self.inner {
+             #[cfg(not(feature = "__tls"))]
+             Inner::Http(mut http) => {
+                 let io = http.call(dst).await?;
++                // Ferrum patch 004.
++                #[cfg(unix)]
++                {
++                    use std::os::fd::AsRawFd;
++                    established.set(io.inner().as_raw_fd());
++                }
+                 Ok(Conn {
+                     inner: self.verbose.wrap(io),
+                     is_proxy,
+@@ -673,6 +980,12 @@
+ 
+                 let mut http = hyper_rustls::HttpsConnector::from((http, tls.clone()));
+                 let io = http.call(dst).await?;
++                // Ferrum patch 004: the socket exists and no request byte has
++                // been written yet.
++                #[cfg(unix)]
++                if let Some(fd) = rustls_stream_raw_fd(&io) {
++                    established.set(fd);
++                }
+ 
+                 if let hyper_rustls::MaybeHttpsStream::Https(stream) = io {
+                     if !self.nodelay {
+@@ -780,13 +1093,22 @@
+         }
+     }
+ 
+-    async fn connect_via_proxy(self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
++    async fn connect_via_proxy(
++        self,
++        dst: Uri,
++        proxy: Intercepted,
++        // Ferrum patch 004: filled with the dialed socket's descriptor.
++        established: EstablishedFd,
++    ) -> Result<Conn, BoxError> {
++        // Ferrum patch 004: only the plain-HTTP proxy arm reaches a TCP dial
++        // this connector can see.
++        let _ = &established;
+         log::debug!("proxy({proxy:?}) intercepts '{:?}'", dst.host());
+ 
+         #[cfg(feature = "socks")]
+         match proxy.uri().scheme_str().ok_or("proxy scheme expected")? {
+             "socks4" | "socks4a" | "socks5" | "socks5h" => {
+-                return self.connect_socks(dst, proxy).await
++                return self.connect_socks(dst, proxy).await;
+             }
+             _ => (),
+         }
+@@ -888,7 +1210,8 @@
+             Inner::Http(_) => (),
+         }
+ 
+-        self.connect_with_maybe_proxy(proxy_dst, true).await
++        self.connect_with_maybe_proxy(proxy_dst, true, established)
++            .await
+     }
+ 
+     #[cfg(any(unix, target_os = "windows"))]
+@@ -927,29 +1250,60 @@
+ 
+     fn call(&mut self, dst: Uri) -> Self::Future {
+         log::debug!("starting new connection '{:?}'", dst.host());
+-        let timeout = self.simple_timeout;
++        let timeout = effective_connect_timeout(self.simple_timeout);
++
++        // Ferrum patch 003: this method is reached only for a NEW physical
++        // connection — pooled reuse and HTTP/2 stream multiplexing never call
++        // the connector — so admission belongs exactly here, before any dial.
++        // The token is bound to the connection below and released when it dies.
++        let admission = match self.connection_admission.as_ref() {
++            None => None,
++            Some(hook) => match hook.admit(&dst) {
++                Ok(token) => Some(token),
++                Err(err) => return Box::pin(std::future::ready(Err::<Conn, BoxError>(err))),
++            },
++        };
++
++        // Ferrum patch 004: the dialed socket's descriptor, reported to the
++        // admission hook once the connection exists. Costs one small allocation
++        // per NEW physical connection; pooled reuse never reaches `call`.
++        let established = EstablishedFd::new();
+ 
+         // Local transports (UDS, Windows Named Pipes) skip proxies
+         #[cfg(any(unix, target_os = "windows"))]
+         if self.should_use_local_transport() {
+-            return Box::pin(with_timeout(
+-                self.clone().connect_local_transport(dst),
+-                timeout,
++            return Box::pin(with_admission(
++                with_timeout(self.clone().connect_local_transport(dst), timeout),
++                admission,
++                self.connection_admission.clone(),
++                established,
+             ));
+         }
+ 
+         for prox in self.proxies.iter() {
+             if let Some(intercepted) = prox.intercept(&dst) {
+-                return Box::pin(with_timeout(
+-                    self.clone().connect_via_proxy(dst, intercepted),
+-                    timeout,
++                return Box::pin(with_admission(
++                    with_timeout(
++                        self.clone()
++                            .connect_via_proxy(dst, intercepted, established.clone()),
++                        timeout,
++                    ),
++                    admission,
++                    self.connection_admission.clone(),
++                    established,
+                 ));
+             }
+         }
+ 
+-        Box::pin(with_timeout(
+-            self.clone().connect_with_maybe_proxy(dst, false),
+-            timeout,
++        Box::pin(with_admission(
++            with_timeout(
++                self.clone()
++                    .connect_with_maybe_proxy(dst, false, established.clone()),
++                timeout,
++            ),
++            admission,
++            self.connection_admission.clone(),
++            established,
+         ))
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -194,6 +194,7 @@
+ //!   over HTTPS.
+ //! - **rustls**: Enables TLS functionality provided by `rustls`.
+ //! - **rustls-no-provider**: Enables TLS provided by `rustls` without specifying a crypto provider.
++//! - **__rustls-ring**: Internal provider-selection arm for applications that pair reqwest with `rustls/ring`.
+ //! - **native-tls**: Enables TLS functionality provided by `native-tls`.
+ //! - **native-tls-vendored**: Enables the `vendored` feature of `native-tls`.
+ //! - **native-tls-no-alpn**: Enables `native-tls` without its `alpn` feature.
+@@ -362,6 +363,8 @@
+         Body, Client, ClientBuilder, Request, RequestBuilder, Response, Upgraded,
+     };
+     pub use self::proxy::{Proxy,NoProxy};
++    // Ferrum patch 003: physical-connection admission hook.
++    pub use self::connect::{ConnectionAdmission, ConnectionAdmissionToken};
+     #[cfg(feature = "__tls")]
+     // Re-exports, to be removed in a future release
+     pub use tls::{Certificate, Identity};

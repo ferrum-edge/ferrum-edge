@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Prepare the dependency security chain upgrade** (#5912,
+  GHSA-w9wp-h8wv-79jx, GHSA-8ffr-xgwf-xj56, GHSA-6g2r-675j-hx59).
+  Rebase all retained Hyper patches onto published 1.10.0 and reqwest patches
+  onto published 0.13.4, constrain the compatible GCP/OpenTelemetry and fixed
+  Smithy/xxhash versions, and add an optional hosted lockfile producer.
+  Hosted lockfile replacement, compilation and behavioral validation are
+  pending; existing locked alerts are not claimed resolved. See
+  [the evidence and remaining gates](docs/dependency-security-upgrade-5912.md).
+
 - **Conditional admin reads and restores use authoritative strong state tags**
   (#5992). Admin-only `GET /consumers/{id}/verification` returns the complete
   stored credential row with the same keyed ETag as ordinary consumer reads,

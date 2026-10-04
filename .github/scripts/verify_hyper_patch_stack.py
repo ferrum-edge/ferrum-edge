@@ -20,9 +20,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCS = ROOT / "docs/upstream-hyper-patches"
-VENDOR_REL = "vendor/hyper-1.9.0-ferrum-patched"
-ARCHIVE_SHA256 = "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca"
-UPSTREAM_REVISION = "0d6c7d5469baa09e2fb127ee3758a79b3271a4f0"
+VENDOR_REL = "vendor/hyper-1.10.0-ferrum-patched"
+ARCHIVE_SHA256 = "eb92f162bf56536459fc83c79b974bb12837acfed43d6bc370a7916d0ae15ecc"
+UPSTREAM_REVISION = "79dbab620bf14b96cd5d53a60ca35d7fe2ddbaf1"
 SERIES = (
     "001-upgraded-h2-connect-error-reset/hyper-upgraded-h2-connect-error-reset.patch",
     "002-min-data-frame-capacity/hyper-min-data-frame-capacity.patch",
@@ -52,7 +52,7 @@ def validate_member(member: tarfile.TarInfo) -> None:
         path.is_absolute()
         or ".." in path.parts
         or not path.parts
-        or path.parts[0] != "hyper-1.9.0"
+        or path.parts[0] != "hyper-1.10.0"
         or not (member.isfile() or member.isdir())
     ):
         raise ValueError(f"Unexpected crate archive member: {member.name!r}")
@@ -117,10 +117,12 @@ def verify(archive: Path, evidence: Path) -> None:
             for member in crate.getmembers():
                 validate_member(member)
             crate.extractall(destination, filter="data")
-        reconstructed = destination / "hyper-1.9.0"
+        reconstructed = destination / "hyper-1.10.0"
         provenance = json.loads((reconstructed / ".cargo_vcs_info.json").read_text())
         if provenance["git"]["sha1"] != UPSTREAM_REVISION:
             raise ValueError("Hyper crate VCS revision differs from the pinned source")
+        if provenance["git"].get("dirty") is not True:
+            raise ValueError("Hyper 1.10.0's published dirty VCS marker differs from the archive")
         for name in SERIES:
             patch_bytes = (DOCS / name).read_bytes()
             patch_hashes[name] = sha256(patch_bytes)
@@ -141,6 +143,7 @@ def verify(archive: Path, evidence: Path) -> None:
     report = {
         "archive_sha256": ARCHIVE_SHA256,
         "upstream_revision": UPSTREAM_REVISION,
+        "upstream_vcs_dirty": True,
         "patch_sha256": patch_hashes,
         "files_verified": len(expected),
         "comparison": "exact vendor bytes and LF-normalized integrity manifest hashes",
@@ -159,10 +162,10 @@ class VerificationTests(unittest.TestCase):
             validate_series(list(SERIES), set(SERIES) | {"unexpected.patch"})
 
     def test_archive_members_cannot_escape_or_link(self) -> None:
-        for name in ("../src/mod.rs", "/hyper-1.9.0/src/mod.rs", "hyper-1.9.0/../outside"):
+        for name in ("../src/mod.rs", "/hyper-1.10.0/src/mod.rs", "hyper-1.10.0/../outside"):
             with self.assertRaises(ValueError):
                 validate_member(tarfile.TarInfo(name))
-        link = tarfile.TarInfo("hyper-1.9.0/src/link")
+        link = tarfile.TarInfo("hyper-1.10.0/src/link")
         link.type = tarfile.SYMTYPE
         with self.assertRaises(ValueError):
             validate_member(link)

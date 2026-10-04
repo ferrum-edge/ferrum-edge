@@ -28,6 +28,16 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Unreleased
 
+**Dependency security chain candidate (#5912).** The proposed Hyper 1.10.0
+and reqwest 0.13.4 vendor refresh retains every local patch and preserves the
+selected ordinary/FIPS crypto profiles. GCP uses the compatible GAX 0.7.14 /
+OpenTelemetry 0.32 generation with SDK >=0.32.1; Smithy JSON and xxhash have
+fixed-version constraints. The committed lockfiles still require genuine hosted
+Cargo output and validation before this candidate is mergeable or releasable.
+Do not treat the current locked dependencies as remediated. See
+[the security upgrade record](dependency-security-upgrade-5912.md) for exact
+provenance, patch-port risks and the root-owned CI binding updates.
+
 **Conditional admin snapshots and restore (#5992).** Use an admin-role JWT
 for `GET /consumers/{id}/verification` when checking the complete stored
 credential state. Ordinary consumer reads retain their redacted projection.

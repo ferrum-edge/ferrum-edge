@@ -109,7 +109,7 @@ diff --git a/src/proto/h2/upgrade.rs b/src/proto/h2/upgrade.rs
  
  impl Read for H2Upgraded {
      fn poll_read(
-@@ -278,3 +316,172 @@
+@@ -279,3 +317,172 @@
          std::io::Error::new(std::io::ErrorKind::Other, e)
      }
  }
@@ -285,7 +285,7 @@ diff --git a/src/proto/h2/upgrade.rs b/src/proto/h2/upgrade.rs
 diff --git a/src/upgrade.rs b/src/upgrade.rs
 --- a/src/upgrade.rs
 +++ b/src/upgrade.rs
-@@ -160,6 +160,33 @@
+@@ -161,6 +161,33 @@
              }),
          }
      }
@@ -319,7 +319,7 @@ diff --git a/src/upgrade.rs b/src/upgrade.rs
  }
  
  impl Read for Upgraded {
-@@ -312,6 +339,16 @@
+@@ -313,6 +340,16 @@
              Err(self)
          }
      }
