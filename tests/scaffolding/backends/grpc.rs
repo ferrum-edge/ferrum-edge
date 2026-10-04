@@ -200,6 +200,64 @@ impl ScriptedGrpcBackendBuilder {
         self
     }
 
+    /// Route each RPC to its matching script on any accepted connection.
+    ///
+    /// Use instead of `steps` / `connection_scripts` when frontend connections
+    /// may use different pooled backend connections. Each script must begin
+    /// with `AcceptRpc` or `AcceptStreamingRpc` and handle exactly one RPC.
+    /// Connections remain open for further RPCs; unmatched or ambiguous RPCs
+    /// fail the fixture rather than receiving another method's response.
+    pub fn rpc_scripts(
+        mut self,
+        scripts: impl IntoIterator<Item = Vec<GrpcStep>>,
+    ) -> std::io::Result<Self> {
+        let mut routes = Vec::new();
+        for script in scripts {
+            let mut steps = script.into_iter();
+            let (matcher, drain_body) = match steps.next() {
+                Some(GrpcStep::AcceptRpc(matcher)) => (matcher, true),
+                Some(GrpcStep::AcceptStreamingRpc(matcher)) => (matcher, false),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "RPC script must start with AcceptRpc or AcceptStreamingRpc",
+                    ));
+                }
+            };
+            let mut lowered = Vec::new();
+            if drain_body {
+                lowered.push(H2Step::DrainRequestBody);
+            }
+            for step in steps {
+                if matches!(step, GrpcStep::AcceptRpc(_) | GrpcStep::AcceptStreamingRpc(_)) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "RPC script must handle exactly one RPC",
+                    ));
+                }
+                lowered.extend(lower_grpc_step(step));
+            }
+            routes.push((
+                MatchHeaders::custom(move |stream| (matcher.0)(stream)),
+                lowered,
+            ));
+        }
+        if routes.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "at least one RPC script is required",
+            ));
+        }
+        self.h2_builder = self
+            .h2_builder
+            .steps([
+                H2Step::ExpectHeaders(MatchHeaders::any()),
+                H2Step::SelectStreamScript(routes),
+            ])
+            .repeat_script(true);
+        Ok(self)
+    }
+
     /// Override pre-handshake H2 settings (window sizes, max concurrent
     /// streams).
     pub fn with_settings(mut self, settings: ConnectionSettings) -> Self {
@@ -437,6 +495,148 @@ mod tests {
     use h2::client as h2_client;
     use http::Request as HttpRequest;
     use tokio::net::TcpStream;
+
+    /// RPC routing must work across distinct connections and on a reused
+    /// connection, including a bidi request that never sends END_STREAM.
+    #[tokio::test]
+    async fn grpc_rpc_scripts_route_across_new_and_reused_connections() {
+        const CLIENT: &str = "/ferrum.Echo/ClientStream";
+        const SERVER: &str = "/ferrum.Echo/ServerStream";
+        const BIDI: &str = "/ferrum.Echo/Bidi";
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let mut scripts = Vec::new();
+        for path in [SERVER, CLIENT, BIDI] {
+            scripts.push(vec![
+                if path == BIDI {
+                    GrpcStep::AcceptStreamingRpc(MatchRpc::method(path))
+                } else {
+                    GrpcStep::AcceptRpc(MatchRpc::method(path))
+                },
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondMessage(Bytes::from_static(path.as_bytes())),
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+            ]);
+        }
+        let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+            .rpc_scripts(scripts)
+            .expect("RPC scripts")
+            .spawn()
+            .expect("spawn");
+        let wire_body = Bytes::from_static(b"\0\0\0\0\x03one\0\0\0\0\x03two");
+        let mut drivers = tokio::task::JoinSet::new();
+        let mut senders = Vec::new();
+        for paths in [vec![CLIENT], vec![BIDI, SERVER]] {
+            let tcp = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("tcp connect");
+            let (mut sender, connection) = h2_client::handshake(tcp).await.expect("h2 handshake");
+            drivers.spawn(connection);
+            for path in paths {
+                sender = sender.ready().await.expect("sender ready");
+                let req = HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("http://127.0.0.1:{port}{path}"))
+                    .header("content-type", "application/grpc")
+                    .header("te", "trailers")
+                    .body(())
+                    .expect("req");
+                let (response_fut, mut req_body) =
+                    sender.send_request(req, false).expect("send request");
+                req_body
+                    .send_data(wire_body.clone(), path != BIDI)
+                    .expect("send body");
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let response = response_fut.await.expect("response");
+                    assert_eq!(response.status().as_u16(), 200);
+                    let (_, mut body) = response.into_parts();
+                    let mut received = Vec::new();
+                    while let Some(frame) = body.data().await {
+                        let chunk = frame.expect("response DATA");
+                        body.flow_control()
+                            .release_capacity(chunk.len())
+                            .expect("release capacity");
+                        received.extend_from_slice(&chunk);
+                    }
+                    let mut expected = BytesMut::new();
+                    expected.put_u8(0);
+                    expected.put_u32(path.len() as u32);
+                    expected.extend_from_slice(path.as_bytes());
+                    assert_eq!(received.as_slice(), expected.as_ref());
+                    let trailers = body
+                        .trailers()
+                        .await
+                        .expect("read trailers")
+                        .expect("status trailers");
+                    assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+                })
+                .await
+                .expect("RPC must respond even with an open bidi upload");
+            }
+            // Keep the first connection alive while opening the second.
+            senders.push(sender);
+        }
+        let observed = backend.received_streams().await;
+        assert_eq!(backend.handshakes_completed(), 2);
+        assert_eq!(observed.len(), 3);
+        for path in [CLIENT, SERVER, BIDI] {
+            let streams: Vec<_> = observed
+                .iter()
+                .filter(|stream| stream.path == path)
+                .collect();
+            assert_eq!(streams.len(), 1, "streams={observed:?}");
+            if path != BIDI {
+                assert_eq!(streams[0].body.as_slice(), wire_body.as_ref());
+            }
+        }
+        backend.assert_no_matcher_mismatches().await;
+        backend.assert_no_step_errors().await;
+    }
+
+    #[tokio::test]
+    async fn grpc_rpc_scripts_reject_unmatched_and_ambiguous_methods() {
+        const KNOWN: &str = "/ferrum.Echo/Known";
+        for (path, script_count) in [("/ferrum.Echo/Unknown", 1), (KNOWN, 2)] {
+            let reservation = reserve_port().await.expect("port");
+            let port = reservation.port;
+            let script = vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(KNOWN)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+            ];
+            let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+                .rpc_scripts(vec![script; script_count])
+                .expect("RPC scripts")
+                .spawn()
+                .expect("spawn");
+            let tcp = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("tcp connect");
+            let (mut sender, connection) = h2_client::handshake(tcp).await.expect("h2 handshake");
+            let mut drivers = tokio::task::JoinSet::new();
+            drivers.spawn(connection);
+            sender = sender.ready().await.expect("sender ready");
+            let req = HttpRequest::builder()
+                .method("POST")
+                .uri(format!("http://127.0.0.1:{port}{path}"))
+                .header("content-type", "application/grpc")
+                .body(())
+                .expect("req");
+            let (response, _) = sender.send_request(req, true).expect("send request");
+            let result = tokio::time::timeout(Duration::from_secs(3), response)
+                .await
+                .expect("invalid RPC must fail promptly");
+            assert!(result.is_err(), "unmatched or ambiguous RPC must not succeed");
+            assert_eq!(backend.matcher_mismatches(), 1);
+            assert_eq!(backend.received_stream_count(), 1);
+        }
+    }
 
     /// Happy-path: a backend answers a Unary RPC with a well-formed gRPC
     /// message and a zero grpc-status.
