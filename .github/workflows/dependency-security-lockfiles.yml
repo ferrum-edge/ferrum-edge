@@ -58,8 +58,8 @@ jobs:
           echo '219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3  security-lockfiles/evidence/reqwest-0.13.4.crate' | sha256sum --check
           tar -xzf security-lockfiles/evidence/reqwest-0.13.4.crate \
             -C security-lockfiles/evidence
-          git -C security-lockfiles/evidence/reqwest-0.13.4 apply \
-            "$GITHUB_WORKSPACE/docs/upstream-reqwest-patches/reqwest-ferrum.patch"
+          git apply --directory=security-lockfiles/evidence/reqwest-0.13.4 \
+            docs/upstream-reqwest-patches/reqwest-ferrum.patch
           diff -r security-lockfiles/evidence/reqwest-0.13.4/src \
             vendor/reqwest-0.13.4-ferrum-patched/src
           cmp security-lockfiles/evidence/reqwest-0.13.4/Cargo.toml \

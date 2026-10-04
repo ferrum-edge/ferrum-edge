@@ -66,11 +66,12 @@ Patch 004 never requires or restores the former fixed 1 KiB threshold.
   for real, the pipe sets the flag, sends
   `RST_STREAM(CANCEL)` and fails the body. Dropping the pipe releases the
   request body.
-- **With a bound configured, the pipe polls the body before waiting for
-  capacity**, so time spent waiting for the client to send more is never
-  counted as a write stall. It holds at most one chunk, as stock hyper already
-  does when a 1-byte claim admits a whole chunk. Without the extension the pipe
-  behaves exactly as before.
+- **The pipe polls the body before waiting for capacity**, preserving Hyper
+  1.10's scheduling with or without the extension. Time spent waiting for the
+  client to send more is never counted as a write stall. It holds at most one
+  chunk and reserves only that chunk's actual length; an idle body cannot claim
+  connection window needed by another stream. Without the extension, the
+  pending DATA and positive-capacity behavior remain, with no write-stall timer.
 
 Ferrum attaches the extension instead of installing the pump on two paths:
 
