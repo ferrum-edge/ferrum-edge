@@ -1,0 +1,174 @@
+name: gRPC Dispatch Stack Qualification
+
+# Temporary, isolated evidence for PR #5993's cd4 lib stack overflow. The
+# required CI jobs keep their ordinary parallelism and remain unchanged.
+on:
+  pull_request:
+    paths:
+      - src/proxy/mod.rs
+      - tests/unit/gateway_core/frontend_affinity_tests.rs
+      - tests/unit/gateway_core/native_grpc_dispatch_auth_lifetime_tests.rs
+      - .github/workflows/grpc-dispatch-stack-qualification.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: grpc-dispatch-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  isolated-listeners:
+    if: github.event.pull_request.number == 5993 && github.head_ref == 'fix/grpc-dispatch-auth-lifetime'
+    name: Isolated listener stack (${{ matrix.revision }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [cd4, repair]
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      RUST_BACKTRACE: "1"
+      DIAGNOSTIC_REVISION: ${{ matrix.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ matrix.revision == 'cd4' && 'cd4b02d187051c0d75ba74905d448be3f296cea3' || github.event.pull_request.head.sha }}
+          persist-credentials: false
+          clean: false
+
+      - name: Prepare isolated evidence and native backtrace capture
+        run: |
+          set -euo pipefail
+          diagnostic_dir="$RUNNER_TEMP/grpc-dispatch-stack"
+          mkdir -p "$diagnostic_dir"
+          git rev-parse HEAD | tee "$diagnostic_dir/sha.txt"
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends gdb
+          sudo sysctl -w "kernel.core_pattern=$diagnostic_dir/core.%p"
+          # Match the existing unit lane's compile memory headroom. No stack
+          # environment override or runtime thread-stack change is made.
+          sudo fallocate -l 12G /mnt/ferrum-stack-qualification-swap
+          sudo chmod 600 /mnt/ferrum-stack-qualification-swap
+          sudo mkswap /mnt/ferrum-stack-qualification-swap
+          sudo swapon /mnt/ferrum-stack-qualification-swap
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: ci-debug
+          save: "false"
+          cache-on-failure: "false"
+
+      - name: Compile the exact revision's lib test binary
+        id: build
+        run: |
+          set -euo pipefail
+          diagnostic_dir="$RUNNER_TEMP/grpc-dispatch-stack"
+          cargo test --locked --lib --no-run --message-format=json \
+            2> >(tee "$diagnostic_dir/compile.stderr.log" >&2) \
+            | tee "$diagnostic_dir/compile.jsonl"
+          test_binary="$(python3 - "$diagnostic_dir/compile.jsonl" <<'PY'
+          import json
+          import sys
+
+          binaries = set()
+          with open(sys.argv[1], encoding="utf-8") as messages:
+              for line in messages:
+                  message = json.loads(line)
+                  if (message.get("reason") == "compiler-artifact"
+                          and message.get("profile", {}).get("test")
+                          and message.get("target", {}).get("kind") == ["lib"]
+                          and message.get("executable")):
+                      binaries.add(message["executable"])
+          if len(binaries) != 1:
+              raise SystemExit(f"expected one lib test binary, found {len(binaries)}")
+          print(binaries.pop())
+          PY
+          )"
+          printf 'LIB_TEST_BINARY=%s\n' "$test_binary" >> "$GITHUB_ENV"
+
+      - name: Run every gateway listener test in its own process
+        run: |
+          set -euo pipefail
+          ulimit -c unlimited
+          shopt -s nullglob
+          diagnostic_dir="$RUNNER_TEMP/grpc-dispatch-stack"
+          "$LIB_TEST_BINARY" proxy::gateway_listener::tests:: --list \
+            | tee "$diagnostic_dir/list.log"
+          mapfile -t cases < <(sed -n 's/^\(proxy::gateway_listener::tests::.*\): test$/\1/p' \
+            "$diagnostic_dir/list.log")
+          if [ "${#cases[@]}" -eq 0 ]; then
+            echo "::error::no gateway listener tests discovered"
+            exit 1
+          fi
+          failed=0
+          printf 'revision\ttest\texit_status\n' > "$diagnostic_dir/results.tsv"
+          for case in "${cases[@]}"; do
+            log="$diagnostic_dir/${case##*::}.log"
+            printf 'START %s %s\n' "$DIAGNOSTIC_REVISION" "$case" | tee -a "$log"
+            status=0
+            timeout --signal=TERM --kill-after=10s 120s \
+              "$LIB_TEST_BINARY" "$case" --exact --nocapture --test-threads=1 \
+              >> "$log" 2>&1 || status=$?
+            cat "$log"
+            # An empty or ignored selection must not count as qualification.
+            if [ "$status" -eq 0 ] && ! grep -q 'test result: ok. 1 passed;' "$log"; then
+              status=1
+            fi
+            printf '%s\t%s\t%s\n' "$DIAGNOSTIC_REVISION" "$case" "$status" \
+              >> "$diagnostic_dir/results.tsv"
+            for core in "$diagnostic_dir"/core.*; do
+              gdb --batch "$LIB_TEST_BINARY" "$core" \
+                -ex 'set print frame-arguments none' \
+                -ex 'thread apply all bt 64' \
+                > "$diagnostic_dir/${case##*::}.backtrace.log" 2>&1 || true
+              cat "$diagnostic_dir/${case##*::}.backtrace.log"
+              # Retain symbolized stacks only, never process memory or locals.
+              rm -f -- "$core"
+            done
+            if [ "$status" -ne 0 ]; then
+              echo "::error::$DIAGNOSTIC_REVISION failed $case (exit $status)"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      - name: Qualify repaired authorization, frontend lifetime, and admission paths
+        if: always() && matrix.revision == 'repair' && steps.build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          diagnostic_dir="$RUNNER_TEMP/grpc-dispatch-stack"
+          failed=0
+          for filter in native_grpc_dispatch_auth_lifetime_tests frontend_affinity_tests frontend_h2_admission_tests; do
+            cargo test --locked --test unit_gateway_core_tests "$filter" -- --nocapture \
+              2>&1 | tee "$diagnostic_dir/$filter.log" || failed=1
+          done
+          exit "$failed"
+
+      - name: Qualify repaired real-pool affinity and backend stream retention
+        if: always() && matrix.revision == 'repair' && steps.build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          diagnostic_dir="$RUNNER_TEMP/grpc-dispatch-stack"
+          failed=0
+          for filter in test_grpc_pool_ test_hyper_h2_stream_lifetime_; do
+            cargo test --locked --test integration_tests "$filter" -- --nocapture \
+              2>&1 | tee "$diagnostic_dir/$filter.log" || failed=1
+          done
+          exit "$failed"
+
+      - name: Retain exact-SHA logs, test names, and native backtraces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: grpc-dispatch-stack-${{ matrix.revision }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/grpc-dispatch-stack/*.txt
+            ${{ runner.temp }}/grpc-dispatch-stack/*.log
+            ${{ runner.temp }}/grpc-dispatch-stack/*.tsv
+            ${{ runner.temp }}/grpc-dispatch-stack/*.jsonl
+          if-no-files-found: error
+          retention-days: 7

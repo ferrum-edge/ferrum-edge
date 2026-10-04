@@ -14819,7 +14819,7 @@ async fn handle_connection(
             diagnostic_slot: None,
         };
         async move {
-            let request = handle_proxy_request_on_frontend_port(
+            let request = boxed_handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -23773,7 +23773,7 @@ async fn handle_tls_connection(
             diagnostic_slot: None,
         };
         async move {
-            let request = handle_proxy_request_on_frontend_port(
+            let request = boxed_handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -32065,7 +32065,7 @@ pub async fn handle_proxy_request(
     let peer_spiffe_extraction_cache = tls_client_cert_der.as_ref().map(|_| {
         Arc::new(crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache::new())
     });
-    handle_proxy_request_on_frontend_port(
+    boxed_handle_proxy_request_on_frontend_port(
         req,
         Arc::new(state),
         remote_addr,
@@ -32080,6 +32080,41 @@ pub async fn handle_proxy_request(
         },
     )
     .await
+}
+
+/// Keep the frontend request future behind a pointer before the service moves
+/// it into the HTTP/2 affinity scope. That scope nests task-local futures and
+/// returns the response-side stream guard; embedding the request in each layer
+/// multiplies its construction temporaries on the connection driver's stack.
+///
+/// Box an async trampoline out of line, rather than constructing the handler
+/// as a `Box::pin` argument. Polling stays in the caller's task and affinity
+/// scope, and dropping the box still cancels the request and its guards.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_handle_proxy_request_on_frontend_port(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+    remote_addr: SocketAddr,
+    is_tls: bool,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
+    connection_metadata: RequestConnectionMetadata,
+) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
+    Box::pin(async move {
+        handle_proxy_request_on_frontend_port(
+            req,
+            state,
+            remote_addr,
+            is_tls,
+            tls_client_cert_der,
+            tls_client_cert_chain_der,
+            mtls_auth_connection_cache,
+            connection_metadata,
+        )
+        .await
+    })
 }
 
 /// HTTP/1.1 and HTTP/2 frontend service boundary: every response the gateway
@@ -32382,9 +32417,11 @@ async fn admit_proxy_request_on_frontend_port(
 /// not bound those earlier stack temporaries. Rejection-only boxes also leave
 /// the successful direct-H2 dispatch pipeline embedded in every service call.
 ///
-/// Construct out of line so the large temporary is gone before polling the
-/// pipeline. The caller retains the request guard and attaches it to the body
-/// exactly as before; dropping this future still cancels the same request.
+/// Box an async trampoline out of line so construction captures only the
+/// arguments, rather than first materializing the full routing future as a
+/// `Box::pin` argument on the admission poll stack. The caller retains the
+/// request guard and attaches it to the body exactly as before; dropping this
+/// future still cancels the same request.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_handle_proxy_request_inner(
@@ -32397,16 +32434,19 @@ fn boxed_handle_proxy_request_inner(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
-    Box::pin(handle_proxy_request_inner(
-        req,
-        state,
-        remote_addr,
-        is_tls,
-        tls_client_cert_der,
-        tls_client_cert_chain_der,
-        mtls_auth_connection_cache,
-        connection_metadata,
-    ))
+    Box::pin(async move {
+        handle_proxy_request_inner(
+            req,
+            state,
+            remote_addr,
+            is_tls,
+            tls_client_cert_der,
+            tls_client_cert_chain_der,
+            mtls_auth_connection_cache,
+            connection_metadata,
+        )
+        .await
+    })
 }
 
 /// Inner implementation of [`handle_proxy_request`] — separated so the outer

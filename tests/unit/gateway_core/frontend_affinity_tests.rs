@@ -155,6 +155,68 @@ fn http1_requests_allocate_no_affinity_state() {
     assert!(stream.is_some());
 }
 
+/// The request must be boxed before entering the nested task-local scopes.
+/// Otherwise constructing their futures copies the handler's frame through
+/// every layer, even on requests that never dispatch gRPC.
+#[test]
+fn frontend_services_box_requests_before_the_affinity_scope() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    for handler in ["handle_connection", "handle_tls_connection"] {
+        let marker = format!("async fn {handler}(");
+        let service = source
+            .split_once(marker.as_str())
+            .expect("frontend connection handler")
+            .1
+            .split_once("let svc = service_fn(")
+            .expect("frontend service")
+            .1
+            .split_once("let observation = http2_pool::H2DriverObservation")
+            .expect("end of frontend service")
+            .0;
+        assert!(
+            service.contains("let request = boxed_handle_proxy_request_on_frontend_port("),
+            "{handler} must construct the request behind a pointer before scoping it"
+        );
+        assert!(service.contains("stream.run_request(request).await"));
+        assert!(service.contains("body.with_frontend_stream(stream)"));
+    }
+
+    let library_entry = source
+        .split_once("pub async fn handle_proxy_request(")
+        .expect("library request entry point")
+        .1
+        .split_once("fn boxed_handle_proxy_request_on_frontend_port(")
+        .expect("frontend boxing factory")
+        .0;
+    assert!(library_entry.contains("boxed_handle_proxy_request_on_frontend_port("));
+
+    for (factory, handler) in [
+        (
+            "boxed_handle_proxy_request_on_frontend_port",
+            "handle_proxy_request_on_frontend_port",
+        ),
+        (
+            "boxed_handle_proxy_request_inner",
+            "handle_proxy_request_inner",
+        ),
+    ] {
+        let marker = format!("#[inline(never)]\nfn {factory}(");
+        let body = source
+            .split_once(marker.as_str())
+            .expect("out-of-line request boxing factory")
+            .1
+            .split_once("\n}\n")
+            .expect("end of boxing factory")
+            .0;
+        assert!(body.contains("Box::pin(async move {"));
+        assert!(body.contains(format!("{handler}(").as_str()));
+        assert!(
+            !body.contains(format!("Box::pin({handler}(").as_str()),
+            "{factory} must capture arguments before constructing the handler future"
+        );
+    }
+}
+
 #[tokio::test]
 async fn early_responses_keep_uploads_counted_until_both_halves_terminate() {
     use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;

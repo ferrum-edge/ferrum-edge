@@ -1016,10 +1016,8 @@ async fn late_sidecar_readiness_wake_preserves_connect_before_client_winner() {
 
     let start = tokio::time::Instant::now();
     let plan = plan_after(Duration::from_millis(200));
-    let dispatch = compose_dispatch_phase_bound_for_test(
-        Some(start + Duration::from_millis(100)),
-        Some(&plan),
-    );
+    let dispatch = compose_dispatch_phase_bound_for_test(Some(100), Some(&plan));
+    assert!(!dispatch.authorization_wins());
     let bound =
         compose_backend_handoff_bound_for_test(Some(start + Duration::from_millis(50)), &dispatch);
     let ready = AtomicBool::new(false);
