@@ -2813,6 +2813,23 @@ jobs:
           FERRUM_REDIS_REQUIRED: "1"
           RUST_BACKTRACE: 1
 
+      - name: Run semantic cache Redis quarantine regressions
+        run: |
+          set -euo pipefail
+          archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
+          cargo nextest run \
+            --archive-file "$archive_file" \
+            --workspace-remap . \
+            --run-ignored=all \
+            --no-tests=fail \
+            --no-fail-fast \
+            -j 1 \
+            functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_safe
+        env:
+          FERRUM_SKIP_GATEWAY_BUILD: "1"
+          FERRUM_REDIS_REQUIRED: "1"
+          RUST_BACKTRACE: 1
+
       - name: Run rate limiting Redis regressions
         # Issues #5517-#5519: sustained single/multi-window admission, shared
         # concurrent budgets, and default per-pod fallback with live recovery.
@@ -2836,6 +2853,7 @@ jobs:
         run: |
           echo "## Plugin Hardening Redis Regression" >> $GITHUB_STEP_SUMMARY
           echo "- test_rate_limiting_redis (all HTTP rate-limit Redis regressions)" >> $GITHUB_STEP_SUMMARY
+          echo "- functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_safe" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict" >> $GITHUB_STEP_SUMMARY
