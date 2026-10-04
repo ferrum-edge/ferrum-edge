@@ -612,8 +612,7 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
     let relay_config = RedisConfig::from_plugin_config(&plugin_config, &prefix)
         .unwrap()
         .unwrap();
-    let compare =
-        Arc::new(RedisRateLimitClient::new(relay_config, None, false, None).unwrap());
+    let compare = Arc::new(RedisRateLimitClient::new(relay_config, None, false, None).unwrap());
     let before = relay.reply_bytes.load(Ordering::SeqCst);
     assert!(
         !compare
