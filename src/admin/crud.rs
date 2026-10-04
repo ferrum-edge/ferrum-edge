@@ -714,7 +714,9 @@ impl NamespaceConfigAdmissionGuard {
                 anyhow::anyhow!("namespace config admission keeper stopped unexpectedly")
             })?;
             if report.outcome != LeaseRenewalOutcome::Stopped {
-                anyhow::bail!("namespace config admission lease was lost before transaction handoff");
+                anyhow::bail!(
+                    "namespace config admission lease was lost before transaction handoff"
+                );
             }
         }
         let held = self.ensure_held();

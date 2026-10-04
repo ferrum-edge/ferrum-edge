@@ -7733,7 +7733,10 @@ impl DatabaseStore {
             // The Admin keeper has handed renewal to this transaction. A row
             // lock prevents takeover even if the original TTL elapses, and the
             // commit gate renews only this pinned owner and generation.
-            let lease = graph.admission_lease.as_ref().ok_or(BatchAdmissionLeaseLost)?;
+            let lease = graph
+                .admission_lease
+                .as_ref()
+                .ok_or(BatchAdmissionLeaseLost)?;
             self.verify_namespace_config_admission_lease_tx(&mut tx, graph.namespace, lease)
                 .await?;
         }
@@ -8003,8 +8006,9 @@ impl DatabaseStore {
             "UPDATE config_admission_locks SET expires_at = {now} + ? \
              WHERE namespace = ? AND owner = ? AND generation = ?"
         ));
-        let generation = i64::try_from(lease.generation)
-            .map_err(|_| anyhow::anyhow!("namespace config admission generation is out of range"))?;
+        let generation = i64::try_from(lease.generation).map_err(|_| {
+            anyhow::anyhow!("namespace config admission generation is out of range")
+        })?;
         let result = sqlx::query(&sql)
             .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
             .bind(namespace)
