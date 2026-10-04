@@ -1,7 +1,8 @@
 # Dependency security upgrade #5912
 
-Candidate implementation as of 2026-10-04. This record does not claim that a
-Dependabot alert is closed or that hosted build, formatting or tests passed.
+Implementation and hosted lockfile resolution as of 2026-10-04. This record
+does not claim that a Dependabot alert is closed on the default branch or that
+hosted build, formatting or behavioral tests passed.
 
 ## Verified advisory scope
 
@@ -15,8 +16,9 @@ The repository's open Dependabot alerts were read through the GitHub API:
 | 7 | GHSA-6g2r-675j-hx59 | `xxhash-rust` | `tests/performance/mesh` | 0.8.16 |
 
 All committed lockfiles were inspected statically. Only the root carries the
-affected SDK and Smithy JSON. The root and mesh carry xxhash 0.8.15; fuzz
-already carries fixed xxhash 0.8.18. Other standalone benchmark graphs, eBPF,
+affected SDK and Smithy JSON. Before this change, the root and mesh carried xxhash 0.8.15; fuzz
+already carried fixed xxhash 0.8.18. The imported hosted lockfiles use xxhash
+0.8.16 in root/mesh and retain 0.8.18 in fuzz. Other standalone benchmark graphs, eBPF,
 and the committed dimpl regression graph contain none of these affected
 packages. Root, mesh and fuzz are the three graphs consuming Ferrum's Hyper
 and reqwest path patches. Independent HTTP benchmark clients use registry
@@ -54,9 +56,9 @@ Secret Manager builder, endpoint, anonymous credentials and payload APIs retain
 the shapes used by `src/secrets/gcp.rs`.
 
 The producer selects Smithy runtime API 1.12.3, types 1.4.9, schema 0.1.0 and
-the existing async 1.2.14, rather than silently moving the AWS runtime onto its
+the existing async 1.2.14 and runtime API macros 1.0.0, rather than silently moving the AWS runtime onto its
 newer 1.94.1 compiler generation. The selected runtime API and types require
-Rust 1.91.1; schema requires 1.91. No toolchain, build profile, crypto feature
+Rust 1.91.1; schema and the macro crate require 1.91. No toolchain, build profile, crypto feature
 pair or runtime FIPS policy is changed. Cloud secrets remain deliberately
 unsupported for use in enforcing FIPS mode; this upgrade makes no new claim
 about that combination.
@@ -111,18 +113,35 @@ and supported base FIPS feature graphs. It does not flatten the workspace or
 invent Cargo entries/checksums. The artifact includes lockfiles, source SHA,
 Cargo/Rust versions, metadata, feature trees, checksums and a lockfile diff.
 
-**Pending:** the three committed lockfiles have not yet been replaced with
-hosted Cargo output. Existing vulnerable entries are deliberately left visible
-until a successful artifact is available. This candidate must not be merged or
-released, and #5912 must not be treated as resolved, in that state.
+**Hosted resolution passed:** [run 37205581999](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37205581999)
+produced artifact `dependency-security-lockfiles-993578017d5b02766cafd9bbae0f2b27d404c402-1`
+(ID `11304234065`) from source SHA
+`993578017d5b02766cafd9bbae0f2b27d404c402`, with Cargo and Rust 1.99.0.
+Its source SHA and all three lockfile hashes were verified before the original
+artifact bytes were imported. No graph or checksum was hand-edited.
 
-Root must review/admit the new workflow under the trusted-base security policy
-if required; this branch does not modify or bypass that policy. Retrieve the
-successful exact-head artifact, verify `source-sha.txt` and artifact checksums,
-copy only its three `Cargo.lock` files, commit and push. Then run hosted
-formatting, compile, dependency audit, vendor, secret-provider, small-window,
-write-stall, upgrade-error and stream-lifetime regressions against that head.
-The artifact producer establishes resolution, not compilation or behavior.
+| Imported lockfile | SHA-256 |
+|---|---|
+| `Cargo.lock` | `296c380b49cb46ed420da48f9a88ce64e8eab2a778fa331603e73e3d32078d10` |
+| `fuzz/Cargo.lock` | `af0f00f7d3cc62c75dc2bd6c177531732afc9a8e725dcf51a4c1bd10f804b466` |
+| `tests/performance/mesh/Cargo.lock` | `d9207e05814190457ebdcfd053f6f8b012102d4f2eee162a8786f2fc09c3f741` |
+
+The producer passed vendor reconstruction, metadata resolution for all three
+actual graphs, security-floor checks over every committed lockfile, exact vendor
+path/uniqueness checks, the crypto manifest check, and ordinary/supported base
+FIPS feature-tree checks. Root now locks SDK 0.32.1 and Smithy JSON 0.62.7.
+Root/mesh/fuzz each resolve one Hyper 1.10.0 and one reqwest 0.13.4 from their
+intended path patches. This demonstrates resolution and feature selection,
+not compilation, behavioral correctness, or the AWS SDK's actual MSRV build.
+The runtime versions listed above retain their published compiler floors.
+
+**Remaining:** root must complete any new-workflow trusted-base admission and
+run hosted formatting, compile, dependency audit, vendor, secret-provider,
+small-window, write-stall, upgrade-error and stream-lifetime regressions on the
+final pushed head. Existing FIPS CI rejected the pre-import head's stale
+`--locked` graph; it must be rechecked after import. Hosted job success for the
+lock producer does not replace these gates. Do not merge or release before
+those gates and the owner-controlled bindings below are complete.
 
 Root/automation owners must update the guarded existing `ci.yml` bindings:
 the Hyper archive URL/name/checksum near lines 1714–1718 and every Hyper vendor
@@ -136,6 +155,7 @@ Material risks pending hosted evidence: the body-first reservation adaptation
 changes HTTP/2 capacity scheduling; reset polling precedes pending DATA on every
 repoll; upstream Hyper adds its lock module and request-dispatch changes; and
 reqwest changes TLS/DNS/response/HTTP/3 internals. The new producer and graph
-checker have not been executed locally. A resolver incompatibility, policy
+checker passed on the hosted resolver head and have not been executed locally.
+A resolver incompatibility, policy
 admission rejection, feature-policy failure or hosted formatting diff requires
 a follow-up before this security chain can be considered fixed.
