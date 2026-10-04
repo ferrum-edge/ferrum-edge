@@ -11735,6 +11735,92 @@ pub mod _test_support {
         })
     }
 
+    /// Exercise the production native-H3 pool with a captured plan and a
+    /// controlled TLS-config checkout, including the explicit-target path.
+    pub async fn native_h3_pooled_dispatch_for_test<F>(
+        pool: &crate::http3::client::Http3ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        url: &str,
+        body: bytes::Bytes,
+        auth: &RequestAuthLifetimePlanForTest,
+        explicit_target: bool,
+        tls_config: F,
+    ) -> Result<crate::http3::client::H3StreamingResponse, H3LifetimeErrorForTest>
+    where
+        F: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        let bound = crate::http3::client::H3Authorization::new(None, Some(auth));
+        let result = if explicit_target {
+            pool.request_with_target_streaming_under_authorization(
+                proxy,
+                &proxy.backend_host,
+                proxy.backend_port,
+                proxy.backend_port,
+                "POST",
+                url,
+                &[],
+                body,
+                bound,
+                || tls_config,
+            )
+            .await
+        } else {
+            pool.request_streaming_under_authorization(
+                proxy,
+                "POST",
+                url,
+                &[],
+                body,
+                bound,
+                || tls_config,
+            )
+            .await
+        };
+        result.map_err(|error| {
+            (
+                error.authorization_expiry(),
+                error.request_on_wire(),
+                error.client_deadline_expired(),
+            )
+        })
+    }
+
+    /// The sidecar readiness terminal chosen from the captured connect winner.
+    pub fn sidecar_readiness_connect_terminal_for_test() -> (u16, Option<String>, bool) {
+        let response = crate::proxy::sidecar_readiness_connect_timeout_response(true, None);
+        (
+            response.status_code,
+            response.headers.get("grpc-status").cloned(),
+            response.request_on_wire,
+        )
+    }
+
+    /// Health classification stays neutral at both authorization boundaries;
+    /// dispatch diagnostics retain the explicit request handoff state.
+    pub fn authorization_dispatch_provenance_for_test(
+        request_on_wire: bool,
+    ) -> (bool, bool, Option<crate::retry::ErrorClass>, &'static str) {
+        let response =
+            crate::proxy::authorization_expired_dispatch_placeholder(None, request_on_wire);
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/".to_string(),
+        );
+        ctx.record_backend_dispatch_outcome(response.error_class, response.request_on_wire);
+        let state = match ctx.backend_dispatch_state() {
+            crate::plugins::BackendDispatchState::PreWireFailure => "pre_wire",
+            crate::plugins::BackendDispatchState::AmbiguousFailure => "ambiguous",
+            _ => "unexpected",
+        };
+        (
+            response.connection_error,
+            response.request_on_wire,
+            response.error_class,
+            state,
+        )
+    }
+
     /// Run the production fail-closed native gRPC handoff gate in front of a
     /// fake send adapter (GHSA-xcg4-wj3x-gjj2). `enqueue` stands in for the
     /// first poll of the dispatch send future, where hyper enqueues the
@@ -12920,8 +13006,10 @@ pub mod _test_support {
     /// `(status, body_bytes, connection_error, error_class_label)`.
     pub fn authorization_expired_dispatch_placeholder_for_test()
     -> (u16, Vec<u8>, bool, Option<&'static str>) {
-        let response =
-            crate::proxy::authorization_expired_dispatch_placeholder(Some("10.0.0.9".to_string()));
+        let response = crate::proxy::authorization_expired_dispatch_placeholder(
+            Some("10.0.0.9".to_string()),
+            true,
+        );
         let bytes = match &response.body {
             crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
             _ => panic!("the authorization placeholder is always a buffered body"),

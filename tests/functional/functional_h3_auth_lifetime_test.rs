@@ -1693,3 +1693,175 @@ async fn h3_auth_lifetime_buffered_grpc_bridge_collect_commits_only_the_expiry_t
     assert_eq!(backend.received_stream_count(), 1, "expiry must not retry");
     assert_credential_expired_exactly(&harness, "grpc", 1).await;
 }
+
+/// Complete DATA frames must not become clean EOF when expiry cancels the next
+/// frontend read or a buffered write. The backend asserts the actual QUIC reset.
+async fn assert_native_h3_partial_upload_is_reset(buffered: bool, frontend_h1: bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ca = TestCa::new("h3-upload-reset").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp().await.expect("backend ports");
+    let backend_port = tcp_res.port;
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("probe backend");
+    let mut steps = vec![H3Step::AcceptStream, H3Step::ReadRequestData];
+    if buffered {
+        // Stop consuming after a complete DATA frame. Four MiB exceeds Quinn's
+        // default stream credit, so the next buffered writes park until expiry.
+        steps.push(H3Step::StallFor(Duration::from_secs(
+            TOKEN_TTL_SECS as u64 + 1,
+        )));
+    }
+    steps.push(H3Step::ExpectRequestReset);
+    steps.push(H3Step::StallFor(Duration::from_secs(30)));
+    let backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .steps(steps)
+        .spawn()
+        .expect("reset-observing backend");
+    let mut config: Value =
+        serde_yaml::from_str(&protected_proxy_yaml_with_read_timeout(backend_port, 0))
+            .expect("config");
+    if buffered {
+        config["proxies"][0]["retry"] = json!({"max_retries": 1, "retry_on_connect_failure": true});
+        config["proxies"][0]["response_body_mode"] = json!("buffer");
+    }
+    let (harness, https_port) =
+        spawn_h3_gateway(serde_yaml::to_string(&config).expect("yaml"), false).await;
+    assert!(
+        wait_for_h3_supported(&harness, Duration::from_secs(20))
+            .await
+            .is_some()
+    );
+    let token = mint_short_lived_token();
+    // Keep the frontend owner alive until the backend reset is observed. Dropping
+    // it would cause a client disconnect and would not prove credential expiry.
+    let mut h1 = None;
+    let mut h3 = None;
+    if frontend_h1 {
+        let address = harness.proxy_base_url().trim_start_matches("http://");
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("H1 client");
+        let request = format!(
+            "POST /api/upload HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("complete chunk");
+        h1 = Some(stream);
+    } else {
+        let client = Http3Client::insecure().expect("H3 client");
+        let mut stream = client
+            .open_request_stream_with_content_type(
+                &proxy_url(https_port, "/api/upload"),
+                "application/octet-stream",
+                &[("authorization", &format!("Bearer {token}"))],
+            )
+            .await
+            .expect("open request");
+        if buffered {
+            stream
+                .send_raw_data(Bytes::from(vec![b'x'; 4 * 1024 * 1024]))
+                .await
+                .expect("body");
+            stream.finish().await.expect("frontend EOF");
+        } else {
+            stream
+                .send_raw_data(Bytes::from_static(b"hello"))
+                .await
+                .expect("complete DATA");
+        }
+        h3 = Some((client, stream));
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if backend
+                .received_requests()
+                .await
+                .iter()
+                .any(|request| !request.body.is_empty())
+            {
+                break;
+            }
+            assert!(backend.step_errors().await.is_empty());
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("backend must receive complete DATA before credential expiry");
+    if let Some(stream) = h1.as_mut() {
+        let mut response = [0u8; 4096];
+        let len = tokio::time::timeout(TERMINATION_GRACE, stream.read(&mut response))
+            .await
+            .expect("H1 expiry terminal")
+            .expect("read terminal");
+        assert!(String::from_utf8_lossy(&response[..len]).starts_with("HTTP/1.1 401"));
+    } else if let Some((_, stream)) = h3.as_mut() {
+        let (status, _) = tokio::time::timeout(TERMINATION_GRACE, stream.recv_response())
+            .await
+            .expect("H3 expiry terminal")
+            .expect("response");
+        assert_eq!(status.as_u16(), 401);
+    }
+    tokio::time::timeout(TERMINATION_GRACE, async {
+        loop {
+            let errors = backend.step_errors().await;
+            assert!(
+                errors.is_empty(),
+                "backend observed clean EOF or wrong reset: {errors:?}"
+            );
+            if backend.request_resets() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("backend must observe RESET_STREAM, not clean EOF");
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "authorization expiry must never replay an upload"
+    );
+    if !buffered {
+        assert_eq!(requests[0].body, b"hello");
+        assert!(
+            !requests[0]
+                .headers
+                .iter()
+                .any(|(name, _)| name == "content-length")
+        );
+    }
+    assert_credential_expired_exactly(&harness, "http", 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_native_h3_stalled_frontend_after_data_resets_upload_without_length() {
+    assert_native_h3_partial_upload_is_reset(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_native_h3_incoming_stall_after_data_resets_upload_without_length() {
+    assert_native_h3_partial_upload_is_reset(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_native_h3_buffered_write_expiry_resets_partial_upload() {
+    assert_native_h3_partial_upload_is_reset(true, false).await;
+}

@@ -182,7 +182,7 @@ Because every path enforces the rule's timeouts, HTTP/3 stays advertised (`Alt-S
 
 When the matched proxy has `backend_scheme: https`, the concrete backend target has already been classified as H3-capable, and the request flavor is `Plain`, the gateway keeps the request entirely on QUIC:
 
-- Request body: streamed frame-by-frame via `Http3ConnectionPool::request_streaming_body()`, reading from `RequestStream::recv_data()` on the frontend and `send_data()` on the backend-side stream. No buffering.
+- Request body: streamed frame-by-frame via `Http3ConnectionPool::request_streaming_body_under_authorization()`, reading from `RequestStream::recv_data()` on the frontend and `send_data()` on the backend-side stream. The admitted authorization plan bounds acquisition, HEADERS, upload, and response headers; cancellation resets an unfinished backend upload with `H3_REQUEST_CANCELLED`. No buffering. See [dispatch authorization lifetime](request_lifetime_dispatch.md).
 - Response body: written straight to the client stream with the shared H3 coalescing window (see [Coalescing and frame cadence](#coalescing-and-frame-cadence)).
 - Zero copies of the body to userspace at either end; h3's chunks are `Bytes` pass-throughs.
 

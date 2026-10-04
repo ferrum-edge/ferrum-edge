@@ -3448,6 +3448,8 @@ fn h3_native_grpc_relay_is_full_duplex_not_drain_then_read() {
     for forbidden in [
         "request_streaming_body(",
         "request_with_target_streaming_body(",
+        "request_streaming_body_under_authorization(",
+        "request_with_target_streaming_body_under_authorization(",
     ] {
         assert!(
             !relay.contains(forbidden),

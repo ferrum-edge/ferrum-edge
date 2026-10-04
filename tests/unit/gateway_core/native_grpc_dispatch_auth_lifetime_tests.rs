@@ -706,18 +706,14 @@ async fn an_unpolled_header_wrapper_refuses_before_the_actual_handoff() {
     let bounds = compose_native_grpc_dispatch_bounds_for_test(None, Some(&plan));
     let handed = AtomicBool::new(false);
     let backend_requests = AtomicUsize::new(0);
-    let headers = native_grpc_header_wait_with_handoff_for_test(
-        None,
-        Some(&plan),
-        &handed,
-        async {
+    let headers =
+        native_grpc_header_wait_with_handoff_for_test(None, Some(&plan), &handed, async {
             native_grpc_handoff_gate_for_test(&bounds, Some(&plan), || {
                 backend_requests.fetch_add(1, Ordering::Relaxed);
                 handed.store(true, Ordering::Relaxed);
             })?;
             Ok::<_, GrpcProxyError>(())
-        },
-    );
+        });
     tokio::time::advance(Duration::from_millis(100)).await;
     assert!(matches!(
         headers.await,
@@ -772,10 +768,9 @@ async fn buffered_grpc_collection_is_cancelled_at_the_dispatch_authorization_ins
     let plan = plan_after(Duration::from_millis(100));
     tokio::time::advance(Duration::from_millis(60)).await;
     let (collect, polled, dropped) = stalled();
-    let result = await_native_grpc_header_wait_for_test(None, Some(&plan), async {
-        Ok(collect.await)
-    })
-    .await;
+    let result =
+        await_native_grpc_header_wait_for_test(None, Some(&plan), async { Ok(collect.await) })
+            .await;
     assert_eq!(
         expired_after_handoff(result),
         Some(StreamAuthTermination::CredentialExpired)
@@ -841,7 +836,10 @@ async fn native_h3_acquisition_and_resumed_send_never_outlive_the_plan() {
         result,
         Err((Some(StreamAuthTermination::CredentialExpired), false, false))
     );
-    assert_eq!(tokio::time::Instant::now(), start + Duration::from_millis(50));
+    assert_eq!(
+        tokio::time::Instant::now(),
+        start + Duration::from_millis(50)
+    );
 
     let plan = plan_after(Duration::from_millis(50));
     let stream_credit = AtomicBool::new(false);
@@ -1006,4 +1004,89 @@ async fn native_h3_late_checkout_errors_preserve_the_captured_client_winner() {
     failed.store(true, Ordering::Relaxed);
     assert_eq!(wait.await, Err((None, false, true)));
     assert_eq!(plan.2.observed(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_sidecar_readiness_wake_preserves_connect_before_client_winner() {
+    use ferrum_edge::_test_support::{
+        BackendHandoffBoundSourceForTest, await_backend_checkout_result_for_test,
+        compose_backend_handoff_bound_for_test, compose_dispatch_phase_bound_for_test,
+        sidecar_readiness_connect_terminal_for_test,
+    };
+
+    let start = tokio::time::Instant::now();
+    let plan = plan_after(Duration::from_millis(200));
+    let dispatch = compose_dispatch_phase_bound_for_test(
+        Some(start + Duration::from_millis(100)),
+        Some(&plan),
+    );
+    let bound =
+        compose_backend_handoff_bound_for_test(Some(start + Duration::from_millis(50)), &dispatch);
+    let ready = AtomicBool::new(false);
+    let readiness = std::future::poll_fn(|_| {
+        if ready.load(Ordering::Relaxed) {
+            Poll::Ready(Err::<(), _>("late readiness error"))
+        } else {
+            Poll::Pending
+        }
+    });
+    let mut wait = Box::pin(await_backend_checkout_result_for_test(&bound, readiness));
+    let waker = futures_util::task::noop_waker();
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    tokio::time::advance(Duration::from_millis(300)).await;
+    ready.store(true, Ordering::Relaxed);
+    assert_eq!(
+        wait.await,
+        Err(BackendHandoffBoundSourceForTest::ResponseHeader)
+    );
+    assert_eq!(
+        sidecar_readiness_connect_terminal_for_test(),
+        (200, Some("14".into()), false)
+    );
+    assert_eq!(plan.2.observed(), None, "later authorization did not win");
+}
+
+#[test]
+fn authorization_placeholders_keep_actual_handoff_separate_from_neutral_health() {
+    use ferrum_edge::_test_support::authorization_dispatch_provenance_for_test;
+
+    assert_eq!(
+        authorization_dispatch_provenance_for_test(false),
+        (false, false, Some(ErrorClass::ClientDisconnect), "pre_wire")
+    );
+    assert_eq!(
+        authorization_dispatch_provenance_for_test(true),
+        (false, true, Some(ErrorClass::ClientDisconnect), "ambiguous")
+    );
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(!proxy.contains(
+        "record_backend_dispatch_outcome(result.error_class, !result.connection_error)"
+    ));
+    let compact_proxy: String = proxy.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        compact_proxy
+            .contains("authorization_expired_dispatch_placeholder(resolved_ip,e.request_on_wire())")
+    );
+}
+
+#[test]
+fn every_plain_h3_frontend_pool_route_carries_the_captured_plan() {
+    let server = include_str!("../../../src/http3/server.rs");
+    assert!(!server.contains(".request_streaming("));
+    assert!(!server.contains(".request_with_target_streaming("));
+    assert!(!server.contains(".request_streaming_body("));
+    assert!(!server.contains(".request_with_target_streaming_body("));
+    assert!(server.contains(".request_streaming_body_under_authorization("));
+    assert!(server.contains(".request_with_target_streaming_body_under_authorization("));
+    assert_eq!(
+        server.matches("let attempt = proxy_to_backend_h3(").count(),
+        3
+    );
+    for call in server.split("let attempt = proxy_to_backend_h3(").skip(1) {
+        assert!(call.split_once(");").unwrap().0.contains("auth,"));
+    }
 }

@@ -1821,6 +1821,10 @@ pub struct BackendResponse {
     /// DNS resolution failure, TLS handshake error, connect timeout, etc.
     /// False when we got an actual HTTP response (even if it's a 502).
     pub connection_error: bool,
+    /// Actual request handoff state, independent of backend-health classification.
+    /// Gateway-owned authorization refusals are health-neutral both before and
+    /// after transmission; their `connection_error` bit cannot carry this fact.
+    pub request_on_wire: bool,
     /// The DNS-resolved IP address of the backend that was connected to.
     /// Populated from the DNS cache before the request is sent. `None` when
     /// DNS resolution fails or the request never reaches the backend.

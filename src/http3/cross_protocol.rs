@@ -1335,7 +1335,7 @@ impl PlainAttemptRecord {
     fn of_result(result: &crate::retry::BackendResponse) -> Self {
         Self {
             error_class: result.error_class,
-            on_wire: !result.connection_error,
+            on_wire: result.request_on_wire,
             status: Some(result.status_code),
         }
     }
@@ -1498,6 +1498,7 @@ fn reqwest_error_response_for_cross_protocol(
         connection_error: !crate::retry::request_reached_wire(error_class),
         backend_resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: crate::retry::request_reached_wire(error_class),
         buffered_trailers: None,
     }
 }
@@ -1722,6 +1723,7 @@ fn plain_attempt_head_result(status: u16) -> crate::retry::BackendResponse {
         connection_error: false,
         backend_resolved_ip: None,
         error_class: None,
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -3816,6 +3818,7 @@ where
                             connection_error: mesh_connection_error,
                             backend_resolved_ip: mesh_resolved_ip,
                             error_class: mesh_error_class,
+                            request_on_wire: _,
                             buffered_trailers: _,
                         } = attempt_result;
                         let crate::retry::ResponseBody::Buffered(mesh_body) = mesh_response_body
@@ -10151,7 +10154,10 @@ pub(crate) async fn dispatch_grpc_streaming(
     {
         let handed_to_backend = grpc_proxy::grpc_dispatch_reached_wire(
             &result,
-            result.as_ref().err().map(crate::retry::classify_grpc_proxy_error),
+            result
+                .as_ref()
+                .err()
+                .map(crate::retry::classify_grpc_proxy_error),
         );
         result = Err(grpc_proxy::GrpcProxyError::AuthorizationExpired {
             termination,
@@ -13163,7 +13169,10 @@ where
                 0,
                 backend_start,
                 bytes_sent,
-                matches!(error, crate::http3::stream_util::H3ResponseWriteError::Write(_)),
+                matches!(
+                    error,
+                    crate::http3::stream_util::H3ResponseWriteError::Write(_)
+                ),
             ))
         }
     }

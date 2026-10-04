@@ -3782,6 +3782,7 @@ fn backend_tls_sni_requires_direct_h2_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -4314,6 +4315,7 @@ async fn prepare_mesh_request_body(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip.clone(),
                 error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                request_on_wire: false,
                 buffered_trailers: None,
             },
             RequestBodyBufferError::ClientDisconnected(message) => {
@@ -4325,6 +4327,7 @@ async fn prepare_mesh_request_body(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::ClientDisconnect),
+                    request_on_wire: false,
                     buffered_trailers: None,
                 }
             }
@@ -4386,6 +4389,7 @@ async fn prepare_mesh_request_body(
             connection_error: false,
             backend_resolved_ip: resolved_ip,
             error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+            request_on_wire: false,
             buffered_trailers: None,
         });
     }
@@ -6788,6 +6792,7 @@ fn reject_result_to_backend_response(
         } else {
             retry::ErrorClass::DispatchPolicyRejected
         }),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -39537,9 +39542,7 @@ async fn handle_proxy_request_inner(
                         held_frontend_grpc_upload.take(),
                     ));
                 }
-                if !grpc_skip_final_cb_record
-                    && let Some(cb_config) = &proxy.circuit_breaker
-                {
+                if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.namespace,
                         &proxy.id,
@@ -40395,7 +40398,7 @@ async fn handle_proxy_request_inner(
             if route_request_timeout_phase.is_some() {
                 break;
             }
-            ctx.record_backend_dispatch_outcome(result.error_class, !result.connection_error);
+            ctx.record_backend_dispatch_outcome(result.error_class, result.request_on_wire);
             // Re-check the CURRENT target's DestinationRule maxRetries before
             // authorizing another retry. Use the original route ceiling (not a
             // permanently lowered initial-port projection) so a looser rotated
@@ -40553,7 +40556,7 @@ async fn handle_proxy_request_inner(
             // and a retry replaces it.
             ctx.record_backend_attempt(
                 result.error_class,
-                !result.connection_error,
+                result.request_on_wire,
                 Some(result.status_code),
             );
             last_attempt_recorded = true;
@@ -40692,6 +40695,7 @@ async fn handle_proxy_request_inner(
                         connection_error: false,
                         backend_resolved_ip: None,
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        request_on_wire: false,
                         buffered_trailers: None,
                     }
                 };
@@ -40763,6 +40767,7 @@ async fn handle_proxy_request_inner(
                         connection_error: false,
                         backend_resolved_ip: None,
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        request_on_wire: false,
                         buffered_trailers: None,
                     }
                 };
@@ -40814,6 +40819,7 @@ async fn handle_proxy_request_inner(
                         connection_error: false,
                         backend_resolved_ip: None,
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        request_on_wire: false,
                         buffered_trailers: None,
                     }
                 };
@@ -41257,11 +41263,11 @@ async fn handle_proxy_request_inner(
         sticky_served_target,
     )
     .is_some();
-    ctx.record_backend_dispatch_outcome(backend_resp.error_class, !backend_resp.connection_error);
+    ctx.record_backend_dispatch_outcome(backend_resp.error_class, backend_resp.request_on_wire);
     if !last_attempt_recorded {
         ctx.record_backend_attempt(
             backend_resp.error_class,
-            !backend_resp.connection_error,
+            backend_resp.request_on_wire,
             Some(backend_resp.status_code),
         );
     }
@@ -44530,6 +44536,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip.clone(),
                 error_class: None,
+                request_on_wire: false,
                 buffered_trailers: None,
             };
         }
@@ -44765,6 +44772,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    request_on_wire: false,
                     buffered_trailers: None,
                 };
             }
@@ -44857,7 +44865,7 @@ pub(crate) async fn proxy_to_backend_retry(
             if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
                 .is_some()
             {
-                return authorization_expired_dispatch_placeholder(resolved_ip);
+                return authorization_expired_dispatch_placeholder(resolved_ip, true);
             }
             return client_grpc_deadline_exceeded_response_for_request(
                 request_ctx,
@@ -44932,6 +44940,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                    request_on_wire: true,
                     buffered_trailers: None,
                 };
             }
@@ -44988,7 +44997,7 @@ pub(crate) async fn proxy_to_backend_retry(
                         // partially collected buffer and its charged budget
                         // reservation drop with the cancelled future.
                         Err(ResponseCollectBound::AuthorizationExpired) => {
-                            return authorization_expired_dispatch_placeholder(resolved_ip);
+                            return authorization_expired_dispatch_placeholder(resolved_ip, true);
                         }
                     };
                     buffered_backend_response_from_eager_collect(
@@ -45014,6 +45023,7 @@ pub(crate) async fn proxy_to_backend_retry(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
+                        request_on_wire: true,
                         buffered_trailers: None,
                     }
                 }
@@ -45047,7 +45057,7 @@ pub(crate) async fn proxy_to_backend_retry(
                             );
                         }
                         Err(ResponseCollectBound::AuthorizationExpired) => {
-                            return authorization_expired_dispatch_placeholder(resolved_ip);
+                            return authorization_expired_dispatch_placeholder(resolved_ip, true);
                         }
                     };
                     match collected {
@@ -45058,6 +45068,7 @@ pub(crate) async fn proxy_to_backend_retry(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: None,
+                            request_on_wire: true,
                             buffered_trailers: trailers,
                         },
                         Err(failure) => retry::BackendResponse {
@@ -45067,6 +45078,7 @@ pub(crate) async fn proxy_to_backend_retry(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: Some(failure.error_class),
+                            request_on_wire: true,
                             buffered_trailers: None,
                         },
                     }
@@ -45095,6 +45107,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                    request_on_wire: false,
                     buffered_trailers: None,
                 };
             }
@@ -45238,6 +45251,7 @@ async fn proxy_to_backend_mesh_retry(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                request_on_wire: false,
                 buffered_trailers: None,
             },
             None,
@@ -45718,6 +45732,7 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
             connection_error: false,
             backend_resolved_ip: None,
             error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+            request_on_wire: false,
             buffered_trailers: None,
         };
     }
@@ -45850,6 +45865,7 @@ fn h3_mesh_buffered_retry_response(
             connection_error: false,
             backend_resolved_ip: response.backend_resolved_ip,
             error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+            request_on_wire: response.request_on_wire,
             buffered_trailers: None,
         };
     }
@@ -46125,6 +46141,7 @@ fn buffered_backend_response_from_eager_collect(
             connection_error: false,
             backend_resolved_ip: resolved_ip,
             error_class: None,
+            request_on_wire: true,
             buffered_trailers: trailers,
         },
         Err(EagerRetainFailure::Retain(RetainRejection::BudgetExhausted)) => {
@@ -46151,6 +46168,7 @@ fn buffered_backend_response_from_eager_collect(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
@@ -46169,6 +46187,7 @@ fn buffered_backend_response_from_eager_collect(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
@@ -46186,6 +46205,7 @@ fn buffered_backend_response_from_eager_collect(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
@@ -46234,6 +46254,7 @@ pub(crate) fn connection_pool_client_error_response(
         connection_error: true,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ConnectionPoolError),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -46255,6 +46276,7 @@ pub(crate) fn http_backend_dispatch_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: retry::request_reached_wire(error_class),
         buffered_trailers: None,
     }
 }
@@ -46459,6 +46481,7 @@ fn backend_egress_denied_response(host: &str) -> retry::BackendResponse {
         connection_error: false,
         backend_resolved_ip: Some(host.to_string()),
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -46484,6 +46507,7 @@ fn backend_dns_override_literal_conflict_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -46519,6 +46543,7 @@ fn backend_dns_resolution_failed_response(
         } else {
             retry::ErrorClass::DnsLookupError
         }),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -46632,6 +46657,7 @@ fn oversized_request_body_dispatch_reject(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                request_on_wire: false,
                 buffered_trailers: None,
             },
             None,
@@ -47770,6 +47796,7 @@ async fn proxy_to_backend(
                                 connection_error: false,
                                 backend_resolved_ip: resolved_ip,
                                 error_class: None,
+                                request_on_wire: false,
                                 buffered_trailers: None,
                             },
                             None,
@@ -48012,6 +48039,7 @@ async fn proxy_to_backend(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -48194,6 +48222,7 @@ async fn proxy_to_backend(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -48447,6 +48476,7 @@ async fn proxy_to_backend(
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip.clone(),
                                     error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                                    request_on_wire: false,
                                     buffered_trailers: None,
                                 },
                                 None,
@@ -48470,6 +48500,7 @@ async fn proxy_to_backend(
                                 connection_error: false,
                                 backend_resolved_ip: resolved_ip.clone(),
                                 error_class: Some(retry::ErrorClass::ClientDisconnect),
+                                request_on_wire: false,
                                 buffered_trailers: None,
                             },
                             None,
@@ -48675,6 +48706,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        request_on_wire: false,
                         buffered_trailers: None,
                     },
                     None,
@@ -48888,6 +48920,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        request_on_wire: true,
                         buffered_trailers: None,
                     },
                     retained_body,
@@ -48950,6 +48983,7 @@ async fn proxy_to_backend(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                            request_on_wire: true,
                             buffered_trailers: None,
                         },
                         retained_body,
@@ -49038,6 +49072,7 @@ async fn proxy_to_backend(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: None,
+                            request_on_wire: true,
                             buffered_trailers: None,
                         },
                         retained_body,
@@ -49062,6 +49097,7 @@ async fn proxy_to_backend(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: None,
+                            request_on_wire: true,
                             buffered_trailers: None,
                         },
                         retained_body,
@@ -49109,6 +49145,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
+                        request_on_wire: true,
                         buffered_trailers: trailers,
                     },
                     Err(failure) => retry::BackendResponse {
@@ -49118,6 +49155,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(failure.error_class),
+                        request_on_wire: true,
                         buffered_trailers: None,
                     },
                 }
@@ -49194,6 +49232,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
+                        request_on_wire: true,
                         buffered_trailers: None,
                     }
                 }
@@ -49241,6 +49280,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
+                        request_on_wire: true,
                         buffered_trailers: trailers,
                     },
                     Err(failure) => retry::BackendResponse {
@@ -49250,6 +49290,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(failure.error_class),
+                        request_on_wire: true,
                         buffered_trailers: None,
                     },
                 }
@@ -49275,6 +49316,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        request_on_wire: true,
                         buffered_trailers: None,
                     },
                     retained_body,
@@ -49307,6 +49349,7 @@ async fn proxy_to_backend(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        request_on_wire: false,
                         buffered_trailers: None,
                     },
                     retained_body,
@@ -49568,6 +49611,7 @@ fn direct_h1_collect_error_response(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
@@ -49590,6 +49634,7 @@ fn direct_h1_collect_error_response(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
@@ -49614,6 +49659,7 @@ fn direct_h1_request_body_too_large(resolved_ip: Option<String>) -> retry::Backe
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -49793,6 +49839,7 @@ async fn proxy_to_backend_direct_h1(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: false,
                 buffered_trailers: None,
             },
             None,
@@ -49813,6 +49860,7 @@ async fn proxy_to_backend_direct_h1(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -50096,6 +50144,7 @@ async fn proxy_to_backend_direct_h1(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                        request_on_wire: false,
                         buffered_trailers: None,
                     },
                     None,
@@ -50420,6 +50469,7 @@ async fn proxy_to_backend_direct_h1(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                request_on_wire: true,
                 buffered_trailers: None,
             },
             retained_body,
@@ -50455,6 +50505,7 @@ async fn proxy_to_backend_direct_h1(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: true,
                 buffered_trailers: None,
             }),
             retained_body,
@@ -50507,6 +50558,7 @@ async fn proxy_to_backend_direct_h1(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: true,
                 buffered_trailers: trailers.filter(|t| !t.is_empty()).map(Box::new),
             }
         }
@@ -52201,6 +52253,7 @@ fn request_buffer_capacity_backend_response(resolved_ip: Option<String>) -> retr
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -52217,6 +52270,7 @@ fn request_body_timeout_backend_response(resolved_ip: Option<String>) -> retry::
         // Buffered client-upload timeouts carry no backend health signal.
         // ClientDisconnect is the existing centrally neutral client-side class.
         error_class: Some(retry::ErrorClass::ClientDisconnect),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -52272,6 +52326,7 @@ fn mesh_transport_pool_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -52341,6 +52396,7 @@ fn mesh_transport_hyper_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: retry::request_reached_wire(error_class),
         buffered_trailers: None,
     }
 }
@@ -52521,6 +52577,7 @@ fn response_buffer_capacity_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -52557,6 +52614,7 @@ fn mesh_grpc_response_buffer_capacity_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -52714,6 +52772,7 @@ fn mesh_transport_response_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -52752,6 +52811,7 @@ fn mesh_transport_request_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -52858,6 +52918,7 @@ fn mesh_grpc_unavailable_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: retry::request_reached_wire(error_class),
         buffered_trailers: None,
     }
 }
@@ -52889,6 +52950,7 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -53269,6 +53331,7 @@ pub(crate) fn route_request_timeout_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -53289,7 +53352,10 @@ pub(crate) fn route_deadline_expiry_response(
         return http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, None);
     }
     *timeout_phase = Some(expiry.phase(handed_to_backend));
-    route_request_timeout_response(None, expiry.error_class(handed_to_backend))
+    let mut response =
+        route_request_timeout_response(None, expiry.error_class(handed_to_backend));
+    response.request_on_wire = handed_to_backend;
+    response
 }
 
 /// [`route_deadline_expiry_response`] in the shape a cancelled
@@ -53380,6 +53446,7 @@ fn grpc_deadline_exceeded_response_for_request(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -54151,15 +54218,16 @@ pub(crate) fn await_backend_handoff_result<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    futures_util::FutureExt::map(await_backend_handoff_bound(bound, checkout), move |result| {
-        match result {
+    futures_util::FutureExt::map(
+        await_backend_handoff_bound(bound, checkout),
+        move |result| match result {
             Ok(Err(error)) => match bound.elapsed() {
                 Some(source) => Err(source),
                 None => Ok(Err(error)),
             },
             other => other,
-        }
-    })
+        },
+    )
 }
 
 /// The fail-closed handoff gate in front of a leased connection
@@ -54321,6 +54389,7 @@ pub(crate) fn dispatch_phase_authorization_expiry(
 /// false because no connect failure occurred.
 pub(crate) fn authorization_expired_dispatch_placeholder(
     resolved_ip: Option<String>,
+    request_on_wire: bool,
 ) -> retry::BackendResponse {
     let mut headers = HashMap::with_capacity(1);
     headers.insert("content-type".to_string(), "application/json".to_string());
@@ -54331,6 +54400,7 @@ pub(crate) fn authorization_expired_dispatch_placeholder(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ClientDisconnect),
+        request_on_wire,
         buffered_trailers: None,
     }
 }
@@ -54635,7 +54705,7 @@ fn authorization_expired_backend_dispatch(
     backend_admission_permits: Option<BackendAdmissionPermitSet>,
 ) -> BackendDispatchResult {
     backend_dispatch_response(
-        authorization_expired_dispatch_placeholder(resolved_ip),
+        authorization_expired_dispatch_placeholder(resolved_ip, false),
         retained_body,
         backend_admission_permits,
     )
@@ -54710,9 +54780,12 @@ pub(crate) fn direct_h2_handoff_bound_expired(
 ) -> retry::BackendResponse {
     if source == BackendHandoffBoundSource::Authorization {
         let _ = dispatch_phase_authorization_expiry(dispatch_bound, upload_auth_deadline);
-        return authorization_expired_dispatch_placeholder(resolved_ip);
+        return authorization_expired_dispatch_placeholder(resolved_ip, false);
     }
-    client_grpc_deadline_exceeded_response_for_optional_request(ctx, headers, resolved_ip)
+    let mut response =
+        client_grpc_deadline_exceeded_response_for_optional_request(ctx, headers, resolved_ip);
+    response.request_on_wire = false;
+    response
 }
 
 /// Settle a pooled HBONE inner or Unix-socket HTTP/1.1 checkout or request
@@ -54734,7 +54807,7 @@ fn mesh_h1_handoff_bound_expired(
 ) -> retry::BackendResponse {
     if source == BackendHandoffBoundSource::Authorization {
         let _ = dispatch_phase_authorization_expiry(dispatch_bound, send_auth_deadline);
-        return authorization_expired_dispatch_placeholder(resolved_ip);
+        return authorization_expired_dispatch_placeholder(resolved_ip, false);
     }
     warn!(
         proxy_id = %proxy.id,
@@ -54742,7 +54815,10 @@ fn mesh_h1_handoff_bound_expired(
         read_timeout_ms = proxy.backend_read_timeout_ms,
         "backend read timeout elapsed before the request was handed to the connection"
     );
-    http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
+    let mut response =
+        http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip);
+    response.request_on_wire = false;
+    response
 }
 
 fn mesh_grpc_response_body_too_large_response(
@@ -54781,6 +54857,7 @@ fn mesh_grpc_response_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -54791,6 +54868,7 @@ fn mesh_grpc_response_body_too_large_response(
 /// remains visible to backend-health accounting.
 fn mesh_grpc_response_buffering_refusal_response(
     observed_status: u16,
+    request_on_wire: bool,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
     let mut headers = HashMap::with_capacity(3);
@@ -54820,6 +54898,7 @@ fn mesh_grpc_response_buffering_refusal_response(
         } else {
             Some(retry::ErrorClass::DispatchPolicyRejected)
         },
+        request_on_wire,
         buffered_trailers: None,
     }
 }
@@ -55131,6 +55210,7 @@ async fn proxy_to_backend_hbone(
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                request_on_wire: false,
                 buffered_trailers: None,
             },
             None,
@@ -55250,6 +55330,7 @@ async fn proxy_to_backend_hbone(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -55275,6 +55356,7 @@ async fn proxy_to_backend_hbone(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -55609,6 +55691,7 @@ async fn proxy_to_backend_hbone_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -55707,6 +55790,7 @@ async fn proxy_to_backend_hbone_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -55911,7 +55995,7 @@ async fn proxy_to_backend_hbone_after_ready(
                         .is_some()
                         {
                             return (
-                                authorization_expired_dispatch_placeholder(resolved_ip),
+                                authorization_expired_dispatch_placeholder(resolved_ip, true),
                                 None,
                                 None,
                             );
@@ -56178,6 +56262,7 @@ async fn proxy_to_backend_hbone_after_ready(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: true,
                 buffered_trailers: None,
             },
             None,
@@ -56214,7 +56299,7 @@ async fn proxy_to_backend_hbone_after_ready(
             // pre-commitment terminal owns the client-visible shape.
             Err(ResponseCollectBound::AuthorizationExpired) => {
                 return (
-                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    authorization_expired_dispatch_placeholder(resolved_ip, true),
                     None,
                     None,
                 );
@@ -56291,6 +56376,7 @@ async fn proxy_to_backend_hbone_after_ready(
                 error_class: None,
                 // The inner HTTP/1.1 exchange's chunked trailer section, for
                 // the response builder to govern and relay (issue #5760).
+                request_on_wire: true,
                 buffered_trailers: trailers
                     .filter(|trailers| !trailers.is_empty())
                     .map(Box::new),
@@ -56329,6 +56415,7 @@ fn unix_backend_dispatch_unavailable_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: None,
         error_class: Some(error_class),
+        request_on_wire: retry::request_reached_wire(error_class),
         buffered_trailers: None,
     }
 }
@@ -56376,6 +56463,7 @@ fn unix_backend_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: retry::request_reached_wire(error_class),
         buffered_trailers: None,
     }
 }
@@ -56676,6 +56764,7 @@ async fn proxy_to_backend_unix(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -56776,6 +56865,7 @@ async fn proxy_to_backend_unix(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -56956,7 +57046,7 @@ async fn proxy_to_backend_unix(
                         .is_some()
                         {
                             return (
-                                authorization_expired_dispatch_placeholder(resolved_ip),
+                                authorization_expired_dispatch_placeholder(resolved_ip, true),
                                 None,
                                 None,
                             );
@@ -57213,6 +57303,7 @@ async fn proxy_to_backend_unix(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: true,
                 buffered_trailers: None,
             },
             None,
@@ -57249,7 +57340,7 @@ async fn proxy_to_backend_unix(
             // pre-commitment terminal owns the client-visible shape.
             Err(ResponseCollectBound::AuthorizationExpired) => {
                 return (
-                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    authorization_expired_dispatch_placeholder(resolved_ip, true),
                     None,
                     None,
                 );
@@ -57327,6 +57418,7 @@ async fn proxy_to_backend_unix(
                 error_class: None,
                 // The inner HTTP/1.1 exchange's chunked trailer section, for
                 // the response builder to govern and relay (issue #5760).
+                request_on_wire: true,
                 buffered_trailers: trailers
                     .filter(|trailers| !trailers.is_empty())
                     .map(Box::new),
@@ -57402,6 +57494,7 @@ fn unix_hyper_error_response(
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
         error_class: Some(error_class),
+        request_on_wire: retry::request_reached_wire(error_class),
         buffered_trailers: None,
     }
 }
@@ -57426,6 +57519,7 @@ fn unix_request_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -57461,6 +57555,7 @@ fn unix_response_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -57536,6 +57631,7 @@ async fn proxy_to_backend_mesh_mtls(
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                request_on_wire: false,
                 buffered_trailers: None,
             },
             None,
@@ -57628,6 +57724,7 @@ async fn proxy_to_backend_mesh_mtls(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -57653,6 +57750,7 @@ async fn proxy_to_backend_mesh_mtls(
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -57806,7 +57904,7 @@ async fn proxy_to_backend_mesh_mtls(
              is required and would drop gRPC trailers"
         );
         return (
-            mesh_grpc_response_buffering_refusal_response(200, resolved_ip),
+            mesh_grpc_response_buffering_refusal_response(200, false, resolved_ip),
             None,
             None,
         );
@@ -58021,11 +58119,9 @@ async fn proxy_to_backend_mesh_mtls(
                     None,
                 );
             }
-            return (
-                mesh_mtls_hyper_error_response(proxy, err, resolved_ip, false),
-                None,
-                None,
-            );
+            let mut response = mesh_mtls_hyper_error_response(proxy, err, resolved_ip, false);
+            response.request_on_wire = false;
+            return (response, None, None);
         }
         Err(_) => {
             warn!(
@@ -58033,42 +58129,8 @@ async fn proxy_to_backend_mesh_mtls(
                 "sidecar mTLS HTTP/2 sender readiness timed out ({}ms)",
                 readiness_connect_timeout_ms
             );
-            if is_grpc_flavored {
-                if client_grpc_deadline_at
-                    .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
-                {
-                    return (
-                        client_grpc_deadline_exceeded_response_for_request(
-                            request_ctx,
-                            headers,
-                            resolved_ip,
-                        ),
-                        None,
-                        None,
-                    );
-                }
-                return (
-                    mesh_grpc_unavailable_response(
-                        resolved_ip,
-                        "sidecar mTLS backend unavailable",
-                        retry::ErrorClass::ConnectionTimeout,
-                    ),
-                    None,
-                    None,
-                );
-            }
             return (
-                retry::BackendResponse {
-                    status_code: 504,
-                    body: ResponseBody::buffered(
-                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: true,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ConnectionTimeout),
-                    buffered_trailers: None,
-                },
+                sidecar_readiness_connect_timeout_response(is_grpc_flavored, resolved_ip),
                 None,
                 None,
             );
@@ -58106,6 +58168,30 @@ async fn proxy_to_backend_mesh_mtls(
         client_grpc_deadline_at,
     )
     .await
+}
+
+/// The captured connect-budget winner at sidecar readiness, always pre-handoff.
+pub(crate) fn sidecar_readiness_connect_timeout_response(
+    is_grpc_flavored: bool,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    if is_grpc_flavored {
+        return mesh_grpc_unavailable_response(
+            resolved_ip,
+            "sidecar mTLS backend unavailable",
+            retry::ErrorClass::ConnectionTimeout,
+        );
+    }
+    retry::BackendResponse {
+        status_code: 504,
+        body: ResponseBody::buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: true,
+        request_on_wire: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ConnectionTimeout),
+        buffered_trailers: None,
+    }
 }
 
 /// Post-ready Sidecar dispatch, constructed out of line so send/collect is
@@ -58250,6 +58336,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -58307,6 +58394,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -58409,6 +58497,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -58522,9 +58611,9 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     );
     let handoff_bound = compose_backend_handoff_bound(None, send_bound);
     if let Some(source) = handoff_bound.elapsed() {
-        let response = if source == BackendHandoffBoundSource::Authorization {
+        let mut response = if source == BackendHandoffBoundSource::Authorization {
             let _ = dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref());
-            authorization_expired_dispatch_placeholder(resolved_ip)
+            authorization_expired_dispatch_placeholder(resolved_ip, false)
         } else if is_grpc_flavored {
             if grpc_send_deadline_is_client {
                 client_grpc_deadline_exceeded_response_for_request(
@@ -58538,6 +58627,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         } else {
             http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
         };
+        response.request_on_wire = false;
         return (response, None, None);
     }
     let send_fut = match sender.send_request(backend_req) {
@@ -58595,7 +58685,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     .is_some()
                 {
                     return (
-                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        authorization_expired_dispatch_placeholder(resolved_ip, true),
                         None,
                         None,
                     );
@@ -58789,7 +58879,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
              exempt this route from response-body buffering to restore gRPC dispatch"
         );
         return (
-            mesh_grpc_response_buffering_refusal_response(status, resolved_ip),
+            mesh_grpc_response_buffering_refusal_response(status, true, resolved_ip),
             None,
             None,
         );
@@ -58804,6 +58894,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: true,
                 buffered_trailers: None,
             },
             None,
@@ -58869,7 +58960,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             // pre-commitment terminal owns the client-visible shape.
             Err(ResponseCollectBound::AuthorizationExpired) => {
                 return (
-                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    authorization_expired_dispatch_placeholder(resolved_ip, true),
                     None,
                     None,
                 );
@@ -59011,6 +59102,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 // Plain-HTTP trailer section for the response builder (issue
                 // #5760); it drops the section for gRPC-flavored requests,
                 // whose terminal metadata was folded into the headers above.
+                request_on_wire: true,
                 buffered_trailers: backend_trailers
                     .filter(|trailers| !trailers.is_empty())
                     .map(Box::new),
@@ -59175,6 +59267,7 @@ async fn proxy_to_backend_http2(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -59359,6 +59452,7 @@ async fn proxy_to_backend_http2(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
+                    request_on_wire: false,
                     buffered_trailers: None,
                 },
                 None,
@@ -59544,6 +59638,7 @@ async fn proxy_to_backend_http2(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip.clone(),
                 error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                request_on_wire: true,
                 buffered_trailers: None,
             },
             None,
@@ -59573,6 +59668,7 @@ async fn proxy_to_backend_http2(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        request_on_wire: true,
                         buffered_trailers: None,
                     },
                     None,
@@ -59676,7 +59772,7 @@ async fn proxy_to_backend_http2(
                             upload_auth_deadline.as_ref(),
                         );
                         return (
-                            authorization_expired_dispatch_placeholder(resolved_ip),
+                            authorization_expired_dispatch_placeholder(resolved_ip, true),
                             None,
                         );
                     }
@@ -59846,7 +59942,7 @@ async fn proxy_to_backend_http2(
                                     upload_auth_deadline.as_ref(),
                                 );
                                 (
-                                    authorization_expired_dispatch_placeholder(resolved_ip),
+                                    authorization_expired_dispatch_placeholder(resolved_ip, true),
                                     None,
                                 )
                             }
@@ -59935,7 +60031,7 @@ async fn proxy_to_backend_http2(
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
             DirectH2UploadGate::AuthorizationExpired => {
                 return (
-                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    authorization_expired_dispatch_placeholder(resolved_ip, true),
                     None,
                 );
             }
@@ -59970,6 +60066,7 @@ async fn proxy_to_backend_http2(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ProtocolError),
+                        request_on_wire: true,
                         buffered_trailers: None,
                     },
                     None,
@@ -60010,6 +60107,7 @@ async fn proxy_to_backend_http2(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                request_on_wire: true,
                 buffered_trailers: None,
             },
             None,
@@ -60035,6 +60133,7 @@ async fn proxy_to_backend_http2(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: true,
                 buffered_trailers: None,
             },
             Some(body_size_exceeded),
@@ -60073,7 +60172,7 @@ async fn proxy_to_backend_http2(
             // pre-commitment terminal owns the client-visible shape.
             Err(ResponseCollectBound::AuthorizationExpired) => {
                 return (
-                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    authorization_expired_dispatch_placeholder(resolved_ip, true),
                     None,
                 );
             }
@@ -60098,6 +60197,7 @@ async fn proxy_to_backend_http2(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                        request_on_wire: true,
                         buffered_trailers: None,
                     },
                     None,
@@ -60121,6 +60221,7 @@ async fn proxy_to_backend_http2(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ProtocolError),
+                        request_on_wire: true,
                         buffered_trailers: None,
                     },
                     None,
@@ -60149,6 +60250,7 @@ async fn proxy_to_backend_http2(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: true,
                 buffered_trailers: trailers
                     .filter(|trailers| !trailers.is_empty())
                     .map(Box::new),
@@ -60316,7 +60418,7 @@ async fn drain_h3_response_under_authorization(
     match collect_response_under_authorization(grpc_deadline_at, auth, collect).await {
         Ok(response) => response,
         Err(ResponseCollectBound::AuthorizationExpired) => {
-            authorization_expired_dispatch_placeholder(resolved_ip)
+            authorization_expired_dispatch_placeholder(resolved_ip, true)
         }
         Err(ResponseCollectBound::RpcDeadline) => {
             client_grpc_deadline_exceeded_response_for_optional_request(
@@ -60422,6 +60524,7 @@ async fn proxy_to_backend_http3(
                 connection_error: false,
                 backend_resolved_ip: Some(effective_host.to_string()),
                 error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                request_on_wire: false,
                 buffered_trailers: None,
             },
             None,
@@ -60462,6 +60565,7 @@ async fn proxy_to_backend_http3(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip,
                             error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                            request_on_wire: false,
                             buffered_trailers: None,
                         },
                         None,
@@ -60596,17 +60700,23 @@ async fn proxy_to_backend_http3(
                     }
                     Err(e) => {
                         if e.client_deadline_expired() {
-                            return (
+                            let mut response =
                                 client_grpc_deadline_exceeded_response_for_optional_request(
                                     Some(request_ctx),
                                     headers,
                                     resolved_ip,
+                                );
+                            response.request_on_wire = e.request_on_wire();
+                            return (response, None);
+                        }
+                        if e.authorization_expiry().is_some() {
+                            return (
+                                authorization_expired_dispatch_placeholder(
+                                    resolved_ip,
+                                    e.request_on_wire(),
                                 ),
                                 None,
                             );
-                        }
-                        if e.authorization_expiry().is_some() {
-                            return (authorization_expired_dispatch_placeholder(resolved_ip), None);
                         }
                         let error_str = e.to_string();
                         if error_str.contains("exceeds maximum size") {
@@ -60623,6 +60733,7 @@ async fn proxy_to_backend_http3(
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
                                     error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                                    request_on_wire: true,
                                     buffered_trailers: None,
                                 },
                                 None,
@@ -60647,6 +60758,7 @@ async fn proxy_to_backend_http3(
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
                                     error_class: Some(retry::ErrorClass::ClientDisconnect),
+                                    request_on_wire: true,
                                     buffered_trailers: None,
                                 },
                                 None,
@@ -60708,6 +60820,7 @@ async fn proxy_to_backend_http3(
                                     connection_error: is_conn_error,
                                     backend_resolved_ip: resolved_ip,
                                     error_class: Some(error_class),
+                                    request_on_wire: e.request_on_wire(),
                                     buffered_trailers: None,
                                 },
                                 None,
@@ -60750,6 +60863,7 @@ async fn proxy_to_backend_http3(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        request_on_wire: false,
                         buffered_trailers: None,
                     },
                     None,
@@ -60796,6 +60910,7 @@ async fn proxy_to_backend_http3(
                                 connection_error: false,
                                 backend_resolved_ip: resolved_ip,
                                 error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                                request_on_wire: false,
                                 buffered_trailers: None,
                             },
                             None,
@@ -60818,6 +60933,7 @@ async fn proxy_to_backend_http3(
                             connection_error: false,
                             backend_resolved_ip: resolved_ip,
                             error_class: Some(retry::ErrorClass::ClientDisconnect),
+                            request_on_wire: false,
                             buffered_trailers: None,
                         },
                         None,
@@ -60840,7 +60956,7 @@ async fn proxy_to_backend_http3(
                 // nothing was committed downstream.
                 Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
                     return (
-                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        authorization_expired_dispatch_placeholder(resolved_ip, false),
                         None,
                     );
                 }
@@ -60993,18 +61109,20 @@ async fn proxy_to_backend_http3(
             ),
             Err(e) => {
                 if e.client_deadline_expired() {
-                    return (
-                        client_grpc_deadline_exceeded_response_for_optional_request(
-                            Some(request_ctx),
-                            headers,
-                            resolved_ip,
-                        ),
-                        retained_body,
+                    let mut response = client_grpc_deadline_exceeded_response_for_optional_request(
+                        Some(request_ctx),
+                        headers,
+                        resolved_ip,
                     );
+                    response.request_on_wire = e.request_on_wire();
+                    return (response, retained_body);
                 }
                 if e.authorization_expiry().is_some() {
                     return (
-                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        authorization_expired_dispatch_placeholder(
+                            resolved_ip,
+                            e.request_on_wire(),
+                        ),
                         retained_body,
                     );
                 }
@@ -61049,6 +61167,7 @@ async fn proxy_to_backend_http3(
                         connection_error: is_conn_error,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(error_class),
+                        request_on_wire: e.request_on_wire(),
                         buffered_trailers: None,
                     },
                     retained_body,
@@ -61158,18 +61277,20 @@ async fn proxy_to_backend_http3(
             }
             Err(e) => {
                 if e.client_deadline_expired() {
-                    return (
-                        client_grpc_deadline_exceeded_response_for_optional_request(
-                            Some(request_ctx),
-                            headers,
-                            resolved_ip,
-                        ),
-                        retained_body,
+                    let mut response = client_grpc_deadline_exceeded_response_for_optional_request(
+                        Some(request_ctx),
+                        headers,
+                        resolved_ip,
                     );
+                    response.request_on_wire = e.request_on_wire();
+                    return (response, retained_body);
                 }
                 if e.authorization_expiry().is_some() {
                     return (
-                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        authorization_expired_dispatch_placeholder(
+                            resolved_ip,
+                            e.request_on_wire(),
+                        ),
                         retained_body,
                     );
                 }
@@ -61215,6 +61336,7 @@ async fn proxy_to_backend_http3(
                         connection_error: is_conn_error,
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(error_class),
+                        request_on_wire: e.request_on_wire(),
                         buffered_trailers: None,
                     },
                     retained_body,
@@ -61279,6 +61401,7 @@ fn h3_streaming_backend_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: None,
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -61335,6 +61458,7 @@ async fn drain_h3_streaming_response_to_buffered(
             connection_error: false,
             backend_resolved_ip: resolved_ip,
             error_class: None,
+            request_on_wire: true,
             buffered_trailers: None,
         },
         Err(crate::http3::client::H3BodyDrainError::ResponseTooLarge { .. }) => {
@@ -61355,6 +61479,7 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
@@ -61399,6 +61524,7 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
@@ -61425,6 +61551,7 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionClosed),
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
@@ -61565,6 +61692,7 @@ fn h3_response_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -61644,6 +61772,14 @@ async fn proxy_to_backend_http3_retry(
 ) -> retry::BackendResponse {
     // A replay stays bound by the same request-scoped route ceiling as the
     // first attempt (`GHSA-xrfj-852f-645j`).
+    let dispatch_auth = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let auth = crate::http3::client::H3Authorization::new(
+        request_ctx.grpc_deadline_at(),
+        dispatch_auth.as_ref(),
+    );
     let effective_max_response_body_size_bytes = effective_request_body_limit(
         state.max_response_body_size_bytes,
         request_ctx.route_response_body_limit(),
@@ -61717,7 +61853,7 @@ async fn proxy_to_backend_http3_retry(
             let target_policy_port = target.dispatch_policy_port();
             state
                 .h3_pool
-                .request_with_target_streaming(
+                .request_with_target_streaming_under_authorization(
                     proxy,
                     &target_host,
                     target_port,
@@ -61726,18 +61862,20 @@ async fn proxy_to_backend_http3_retry(
                     backend_url,
                     &http3_headers,
                     body_bytes,
+                    auth,
                     move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
         } else {
             state
                 .h3_pool
-                .request_streaming(
+                .request_streaming_under_authorization(
                     proxy,
                     method,
                     backend_url,
                     &http3_headers,
                     body_bytes,
+                    auth,
                     move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
@@ -61790,10 +61928,11 @@ async fn proxy_to_backend_http3_retry(
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: None,
+                        request_on_wire: true,
                         buffered_trailers: None,
                     }
                 } else {
-                    drain_h3_streaming_response_to_buffered(
+                    drain_h3_response_under_authorization(
                         response,
                         state,
                         proxy,
@@ -61801,11 +61940,30 @@ async fn proxy_to_backend_http3_retry(
                         backend_url,
                         resolved_ip,
                         effective_max_response_body_size_bytes,
+                        request_ctx.grpc_deadline_at(),
+                        dispatch_auth.as_ref(),
+                        request_ctx,
+                        headers,
                     )
                     .await
                 }
             }
             Err(e) => {
+                if e.authorization_expiry().is_some() {
+                    return authorization_expired_dispatch_placeholder(
+                        resolved_ip,
+                        e.request_on_wire(),
+                    );
+                }
+                if e.client_deadline_expired() {
+                    let mut response = client_grpc_deadline_exceeded_response_for_request(
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                    );
+                    response.request_on_wire = e.request_on_wire();
+                    return response;
+                }
                 if e.is_read_timeout() {
                     // `backend_read_timeout_ms` expired waiting for the
                     // retried response headers — surface 504 Backend timeout
@@ -61845,6 +62003,7 @@ async fn proxy_to_backend_http3_retry(
                     connection_error: is_conn_error,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(error_class),
+                    request_on_wire: e.request_on_wire(),
                     buffered_trailers: None,
                 }
             }
@@ -61862,7 +62021,7 @@ async fn proxy_to_backend_http3_retry(
         let target_policy_port = target.dispatch_policy_port();
         state
             .h3_pool
-            .request_with_target(
+            .request_with_target_streaming_under_authorization(
                 proxy,
                 &target_host,
                 target_port,
@@ -61871,23 +62030,38 @@ async fn proxy_to_backend_http3_retry(
                 backend_url,
                 &http3_headers,
                 body_bytes,
+                auth,
                 move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
             )
             .await
     } else {
         state
             .h3_pool
-            .request(
+            .request_streaming_under_authorization(
                 proxy,
                 method,
                 backend_url,
                 &http3_headers,
                 body_bytes,
+                auth,
                 move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
             )
             .await
     };
 
+    let h3_result = match h3_result {
+        Ok(response) => {
+            crate::http3::client::buffer_h3_response_under_authorization(
+                response,
+                method,
+                effective_max_response_body_size_bytes,
+                proxy.backend_read_timeout_ms,
+                auth,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
     match h3_result {
         Ok(response) => {
             debug!(
@@ -61918,6 +62092,7 @@ async fn proxy_to_backend_http3_retry(
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
                     error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                    request_on_wire: true,
                     buffered_trailers: None,
                 };
             }
@@ -61932,10 +62107,26 @@ async fn proxy_to_backend_http3_retry(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
+                request_on_wire: true,
                 buffered_trailers: None,
             }
         }
         Err(e) => {
+            if e.authorization_expiry().is_some() {
+                return authorization_expired_dispatch_placeholder(
+                    resolved_ip,
+                    e.request_on_wire(),
+                );
+            }
+            if e.client_deadline_expired() {
+                let mut response = client_grpc_deadline_exceeded_response_for_request(
+                    request_ctx,
+                    headers,
+                    resolved_ip,
+                );
+                response.request_on_wire = e.request_on_wire();
+                return response;
+            }
             if e.is_read_timeout() {
                 // `backend_read_timeout_ms` expired waiting for the retried
                 // response — surface 504 Backend timeout like the direct-H2
@@ -61975,6 +62166,7 @@ async fn proxy_to_backend_http3_retry(
                 connection_error: is_conn_error,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+                request_on_wire: e.request_on_wire(),
                 buffered_trailers: None,
             }
         }
@@ -65490,8 +65682,11 @@ mod tests {
 
     #[test]
     fn mesh_grpc_response_buffering_refusal_is_gateway_side_neutral() {
-        let resp =
-            mesh_grpc_response_buffering_refusal_response(200, Some("127.0.0.2".to_string()));
+        let resp = mesh_grpc_response_buffering_refusal_response(
+            200,
+            false,
+            Some("127.0.0.2".to_string()),
+        );
 
         assert_eq!(resp.status_code, 200);
         assert!(!resp.connection_error);
@@ -65689,8 +65884,11 @@ mod tests {
 
     #[test]
     fn mesh_grpc_response_buffering_refusal_preserves_backend_server_error() {
-        let resp =
-            mesh_grpc_response_buffering_refusal_response(503, Some("127.0.0.2".to_string()));
+        let resp = mesh_grpc_response_buffering_refusal_response(
+            503,
+            true,
+            Some("127.0.0.2".to_string()),
+        );
 
         assert_eq!(resp.status_code, 503);
         assert!(!resp.connection_error);
@@ -68890,6 +69088,7 @@ mod tests {
                 connection_error,
                 backend_resolved_ip: None,
                 error_class,
+                request_on_wire: !connection_error,
                 buffered_trailers: None,
             }
         };

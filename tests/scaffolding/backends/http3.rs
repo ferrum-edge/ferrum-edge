@@ -88,6 +88,9 @@ pub enum H3Step {
     /// stream is still open. Fails the script if the client half-closes (or
     /// resets) before sending any DATA.
     ReadRequestData,
+    /// Consume any already-buffered DATA, then require H3_REQUEST_CANCELLED.
+    /// Clean EOF is a failure even when the request has no Content-Length.
+    ExpectRequestReset,
     /// Send a chunk of response body.
     RespondData(Bytes),
     /// Keep sending DATA without FIN until the peer cancels this response with
@@ -352,6 +355,11 @@ impl ScriptedH3Backend {
         self.state.connection_close_sent.load(Ordering::SeqCst)
     }
 
+    /// Request send halves whose cancellation was observed on the QUIC wire.
+    pub fn request_resets(&self) -> u32 {
+        self.state.request_resets.load(Ordering::SeqCst)
+    }
+
     /// Clone of every H3 request observed so far.
     pub async fn received_requests(&self) -> Vec<H3RecordedRequest> {
         self.state.requests.lock().await.clone()
@@ -404,6 +412,7 @@ struct H3BackendState {
     refused_handshakes: AtomicU32,
     dropped_initial_packets: AtomicU32,
     connection_close_sent: AtomicU32,
+    request_resets: AtomicU32,
     requests: Mutex<Vec<H3RecordedRequest>>,
     step_errors: Mutex<Vec<String>>,
     connection_aborts: StdMutex<Vec<AbortHandle>>,
@@ -641,6 +650,34 @@ async fn run_h3_script(
                     chunk.advance(take.len());
                 }
                 record_request_body(&state, request_index, &bytes).await?;
+            }
+            H3Step::ExpectRequestReset => {
+                let stream = response_stream
+                    .as_mut()
+                    .ok_or_else(|| "ExpectRequestReset without an accepted stream".to_string())?;
+                let request_index = current_request_index
+                    .ok_or_else(|| "ExpectRequestReset without a recorded request".to_string())?;
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        match stream.recv_data().await {
+                            Ok(Some(mut data)) => {
+                                let len = data.remaining();
+                                let data = data.copy_to_bytes(len);
+                                record_request_body(&state, request_index, &data).await?;
+                            }
+                            Err(h3::error::StreamError::RemoteTerminate { code, .. })
+                                if code == h3::error::Code::H3_REQUEST_CANCELLED =>
+                            {
+                                state.request_resets.fetch_add(1, Ordering::SeqCst);
+                                return Ok(());
+                            }
+                            Ok(None) => return Err("partial upload ended in clean EOF".to_string()),
+                            Err(error) => return Err(format!("expected request reset: {error}")),
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "request was not reset within 15 seconds".to_string())??;
             }
             H3Step::RespondData(bytes) => {
                 let stream = response_stream

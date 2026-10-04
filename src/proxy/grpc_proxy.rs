@@ -216,7 +216,7 @@ pub enum GrpcBody {
         /// Transport-side deadline guard. The pump owns the inbound body when
         /// hyper stops polling, while this guard prevents a frame already in
         /// the bounded bridge from crossing the authorization deadline.
-        auth_deadline: Option<super::RequestAuthLifetimePlan>,
+        auth_deadline: Option<crate::proxy::body::UploadAuthDeadline>,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -440,7 +440,10 @@ impl http_body::Body for GrpcBody {
                         *grpc_deadline_at,
                         Some(*deadline),
                     );
-                    if bound.deadline().is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    if bound
+                        .deadline()
+                        .is_some_and(|at| tokio::time::Instant::now() >= at)
+                    {
                         let message = match bound.expired_authorization() {
                             Some(termination) => {
                                 latch.record_once(termination, *family);
@@ -2646,6 +2649,7 @@ pub fn grpc_request_body_too_large_backend_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }

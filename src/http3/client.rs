@@ -933,6 +933,31 @@ impl H3PooledConnection {
 pub type H3RequestStream =
     h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
 
+/// Quinn finishes a send stream on drop. Until the entire upload is finished,
+/// every error or cancelled future must instead reset it, including cancellation
+/// while waiting for the next frontend DATA frame after a successful write.
+struct H3UploadResetGuard<'a, S: h3::quic::SendStream<bytes::Bytes>> {
+    stream: &'a mut h3::client::RequestStream<S, bytes::Bytes>,
+    completed: bool,
+}
+
+impl<'a, S: h3::quic::SendStream<bytes::Bytes>> H3UploadResetGuard<'a, S> {
+    fn new(stream: &'a mut h3::client::RequestStream<S, bytes::Bytes>) -> Self {
+        Self {
+            stream,
+            completed: false,
+        }
+    }
+}
+
+impl<S: h3::quic::SendStream<bytes::Bytes>> Drop for H3UploadResetGuard<'_, S> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        }
+    }
+}
+
 /// Build a typed `io::Error` of kind `TimedOut` for an H3 backend-connect
 /// budget exhaustion. The shared classifier ([`classify_http3_error`])
 /// downcasts to `std::io::Error` first and maps `ErrorKind::TimedOut` to
@@ -1275,7 +1300,10 @@ impl<'a> H3Authorization<'a> {
         }
     }
 
-    fn compose(self, protocol_at: Option<tokio::time::Instant>) -> crate::proxy::DispatchPhaseBound {
+    fn compose(
+        self,
+        protocol_at: Option<tokio::time::Instant>,
+    ) -> crate::proxy::DispatchPhaseBound {
         let phase_at = match (self.client_deadline_at, protocol_at) {
             (Some(client), Some(protocol)) => Some(client.min(protocol)),
             (client, protocol) => client.or(protocol),
@@ -1390,13 +1418,8 @@ where
     S: h3::quic::SendStream<bytes::Bytes>,
 {
     for chunk in H3BufferedBodyChunks::new(body) {
-        await_h3_write_under_authorization(
-            auth,
-            timeout_ms,
-            stream.send_data(chunk),
-            "send_data",
-        )
-        .await?;
+        await_h3_write_under_authorization(auth, timeout_ms, stream.send_data(chunk), "send_data")
+            .await?;
     }
     Ok(())
 }
@@ -1418,6 +1441,45 @@ async fn recv_h3_response_under_authorization(
         recv_h3_response_with_timeout(stream, read_timeout_ms),
     )
     .await
+}
+
+/// Collect a retained response under the same admitted lifetime as checkout,
+/// HEADERS, and upload. A retry never replaces the plan's absolute instant.
+pub(crate) async fn buffer_h3_response_under_authorization(
+    mut response: H3StreamingResponse,
+    method: &str,
+    max_response_body_size_bytes: usize,
+    read_timeout_ms: u64,
+    auth: H3Authorization<'_>,
+) -> H3PoolResult<H3BufferedResponse> {
+    let content_length = response
+        .headers
+        .get("content-length")
+        .and_then(|value| value.parse().ok());
+    let collect = async {
+        drain_h3_response_body(
+            &mut response.recv_stream,
+            method,
+            response.status,
+            content_length,
+            max_response_body_size_bytes,
+            read_timeout_ms,
+        )
+        .await
+        .map_err(|error| match error {
+            H3BodyDrainError::ReadTimeout { .. } => {
+                H3PoolError::read_timeout(anyhow::anyhow!("recv_data failed: {error}"))
+            }
+            other => H3PoolError::post_wire(anyhow::anyhow!("recv_data failed: {other}")),
+        })
+    };
+    let (body, trailers) = await_h3_dispatch(auth, true, None, collect).await?;
+    Ok(H3BufferedResponse {
+        status: response.status,
+        body,
+        headers: response.headers,
+        trailers,
+    })
 }
 
 /// A native-H3 streaming request may reconnect after a cached-connection
@@ -2812,13 +2874,17 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
-        send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms).await?;
+        let mut upload = H3UploadResetGuard::new(&mut stream);
+        send_h3_buffered_request_body(upload.stream, body, proxy.backend_write_timeout_ms).await?;
         await_h3_client_write_with_timeout(
             proxy.backend_write_timeout_ms,
-            stream.finish(),
+            upload.stream.finish(),
             "finish",
         )
         .await?;
+
+        upload.completed = true;
+        drop(upload);
 
         let response =
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
@@ -2908,8 +2974,9 @@ impl Http3ConnectionPool {
                 .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
         })
         .await?;
+        let mut upload = H3UploadResetGuard::new(&mut stream);
         send_h3_buffered_body_under_authorization(
-            &mut stream,
+            upload.stream,
             body,
             proxy.backend_write_timeout_ms,
             auth,
@@ -2918,17 +2985,17 @@ impl Http3ConnectionPool {
         await_h3_write_under_authorization(
             auth,
             proxy.backend_write_timeout_ms,
-            stream.finish(),
+            upload.stream.finish(),
             "finish",
         )
         .await?;
 
-        let response = recv_h3_response_under_authorization(
-            &mut stream,
-            proxy.backend_read_timeout_ms,
-            auth,
-        )
-        .await?;
+        upload.completed = true;
+        drop(upload);
+
+        let response =
+            recv_h3_response_under_authorization(&mut stream, proxy.backend_read_timeout_ms, auth)
+                .await?;
         let status = response.status().as_u16();
 
         let response_headers = collect_h3_response_headers(response.headers());
@@ -2950,9 +3017,9 @@ impl Http3ConnectionPool {
     ///
     /// Body-on-wire semantics: `request_on_wire` flips to `true` once the
     /// QUIC stream is opened (`send_request` succeeded). The size-limit
-    /// rejection is post-wire because we cannot abort the stream cleanly
-    /// after dispatch — the H3 server callers translate this back into a
-    /// 413 status which is intentionally not a transport-class failure.
+    /// rejection is post-wire and resets the incomplete backend upload. The
+    /// H3 server callers translate it into a 413 status, which deliberately
+    /// supplies no backend-health signal.
     #[allow(clippy::too_many_arguments)]
     async fn do_request_streaming_body(
         send_request: &mut H3SendRequest,
@@ -2988,6 +3055,7 @@ impl Http3ConnectionPool {
         // timeout (a stalled client — neutral for backend health) from a header-wait
         // timeout (a slow backend — a real read-timeout fault).
         upload_complete: Arc<AtomicBool>,
+        auth: H3Authorization<'_>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
@@ -3002,23 +3070,30 @@ impl Http3ConnectionPool {
 
         let req =
             build_h3_backend_request_preserving_te(req_method, path_and_query, headers, None)?;
-        let mut backend_stream = send_request
-            .send_request(req)
-            .await
-            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
+        let mut backend_stream = await_h3_dispatch(auth, false, None, async {
+            send_request
+                .send_request(req)
+                .await
+                .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
+        })
+        .await?;
         // The stream is now open on the backend QUIC connection — the request has
         // reached the wire. Any failure from here on is post-wire (the caller's
         // dispatch `timeout_at` reads this to avoid misclassifying a slow upload /
         // zero-message client-streaming RPC as a pre-wire connect failure).
         stream_opened.store(true, Ordering::Release);
 
+        let mut upload = H3UploadResetGuard::new(&mut backend_stream);
         // Stream request body: read chunks from frontend, forward to backend.
         // Uses Buf::copy_to_bytes() which is zero-copy when the underlying
         // buffer is already bytes::Bytes (common with h3-quinn).
         let mut total_sent: usize = 0;
         let mut grpc_tap = grpc_messages;
         loop {
-            let recv_res = frontend_stream.recv_data().await;
+            let recv_res = await_h3_dispatch(auth, true, None, async {
+                Ok(frontend_stream.recv_data().await)
+            })
+            .await?;
             let chunk_opt = match recv_res {
                 Ok(c) => c,
                 Err(e) => {
@@ -3043,9 +3118,10 @@ impl Http3ConnectionPool {
             }
             let data = chunk.copy_to_bytes(len);
             let metric_data = grpc_tap.as_ref().map(|_| data.clone());
-            await_h3_client_write_with_timeout(
+            await_h3_write_under_authorization(
+                auth,
                 proxy.backend_write_timeout_ms,
-                backend_stream.send_data(data),
+                upload.stream.send_data(data),
                 "send_data",
             )
             .await?;
@@ -3063,7 +3139,11 @@ impl Http3ConnectionPool {
         // backend stream as if the client had sent none. Classified as a client
         // request-body fault (post-wire, neutral for backend health — see
         // `is_h3_client_request_body_disconnect`). Absent trailers are fine.
-        match frontend_stream.recv_trailers().await {
+        let trailers = await_h3_dispatch(auth, true, None, async {
+            Ok(frontend_stream.recv_trailers().await)
+        })
+        .await?;
+        match trailers {
             Ok(Some(mut trailers)) if !trailers.is_empty() => {
                 // Client request trailers are read AFTER the initial headers were
                 // stripped/sanitized, so a malicious client can smuggle hop-by-hop
@@ -3077,9 +3157,10 @@ impl Http3ConnectionPool {
                 // Only forward a still-non-empty block; an all-reserved trailer set
                 // collapses to nothing and must not emit an empty trailer frame.
                 if !trailers.is_empty() {
-                    await_h3_client_write_with_timeout(
+                    await_h3_write_under_authorization(
+                        auth,
                         proxy.backend_write_timeout_ms,
-                        backend_stream.send_trailers(trailers),
+                        upload.stream.send_trailers(trailers),
                         "send request trailers",
                     )
                     .await?;
@@ -3093,9 +3174,10 @@ impl Http3ConnectionPool {
                 )));
             }
         }
-        await_h3_client_write_with_timeout(
+        await_h3_write_under_authorization(
+            auth,
             proxy.backend_write_timeout_ms,
-            backend_stream.finish(),
+            upload.stream.finish(),
             "finish",
         )
         .await?;
@@ -3104,8 +3186,12 @@ impl Http3ConnectionPool {
         // to return response headers, NOT a stalled client upload.
         upload_complete.store(true, Ordering::Release);
 
+        upload.completed = true;
+        drop(upload);
+
         let response =
-            recv_h3_response_with_timeout(&mut backend_stream, header_read_timeout_ms).await?;
+            recv_h3_response_under_authorization(&mut backend_stream, header_read_timeout_ms, auth)
+                .await?;
         let status = response.status().as_u16();
 
         let response_headers = collect_h3_response_headers(response.headers());
@@ -3463,12 +3549,11 @@ impl Http3ConnectionPool {
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
         auth: H3Authorization<'_>,
     ) -> H3PoolResult<H3StreamingResponse> {
+        let mut upload = H3UploadResetGuard::new(&mut backend_stream);
         let mut total_sent: usize = 0;
         let mut grpc_tap = grpc_messages;
-        while let Some(frame_result) = await_h3_dispatch(auth, true, None, async {
-            Ok(frontend_body.frame().await)
-        })
-        .await?
+        while let Some(frame_result) =
+            await_h3_dispatch(auth, true, None, async { Ok(frontend_body.frame().await) }).await?
         {
             let frame = frame_result.map_err(|e| {
                 H3PoolError::post_wire(anyhow::anyhow!(
@@ -3496,7 +3581,7 @@ impl Http3ConnectionPool {
             await_h3_write_under_authorization(
                 auth,
                 proxy.backend_write_timeout_ms,
-                backend_stream.send_data(data),
+                upload.stream.send_data(data),
                 "send_data",
             )
             .await?;
@@ -3508,10 +3593,13 @@ impl Http3ConnectionPool {
         await_h3_write_under_authorization(
             auth,
             proxy.backend_write_timeout_ms,
-            backend_stream.finish(),
+            upload.stream.finish(),
             "finish",
         )
         .await?;
+
+        upload.completed = true;
+        drop(upload);
 
         let response = recv_h3_response_under_authorization(
             &mut backend_stream,
@@ -3537,7 +3625,7 @@ impl Http3ConnectionPool {
     /// directly to the backend without buffering. This avoids `Vec<u8>` allocation
     /// for large request bodies when no plugins need body inspection.
     #[allow(clippy::too_many_arguments)]
-    pub async fn request_streaming_body<TlsFut>(
+    pub(crate) async fn request_streaming_body_under_authorization<TlsFut>(
         &self,
         proxy: &Proxy,
         method: &str,
@@ -3563,6 +3651,7 @@ impl Http3ConnectionPool {
         // stream is FINished; lets the dispatch separate an upload-phase stall (client
         // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
         upload_complete: Arc<AtomicBool>,
+        auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
     where
@@ -3595,11 +3684,15 @@ impl Http3ConnectionPool {
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
                 Arc::clone(&upload_complete),
+                auth,
             )
             .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    if e.lifetime_expired() {
+                        return Err(e);
+                    }
                     debug!(
                         "HTTP/3 streaming body: cached connection failed, evicting: {}",
                         e
@@ -3619,25 +3712,24 @@ impl Http3ConnectionPool {
         // Create a new connection. Reaching here after a cached failure is safe
         // only because the gate above proved it was pre-wire; therefore no sticky
         // `request_on_wire` state needs to be promoted into this attempt.
-        let tls_config = tls_config_fn().await.map_err(H3PoolError::pre_wire)?;
+        let tls_config = await_h3_checkout(auth, tls_config_fn()).await?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         // A create refused by the destination's `maxConnections` ceiling is not
         // a dead end: an already-established shard can serve this request by
         // multiplexing. Only a cap refusal takes that path — see
         // `reuse_shard_after_max_connections`.
-        let pooled = match self
-            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
-            .await
-        {
+        let create = self.create_or_get_proxy_sender(key, proxy, tls_config, h3_config);
+        let pooled = match await_h3_checkout(auth, create).await {
             Ok(pooled) => pooled,
+            Err(err) if err.lifetime_expired() => return Err(err),
             Err(err) => match self.reuse_shard_after_max_connections(
-                &err,
+                err.as_error(),
                 start,
                 conns_per_backend,
                 |index| self.pool_key_with_current_generation(proxy, index),
             ) {
                 Some(pooled) => pooled,
-                None => return Err(H3PoolError::pre_wire(err)),
+                None => return Err(err),
             },
         };
         let mut sr_for_request = pooled.send_request;
@@ -3655,6 +3747,7 @@ impl Http3ConnectionPool {
             header_read_timeout_ms,
             stream_opened,
             upload_complete,
+            auth,
         )
         .await
     }
@@ -3831,7 +3924,7 @@ impl Http3ConnectionPool {
     /// Send an HTTP/3 request with a streaming request body to an explicit
     /// host/port target.
     #[allow(clippy::too_many_arguments)]
-    pub async fn request_with_target_streaming_body<TlsFut>(
+    pub(crate) async fn request_with_target_streaming_body_under_authorization<TlsFut>(
         &self,
         proxy: &Proxy,
         target_host: &str,
@@ -3865,6 +3958,7 @@ impl Http3ConnectionPool {
         // stream is FINished; lets the dispatch separate an upload-phase stall (client
         // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
         upload_complete: Arc<AtomicBool>,
+        auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
     where
@@ -3897,11 +3991,15 @@ impl Http3ConnectionPool {
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
                 Arc::clone(&upload_complete),
+                auth,
             )
             .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    if e.lifetime_expired() {
+                        return Err(e);
+                    }
                     debug!(
                         "HTTP/3 streaming body: cached connection to {}:{} failed, evicting: {}",
                         target_host, target_port, e
@@ -3918,29 +4016,28 @@ impl Http3ConnectionPool {
 
         // Create a new connection. Any cached failure that reached this point
         // was pre-wire, so replay safety is preserved.
-        let tls_config = tls_config_fn().await.map_err(H3PoolError::pre_wire)?;
+        let tls_config = await_h3_checkout(auth, tls_config_fn()).await?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         // A create refused by the destination's `maxConnections` ceiling is not
         // a dead end: an already-established shard can serve this request by
         // multiplexing. Only a cap refusal takes that path — see
         // `reuse_shard_after_max_connections`.
-        let pooled = match self
-            .create_or_get_target_sender(
-                key,
-                proxy,
-                H3ConnectionTarget {
-                    host: target_host,
-                    port: target_port,
-                    policy_port: target_policy_port,
-                },
-                tls_config,
-                h3_config,
-            )
-            .await
-        {
+        let create = self.create_or_get_target_sender(
+            key,
+            proxy,
+            H3ConnectionTarget {
+                host: target_host,
+                port: target_port,
+                policy_port: target_policy_port,
+            },
+            tls_config,
+            h3_config,
+        );
+        let pooled = match await_h3_checkout(auth, create).await {
             Ok(pooled) => pooled,
+            Err(err) if err.lifetime_expired() => return Err(err),
             Err(err) => match self.reuse_shard_after_max_connections(
-                &err,
+                err.as_error(),
                 start,
                 conns_per_backend,
                 |index| {
@@ -3953,7 +4050,7 @@ impl Http3ConnectionPool {
                 },
             ) {
                 Some(pooled) => pooled,
-                None => return Err(H3PoolError::pre_wire(err)),
+                None => return Err(err),
             },
         };
         let mut sr_for_request = pooled.send_request;
@@ -3971,6 +4068,7 @@ impl Http3ConnectionPool {
             header_read_timeout_ms,
             stream_opened,
             upload_complete,
+            auth,
         )
         .await
     }
