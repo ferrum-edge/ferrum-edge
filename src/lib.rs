@@ -11749,10 +11749,14 @@ pub mod _test_support {
 
     /// Exercise the production native-H3 pool with a captured plan and a
     /// controlled TLS-config checkout, including the explicit-target path.
+    /// Supply finalized backend headers, including Host: the pool uses a
+    /// path-only URI, just as it does for production dispatch.
+    #[allow(clippy::too_many_arguments)]
     pub async fn native_h3_pooled_dispatch_for_test<F>(
         pool: &crate::http3::client::Http3ConnectionPool,
         proxy: &crate::config::types::Proxy,
         url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
         auth: &RequestAuthLifetimePlanForTest,
         explicit_target: bool,
@@ -11770,16 +11774,22 @@ pub mod _test_support {
                 proxy.backend_port,
                 "POST",
                 url,
-                &[],
+                headers,
                 body,
                 bound,
                 || tls_config,
             )
             .await
         } else {
-            pool.request_streaming_under_authorization(proxy, "POST", url, &[], body, bound, || {
-                tls_config
-            })
+            pool.request_streaming_under_authorization(
+                proxy,
+                "POST",
+                url,
+                headers,
+                body,
+                bound,
+                || tls_config,
+            )
             .await
         };
         result.map_err(|error| {

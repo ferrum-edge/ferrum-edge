@@ -3442,6 +3442,11 @@ async fn h3_pool_authorization_expiry_during_checkout_sends_zero_backend_request
         let (pool, _, mut proxy) = capped_h3_pool(1, port);
         proxy.pool_http3_connections_per_backend = Some(1);
         let url = format!("https://127.0.0.1:{port}/");
+        let headers = [(
+            http::header::HOST,
+            http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+                .expect("backend authority"),
+        )];
         let plan = (
             StreamAuthDeadline {
                 at: tokio::time::Instant::now() + Duration::from_millis(100),
@@ -3455,6 +3460,7 @@ async fn h3_pool_authorization_expiry_during_checkout_sends_zero_backend_request
             &pool,
             &proxy,
             &url,
+            &headers,
             bytes::Bytes::new(),
             &plan,
             explicit_target,
@@ -3472,9 +3478,14 @@ async fn h3_pool_authorization_expiry_during_checkout_sends_zero_backend_request
         assert!(backend.received_requests().await.is_empty());
         // Prove zero hits came from expiry rather than an unusable fixture.
         let response = pool
-            .request(&proxy, "GET", &url, &[], bytes::Bytes::new(), || {
-                std::future::ready(Ok(client_tls))
-            })
+            .request(
+                &proxy,
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                || std::future::ready(Ok(client_tls)),
+            )
             .await
             .expect("healthy backend after refused acquisition");
         assert_eq!(response.status, 200);
@@ -3496,10 +3507,20 @@ async fn h3_pool_expired_plan_refuses_cached_sender_before_backend_headers() {
         let (pool, _, mut proxy) = capped_h3_pool(1, port);
         proxy.pool_http3_connections_per_backend = Some(1);
         let url = format!("https://127.0.0.1:{port}/");
+        let headers = [(
+            http::header::HOST,
+            http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+                .expect("backend authority"),
+        )];
         let tls = client_tls.clone();
-        pool.request(&proxy, "GET", &url, &[], bytes::Bytes::new(), || {
-            std::future::ready(Ok(tls))
-        })
+        pool.request(
+            &proxy,
+            "GET",
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            || std::future::ready(Ok(tls)),
+        )
         .await
         .expect("warm live sender");
         let plan = (
@@ -3514,6 +3535,7 @@ async fn h3_pool_expired_plan_refuses_cached_sender_before_backend_headers() {
             &pool,
             &proxy,
             &url,
+            &headers,
             bytes::Bytes::new(),
             &plan,
             explicit_target,
@@ -3528,9 +3550,14 @@ async fn h3_pool_expired_plan_refuses_cached_sender_before_backend_headers() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(backend.received_requests().await.len(), 1);
         let response = pool
-            .request(&proxy, "GET", &url, &[], bytes::Bytes::new(), || {
-                std::future::ready(Ok(client_tls))
-            })
+            .request(
+                &proxy,
+                "GET",
+                &url,
+                &headers,
+                bytes::Bytes::new(),
+                || std::future::ready(Ok(client_tls)),
+            )
             .await
             .expect("refusal must preserve the healthy sender");
         assert_eq!(response.status, 200);
@@ -3558,10 +3585,20 @@ async fn h3_pool_upload_expiry_after_transmission_retains_post_handoff_provenanc
     let (pool, _, mut proxy) = capped_h3_pool(1, port);
     proxy.pool_http3_connections_per_backend = Some(1);
     let url = format!("https://127.0.0.1:{port}/");
+    let headers = [(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+            .expect("backend authority"),
+    )];
     let tls = client_tls.clone();
-    pool.request(&proxy, "GET", &url, &[], bytes::Bytes::new(), || {
-        std::future::ready(Ok(tls))
-    })
+    pool.request(
+        &proxy,
+        "GET",
+        &url,
+        &headers,
+        bytes::Bytes::new(),
+        || std::future::ready(Ok(tls)),
+    )
     .await
     .expect("warm live sender");
     let plan = (
@@ -3576,6 +3613,7 @@ async fn h3_pool_upload_expiry_after_transmission_retains_post_handoff_provenanc
         &pool,
         &proxy,
         &url,
+        &headers,
         bytes::Bytes::from(vec![b'x'; 4 * 1024 * 1024]),
         &plan,
         false,
@@ -3595,6 +3633,34 @@ async fn h3_pool_upload_expiry_after_transmission_retains_post_handoff_provenanc
         authorization_dispatch_provenance_for_test(error.1),
         (false, true, Some(ErrorClass::ClientDisconnect), "ambiguous")
     );
+}
+
+/// State ceilings complement the real cold acquisition below: state size does
+/// not measure compiler poll-frame temporaries, so both guards are needed on
+/// ordinary test/Tokio stacks, including debug builds.
+#[test]
+fn h3_cold_dispatch_future_state_stays_within_the_stack_budget() {
+    use ferrum_edge::http3::client::Http3ConnectionPool;
+
+    let sizes = Http3ConnectionPool::buffered_dispatch_future_sizes_for_test();
+    for ((name, ceiling), actual) in [
+        ("proxy dispatch", 32 * 1024),
+        ("target dispatch", 32 * 1024),
+        ("proxy pool create", 16 * 1024),
+        ("target pool create", 16 * 1024),
+        ("proxy connection", 16 * 1024),
+        ("target connection", 16 * 1024),
+        ("buffered exchange", 32 * 1024),
+        ("streaming exchange", 32 * 1024),
+    ]
+    .into_iter()
+    .zip(sizes)
+    {
+        assert!(
+            actual <= ceiling,
+            "{name} future is {actual} bytes, exceeding its {ceiling}-byte state budget"
+        );
+    }
 }
 
 /// A real cold QUIC acquisition has a shorter connect budget than its admitted
@@ -3618,6 +3684,12 @@ async fn h3_cold_connect_timeout_does_not_become_an_authorization_refusal() {
         let _silent_socket = silent.into_socket();
         let (pool, _, mut proxy) = capped_h3_pool(1, silent_port);
         proxy.backend_connect_timeout_ms = 100;
+        let silent_url = format!("https://127.0.0.1:{silent_port}/");
+        let silent_headers = [(
+            http::header::HOST,
+            http::header::HeaderValue::from_str(&format!("127.0.0.1:{silent_port}"))
+                .expect("silent backend authority"),
+        )];
         let plan = (
             StreamAuthDeadline {
                 at: tokio::time::Instant::now() + Duration::from_secs(2),
@@ -3631,7 +3703,8 @@ async fn h3_cold_connect_timeout_does_not_become_an_authorization_refusal() {
             native_h3_pooled_dispatch_for_test(
                 &pool,
                 &proxy,
-                &format!("https://127.0.0.1:{silent_port}/"),
+                &silent_url,
+                &silent_headers,
                 bytes::Bytes::new(),
                 &plan,
                 explicit_target,
@@ -3648,12 +3721,17 @@ async fn h3_cold_connect_timeout_does_not_become_an_authorization_refusal() {
         // fixture, so the zero-request outcome came from the cold timeout.
         proxy.backend_port = port;
         proxy.backend_connect_timeout_ms = 5000;
+        let headers = [(
+            http::header::HOST,
+            http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+                .expect("live backend authority"),
+        )];
         let response = pool
             .request(
                 &proxy,
                 "GET",
                 &format!("https://127.0.0.1:{port}/"),
-                &[],
+                &headers,
                 bytes::Bytes::new(),
                 || std::future::ready(Ok(client_tls)),
             )

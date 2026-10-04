@@ -1190,18 +1190,33 @@ fn h3_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
     // helper (not an inline strip). Pin both the call site and the geo arm so a
     // refactor cannot drop the reserved assertion from either side.
     let h3_client = include_str!("../../../src/http3/client.rs");
-    let trailer_recv = h3_client
+    let relay = h3_client
+        .split("async fn do_request_streaming_body(")
+        .nth(1)
+        .expect("native H3 request-body relay")
+        .split("async fn do_open_bidi_backend_stream(")
+        .next()
+        .expect("bounded native H3 request-body relay");
+    let trailer_recv = relay
         .find("frontend_stream.recv_trailers().await")
         .expect("native H3 relay must read client request trailers");
-    let trailer_finish = h3_client[trailer_recv..]
-        .find("backend_stream\n            .finish()")
-        .or_else(|| h3_client[trailer_recv..].find("backend_stream.finish()"))
+    let trailer_finish = relay[trailer_recv..]
+        .find("upload.stream.finish()")
         .expect("native H3 relay must finish the backend stream after trailers");
-    let trailer_block = &h3_client[trailer_recv..trailer_recv + trailer_finish];
+    let trailer_block = &relay[trailer_recv..trailer_recv + trailer_finish];
+    assert!(trailer_block.contains("upload.stream.send_trailers(trailers)"));
+    assert!(trailer_block.contains("await_h3_write_under_authorization("));
     assert!(
         trailer_block.contains("sanitize_backend_request_trailers(&mut trailers)"),
         "H3 client request trailers must pass through the shared backend-trailer sanitizer"
     );
+    let sanitize = trailer_block
+        .find("sanitize_backend_request_trailers(&mut trailers)")
+        .unwrap();
+    let send = trailer_block
+        .find("upload.stream.send_trailers(trailers)")
+        .unwrap();
+    assert!(sanitize < send);
 
     let headers = include_str!("../../../src/proxy/headers.rs");
     let forbidden_start = headers

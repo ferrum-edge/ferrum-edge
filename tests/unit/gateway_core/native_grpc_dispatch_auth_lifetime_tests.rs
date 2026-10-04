@@ -1861,6 +1861,20 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
             .expect("H3 readiness");
         assert!(dns < connect && connect < candidate && candidate < quic && quic < h3);
         assert!(constructor[dns..connect].contains(".await?;"));
+        assert!(constructor.contains("boxed_h3_future(|| async move {"));
+        assert!(constructor.contains("let (mut driver, send_request) = boxed_h3_future(|| {"));
+    }
+    assert!(client.contains("#[inline(never)]\nfn boxed_h3_future<F>("));
+    let factory = source_region(client, "fn boxed_h3_future<F>(", "\n}\n");
+    assert!(factory.contains("Box::pin(construct())"));
+    assert!(!factory.contains("async"));
+    for creator in [
+        "async fn create_or_get_proxy_sender_with_connect_deadline(",
+        "async fn create_or_get_target_sender_with_connect_deadline(",
+    ] {
+        let body = source_region(client, creator, "\n    }\n");
+        assert!(body.contains("boxed_h3_future(|| {"));
+        assert!(body.contains("self.create_or_get_sender(key, connect_at, create).await"));
     }
     assert_eq!(
         client

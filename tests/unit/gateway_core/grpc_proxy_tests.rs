@@ -518,23 +518,61 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
     );
 
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
-    // Three native/gRPC-Web backend-error shapes plus the authorization-expiry
-    // terminal (GHSA-xcg4-wj3x-gjj2): a sender acquisition the authorization
-    // lifetime cut short is pre-wire too, so it also retains the upload.
-    assert_eq!(
-        proxy_src
-            .matches("grpc_proxy::attach_held_frontend_grpc_upload(")
-            .count(),
-        4,
-        "every terminal native/gRPC-Web error shape must attach the held upload"
-    );
-    assert_eq!(
-        proxy_src
-            .matches("held_frontend_grpc_upload.take()")
-            .count(),
-        4,
-        "each terminal error attachment must consume the held upload exactly once"
-    );
+    // Check each terminal's own scope: two pre-commitment gates, dispatch
+    // expiry, and all three native/gRPC-Web backend-error shapes. A duplicate
+    // attachment elsewhere cannot compensate for a lost one here.
+    for (start, end, expected) in [
+        (
+            "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
+            "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
+            1,
+        ),
+        (
+            "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
+            "Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {",
+            1,
+        ),
+        (
+            "Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {",
+            "Err(e) => {",
+            1,
+        ),
+        (
+            concat!(
+                "if let Some(content_type) = grpc_web_response_content_type {\n",
+                "                    let response = boxed_grpc_web_gateway_error_response(",
+            ),
+            "// Keep only the independently owned header map",
+            3,
+        ),
+    ] {
+        let start_at = proxy_src.find(start).expect("gRPC terminal start");
+        let tail = &proxy_src[start_at..];
+        let end_at = tail.find(end).expect("gRPC terminal end");
+        let terminal = &tail[..end_at];
+        assert_eq!(
+            terminal
+                .matches("grpc_proxy::attach_held_frontend_grpc_upload(")
+                .count(),
+            expected,
+            "terminal {start} must retain every held frontend upload"
+        );
+        assert_eq!(
+            terminal.matches("held_frontend_grpc_upload.take()").count(),
+            expected,
+            "terminal {start} must consume each held upload exactly once"
+        );
+        for attachment in terminal
+            .split("grpc_proxy::attach_held_frontend_grpc_upload(")
+            .skip(1)
+        {
+            let attachment = attachment.split("));").next().expect("attachment return");
+            assert_eq!(
+                attachment.matches("held_frontend_grpc_upload.take()").count(),
+                1
+            );
+        }
+    }
 }
 
 #[test]

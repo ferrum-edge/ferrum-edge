@@ -40,6 +40,17 @@ use crate::tls::backend::{
     backend_svid_generation_for_client_cert,
 };
 
+/// Construct a concrete child outside the caller's construction/poll frame.
+/// An async boxing trampoline would still retain the wide child inline. Keep
+/// the same task and guards: dropping the returned pointer cancels the child.
+#[inline(never)]
+fn boxed_h3_future<F>(construct: impl FnOnce() -> F) -> std::pin::Pin<Box<F>>
+where
+    F: std::future::Future,
+{
+    Box::pin(construct())
+}
+
 /// Classify an HTTP/3 backend error into the shared `ErrorClass` taxonomy.
 ///
 /// Walks the error source chain looking for recognizable `quinn::ConnectionError`
@@ -2307,11 +2318,13 @@ impl Http3ConnectionPool {
     ) -> Result<H3PooledConnection, anyhow::Error> {
         // H3 is the one pool that needs extra creation context beyond the
         // `Proxy`, so it uses the shared shell's explicit creation closure.
-        self.create_or_get_sender(key, connect_at, async {
-            self.create_connection(proxy, &tls_config, Some(&h3_config), connect_at)
-                .await
-        })
-        .await
+        let create = async {
+            boxed_h3_future(|| {
+                self.create_connection(proxy, &tls_config, Some(&h3_config), connect_at)
+            })
+            .await
+        };
+        self.create_or_get_sender(key, connect_at, create).await
     }
 
     /// `policy_port` is the DestinationRule policy port for this dispatch; see
@@ -2342,19 +2355,21 @@ impl Http3ConnectionPool {
         h3_config: super::config::Http3ServerConfig,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
-        self.create_or_get_sender(key, connect_at, async {
-            self.create_connection_to_target(
-                proxy,
-                target.host,
-                target.port,
-                target.policy_port,
-                &tls_config,
-                Some(&h3_config),
-                connect_at,
-            )
+        let create = async {
+            boxed_h3_future(|| {
+                self.create_connection_to_target(
+                    proxy,
+                    target.host,
+                    target.port,
+                    target.policy_port,
+                    &tls_config,
+                    Some(&h3_config),
+                    connect_at,
+                )
+            })
             .await
-        })
-        .await
+        };
+        self.create_or_get_sender(key, connect_at, create).await
     }
 
     /// Recover from a create the destination's `maxConnections` ceiling refused
@@ -2534,7 +2549,7 @@ impl Http3ConnectionPool {
         let mut fast_path_failed_pre_wire = false;
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
-            match Self::do_request(
+            match Self::boxed_do_request(
                 &mut sr,
                 proxy,
                 method,
@@ -2571,7 +2586,7 @@ impl Http3ConnectionPool {
             && let Some(pooled) = self.pool.cached(&key)
         {
             let mut sr = pooled.send_request;
-            match Self::do_request(
+            match Self::boxed_do_request(
                 &mut sr,
                 proxy,
                 method,
@@ -2600,7 +2615,7 @@ impl Http3ConnectionPool {
                     self.pool_key_with_generation(proxy, fallback_index, svid_generation);
                 if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                     let mut fallback_sr = fallback_pooled.send_request;
-                    match Self::do_request(
+                    match Self::boxed_do_request(
                         &mut fallback_sr,
                         proxy,
                         method,
@@ -2650,7 +2665,7 @@ impl Http3ConnectionPool {
         };
         let mut sr_for_request = pooled.send_request;
 
-        Self::do_request(
+        Self::boxed_do_request(
             &mut sr_for_request,
             proxy,
             method,
@@ -2716,7 +2731,7 @@ impl Http3ConnectionPool {
         // request and bypassing the gateway's retry_on_methods policy.
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
-            match Self::do_request(
+            match Self::boxed_do_request(
                 &mut sr,
                 proxy,
                 method,
@@ -2748,7 +2763,7 @@ impl Http3ConnectionPool {
                         );
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
-                            match Self::do_request(
+                            match Self::boxed_do_request(
                                 &mut fallback_sr,
                                 proxy,
                                 method,
@@ -2816,7 +2831,7 @@ impl Http3ConnectionPool {
         };
         let mut sr_for_request = pooled.send_request;
 
-        Self::do_request(
+        Self::boxed_do_request(
             &mut sr_for_request,
             proxy,
             method,
@@ -2927,7 +2942,7 @@ impl Http3ConnectionPool {
                 // One reservation, cloned per DNS candidate: a failed attempt
                 // drops its clone, so only the established connection holds it.
                 let conn_slot = conn_slot.clone();
-                async move {
+                boxed_h3_future(|| async move {
                     let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
                     let connection = endpoint
                         .connect_with(client_config, addr, tls_server_name)?
@@ -2938,12 +2953,15 @@ impl Http3ConnectionPool {
                     // QUIC-successful peer that cannot speak HTTP/3 cannot pin
                     // this pool and suppress failover to a later DNS address.
                     let quic_conn = connection.clone();
-                    let (mut driver, send_request) = h3::client::builder()
+                    let mut builder = h3::client::builder();
+                    builder
                         .max_field_section_size(h3_backend_response_max_field_section_size)
-                        .max_buffered_frame_len(h3_max_buffered_frame_len)
-                        .build(h3_quinn::Connection::new(connection))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+                        .max_buffered_frame_len(h3_max_buffered_frame_len);
+                    let (mut driver, send_request) = boxed_h3_future(|| {
+                        builder.build(h3_quinn::Connection::new(connection))
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
 
                     tokio::spawn(async move {
                         // The `maxConnections` slot lives exactly as long as
@@ -2959,7 +2977,7 @@ impl Http3ConnectionPool {
                         debug!("HTTP/3 pool connection driver closed: {}", err);
                     });
                     Ok(H3PooledConnection::new(send_request, quic_conn))
-                }
+                })
             })
             .await
             .map_err(|error| match error {
@@ -3085,7 +3103,7 @@ impl Http3ConnectionPool {
                 // One reservation, cloned per DNS candidate: a failed attempt
                 // drops its clone, so only the established connection holds it.
                 let conn_slot = conn_slot.clone();
-                async move {
+                boxed_h3_future(|| async move {
                     let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
                     let connection = endpoint
                         .connect_with(client_config, addr, tls_server_name)?
@@ -3096,12 +3114,15 @@ impl Http3ConnectionPool {
                     // QUIC-successful peer that cannot speak HTTP/3 cannot pin
                     // this pool and suppress failover to a later DNS address.
                     let quic_conn = connection.clone();
-                    let (mut driver, send_request) = h3::client::builder()
+                    let mut builder = h3::client::builder();
+                    builder
                         .max_field_section_size(h3_backend_response_max_field_section_size)
-                        .max_buffered_frame_len(h3_max_buffered_frame_len)
-                        .build(h3_quinn::Connection::new(connection))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+                        .max_buffered_frame_len(h3_max_buffered_frame_len);
+                    let (mut driver, send_request) = boxed_h3_future(|| {
+                        builder.build(h3_quinn::Connection::new(connection))
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
 
                     tokio::spawn(async move {
                         // The `maxConnections` slot lives exactly as long as
@@ -3117,7 +3138,7 @@ impl Http3ConnectionPool {
                         debug!("HTTP/3 pool connection driver closed: {}", err);
                     });
                     Ok(H3PooledConnection::new(send_request, quic_conn))
-                }
+                })
             })
             .await
             .map_err(|error| match error {
@@ -3143,6 +3164,28 @@ impl Http3ConnectionPool {
     /// request headers (and possibly body bytes) are committed and the
     /// backend may have processed the request, so the gateway must
     /// respect `retry_on_methods` instead of replaying blindly.
+    fn boxed_do_request<'a>(
+        send_request: &'a mut H3SendRequest,
+        proxy: &'a Proxy,
+        method: &'a str,
+        backend_url: &'a str,
+        headers: &'a [(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        max_response_body_size_bytes: usize,
+    ) -> impl std::future::Future<Output = H3PoolResult<H3BufferedResponse>> + 'a {
+        boxed_h3_future(|| {
+            Self::do_request(
+                send_request,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                body,
+                max_response_body_size_bytes,
+            )
+        })
+    }
+
     async fn do_request(
         send_request: &mut H3SendRequest,
         proxy: &Proxy,
@@ -3245,6 +3288,28 @@ impl Http3ConnectionPool {
     ///
     /// Body-on-wire semantics match [`do_request`] — `request_on_wire`
     /// flips to `true` once `send_request().await` succeeds.
+    fn boxed_do_request_streaming<'a>(
+        send_request: &'a mut H3SendRequest,
+        proxy: &'a Proxy,
+        method: &'a str,
+        backend_url: &'a str,
+        headers: &'a [(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        auth: H3Authorization<'a>,
+    ) -> impl std::future::Future<Output = H3PoolResult<H3StreamingResponse>> + 'a {
+        boxed_h3_future(|| {
+            Self::do_request_streaming(
+                send_request,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                body,
+                auth,
+            )
+        })
+    }
+
     async fn do_request_streaming(
         send_request: &mut H3SendRequest,
         proxy: &Proxy,
@@ -4763,7 +4828,7 @@ impl Http3ConnectionPool {
         let mut fast_path_failed_pre_wire = false;
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
-            match Self::do_request_streaming(
+            match Self::boxed_do_request_streaming(
                 &mut sr,
                 proxy,
                 method,
@@ -4794,7 +4859,7 @@ impl Http3ConnectionPool {
             && let Some(pooled) = self.pool.cached(&key)
         {
             let mut sr = pooled.send_request;
-            match Self::do_request_streaming(
+            match Self::boxed_do_request_streaming(
                 &mut sr,
                 proxy,
                 method,
@@ -4822,7 +4887,7 @@ impl Http3ConnectionPool {
                     self.pool_key_with_generation(proxy, fallback_index, svid_generation);
                 if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                     let mut fallback_sr = fallback_pooled.send_request;
-                    match Self::do_request_streaming(
+                    match Self::boxed_do_request_streaming(
                         &mut fallback_sr,
                         proxy,
                         method,
@@ -4879,7 +4944,7 @@ impl Http3ConnectionPool {
         };
         let mut sr_for_request = pooled.send_request;
 
-        Self::do_request_streaming(
+        Self::boxed_do_request_streaming(
             &mut sr_for_request,
             proxy,
             method,
@@ -5010,7 +5075,7 @@ impl Http3ConnectionPool {
         // `request()`).
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
-            match Self::do_request_streaming(
+            match Self::boxed_do_request_streaming(
                 &mut sr,
                 proxy,
                 method,
@@ -5041,7 +5106,7 @@ impl Http3ConnectionPool {
                         );
                         if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
                             let mut fallback_sr = fallback_pooled.send_request;
-                            match Self::do_request_streaming(
+                            match Self::boxed_do_request_streaming(
                                 &mut fallback_sr,
                                 proxy,
                                 method,
@@ -5115,7 +5180,7 @@ impl Http3ConnectionPool {
         };
         let mut sr_for_request = pooled.send_request;
 
-        Self::do_request_streaming(
+        Self::boxed_do_request_streaming(
             &mut sr_for_request,
             proxy,
             method,
@@ -5125,6 +5190,122 @@ impl Http3ConnectionPool {
             auth,
         )
         .await
+    }
+
+    /// Concrete dispatch, pool-create, and candidate-owner states. Measuring
+    /// their types does not construct or poll them, and catches an inline
+    /// child reintroduced behind an otherwise pointer-sized boxing boundary.
+    #[doc(hidden)]
+    pub fn buffered_dispatch_future_sizes_for_test() -> [usize; 8] {
+        fn measure<'a, F: std::future::Future>(
+            _construct: impl FnOnce(
+                &'a Http3ConnectionPool,
+                &'a Proxy,
+                &'a Arc<rustls::ClientConfig>,
+                &'a super::config::Http3ServerConfig,
+                &'a crate::proxy::RequestAuthLifetimePlan,
+                &'a OnceLock<tokio::time::Instant>,
+            ) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+
+        fn measure_exchange<'a, F: std::future::Future>(
+            _construct: impl FnOnce(
+                &'a mut H3SendRequest,
+                &'a Proxy,
+                &'a crate::proxy::RequestAuthLifetimePlan,
+            ) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+
+        [
+            measure(|pool, proxy, tls, _, auth, _| {
+                pool.request_streaming_inner(
+                    proxy,
+                    "POST",
+                    "https://127.0.0.1/",
+                    &[],
+                    bytes::Bytes::new(),
+                    H3Authorization::new(None, Some(auth)),
+                    move || std::future::ready(Ok(tls.clone())),
+                )
+            }),
+            measure(|pool, proxy, tls, _, auth, _| {
+                pool.request_with_target_streaming_inner(
+                    proxy,
+                    &proxy.backend_host,
+                    proxy.backend_port,
+                    proxy.backend_port,
+                    "POST",
+                    "https://127.0.0.1/",
+                    &[],
+                    bytes::Bytes::new(),
+                    H3Authorization::new(None, Some(auth)),
+                    move || std::future::ready(Ok(tls.clone())),
+                )
+            }),
+            measure(|pool, proxy, tls, cfg, _, at| {
+                pool.create_or_get_proxy_sender_with_connect_deadline(
+                    String::new(),
+                    proxy,
+                    tls.clone(),
+                    cfg.clone(),
+                    Some(at),
+                )
+            }),
+            measure(|pool, proxy, tls, cfg, _, at| {
+                pool.create_or_get_target_sender_with_connect_deadline(
+                    String::new(),
+                    proxy,
+                    H3ConnectionTarget {
+                        host: &proxy.backend_host,
+                        port: proxy.backend_port,
+                        policy_port: proxy.backend_port,
+                    },
+                    tls.clone(),
+                    cfg.clone(),
+                    Some(at),
+                )
+            }),
+            measure(|pool, proxy, tls, cfg, _, at| {
+                pool.create_connection(proxy, tls, Some(cfg), Some(at))
+            }),
+            measure(|pool, proxy, tls, cfg, _, at| {
+                pool.create_connection_to_target(
+                    proxy,
+                    &proxy.backend_host,
+                    proxy.backend_port,
+                    proxy.backend_port,
+                    tls,
+                    Some(cfg),
+                    Some(at),
+                )
+            }),
+            measure_exchange(|sender, proxy, _| {
+                Self::do_request(
+                    sender,
+                    proxy,
+                    "POST",
+                    "https://127.0.0.1/",
+                    &[],
+                    bytes::Bytes::new(),
+                    1024,
+                )
+            }),
+            measure_exchange(|sender, proxy, auth| {
+                Self::do_request_streaming(
+                    sender,
+                    proxy,
+                    "POST",
+                    "https://127.0.0.1/",
+                    &[],
+                    bytes::Bytes::new(),
+                    H3Authorization::new(None, Some(auth)),
+                )
+            }),
+        ]
     }
 }
 

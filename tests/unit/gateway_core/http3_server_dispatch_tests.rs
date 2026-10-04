@@ -728,8 +728,18 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         timed_out.contains("halt_request_body(stream)"),
         "the full-stream bridge must halt after the bounded terminal write settles"
     );
+    let authorization = body
+        .split("H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {")
+        .nth(1)
+        .expect("authorization upload branch")
+        .split("H3RequestBodyReadError::DeadlineExceeded(None)) => {")
+        .next()
+        .expect("bounded authorization upload branch");
+    assert!(authorization.contains("record_authorization_termination_once("));
+    assert!(authorization.contains("write_grpc_authorization_expired_terminal("));
+    assert!(!authorization.contains("halt_request_body(stream)"));
     let deadline = body
-        .find("H3RequestBodyReadError::DeadlineExceeded")
+        .find("H3RequestBodyReadError::DeadlineExceeded(None)")
         .expect("missing deadline upload branch");
     let deadline = &body[deadline..];
     let deadline_end = deadline[1..]
@@ -986,7 +996,7 @@ fn h3_buffered_terminal_write_bias_uses_typed_gateway_provenance() {
         .next()
         .expect("bounded buffered gRPC response arm");
     let writer = buffered
-        .split("let grpc_deadline_at = ctx.grpc_deadline_at();")
+        .split("let response_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(")
         .nth(1)
         .expect("buffered cross-protocol writer");
     let header_write = writer
@@ -1844,11 +1854,18 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
         6,
         "each terminal-deadline branch must abort on both write failure and grace expiry"
     );
-    let timed_out = cross
+    let dispatch = cross
+        .split("async fn dispatch_grpc<S>(")
+        .nth(1)
+        .expect("buffered cross-protocol gRPC dispatch")
+        .split("let bytes_sent = if body_was_prebuffered")
+        .next()
+        .expect("bounded buffered cross-protocol upload");
+    let timed_out = dispatch
         .split("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
         .nth(1)
         .expect("cross-protocol timed-out bridge arm")
-        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {")
+        .split("H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {")
         .next()
         .expect("bounded timed-out bridge arm");
     assert!(timed_out.contains("await_post_deadline_terminal_response_write("));
@@ -4666,11 +4683,13 @@ fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
             .split(anchor)
             .nth(1)
             .unwrap_or_else(|| panic!("{label} entry point"))
-            .split("stream.finish(),")
+            .split(".finish(),")
             .next()
             .unwrap_or_else(|| panic!("bounded {label} entry point"));
         let uses_chunked_sender = if label == "pooled streaming-response request" {
             entry.contains("send_h3_buffered_body_under_authorization(")
+        } else if label == "pooled buffered request" {
+            entry.contains("send_h3_buffered_request_body(upload.stream, body,")
         } else {
             entry.contains(
                 "send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms)",
