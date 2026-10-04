@@ -141,15 +141,22 @@ small-window, write-stall, upgrade-error and stream-lifetime regressions on the
 final pushed head. Existing FIPS CI rejected the pre-import head's stale
 `--locked` graph; it must be rechecked after import. Hosted job success for the
 lock producer does not replace these gates. Do not merge or release before
-those gates and the owner-controlled bindings below are complete.
+those gates and trusted policy admission are complete.
 
-Root/automation owners must update the guarded existing `ci.yml` bindings:
-the Hyper archive URL/name/checksum near lines 1714–1718 and every Hyper vendor
-manifest path near lines 2027–2046. Their current 1.9.0 bindings cannot validate
-this 1.10.0 port. Current path hints in `.claude/rules/dependencies.md`,
-`.claude/rules/proxy-protocols.md` and vendor-integrity test fixture strings also
-still name the former vendor directories; those worker-owned files were not
-edited here. Historical released changelog/upgrade/benchmark entries stay intact.
+The existing `ci.yml` dependency-audit consumer now downloads the published
+Hyper 1.10.0 archive with the checksum above and passes that archive to the
+complete patch-stack verifier. Every Hyper manifest path in
+`test-vendor-patches` now points to `vendor/hyper-1.10.0-ferrum-patched`, including
+the h2 pin, all four patch regressions and the vendored-h2 combination. Current
+dependency and proxy rule paths and vendor-integrity fixture strings also match
+the Hyper 1.10.0 / reqwest 0.13.4 directories. Historical released
+changelog/upgrade/benchmark entries stay intact.
+
+These consumer changes still require the hosted `Trusted Cross Build Policy`
+result on the final pushed head. Cross-sensitive jobs may be compared as whole
+frozen surfaces; correcting an archive pin does not establish admission. If the
+trusted gate rejects a changed job surface, root/automation owners must arrange
+human-reviewed trusted-base admission without bypassing the gate.
 
 Material risks pending hosted evidence: the body-first reservation adaptation
 changes HTTP/2 capacity scheduling; reset polling precedes pending DATA on every
