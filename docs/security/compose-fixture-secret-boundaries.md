@@ -111,8 +111,9 @@ proves the required default CLI positives and certificate-specific refusal.
 Cleanup remains in the original `finally` and unconditional workflow step.
 There is no aggregate PASS for an unresolved CLI disconnect.
 
-The optional hosted qualification path adds a C observer executable compiled
-with GCC on the runner. Its finite dispatcher adds the
+The optional hosted qualification path adds a C observer shared library
+compiled with GCC on the runner and loaded into the original MySQL CLI via
+`LD_PRELOAD`. Its finite dispatcher adds the
 `mysql-observer-compile`, `mysql-observer-server-der` and
 `mysql-observer-client-der` operations to compile the observer and derive the
 pinned server/client certificate signatures it checks. These additions do not
