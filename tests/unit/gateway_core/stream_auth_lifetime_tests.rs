@@ -2336,12 +2336,21 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
     // collect composer. Direct-H2 composes
     // through `authorization_bounded_header_deadline` instead, because it
     // carries a typed bound source.
+    //
+    // Plus five connection-checkout / request-handoff compositions
+    // (GHSA-xcg4-wj3x-gjj2): the Unix-socket checkout bound, the HBONE inner
+    // lease open's two attribution arms (first lease and idle-race replay),
+    // the direct-H2 sender acquisition's attribution, and the direct-H2
+    // handoff gate. The direct-H2 sender bound itself composes the bare
+    // instant through `compose_dispatch_phase_auth_bound_at`, and the direct
+    // HTTP/1.1 pool reuses its one header-wait composition for its checkout,
+    // replay, and handoff gate, so neither adds one here.
     assert_eq!(
         PROXY_SOURCE
             .matches("compose_dispatch_phase_auth_bound(")
             .count(),
-        8,
-        "an H1/H2 response-header wait lost its authorization bound"
+        13,
+        "an H1/H2 response-header wait or backend checkout lost its authorization bound"
     );
     assert!(PROXY_SOURCE.contains("authorization_bounded_header_deadline("));
     assert!(PROXY_SOURCE.contains("ResponseHeaderDeadlineSource::Authorization => {"));
@@ -2349,20 +2358,28 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
     // header wait, the direct-H2 early-response upload join, and the shared
     // buffered-response collect composer. Each attributes the fired bound, so an
     // authorization expiry is never reported as a backend timeout or a client
-    // RPC deadline.
+    // RPC deadline. The direct HTTP/1.1 pool's one attribution now lives in its
+    // out-of-line `direct_h1_handoff_bound_expired`, shared by its checkout,
+    // replay checkout, handoff gate, and header wait.
+    //
+    // Plus three checkout / handoff attributions (GHSA-xcg4-wj3x-gjj2): the
+    // HBONE / Unix-socket settle helper, the direct-H2 sender acquisition, and
+    // the direct-H2 handoff gate.
     assert_eq!(
         PROXY_SOURCE
             .matches("dispatch_phase_authorization_expiry(")
             .count(),
-        10,
+        13,
         "an H1/H2 dispatch phase lost its authorization attribution"
     );
-    // Every one of those exits returns the health-neutral placeholder. Sixteen
+    // Every one of those exits returns the health-neutral placeholder. Eighteen
     // references name it directly: the definition, the out-of-line wrapper's own
-    // single use, the three `proxy_to_backend_retry` returns, and the eleven
+    // single use, the three `proxy_to_backend_retry` returns, the eleven
     // tuple-returning exits across HBONE, Unix, mesh mTLS, direct-H2, and the
-    // native-H3 backend. The six `proxy_to_backend` exits reach the same value
-    // through that wrapper.
+    // native-H3 backend, and the two checkout / handoff settle helpers
+    // (GHSA-xcg4-wj3x-gjj2: HBONE / Unix-socket, and the direct-H2 handoff
+    // gate). The six `proxy_to_backend` exits reach the same value through that
+    // wrapper.
     //
     // Issue #4153 retired one reference on each of these two counts, and only
     // one: giving the buffered uploads a fail-closed retained ceiling folded the
@@ -2374,16 +2391,18 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         PROXY_SOURCE
             .matches("authorization_expired_dispatch_placeholder(")
             .count(),
-        16,
+        18,
         "an H1/H2 authorization exit stopped being health-neutral"
     );
-    // The wrapper's definition plus its six `proxy_to_backend` call sites and
-    // the direct HTTP/1.1 pool's two (#5588).
+    // The wrapper's definition plus its six `proxy_to_backend` call sites, the
+    // direct HTTP/1.1 pool's two (#5588: the shared checkout / handoff /
+    // header-wait settle helper and the buffered collect), and the direct-H2
+    // sender acquisition's (GHSA-xcg4-wj3x-gjj2).
     assert_eq!(
         PROXY_SOURCE
             .matches("authorization_expired_backend_dispatch(")
             .count(),
-        9,
+        10,
         "a reqwest-dispatch authorization exit stopped being health-neutral"
     );
     // The counts above are a tripwire for a LOST exit; this is the check that
@@ -2409,6 +2428,311 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
             "a buffered-upload authorization expiry stopped being health-neutral: {branch}"
         );
     }
+}
+
+/// The slice of `source` from the first `start` to the next `end` after it.
+fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split(start)
+        .nth(1)
+        .unwrap_or_else(|| panic!("missing region start {start:?}"))
+        .split(end)
+        .next()
+        .unwrap_or_else(|| panic!("missing region end {end:?}"))
+}
+
+/// Code outside `//` comments with every whitespace character removed, so a
+/// structural scan depends neither on prose nor on how rustfmt wraps a call.
+fn compact_code(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// Byte offset of `pattern` in `haystack`, or a failure naming it.
+fn offset_of(haystack: &str, pattern: &str) -> usize {
+    haystack
+        .find(pattern)
+        .unwrap_or_else(|| panic!("missing {pattern:?}"))
+}
+
+/// The handoff gate precedes the synchronous enqueue, and nothing between the
+/// END of the gate's refusal arm and the enqueue awaits.
+fn assert_gated_handoff(label: &str, code: &str, gate: &str, refusal_end: &str, enqueue: &str) {
+    let gate_at = offset_of(code, gate);
+    let enqueue_at = offset_of(code, enqueue);
+    assert!(
+        gate_at < enqueue_at,
+        "{label}: the handoff gate must precede the enqueue"
+    );
+    let after_refusal = code[gate_at..enqueue_at]
+        .split_once(refusal_end)
+        .unwrap_or_else(|| panic!("{label}: the refusal arm must return before the enqueue"))
+        .1;
+    assert!(
+        !after_refusal.contains(".await"),
+        "{label}: nothing may await between the handoff gate and the synchronous enqueue"
+    );
+}
+
+/// Backend connection checkout and request handoff are held to the admitted
+/// request's authorization lifetime on every pooled H1/H2 dispatch path
+/// (GHSA-xcg4-wj3x-gjj2).
+///
+/// hyper's `try_send_request` / `send_request` enqueue the request on the
+/// connection task synchronously, so a bound armed only around the response
+/// wait is too late: the plan must be composed BEFORE the checkout, bound the
+/// checkout (and its idle-race replay, at the same instant), and be re-checked
+/// immediately before the handoff, with no await in between.
+#[test]
+fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
+    const PLAN: &str = "letsend_auth_deadline=request_upload_auth_deadline(";
+    const H1_ENQUEUE: &str = "checkout.sender.try_send_request(backend_req)";
+
+    // The shared gate is inclusive and reads the clock only when bounded.
+    let gate = compact_code(source_region(
+        PROXY_SOURCE,
+        "pub(crate) fn elapsed(self) -> Option<BackendHandoffBoundSource> {",
+        "\n    }",
+    ));
+    assert!(gate.contains("letat=self.at?;"));
+    assert!(gate.contains("(tokio::time::Instant::now()>=at).then_some(self.source)"));
+    // The checkout wait: an elapsed bound refuses before the checkout is ever
+    // polled; otherwise the checkout is polled BEFORE a timer exists, so a
+    // ready pooled connection never registers with the timer driver; only a
+    // pending checkout arms `sleep_until(at)`. Never `timeout_at`.
+    let checkout_wait = compact_code(source_region(
+        PROXY_SOURCE,
+        "impl<F> std::future::Future for BackendHandoffBounded<F>",
+        "\n}\n",
+    ));
+    let precheck = offset_of(
+        &checkout_wait,
+        "iftokio::time::Instant::now()>=at{returnstd::task::Poll::Ready(Err(source));}",
+    );
+    let checkout_first = offset_of(
+        &checkout_wait,
+        "ifletstd::task::Poll::Ready(output)=this.checkout.as_mut().poll(cx)",
+    );
+    let timer = offset_of(
+        &checkout_wait,
+        "this.sleep.set(Some(tokio::time::sleep_until(at)));",
+    );
+    assert!(
+        precheck < checkout_first && checkout_first < timer,
+        "expiry pre-check, then the checkout, then (only if pending) the timer"
+    );
+    assert!(!checkout_wait.contains("timeout_at("));
+    assert!(!checkout_wait.contains("select!"));
+    // The lease gate releases a refused lease untouched and enqueues nothing.
+    let lease_gate = compact_code(source_region(
+        PROXY_SOURCE,
+        "pub(crate) fn gate_backend_handoff<L>(",
+        "\n}\n",
+    ));
+    assert!(
+        lease_gate.contains(
+            "matchbound.elapsed(){None=>Ok(lease),Some(source)=>{release(lease);Err(source)}}"
+        ),
+        "the handoff gate must release the refused lease and return the source"
+    );
+    for (gate, release) in [
+        (
+            "pub(crate) fn direct_h1_handoff_gate(",
+            "gate_backend_handoff(bound,checkout,http2_pool::Http1Checkout::checkin)",
+        ),
+        (
+            "pub(crate) fn unix_h1_handoff_gate(",
+            "gate_backend_handoff(bound,checkout,|lease|pool.checkin_h1(lease))",
+        ),
+        (
+            "pub(crate) fn hbone_h1_handoff_gate(",
+            "gate_backend_handoff(bound,checkout,drop)",
+        ),
+    ] {
+        let body = compact_code(source_region(PROXY_SOURCE, gate, "\n}\n"));
+        assert!(
+            body.contains(release),
+            "{gate} must release through {release}"
+        );
+    }
+
+    // ── Direct HTTP/1.1 pool ──────────────────────────────────────────────
+    let direct_h1 = compact_code(source_region(
+        PROXY_SOURCE,
+        "async fn proxy_to_backend_direct_h1(",
+        "\nfn is_streaming_content_type(",
+    ));
+    let plan = offset_of(&direct_h1, PLAN);
+    let composed = offset_of(
+        &direct_h1,
+        "lethandoff_bound=compose_backend_handoff_bound(header_deadline_at,send_bound);",
+    );
+    let first_checkout = offset_of(&direct_h1, "direct_h1_bounded_checkout(");
+    assert!(
+        plan < composed && composed < first_checkout,
+        "the direct HTTP/1.1 authorization plan must be composed before the first checkout"
+    );
+    assert_eq!(
+        direct_h1.matches("letsend_auth_deadline=").count(),
+        1,
+        "one plan per dispatch: a second derivation could re-arm the lifetime"
+    );
+    assert_eq!(
+        direct_h1.matches("direct_h1_bounded_checkout(").count(),
+        2,
+        "the first checkout and the idle-race replay"
+    );
+    for call in direct_h1.split("direct_h1_bounded_checkout(").skip(1) {
+        let args = call.split(".await").next().expect("checkout call");
+        assert!(
+            args.contains(",handoff_bound,send_bound,send_auth_deadline.as_ref(),"),
+            "every direct HTTP/1.1 checkout, replay included, takes the ONE composed bound: \
+             {args}"
+        );
+    }
+    assert_gated_handoff(
+        "direct HTTP/1.1",
+        &direct_h1,
+        "checkout=matchdirect_h1_handoff_gate(handoff_bound,checkout){",
+        "returndirect_h1_handoff_bound_expired(",
+        H1_ENQUEUE,
+    );
+    assert!(
+        direct_h1.contains("crate::plugins::await_deadline_first(handoff_bound.at,send_fut)"),
+        "the response-header wait is held to, and attributed from, the same composed bound"
+    );
+    let bounded_checkout = compact_code(source_region(
+        PROXY_SOURCE,
+        "async fn direct_h1_bounded_checkout(",
+        "\n/// Dispatch an HTTP/1.1 backend request on the direct hyper pool",
+    ));
+    let bounded_wait = concat!(
+        "letbounded=await_backend_handoff_bound(handoff_bound,state.http2_pool",
+        ".checkout_h1(conn_proxy,tls,connect_timeout,fresh),).await;",
+    );
+    assert!(
+        bounded_checkout.contains(bounded_wait),
+        "the direct HTTP/1.1 checkout must be awaited under the composed bound"
+    );
+    assert!(
+        !bounded_checkout.contains("await_grpc_deadline("),
+        "the checkout must not keep a separate, authorization-blind client-deadline wait"
+    );
+    let settle = compact_code(source_region(
+        PROXY_SOURCE,
+        "fn direct_h1_handoff_bound_expired(",
+        "\n}\n",
+    ));
+    let authorization_arm = source_region(
+        &settle,
+        "BackendHandoffBoundSource::Authorization=>{",
+        "BackendHandoffBoundSource::PhaseProtocol",
+    );
+    assert!(
+        authorization_arm.contains("dispatch_phase_authorization_expiry(")
+            && authorization_arm.contains("authorization_expired_backend_dispatch("),
+        "a direct HTTP/1.1 authorization expiry is latched once and health-neutral"
+    );
+
+    // ── Unix-socket HTTP/1.1 pool ─────────────────────────────────────────
+    let unix = compact_code(source_region(
+        PROXY_SOURCE,
+        "async fn proxy_to_backend_unix(",
+        "async fn proxy_to_backend_unix(\n    _state:",
+    ));
+    let unix_plan = offset_of(&unix, PLAN);
+    let unix_checkout = offset_of(&unix, "state.unix_backend_pool.checkout_h1(");
+    assert!(unix_plan < unix_checkout);
+    assert!(
+        unix.contains("letcheckout=await_backend_handoff_bound(checkout_handoff_bound,"),
+        "the Unix-socket checkout must be awaited under the authorization bound"
+    );
+    assert!(
+        unix.contains("letreplay=await_backend_handoff_bound(checkout_handoff_bound,"),
+        "the Unix-socket idle-race replay is held to the same absolute instant"
+    );
+    assert_gated_handoff(
+        "Unix-socket HTTP/1.1",
+        &unix,
+        "checkout=matchunix_h1_handoff_gate(&state.unix_backend_pool,handoff_bound,checkout){",
+        "return(mesh_h1_handoff_bound_expired(",
+        H1_ENQUEUE,
+    );
+
+    // ── HBONE inner HTTP/1.1 ──────────────────────────────────────────────
+    let open = compact_code(source_region(
+        PROXY_SOURCE,
+        "fn boxed_open_hbone_inner_h1<'a>(",
+        "\nasync fn proxy_to_backend_hbone(",
+    ));
+    assert!(
+        open.contains("crate::plugins::await_deadline_first(authorization_at,open_hbone_inner_h1(")
+            && open.contains(".unwrap_or(Err(HboneInnerOpenError::AuthorizationExpired))"),
+        "the HBONE CONNECT and inner handshake are bounded inside the boxed trampoline"
+    );
+    let hbone_acquire = compact_code(source_region(
+        PROXY_SOURCE,
+        "async fn proxy_to_backend_hbone(",
+        "fn boxed_proxy_to_backend_hbone_after_ready<'a>(",
+    ));
+    assert!(hbone_acquire.contains("Err(HboneInnerOpenError::AuthorizationExpired)=>{"));
+    let hbone_post = compact_code(source_region(
+        PROXY_SOURCE,
+        "async fn proxy_to_backend_hbone_after_ready(",
+        "fn unix_backend_dispatch_unavailable_response(",
+    ));
+    assert!(hbone_post.contains("Err(HboneInnerOpenError::AuthorizationExpired)=>{"));
+    assert!(
+        hbone_post.contains("plan.asserted_source_identity,authorization_at,)"),
+        "the HBONE idle-race replay open is held to the same absolute instant"
+    );
+    assert_gated_handoff(
+        "HBONE inner HTTP/1.1",
+        &hbone_post,
+        "checkout=matchhbone_h1_handoff_gate(handoff_bound,checkout){",
+        "return(mesh_h1_handoff_bound_expired(",
+        H1_ENQUEUE,
+    );
+
+    // ── Direct HTTP/2 ─────────────────────────────────────────────────────
+    let reqwest_dispatch = compact_code(source_region(
+        PROXY_SOURCE,
+        "\nasync fn proxy_to_backend(",
+        "\nasync fn proxy_to_backend_direct_h1(",
+    ));
+    let sender_wait = concat!(
+        "letsender_result=await_backend_handoff_bound(sender_bound,",
+        "state.http2_pool.get_sender(direct_h2_proxy),)",
+    );
+    assert!(
+        reqwest_dispatch.contains(sender_wait),
+        "the direct-H2 sender acquisition must be awaited under the authorization bound"
+    );
+    let h2 = compact_code(source_region(
+        PROXY_SOURCE,
+        "async fn proxy_to_backend_http2(",
+        "let request_body_too_large = || {",
+    ));
+    // The refusal arm joins the upload pump before it returns.
+    let refusal_arm = source_region(
+        &h2,
+        "direct_h2_handoff_refusal(grpc_deadline_at,upload_auth_deadline.as_ref()){",
+        "return(direct_h2_handoff_bound_expired(",
+    );
+    assert!(
+        refusal_arm.contains("pump.cancel_and_join().await;"),
+        "the direct-H2 handoff refusal must join the gateway-owned upload"
+    );
+    assert_gated_handoff(
+        "direct HTTP/2",
+        &h2,
+        "direct_h2_handoff_refusal(grpc_deadline_at,upload_auth_deadline.as_ref()){",
+        "upload_auth_deadline.as_ref(),resolved_ip,),None,);}",
+        "leth2_send_fut=sender.send_request(backend_req);",
+    );
 }
 
 /// Every buffered RESPONSE collection goes through the shared composer, and
@@ -4682,9 +5006,10 @@ fn only_streaming_uploads_pay_the_bridged_relay() {
 #[test]
 fn the_direct_h2_handler_joins_its_upload_before_returning() {
     // Every bounded direct-H2 exit, plus the normal completion path, joins the
-    // pump; the residual error exits are covered by `cancel_on_drop`. The three
+    // pump; the residual error exits are covered by `cancel_on_drop`. The four
     // bounded exits are the response-header deadline, the early-response upload
-    // join, and the backend write watermark (#4055).
+    // join, the backend write watermark (#4055), and the pre-enqueue handoff
+    // gate's refusal (GHSA-xcg4-wj3x-gjj2).
     let direct_h2 = PROXY_SOURCE
         .split("async fn proxy_to_backend_http2(")
         .nth(1)
@@ -4694,7 +5019,7 @@ fn the_direct_h2_handler_joins_its_upload_before_returning() {
         .expect("bounded direct-H2 dispatcher");
     assert_eq!(
         direct_h2.matches("pump.cancel_and_join().await;").count(),
-        3,
+        4,
         "a direct-H2 bounded exit stopped joining the gateway-owned upload"
     );
     assert!(
@@ -4927,9 +5252,11 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
     for (callee, expected_calls) in [
         ("apply_precommit_authorization_terminal(", 2),
         ("install_response_authorization_deadline(", 2),
-        // Six reqwest cold arms plus the direct HTTP/1.1 pool's send-phase
-        // and buffered-collect arms (#5588).
-        ("authorization_expired_backend_dispatch(", 8),
+        // Six reqwest cold arms, the direct HTTP/1.1 pool's shared
+        // checkout / handoff / header-wait settle helper and its
+        // buffered-collect arm (#5588), and the direct-H2 sender acquisition
+        // (GHSA-xcg4-wj3x-gjj2).
+        ("authorization_expired_backend_dispatch(", 9),
     ] {
         let definition = format!("fn {callee}");
         let before_definition = PROXY_SOURCE

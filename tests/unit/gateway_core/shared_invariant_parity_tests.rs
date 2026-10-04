@@ -2722,6 +2722,78 @@ fn every_direct_h1_dispatch_awaits_through_the_sender_release() {
     );
 }
 
+/// Every direct hyper HTTP/1.1 dispatch (the sites above) refuses a request
+/// whose composed checkout/handoff bound has already elapsed BEFORE it calls
+/// `try_send_request` (GHSA-xcg4-wj3x-gjj2). hyper enqueues the request on the
+/// connection task synchronously, before any deadline around the response
+/// future is polled, so a bound checked only around the response wait lets an
+/// expired request reach the connection driver.
+///
+/// Structural, not a line window: the gate must be a `*_handoff_gate(`
+/// call over `handoff_bound` and the leased `checkout`, inside the SAME
+/// dispatch `loop` body as the enqueue (so the idle-race replay passes it
+/// too), before the enqueue, with no `.await` between the end of the gate
+/// statement and the enqueue.
+#[test]
+fn every_direct_h1_dispatch_gates_its_handoff_on_the_composed_bound() {
+    let mut found = Vec::new();
+    for (path, text) in production_sources() {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut sites = 0;
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !line.contains(".try_send_request(") {
+                continue;
+            }
+            sites += 1;
+            let site = format!("{path}:{}", index + 1);
+            let loop_start = lines[..index]
+                .iter()
+                .rposition(|line| line.trim_end().ends_with("= loop {"))
+                .unwrap_or_else(|| panic!("{site}: the enqueue must sit in a dispatch loop"));
+            // Whitespace- and comment-free, so rustfmt wrapping is irrelevant.
+            let body: String = lines[loop_start..index]
+                .iter()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(|line| line.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let Some(gate_at) = body.find("_handoff_gate(") else {
+                panic!("{site}: a direct HTTP/1.1 dispatch must gate its handoff (GHSA-xcg4)")
+            };
+            let Some((statement, after)) = body[gate_at..].split_once("};") else {
+                panic!("{site}: the handoff gate must be a match statement")
+            };
+            assert!(
+                statement.contains("handoff_bound,checkout)"),
+                "{site}: the gate must check the composed `handoff_bound` for this lease"
+            );
+            assert!(
+                statement.contains("Err(source)=>{") && statement.contains("return"),
+                "{site}: a refused handoff must return"
+            );
+            assert!(
+                !body[..gate_at].contains("try_send_request"),
+                "{site}: the gate must come before the enqueue"
+            );
+            assert!(
+                !after.contains(".await"),
+                "{site}: nothing may await between the handoff gate and the synchronous enqueue"
+            );
+        }
+        if sites > 0 {
+            found.push((path, sites));
+        }
+    }
+    let expected: Vec<(String, usize)> = DIRECT_H1_DISPATCH_SITES
+        .iter()
+        .map(|(path, sites)| ((*path).to_string(), *sites))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the direct HTTP/1.1 dispatch sites changed; list the new site above"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Gateway-owned `x-consumer-*` consumer assertion namespace
 // ---------------------------------------------------------------------------

@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **OIDC session encryption secrets reject published and placeholder values**
+  (#5987; cross-repo hardening from Ferrum Foundry GHSA-hjw6-685j-p5hw). The
+  `oidc_relying_party` session config previously checked
+  `session.encryption_secret` and `session.encryption_secret_previous` only for
+  minimum length, so it accepted values that anyone can read from Ferrum's own
+  documentation and examples: the literal `${OIDC_SESSION_SECRET_32_BYTES_MIN}`
+  placeholder, the key Ferrum Foundry's OIDC template published, the sequential
+  secrets Ferrum's own tests used, and obvious placeholders (`changeme`,
+  `change-me`/`change_me`, `replace-me`/`replace_me`, `placeholder`, `example`,
+  `your-secret`). Both fields are now screened against a small documented
+  deny-list over both the supplied value and the effective pre-HKDF key
+  material, so Base64 spellings cannot bypass rejection. Unresolved `${...}`
+  templates are refused anywhere in either textual value. Screening runs at
+  the shared plugin-config validation entry point, so Admin API
+  create/update, batch, restore, and file/database config load all reject with a
+  `400` naming the field. Disabled configs may still be saved before an operator
+  supplies a key. Generate a unique random secret of at least 32 bytes and
+  rotate through `session.encryption_secret_previous`.
+- **Backend connection checkout and request handoff are held to the
+  authorization lifetime** (GHSA-xcg4-wj3x-gjj2; regression from the direct
+  HTTP/1.1 pool, #5961). The direct HTTP/1.1 pool checked out its connection
+  (pool wait, dial, TLS handshake) under the response-header and client RPC
+  deadlines only, and composed the request's authorization lifetime only
+  after the checkout. A credential that expired while the checkout was
+  stalled therefore did not end the request, and because hyper enqueues the
+  request on its connection task synchronously, before any wait on the
+  response is polled, a request whose credential had already expired could
+  be handed to the connection and reach the backend. The plan is now composed
+  before the first checkout and bounds the checkout and its idle-race replay
+  at the same absolute instant, and it is re-checked immediately before the
+  request is enqueued, so an expired request is refused with nothing sent.
+  The expiry is reported as the gateway's own health-neutral authorization
+  decision (the fixed pre-commitment terminal and one `credential_expired` /
+  `authenticated_stream_max_lifetime` count), never as a `504` or a client
+  RPC deadline; an earlier client or operator bound keeps its own terminal,
+  and an exact tie with the response-header read bound is a `504`, as on the
+  reqwest path. The same checkout bound and handoff gate now also cover the
+  Unix-socket HTTP/1.1 pool, the HBONE inner HTTP/1.1 lease (CONNECT and inner
+  handshake), and the direct-H2 sender acquisition. A checkout that is ready
+  on its first poll (a pooled connection or live HTTP/2 sender) never arms a
+  timer. Unauthenticated requests are unchanged. **Still unbounded**, tracked
+  in #5990: sender acquisition and handoff on sidecar mesh-mTLS dispatch
+  (including the Unix-socket h2c carrier), native gRPC dispatch, and possibly
+  the native HTTP/3 backend.
+
 ### Fixed
 
 - The release ARM64 (aarch64) Cross build no longer adds the third-party
@@ -17,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `1:6.0-1ubuntu2~16.04.1`. The LLVM major version and `LIBCLANG_PATH`
   (`/usr/lib/llvm-6.0/lib`) are unchanged. The trusted Cross build policy's
   frozen pre-build allowlist is updated to match.
+- The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
+  entry generation it selected. A concurrent same-key refresh survives the cleanup
+  pass instead of being removed as stale. The expired-entry lookup path also removes
+  only the generation it observed, so a fresh same-key store survives there too.
+
 - **`response_mock` preserves mixed-case extension method spelling** (#5972).
   The constructor folded every configured `method` token to uppercase, so a
   valid case-sensitive extension method (for example `Foo`) was stored as `FOO`

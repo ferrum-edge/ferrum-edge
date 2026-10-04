@@ -32,7 +32,7 @@ use crate::common::hydra::{
     TokenEndpointAuthMethod, rewrite_authorization_nonce, start_hydra_container,
 };
 
-const SESSION_SECRET: &str = "01234567890123456789012345678901";
+const SESSION_SECRET: &str = "9f3a7c1e5b2d8406a1c9e7f3b5d20486";
 const REDIRECT_PATH: &str = "/oauth/callback";
 const LOGOUT_PATH: &str = "/oauth/logout";
 
