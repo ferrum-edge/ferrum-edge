@@ -1250,12 +1250,7 @@ async fn grpc_deadline_after_partial_data_resets_stream_and_preserves_backend_he
             2,
             "{case}: client deadline must not trip the one-failure circuit breaker"
         );
-        assert_grpc_backend_rpc_paths(
-            &backend,
-            &[method, "/ferrum.Echo/Health"],
-            case,
-        )
-        .await;
+        assert_grpc_backend_rpc_paths(&backend, &[method, "/ferrum.Echo/Health"], case).await;
     }
 }
 
@@ -1797,16 +1792,15 @@ async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
         .await
         .expect("malformed-status RPC response");
     assert_eq!(malformed.grpc_status(), None, "{case}: {malformed:?}");
-    assert_eq!(
-        success.messages,
-        vec![Bytes::from_static(b"ok")],
-        "{case}"
-    );
+    assert_eq!(success.messages, vec![Bytes::from_static(b"ok")], "{case}");
     for (response, status) in [(&success, "0"), (&failure, "4"), (&malformed, "malformed")] {
         assert_eq!(response.http_status, 200, "{case}: {response:?}");
         assert!(response.stream_error.is_none(), "{case}: {response:?}");
         assert!(!response.initial_headers_end_stream, "{case}: {response:?}");
-        assert!(!response.headers.contains_key("grpc-status"), "{case}: {response:?}");
+        assert!(
+            !response.headers.contains_key("grpc-status"),
+            "{case}: {response:?}"
+        );
         assert_eq!(
             response
                 .trailers
@@ -1820,12 +1814,7 @@ async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
     for response in [&failure, &malformed] {
         assert!(response.raw_body_frames.is_empty(), "{case}: {response:?}");
     }
-    assert_grpc_backend_rpc_paths(
-        &backend,
-        &[SUCCESS, FAILURE, MALFORMED],
-        case,
-    )
-    .await;
+    assert_grpc_backend_rpc_paths(&backend, &[SUCCESS, FAILURE, MALFORMED], case).await;
 
     let logs = harness
         .wait_for_log_contains(
@@ -1942,7 +1931,10 @@ async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case:
         assert!(response.stream_error.is_none(), "{case}: {response:?}");
         assert!(response.raw_body_frames.is_empty(), "{case}: {response:?}");
         assert!(!response.initial_headers_end_stream, "{case}: {response:?}");
-        assert!(!response.headers.contains_key("grpc-status"), "{case}: {response:?}");
+        assert!(
+            !response.headers.contains_key("grpc-status"),
+            "{case}: {response:?}"
+        );
         assert_eq!(
             response
                 .trailers
@@ -1953,12 +1945,7 @@ async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case:
             "{case}: terminal wire status must be preserved: {response:?}"
         );
     }
-    assert_grpc_backend_rpc_paths(
-        &backend,
-        &[SUCCESS, FAILURE],
-        case,
-    )
-    .await;
+    assert_grpc_backend_rpc_paths(&backend, &[SUCCESS, FAILURE], case).await;
 
     let charges = wait_for_chargeback_statuses(
         &harness,
