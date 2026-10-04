@@ -28,6 +28,9 @@ pub(super) struct Stream {
     /// concurrent streams.
     pub is_counted: bool,
 
+    /// FERRUM PATCH 002: retained through h2 transport completion, not body EOF.
+    pub lifetime: Option<crate::ext::StreamLifetime>,
+
     /// Number of outstanding handles pointing to this stream
     pub ref_count: usize,
 
@@ -163,6 +166,7 @@ impl Stream {
             state: State::default(),
             ref_count: 0,
             is_counted: false,
+            lifetime: None,
 
             // ===== Fields related to sending =====
             next_pending_send: None,

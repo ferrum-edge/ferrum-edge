@@ -257,24 +257,72 @@ fn get_sender_with_purpose_joins_coalesced_attempt_for_probe_and_request() {
         .split("async fn get_sender_with_purpose(")
         .nth(1)
         .expect("get_sender_with_purpose")
-        .split("enum GrpcPhase1")
+        .split("async fn get_sender_with_purpose_unprofiled(")
         .next()
         .expect("bounded get_sender_with_purpose");
     assert!(
-        with_purpose.contains("create_or_get_existing_owned_with_attempt"),
-        "probe and request must share the pending-attempt identity"
+        with_purpose.contains("self.get_sender_with_purpose_unprofiled(proxy, purpose)"),
+        "the profiled wrapper must preserve purpose when delegating"
+    );
+
+    let unprofiled = source
+        .split("async fn get_sender_with_purpose_unprofiled(")
+        .nth(1)
+        .expect("get_sender_with_purpose_unprofiled")
+        .split("enum GrpcPhase1")
+        .next()
+        .expect("bounded get_sender_with_purpose_unprofiled");
+    assert!(
+        unprofiled.contains("create_or_get_existing_owned_with_recovery("),
+        "the unprofiled path must use the shared recovery/coalescing operation"
     );
     assert!(
-        with_purpose.contains("note_grpc_establishment_join"),
-        "live-request join must be recorded on the coalesced attempt"
+        unprofiled.contains("|attempt| note_grpc_establishment_join(attempt, purpose)"),
+        "probe and request must join the coalesced pending attempt"
     );
     assert!(
-        with_purpose.contains("note_grpc_establishment_waiter_failure"),
+        unprofiled.contains("|attempt| note_grpc_establishment_waiter_failure(attempt, purpose)"),
         "a request waiter must be able to upgrade a probe-only DEBUG"
     );
     assert!(
-        with_purpose.contains("Some(attempt)"),
-        "the creator must log against the same attempt waiters join"
+        unprofiled.contains("|key, attempt| async move {"),
+        "the creator must receive the coalesced attempt"
+    );
+    assert!(
+        unprofiled.contains("create_connection(proxy, svid_generation, purpose, Some(attempt))"),
+        "the creator must log against the same attempt waiters joined"
+    );
+
+    let pool_source = include_str!("../../../src/pool/mod.rs");
+    let coalesced_recovery = pool_source
+        .split("pub(crate) async fn create_or_get_existing_owned_with_recovery<")
+        .nth(1)
+        .expect("create_or_get_existing_owned_with_recovery")
+        .split("fn register_pending_creation(")
+        .next()
+        .expect("bounded create_or_get_existing_owned_with_recovery");
+    assert!(
+        coalesced_recovery.contains(concat!(
+            "let attempt = CoalescedCreateAttempt {\n",
+            "                inner: Arc::clone(&pending),\n",
+            "            };"
+        )),
+        "joiners and the creator must derive from the registered pending entry"
+    );
+    assert!(
+        coalesced_recovery.contains("on_join(&attempt)"),
+        "join bookkeeping must receive the pending attempt identity"
+    );
+    assert!(
+        coalesced_recovery.contains("on_waiter_failure(&attempt)"),
+        "waiter failure bookkeeping must receive that pending attempt identity"
+    );
+    assert!(
+        coalesced_recovery.contains(concat!(
+            "let attempt = attempt.clone();\n",
+            "                    move |key| create(key, attempt)"
+        )),
+        "the creator must receive a clone of the same attempt given to waiters"
     );
 }
 

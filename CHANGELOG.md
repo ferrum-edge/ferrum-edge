@@ -71,6 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The required Redis-backed CI gate exercises plugin admission, quarantine races, and bounded
   transfer regressions.
 
+- **gRPC shard affinity now accounts for cancelled creates and unfinished
+  uploads** (#5991). Failed or cancelled physical shard creates record one
+  cooldown before waiting callers elect another creator; those callers borrow
+  a ready sibling during cooldown, while a cold pool can still recover
+  immediately. Early terminal responses retain every gRPC upload's affinity
+  count until its frontend response and all backend attempts end, including
+  final DATA still queued after source EOF, reset, and connection teardown.
+  Streaming, buffered native/retry, and translated/pumped gRPC-Web uploads
+  therefore spill beyond 32 open calls. One shared Arc joins transport owners
+  without extra tasks or locks; source observers and timers remain independent.
+  Failure bookkeeping is capped at 4,096 keys and FIFO records with at most one
+  eviction per physical failure, replacing full-map scans on failed requests.
+
 - The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
   entry generation it selected. A concurrent same-key refresh survives the cleanup
   pass instead of being removed as stale. The expired-entry lookup path also removes
@@ -205,6 +218,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **gRPC keeps a client connection's calls on one backend connection** (#5588).
+  The gRPC pool spreads each host's calls over `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`
+  backend connections, and each call used to pick one round-robin. The calls
+  of one multiplexed client connection were therefore spread over every
+  backend connection, their responses came back at different times, and
+  Ferrum wrote them to the client one at a time. The benchmark client made
+  about 45% more reads per call behind Ferrum than behind Envoy, which keeps a
+  downstream connection's streams on one upstream connection per worker.
+  Each HTTP/2 client connection now takes a slot (least-loaded, so
+  long-lived connections stay evenly spread). While it has at most 32 open
+  streams, its gRPC calls go to that slot's backend connection; further calls
+  spill round-robin, so one busy client cannot monopolise one backend
+  connection's stream limit. Both create their backend connection when it is
+  missing or closed, so the pool still widens. HTTP/1.1 and HTTP/3 frontends
+  keep the round-robin start, and so does the direct HTTP/2 pool.
+  - On the protocol benchmark's EPYC 9V74 runner, where gRPC 10 KiB had been
+    below Envoy, it gained 2.6–4.9% in all eight same-run A/B pairs (runs
+    37108522768 and 37108528648) and is now 1.01–1.02× Envoy.
+  - CPU per call fell in the gateway, the backend and the client.
+  - Larger payloads are about flat. 5 MiB averages −0.8% and stays 1.10–1.15×
+    Envoy.
+  - HTTP/1.1 is unaffected.
+  - The direct HTTP/2 pool keeps the round-robin start: the same change made
+    HTTP/2 slower there.
 - **Less per-request work in the request handler** (#5588). Three per-request
   costs found in the gRPC 10 KiB profile, about 2% of gateway CPU together. The
   first two apply to every protocol, the third to native gRPC dispatch:
