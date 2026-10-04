@@ -202,25 +202,27 @@ under `pull_request_target` and rejects any change to
   against its own base before being queued, which is what keeps the payload
   base usable as a trusted baseline.
 
-**Live admin / no-bypass posture (root-owned repository settings; re-applied
-and re-verified 2026-09-01, issue #4445):** classic branch protection and
-ruleset `20208307` both require all nine GitHub Actions checks above, including
-`FIPS Build & Test`. Classic protection enforces administrators
-(`enforce_admins=true`); it previously did not, and it previously required only
-seven contexts. The active ruleset has no bypass actors -- the standing
-`OrganizationAdmin` / `bypass_mode: always` actor is removed, not narrowed --
-and it blocks force pushes and deletion. As of 2026-09-26 the ruleset contains
-only `deletion`, `non_fast_forward`, and `required_status_checks` rules: it has
-no `pull_request` (approval) rule and no `merge_queue` rule (see
-[Merge-queue batching and coordinated cadence](#merge-queue-batching-and-coordinated-cadence-evaluation-not-a-decision) below). The owner intentionally disabled GitHub's
-"approval of the most recent reviewable push by someone other than the pusher"
-rule (`require_last_push_approval=false`), so do not document or re-enable that
-distinct restriction without an explicit settings decision.
+**Live main-branch settings (read-only API snapshot, 2026-10-04 10:01 UTC):**
+ruleset `20208307` is active and requires all nine GitHub Actions checks above,
+including `FIPS Build & Test`, with integration id `15368` for each check and
+`strict_required_status_checks_policy=false`. Its rules are `deletion`,
+`non_fast_forward`, and `required_status_checks`; it has no pull-request
+approval or merge-queue rule. The ruleset currently has two bypass actors:
+`OrganizationAdmin` and `RepositoryRole` id `5`, both with
+`bypass_mode: always`. It is therefore not a no-bypass ruleset.
 
-After any future settings edit, re-query both protection APIs and confirm the
-nine exact check names, GitHub Actions app id `15368`, admin enforcement, empty
-bypass list, pull-request parameters, and merge-queue parameters. Exercise a
-queued PR to prove every required owner reports on the synthesized SHA.
+The classic branch-protection API was available for this snapshot. It reports
+the same nine required checks, each bound to GitHub Actions app id `15368`,
+`strict=false`, and `enforce_admins=false`; it also disallows force pushes and
+deletion. Its response did not include a required pull-request reviews rule.
+These API observations describe only the settings returned at the read time.
+Re-query both APIs after any settings change and before claiming administrator
+enforcement, bypass behavior, approval requirements, or merge-queue enforcement.
+
+**Historical record:** the 2026-09-01 note for issue #4445 recorded that
+administrator enforcement was enabled and the ruleset bypass list was empty.
+That is a record of the earlier observation, not a statement of current
+settings. The 2026-09-26 ruleset observation likewise predates this snapshot.
 
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
