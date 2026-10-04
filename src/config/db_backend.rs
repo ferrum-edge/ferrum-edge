@@ -1790,6 +1790,33 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         ))
     }
 
+    /// Opt-in complete raw dependency evidence. Unsupported stores fail closed.
+    async fn load_deployment_snapshot(
+        &self,
+        _namespace: &str,
+    ) -> Result<crate::config::deployment_mutation::DeploymentSnapshot, anyhow::Error> {
+        Err(anyhow::anyhow!("Deployment authority unavailable"))
+    }
+
+    /// Compare original evidence and remove only the selected cascade atomically.
+    async fn remove_deployment_conditionally(
+        &self,
+        _id: &str,
+        _precondition: &crate::config::deployment_mutation::DeploymentPrecondition<'_>,
+    ) -> Result<(), anyhow::Error> {
+        Err(anyhow::anyhow!("Deployment authority unavailable"))
+    }
+
+    /// Replace a spec under original dependency authority, without restore preparation.
+    async fn replace_deployment_conditionally(
+        &self,
+        _bundle: &crate::admin::api_specs::ExtractedBundle,
+        _spec: &ApiSpec,
+        _precondition: &crate::config::deployment_mutation::DeploymentPrecondition<'_>,
+    ) -> Result<(), anyhow::Error> {
+        Err(anyhow::anyhow!("Deployment authority unavailable"))
+    }
+
     /// Load the namespace policy graph (proxies + plugin_configs) without
     /// consumers or upstreams.
     ///

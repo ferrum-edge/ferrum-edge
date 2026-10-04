@@ -103,6 +103,24 @@ An export that cannot carry spec documents also clears the `api_spec_id` tags on
 
 A filtered export that includes `api_specs` without `proxies`, `upstreams`, and `plugin_configs` is rejected with `400` before any database or spec loading, because that shape is not directly restorable.
 
+## Dependency-fenced deployment recovery (#6010)
+
+Use admin-only `GET /deployment-snapshot` for complete original spec/plugin and
+raw dependency evidence. Send its original deployment token to
+`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
+`PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
+partially mutate inside one owner-fenced transaction on all four supported
+stores (MongoDB requires a replica set). Stale evidence is `412`; invalid modes
+or headers refuse without fallback. Ordinary row deletion, spec replacement,
+backup and restore profiles retain their supported behavior.
+
+Only an acknowledgement with `durable: "committed"`, `live: "applied"` and
+`recovery_cleanup_authorized: true` authorizes automatic journal removal.
+Durable-only CP/unserved results explicitly return `false`. Preserve the original
+encrypted journal after every refusal or uncertain outcome. See the
+[consumer adoption guide](deployment_mutations.md) for exact evidence, query,
+ownership, preservation and acknowledgement rules.
+
 ## Restore — `POST /restore?confirm=true`
 
 ### Conditional snapshots and restore

@@ -1422,6 +1422,10 @@ async fn sqlite_conditional_restore_checks_state_and_lease_inside_the_transactio
     let dir = TempDir::new().unwrap();
     let db = make_store(&dir).await;
     assert_transaction_precondition(db.as_ref()).await;
+    assert_sql_deployment_raw_preservation(db.clone(), "sqlite").await;
+    assert_deployment_mutation_contract(db.clone()).await;
+    assert_deployment_cancellation_and_live_ack(db.clone()).await;
+    assert_deployment_concurrent_writer_fences(db.clone()).await;
     let pool = db.pool();
     assert_restore_renewal_and_fencing(db.clone(), move |namespace, ttl| {
         let pool = pool.clone();
@@ -2402,10 +2406,14 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     db.run_migrations().await.unwrap();
     assert_transaction_precondition(&db).await;
     let db = Arc::new(db);
+    assert_deployment_mutation_contract(db.clone()).await;
+    assert_deployment_cancellation_and_live_ack(db.clone()).await;
+    assert_deployment_concurrent_writer_fences(db.clone()).await;
     let raw = mongodb::Client::with_uri_str(&url)
         .await
         .unwrap()
         .database(&database);
+    assert_mongo_deployment_raw_preservation(db.clone(), &raw).await;
     let locks = raw.collection::<mongodb::bson::Document>("config_admission_locks");
     assert_restore_renewal_and_fencing(db.clone(), move |namespace, ttl| {
         let locks = locks.clone();
@@ -2436,6 +2444,10 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
         .unwrap();
     assert_transaction_precondition(&db).await;
     let db = Arc::new(db);
+    assert_sql_deployment_raw_preservation(db.clone(), "postgres").await;
+    assert_deployment_mutation_contract(db.clone()).await;
+    assert_deployment_cancellation_and_live_ack(db.clone()).await;
+    assert_deployment_concurrent_writer_fences(db.clone()).await;
     let stalled_db = DatabaseStore::connect_with_pool_config(
         "postgres",
         &url,
@@ -2460,6 +2472,1214 @@ async fn mysql_conditional_restore_checks_state_and_lease_in_transaction() {
         .unwrap();
     assert_transaction_precondition(&db).await;
     let db = Arc::new(db);
+    assert_sql_deployment_raw_preservation(db.clone(), "mysql").await;
+    assert_deployment_mutation_contract(db.clone()).await;
+    assert_deployment_cancellation_and_live_ack(db.clone()).await;
+    assert_deployment_concurrent_writer_fences(db.clone()).await;
     assert_sql_restore_renewal(db.clone()).await;
     assert_http_restore_spans_keeper_renewal(db).await;
+}
+
+/// The same contract runs inside the required SQLite and three live-store gates.
+async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
+    use ferrum_edge::_test_support::{
+        AtomicBatchFault, AtomicBatchPhase, set_atomic_batch_fault_for_test,
+    };
+    use ferrum_edge::config::db_backend::{
+        NamespaceConfigAdmissionLeaseRef, NamespacePreconditionFailed,
+        is_batch_admission_lease_lost,
+    };
+    use ferrum_edge::config::deployment_mutation::DeploymentPrecondition;
+    use ferrum_edge::config::types::Consumer;
+
+    let validation_http_client = ferrum_edge::plugins::PluginHttpClient::default();
+    let namespace = format!("deployment-{}", uuid::Uuid::new_v4());
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    let mut document = json!({
+        "openapi": "3.0.3", "info": {"title": "Deployment", "version": "1"},
+        "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": "deployment", "listen_path": "/deployment",
+            "backend_host": "backend.example.com", "backend_port": 8080},
+        "x-ferrum-plugins": [{"id": "generated", "plugin_name": "cors",
+            "config": {"allowed_origins": ["https://original.example"]}}]
+    });
+    let imported = send_ns(
+        Method::POST,
+        &base,
+        "/api-specs",
+        &admin_token(),
+        None,
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(imported.status, 201, "{}", imported.body);
+    let spec_id = imported.body["id"].as_str().unwrap().to_string();
+    let replace_path = format!("/api-specs/{spec_id}?conditional=true");
+    let remove_path = "/proxies/deployment?conditional=true&cleanup_orphaned_upstream=false";
+    // Historical credential representations and timestamps survive without
+    // restore's normalization, credential preparation or trust re-publication.
+    let consumer: Consumer = serde_json::from_value(json!({
+        "namespace": namespace, "id": "historical", "username": "historical",
+        "credentials": {"custom": [{"legacy": "  value  ", "nested": {"unknown": true}}]},
+        "created_at": "2000-01-01T00:00:00Z", "updated_at": "2001-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    db.create_consumer(&consumer).await.unwrap();
+    let trust = deployment_trust_record(&namespace);
+    db.create_gateway_trust_bundle(&trust).await.unwrap();
+    let trust_before = db
+        .get_namespace_gateway_trust_bundle(&namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    for (path, body) in [
+        (
+            "/upstreams",
+            json!({"id": "retained", "name": "retained", "targets": [
+                {"host": "backend.example.com", "port": 8080}
+            ]}),
+        ),
+        (
+            "/plugins/config",
+            json!({"id": "shared", "plugin_name": "cors", "scope": "proxy_group",
+                "config": {"allowed_origins": ["https://shared.example"]},
+                "labels": {"unknown-owner-metadata": "retained"}}),
+        ),
+        (
+            "/proxies",
+            json!({"id": "unrelated", "listen_path": "/unrelated",
+                "backend_host": "unrelated.example.com", "backend_port": 8080,
+                "plugins": [{"plugin_config_id": "shared"}],
+                "labels": {"unrelated-unknown": "keep"}}),
+        ),
+    ] {
+        let result = send_ns(
+            Method::POST,
+            &base,
+            path,
+            &admin_token(),
+            None,
+            Some(&body),
+            &namespace,
+        )
+        .await;
+        assert_eq!(result.status, 201, "{}", result.body);
+    }
+    let mut target = get_ns(&base, "/proxies/deployment", &namespace).await.body;
+    target["upstream_id"] = json!("retained");
+    target["plugins"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"plugin_config_id": "shared"}));
+    let updated = send_ns(
+        Method::PUT,
+        &base,
+        "/proxies/deployment",
+        &admin_token(),
+        None,
+        Some(&target),
+        &namespace,
+    )
+    .await;
+    assert_eq!(updated.status, 200, "{}", updated.body);
+
+    let opened = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    assert_eq!(opened.status, 200, "{}", opened.body);
+    assert_eq!(
+        opened.etag.as_ref().unwrap(),
+        opened.body["namespace_etag"].as_str().unwrap()
+    );
+    assert_eq!(opened.body["api_specs"][0]["id"], spec_id);
+    assert!(opened.body["api_specs"][0]["spec_content"].is_array());
+    for header in [
+        None,
+        Some("*"),
+        Some(r#""row-token""#),
+        Some(r#"W/"deployment-v1-00000000000000000000000000000000""#),
+        Some(concat!(
+            "\"deployment-v1-00000000000000000000000000000000\",",
+            "\"deployment-v1-00000000000000000000000000000000\""
+        )),
+    ] {
+        for (method, path, body) in [
+            (Method::DELETE, remove_path, None),
+            (Method::PUT, replace_path.as_str(), Some(&document)),
+        ] {
+            let result = send_ns(
+                method,
+                &base,
+                path,
+                &admin_token(),
+                header,
+                body,
+                &namespace,
+            )
+            .await;
+            assert_eq!(result.status, 400, "{}", result.body);
+        }
+    }
+    for path in [
+        "/proxies/deployment?conditional=true",
+        "/proxies/deployment?conditional=false&cleanup_orphaned_upstream=false",
+        "/proxies/deployment?conditional=true&conditional=true&cleanup_orphaned_upstream=false",
+        "/proxies/deployment?conditional=true&cleanup_orphaned_upstream=false&apply=async",
+        "/proxies/deployment",
+    ] {
+        let result = send_ns(
+            Method::DELETE,
+            &base,
+            path,
+            &admin_token(),
+            opened.etag.as_deref(),
+            None,
+            &namespace,
+        )
+        .await;
+        assert_eq!(result.status, 400, "{}", result.body);
+    }
+    for suffix in [
+        "",
+        "?conditional=false",
+        "?conditional=true&conditional=true",
+        "?conditional=true&apply=async",
+    ] {
+        let result = send_ns(
+            Method::PUT,
+            &base,
+            &format!("/api-specs/{spec_id}{suffix}"),
+            &admin_token(),
+            opened.etag.as_deref(),
+            Some(&document),
+            &namespace,
+        )
+        .await;
+        assert_eq!(result.status, 400, "{}", result.body);
+    }
+    for (method, path) in [
+        (Method::PUT, "/proxies/deployment?conditional=true"),
+        (Method::DELETE, "/plugins/config/generated?conditional=true"),
+        (Method::POST, "/api-specs?conditional=true"),
+    ] {
+        let unsupported = send_ns(
+            method,
+            &base,
+            path,
+            &admin_token(),
+            opened.etag.as_deref(),
+            Some(&document),
+            &namespace,
+        )
+        .await;
+        assert_eq!(unsupported.status, 400, "{}", unsupported.body);
+    }
+    let duplicate = reqwest::Client::new()
+        .delete(format!("{base}{remove_path}"))
+        .bearer_auth(admin_token())
+        .header("X-Ferrum-Namespace", &namespace)
+        .header("If-Match", opened.etag.as_ref().unwrap())
+        .header("If-Match", opened.etag.as_ref().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status().as_u16(), 400);
+    assert_eq!(
+        get_ns(&base, "/deployment-snapshot?conditional=true", &namespace)
+            .await
+            .status,
+        400
+    );
+
+    for (method, path, body) in [
+        (
+            Method::DELETE,
+            "/proxies/missing?conditional=true&cleanup_orphaned_upstream=false",
+            None,
+        ),
+        (Method::PUT, "/api-specs/missing?conditional=true", Some(&document)),
+    ] {
+        let missing = send_ns(
+            method,
+            &base,
+            path,
+            &admin_token(),
+            opened.etag.as_deref(),
+            body,
+            &namespace,
+        )
+        .await;
+        assert_eq!(missing.status, 409, "{}", missing.body);
+        assert_eq!(missing.body["recovery_cleanup_authorized"], false);
+    }
+
+    // Writes after the original evidence must invalidate both owner operations,
+    // including document-only spec drift and unrelated rows in this namespace.
+    for mutation in ["hosts", "plugin", "spec", "unrelated"] {
+        let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        let (path, changed) = match mutation {
+            "hosts" => {
+                let mut proxy = get_ns(&base, "/proxies/deployment", &namespace).await.body;
+                proxy["hosts"] = json!(["operator.example"]);
+                ("/proxies/deployment".to_string(), Some(proxy))
+            }
+            "plugin" => {
+                let mut plugin = get_ns(&base, "/plugins/config/generated", &namespace).await.body;
+                plugin["config"] = json!({"allowed_origins": ["https://operator.example"]});
+                ("/plugins/config/generated".to_string(), Some(plugin))
+            }
+            "spec" => {
+                document["info"]["description"] = json!("operator changed spec");
+                (format!("/api-specs/{spec_id}"), Some(document.clone()))
+            }
+            _ => {
+                let mut changed = consumer.clone();
+                changed.acl_groups = vec!["operator".to_string()];
+                db.update_consumer(&changed).await.unwrap();
+                (String::new(), None)
+            }
+        };
+        if let Some(changed) = changed {
+            let updated = send_ns(
+                Method::PUT,
+                &base,
+                &path,
+                &admin_token(),
+                None,
+                Some(&changed),
+                &namespace,
+            )
+            .await;
+            assert_eq!(updated.status, 200, "{}", updated.body);
+        }
+        let current = db
+            .load_deployment_snapshot(&namespace)
+            .await
+            .unwrap()
+            .representation()
+            .unwrap();
+        for (method, path, body) in [
+            (Method::DELETE, remove_path, None),
+            (Method::PUT, replace_path.as_str(), Some(&document)),
+        ] {
+            let result = send_ns(
+                method,
+                &base,
+                path,
+                &admin_token(),
+                original.etag.as_deref(),
+                body,
+                &namespace,
+            )
+            .await;
+            assert_eq!(result.status, 412, "{}", result.body);
+            assert_eq!(result.body["recovery_cleanup_authorized"], false);
+        }
+        assert_eq!(
+            db.load_deployment_snapshot(&namespace)
+                .await
+                .unwrap()
+                .representation()
+                .unwrap(),
+            current
+        );
+        // Bypass the handler's initial comparison to exercise the transaction
+        // boundary itself, retaining the original representation on both calls.
+        let owner = uuid::Uuid::new_v4().to_string();
+        let generation = db
+            .try_acquire_namespace_config_admission_lease(&namespace, &owner)
+            .await
+            .unwrap()
+            .unwrap();
+        let precondition = DeploymentPrecondition {
+            namespace: &namespace,
+            expected: &original.body["evidence"],
+            validation_http_client: &validation_http_client,
+            lease: NamespaceConfigAdmissionLeaseRef {
+                owner: &owner,
+                generation,
+            },
+        };
+        let error = db
+            .remove_deployment_conditionally("deployment", &precondition)
+            .await
+            .unwrap_err();
+        assert!(error.chain().any(|e| e.is::<NamespacePreconditionFailed>()));
+        let snapshot = db.load_deployment_snapshot(&namespace).await.unwrap();
+        let spec = &snapshot.snapshot.api_specs[0];
+        let bundle = deployment_bundle(&snapshot, "deployment", &spec_id);
+        let error = db
+            .replace_deployment_conditionally(&bundle, spec, &precondition)
+            .await
+            .unwrap_err();
+        assert!(error.chain().any(|e| e.is::<NamespacePreconditionFailed>()));
+        db.release_namespace_config_admission_lease(&namespace, &owner)
+            .await
+            .unwrap();
+    }
+
+    // An unrelated tenant write must not invalidate this tenant's authority.
+    let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    let other: Consumer = serde_json::from_value(json!({
+        "namespace": format!("other-{}", uuid::Uuid::new_v4()),
+        "id": "other", "username": "other", "credentials": {}
+    }))
+    .unwrap();
+    db.create_consumer(&other).await.unwrap();
+    assert_eq!(get_ns(&base, "/deployment-snapshot", &namespace).await.etag, original.etag);
+
+    // Entry loss with matching evidence cannot authorize either mutation.
+    let snapshot = db.load_deployment_snapshot(&namespace).await.unwrap();
+    let exact = snapshot.representation().unwrap();
+    let spec = &snapshot.snapshot.api_specs[0];
+    let bundle = deployment_bundle(&snapshot, "deployment", &spec_id);
+    let precondition = DeploymentPrecondition {
+        namespace: &namespace,
+        expected: &exact,
+        validation_http_client: &validation_http_client,
+        lease: NamespaceConfigAdmissionLeaseRef {
+            owner: "missing-owner",
+            generation: 999,
+        },
+    };
+    let error = db
+        .remove_deployment_conditionally("deployment", &precondition)
+        .await
+        .unwrap_err();
+    assert!(is_batch_admission_lease_lost(&error));
+    let error = db
+        .replace_deployment_conditionally(&bundle, spec, &precondition)
+        .await
+        .unwrap_err();
+    assert!(is_batch_admission_lease_lost(&error));
+
+    // Failure immediately before commit must roll back both operations and
+    // retain the original token, without compensation or freshly read retries.
+    for (method, path, body) in [
+        (Method::DELETE, remove_path, None),
+        (Method::PUT, replace_path.as_str(), Some(&document)),
+    ] {
+        set_atomic_batch_fault_for_test(
+            &namespace,
+            Some(AtomicBatchFault::new(AtomicBatchPhase::Commit, 0)),
+        );
+        let failed = send_ns(
+            method,
+            &base,
+            path,
+            &admin_token(),
+            original.etag.as_deref(),
+            body,
+            &namespace,
+        )
+        .await;
+        set_atomic_batch_fault_for_test(&namespace, None);
+        assert_eq!(failed.status, 503, "{}", failed.body);
+        assert_eq!(failed.body["recovery_cleanup_authorized"], false);
+        assert_eq!(get_ns(&base, "/deployment-snapshot", &namespace).await.etag, original.etag);
+    }
+
+    let consumer_before = db.get_consumer(&namespace, "historical").await.unwrap().unwrap();
+    let unrelated_before = db.get_proxy_for_write(&namespace, "unrelated").await.unwrap().unwrap();
+    let shared_before = db.get_plugin_config(&namespace, "shared").await.unwrap().unwrap();
+    let upstream_before = db.get_upstream(&namespace, "retained").await.unwrap().unwrap();
+    let generated_before = db.get_plugin_config(&namespace, "generated").await.unwrap().unwrap();
+    document["x-ferrum-proxy"]["backend_host"] = json!("replacement.example.com");
+    let replaced = send_ns(
+        Method::PUT,
+        &base,
+        &replace_path,
+        &admin_token(),
+        original.etag.as_deref(),
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    assert_eq!(replaced.body["durable"], "committed");
+    // No serving poll loop: a durable-only acknowledgement forbids cleanup.
+    assert_eq!(replaced.body["live"], "not_applicable");
+    assert_eq!(replaced.body["recovery_cleanup_authorized"], false);
+    let target = db.get_proxy_for_write(&namespace, "deployment").await.unwrap().unwrap();
+    assert_eq!(target.backend_host, "replacement.example.com");
+    assert!(target.plugins.iter().any(|a| a.plugin_config_id == "shared"));
+    assert_eq!(
+        db.get_plugin_config(&namespace, "generated")
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at,
+        generated_before.created_at
+    );
+    assert_eq!(
+        db.get_plugin_config(&namespace, "generated")
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        generated_before.updated_at
+    );
+    // Reattach the last-referenced hand-owned upstream before exact removal.
+    let mut target = get_ns(&base, "/proxies/deployment", &namespace).await.body;
+    target["upstream_id"] = json!("retained");
+    let updated = send_ns(
+        Method::PUT,
+        &base,
+        "/proxies/deployment",
+        &admin_token(),
+        None,
+        Some(&target),
+        &namespace,
+    )
+    .await;
+    assert_eq!(updated.status, 200, "{}", updated.body);
+    let exact = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    let removed = send_ns(
+        Method::DELETE,
+        &base,
+        remove_path,
+        &admin_token(),
+        exact.etag.as_deref(),
+        None,
+        &namespace,
+    )
+    .await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert_eq!(removed.body["durable"], "committed");
+    assert_eq!(removed.body["recovery_cleanup_authorized"], false);
+    assert!(db.get_proxy_for_write(&namespace, "deployment").await.unwrap().is_none());
+    assert!(db.get_api_spec(&namespace, &spec_id).await.unwrap().is_none());
+    assert!(db.get_plugin_config(&namespace, "generated").await.unwrap().is_none());
+    assert_eq!(
+        serde_json::to_value(
+            db.get_consumer(&namespace, "historical")
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(consumer_before).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            db.get_proxy_for_write(&namespace, "unrelated")
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(unrelated_before).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            db.get_plugin_config(&namespace, "shared")
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(shared_before).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            db.get_upstream(&namespace, "retained")
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(upstream_before).unwrap()
+    );
+    assert_eq!(
+        db.get_namespace_gateway_trust_bundle(&namespace)
+            .await
+            .unwrap()
+            .unwrap(),
+        trust_before
+    );
+}
+
+fn deployment_trust_record(
+    namespace: &str,
+) -> ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord {
+    use base64::Engine;
+    use ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord;
+    use ferrum_edge::identity::TrustDomain;
+    use ferrum_edge::modes::mesh::config::{TrustBundle, TrustBundleSet};
+
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let certificate = params.self_signed(&key).unwrap();
+    GatewayTrustBundleRecord::new(
+        namespace,
+        namespace,
+        TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: TrustDomain::new("deployment.example").unwrap(),
+                x509_authorities: vec![
+                    base64::engine::general_purpose::STANDARD.encode(certificate.der()),
+                ],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Vec::new(),
+        },
+    )
+}
+
+fn deployment_bundle(
+    snapshot: &ferrum_edge::config::deployment_mutation::DeploymentSnapshot,
+    proxy_id: &str,
+    spec_id: &str,
+) -> ferrum_edge::admin::api_specs::ExtractedBundle {
+    ferrum_edge::admin::api_specs::ExtractedBundle {
+        proxy: snapshot
+            .snapshot
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.id == proxy_id)
+            .unwrap()
+            .clone(),
+        upstream: None,
+        plugins: snapshot
+            .snapshot
+            .config
+            .plugin_configs
+            .iter()
+            .filter(|p| p.api_spec_id.as_deref() == Some(spec_id))
+            .cloned()
+            .collect(),
+    }
+}
+
+async fn assert_deployment_cancellation_and_live_ack(db: Arc<dyn DatabaseBackend>) {
+    use ferrum_edge::config::batch_atomicity::{
+        ConditionalRestoreTestPause, set_conditional_restore_pause,
+    };
+    use ferrum_edge::config::runtime_config_apply::{LiveApplyCursor, RuntimeConfigApply};
+    use std::time::Duration;
+
+    for live in [false, true] {
+        let namespace = format!("deployment-live-{}", uuid::Uuid::new_v4());
+        let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(json!({
+            "namespace": namespace, "id": "live", "listen_path": "/live-proxy",
+            "backend_host": "backend.example.com", "backend_port": 8080
+        }))
+        .unwrap();
+        db.create_proxy(&proxy).await.unwrap();
+        let timeout = if live {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(200)
+        };
+        let apply = Arc::new(RuntimeConfigApply::with_timeout_at_epoch(
+            namespace.clone(),
+            db.config_topology_epoch(),
+            0,
+            timeout,
+        ));
+        let mut state = admin_state(db.clone(), JWT_SECRET);
+        state.runtime_config_apply = Some(apply.clone());
+        let (base, _shutdown) = start_admin(state).await;
+        let snapshot = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        let path = "/proxies/live?conditional=true&cleanup_orphaned_upstream=false";
+        let request = tokio::spawn({
+            let base = base.clone();
+            let namespace = namespace.clone();
+            let token = snapshot.etag.clone();
+            async move {
+                send_ns(
+                    Method::DELETE,
+                    &base,
+                    path,
+                    &admin_token(),
+                    token.as_deref(),
+                    None,
+                    &namespace,
+                )
+                .await
+            }
+        });
+        if live {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while apply.waiter_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            apply.record_accepted_cursor(LiveApplyCursor::new(
+                db.config_topology_epoch(),
+                db.latest_change_sequence(&namespace).await.unwrap(),
+            ));
+        }
+        let response = request.await.unwrap();
+        assert_eq!(response.body["durable"], "committed");
+        assert_eq!(response.status, if live { 200 } else { 503 }, "{}", response.body);
+        assert_eq!(response.body["recovery_cleanup_authorized"], live);
+        assert_eq!(response.body["live"], if live { "applied" } else { "unconfirmed" });
+        assert!(db.get_proxy_for_write(&namespace, "live").await.unwrap().is_none());
+    }
+
+    for replacement in [false, true] {
+        let namespace = format!("deployment-cancel-{}", uuid::Uuid::new_v4());
+        let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+        let mut document = json!({
+            "openapi": "3.0.3", "info": {"title": "Cancel", "version": "1"},
+            "paths": {"/cancel": {"get": {"responses": {"200": {"description": "OK"}}}}},
+            "x-ferrum-proxy": {"id": "cancel", "listen_path": "/cancel",
+                "backend_host": "backend.example.com", "backend_port": 8080}
+        });
+        let imported = send_ns(
+            Method::POST,
+            &base,
+            "/api-specs",
+            &admin_token(),
+            None,
+            Some(&document),
+            &namespace,
+        )
+        .await;
+        assert_eq!(imported.status, 201, "{}", imported.body);
+        let spec_id = imported.body["id"].as_str().unwrap();
+        let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        let pause = Arc::new(ConditionalRestoreTestPause::default());
+        set_conditional_restore_pause(&namespace, Some(pause.clone()));
+        let path = if replacement {
+            format!("/api-specs/{spec_id}?conditional=true")
+        } else {
+            "/proxies/cancel?conditional=true&cleanup_orphaned_upstream=false".to_string()
+        };
+        document["info"]["description"] = json!("cancellation completed");
+        let method = if replacement {
+            Method::PUT
+        } else {
+            Method::DELETE
+        };
+        let request = tokio::spawn({
+            let namespace = namespace.clone();
+            let base = base.clone();
+            let token = original.etag.clone();
+            let path = path.clone();
+            let document = document.clone();
+            let method = method.clone();
+            async move {
+                send_ns(
+                    method,
+                    &base,
+                    &path,
+                    &admin_token(),
+                    token.as_deref(),
+                    replacement.then_some(&document),
+                    &namespace,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            .await
+            .unwrap();
+        request.abort();
+        assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+        pause.resume.notify_one();
+        set_conditional_restore_pause(&namespace, None);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let settled = if replacement {
+                    db.get_api_spec(&namespace, spec_id)
+                        .await
+                        .unwrap()
+                        .is_some_and(|s| s.description.as_deref() == Some("cancellation completed"))
+                } else {
+                    db.get_proxy_for_write(&namespace, "cancel").await.unwrap().is_none()
+                };
+                if settled {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let replay = send_ns(
+            method,
+            &base,
+            &path,
+            &admin_token(),
+            original.etag.as_deref(),
+            replacement.then_some(&document),
+            &namespace,
+        )
+        .await;
+        assert_eq!(replay.status, 412, "{}", replay.body);
+        assert_eq!(replay.body["recovery_cleanup_authorized"], false);
+    }
+}
+
+/// A competing writer cannot enter the dependency graph after comparison and
+/// before commit. An unrelated namespace remains independent where supported.
+async fn assert_deployment_concurrent_writer_fences(db: Arc<dyn DatabaseBackend>) {
+    use ferrum_edge::config::batch_atomicity::{
+        ConditionalRestoreTestPause, set_conditional_restore_pause,
+    };
+    use std::time::Duration;
+
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    for replacement in [false, true] {
+        let namespace = format!("deployment-fence-{}", uuid::Uuid::new_v4());
+        let mut document = json!({
+            "openapi": "3.0.3", "info": {"title": "Fence", "version": "1"},
+            "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+            "x-ferrum-proxy": {"id": "fenced", "listen_path": "/fenced",
+                "backend_host": "backend.example.com", "backend_port": 8080},
+            "x-ferrum-upstream": {"id": "generated-upstream", "targets": [
+                {"host": "backend.example.com", "port": 8080}
+            ]}
+        });
+        let imported = send_ns(
+            Method::POST,
+            &base,
+            "/api-specs",
+            &admin_token(),
+            None,
+            Some(&document),
+            &namespace,
+        )
+        .await;
+        assert_eq!(imported.status, 201, "{}", imported.body);
+        let spec_id = imported.body["id"].as_str().unwrap();
+        let unrelated: ferrum_edge::config::types::Proxy = serde_json::from_value(json!({
+            "namespace": namespace, "id": "unrelated", "listen_path": "/unrelated",
+            "backend_host": "unrelated.example.com", "backend_port": 8080
+        }))
+        .unwrap();
+        db.create_proxy(&unrelated).await.unwrap();
+        let snapshot = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        document["x-ferrum-proxy"]["hosts"] = json!(["replacement.example"]);
+        let pause = Arc::new(ConditionalRestoreTestPause::default());
+        set_conditional_restore_pause(&namespace, Some(pause.clone()));
+        let request = tokio::spawn({
+            let base = base.clone();
+            let namespace = namespace.clone();
+            let token = snapshot.etag.clone();
+            let path = if replacement {
+                format!("/api-specs/{spec_id}?conditional=true")
+            } else {
+                "/proxies/fenced?conditional=true&cleanup_orphaned_upstream=false".to_string()
+            };
+            async move {
+                send_ns(
+                    if replacement {
+                        Method::PUT
+                    } else {
+                        Method::DELETE
+                    },
+                    &base,
+                    &path,
+                    &admin_token(),
+                    token.as_deref(),
+                    replacement.then_some(&document),
+                    &namespace,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+            .await
+            .unwrap();
+        let mut writer = tokio::spawn({
+            let db = db.clone();
+            let mut changed = unrelated;
+            changed.hosts = vec!["operator.example".to_string()];
+            async move { db.update_proxy(&changed).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut writer)
+                .await
+                .is_err(),
+            "a writer crossed the comparison/commit admission fence"
+        );
+        pause.resume.notify_one();
+        set_conditional_restore_pause(&namespace, None);
+        let response = request.await.unwrap();
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert_eq!(response.body["recovery_cleanup_authorized"], false);
+        assert!(writer.await.unwrap().unwrap());
+        assert_eq!(
+            db.get_proxy_for_write(&namespace, "unrelated")
+                .await
+                .unwrap()
+                .unwrap()
+                .hosts,
+            vec!["operator.example".to_string()]
+        );
+        assert_eq!(
+            db.get_upstream(&namespace, "generated-upstream")
+                .await
+                .unwrap()
+                .is_some(),
+            replacement
+        );
+    }
+}
+
+async fn assert_mongo_deployment_raw_preservation(
+    db: Arc<dyn DatabaseBackend>,
+    raw: &mongodb::Database,
+) {
+    use mongodb::bson::{Document, doc};
+
+    let namespace = format!("deployment-raw-{}", uuid::Uuid::new_v4());
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    let mut document = json!({
+        "openapi": "3.0.3", "info": {"title": "Raw", "version": "1"},
+        "paths": {"/raw": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": "raw", "listen_path": "/raw",
+            "backend_host": "backend.example.com", "backend_port": 8080},
+        "x-ferrum-plugins": [{"id": "raw-generated", "plugin_name": "cors", "config": {}}]
+    });
+    let imported = send_ns(
+        Method::POST,
+        &base,
+        "/api-specs",
+        &admin_token(),
+        None,
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(imported.status, 201, "{}", imported.body);
+    let spec_id = imported.body["id"].as_str().unwrap();
+    let proxies = raw.collection::<Document>("proxies");
+    proxies
+        .update_one(
+            doc! { "_id": format!("{namespace}:raw") },
+            doc! { "$set": { "plugins.0.future_metadata": {
+                "owner": "retained", "nested": [1, "opaque"],
+            } } },
+        )
+        .await
+        .unwrap();
+    let association_before = proxies
+        .find_one(doc! { "_id": format!("{namespace}:raw") })
+        .await
+        .unwrap()
+        .unwrap()
+        .get_array("plugins")
+        .unwrap()
+        .clone();
+    let consumers = raw.collection::<Document>("consumers");
+    consumers
+        .insert_one(doc! {
+            "_id": format!("{namespace}:historical"), "namespace": &namespace,
+            "id": "historical", "username": "historical", "custom_id": " \t ",
+            "credentials": { "custom": [{ "secret": " historical-canary ",
+                "future": { "preserve": true } }] },
+            "created_at": "2000-01-01T00:00:00Z", "updated_at": "2001-01-01T00:00:00Z",
+        })
+        .await
+        .unwrap();
+    let historical = consumers
+        .find_one(doc! { "_id": format!("{namespace}:historical") })
+        .await
+        .unwrap()
+        .unwrap();
+    let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    assert_eq!(original.status, 200, "{}", original.body);
+    // Unknown association fields participate even without a change-log row.
+    proxies
+        .update_one(
+            doc! { "_id": format!("{namespace}:raw") },
+            doc! { "$set": { "plugins.0.future_metadata.owner": "operator" } },
+        )
+        .await
+        .unwrap();
+    let remove_path = "/proxies/raw?conditional=true&cleanup_orphaned_upstream=false";
+    let replace_path = format!("/api-specs/{spec_id}?conditional=true");
+    for (method, path, body) in [
+        (Method::DELETE, remove_path, None),
+        (Method::PUT, replace_path.as_str(), Some(&document)),
+    ] {
+        let stale = send_ns(
+            method,
+            &base,
+            path,
+            &admin_token(),
+            original.etag.as_deref(),
+            body,
+            &namespace,
+        )
+        .await;
+        assert_eq!(stale.status, 412, "{}", stale.body);
+    }
+    proxies
+        .update_one(
+            doc! { "_id": format!("{namespace}:raw") },
+            doc! { "$set": { "plugins": &association_before } },
+        )
+        .await
+        .unwrap();
+    let exact = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    document["x-ferrum-proxy"]["backend_host"] = json!("replacement.example.com");
+    let replaced = send_ns(
+        Method::PUT,
+        &base,
+        &replace_path,
+        &admin_token(),
+        exact.etag.as_deref(),
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    assert!(!replaced.body.to_string().contains("historical-canary"));
+    assert_eq!(
+        proxies
+            .find_one(doc! { "_id": format!("{namespace}:raw") })
+            .await
+            .unwrap()
+            .unwrap()
+            .get_array("plugins")
+            .unwrap(),
+        &association_before
+    );
+    assert_eq!(
+        consumers
+            .find_one(doc! { "_id": format!("{namespace}:historical") })
+            .await
+            .unwrap()
+            .unwrap(),
+        historical
+    );
+
+    // A schema-rejected resource field refuses authority rather than being
+    // projected away, and does not erase the original stored representation.
+    consumers
+        .update_one(
+            doc! { "_id": format!("{namespace}:historical") },
+            doc! { "$set": { "future_resource_field": "preserve" } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_ns(&base, "/deployment-snapshot", &namespace).await.status, 503);
+    consumers
+        .update_one(
+            doc! { "_id": format!("{namespace}:historical") },
+            doc! { "$unset": { "future_resource_field": "" } },
+        )
+        .await
+        .unwrap();
+
+    // Reject security audit only for this fixture's namespace. A bad fallback
+    // path then proves that neither read disclosure nor mutation is admitted.
+    let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    raw.run_command(doc! {
+        "collMod": "audit_events",
+        "validator": { "namespace": { "$ne": &namespace } },
+        "validationLevel": "strict", "validationAction": "error",
+    })
+    .await
+    .unwrap();
+    let fallback = tempfile::NamedTempFile::new().unwrap();
+    let mut state = admin_state(db.clone(), JWT_SECRET);
+    state.admin_audit_fallback_dir = Some(fallback.path().to_path_buf());
+    let (denied_base, _denied_shutdown) = start_admin(state).await;
+    assert_eq!(get_ns(&denied_base, "/deployment-snapshot", &namespace).await.status, 503);
+    for (method, path, body) in [
+        (Method::DELETE, remove_path, None),
+        (Method::PUT, replace_path.as_str(), Some(&document)),
+    ] {
+        let denied = send_ns(
+            method,
+            &denied_base,
+            path,
+            &admin_token(),
+            original.etag.as_deref(),
+            body,
+            &namespace,
+        )
+        .await;
+        assert_eq!(denied.status, 503, "{}", denied.body);
+        assert_eq!(denied.body["recovery_cleanup_authorized"], false);
+        assert_eq!(denied.body["durable"], "not_started");
+        assert!(!denied.body.to_string().contains("historical-canary"));
+    }
+    raw.run_command(doc! { "collMod": "audit_events", "validator": {} })
+        .await
+        .unwrap();
+    assert_eq!(get_ns(&base, "/deployment-snapshot", &namespace).await.etag, original.etag);
+    // Audit rejection after a proven commit and local application still
+    // denies successful cleanup. The admitted intent itself remains durable.
+    raw.run_command(doc! {
+        "collMod": "audit_events",
+        "validator": { "$or": [
+            { "namespace": { "$ne": &namespace } },
+            { "diff": { "$regex": r#""phase":"admitted""# } },
+        ] },
+        "validationLevel": "strict", "validationAction": "error",
+    })
+    .await
+    .unwrap();
+    let apply = Arc::new(
+        ferrum_edge::config::runtime_config_apply::RuntimeConfigApply::with_timeout_at_epoch(
+            namespace.clone(),
+            db.config_topology_epoch(),
+            0,
+            std::time::Duration::from_secs(5),
+        ),
+    );
+    let mut state = admin_state(db.clone(), JWT_SECRET);
+    state.admin_audit_fallback_dir = Some(fallback.path().to_path_buf());
+    state.runtime_config_apply = Some(apply.clone());
+    let (final_base, _final_shutdown) = start_admin(state).await;
+    let request = tokio::spawn({
+        let namespace = namespace.clone();
+        let token = original.etag.clone();
+        async move {
+            send_ns(
+                Method::DELETE,
+                &final_base,
+                remove_path,
+                &admin_token(),
+                token.as_deref(),
+                None,
+                &namespace,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while apply.waiter_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    apply.record_accepted_cursor(
+        ferrum_edge::config::runtime_config_apply::LiveApplyCursor::new(
+            db.config_topology_epoch(),
+            db.latest_change_sequence(&namespace).await.unwrap(),
+        ),
+    );
+    let removed = request.await.unwrap();
+    assert_eq!(removed.status, 503, "{}", removed.body);
+    assert_eq!(removed.body["durable"], "committed");
+    assert_eq!(removed.body["live"], "unconfirmed");
+    assert_eq!(removed.body["recovery_cleanup_authorized"], false);
+    raw.run_command(doc! { "collMod": "audit_events", "validator": {} })
+        .await
+        .unwrap();
+    assert!(db.get_proxy_for_write(&namespace, "raw").await.unwrap().is_none());
+    assert_eq!(
+        consumers
+            .find_one(doc! { "_id": format!("{namespace}:historical") })
+            .await
+            .unwrap()
+            .unwrap(),
+        historical
+    );
+}
+
+/// Fixture-only schema drift proves unknown SQL columns participate in authority
+/// and survive selected replacement. No production schema change is required.
+async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect: &str) {
+    use sqlx::Row;
+
+    let namespace = format!("deployment-sql-{}", uuid::Uuid::new_v4());
+    let pool = db.pool();
+    for table in ["plugin_configs", "proxy_plugins"] {
+        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN deployment_future_metadata TEXT"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    let mut document = json!({
+        "openapi": "3.0.3", "info": {"title": "SQL", "version": "1"},
+        "paths": {"/sql": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": "sql", "listen_path": "/sql",
+            "backend_host": "backend.example.com", "backend_port": 8080},
+        "x-ferrum-plugins": [{"id": "sql-generated", "plugin_name": "cors", "config": {}}]
+    });
+    let imported = send_ns(
+        Method::POST,
+        &base,
+        "/api-specs",
+        &admin_token(),
+        None,
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(imported.status, 201, "{}", imported.body);
+    let spec_id = imported.body["id"].as_str().unwrap();
+    let placeholder = if dialect == "postgres" { "$1" } else { "?" };
+    for table in ["plugin_configs", "proxy_plugins"] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET deployment_future_metadata = ' opaque-original ' \
+             WHERE namespace = {placeholder}"
+        ))
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    assert_eq!(original.status, 200, "{}", original.body);
+    sqlx::query(&format!(
+        "UPDATE proxy_plugins SET deployment_future_metadata = 'operator' \
+         WHERE namespace = {placeholder}"
+    ))
+    .bind(&namespace)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let replace_path = format!("/api-specs/{spec_id}?conditional=true");
+    for (method, path, body) in [
+        (
+            Method::DELETE,
+            "/proxies/sql?conditional=true&cleanup_orphaned_upstream=false",
+            None,
+        ),
+        (Method::PUT, replace_path.as_str(), Some(&document)),
+    ] {
+        let stale = send_ns(
+            method,
+            &base,
+            path,
+            &admin_token(),
+            original.etag.as_deref(),
+            body,
+            &namespace,
+        )
+        .await;
+        assert_eq!(stale.status, 412, "{}", stale.body);
+    }
+    let exact = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    document["x-ferrum-proxy"]["backend_host"] = json!("replacement.example.com");
+    let replaced = send_ns(
+        Method::PUT,
+        &base,
+        &replace_path,
+        &admin_token(),
+        exact.etag.as_deref(),
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    for (table, expected) in [
+        ("plugin_configs", " opaque-original "),
+        ("proxy_plugins", "operator"),
+    ] {
+        let row = sqlx::query(&format!(
+            "SELECT deployment_future_metadata FROM {table} WHERE namespace = {placeholder}"
+        ))
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("deployment_future_metadata"), expected);
+    }
 }

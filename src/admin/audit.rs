@@ -496,6 +496,16 @@ impl AuditEvent {
         }
     }
 
+    pub(crate) fn with_current_request_context(mut self) -> Self {
+        if let Some(slot) = current_slot() {
+            slot.with(|inner| {
+                self.source_address = inner.source_address.clone();
+                self.request_id = inner.request_id.clone();
+            });
+        }
+        self
+    }
+
     pub fn with_request_context(mut self, ctx: &AuditRequestContext) -> Self {
         self.source_address = ctx.source_address.clone();
         self.request_id = ctx.request_id.clone();

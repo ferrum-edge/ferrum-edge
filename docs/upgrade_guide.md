@@ -28,6 +28,23 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Unreleased
 
+**Dependency-fenced partial deployment mutations (#6010).** Automation must use
+`GET /deployment-snapshot` and its original deployment token for opt-in
+`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` and
+`PUT /api-specs/{id}?conditional=true`. Backup namespace tokens and row ETags
+cannot authorize these operations. No local schema migration or configuration
+change enables this additive profile; MongoDB needs replica-set transactions
+and MySQL needs REPEATABLE READ. The legacy missing-If-Match profiles remain
+supported outside conditional mode.
+
+Keep the original encrypted snapshot/journal on stale/refused/uncertain outcomes.
+Never retry recovery with a fresh token or restore an entire namespace minus one
+graph. Require `durable: "committed"`, `live: "applied"` and
+`recovery_cleanup_authorized: true` before automatic journal removal. CP and
+unserved-namespace durable-only acknowledgements do not authorize cleanup. See
+[consumer adoption and limitations](deployment_mutations.md). This source change
+does not establish downstream adoption or packaged qualification.
+
 ## Upgrading to 0.9.11 (release draft)
 
 0.9.11 is not published or qualified yet. This candidate was prepared on

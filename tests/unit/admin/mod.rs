@@ -25,6 +25,7 @@ mod api_specs_yaml_alias_budget_tests;
 mod audit_pipeline_tests;
 mod backend_egress_policy_tests;
 mod config_export_tests;
+mod deployment_mutation_contract_tests;
 mod mesh_remote_clusters_tests;
 mod mesh_slice_drift_tests;
 mod namespace_admission_lease_renewal_tests;

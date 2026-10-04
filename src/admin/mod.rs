@@ -9,6 +9,7 @@ mod conditional_snapshots;
 pub mod config_export;
 pub mod conn_limit;
 pub(crate) mod crud;
+mod deployment_mutations;
 pub mod jwt_auth;
 mod mcp_tool_catalog;
 pub mod mesh_config_drift;
@@ -2319,6 +2320,7 @@ fn namespace_scoped_resource_kind(segments: &[&str]) -> Option<&'static str> {
         "api-specs" => "api-specs",
         "batch" => "batch",
         "backup" => "backup",
+        "deployment-snapshot" => "deployment-snapshot",
         // Process policy applicable to this tenant, disclosed only through
         // namespace read authorization (including the viewer-key ceiling).
         "backend-egress-policy" if segments.len() == 1 => "backend-egress-policy",
@@ -3987,6 +3989,32 @@ async fn handle_admin_request_inner(
         drop(req.into_body());
         return Ok(resp);
     }
+    let deployment_write_route = matches!(
+        (method.clone(), segments_peek.as_slice()),
+        (Method::DELETE, ["proxies", _]) | (Method::PUT, ["api-specs", _])
+    );
+    if deployment_mutations::requested(req.uri().query(), req.headers())
+        && matches!(
+            method,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        )
+        && !deployment_write_route
+    {
+        let role = if matches!(segments_peek.as_slice(), ["api-specs", ..]) {
+            Some(AdminRole::Admin)
+        } else {
+            body_consuming_route_role(&method, segments_peek.as_slice()).flatten()
+        };
+        if let Some(role) = role
+            && let Some(response) = require_admin_role(&auth, role)
+        {
+            return Ok(response);
+        }
+        return Ok(deployment_mutations::refusal(
+            "Deployment conditional mode is unsupported on this mutation route",
+        ));
+    }
+
     match (method.clone(), segments_peek.as_slice()) {
         (Method::GET, ["backend-egress-policy"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Viewer) {
@@ -4001,6 +4029,35 @@ async fn handle_admin_request_inner(
             }
             drop(req.into_body());
             return Ok(backend_egress_policy::handle_get(&state, &namespace));
+        }
+        (Method::DELETE, ["proxies", id])
+            if deployment_mutations::requested(req.uri().query(), req.headers()) =>
+        {
+            if let Some(response) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(response);
+            }
+            if auth.allowed_namespaces.is_present()
+                && let Some(response) = enforce_namespace_claim(&auth, &namespace, &path)
+            {
+                return Ok(response);
+            }
+            if crate::config::types::validate_resource_id(id).is_err() {
+                return Ok(deployment_mutations::refusal("Invalid deployment target id"));
+            }
+            let original = match deployment_mutations::parse_request(
+                req.uri().query(),
+                req.headers(),
+                true,
+            ) {
+                Ok(Some(original)) => original,
+                _ => {
+                    return Ok(deployment_mutations::refusal(
+                        "Invalid deployment mode or precondition",
+                    ));
+                }
+            };
+            drop(req.into_body());
+            return Ok(deployment_mutations::remove(&state, &auth, &namespace, id, original).await);
         }
         (Method::POST, ["api-specs"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -4733,6 +4790,24 @@ async fn handle_admin_request_inner(
         }
 
         // Backup & Restore
+        (Method::GET, ["deployment-snapshot"]) => {
+            if let Some(response) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(response);
+            }
+            if uri.query().is_some() {
+                return Ok(deployment_mutations::refusal(
+                    "Deployment snapshot requires an unfiltered read",
+                ));
+            }
+            if auth.allowed_namespaces.is_present()
+                && let Some(response) = enforce_namespace_claim(&auth, &namespace, &path)
+            {
+                return Ok(response);
+            }
+            Ok(
+                deployment_mutations::snapshot(&state, &auth, &namespace, &audit_request_ctx).await,
+            )
+        }
         (Method::GET, ["backup"]) => {
             // Backup returns unredacted credentials and consul tokens — Admin only.
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
