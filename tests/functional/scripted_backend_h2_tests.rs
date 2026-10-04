@@ -5280,10 +5280,7 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
                         .expect("early terminal response");
                     let mut send = respond.send_response(response, true).expect("respond");
                     let Some(index) = index else {
-                        assert!(
-                            request.into_body().is_end_stream(),
-                            "probe upload is empty"
-                        );
+                        assert!(request.into_body().is_end_stream(), "probe upload is empty");
                         continue;
                     };
                     let blocked_tx = blocked_tx.clone();
@@ -5301,10 +5298,7 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
                             received.extend_from_slice(&data);
                         }
                         assert_eq!(received.len(), WINDOW);
-                        assert!(
-                            !body.is_end_stream(),
-                            "final DATA remains flow controlled"
-                        );
+                        assert!(!body.is_end_stream(), "final DATA remains flow controlled");
                         blocked_tx.send(index).expect("report withheld credit");
                         while !*release_rx.borrow_and_update() {
                             release_rx.changed().await.expect("release signal");
@@ -5342,7 +5336,9 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
                         } else {
                             assert!(trailers.is_none());
                         }
-                        ended_tx.send((index, false)).expect("report drained upload");
+                        ended_tx
+                            .send((index, false))
+                            .expect("report drained upload");
                     });
                 }
                 while let Some(result) = uploads.join_next().await {
@@ -5495,8 +5491,14 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
         backend_ids[32..].iter().any(|id| id != &backend_ids[0]),
         "final DATA still queued after terminal responses must force spill"
     );
-    assert!(ended_rx.try_recv().is_err(), "no upload has drained or reset");
-    assert!(accepted.load(Ordering::Relaxed) >= 2, "spill widens the pool");
+    assert!(
+        ended_rx.try_recv().is_err(),
+        "no upload has drained or reset"
+    );
+    assert!(
+        accepted.load(Ordering::Relaxed) >= 2,
+        "spill widens the pool"
+    );
     if matches!(mode, QueuedGrpcUpload::RetryBuffered) {
         let logs = harness
             .wait_for_log_contains(
@@ -5548,7 +5550,10 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
                 .is_none()
         );
     }
-    assert!(ended_rx.try_recv().is_err(), "no duplicate termination report");
+    assert!(
+        ended_rx.try_recv().is_err(),
+        "no duplicate termination report"
+    );
     driver.abort();
     let _ = driver.await;
     drop(harness);

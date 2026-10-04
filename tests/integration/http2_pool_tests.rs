@@ -2849,7 +2849,9 @@ async fn hyper_h2_lifetime_outlives_final_source_data(termination: u8) {
             .await
             .expect("h2 backend");
         let (request, mut respond) = conn.accept().await.unwrap().unwrap();
-        let mut send = respond.send_response(http::Response::new(()), true).unwrap();
+        let mut send = respond
+            .send_response(http::Response::new(()), true)
+            .unwrap();
         let upload = async move {
             let mut body = request.into_body();
             let first = body.data().await.unwrap().unwrap();
@@ -2875,9 +2877,7 @@ async fn hyper_h2_lifetime_outlives_final_source_data(termination: u8) {
             ended_tx.send(()).unwrap();
             std::future::pending::<()>().await;
         };
-        let drive = async move {
-            while conn.accept().await.is_some() {}
-        };
+        let drive = async move { while conn.accept().await.is_some() {} };
         tokio::select! {
             _ = upload => {}
             _ = drive => panic!("backend connection ended before test teardown"),
@@ -2898,13 +2898,10 @@ async fn hyper_h2_lifetime_outlives_final_source_data(termination: u8) {
         .unwrap();
     let lifetime = h2::ext::StreamLifetime::new(Arc::new(Owner(owner_tx)));
     request.extensions_mut().insert(lifetime);
-    let response = tokio::time::timeout(
-        Duration::from_secs(5),
-        sender.send_request(request),
-    )
-    .await
-    .expect("early response timeout")
-    .expect("early response");
+    let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+        .await
+        .expect("early response timeout")
+        .expect("early response");
     let response_body = response.into_body();
     let body = tokio::time::timeout(Duration::from_secs(5), response_body.collect())
         .await
