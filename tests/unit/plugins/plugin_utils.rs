@@ -803,7 +803,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             }],
             "session": {
                 "store": "cookie",
-                "encryption_secret": "01234567890123456789012345678901"
+                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486"
             },
             "behavior": {"trusted_redirect_hosts": ["app.example.com"]}
         }),
