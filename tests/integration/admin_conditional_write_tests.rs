@@ -1544,6 +1544,185 @@ where
         .unwrap();
 }
 
+/// Cancel handoff while the datastore itself is running a renewal or reclaim.
+/// In particular, BEFORE INSERT blocks reclaim before it locks the lease row:
+/// an early release can complete, then the blocked command can revive that same
+/// owner's released lease. Merely retaining/aborting the keeper handle does not
+/// settle this already-submitted server command.
+async fn assert_postgres_cancelled_handoff_settles_operations(db: Arc<DatabaseStore>) {
+    use ferrum_edge::_test_support::lock_namespace_config_admission_db_for_test;
+    use std::future::Future;
+    use std::time::Duration;
+
+    let pool = db.pool();
+    for (reclaim, timed_out) in [(false, false), (true, false), (true, true)] {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let namespace = format!("cancelled-{suffix}");
+        let mut guard = lock_namespace_config_admission_db_for_test(db.clone(), &namespace)
+            .await
+            .unwrap();
+        let owner = guard.lease_ref().owner.to_string();
+        let generation = guard.lease_ref().generation;
+        if reclaim {
+            // Refuse renewal without changing owner/generation. The keeper must
+            // then issue its generation-preserving reclaim.
+            sqlx::query("UPDATE config_admission_locks SET expires_at = 1 WHERE namespace = $1")
+                .bind(&namespace)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let key = i64::from(uuid::Uuid::new_v4().as_fields().0 & 0x7fff_ffff);
+        let function = format!("pause_admission_{suffix}");
+        let trigger = format!("pause_admission_trigger_{suffix}");
+        // All interpolated identifiers/values come from generated UUIDs, never
+        // from external input. Only this namespace/owner is affected.
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF NEW.namespace = '{namespace}' AND NEW.owner = '{owner}' \
+                  AND NEW.expires_at > 0 THEN \
+                 PERFORM pg_advisory_xact_lock({key}::bigint); \
+               END IF; \
+               RETURN NEW; \
+             END; $$"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let event = if reclaim { "INSERT" } else { "UPDATE" };
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger} BEFORE {event} ON config_admission_locks \
+             FOR EACH ROW EXECUTE FUNCTION {function}()"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut barrier = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM pg_advisory_xact_lock($1)")
+            .bind(key)
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+
+        // Register the production keeper timer, then advance just that timer.
+        // Resume real time before awaiting database I/O so paused-clock auto
+        // advance cannot expire a query that is waiting on the server barrier.
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' \
+                     AND classid = 0 AND objid::bigint = $1 AND NOT granted",
+                )
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("keeper submitted its command and reached the server barrier");
+        if timed_out {
+            // A timeout must abandon only the response, never the submitted
+            // command. Handoff also has to join these outstanding attempts.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::time::resume();
+        }
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let handoff = tokio::spawn(async move {
+            let mut future = Box::pin(guard.hand_off_to_restore_transaction());
+            std::future::poll_fn(|context| {
+                assert!(future.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            entered_tx.send(()).unwrap();
+            future.await
+        });
+        entered_rx.await.unwrap();
+        handoff.abort();
+        assert!(handoff.await.unwrap_err().is_cancelled());
+
+        let next_db = db.clone();
+        let next_namespace = namespace.clone();
+        let mut next = tokio::spawn(async move {
+            lock_namespace_config_admission_db_for_test(next_db, &next_namespace).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut next)
+                .await
+                .is_err(),
+            "cleanup must retain the local admission mutex until the command settles"
+        );
+        let expiry: i64 = sqlx::query_scalar(
+            "SELECT expires_at FROM config_admission_locks WHERE namespace = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if reclaim {
+            assert_eq!(expiry, 1, "release must not race an in-flight reclaim");
+        } else {
+            assert!(expiry > 0, "release must follow the in-flight renewal");
+        }
+
+        // The submitted write completes first, then cleanup releases it. A
+        // writer must acquire promptly without waiting out the 120-second TTL.
+        barrier.commit().await.unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(15), next)
+            .await
+            .expect("other writer acquired after cancellation cleanup")
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.lease_ref().generation, generation + 1);
+        assert_ne!(next.lease_ref().owner, owner);
+        assert!(
+            db.try_acquire_namespace_config_admission_lease(&namespace, &owner)
+                .await
+                .unwrap()
+                .is_none(),
+            "the cancelled owner must not reclaim the next writer's live lease"
+        );
+        assert!(
+            !db.renew_namespace_config_admission_lease(&namespace, &owner)
+                .await
+                .unwrap(),
+            "the cancelled owner must remain fenced after takeover"
+        );
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT expires_at - CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) \
+             FROM config_admission_locks WHERE namespace = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(remaining > 115_000, "the production TTL must remain 120 seconds");
+
+        sqlx::query(&format!("DROP TRIGGER {trigger} ON config_admission_locks"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP FUNCTION {function}()"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(next);
+    }
+}
+
 async fn assert_sql_restore_renewal(db: Arc<DatabaseStore>) {
     let pool = db.pool();
     let sql = match db.db_type_str() {
@@ -1768,6 +1947,7 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
         .unwrap();
     assert_transaction_precondition(&db).await;
     let db = Arc::new(db);
+    assert_postgres_cancelled_handoff_settles_operations(db.clone()).await;
     assert_sql_restore_renewal(db.clone()).await;
     assert_http_restore_spans_keeper_renewal(db).await;
 }
