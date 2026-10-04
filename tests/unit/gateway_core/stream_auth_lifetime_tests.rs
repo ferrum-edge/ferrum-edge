@@ -4815,11 +4815,17 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         .find("if auth.is_some() {")
         .expect("authorization lifetimes keep the pump");
     let pump_install = grpc_installer
-        .find("Self::for_streaming_upload_with_deferred_write(incoming, auth, write_timeout_ms)")
+        .find("Self::for_streaming_upload_with_deferred_write(")
         .expect("the authenticated branch installs the pump");
     assert!(
         auth_branch < pump_install && grpc_installer.contains("Http2BodyWriteTimeout::new("),
         "native gRPC must keep the pump for authorization lifetimes and bound the write otherwise"
+    );
+    assert!(
+        GRPC_PROXY_SOURCE
+            .contains("let require_end_stream = parts.version == hyper::Version::HTTP_2;")
+            && grpc_installer[pump_install..].contains("require_end_stream,"),
+        "the authenticated pump must receive the original frontend protocol's EOF policy"
     );
     let native_grpc_poll = GRPC_PROXY_SOURCE
         .split("impl http_body::Body for GrpcBody")

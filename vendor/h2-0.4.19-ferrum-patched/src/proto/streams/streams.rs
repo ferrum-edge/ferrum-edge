@@ -273,6 +273,8 @@ where
         use http::Method;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        // FERRUM PATCH 002: move the owner out before clearing extensions.
+        let lifetime = request.extensions_mut().remove::<crate::ext::StreamLifetime>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -315,6 +317,8 @@ where
             me.actions.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
         );
+
+        stream.lifetime = lifetime;
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;

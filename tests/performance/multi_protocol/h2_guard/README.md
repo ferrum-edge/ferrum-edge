@@ -262,3 +262,8 @@ An h2 version change fails preparation until its source and observations are
 reviewed anew. Promoting a dependency repair to a shipping graph requires the
 normal dependency lifecycle inventory, retirement plan and behavioral gates;
 this diagnostic lane does not authorize that promotion.
+
+The shipped h2 source is reconstructed with patches 001 and 002 in order.
+Patch 002 retains backend stream owners through queued DATA drainage/reset;
+`prepare.py` verifies the resulting source against the drift manifest before
+applying the diagnostic observer and checking `source.json` pre/postimages.

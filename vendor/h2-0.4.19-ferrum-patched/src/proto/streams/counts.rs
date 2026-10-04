@@ -300,6 +300,12 @@ impl Counts {
                 // Decrement the number of active streams.
                 self.dec_num_streams(&mut stream);
             }
+
+            // FERRUM PATCH 002: use the same queued-frame drain boundary as
+            // concurrent-stream accounting. Scheduled resets still own DATA.
+            if !stream.state.is_scheduled_reset() {
+                stream.lifetime.take();
+            }
         }
 
         // Release the stream if it requires releasing

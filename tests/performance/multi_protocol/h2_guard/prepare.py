@@ -20,11 +20,14 @@ VENDOR = "vendor/h2-0.4.19-observation"
 # Input anchors shared by the hosted preparation and the quick pin check, so the
 # two cannot disagree about what "present" means.
 PATCH_TABLE = "[patch.crates-io]\n"
-# Ferrum ships a vendored h2 0.4.19 (docs/upstream-h2-patches/001-*), so the
+# Ferrum ships a vendored h2 0.4.19 (patches 001/002), so the
 # root lock records it path-sourced (no source/checksum lines) and the patch
 # table already names it. The observation build replaces that one entry.
 FERRUM_VENDOR = "vendor/h2-0.4.19-ferrum-patched"
-FERRUM_PATCH = "docs/upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch"
+FERRUM_PATCHES = (
+    "docs/upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch",
+    "docs/upstream-h2-patches/002-stream-lifetime/h2-stream-lifetime.patch",
+)
 VENDOR_MANIFEST = "vendor/VENDOR_INTEGRITY.sha256"
 VENDORED_H2 = 'h2 = { path = "' + FERRUM_VENDOR + '" }\n'
 LOCK_PIN = 'name = "h2"\nversion = "0.4.19"\ndependencies = [\n'
@@ -77,16 +80,17 @@ def manifest_entries(root, prefix):
 def apply_ferrum_patch(source, root):
     """Turn the verified archive into Ferrum's shipped h2 sources.
 
-    Applies Ferrum's vendored h2 patch without fuzz, then requires every file
-    under src/ to match the vendored crate's drift-manifest hash (text hashed
+    Applies Ferrum's vendored h2 patches in order without fuzz, then requires
+    every file under src/ to match the vendored crate's drift-manifest hash (text hashed
     with CR stripped, as the drift guard does), so the observation build
     measures exactly the h2 the gateway ships plus the observer.
     """
-    patch = (root / FERRUM_PATCH).read_bytes()
-    applied = subprocess.run(["patch", "--batch", "--fuzz=0", "-p1"],
-                             input=patch, cwd=source, capture_output=True)
-    if applied.returncode != 0:
-        raise ValueError("Ferrum h2 patch does not apply to the verified archive")
+    for patch_path in FERRUM_PATCHES:
+        patch = (root / patch_path).read_bytes()
+        applied = subprocess.run(["patch", "--batch", "--fuzz=0", "-p1"],
+                                 input=patch, cwd=source, capture_output=True)
+        if applied.returncode != 0:
+            raise ValueError("Ferrum h2 patch does not apply to the verified archive: " + patch_path)
     expected = manifest_entries(root, FERRUM_VENDOR + "/src/")
     if not expected:
         raise ValueError("drift manifest has no vendored h2 sources")
@@ -187,7 +191,8 @@ def check_pins_only(provenance):
         raise SystemExit("pin check failed: Cargo.toml [patch.crates-io] anchor must occur once")
     if manifest.count(VENDORED_H2) != 1:
         raise SystemExit("pin check failed: Cargo.toml vendored h2 patch entry must occur once")
-    if not (ROOT / FERRUM_PATCH).is_file() or not manifest_entries(ROOT, FERRUM_VENDOR + "/src/"):
+    if (not all((ROOT / patch).is_file() for patch in FERRUM_PATCHES)
+            or not manifest_entries(ROOT, FERRUM_VENDOR + "/src/")):
         raise SystemExit("pin check failed: vendored h2 patch or its drift-manifest entries are missing")
 
     docker = (ROOT / "Dockerfile").read_text()

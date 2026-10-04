@@ -47,6 +47,7 @@ pub mod deferred_log;
 /// hyper's HTTP/1 `header_read_timeout` cannot see, without closing idle
 /// keep-alive after the first request.
 pub(crate) mod frontend_admission;
+pub mod frontend_affinity;
 pub mod frontend_proxy_protocol;
 pub mod gateway_listener;
 pub mod gateway_listener_status;
@@ -14778,8 +14779,12 @@ async fn handle_connection(
     // count can be drained once after the connection resolves.
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = Arc::clone(&h1_framing_signals);
+    // gRPC backend-shard affinity for this connection's HTTP/2 streams
+    // (issue #5588), allocated on the first HTTP/2 request.
+    let connection_affinity = frontend_affinity::LazyConnectionAffinity::new();
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
+        let frontend_stream = connection_affinity.open_stream(req.version());
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let http1_framing_result =
@@ -14814,7 +14819,7 @@ async fn handle_connection(
             diagnostic_slot: None,
         };
         async move {
-            let mut response = handle_proxy_request_on_frontend_port(
+            let request = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -14823,9 +14828,21 @@ async fn handle_connection(
                 None,
                 None,
                 connection_metadata,
-            )
-            .await;
+            );
+            let (mut response, frontend_stream) = match frontend_stream {
+                Some(stream) => {
+                    let (response, stream) = stream.run_request(request).await;
+                    (response, Some(stream))
+                }
+                None => (request.await, None),
+            };
             apply_h1_framing_connection_close(&mut response, http1_framing_result);
+            // A streamed gRPC upload shares its affinity count with the backend
+            // H2 transport until queued DATA drains or the stream resets.
+            if let Some(stream) = frontend_stream {
+                response =
+                    response.map(|response| response.map(|body| body.with_frontend_stream(stream)));
+            }
             if let Some(signals) = response_h1_framing_signals.as_ref()
                 && h1_response_ends_framing_observation(&request_method, &response)
             {
@@ -23714,8 +23731,12 @@ async fn handle_tls_connection(
     let post_conn_state = Arc::clone(&state);
     let post_conn_signals = h1_framing_signals.clone();
     let service_h1_framing_signals = h1_framing_signals;
+    // gRPC backend-shard affinity for this connection's HTTP/2 streams
+    // (issue #5588), allocated on the first HTTP/2 request.
+    let connection_affinity = frontend_affinity::LazyConnectionAffinity::new();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
+        let frontend_stream = connection_affinity.open_stream(req.version());
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let cert = client_cert_der.clone();
@@ -23752,7 +23773,7 @@ async fn handle_tls_connection(
             diagnostic_slot: None,
         };
         async move {
-            let mut response = handle_proxy_request_on_frontend_port(
+            let request = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -23761,9 +23782,21 @@ async fn handle_tls_connection(
                 chain,
                 mtls_auth_connection_cache,
                 connection_metadata,
-            )
-            .await;
+            );
+            let (mut response, frontend_stream) = match frontend_stream {
+                Some(stream) => {
+                    let (response, stream) = stream.run_request(request).await;
+                    (response, Some(stream))
+                }
+                None => (request.await, None),
+            };
             apply_h1_framing_connection_close(&mut response, http1_framing_result);
+            // A streamed gRPC upload shares its affinity count with the backend
+            // H2 transport until queued DATA drains or the stream resets.
+            if let Some(stream) = frontend_stream {
+                response =
+                    response.map(|response| response.map(|body| body.with_frontend_stream(stream)));
+            }
             if let Some(signals) = response_h1_framing_signals.as_ref()
                 && h1_response_ends_framing_observation(&request_method, &response)
             {
