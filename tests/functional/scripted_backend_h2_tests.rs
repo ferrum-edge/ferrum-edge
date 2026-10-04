@@ -5076,19 +5076,38 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
                             "affinity-consumer"
                         );
                     }
-                    let response = http::Response::builder()
-                        .status(200)
-                        .header("content-type", "application/grpc")
-                        .header("grpc-status", "0")
-                        .header("x-backend-connection", id.to_string())
-                        .body(())
-                        .expect("early terminal response");
-                    respond.send_response(response, true).expect("respond");
                     let ended_tx = ended_tx.clone();
                     uploads.spawn(async move {
                         let mut body = request.into_body();
-                        let mut reset = None;
                         let mut received = Vec::new();
+                        if upload_id.is_some_and(|upload_id| upload_id != 82) {
+                            // Prove the initial message reached the backend before
+                            // answering. The frontend keeps the upload open until
+                            // it has drained this terminal response. The H1
+                            // chunked case (82) sends its complete body up front.
+                            while received.len() < 6 {
+                                let data = body
+                                    .data()
+                                    .await
+                                    .expect("initial upload DATA")
+                                    .expect("initial upload DATA result");
+                                received.extend_from_slice(&data);
+                                body.flow_control()
+                                    .release_capacity(data.len())
+                                    .expect("release initial upload credit");
+                            }
+                            assert_eq!(received, [0, 0, 0, 0, 1, b'x']);
+                            assert!(!body.is_end_stream(), "upload remains open at response");
+                        }
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "0")
+                            .header("x-backend-connection", id.to_string())
+                            .body(())
+                            .expect("early terminal response");
+                        respond.send_response(response, true).expect("respond");
+                        let mut reset = None;
                         while let Some(data) = body.data().await {
                             match data {
                                 Ok(data) => {
@@ -5100,13 +5119,35 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
                                 Err(error) => {
                                     assert!(error.is_reset(), "unexpected upload error: {error}");
                                     reset = error.reason();
-                                    assert_eq!(reset, Some(h2::Reason::CANCEL));
+                                    assert_eq!(
+                                        reset,
+                                        Some(h2::Reason::CANCEL),
+                                        "upload {upload_id:?} preserves frontend cancellation"
+                                    );
                                     break;
                                 }
                             }
                         }
                         if let Some(upload_id) = upload_id {
-                            if reset.is_none() {
+                            if reset.is_some() {
+                                assert_eq!(
+                                    received,
+                                    [0, 0, 0, 0, 1, b'x'],
+                                    "a reset upload forwards no further DATA"
+                                );
+                                assert!(!body.is_end_stream(), "reset must not become END_STREAM");
+                                let error = body
+                                    .data()
+                                    .await
+                                    .expect("reset remains a DATA error")
+                                    .expect_err("no DATA or clean EOF after reset");
+                                assert_eq!(error.reason(), Some(h2::Reason::CANCEL));
+                                let error = body
+                                    .trailers()
+                                    .await
+                                    .expect_err("no terminal trailers after reset");
+                                assert_eq!(error.reason(), Some(h2::Reason::CANCEL));
+                            } else {
                                 let trailers = body.trailers().await.expect("upload trailers");
                                 if upload_id % 4 == 0 {
                                     let trailers = trailers.expect("native request trailers");
@@ -5330,9 +5371,9 @@ async fn exercise_grpc_retained_uploads<T>(
             "none of the retained uploads ended yet, and prior uploads terminate once"
         );
 
-        // Empty/nonempty DATA END_STREAM, terminal trailers, and both masked
-        // H2 resets terminate the independent upload half. Require actual backend
-        // CANCEL for each reset; accepting an arbitrary error would hide a
+        // Empty/nonempty DATA END_STREAM, terminal trailers, and frontend
+        // CANCEL/NO_ERROR resets terminate the independent upload half. Require
+        // actual backend CANCEL for each reset; accepting an arbitrary error would hide a
         // changed wire reason or a truncated clean upload.
         for (index, mut upload) in uploads.into_iter().enumerate() {
             if index % 4 == 0 {
