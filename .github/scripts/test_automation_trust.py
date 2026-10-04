@@ -571,6 +571,11 @@ class JsonContractTests(unittest.TestCase):
                     ("finite negative exponent", b'{"number":-1e300}', {"number": -1e300}),
                     ("nested finite exponents", b'{"nested":[1e200,-1e200]}',
                      {"nested": [1e200, -1e200]}),
+                    ("quoted delimiters and escaped quote",
+                     b'{"text":"quoted brace } and escaped quote ' + b'\\' +
+                     b'" [","nested":[{"x":1}]}',
+                     {"text": 'quoted brace } and escaped quote " [',
+                      "nested": [{"x": 1}]}),
                     ("empty object", b"{}", {}))
         for case, value, expected in accepted:
             with self.subTest(case=case):
@@ -587,11 +592,22 @@ class JsonContractTests(unittest.TestCase):
                     ("nested positive exponent overflow", b'{"nested":{"x":1e999}}'),
                     ("nested negative exponent overflow", b'{"nested":[-1e999]}'),
                     ("duplicate key", b'{"nested":{"x":1,"x":2}}'),
-                    ("excessive nesting", b"[" * 2000 + b"]" * 2000),
                     ("oversized input", b" " * (io.API_LIMIT + 1)))
         for case, value in rejected:
             with self.subTest(case=case), self.assertRaises(ValueError):
                 io.load_json(value)
+
+        at_limit = b"[" * io.MAX_JSON_DEPTH + b"0" + b"]" * io.MAX_JSON_DEPTH
+        expected = 0
+        for _ in range(io.MAX_JSON_DEPTH):
+            expected = [expected]
+        with self.subTest(case="maximum JSON depth is accepted"):
+            self.assertEqual(io.load_json(at_limit), expected)
+        over_limit = b"[" * (io.MAX_JSON_DEPTH + 1) + b"0" + b"]" * (
+            io.MAX_JSON_DEPTH + 1)
+        with self.subTest(case="maximum JSON depth plus one is rejected"), self.assertRaises(
+                ValueError):
+            io.load_json(over_limit)
         for value in (float("nan"), float("inf"), float("-inf")):
             with self.assertRaises(ValueError):
                 io.json_bytes({"x": value})

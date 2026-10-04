@@ -19,6 +19,7 @@ OUTPUT_LIMIT = 12_000
 COMMENT_LIMIT = 60_000
 API_LIMIT = 2_000_000
 ARCHIVE_LIMIT = 1_000_000
+MAX_JSON_DEPTH = 64
 
 
 def require(condition, message):
@@ -48,6 +49,27 @@ def json_bytes(value):
             + "\n").encode("utf-8")
 
 
+def _check_json_depth(source):
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in source:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            require(depth <= MAX_JSON_DEPTH, "excessive JSON nesting")
+        elif char in "]}" and depth > 0:
+            depth -= 1
+
+
 def load_json(data, *, limit=API_LIMIT):
     require(type(data) is bytes and 0 < len(data) <= limit, "invalid JSON byte length")
 
@@ -66,23 +88,13 @@ def load_json(data, *, limit=API_LIMIT):
     def refuse_constant(value):
         raise ValueError("nonfinite JSON constant")
 
-    def require_finite_numbers(value):
-        if isinstance(value, float):
-            require(math.isfinite(value), "nonfinite JSON number")
-        elif isinstance(value, list):
-            for item in value:
-                require_finite_numbers(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                require_finite_numbers(item)
-
     try:
-        result = json.loads(data.decode("utf-8", errors="strict"), object_pairs_hook=unique,
-                            parse_constant=refuse_constant, parse_float=finite)
-        require_finite_numbers(result)
-        return result
-    except (UnicodeError, RecursionError):
-        raise ValueError("invalid UTF-8 or excessive JSON nesting") from None
+        source = data.decode("utf-8", errors="strict")
+    except UnicodeError:
+        raise ValueError("invalid UTF-8") from None
+    _check_json_depth(source)
+    return json.loads(source, object_pairs_hook=unique, parse_constant=refuse_constant,
+                      parse_float=finite)
 
 
 def text(value, limit, *, multiline=False):

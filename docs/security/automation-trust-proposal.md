@@ -135,8 +135,9 @@ the provider endpoint is fixed, regardless of input or provider-base environment
 variables.
 Archives are read as data without extraction, with exact filenames, bounded
 compressed/member sizes, no symlinks, no extra/duplicate members and duplicate
-JSON-key rejection. JSON must be strictly decoded UTF-8, with finite numbers
-only. Both generator and publisher validate the same closed input/patch schema:
+JSON-key rejection. JSON must be strictly decoded UTF-8, contain only finite
+numbers, and nest objects and arrays no deeper than 64 containers. Both generator
+and publisher validate the same closed input/patch schema:
 1–299 unique relative paths, bounded UTF-8 text, a finite status set, and no
 unknown patch fields, invalid Unicode or unexpected controls. These are finite
 data contracts, not a guarantee of complete or truthful patch/model content.
