@@ -95,6 +95,52 @@ that dispatch contract, and direct H2 keeps its documented round-robin pool
 policy. Existing real-pool affinity regressions cover new frontend shard
 creation separately; this OTEL case specifically proves same-frontend reuse.
 
+## Exact-main sequential gRPC reuse
+
+[Protocol job 111483212924](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37217711050/job/111483212924)
+tested main `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017` and failed
+`h2_direct_pool_reuses_connection_across_requests` at line 2489: the second
+response contained `[b"one"]` instead of the required second script's
+`[b"two"]`. [Issue comment 5982508001](https://github.com/ferrum-edge/ferrum-edge/issues/6006#issuecomment-5982508001)
+groups this third failure with the release qualification repairs.
+
+This test already used the cold in-process harness, so the binary startup
+probe is not its cause. Despite its name, it sends `application/grpc` and
+uses the native `GrpcConnectionPool`, not the plain direct-H2 pool.
+`GrpcClient::h2c` stores only the target and transport. Every `unary` call
+reaches `request_with_headers`, opens a new TCP socket, and handshakes H2 in
+`send_over_io`. Its `AbortOnDrop` driver is aborted after response collection;
+that does not await the gateway releasing the old frontend's affinity slot.
+
+`LazyConnectionAffinity` belongs to the accepted frontend service, and its
+slot remains owned until that connection and its retained streams end.
+If the old slot is still live when the second frontend arrives, the new
+frontend takes another least-loaded slot. `GrpcConnectionPool::get_sender`
+creates that preferred shard when missing, even with a ready sibling. The
+scripted backend clones the entire ordered script for each TCP accept, so
+the first RPC on the new shard receives `"one"` again. These source paths
+explain the logged message, independently of the OTEL helper's teardown.
+This is a fixture lifetime/affinity mismatch, not proof of broken pool reuse.
+
+The repair keeps one raw H2 frontend sender and an owned `JoinSet` driver
+through both RPCs and all backend assertions. Each RPC must complete within
+a bounded watchdog, with HTTP 200, the exact length-prefixed `"one"` or
+`"two"` body, and an actual `grpc-status: 0` trailer before the next starts.
+Their frontend stream IDs must differ. The backend's existing
+`AwaitTestSignal` holds its connection open through inspection, which requires
+exactly two recorded RPC streams, one TCP accept, one completed H2 handshake,
+and no matcher or script errors. `ReceivedStream` exposes no backend stream
+ID; the accept/handshake counts independently establish the physical socket.
+
+The old 100ms counter-settlement sleep is removed: accept and handshake
+counters and each stream's record are published before its scripted response,
+so receipt of both complete bodies and trailers proves those events occurred.
+Cleanup releases the backend barrier, drops the frontend sender, and joins
+the owned driver under a five-second bound; dropping the `JoinSet` also aborts
+the driver on a failed assertion or timeout. The backend retains its existing
+drop shutdown. No shard-count override, affinity bypass, reconnection-as-reuse,
+weaker message assertion, or production change is introduced.
+
 ## Validation and integration
 
 Local validation is static source/diff inspection and `git diff --check`

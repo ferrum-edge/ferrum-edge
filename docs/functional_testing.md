@@ -4,7 +4,7 @@ This guide covers Ferrum Edge functional testing, with a focus on Control Plane 
 
 ## Test Files
 
-### gRPC acquisition expiry and attempt spans (#6006)
+### gRPC acquisition expiry, attempt spans, and sequential reuse (#6006)
 
 `functional_h1_h2_auth_lifetime_test.rs` isolates its buffered and streamed
 sender-acquisition cases from binary startup capability probes with the cold
@@ -16,6 +16,16 @@ checks pool recovery, breaker neutrality, and stable once-only expiry accounting
 both live RPCs, completes their bodies, and holds the scripted backend open
 through trace inspection. One backend accept/handshake independently proves
 reuse while strict per-attempt timing and parentage assertions remain in place.
+
+`scripted_backend_h2_tests.rs::h2_direct_pool_reuses_connection_across_requests`
+also retains one frontend H2 sender and an owned driver. It requires distinct
+frontend stream IDs, complete exact `"one"` / `"two"` gRPC bodies and success
+trailers, exactly two backend RPC records, and one backend accept/handshake.
+The script stays at `AwaitTestSignal` through inspection; completed responses
+replace the former counter-settlement sleep. Sender cleanup is joined under
+a bounded watchdog. New frontend connections may intentionally create new
+gRPC affinity shards, so separate `GrpcClient::unary` calls cannot prove this
+same-frontend reuse invariant.
 See [the hosted failures and causal evidence](grpc_qualification_6006.md).
 
 ### scripted_backend_matrix_tests.rs

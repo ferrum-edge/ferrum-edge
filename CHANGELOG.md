@@ -107,7 +107,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without a sleep-based settlement. Retain one frontend H2 connection for both
   live OTEL RPCs and prove one backend accept/handshake while preserving cold
   setup timings, genuine reuse without setup attributes, attempt parentage, and
-  three connect-failure retry spans. Production lifetime and pool semantics are
+  three connect-failure retry spans. Repair the exact-main sequential reuse
+  fixture with one owned frontend, distinct stream IDs, complete exact
+  `"one"` / `"two"` bodies and success trailers, and exactly two backend streams
+  on one accept/handshake; hold the script open through inspection and join
+  frontend cleanup under a bound. Completed responses replace its counter
+  settlement sleep. Production lifetime and pool semantics are
   unchanged. Fresh hosted qualification remains pending; see
   [the root-cause record](docs/grpc_qualification_6006.md).
 
