@@ -66,9 +66,21 @@ def load_json(data, *, limit=API_LIMIT):
     def refuse_constant(value):
         raise ValueError("nonfinite JSON constant")
 
+    def require_finite_numbers(value):
+        if isinstance(value, float):
+            require(math.isfinite(value), "nonfinite JSON number")
+        elif isinstance(value, list):
+            for item in value:
+                require_finite_numbers(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                require_finite_numbers(item)
+
     try:
-        return json.loads(data.decode("utf-8", errors="strict"), object_pairs_hook=unique,
-                          parse_constant=refuse_constant, parse_float=finite)
+        result = json.loads(data.decode("utf-8", errors="strict"), object_pairs_hook=unique,
+                            parse_constant=refuse_constant, parse_float=finite)
+        require_finite_numbers(result)
+        return result
     except (UnicodeError, RecursionError):
         raise ValueError("invalid UTF-8 or excessive JSON nesting") from None
 

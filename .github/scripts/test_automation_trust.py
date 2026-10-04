@@ -566,12 +566,31 @@ class ApprovalTests(unittest.TestCase):
 
 class JsonContractTests(unittest.TestCase):
     def test_only_strict_utf8_finite_unique_bounded_json_is_accepted(self):
-        self.assertEqual(io.load_json(b'{"number":1.5}'), {"number": 1.5})
-        for value in ("{}".encode("utf-16"), "{}".encode("utf-32"),
-                      b'{"x":"\xff"}', b'{"x":NaN}', b'{"x":Infinity}', b'{"x":-Infinity}',
-                      b'{"x":1e999}', b'{"nested":{"x":1,"x":2}}', b"[" * 2000 + b"]" * 2000,
-                      b" " * (io.API_LIMIT + 1), "{}"):
-            with self.subTest(value_type=type(value)), self.assertRaises(ValueError):
+        accepted = (("decimal", b'{"number":1.5}', {"number": 1.5}),
+                    ("finite positive exponent", b'{"number":1e300}', {"number": 1e300}),
+                    ("finite negative exponent", b'{"number":-1e300}', {"number": -1e300}),
+                    ("nested finite exponents", b'{"nested":[1e200,-1e200]}',
+                     {"nested": [1e200, -1e200]}),
+                    ("empty object", b"{}", {}))
+        for case, value, expected in accepted:
+            with self.subTest(case=case):
+                self.assertEqual(io.load_json(value), expected)
+
+        rejected = (("UTF-16", "{}".encode("utf-16")),
+                    ("UTF-32", "{}".encode("utf-32")),
+                    ("invalid UTF-8", b'{"x":"\xff"}'),
+                    ("NaN token", b'{"x":NaN}'),
+                    ("positive Infinity token", b'{"x":Infinity}'),
+                    ("negative Infinity token", b'{"x":-Infinity}'),
+                    ("positive exponent overflow", b'{"x":1e999}'),
+                    ("negative exponent overflow", b'{"x":-1e999}'),
+                    ("nested positive exponent overflow", b'{"nested":{"x":1e999}}'),
+                    ("nested negative exponent overflow", b'{"nested":[-1e999]}'),
+                    ("duplicate key", b'{"nested":{"x":1,"x":2}}'),
+                    ("excessive nesting", b"[" * 2000 + b"]" * 2000),
+                    ("oversized input", b" " * (io.API_LIMIT + 1)))
+        for case, value in rejected:
+            with self.subTest(case=case), self.assertRaises(ValueError):
                 io.load_json(value)
         for value in (float("nan"), float("inf"), float("-inf")):
             with self.assertRaises(ValueError):
