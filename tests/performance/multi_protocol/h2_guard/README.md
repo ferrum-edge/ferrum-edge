@@ -17,8 +17,10 @@ The ordinary Cargo manifests, lockfiles, vendored inventory and published
 images continue to use the existing dependency graph. `prepare.py` requires a
 GitHub-hosted Linux runner, copies the checkout into a new temporary directory,
 verifies the immutable h2 0.4.19 archive/revision, applies Ferrum's vendored
-h2 patch (`docs/upstream-h2-patches/001-coalesce-data-frame-writes/`) without
-fuzz and requires every `src/` file to match `vendor/h2-0.4.19-ferrum-patched`'s
+h2 patches (`docs/upstream-h2-patches/001-coalesce-data-frame-writes/`,
+`docs/upstream-h2-patches/002-runtime-data-frame-budget/`, and
+`docs/upstream-h2-patches/002-stream-lifetime/`) without fuzz and
+requires every `src/` file to match `vendor/h2-0.4.19-ferrum-patched`'s
 drift-manifest hash, so the observed crate is the h2 the gateway ships. It then
 verifies every observer preimage, applies the reviewed observer patch without
 fuzz, verifies postimages and injected assets, and selects the result only in
@@ -263,7 +265,8 @@ reviewed anew. Promoting a dependency repair to a shipping graph requires the
 normal dependency lifecycle inventory, retirement plan and behavioral gates;
 this diagnostic lane does not authorize that promotion.
 
-The shipped h2 source is reconstructed with patches 001 and 002 in order.
-Patch 002 retains backend stream owners through queued DATA drainage/reset;
+The shipped h2 source is reconstructed with the coalescing, runtime-budget,
+and stream-lifetime patches in that order. The stream-lifetime patch retains
+backend stream owners through queued DATA drainage/reset;
 `prepare.py` verifies the resulting source against the drift manifest before
 applying the diagnostic observer and checking `source.json` pre/postimages.

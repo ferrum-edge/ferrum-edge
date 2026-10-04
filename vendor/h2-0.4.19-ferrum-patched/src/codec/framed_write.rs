@@ -397,9 +397,7 @@ impl<T, B> FramedWrite<T, B> {
     /// across writes and an idle one holds only the initial 16 KiB.
     pub(crate) fn shrink_if_idle(&mut self) {
         let buf = self.encoder.buf.get_ref();
-        if self.encoder.next.is_none()
-            && buf.is_empty()
-            && buf.capacity() > DEFAULT_BUFFER_CAPACITY
+        if self.encoder.next.is_none() && buf.is_empty() && buf.capacity() > DEFAULT_BUFFER_CAPACITY
         {
             self.encoder.buf = Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY));
         }
@@ -409,7 +407,10 @@ impl<T, B> FramedWrite<T, B> {
     /// coalesce).
     #[cfg(test)]
     pub(crate) fn write_buf_state(&self) -> (usize, bool) {
-        (self.encoder.buf.get_ref().capacity(), self.encoder.grew_to_coalesce)
+        (
+            self.encoder.buf.get_ref().capacity(),
+            self.encoder.grew_to_coalesce,
+        )
     }
 
     pub fn get_mut(&mut self) -> &mut T {
@@ -557,12 +558,20 @@ mod ferrum_coalesce_data_frame_writes_tests {
             let (mut framed, writes) = framed(vectored);
             send_all(
                 &mut framed,
-                vec![data(1, 16_384, b'a'), data(3, 16_384, b'b'), data(1, 10_000, b'c')],
+                vec![
+                    data(1, 16_384, b'a'),
+                    data(3, 16_384, b'b'),
+                    data(1, 10_000, b'c'),
+                ],
             );
             let mut expected = wire(1, 16_384, b'a');
             expected.extend(wire(3, 16_384, b'b'));
             expected.extend(wire(1, 10_000, b'c'));
-            assert_writes(&writes.lock().unwrap(), &[expected], &format!("vectored={vectored}"));
+            assert_writes(
+                &writes.lock().unwrap(),
+                &[expected],
+                &format!("vectored={vectored}"),
+            );
         }
     }
 
@@ -574,18 +583,30 @@ mod ferrum_coalesce_data_frame_writes_tests {
         let (mut framed, writes) = framed(true);
         send_all(
             &mut framed,
-            vec![data(1, 40_000, b'a'), data(1, 40_000, b'b'), data(1, 1_000, b'c')],
+            vec![
+                data(1, 40_000, b'a'),
+                data(1, 40_000, b'b'),
+                data(1, 1_000, b'c'),
+            ],
         );
         let mut first = wire(1, 40_000, b'a');
         first.extend(wire(1, 40_000, b'b'));
-        assert_writes(&writes.lock().unwrap(), &[first, wire(1, 1_000, b'c')], "vectored");
+        assert_writes(
+            &writes.lock().unwrap(),
+            &[first, wire(1, 1_000, b'c')],
+            "vectored",
+        );
     }
 
     #[test]
     fn a_frame_larger_than_the_limit_is_chained_whole() {
         let (mut framed, writes) = framed(true);
         send_all(&mut framed, vec![data(5, 100_000, b'z')]);
-        assert_writes(&writes.lock().unwrap(), &[wire(5, 100_000, b'z')], "large frame");
+        assert_writes(
+            &writes.lock().unwrap(),
+            &[wire(5, 100_000, b'z')],
+            "large frame",
+        );
         assert!(framed.encoder.buf.get_ref().capacity() <= DEFAULT_BUFFER_CAPACITY);
     }
 
@@ -594,7 +615,10 @@ mod ferrum_coalesce_data_frame_writes_tests {
     #[test]
     fn a_grown_buffer_is_kept_across_writes_and_dropped_when_idle() {
         let (mut framed, _writes) = framed(true);
-        send_all(&mut framed, vec![data(1, 30_000, b'a'), data(3, 30_000, b'b')]);
+        send_all(
+            &mut framed,
+            vec![data(1, 30_000, b'a'), data(3, 30_000, b'b')],
+        );
         assert!(framed.encoder.buf.get_ref().is_empty());
         assert!(framed.encoder.buf.get_ref().capacity() >= COALESCE_LIMIT);
         send_all(&mut framed, vec![data(1, 1_000, b'c')]);
@@ -604,7 +628,10 @@ mod ferrum_coalesce_data_frame_writes_tests {
         framed.buffer(data(1, 30_000, b'd')).unwrap();
         let _ = framed.take_last_data_frame();
         framed.shrink_if_idle();
-        assert_eq!(framed.encoder.buf.get_ref().len(), frame::HEADER_LEN + 30_000);
+        assert_eq!(
+            framed.encoder.buf.get_ref().len(),
+            frame::HEADER_LEN + 30_000
+        );
 
         send_all(&mut framed, vec![]);
         framed.shrink_if_idle();
@@ -648,9 +675,13 @@ mod ferrum_coalesce_data_frame_writes_tests {
         let (client, mut conn) = crate::client::handshake(client_io).await.unwrap();
         let exchange = async move {
             let mut client = client.ready().await.unwrap();
-            let request = http::Request::post("https://example.com/").body(()).unwrap();
+            let request = http::Request::post("https://example.com/")
+                .body(())
+                .unwrap();
             let (response, mut stream) = client.send_request(request, false).unwrap();
-            stream.send_data(Bytes::from(vec![b'x'; 512 * 1024]), true).unwrap();
+            stream
+                .send_data(Bytes::from(vec![b'x'; 512 * 1024]), true)
+                .unwrap();
             let response = response.await.unwrap();
             assert_eq!(response.status(), http::StatusCode::OK);
             client
@@ -691,7 +722,10 @@ mod ferrum_coalesce_data_frame_writes_tests {
         let fits = COALESCE_LIMIT - frame::HEADER_LEN;
         let (mut copied, _writes) = framed(true);
         copied.buffer(data(1, fits, b'a')).unwrap();
-        assert!(copied.encoder.next.is_none(), "a frame filling the limit is copied");
+        assert!(
+            copied.encoder.next.is_none(),
+            "a frame filling the limit is copied"
+        );
         assert_eq!(copied.encoder.buf.get_ref().len(), COALESCE_LIMIT);
         assert!(copied.take_last_data_frame().is_some());
 
@@ -703,14 +737,20 @@ mod ferrum_coalesce_data_frame_writes_tests {
         );
         // Stock chaining: the head plus enough payload to reach the chain
         // threshold sit in the buffer, the rest stays in the frame.
-        assert_eq!(chained.encoder.buf.get_ref().len(), chained.encoder.chain_threshold);
+        assert_eq!(
+            chained.encoder.buf.get_ref().len(),
+            chained.encoder.chain_threshold
+        );
     }
 
     /// Without vectored I/O a chained frame still goes out whole and in order.
     #[test]
     fn a_chained_frame_without_vectored_io_is_written_whole() {
         let (mut framed, writes) = framed(false);
-        send_all(&mut framed, vec![data(1, 2_000, b'a'), data(1, 100_000, b'b')]);
+        send_all(
+            &mut framed,
+            vec![data(1, 2_000, b'a'), data(1, 100_000, b'b')],
+        );
         let joined: Vec<u8> = writes.lock().unwrap().concat();
         let mut expected = wire(1, 2_000, b'a');
         expected.extend(wire(1, 100_000, b'b'));
@@ -771,7 +811,12 @@ mod ferrum_coalesce_data_frame_writes_tests {
             data(1, 7, b'd'),
         ];
         let mut expected = Vec::new();
-        for (stream, len, fill) in [(1, 20_000, b'a'), (3, 20_000, b'b'), (5, 30_000, b'c'), (1, 7, b'd')] {
+        for (stream, len, fill) in [
+            (1, 20_000, b'a'),
+            (3, 20_000, b'b'),
+            (5, 30_000, b'c'),
+            (1, 7, b'd'),
+        ] {
             expected.extend(wire(stream, len, fill));
         }
         for f in frames {

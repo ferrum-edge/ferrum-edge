@@ -2163,6 +2163,65 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
     );
 }
 
+// hyperium/hyper#4212: an HTTP/2 peer may advertise any positive stream
+// window. Ferrum's former 1 KiB minimum-capacity patch waited forever when a
+// backend advertised 512 bytes, even though releasing each received frame
+// would have allowed the complete upload to proceed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_upload_progresses_with_512_byte_backend_stream_window() {
+    const MESSAGE_LEN: usize = 2043;
+
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+        .with_initial_window_size(512)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(&[0, 0, 0, 0, 2, b'o', b'k']),
+            end_stream: false,
+        })
+        .step(H2Step::RespondTrailers(vec![("grpc-status", "0".into())]))
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = spawn_grpc_harness(grpc_file_config(backend_port, Value::Null)).await;
+    let gateway_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gateway_port}"));
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.unary(
+            "/grpc/ferrum.Echo/Upload",
+            Bytes::from(vec![b'x'; MESSAGE_LEN]),
+        ),
+    )
+    .await
+    .expect("a legal 512-byte backend stream window must not stall the upload")
+    .expect("gateway returns a gRPC response");
+    assert_eq!(response.grpc_status(), Some(0));
+
+    let streams = backend.received_streams().await;
+    let body = &streams.first().expect("one backend stream").body;
+    assert_eq!(body.len(), MESSAGE_LEN + 5);
+    assert_eq!(body[0], 0, "gRPC compression flag");
+    assert_eq!(
+        u32::from_be_bytes(body[1..5].try_into().unwrap()),
+        MESSAGE_LEN as u32
+    );
+    assert!(body[5..].iter().all(|byte| *byte == b'x'));
+    backend.assert_no_step_errors().await;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 6b — direct-H2 buffered response body stalls are bounded by
 //            `backend_read_timeout_ms`.

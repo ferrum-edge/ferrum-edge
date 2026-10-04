@@ -1,6 +1,8 @@
+diff --git a/src/ext.rs b/src/ext.rs
+index cf383a495..d7aa9cade 100644
 --- a/src/ext.rs
 +++ b/src/ext.rs
-@@ -53,3 +53,34 @@
+@@ -53,3 +53,34 @@ impl fmt::Debug for Protocol {
          self.value.fmt(f)
      }
  }
@@ -35,9 +37,11 @@
 +        f.debug_struct("StreamLifetime").finish_non_exhaustive()
 +    }
 +}
+diff --git a/src/proto/streams/counts.rs b/src/proto/streams/counts.rs
+index f74aa14a7..e4d5fd5e4 100644
 --- a/src/proto/streams/counts.rs
 +++ b/src/proto/streams/counts.rs
-@@ -300,6 +300,12 @@
+@@ -321,6 +321,12 @@ impl Counts {
                  // Decrement the number of active streams.
                  self.dec_num_streams(&mut stream);
              }
@@ -50,9 +54,11 @@
          }
  
          // Release the stream if it requires releasing
+diff --git a/src/proto/streams/stream.rs b/src/proto/streams/stream.rs
+index 3b0ddec76..cc8e66317 100644
 --- a/src/proto/streams/stream.rs
 +++ b/src/proto/streams/stream.rs
-@@ -28,6 +28,9 @@
+@@ -28,6 +28,9 @@ pub(super) struct Stream {
      /// concurrent streams.
      pub is_counted: bool,
  
@@ -62,7 +68,7 @@
      /// Number of outstanding handles pointing to this stream
      pub ref_count: usize,
  
-@@ -163,6 +166,7 @@
+@@ -163,6 +166,7 @@ impl Stream {
              state: State::default(),
              ref_count: 0,
              is_counted: false,
@@ -70,9 +76,11 @@
  
              // ===== Fields related to sending =====
              next_pending_send: None,
+diff --git a/src/proto/streams/streams.rs b/src/proto/streams/streams.rs
+index e01dc8b48..036f1e895 100644
 --- a/src/proto/streams/streams.rs
 +++ b/src/proto/streams/streams.rs
-@@ -273,6 +273,8 @@
+@@ -275,6 +275,8 @@ where
          use http::Method;
  
          let protocol = request.extensions_mut().remove::<Protocol>();
@@ -81,12 +89,12 @@
  
          // Clear before taking lock, incase extensions contain a StreamRef.
          request.extensions_mut().clear();
-@@ -315,6 +317,8 @@
-             me.actions.send.init_window_sz(),
+@@ -318,6 +320,8 @@ where
              me.actions.recv.init_window_sz(),
          );
-+
-+        stream.lifetime = lifetime;
  
++        stream.lifetime = lifetime;
++
          if *request.method() == Method::HEAD {
              stream.content_length = ContentLength::Head;
+         }

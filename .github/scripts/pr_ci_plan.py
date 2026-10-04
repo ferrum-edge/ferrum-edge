@@ -552,7 +552,8 @@ FULL_CI_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 # `dependency-audit` job) must keep its `mode == 'full'` guard — that is
 # asserted by .github/scripts/verify_required_ci.py's DIRECT_FULL_CI_JOBS — so a
 # governance-doc-only pull request would otherwise skip the only check that
-# guards these files. They schedule no expensive path-gated suite.
+# guards these files. Hyper artifact changes also reconstruct the pinned patch
+# stack in that job without requiring Rust test artifacts.
 FULL_CI_GOVERNANCE_PATHS = frozenset(
     {
         "docs/dependency-policy.md",
@@ -938,11 +939,12 @@ VENDOR_PATCH_PATTERNS = [
 ]
 
 # `run_dependency_audit`: cargo-deny plus the vendored-patch lifecycle and
-# advisory-expiry gates it hosts.
+# advisory-expiry gates and pinned Hyper patch reconstruction it hosts.
 DEPENDENCY_AUDIT_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         r"^\.github/workflows/ci\.yml$",
+        r"^\.github/scripts/verify_hyper_patch_stack\.py$",
         r"^Cargo\.(?:toml|lock)$",
         # Standalone workspaces (fuzz/, tests/performance/**, ...) carry their
         # own lockfiles, which the job audits through the manifest inventory.
@@ -1731,6 +1733,29 @@ def self_test() -> int:
             "pull_request",
             ["docs/vendored-patch-lifecycle.json", "docs/dependency-policy.md"],
             {"run_dependency_audit": True, "run_rust": False},
+        ),
+        (
+            "pull_request",
+            [
+                "docs/upstream-hyper-patches/002-min-data-frame-capacity/"
+                "hyper-min-data-frame-capacity.patch"
+            ],
+            {
+                "run_dependency_audit": True,
+                "run_vendor_patches": False,
+                "run_artifacts": False,
+                "run_rust": False,
+            },
+        ),
+        (
+            "pull_request",
+            [".github/scripts/verify_hyper_patch_stack.py"],
+            {
+                "run_dependency_audit": True,
+                "run_vendor_patches": False,
+                "run_artifacts": False,
+                "run_rust": False,
+            },
         ),
         (
             "pull_request",

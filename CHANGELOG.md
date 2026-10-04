@@ -108,6 +108,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The required Redis-backed CI gate exercises plugin admission, quarantine races, and bounded
   transfer regressions.
 
+- **HTTP/2 and gRPC uploads progress through small legal backend windows**
+  (#6001). The vendored Hyper body pipe previously waited for at least 1 KiB
+  of send capacity, so a backend advertising a 512-byte stream window could
+  receive headers but no body bytes before timeout. A pending non-empty chunk
+  now progresses whenever any capacity is assigned, including the final byte
+  of connection capacity; an empty end-of-stream chunk needs none. The existing
+  request-body write-stall bound still applies while a ready chunk cannot be
+  written, without treating a slow client as a backend write stall.
+- **Adaptive HTTP/2 receive windows keep their automatic small-DATA-frame
+  budget in sync** (#6001; hyperium/h2#965). The budget now follows runtime
+  target connection-window changes, preventing valid small DATA frames within
+  a grown advertised window from exhausting the initial budget and closing the
+  connection with `ENHANCE_YOUR_CALM`. Explicit budgets and outstanding framing
+  charges are preserved, including across window shrinkage. The lifetime limit
+  for empty non-final DATA frames is unchanged.
+
 - **gRPC shard affinity now accounts for cancelled creates and unfinished
   uploads** (#5991). Failed or cancelled physical shard creates record one
   cooldown before waiting callers elect another creator; those callers borrow

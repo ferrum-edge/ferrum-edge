@@ -52,6 +52,14 @@
         "reqwest-003-connection-admission-hook",
         "reqwest-004-connection-established-fd"
       ]
+    },
+    {
+      "id": "hyper-h2-body-progress-and-timeout",
+      "description": "Hyper patch 004 depends on patch 002's pending-body implementation. Retire both together after adopting an equivalent write-stall bound that preserves positive-capacity progress, or moving the HTTP/2 client off Hyper.",
+      "patch_ids": [
+        "hyper-002-min-data-frame-capacity",
+        "hyper-004-h2-body-write-timeout"
+      ]
     }
   ],
   "patches": [
@@ -759,32 +767,33 @@
     },
     {
       "id": "hyper-002-min-data-frame-capacity",
-      "label": "hyper HTTP/2 body pipe waits for useful send capacity",
+      "label": "hyper HTTP/2 body pipe preserves progress for every positive window",
       "crate": "hyper",
       "vendored_version": "1.9.0",
       "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
       "docs_path": "docs/upstream-hyper-patches/002-min-data-frame-capacity/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "hyper's HTTP/2 body pipe handed a chunk to h2 while the stream held only its 1-byte claim, so on a nearly spent connection window a request body left as 1-byte DATA frames; h2 >= 0.4.16 peers GOAWAY(ENHANCE_YOUR_CALM, too_many_data_frames) the connection, failing every stream on it (#5588).",
+      "reason": "The original 1 KiB minimum-capacity patch could deadlock a legal 512-byte peer stream window; Ferrum Edge 0.9.10 reproduced the failure with headers received but zero body bytes before timeout. The pending-body path used by the HTTP/2 write-timeout extension must preserve Hyper's invariant that every positive amount of assigned flow-control capacity permits progress.",
       "upstream": {
-        "filing": "filed",
+        "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/hyper",
-        "pr_number": 4212,
+        "pr_number": null,
         "issue_number": 4211,
         "fork_ref": null
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "A hyper release containing hyperium/hyper#4212 (or another fix that stops cutting a chunk into sub-1 KiB frames from a sliver of capacity) is adopted.",
-        "co_retirement_group": null,
+        "trigger": "Retire Hyper patches 002 and 004 together when Ferrum adopts an equivalent upstream per-request HTTP/2 body write-stall bound preserving progress at every positive assigned capacity, or its HTTP/2 client moves off Hyper; hosted small-window, final-connection-byte, empty-EOS and write-stall regressions must pass against the replacement.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
         "compatible_release_test": {
           "status": "not_started",
-          "notes": null
+          "notes": "No compatible replacement release is selected or tested. Hyper #4212 closed unmerged on 2026-10-04 at 08:45:54 UTC and is historical context, not a release prerequisite."
         }
       },
       "regression_tests": [
-        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_min_data_frame_capacity_tests)"
+        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_h2_flow_control_progress_tests)",
+        "tests/functional/scripted_backend_h2_tests.rs (grpc_upload_progresses_with_512_byte_backend_stream_window)"
       ]
     },
     {
@@ -836,11 +845,11 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "hyper offers an equivalent per-request bound on HTTP/2 request body write stalls, or Ferrum's HTTP/2 client moves off hyper.",
-        "co_retirement_group": null,
+        "trigger": "Retire Hyper patches 002 and 004 together when Ferrum adopts an equivalent upstream per-request HTTP/2 body write-stall bound preserving progress at every positive assigned capacity, or its HTTP/2 client moves off Hyper; hosted small-window, final-connection-byte, empty-EOS and write-stall regressions must pass against the replacement.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
         "compatible_release_test": {
           "status": "not_started",
-          "notes": null
+          "notes": "No compatible replacement release is selected or tested. Hyper #4212 closed unmerged on 2026-10-04 at 08:45:54 UTC and is historical context, not a release prerequisite."
         }
       },
       "regression_tests": [
@@ -867,7 +876,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. Patch 002 must also retire before removing the vendored crate.",
+        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The runtime-budget and stream-lifetime patches must also retire before removing the vendored crate.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
@@ -879,6 +888,37 @@
       ]
     },
     {
+      "id": "h2-002-runtime-data-frame-budget",
+      "label": "h2 automatic DATA frame budget tracks runtime target windows",
+      "crate": "h2",
+      "vendored_version": "0.4.19",
+      "vendor_path": "vendor/h2-0.4.19-ferrum-patched",
+      "docs_path": "docs/upstream-h2-patches/002-runtime-data-frame-budget/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Adaptive flow control can change the target connection window after setup, but h2 resolved its automatic small-DATA-frame budget only from the initial target. A grown advertised window could therefore reject valid small DATA frames with ENHANCE_YOUR_CALM. The automatic budget now follows every target-window change while explicit budgets and outstanding charges remain intact.",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "hyperium/h2",
+        "pr_number": 965,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "An h2 release containing hyperium/h2#965 (or an equivalent runtime automatic-budget update) is adopted.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/h2-0.4.19-ferrum-patched (proto::streams::counts budget tests)",
+        "tests/functional/scripted_backend_h2_tests.rs (grpc_upload_progresses_with_512_byte_backend_stream_window)"
+      ]
+    },
+    {
       "id": "h2-002-stream-lifetime",
       "label": "h2 retains an owned client-stream lifetime through queued DATA drain/reset",
       "crate": "h2",
@@ -887,7 +927,7 @@
       "docs_path": "docs/upstream-h2-patches/002-stream-lifetime/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
-      "reason": "Hyper drops a final DATA source after acquiring only 1 KiB capacity while h2 still owns blocked bytes; source Drop and early terminal responses prematurely released frontend affinity. StreamLifetime retains one shared owner at the actual h2 concurrent-stream drain/reset boundary for all gRPC body representations and retry attempts (#5991, #5588).",
+      "reason": "Hyper can drop a final DATA source after acquiring only partial flow-control capacity while h2 still owns blocked bytes; source Drop and early terminal responses prematurely released frontend affinity. StreamLifetime retains one shared owner at the actual h2 concurrent-stream drain/reset boundary for all gRPC body representations and retry attempts (#5991, #5588).",
       "upstream": {
         "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/h2",

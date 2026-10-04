@@ -1,6 +1,5 @@
 diff --git a/src/ext/h2_body_write_timeout.rs b/src/ext/h2_body_write_timeout.rs
 new file mode 100644
-index 000000000..0ec3797dc
 --- /dev/null
 +++ b/src/ext/h2_body_write_timeout.rs
 @@ -0,0 +1,55 @@
@@ -60,26 +59,24 @@ index 000000000..0ec3797dc
 +    }
 +}
 diff --git a/src/ext/mod.rs b/src/ext/mod.rs
-index b59d809de..dee9f10d9 100644
 --- a/src/ext/mod.rs
 +++ b/src/ext/mod.rs
-@@ -54,6 +54,11 @@ mod h1_reason_phrase;
+@@ -53,6 +53,11 @@
+ mod h1_reason_phrase;
  #[cfg(any(feature = "http1", feature = "ffi"))]
  pub use h1_reason_phrase::ReasonPhrase;
- 
++
 +#[cfg(feature = "http2")]
 +mod h2_body_write_timeout;
 +#[cfg(feature = "http2")]
 +pub use h2_body_write_timeout::Http2BodyWriteTimeout;
-+
+ 
  #[cfg(all(feature = "http1", feature = "client"))]
  mod informational;
- #[cfg(all(feature = "http1", feature = "client"))]
 diff --git a/src/proto/h2/client.rs b/src/proto/h2/client.rs
-index bf154e458..bdabd4e5d 100644
 --- a/src/proto/h2/client.rs
 +++ b/src/proto/h2/client.rs
-@@ -172,7 +172,7 @@ where
+@@ -172,7 +172,7 @@
  
      let (conn, ping) = if ping_config.is_enabled() {
          let pp = conn.ping_pong().expect("conn.ping_pong");
@@ -88,7 +85,7 @@ index bf154e458..bdabd4e5d 100644
  
          let conn: Conn<_, B> = Conn::new(ponger, conn);
          (Either::left(conn), recorder)
-@@ -190,6 +190,7 @@ where
+@@ -190,6 +190,7 @@
  
      Ok(ClientTask {
          ping,
@@ -96,7 +93,7 @@ index bf154e458..bdabd4e5d 100644
          conn_drop_ref,
          conn_eof,
          executor: exec,
-@@ -413,6 +414,8 @@ where
+@@ -413,6 +414,8 @@
      body_tx: SendStream<SendBuf<B::Data>>,
      body: B,
      cb: Callback<Request<B>, Response<IncomingBody>>,
@@ -105,7 +102,7 @@ index bf154e458..bdabd4e5d 100644
  }
  
  impl<B: Body> Unpin for FutCtx<B> {}
-@@ -423,6 +426,9 @@ where
+@@ -423,6 +426,9 @@
      E: Unpin,
  {
      ping: ping::Recorder,
@@ -115,7 +112,7 @@ index bf154e458..bdabd4e5d 100644
      conn_drop_ref: ConnDropRef,
      conn_eof: ConnEof,
      executor: E,
-@@ -528,6 +534,12 @@ where
+@@ -528,6 +534,12 @@
          let send_stream = if !f.is_connect {
              if !f.eos {
                  let mut pipe = PipeToSendStream::new(f.body, f.body_tx);
@@ -128,7 +125,7 @@ index bf154e458..bdabd4e5d 100644
  
                  // eagerly see if the body pipe is ready and
                  // can thus skip allocating in the executor
-@@ -727,6 +739,23 @@ where
+@@ -727,6 +739,23 @@
                          req.extensions_mut().insert(protocol.into_inner());
                      }
  
@@ -152,7 +149,7 @@ index bf154e458..bdabd4e5d 100644
                      let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
                          Ok(ok) => ok,
                          Err(err) => {
-@@ -746,6 +775,7 @@ where
+@@ -746,6 +775,7 @@
                          body_tx,
                          body,
                          cb,
@@ -161,10 +158,9 @@ index bf154e458..bdabd4e5d 100644
  
                      // Check poll_ready() again.
 diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
-index 9292b3524..2d1ecaac0 100644
 --- a/src/proto/h2/mod.rs
 +++ b/src/proto/h2/mod.rs
-@@ -91,11 +91,83 @@ pin_project! {
+@@ -91,8 +91,80 @@
          // FERRUM PATCH 002: a polled DATA chunk (and its end-of-stream flag)
          // waiting for enough assigned capacity to avoid a sliver frame.
          pending_data: Option<(S::Data, bool)>,
@@ -173,9 +169,9 @@ index 9292b3524..2d1ecaac0 100644
 +        write_timeout: Option<WriteTimeout>,
          #[pin]
          stream: S,
-     }
- }
- 
++    }
++}
++
 +/// FERRUM PATCH 004: the running state of an `Http2BodyWriteTimeout`.
 +///
 +/// A window-limited upload stalls many times per request (each wait for a
@@ -242,33 +238,28 @@ index 9292b3524..2d1ecaac0 100644
 +    /// A chunk was handed to h2: the stall, if any, is over.
 +    fn progressed(&mut self) {
 +        self.stalled_since = None;
-+    }
-+}
-+
- /// FERRUM PATCH 002: smallest DATA frame worth cutting while more of the
- /// chunk is still waiting for capacity. h2 cuts a frame from whatever capacity
- /// a stream holds, so on a connection whose window is nearly spent a chunk can
-@@ -115,10 +187,18 @@ where
+     }
+ }
+ 
+@@ -105,8 +177,16 @@
              body_tx: tx,
              data_done: false,
              pending_data: None,
 +            write_timeout: None,
              stream,
          }
-     }
- 
++    }
++
 +    /// FERRUM PATCH 004: bound how long a polled chunk may wait to be written.
 +    #[cfg(feature = "client")]
 +    pub(crate) fn with_write_timeout(mut self, write_timeout: WriteTimeout) -> Self {
 +        self.write_timeout = Some(write_timeout);
 +        self
-+    }
-+
+     }
+ 
      #[cfg(feature = "client")]
-     fn send_reset(self: Pin<&mut Self>, reason: h2::Reason) {
-         self.project().body_tx.send_reset(reason);
-@@ -143,6 +223,18 @@ where
-                 while me.body_tx.capacity() < needed {
+@@ -133,6 +213,18 @@
+                 while chunk.has_remaining() && me.body_tx.capacity() == 0 {
                      match me.body_tx.poll_capacity(cx) {
                          Poll::Pending => {
 +                            // FERRUM PATCH 004: a ready chunk that cannot be
@@ -286,7 +277,7 @@ index 9292b3524..2d1ecaac0 100644
                              *me.pending_data = Some((chunk, is_eos));
                              return Poll::Pending;
                          }
-@@ -160,6 +252,9 @@ where
+@@ -150,6 +242,9 @@
                  me.body_tx
                      .send_data(SendBuf::Buf(chunk), is_eos)
                      .map_err(crate::Error::new_body_write)?;
@@ -296,7 +287,7 @@ index 9292b3524..2d1ecaac0 100644
                  if is_eos {
                      return Poll::Ready(Ok(()));
                  }
-@@ -171,7 +266,11 @@ where
+@@ -161,7 +256,11 @@
              // for the actual body chunk.
              me.body_tx.reserve_capacity(1);
  
@@ -309,8 +300,8 @@ index 9292b3524..2d1ecaac0 100644
                  loop {
                      match ready!(me.body_tx.poll_capacity(cx)) {
                          Some(Ok(0)) => {}
-@@ -403,3 +502,279 @@ mod ferrum_min_data_frame_capacity_tests {
-         );
+@@ -434,3 +533,279 @@
+         assert_eq!(first_b, 1);
      }
  }
 +
