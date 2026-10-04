@@ -122,10 +122,12 @@ def verify(archive: Path, evidence: Path) -> None:
         if provenance["git"]["sha1"] != UPSTREAM_REVISION:
             raise ValueError("Hyper crate VCS revision differs from the pinned source")
         for name in SERIES:
-            patch = DOCS / name
-            patch_hashes[name] = sha256(patch.read_bytes())
+            patch_bytes = (DOCS / name).read_bytes()
+            patch_hashes[name] = sha256(patch_bytes)
+            # Keep argv literal for trusted policy inspection; stdin is patch data.
             subprocess.run(
-                ["git", "apply", "--verbose", "--whitespace=nowarn", str(patch)],
+                ["git", "apply", "--verbose", "--whitespace=nowarn", "-"],
+                input=patch_bytes,
                 cwd=reconstructed,
                 check=True,
             )
@@ -196,19 +198,40 @@ class VerificationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 compare_source(reconstructed, vendor, expected)
 
+    def test_ordered_patches_apply_from_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+            (root / "src/mod.rs").write_bytes(b"upstream\n")
+            for patch_bytes in (
+                b"--- a/src/mod.rs\n+++ b/src/mod.rs\n@@ -1 +1 @@\n-upstream\n+pending_data\n",
+                b"--- a/src/mod.rs\n+++ b/src/mod.rs\n@@ -1 +1 @@\n-pending_data\n+progress\n",
+            ):
+                subprocess.run(
+                    ["git", "apply", "--verbose", "--whitespace=nowarn", "-"],
+                    input=patch_bytes,
+                    cwd=root,
+                    capture_output=True,
+                    check=True,
+                )
+            self.assertEqual((root / "src/mod.rs").read_bytes(), b"progress\n")
+
     def test_incremental_patch_cannot_apply_to_upstream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "src").mkdir()
             (root / "src/mod.rs").write_text("upstream\n")
-            patch = root / "incremental.patch"
-            patch.write_text(
-                "--- a/src/mod.rs\n+++ b/src/mod.rs\n@@ -1 +1 @@\n-pending_data\n+progress\n"
+            patch_bytes = (
+                b"--- a/src/mod.rs\n+++ b/src/mod.rs\n@@ -1 +1 @@\n-pending_data\n+progress\n"
             )
-            result = subprocess.run(
-                ["git", "apply", str(patch)], cwd=root, capture_output=True, check=False
-            )
-            self.assertNotEqual(result.returncode, 0)
+            with self.assertRaises(subprocess.CalledProcessError):
+                subprocess.run(
+                    ["git", "apply", "--verbose", "--whitespace=nowarn", "-"],
+                    input=patch_bytes,
+                    cwd=root,
+                    capture_output=True,
+                    check=True,
+                )
             self.assertEqual((root / "src/mod.rs").read_text(), "upstream\n")
 
 
