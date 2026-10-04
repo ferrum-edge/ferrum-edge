@@ -147,7 +147,7 @@ production volumes.
 ## Hosted qualification and separate guarded dependency
 
 The added optional `.github/workflows/compose-fixture-qualification.yml`
-executes `tests/scripts/qualify_compose_fixtures.py` on an Ubuntu hosted runner,
+executes `scripts/qualify_compose_fixtures.py` on an Ubuntu hosted runner,
 with `contents: read`, no retained checkout credentials, no secret inputs,
 no release operations, and a 15-minute job limit. The qualification command
 has a 10-minute deadline, each subprocess has a deadline, profile startup uses
@@ -168,6 +168,42 @@ plaintext, missing-client, and untrusted-client negative controls; mTLS
 positives; healthcheck, live SQL/Docker argv and container-log secret scans;
 and private-directory cleanup. An expected TLS/auth diagnostic is required for
 negative controls: a timeout alone is not a passing rejection.
+
+The canonical frozen checker at
+`.github/scripts/verify_cross_build_policy.py` lists `.github/scripts/`,
+`comparison/`, `scripts/`, `tests/k8s/`, and `tests/performance/` in
+`APPROVED_AUTOMATION_ROOTS`; `tests/scripts/` is excluded. Both workflow root
+commands now name the `scripts/` implementations directly. The qualifier's
+two subprocess call sites use a literal `bash scripts/compose_fixture_command.sh`
+argument list. That dispatcher enumerates the Compose, Docker SQL, Mongo, and
+OpenSSL operations with literal executable names and literal setup/cleanup
+script edges. Operation selectors, paths, SQL queries, and connection settings
+are quoted environment data; no input is evaluated as shell source or selected
+as an executable. Unknown selectors fail. This makes the implementation and
+its transitive command graph available to the existing scan without changing
+the checker, digests, guarded CI bindings, or either required trust check.
+
+The released `tests/scripts/setup_db_tls.sh` path remains only a manual
+forwarder to the full `scripts/setup_db_tls.sh` implementation: the five SQL
+cells still name it in their setup diagnostics. Its retention preserves that
+entrypoint, not their historical password behavior. No workflow executes the
+forwarder. The unreleased `tests/scripts/qualify_compose_fixtures.py` path is
+removed.
+
+Current candidate source inventory (replace the earlier seven-file inventory
+when recording exact-head qualification/review evidence):
+
+| File | Role |
+| --- | --- |
+| `docker-compose.yml` | Default/profile Mongo startup boundary |
+| `docker-compose.tls-test.yml` | Loopback SQL, private mounts, verified readiness |
+| `scripts/setup_db_tls.sh` | Full SQL generation, startup, ownership and cleanup implementation |
+| `scripts/qualify_compose_fixtures.py` | Hosted assertions, private capture, bounded diagnostic admission |
+| `scripts/compose_fixture_command.sh` | Explicit command graph for all qualifier subprocesses |
+| `tests/scripts/setup_db_tls.sh` | Released manual entrypoint forwarder |
+| `.github/workflows/compose-fixture-qualification.yml` | Hosted qualification and unconditional cleanup roots |
+| `docs/database_tls.md` | Setup/cleanup usage and consumer dependency |
+| `docs/security/compose-fixture-security-proposal.md` | Scope, source inventory, evidence and owner decision |
 
 Published index identities read from Docker Hub on 2026-10-04 (availability,
 not runtime qualification):
@@ -259,26 +295,69 @@ The independent review recorded no other static blocker across the seven-file
 proposal. Cleanup completed, but the live SQL argv/log credential scan was not
 reached. This failed run is not qualification approval.
 
-Static diagnosis points to `mysql-untrusted-client-default`: MySQL's
+The [second hosted qualification](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37196574213/job/111419615974)
+for `827f328d70d621e60cb0f5fd92f6ecc6718f8322` identifies the failure as
+`mysql-untrusted-client-default`. Ordinary verified TLS wrong-CA, hostname and
+plaintext negatives passed, as did PostgreSQL missing/untrusted client and
+MySQL missing-client controls. The trusted MySQL TLS 1.2 query and the paired
+`mysql-untrusted-client-tls12` certificate-alert negative passed. The default
+rogue-client attempt failed, but its stderr matched neither the TLS/auth
+substrings nor the two narrowly allowed error-2013 messages. Raw stderr was
+not retained. The later default positive and live argv/log scan were not
+reached; cleanup ran. This remains failed qualification, not proof of the
+default rejection's cause.
+
+The [required trusted policy check](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37196573281/job/111419613381)
+and [CI policy check](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37196574202/job/111419819039)
+also rejected both `tests/scripts/` workflow commands as outside their scanned
+automation roots. The relocation and explicit dispatcher above address that
+demonstrated reachability failure. Their acceptance is still unverified until
+the unchanged hosted checkers inspect the new exact head.
+
+MySQL's
 [`sslaccept`/X509 path](https://github.com/mysql/mysql-server/blob/8.0/sql/auth/sql_authentication.cc)
 drops invalid client certificates during the handshake. In TLS 1.3,
 [`SSL_connect` can finish before the server verifies the client](https://mta.openssl.org/pipermail/openssl-users/2022-October/015568.html);
 the MySQL [client read path](https://github.com/mysql/mysql-server/blob/8.0/sql-common/client.cc)
 can then report `ERROR 2013 (HY000)` while reading the authorization packet or
 final connect information, rather than `SSL connection error`/`Access denied`.
-The old helper accepted only the latter diagnostics. The precise historical
-stderr was withheld, so this attribution is a source-based inference, not an
-observed case/message from that run.
+The precise historical stderr was withheld, so this remains a possible
+source-based explanation, not an observed diagnostic from either run. The
+second run disproved assuming the two existing exact error-2013 patterns were
+sufficient. No additional error-2013 variant is admitted on that assumption.
 
 The repair names every negative case using fixed, credential-free labels and
-keeps subprocess output private. The untrusted MySQL client must still fail on
-the default protocol. The two exact late-read error-2013 messages with system
-error 0 are admitted only after the same rogue certificate/key produces a
-certificate-specific TLS 1.2 alert, alongside a trusted TLS 1.2 SQL positive.
-A trusted default-protocol SQL positive follows the rejection. A disconnect,
-timeout, unsupported TLS version, or arbitrary error alone cannot pass this
-paired control. Other negative checks keep their TLS/authentication diagnostics.
-The server's allowed protocols and ordinary/default client options are unchanged.
+keeps subprocess output private. For MySQL it extracts only a four-digit numeric
+error and a fixed diagnostic category from a bounded, single-error record;
+it emits neither SQLSTATE nor any message, argv, password, certificate/key
+material, user/host, or path. Certificate-specific TLS alerts, authentication
+rejection, the two exact late-auth-read error-2013/HY000 messages with system
+error 0, other late-read system errors, initial-handshake disconnects, and
+unclassified failures remain distinct. A connection reset is classified for
+diagnosis but is not newly admitted. Generic SSL errors (including local
+material failures/unsupported protocols), unknown errors, ambiguous/missing
+records and timeouts cannot pass the default rogue-client control.
+
+The untrusted MySQL client must still actually fail on the default protocol.
+Only the existing two exact late-read error-2013 messages, a certificate-specific
+TLS alert, or error-1045 authentication rejection can satisfy that negative,
+after the same rogue certificate/key produces a certificate-specific TLS 1.2
+alert alongside a trusted TLS 1.2 SQL positive. A trusted default-protocol
+`SELECT 1` now runs after the rogue attempt even if its diagnostic is unknown;
+that positive cannot convert an unknown negative to a pass. Hosted classifier
+self-checks cover allowed messages, a nonzero system error, altered SQLSTATE,
+trailing text, unsupported protocols, missing local material, connection
+failure, multiple errors, and oversized output. Other negative checks retain
+their TLS/authentication diagnostics. The server's allowed protocols and
+ordinary/default client options are unchanged.
+
+**Focused re-review required:** the new diagnostic/admission code, post-attempt
+positive in `finally`, command/environment boundary, dispatcher operation
+inventory, moved setup root calculation, and retained manual forwarder were
+not in the prior immutable `827f328d7` review input. Root must review these
+changes against the new exact head and confirm that all original controls and
+both hosted trust contracts remain effective. The actual default-case proof
+must remain failed until its permitted diagnostic is observed and identified.
 
 **The repaired head still requires a fresh complete hosted run.** Root must
 record its exact SHA and checkout/merge-tree identity, run URL/result, all

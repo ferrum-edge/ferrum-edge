@@ -536,10 +536,14 @@ seven-day certificates in a newly created directory. It refuses an existing
 directory or container instead of replacing it. Its default directory remains
 `/tmp/ferrum-db-tls-certs`; pass another absolute path with an existing parent
 to isolate the material. Do not use a shared directory or real database data.
+The implementation now lives in `scripts/setup_db_tls.sh`, inside the frozen
+checker's scanned automation roots. The released `tests/scripts/setup_db_tls.sh`
+path remains a manual forwarding entrypoint for the five existing SQL cells;
+the qualification workflow calls the `scripts/` implementation directly.
 
 ```bash
 # Generate certificates and start TLS-enabled PostgreSQL/MySQL containers
-./tests/scripts/setup_db_tls.sh
+./scripts/setup_db_tls.sh
 
 # MongoDB TLS/mTLS fixtures are owned by hosted data-plane CI. Local Mongo TLS
 # cells skip unless FERRUM_TEST_MONGO_CERT_DIR / 27018 / 27019 are already present.
@@ -642,7 +646,7 @@ Each test performs a complete CRUD cycle:
 
 ```bash
 # Stop and remove the PostgreSQL/MySQL TLS test containers
-./tests/scripts/setup_db_tls.sh --cleanup
+./scripts/setup_db_tls.sh --cleanup
 ```
 
 Pass the same custom directory after `--cleanup` if one was used at setup.

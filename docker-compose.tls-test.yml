@@ -1,4 +1,4 @@
-# Disposable fixtures only. Generate private material with tests/scripts/setup_db_tls.sh.
+# Disposable fixtures only. Generate private material with scripts/setup_db_tls.sh.
 # CERTS_DIR must be an absolute path; direct Compose use needs the same file layout.
 services:
   postgres-tls:

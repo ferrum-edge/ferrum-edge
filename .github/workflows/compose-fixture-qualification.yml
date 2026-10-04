@@ -7,7 +7,9 @@ on:
       - docker-compose.yml
       - docker-compose.tls-test.yml
       - tests/scripts/setup_db_tls.sh
-      - tests/scripts/qualify_compose_fixtures.py
+      - scripts/setup_db_tls.sh
+      - scripts/compose_fixture_command.sh
+      - scripts/qualify_compose_fixtures.py
       - docs/database_tls.md
       - docs/security/compose-fixture-security-proposal.md
       - .github/workflows/compose-fixture-qualification.yml
@@ -29,7 +31,7 @@ jobs:
         run: |
           set +x
           set -euo pipefail
-          timeout --kill-after=15s 10m python3 tests/scripts/qualify_compose_fixtures.py
+          timeout --kill-after=15s 10m python3 scripts/qualify_compose_fixtures.py
       - name: Remove any remaining owned fixtures
         if: always()
         run: |
@@ -39,7 +41,7 @@ jobs:
             | xargs -r timeout 60s docker rm -fv >/dev/null
           fixture_dir="${RUNNER_TEMP}/compose-fixture-qualification/sql"
           if [ -f "$fixture_dir/.fixture-owned" ]; then
-            timeout --kill-after=5s 60s bash tests/scripts/setup_db_tls.sh --cleanup "$fixture_dir"
+            timeout --kill-after=5s 60s bash scripts/setup_db_tls.sh --cleanup "$fixture_dir"
           fi
           timeout 30s docker volume ls -q --filter label=com.docker.compose.project=ferrum-fixture-qualification \
             | xargs -r timeout 60s docker volume rm >/dev/null

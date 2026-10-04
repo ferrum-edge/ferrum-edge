@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import secrets
 import signal
 import socket
@@ -32,10 +33,27 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def run(args, *, env=None, timeout=30, check=True, input=None):
+def request(operation, **fields):
+    return operation, fields
+
+
+def command_env(command, env):
+    operation, fields = command
+    result = dict(os.environ if env is None else env)
+    # Do not inherit operation/data selectors from the surrounding runner.
+    for key in tuple(result):
+        if key.startswith("FIXTURE_"):
+            del result[key]
+    result["FIXTURE_OPERATION"] = operation
+    result.update({"FIXTURE_" + key.upper(): str(value) for key, value in fields.items()})
+    return result
+
+
+def run(command, *, env=None, timeout=30, check=True):
     try:
         result = subprocess.run(
-            args, env=env, input=input, capture_output=True, text=True, timeout=timeout
+            ["bash", "scripts/compose_fixture_command.sh"],
+            env=command_env(command, env), capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("Fixture command exceeded its deadline") from None
@@ -45,19 +63,125 @@ def run(args, *, env=None, timeout=30, check=True, input=None):
 
 
 def inspect(name):
-    return json.loads(run(["docker", "inspect", name]).stdout)[0]
+    return json.loads(run(request("inspect", container=name)).stdout)[0]
 
 
-def refused(args, *, case, env=None, reasons):
+def mysql_failure(stderr):
+    # Only a bounded numeric code and a fixed category may leave this function.
+    # Retain neither the raw message nor SQLSTATE, user/host, paths or key bytes.
+    if len(stderr) > 8192:
+        return None, "oversized-diagnostic"
+    errors = [line for line in stderr.splitlines() if line.startswith("ERROR ")]
+    if len(errors) != 1:
+        return None, "missing-or-multiple-errors"
+    match = re.fullmatch(r"ERROR ([0-9]{4}) \(([A-Z0-9]{5})\): (.+)", errors[0])
+    if match is None:
+        return None, "unrecognized-error-header"
+    code = int(match.group(1))
+    sqlstate = match.group(2)
+    message = match.group(3)
+    if code == 2026 and message.startswith("SSL connection error: "):
+        for alert, category in (
+            ("alert unknown ca", "tls-alert-unknown-ca"),
+            ("alert bad certificate", "tls-alert-bad-certificate"),
+            ("alert certificate unknown", "tls-alert-certificate-unknown"),
+        ):
+            if alert in message.lower():
+                return code, category
+        return code, "tls-connection-error"
+    if code == 1045 and message.startswith("Access denied for user "):
+        return code, "authentication-rejected"
+    if code == 3159 and message == (
+        "Connections using insecure transport are prohibited while --require_secure_transport=ON."
+    ):
+        return code, "secure-transport-required"
+    if code == 2013 and sqlstate == "HY000":
+        late_read = re.fullmatch(
+            r"Lost connection to MySQL server at 'reading "
+            r"(?:authorization packet|final connect information)', system error: ([0-9]+)",
+            message,
+        )
+        if late_read is not None:
+            if late_read.group(1) == "0":
+                return code, "late-auth-read-zero"
+            if late_read.group(1) == "104":
+                return code, "late-auth-read-connection-reset"
+            return code, "late-auth-read-other-system-error"
+        if message.startswith(
+            "Lost connection to MySQL server at 'reading initial communication packet'"
+        ):
+            return code, "initial-handshake-read-disconnect"
+    return code, "unclassified"
+
+
+MYSQL_CERTIFICATE_ALERTS = (
+    (2026, "tls-alert-unknown-ca"),
+    (2026, "tls-alert-bad-certificate"),
+    (2026, "tls-alert-certificate-unknown"),
+)
+MYSQL_DEFAULT_REJECTIONS = MYSQL_CERTIFICATE_ALERTS + (
+    (1045, "authentication-rejected"),
+    (2013, "late-auth-read-zero"),
+)
+
+
+def check_mysql_classifier():
+    late_read = (
+        "ERROR 2013 (HY000): Lost connection to MySQL server at "
+        "'reading authorization packet', system error: "
+    )
+    cases = (
+        ("ERROR 2026 (HY000): SSL connection error: tlsv1 alert unknown ca",
+         (2026, "tls-alert-unknown-ca"), True),
+        ("ERROR 1045 (28000): Access denied for user 'private-user'@'private-host'",
+         (1045, "authentication-rejected"), True),
+        (late_read + "0", (2013, "late-auth-read-zero"), True),
+        (late_read.replace("authorization packet", "final connect information") + "0",
+         (2013, "late-auth-read-zero"), True),
+        (late_read + "104", (2013, "late-auth-read-connection-reset"), False),
+        (late_read + "1", (2013, "late-auth-read-other-system-error"), False),
+        (late_read + "0 trailing text", (2013, "unclassified"), False),
+        (late_read.replace("HY000", "HY001") + "0", (2013, "unclassified"), False),
+        ("ERROR 2013 (HY000): Lost connection to MySQL server at "
+         "'reading initial communication packet', system error: 0",
+         (2013, "initial-handshake-read-disconnect"), False),
+        ("ERROR 2026 (HY000): SSL connection error: unsupported protocol",
+         (2026, "tls-connection-error"), False),
+        ("ERROR 2026 (HY000): SSL connection error: Unable to get certificate /private/client.key",
+         (2026, "tls-connection-error"), False),
+        ("ERROR 2003 (HY000): Can't connect to MySQL server", (2003, "unclassified"), False),
+        ("private stderr with no MySQL error", (None, "missing-or-multiple-errors"), False),
+        (late_read + "0\n" + late_read + "0", (None, "missing-or-multiple-errors"), False),
+        ("x" * 8193, (None, "oversized-diagnostic"), False),
+    )
+    for stderr, expected, accepted in cases:
+        diagnostic = mysql_failure(stderr)
+        require(diagnostic == expected, "MySQL diagnostic classification self-check failed")
+        require((diagnostic in MYSQL_DEFAULT_REJECTIONS) == accepted,
+                "MySQL diagnostic admission self-check failed")
+    print("PASS: bounded MySQL diagnostics and fail-closed admission self-check", flush=True)
+
+
+def refused(command, *, case, env=None, reasons=(), mysql_categories=None):
     # Case names are fixed literals, never commands, credentials or captured output.
     print("CHECK: negative control " + case, flush=True)
     try:
-        result = run(args, env=env, check=False)
+        result = run(command, env=env, check=False)
     except RuntimeError:
         raise RuntimeError(case + ": negative control exceeded its deadline") from None
     require(result.returncode != 0, case + ": negative TLS/authentication control succeeded")
+    diagnostic = None
+    if command[0] == "mysql-query":
+        diagnostic = mysql_failure(result.stderr)
+        code, category = diagnostic
+        print("DIAGNOSTIC: " + case + " mysql_error="
+              + (str(code) if code is not None else "none") + " category=" + category, flush=True)
+    accepted = (
+        diagnostic in mysql_categories if mysql_categories is not None
+        else any(reason.lower() in result.stderr.lower() for reason in reasons)
+    )
     require(
-        any(reason.lower() in result.stderr.lower() for reason in reasons),
+        accepted,
         case + ": negative control failed without the expected TLS/authentication diagnostic",
     )
     print("PASS: negative control " + case, flush=True)
@@ -82,27 +206,22 @@ def qualify_profiles(work):
             }.items()
         }
     }))
-    base = [
-        "docker", "compose", "--env-file", "/dev/null", "-p", PROJECT,
-        "-f", "docker-compose.yml", "-f", str(override),
-    ]
 
-    def compose(*args, check=True, timeout=180):
-        return run(base + list(args), env=env, check=check, timeout=timeout)
+    def compose(operation, check=True, timeout=180):
+        return run(request(operation, override=override), env=env, check=check, timeout=timeout)
 
     def down():
-        compose("--profile", "mongodb", "--profile", "postgres", "down", "--volumes")
+        compose("compose-down")
 
     try:
         print("CHECK: default and PostgreSQL profile startup", flush=True)
-        active = compose("config", "--services").stdout.splitlines()
+        active = compose("compose-services").stdout.splitlines()
         require(set(active) == {"ferrum-sqlite", "postgres"}, "Unexpected default services")
-        compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "120")
+        compose("compose-default-up")
         require(inspect("ferrum-sqlite")["State"]["Health"]["Status"] == "healthy",
                 "Default SQLite profile failed")
         down()
-        compose("--profile", "postgres", "up", "-d", "--no-build", "--wait",
-                "--wait-timeout", "120", "ferrum-postgres")
+        compose("compose-postgres-up")
         require(inspect("ferrum-postgres")["State"]["Health"]["Status"] == "healthy",
                 "Non-Mongo PostgreSQL profile failed without MONGO_PASSWORD")
         down()
@@ -114,9 +233,8 @@ def qualify_profiles(work):
                 env.pop("MONGO_PASSWORD", None)
             else:
                 env["MONGO_PASSWORD"] = value
-            compose("--profile", "mongodb", "config", "--quiet")
-            result = compose("--profile", "mongodb", "up", "-d", "--no-build", "--wait",
-                             "--wait-timeout", "30", "mongodb", "ferrum-mongodb", check=False)
+            compose("compose-config-check")
+            result = compose("compose-mongo-invalid-up", check=False)
             require(result.returncode != 0, "Invalid Mongo secret produced a working profile")
             state = inspect("ferrum-mongodb-db")["State"]
             require(state["Status"] == "exited" and state["ExitCode"] == 1,
@@ -125,26 +243,18 @@ def qualify_profiles(work):
 
         env["MONGO_PASSWORD"] = secrets.token_hex(32)
         print("CHECK: valid Mongo authentication with released Edge", flush=True)
-        model = json.loads(compose("--profile", "mongodb", "config", "--format", "json").stdout)
+        model = json.loads(compose("compose-config-json").stdout)
         uri = model["services"]["ferrum-mongodb"]["environment"]["FERRUM_DB_URL"]
         require(uri == "mongodb://ferrum:" + env["MONGO_PASSWORD"]
                 + "@mongodb:27017/?authSource=admin", "Mongo URL/password contract differs")
-        compose("--profile", "mongodb", "up", "-d", "--no-build", "--wait",
-                "--wait-timeout", "120", "mongodb", "ferrum-mongodb")
+        compose("compose-mongo-up")
         require(not inspect("ferrum-mongodb-db")["HostConfig"]["PortBindings"],
                 "Mongo unexpectedly publishes a host port")
         require(inspect("ferrum-mongodb")["State"]["Health"]["Status"] == "healthy",
                 "Released Edge did not connect using the valid Mongo credential")
-        auth = (
-            "const c = new Mongo('mongodb://ferrum:' + "
-            "process.env.MONGO_INITDB_ROOT_PASSWORD + '@localhost:27017/?authSource=admin');"
-            "const s = c.getDB('admin').runCommand({connectionStatus:1});"
-            "if (!s.ok || !s.authInfo.authenticatedUsers.some(u => u.user === 'ferrum')) quit(1);"
-        )
-        run(["docker", "exec", "ferrum-mongodb-db", "mongosh", "--quiet", "--nodb", "--eval", auth])
+        run(request("mongo-authenticated"))
         refused(
-            ["docker", "exec", "ferrum-mongodb-db", "mongosh", "--quiet", "--nodb", "--eval",
-             "new Mongo('mongodb://ferrum:dev-password-change-in-production@localhost:27017/?authSource=admin')"],
+            request("mongo-historical-password"),
             case="mongo-historical-password", reasons=("authentication failed",),
         )
         # A valid initialized volume must not bypass either empty-input guard.
@@ -153,9 +263,7 @@ def qualify_profiles(work):
                 env.pop("MONGO_PASSWORD", None)
             else:
                 env["MONGO_PASSWORD"] = value
-            result = compose("--profile", "mongodb", "up", "-d", "--no-build", "--wait",
-                             "--force-recreate", "--wait-timeout", "30", "mongodb",
-                             "ferrum-mongodb", check=False)
+            result = compose("compose-mongo-recreate", check=False)
             require(result.returncode != 0, "Existing volume bypassed the missing/empty secret guard")
             state = inspect("ferrum-mongodb-db")["State"]
             require(state["Status"] == "exited" and state["ExitCode"] == 1,
@@ -166,22 +274,19 @@ def qualify_profiles(work):
 
 
 def pg_args(connection, query="SELECT 1"):
-    return ["docker", "exec", "-e", "PGPASSWORD", PG, "psql", connection,
-            "-v", "ON_ERROR_STOP=1", "-Atqc", query]
+    return request("pg-query", connection=connection, query=query)
 
 
-def mysql_args(*options, query="SELECT 1"):
-    return ["docker", "exec", MYSQL, "mysql",
-            "--defaults-extra-file=/run/secrets/mysql-client.cnf", "--batch",
-            "--skip-column-names", *options, "-e", query]
+def mysql_args(mode="trusted", query="SELECT 1"):
+    return request("mysql-query", mysql_mode=mode, query=query)
 
 
 def assert_no_exposure(names, passwords):
     for name in names:
         container = inspect(name)
         surfaces = json.dumps(container["Config"]["Healthcheck"])
-        surfaces += run(["docker", "top", name, "-eo", "args"]).stdout
-        logs = run(["docker", "logs", name])
+        surfaces += run(request("top", container=name)).stdout
+        logs = run(request("logs", container=name))
         surfaces += logs.stdout
         # Logs can be emitted on either stream by the image entrypoint.
         surfaces += logs.stderr
@@ -202,17 +307,17 @@ def assert_no_exposure(names, passwords):
 
 def qualify_sql(work):
     certs = work / "sql"
-    setup = ["bash", "tests/scripts/setup_db_tls.sh"]
+    setup = request("setup", certs_dir=certs)
     try:
         print("CHECK: generated SQL TLS fixtures and private files", flush=True)
-        run(setup + [str(certs)], timeout=180)
+        run(setup, timeout=180)
         passwords = [(certs / name).read_text().strip() for name in
                      ("pg-password", "mysql-password", "mysql-root-password")]
         for path in certs.rglob("*"):
             require(path.stat().st_mode & 0o777 == (0o700 if path.is_dir() else 0o600),
                     "Private fixture file/directory permissions changed")
         # A rerun must not silently replace live databases or credentials.
-        require(run(setup + [str(certs)], check=False).returncode != 0,
+        require(run(setup, check=False).returncode != 0,
                 "Setup replaced an existing fixture")
         require(passwords == [(certs / name).read_text().strip() for name in
                              ("pg-password", "mysql-password", "mysql-root-password")],
@@ -248,28 +353,23 @@ def qualify_sql(work):
 
         # Wrong trust anchor and hostname controls share the successful query path.
         print("CHECK: verified SQL TLS and invalid trust/hostname controls", flush=True)
-        run(["openssl", "req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-             "-subj", "/CN=Untrusted Fixture CA", "-keyout", str(certs / "client/bad-ca.key"),
-             "-out", str(certs / "client/bad-ca.crt")])
+        run(request("untrusted-ca", certs_dir=certs))
         refused(pg_args(connection.replace("/client/ca.crt", "/client/bad-ca.crt")), env=pg_env,
                 case="pg-wrong-ca", reasons=("certificate verify failed",))
         refused(pg_args(connection.replace("host=localhost", "host=wrong.invalid hostaddr=127.0.0.1")),
                 env=pg_env, case="pg-wrong-hostname", reasons=("does not match host name",))
-        refused(mysql_args("--ssl-ca=/client/bad-ca.crt"), case="mysql-wrong-ca",
+        refused(mysql_args("wrong-ca"), case="mysql-wrong-ca",
                 reasons=("SSL connection error",))
-        refused(mysql_args("--host=127.0.0.2"), case="mysql-wrong-hostname",
+        refused(mysql_args("wrong-hostname"), case="mysql-wrong-hostname",
                 reasons=("SSL connection error",))
         refused(pg_args(connection.replace("sslmode=verify-full", "sslmode=disable")), env=pg_env,
                 case="pg-plaintext", reasons=("pg_hba.conf rejects connection", "no pg_hba.conf entry"))
-        refused(mysql_args("--ssl-mode=DISABLED"), case="mysql-plaintext",
+        refused(mysql_args("plaintext"), case="mysql-plaintext",
                 reasons=("insecure transport", "secure transport",))
 
         # Require a client certificate after the ordinary verified TLS positives.
         print("CHECK: SQL mutual TLS positives and invalid client controls", flush=True)
-        run(["docker", "exec", PG, "sh", "-ec",
-             "sed -i 's/scram-sha-256$/scram-sha-256 clientcert=verify-full/' "
-             "/var/lib/postgresql/tls/pg_hba.conf; "
-             "psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c 'SELECT pg_reload_conf()'"])
+        run(request("pg-require-client"))
         # The database reload is asynchronous; wait for explicit admission behaviour.
         no_client = pg_args(connection.replace("sslcert=/client/client.crt sslkey=/client/client.key",
                                                "sslcert='' sslkey=''"))
@@ -282,59 +382,54 @@ def qualify_sql(work):
         ssl = run(pg_args(connection, "SELECT ssl, client_dn FROM pg_stat_ssl WHERE pid=pg_backend_pid()"),
                   env=pg_env).stdout.strip()
         require(ssl.startswith("t|") and "ferrum" in ssl, "PostgreSQL mTLS positive failed")
-        run(["docker", "exec", MYSQL, "mysql", "--defaults-extra-file=/run/secrets/mysql-root.cnf",
-             "-e", "ALTER USER 'ferrum'@'%' REQUIRE X509"])
+        run(request("mysql-require-client"))
         require(run(mysql_args()).stdout.strip() == "1", "MySQL mTLS positive failed")
         no_mysql_client = (certs / "mysql-client.cnf").read_text()
         no_mysql_client = "\n".join(line for line in no_mysql_client.splitlines()
                                     if not line.startswith(("ssl-cert=", "ssl-key="))) + "\n"
         (certs / "client/no-client.cnf").write_text(no_mysql_client)
-        refused(["docker", "exec", MYSQL, "mysql", "--defaults-extra-file=/client/no-client.cnf",
-                 "-e", "SELECT 1"], case="mysql-missing-client", reasons=("Access denied",))
-        run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=ferrum",
-             "-keyout", str(certs / "client/rogue.key"), "-out", str(certs / "client/rogue.csr")])
+        refused(mysql_args("no-client"), case="mysql-missing-client", reasons=("Access denied",))
+        run(request("rogue-key", certs_dir=certs))
         (certs / "client/rogue.cnf").write_text("extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n")
-        run(["openssl", "x509", "-req", "-days", "1", "-in", str(certs / "client/rogue.csr"),
-             "-CA", str(certs / "client/bad-ca.crt"), "-CAkey", str(certs / "client/bad-ca.key"),
-             "-CAcreateserial", "-extfile", str(certs / "client/rogue.cnf"),
-             "-out", str(certs / "client/rogue.crt")])
+        run(request("rogue-cert", certs_dir=certs))
         refused(pg_args(connection.replace("/client/client.crt", "/client/rogue.crt")
                         .replace("/client/client.key", "/client/rogue.key")), env=pg_env,
                 case="pg-untrusted-client",
                 reasons=("unknown ca", "certificate verify failed", "certificate unknown"))
-        rogue_options = ("--ssl-cert=/client/rogue.crt", "--ssl-key=/client/rogue.key")
         # TLS 1.3 can finish SSL_connect before the server checks the client cert.
         # MySQL then masks the fatal alert as CR_SERVER_LOST while reading auth.
         # Require a certificate-specific TLS 1.2 alert from the same client/server
         # before allowing those exact late-disconnect messages on the default path.
-        require(run(mysql_args("--tls-version=TLSv1.2")).stdout.strip() == "1",
+        require(run(mysql_args("trusted-tls12")).stdout.strip() == "1",
                 "MySQL TLS 1.2 mTLS positive failed")
-        refused(mysql_args("--tls-version=TLSv1.2", *rogue_options),
+        refused(mysql_args("rogue-tls12"),
                 case="mysql-untrusted-client-tls12",
-                reasons=("alert unknown ca", "alert bad certificate", "alert certificate unknown"))
-        refused(mysql_args(*rogue_options), case="mysql-untrusted-client-default",
-                reasons=(
-                    "SSL connection error", "Access denied",
-                    "ERROR 2013 (HY000): Lost connection to MySQL server at "
-                    "'reading authorization packet', system error: 0",
-                    "ERROR 2013 (HY000): Lost connection to MySQL server at "
-                    "'reading final connect information', system error: 0",
-                ))
-        require(run(mysql_args()).stdout.strip() == "1",
-                "MySQL default mTLS positive after untrusted-client rejection failed")
+                mysql_categories=MYSQL_CERTIFICATE_ALERTS)
+        try:
+            refused(mysql_args("rogue-default"), case="mysql-untrusted-client-default",
+                    mysql_categories=MYSQL_DEFAULT_REJECTIONS)
+        finally:
+            # Prove availability after the wrong certificate even on an unidentified
+            # rejection. A positive never converts that unresolved negative to PASS.
+            require(run(mysql_args()).stdout.strip() == "1",
+                    "MySQL default mTLS positive after untrusted-client rejection failed")
+            print("PASS: MySQL default mTLS SELECT 1 after untrusted-client attempt", flush=True)
 
         # Observe live, authenticated clients during a bounded query, then scan argv.
         print("CHECK: live SQL process argv, healthcheck configuration and logs", flush=True)
         processes = []
         try:
-            for args, env in ((pg_args(connection, "SELECT pg_sleep(4)"), pg_env),
+            for command, env in ((pg_args(connection, "SELECT pg_sleep(4)"), pg_env),
                               (mysql_args(query="SELECT SLEEP(4)"), None)):
-                processes.append(subprocess.Popen(args, env=env, stdout=subprocess.PIPE,
-                                                  stderr=subprocess.PIPE, text=True))
+                processes.append(subprocess.Popen(
+                    ["bash", "scripts/compose_fixture_command.sh"],
+                    env=command_env(command, env), stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                ))
             deadline = time.monotonic() + 3
             while True:
-                pg_top = run(["docker", "top", PG, "-eo", "args"]).stdout
-                mysql_top = run(["docker", "top", MYSQL, "-eo", "args"]).stdout
+                pg_top = run(request("top", container=PG)).stdout
+                mysql_top = run(request("top", container=MYSQL)).stdout
                 if "SELECT pg_sleep(4)" in pg_top and "SELECT SLEEP(4)" in mysql_top:
                     break
                 require(time.monotonic() < deadline, "Did not observe live SQL probe processes")
@@ -351,12 +446,13 @@ def qualify_sql(work):
         print("PASS: actual loopback bindings, private files, SQL CRUD, argv/log checks, TLS and mTLS controls")
     finally:
         if (certs / ".fixture-owned").exists():
-            run(setup + ["--cleanup", str(certs)], timeout=60)
+            run(request("cleanup", certs_dir=certs), timeout=60)
         require(not certs.exists(), "SQL private fixture material remains after cleanup")
 
 
 def main():
     require(os.environ.get("GITHUB_ACTIONS") == "true", "This qualification runs only on hosted Actions")
+    check_mysql_classifier()
     os.umask(0o077)
     work = Path(os.environ["RUNNER_TEMP"]) / "compose-fixture-qualification"
     work.mkdir(mode=0o700)
