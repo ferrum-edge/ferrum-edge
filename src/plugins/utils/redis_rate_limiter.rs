@@ -1486,8 +1486,21 @@ pub fn is_cluster_topology_error(error: &redis::RedisError) -> bool {
 /// `NOPERM` and aborts the whole `EXEC` under an `EXECABORT` outer code. Only
 /// the per-command server errors carry the real reason, so admission would
 /// otherwise read a permanent ACL change as an endless outage.
+///
+/// A denial of `EXEC` itself is different: Redis aborts the transaction and
+/// wraps the refusal in one `EXECABORT Transaction discarded because of:
+/// NOPERM ...` reply. Recognize only that exact reason prefix under EXECABORT,
+/// never an arbitrary mention of NOPERM in server text or a transport error.
 pub fn is_permission_denied_error(error: &redis::RedisError) -> bool {
-    if matches!(error.code(), Some("NOPERM")) {
+    fn reply_is_permission_denied(code: Option<&str>, detail: Option<&str>) -> bool {
+        matches!(code, Some("NOPERM"))
+            || (code == Some("EXECABORT")
+                && detail.is_some_and(|detail| {
+                    detail.starts_with("Transaction discarded because of: NOPERM ")
+                }))
+    }
+
+    if reply_is_permission_denied(error.code(), error.detail()) {
         return true;
     }
     // `into_server_errors` consumes the error; `RedisError` is `Clone` and the
@@ -1495,7 +1508,9 @@ pub fn is_permission_denied_error(error: &redis::RedisError) -> bool {
     let Some(errors) = error.clone().into_server_errors() else {
         return false;
     };
-    errors.iter().any(|(_, err)| err.code() == "NOPERM")
+    errors
+        .iter()
+        .any(|(_, err)| reply_is_permission_denied(Some(err.code()), err.details()))
 }
 
 /// Whether a failed command was refused because the server does not implement

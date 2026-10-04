@@ -612,7 +612,8 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
     let relay_config = RedisConfig::from_plugin_config(&plugin_config, &prefix)
         .unwrap()
         .unwrap();
-    let compare = RedisRateLimitClient::new(relay_config, None, false, None).unwrap();
+    let compare =
+        Arc::new(RedisRateLimitClient::new(relay_config, None, false, None).unwrap());
     let before = relay.reply_bytes.load(Ordering::SeqCst);
     assert!(
         !compare
@@ -711,6 +712,28 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             .unwrap()
     );
     assert_eq!(relay.get_calls.load(Ordering::SeqCst), 0);
+
+    // Even a byte-identical valid rewrite after comparison must abort the
+    // watched deletion. Comparing bytes again cannot replace the WATCH fence.
+    redis.set_bytes_with_expire(&key, &valid, 60).await.unwrap();
+    relay.pause_on.store(2, Ordering::SeqCst);
+    let comparison_client = Arc::clone(&compare);
+    let comparison_key = key.clone();
+    let expected = valid.clone();
+    let comparison = tokio::spawn(async move {
+        comparison_client
+            .delete_if_value_matches_bounded(&comparison_key, &expected)
+            .await
+    });
+    relay.wait_for_pause().await;
+    redis.set_bytes_with_expire(&key, &valid, 60).await.unwrap();
+    relay.resume.notify_one();
+    assert!(!comparison.await.unwrap().unwrap());
+    assert!(matches!(
+        redis.get_bytes_bounded(&key, READ_CAP).await,
+        Ok(BoundedRedisValue::Found(value)) if value == valid
+    ));
+    redis.delete(&key).await.unwrap();
 
     // Exercise the released semantic command profile and every optional
     // maintenance denial against real Redis ACLs. These cases live inside the
@@ -817,6 +840,44 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             .set_bytes_with_expire(&key, MALFORMED, 60)
             .await
             .unwrap();
+        // Establish required-command availability before optional maintenance.
+        // The 3600s probe interval cannot conceal a mistaken outage transition.
+        assert!(matches!(
+            acl_compare.get_bytes_bounded(&key, READ_CAP).await,
+            Ok(BoundedRedisValue::Found(value)) if value == MALFORMED
+        ));
+        assert!(
+            acl_compare.is_available(),
+            "required reads must work for {denied}"
+        );
+        if denied == "EXEC" {
+            // Redis wraps a denial of EXEC itself in a single EXECABORT reply,
+            // rather than exposing NOPERM as a queued-command server error.
+            let restricted_url = acl_config["redis_url"].as_str().unwrap();
+            let mut rejected_exec = redis::Client::open(restricted_url)
+                .unwrap()
+                .get_multiplexed_async_connection()
+                .await
+                .unwrap();
+            let _: () = redis::cmd("MULTI")
+                .query_async(&mut rejected_exec)
+                .await
+                .unwrap();
+            let queued: String = redis::cmd("DEL")
+                .arg(&key)
+                .query_async(&mut rejected_exec)
+                .await
+                .unwrap();
+            assert_eq!(queued, "QUEUED");
+            let error = redis::cmd("EXEC")
+                .query_async::<redis::Value>(&mut rejected_exec)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Some("EXECABORT"));
+            assert!(error.detail().is_some_and(|detail| {
+                detail.starts_with("Transaction discarded because of: NOPERM ")
+            }));
+        }
         let expected = if denied == "UNWATCH" {
             b"different".as_slice()
         } else {
@@ -827,11 +888,11 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
                 .delete_if_value_matches_bounded(&key, expected)
                 .await
                 .is_err(),
-            "the restricted ACL must refuse the targeted quarantine operation"
+            "the restricted ACL must refuse the targeted quarantine operation: {denied}"
         );
         assert!(
             acl_compare.is_available(),
-            "optional quarantine permission denial must preserve backend availability"
+            "optional quarantine permission denial must preserve backend availability: {denied}"
         );
         assert!(matches!(
             acl_compare.get_bytes_bounded(&key, READ_CAP).await,

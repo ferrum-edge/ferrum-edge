@@ -5639,6 +5639,52 @@ async fn repeated_failover_replacement_leaves_only_active_observer() {
 
 // ── WATCH fencing connection type + fail-closed disconnect (GHSA-f72h) ────
 
+#[test]
+fn permission_denial_requires_a_server_code_or_exact_exec_abort_reason() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::is_permission_denied_error;
+    use redis::ErrorKind;
+
+    for (reply, denied) in [
+        (b"-NOPERM command denied\r\n".as_slice(), true),
+        (
+            b"-EXECABORT Transaction discarded because of: NOPERM command denied\r\n".as_slice(),
+            true,
+        ),
+        (
+            b"-EXECABORT Transaction discarded because of previous errors.\r\n".as_slice(),
+            false,
+        ),
+        (
+            b"-EXECABORT Transaction discarded because of: LOADING dataset\r\n".as_slice(),
+            false,
+        ),
+        (
+            b"-EXECABORT Transaction discarded because of: NOPERMISH\r\n".as_slice(),
+            false,
+        ),
+        (b"-EXECABORT unrelated NOPERM text\r\n".as_slice(), false),
+        (
+            b"-ERR Transaction discarded because of: NOPERM command denied\r\n".as_slice(),
+            false,
+        ),
+        (b"-NOAUTH Authentication required\r\n".as_slice(), false),
+        (b"-MOVED 1 127.0.0.1:6379\r\n".as_slice(), false),
+    ] {
+        let error = redis::parse_redis_value(reply)
+            .unwrap()
+            .extract_error()
+            .unwrap_err();
+        assert_eq!(is_permission_denied_error(&error), denied);
+    }
+    for kind in [ErrorKind::Io, ErrorKind::UnexpectedReturnType] {
+        let error = redis::RedisError::from((
+            kind,
+            "Transaction discarded because of: NOPERM command denied",
+        ));
+        assert!(!is_permission_denied_error(&error));
+    }
+}
+
 /// Static pin: ownership CAS helpers must dial a non-reconnecting
 /// `MultiplexedConnection`, never a transparently-reconnecting
 /// `ConnectionManager` that can drop WATCH state across a reconnect.
