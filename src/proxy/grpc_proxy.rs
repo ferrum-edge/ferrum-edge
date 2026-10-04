@@ -32,10 +32,10 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -76,11 +76,11 @@ pub(crate) const GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER: &str =
 /// Canonical serialized `grpc-status` paired with the gateway message above.
 pub(crate) const GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER: &str = "4";
 
-/// Observer fired exactly when the streaming gRPC **request upload** reaches a
+/// Observer fired exactly when the streaming gRPC **request source** reaches a
 /// terminal state — clean EOF, overflow abort, or stream drop (client/backend
 /// reset). Attached to the `GrpcBody::Streaming` request-body wrapper and
-/// invoked from its `Drop`, which hyper runs once it is done sending the
-/// request body (END_STREAM) or abandons the stream.
+/// invoked from its `Drop`, when hyper finishes polling the source or abandons
+/// it. h2 may still own queued DATA then; this is not transport completion.
 ///
 /// The gRPC transport layer stays agnostic to what the observer does. The proxy
 /// layer wires it to circuit-breaker probe accounting (`GrpcStreamingProbeRecorder`
@@ -200,6 +200,10 @@ pub enum GrpcBody {
     /// observe `bytes_seen` from another task after `into_reqwest_body()`
     /// moves ownership — `GrpcBody` has no such cross-task read path.
     Streaming {
+        /// Only H2 receive state proves END_STREAM after body EOF. A clean
+        /// H1 chunked body can yield `None` without `is_end_stream()` becoming
+        /// true, so that transport must not use this reset check.
+        require_end_stream: bool,
         /// The client body, or — for an AUTHENTICATED request — a bounded
         /// bridge fed by a gateway-owned pump task (issue #3815).
         ///
@@ -289,10 +293,9 @@ impl Drop for GrpcBody {
         {
             accounting.publish(*bytes_seen as u64);
         }
-        // Notify the upload-termination observer when the streaming request
-        // body is dropped. hyper drops it once the upload finishes (END_STREAM)
-        // or the stream is reset, so this is the canonical "request upload
-        // terminated" signal — independent of the response body's lifetime.
+        // Preserve the source observer for probe/accounting publication. Hyper
+        // can drop this body with final DATA still queued inside h2; backend
+        // stream affinity is owned separately by the request extension.
         let upload_observer = match self {
             GrpcBody::Streaming {
                 upload_observer, ..
@@ -337,6 +340,7 @@ impl http_body::Body for GrpcBody {
             }
             GrpcBody::Pumped(source) => source.poll_frame(cx),
             GrpcBody::Streaming {
+                require_end_stream,
                 incoming,
                 bytes_seen,
                 max_bytes,
@@ -404,10 +408,19 @@ impl http_body::Body for GrpcBody {
                         Poll::Ready(Some(Err(e)))
                     }
                     Poll::Ready(None) => {
-                        // Clean END_STREAM: the whole upload is on the wire.
                         if let Some(accounting) = request_bytes.as_mut() {
                             accounting.publish(*bytes_seen as u64);
                         }
+                        // Hyper treats inbound H2 CANCEL/NO_ERROR as body EOF,
+                        // but h2's receive state still distinguishes a reset
+                        // from END_STREAM. The authenticated pump checks that
+                        // original receive state before converting EOF into its
+                        // own terminal; this check covers the bare Incoming.
+                        if *require_end_stream && !incoming.is_end_stream() {
+                            let reset = h2::Error::from(h2::Reason::CANCEL);
+                            return Poll::Ready(Some(Err(reset.into())));
+                        }
+                        // Clean source EOF: h2 may still hold queued upload DATA.
                         Poll::Ready(None)
                     }
                     Poll::Pending => Poll::Pending,
@@ -675,6 +688,100 @@ fn write_grpc_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize)
 pub struct GrpcConnectionPool {
     pool: Arc<GenericPool<GrpcPoolManager>>,
     rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// Shard keys whose affinity or spill create failed or was cancelled, with the
+    /// failure time (issue #5588). Until [`SHARD_CREATE_BACKOFF`] passes, a
+    /// missing or closed shard listed here is treated like any other missing
+    /// shard: the probe borrows a ready neighbour instead of dialling again on
+    /// every call (a DestinationRule `maxConnections` below the shard count,
+    /// or a backend refusing new connections). Consulted only when the
+    /// preferred shard is missing or closed.
+    shard_create_backoff: ShardCreateBackoff,
+}
+
+/// How long a failed affinity or spill shard create keeps that shard on the
+/// borrow path before it is dialled again.
+const SHARD_CREATE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Hard bound on retained failure keys and FIFO records. Recording one
+/// physical failure evicts at most one record; there are no full-map scans.
+const SHARD_CREATE_BACKOFF_CAPACITY: usize = 4096;
+
+struct ShardCreateBackoff {
+    failures: DashMap<Arc<str>, ShardCreateFailure>,
+    // Only physical failed/cancelled creates take this lock. Warm requests
+    // never consult the backoff cache, and coalesced waiters never record.
+    order: Mutex<VecDeque<(Arc<str>, usize)>>,
+    recorded: AtomicUsize,
+    evicted: AtomicUsize,
+}
+
+struct ShardCreateFailure {
+    at: tokio::time::Instant,
+    generation: usize,
+}
+
+impl ShardCreateBackoff {
+    fn new(shards: usize) -> Self {
+        Self {
+            failures: DashMap::with_shard_amount(shards),
+            order: Mutex::new(VecDeque::with_capacity(SHARD_CREATE_BACKOFF_CAPACITY)),
+            recorded: AtomicUsize::new(0),
+            evicted: AtomicUsize::new(0),
+        }
+    }
+
+    fn backed_off(&self, key: &str) -> bool {
+        let failed_at = match self.failures.get(key) {
+            Some(entry) => entry.at,
+            None => return false,
+        };
+        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
+            return true;
+        }
+        self.failures.remove_if(key, |_, failure| {
+            failure.at.elapsed() >= SHARD_CREATE_BACKOFF
+        });
+        false
+    }
+
+    fn record(&self, key: String) {
+        // Recover the bounded bookkeeping after a panic without dropping the
+        // cancellation cooldown. No user work runs while this lock is held.
+        let mut order = self.order.lock().unwrap_or_else(|err| err.into_inner());
+        if order.len() == SHARD_CREATE_BACKOFF_CAPACITY
+            && let Some((old_key, old_generation)) = order.pop_front()
+        {
+            self.failures.remove_if(old_key.as_ref(), |_, failure| {
+                failure.generation == old_generation
+            });
+            self.evicted.fetch_add(1, Ordering::Relaxed);
+        }
+        let key: Arc<str> = key.into();
+        let generation = self.recorded.fetch_add(1, Ordering::Relaxed);
+        self.failures.insert(
+            Arc::clone(&key),
+            ShardCreateFailure {
+                at: tokio::time::Instant::now(),
+                generation,
+            },
+        );
+        order.push_back((key, generation));
+    }
+}
+
+/// Lives inside the elected physical creator, so cancellation records the
+/// cooldown before GenericPool wakes waiters to elect the next creator.
+struct ShardCreateGuard<'a> {
+    backoff: &'a ShardCreateBackoff,
+    key: Option<String>,
+}
+
+impl Drop for ShardCreateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.backoff.record(key);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -770,6 +877,7 @@ impl GrpcConnectionPool {
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
+            shard_create_backoff: ShardCreateBackoff::new(shards),
         }
     }
 
@@ -982,6 +1090,56 @@ impl GrpcConnectionPool {
         self.rr_counters.len()
     }
 
+    /// Shard keys currently backed off after a failed affinity or spill
+    /// create.
+    #[allow(dead_code)] // exercised from integration tests
+    pub fn shard_create_backoff_len(&self) -> usize {
+        self.shard_create_backoff.failures.len()
+    }
+
+    /// Physical failure records and bounded FIFO eviction operations. Exposed
+    /// for outage/fanout regression coverage, not logical request counts.
+    #[doc(hidden)]
+    pub fn shard_create_backoff_work(&self) -> (usize, usize) {
+        (
+            self.shard_create_backoff.recorded.load(Ordering::Relaxed),
+            self.shard_create_backoff.evicted.load(Ordering::Relaxed),
+        )
+    }
+
+    fn shard_create_backed_off(&self, key: &str) -> bool {
+        self.shard_create_backoff.backed_off(key)
+    }
+
+    fn ready_sibling(
+        &self,
+        key: &str,
+        base_len: usize,
+        start: usize,
+        shards: usize,
+    ) -> Option<GrpcPooledSender> {
+        // Cold creator recheck only. Reuse the thread-local key buffer rather
+        // than allocating one key per sibling, and never alias the borrowed
+        // sender into the failed shard's cache entry.
+        GRPC_POOL_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.push_str(&key[..base_len]);
+            for offset in 1..shards {
+                Self::write_shard_key_inplace(&mut buf, base_len, (start + offset) % shards);
+                if let Some(mut sender) = self.pool.cached(&buf)
+                    && matches!(
+                        futures_util::FutureExt::now_or_never(sender.ready()),
+                        Some(Ok(()))
+                    )
+                {
+                    return Some(sender);
+                }
+            }
+            None
+        })
+    }
+
     #[allow(dead_code)] // exercised from unit tests
     pub fn contains_rr_counter(&self, key: &str) -> bool {
         self.rr_counters.contains_key(key)
@@ -1063,8 +1221,9 @@ impl GrpcConnectionPool {
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
         // Phase 1 (synchronous): build the pool key in the thread-local
-        // buffer, pick a starting shard via the per-host RR counter, and
-        // probe every shard for an immediately-ready sender. On a cache hit
+        // buffer, pick a starting shard (the frontend connection's affinity
+        // shard, or the per-host RR counter), and probe the shards for an
+        // immediately-ready sender. On a cache hit
         // we return early without ever cloning the key. On a miss we clone
         // the buffer once into `selected_key` so the await below has an
         // owned String to hand to `create_or_get_existing_owned`.
@@ -1077,20 +1236,37 @@ impl GrpcConnectionPool {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> GrpcPhase1 {
                 let base_len = key_buf.len();
 
+                // Where the probe starts (issue #5588, `frontend_affinity`): an
+                // HTTP/2 frontend connection under its affinity bound goes to its
+                // own shard, and one over it spills to the round-robin shard;
+                // both create their shard when it is missing or closed rather
+                // than borrowing a neighbour, so the pool still widens. A call
+                // with no frontend connection in scope keeps the original
+                // round-robin probe below.
+                //
                 // Round-robin counter is per-host, but on FIRST access we seed it
                 // with a thread-local PRNG offset so a burst of concurrent
                 // requests on a cold pool does not land all on shard 0 before
                 // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
                 // Relaxed)` is wait-free after the seed — the seed only matters
                 // for the first `shard_count` picks per host on this gateway.
-                let start = crate::profile_pool_sync!(Rr, {
-                    let rr = crate::proxy::http2_pool::get_or_seed_rr_counter(
-                        &self.rr_counters,
-                        &key_buf[..base_len],
-                        svid_generation,
-                        &self.pool.manager().backend_svid_generation,
-                    );
-                    rr.fetch_add(1, Ordering::Relaxed) % shard_count
+                let (start, create_if_missing) = crate::profile_pool_sync!(Rr, {
+                    use crate::proxy::frontend_affinity::{ShardStart, shard_start};
+                    match shard_start(shard_count) {
+                        ShardStart::Affinity(shard) => (shard, true),
+                        preference => {
+                            let rr = crate::proxy::http2_pool::get_or_seed_rr_counter(
+                                &self.rr_counters,
+                                &key_buf[..base_len],
+                                svid_generation,
+                                &self.pool.manager().backend_svid_generation,
+                            );
+                            (
+                                rr.fetch_add(1, Ordering::Relaxed) % shard_count,
+                                preference == ShardStart::Spill,
+                            )
+                        }
+                    }
                 });
 
                 // Cheap probe pass — any shard whose cached sender is
@@ -1103,9 +1279,8 @@ impl GrpcConnectionPool {
                     Self::write_shard_key_inplace(key_buf, base_len, shard);
 
                     crate::profile_pool_event!(Probe);
-                    if let Some(mut sender) =
-                        crate::profile_pool_sync!(Probe, self.pool.cached(key_buf))
-                    {
+                    let cached = crate::profile_pool_sync!(Probe, self.pool.cached(key_buf));
+                    if let Some(mut sender) = cached {
                         match crate::profile_pool_ready!(futures_util::FutureExt::now_or_never(
                             sender.ready()
                         )) {
@@ -1115,18 +1290,25 @@ impl GrpcConnectionPool {
                             }
                             Some(Err(_)) => {
                                 self.pool.invalidate(key_buf);
+                                // A closed preferred shard is recreated, as a
+                                // missing one is below.
+                                if offset == 0
+                                    && create_if_missing
+                                    && !self.shard_create_backed_off(key_buf)
+                                {
+                                    break;
+                                }
                             }
-                            // Shard exists but is mid-send. Skip — `now_or_never`
-                            // only wins on an immediately-ready sender, so a
-                            // busy-but-healthy shard falls through to phase 2.
-                            // There `create_or_get_existing_owned` checks
-                            // `cached()` first; the existing sender is still
-                            // healthy (`!is_closed()`), so the create closure
-                            // never runs and the pool does NOT grow beyond the
-                            // shard ring. Callers queue on H2 readiness /
-                            // stream-cap backpressure instead of spawning a fresh
-                            // connection. This immediate probe is intentional —
-                            // there is no operator-configurable wait on this path.
+                            // Not ready yet. A hyper HTTP/2 sender reports
+                            // ready whenever its connection is open, however
+                            // many streams it carries, so this arm is not a
+                            // load signal (the affinity bound above is what
+                            // limits one client's share of a shard). Skip — it
+                            // falls through to phase 2, where
+                            // `create_or_get_existing_owned` checks `cached()`
+                            // first; the existing sender is still healthy
+                            // (`!is_closed()`), so the create closure never runs
+                            // and the pool does NOT grow beyond the shard ring.
                             None => {
                                 #[cfg(feature = "bench-pool-profile")]
                                 {
@@ -1134,6 +1316,15 @@ impl GrpcConnectionPool {
                                 }
                             }
                         }
+                    } else if offset == 0
+                        && create_if_missing
+                        && !self.shard_create_backed_off(key_buf)
+                    {
+                        // The preferred shard does not exist yet: create it
+                        // rather than borrow a neighbour (coalesced per key, so
+                        // at most one connection per shard). A shard whose
+                        // create failed recently is borrowed around instead.
+                        break;
                     }
                 }
 
@@ -1150,11 +1341,12 @@ impl GrpcConnectionPool {
                     selected_key: key_buf.clone(),
                     base_len,
                     start,
+                    create_if_missing,
                 }
             })
         });
 
-        let (selected_key, base_len, start) = match phase1 {
+        let (selected_key, base_len, start, create_if_missing) = match phase1 {
             GrpcPhase1::Hit(sender) => {
                 crate::plugins::otel_tracing::note_backend_connection_reused();
                 return Ok(sender);
@@ -1163,18 +1355,29 @@ impl GrpcConnectionPool {
                 selected_key,
                 base_len,
                 start,
-            } => (selected_key, base_len, start),
+                create_if_missing,
+            } => (selected_key, base_len, start, create_if_missing),
         };
 
         crate::profile_pool_event!(Fallback);
         let manager = Arc::clone(self.pool.manager());
         let acquired = crate::profile_pool_future!(FallbackPoll, {
-            self.pool.create_or_get_existing_owned_with_attempt(
+            self.pool.create_or_get_existing_owned_with_recovery(
                 selected_key,
                 |attempt| note_grpc_establishment_join(attempt, purpose),
                 |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
+                |key| {
+                    if create_if_missing && self.shard_create_backed_off(key) {
+                        self.ready_sibling(key, base_len, start, shard_count)
+                    } else {
+                        None
+                    }
+                },
                 |key, attempt| async move {
-                    let _ = key;
+                    let mut guard = ShardCreateGuard {
+                        backoff: &self.shard_create_backoff,
+                        key: create_if_missing.then_some(key),
+                    };
                     // Only the creator runs this closure, so the connection
                     // this attempt waits on is one it set up (issue #5864).
                     let setup_started =
@@ -1183,6 +1386,7 @@ impl GrpcConnectionPool {
                         .create_connection(proxy, svid_generation, purpose, Some(attempt))
                         .await;
                     if created.is_ok() {
+                        guard.key = None;
                         crate::plugins::otel_tracing::note_backend_connection_established_since(
                             setup_started,
                         );
@@ -1233,6 +1437,9 @@ enum GrpcPhase1 {
     /// `start` so the post-await error fallback can reconstruct shard
     /// keys without recomputing them.
     Miss {
+        /// Whether the start shard is an affinity or spill target, whose
+        /// failed create is backed off.
+        create_if_missing: bool,
         selected_key: String,
         base_len: usize,
         start: usize,
@@ -4227,8 +4434,13 @@ impl GrpcDispatchSender {
     /// post-wire hyper error.
     async fn send_request(
         &mut self,
-        request: Request<GrpcBody>,
+        mut request: Request<GrpcBody>,
     ) -> Result<hyper::Response<Incoming>, GrpcDispatchSendError> {
+        // Cover every body representation and retry at the common transport
+        // seam. The source observer remains independent of h2 queued DATA.
+        if let Some(lifetime) = super::frontend_affinity::retain_backend_stream() {
+            request.extensions_mut().insert(lifetime);
+        }
         match self {
             Self::H2(sender) => sender
                 .send_request(request)
@@ -4644,16 +4856,19 @@ pub async fn proxy_grpc_request_streaming(
     // transport body plus `UploadPumpSource` abort guard own upload teardown.
     // An upload with no authorization lifetime needs no pump: hyper's HTTP/2
     // pipe bounds the write itself (issue #5588).
+    let require_end_stream = parts.version == hyper::Version::HTTP_2;
     let (body, upload_pump, body_write_timeout) =
         crate::proxy::body::UploadSource::for_streaming_grpc_upload(
             body,
             auth,
             proxy.backend_write_timeout_ms,
+            require_end_stream,
         );
     let auth_deadline = auth.map(|(deadline, family, latch)| {
         crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
     });
     let grpc_body = GrpcBody::Streaming {
+        require_end_stream,
         incoming: body,
         auth_deadline,
         bytes_seen: 0,

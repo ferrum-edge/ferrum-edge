@@ -20,13 +20,14 @@ VENDOR = "vendor/h2-0.4.19-observation"
 # Input anchors shared by the hosted preparation and the quick pin check, so the
 # two cannot disagree about what "present" means.
 PATCH_TABLE = "[patch.crates-io]\n"
-# Ferrum ships a vendored h2 0.4.19 (docs/upstream-h2-patches/001-*), so the
+# Ferrum ships a vendored h2 0.4.19 (three logical patches), so the
 # root lock records it path-sourced (no source/checksum lines) and the patch
 # table already names it. The observation build replaces that one entry.
 FERRUM_VENDOR = "vendor/h2-0.4.19-ferrum-patched"
 FERRUM_PATCHES = (
     "docs/upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch",
     "docs/upstream-h2-patches/002-runtime-data-frame-budget/h2-runtime-data-frame-budget.patch",
+    "docs/upstream-h2-patches/002-stream-lifetime/h2-stream-lifetime.patch",
 )
 VENDOR_MANIFEST = "vendor/VENDOR_INTEGRITY.sha256"
 VENDORED_H2 = 'h2 = { path = "' + FERRUM_VENDOR + '" }\n'
@@ -80,9 +81,9 @@ def manifest_entries(root, prefix):
 def apply_ferrum_patch(source, root):
     """Turn the verified archive into Ferrum's shipped h2 sources.
 
-    Applies Ferrum's vendored h2 patch without fuzz, then requires every file
-    under src/ to match the vendored crate's drift-manifest hash (text hashed
-    with CR stripped, as the drift guard does), so the observation build
+    Applies Ferrum's vendored h2 patches in order without fuzz, then requires
+    every file under src/ to match the vendored crate's drift-manifest hash
+    (text hashed with CR stripped, as the drift guard does), so the observation build
     measures exactly the h2 the gateway ships plus the observer.
     """
     for patch_path in FERRUM_PATCHES:

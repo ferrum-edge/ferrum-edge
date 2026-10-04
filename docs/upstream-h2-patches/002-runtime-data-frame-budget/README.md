@@ -76,4 +76,6 @@ the sender continues to make progress through small legal peer windows.
 Retire this patch when an h2 release containing hyperium/h2#965, or an
 equivalent runtime automatic-budget update, is adopted. Remove this lifecycle
 entry and patch document, preserve behavior-level regressions that apply to the
-released dependency, and regenerate `vendor/VENDOR_INTEGRITY.sha256`.
+released dependency, and regenerate `vendor/VENDOR_INTEGRITY.sha256`. The
+coalescing and stream-lifetime patches must also retire before removing the
+vendored crate.
