@@ -2415,9 +2415,12 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         .split("Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {")
         .skip(1)
     {
-        // Bounded at the start of the next match arm; the helper call is the
-        // arm's first statement, so this window always contains it.
-        let branch = arm.split("=> {").next().unwrap_or(arm);
+        // These arms contain only a return through a health-neutral helper.
+        // Require their closing brace so a sibling cannot supply that helper.
+        let end = arm
+            .find('}')
+            .expect("bounded buffered-upload authorization arm");
+        let branch = &arm[..end];
         assert!(
             branch.contains("authorization_expired_dispatch_placeholder(")
                 || branch.contains("authorization_expired_backend_dispatch("),
@@ -2770,10 +2773,10 @@ fn every_buffered_response_collect_is_authorization_bounded() {
         .split("Err(ResponseCollectBound::AuthorizationExpired) => {")
         .skip(1)
     {
-        let branch = arm
-            .split("\n        };")
-            .next()
-            .expect("bounded authorization arm");
+        let end = arm
+            .find('}')
+            .expect("bounded response-collect authorization arm");
+        let branch = &arm[..end];
         assert!(
             branch.contains("authorization_expired_dispatch_placeholder(")
                 || branch.contains("authorization_expired_backend_dispatch("),
@@ -4594,13 +4597,11 @@ async fn an_empty_buffered_grpc_upload_with_no_trailers_installs_no_pump() {
 #[test]
 fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermark() {
     let source = include_str!("../../../src/proxy/grpc_proxy.rs");
-    let core = source
-        .split("pub(crate) async fn proxy_grpc_request_core(")
-        .nth(1)
-        .expect("buffered gRPC dispatch core")
-        .split("// Extract response status and headers through the shared collector")
-        .next()
-        .expect("bounded buffered gRPC dispatch core");
+    let core = source_region(
+        source,
+        "pub(crate) async fn proxy_grpc_request_core(",
+        "// Extract response status and headers through the shared collector",
+    );
 
     assert!(
         core.contains("buffered_grpc_request_body_with_write_watermark("),
@@ -4660,13 +4661,11 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
         core.contains("pump.cancel_and_join().await;"),
         "a won watermark must cancel and join the gateway-owned pump"
     );
-    let write_timeout_error = GRPC_PROXY_SOURCE
-        .split("fn grpc_backend_write_timeout_error(")
-        .nth(1)
-        .expect("shared gRPC write-timeout terminal")
-        .split("\n}\n")
-        .next()
-        .expect("bounded gRPC write-timeout terminal");
+    let write_timeout_error = source_region(
+        GRPC_PROXY_SOURCE,
+        "fn grpc_backend_write_timeout_error(",
+        "\n}\n",
+    );
     assert!(
         core.contains("grpc_backend_write_timeout_error(")
             && write_timeout_error.contains("kind: GrpcTimeoutKind::Read,")
@@ -5291,10 +5290,10 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
         ("authorization_expired_backend_dispatch(", 9),
     ] {
         let definition = format!("fn {callee}");
-        let before_definition = PROXY_SOURCE
-            .split(definition.as_str())
-            .next()
+        let definition_at = PROXY_SOURCE
+            .find(definition.as_str())
             .expect("the out-of-line helper must remain present");
+        let before_definition = &PROXY_SOURCE[..definition_at];
         assert!(
             // A visibility modifier may sit between the attribute and `fn`; the
             // attribute itself is what must stay attached.
@@ -5317,13 +5316,11 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
     // moment one of its cold arms builds the `retry::BackendResponse` inline
     // again, that coroutine's `poll` frame gets the fixed slot back — for a
     // plain unauthenticated request that can reach none of those arms.
-    let reqwest_dispatch = PROXY_SOURCE
-        .split("\nasync fn proxy_to_backend(")
-        .nth(1)
-        .expect("the reqwest dispatcher must remain present")
-        .split("\nfn is_streaming_content_type(")
-        .next()
-        .expect("the reqwest dispatcher must remain bounded");
+    let reqwest_dispatch = source_region(
+        PROXY_SOURCE,
+        "\nasync fn proxy_to_backend(",
+        "\nfn is_streaming_content_type(",
+    );
     assert!(
         !reqwest_dispatch.contains("authorization_expired_dispatch_placeholder("),
         "a `proxy_to_backend` authorization exit builds its terminal inline again \
@@ -5338,13 +5335,11 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
     // shared latch is still consulted first, an unlatched-but-elapsed plan is
     // still recorded exactly once through it, and the only terminal selectable
     // is still the fixed, redacted pre-commitment one.
-    let applier = PROXY_SOURCE
-        .split("fn apply_precommit_authorization_terminal(")
-        .nth(1)
-        .expect("the out-of-line applier body")
-        .split("\n}\n")
-        .next()
-        .expect("bounded applier body");
+    let applier = source_region(
+        PROXY_SOURCE,
+        "fn apply_precommit_authorization_terminal(",
+        "\n}\n",
+    );
     assert!(applier.contains("request_authorization_termination(ctx, max_lifetime_seconds)?"));
     let decision = source_region(
         PROXY_SOURCE,
@@ -5365,13 +5360,11 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
 
     // The response funnels keep the family selection and the shared latch/closer
     // wiring they had inline.
-    let installer = PROXY_SOURCE
-        .split("fn install_response_authorization_deadline(")
-        .nth(1)
-        .expect("the out-of-line response installer body")
-        .split("\n}\n")
-        .next()
-        .expect("bounded installer body");
+    let installer = source_region(
+        PROXY_SOURCE,
+        "fn install_response_authorization_deadline(",
+        "\n}\n",
+    );
     assert!(installer.contains("effective_request_auth_deadline("));
     assert!(installer.contains("StreamAuthProtocolFamily::GrpcWeb"));
     assert!(installer.contains("StreamAuthProtocolFamily::Grpc"));

@@ -518,32 +518,50 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
     );
 
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let native_start = proxy_src
+        .find("Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {")
+        .expect("native gRPC response terminals");
+    let native_tail = &proxy_src[native_start..];
+    let native_end = native_tail
+        .find("// Keep only the independently owned header map")
+        .expect("native gRPC response terminals end");
+    let proxy_src = &native_tail[..native_end];
     // Check each terminal's own scope: two pre-commitment gates, dispatch
     // expiry, and all three native/gRPC-Web backend-error shapes. A duplicate
     // attachment elsewhere cannot compensate for a lost one here.
-    for (start, end, expected) in [
+    for (start, end) in [
         (
             "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
             "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
-            1,
         ),
         (
             "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
             "Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {",
-            1,
         ),
         (
             "Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {",
             "Err(e) => {",
-            1,
         ),
         (
             concat!(
                 "if let Some(content_type) = grpc_web_response_content_type {\n",
                 "                    let response = boxed_grpc_web_gateway_error_response(",
             ),
-            "// Keep only the independently owned header map",
-            3,
+            "if grpc_request_is_web_translated\n",
+        ),
+        (
+            "if grpc_request_is_web_translated\n",
+            concat!(
+                "return Ok(grpc_proxy::attach_held_frontend_grpc_upload(\n",
+                "                    grpc_proxy::build_grpc_error_response_with_policy(",
+            ),
+        ),
+        (
+            concat!(
+                "return Ok(grpc_proxy::attach_held_frontend_grpc_upload(\n",
+                "                    grpc_proxy::build_grpc_error_response_with_policy(",
+            ),
+            "\n            }\n",
         ),
     ] {
         let start_at = proxy_src.find(start).expect("gRPC terminal start");
@@ -554,19 +572,20 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
             terminal
                 .matches("grpc_proxy::attach_held_frontend_grpc_upload(")
                 .count(),
-            expected,
-            "terminal {start} must retain every held frontend upload"
+            1,
+            "terminal {start} must retain its held frontend upload exactly once"
         );
         assert_eq!(
             terminal.matches("held_frontend_grpc_upload.take()").count(),
-            expected,
-            "terminal {start} must consume each held upload exactly once"
+            1,
+            "terminal {start} must consume its held upload exactly once"
         );
         for attachment in terminal
             .split("grpc_proxy::attach_held_frontend_grpc_upload(")
             .skip(1)
         {
-            let attachment = attachment.split("));").next().expect("attachment return");
+            let end_at = attachment.find("));").expect("attachment return");
+            let attachment = &attachment[..end_at];
             assert_eq!(
                 attachment
                     .matches("held_frontend_grpc_upload.take()")

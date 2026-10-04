@@ -1,3 +1,15 @@
+/// Require both markers before inspecting a structural proof's source region.
+fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_at = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing region start {start:?}"));
+    let tail = &source[start_at + start.len()..];
+    let end_at = tail
+        .find(end)
+        .unwrap_or_else(|| panic!("missing region end {end:?}"));
+    &tail[..end_at]
+}
+
 #[test]
 fn h3_native_forces_mesh_onto_bridge_and_refuses_unix_before_dispatch() {
     let src = include_str!("../../../src/http3/server.rs");
@@ -697,16 +709,13 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
 #[test]
 fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
-    let dispatch = source
-        .find("async fn dispatch_grpc<S>(")
-        .expect("buffered H3-to-gRPC dispatcher must remain present");
-    let body = &source[dispatch..];
+    let body = source_region(source, "async fn dispatch_grpc<S>(", "\n}\n");
     let body_start = body
         .find("let body = if let Some(buffered)")
         .expect("H3 gRPC upload buffering must remain present");
     let body = &body[body_start..];
     let body_end = body
-        .find("// Build the backend-facing header map")
+        .find("let bytes_sent = if body_was_prebuffered")
         .expect("H3 gRPC upload buffering must remain bounded");
     let body = &body[..body_end];
     let timed_out = body
@@ -715,8 +724,8 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
     let timed_out = &body[timed_out..];
     let timed_out_end = timed_out[1..]
         .find("H3RequestBodyReadError::")
-        .map_or(timed_out.len(), |offset| offset + 1);
-    let timed_out = &timed_out[..timed_out_end];
+        .expect("bounded timed-out upload branch");
+    let timed_out = &timed_out[..timed_out_end + 1];
     assert!(timed_out.contains("write_grpc_error_for_request_with_recv_halt("));
     assert!(timed_out.contains("ctx,"));
     assert!(
@@ -728,13 +737,11 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         timed_out.contains("halt_request_body(stream)"),
         "the full-stream bridge must halt after the bounded terminal write settles"
     );
-    let authorization = body
-        .split("H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {")
-        .nth(1)
-        .expect("authorization upload branch")
-        .split("H3RequestBodyReadError::DeadlineExceeded(None)) => {")
-        .next()
-        .expect("bounded authorization upload branch");
+    let authorization = source_region(
+        body,
+        "H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {",
+        "H3RequestBodyReadError::DeadlineExceeded(None)) => {",
+    );
     assert!(authorization.contains("record_authorization_termination_once("));
     assert!(authorization.contains("write_grpc_authorization_expired_terminal("));
     assert!(!authorization.contains("halt_request_body(stream)"));
@@ -742,9 +749,9 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         .find("H3RequestBodyReadError::DeadlineExceeded(None)")
         .expect("missing deadline upload branch");
     let deadline = &body[deadline..];
-    let deadline_end = deadline[1..]
-        .find("H3RequestBodyReadError::")
-        .map_or(deadline.len(), |offset| offset + 1);
+    let deadline_end = deadline
+        .find("\n            }\n")
+        .expect("bounded deadline upload branch");
     let deadline = &deadline[..deadline_end];
     assert!(deadline.contains("write_final_body_reject("));
     assert!(deadline.contains("grpc_deadline_exceeded_plugin_result()"));
@@ -978,23 +985,19 @@ fn h3_buffered_terminal_write_bias_uses_typed_gateway_provenance() {
     assert!(context.contains("fn mark_gateway_deadline_response_selected"));
 
     let proxy = include_str!("../../../src/proxy/mod.rs");
-    let replacement = proxy
-        .split("pub(crate) fn replace_buffered_grpc_response_with_deadline(")
-        .nth(1)
-        .expect("shared buffered deadline replacement")
-        .split("pub(crate) async fn transform_buffered_response_body_with_deadline")
-        .next()
-        .expect("bounded shared buffered deadline replacement");
+    let replacement = source_region(
+        proxy,
+        "pub(crate) fn replace_buffered_grpc_response_with_deadline(",
+        "pub(crate) async fn transform_buffered_response_body_with_deadline",
+    );
     assert!(replacement.contains("ctx.mark_gateway_deadline_response_selected()"));
 
     let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
-    let buffered = cross_protocol
-        .split("Ok(GrpcResponseKind::Buffered(resp)) => {")
-        .nth(1)
-        .expect("buffered cross-protocol gRPC response arm")
-        .split("Ok(GrpcResponseKind::Streaming(streaming)) => {")
-        .next()
-        .expect("bounded buffered gRPC response arm");
+    let buffered = source_region(
+        cross_protocol,
+        "Ok(GrpcResponseKind::Buffered(resp)) => {",
+        "Ok(GrpcResponseKind::Streaming(streaming)) => {",
+    );
     let writer = buffered
         .split("let response_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(")
         .nth(1)
@@ -1006,13 +1009,11 @@ fn h3_buffered_terminal_write_bias_uses_typed_gateway_provenance() {
     assert!(!writer[..header_write].contains("metadata.get(\"grpc_status\")"));
 
     let native = include_str!("../../../src/http3/server.rs");
-    let native_writer = native
-        .split("// Build and send buffered response")
-        .nth(1)
-        .expect("native H3 buffered response writer")
-        .split("macro_rules! await_buffered_h3_write")
-        .next()
-        .expect("bounded native H3 provenance setup");
+    let native_writer = source_region(
+        native,
+        "// Build and send buffered response",
+        "macro_rules! await_buffered_h3_write",
+    );
     assert!(native_writer.contains("ctx.gateway_deadline_response_selected()"));
     assert!(!native_writer.contains("metadata.get(\"grpc_status\")"));
 }
@@ -1798,13 +1799,11 @@ fn cross_protocol_plain_authorization_expired_terminal_uses_post_deadline_grace(
 #[test]
 fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
     let server = include_str!("../../../src/http3/server.rs");
-    let error_writer = server
-        .split("async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(")
-        .nth(1)
-        .expect("native H3 error writer with recv-halt control")
-        .split("async fn send_h3_reject_flavor_aware(")
-        .next()
-        .expect("bounded native H3 error writer");
+    let error_writer = source_region(
+        server,
+        "async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(",
+        "async fn send_h3_reject_flavor_aware(",
+    );
     assert!(error_writer.contains("if !halt_recv"));
     assert!(error_writer.contains("await_post_deadline_terminal_response_write("));
     assert!(error_writer.contains("abort_response_stream(stream)"));
@@ -1833,13 +1832,11 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
     );
 
     let cross = include_str!("../../../src/http3/cross_protocol.rs");
-    let final_reject = cross
-        .split("async fn write_final_body_reject<S>(")
-        .nth(1)
-        .expect("cross-protocol final reject writer")
-        .split("fn normalize_h3_grpc_reject(")
-        .next()
-        .expect("bounded cross-protocol final reject writer");
+    let final_reject = source_region(
+        cross,
+        "async fn write_final_body_reject<S>(",
+        "fn normalize_h3_grpc_reject(",
+    );
     assert_eq!(
         final_reject
             .matches("await_post_deadline_terminal_response_write(")
@@ -1854,20 +1851,17 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
         6,
         "each terminal-deadline branch must abort on both write failure and grace expiry"
     );
-    let dispatch = cross
-        .split("async fn dispatch_grpc<S>(")
-        .nth(1)
-        .expect("buffered cross-protocol gRPC dispatch")
-        .split("let bytes_sent = if body_was_prebuffered")
-        .next()
-        .expect("bounded buffered cross-protocol upload");
-    let timed_out = dispatch
-        .split("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
-        .nth(1)
-        .expect("cross-protocol timed-out bridge arm")
-        .split("H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {")
-        .next()
-        .expect("bounded timed-out bridge arm");
+    let dispatch = source_region(cross, "async fn dispatch_grpc<S>(", "\n}\n");
+    let dispatch = source_region(
+        dispatch,
+        "let body = if let Some(buffered) = prebuffered_body",
+        "let bytes_sent = if body_was_prebuffered",
+    );
+    let timed_out = source_region(
+        dispatch,
+        "Err(super::server::H3RequestBodyReadError::TimedOut) => {",
+        "H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {",
+    );
     assert!(timed_out.contains("await_post_deadline_terminal_response_write("));
     assert!(timed_out.contains("abort_response_stream(stream)"));
     assert_eq!(
@@ -4679,13 +4673,11 @@ fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
             "/// Send an HTTP/3 request to the specified backend.\n    pub async fn request(",
         ),
     ] {
-        let entry = client
-            .split(anchor)
-            .nth(1)
-            .unwrap_or_else(|| panic!("{label} entry point"))
-            .split(".finish(),")
-            .next()
-            .unwrap_or_else(|| panic!("bounded {label} entry point"));
+        let entry = source_region(client, anchor, "\n    }\n");
+        let finish = entry
+            .find(".finish(),")
+            .unwrap_or_else(|| panic!("{label} request FIN"));
+        let entry = &entry[..finish];
         let uses_chunked_sender = if label == "pooled streaming-response request" {
             entry.contains("send_h3_buffered_body_under_authorization(")
         } else if label == "pooled buffered request" {
@@ -4705,26 +4697,22 @@ fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
         );
     }
 
-    let sender = client
-        .split("async fn send_h3_buffered_request_body<S>(")
-        .nth(1)
-        .expect("shared chunked sender")
-        .split("/// The bounded slices a buffered native-H3 request body")
-        .next()
-        .expect("bounded shared chunked sender");
+    let sender = source_region(
+        client,
+        "async fn send_h3_buffered_request_body<S>(",
+        "/// The bounded slices a buffered native-H3 request body",
+    );
     assert!(
         sender.contains("for chunk in H3BufferedBodyChunks::new(body)")
             && sender.contains("await_h3_client_write_with_timeout(")
             && sender.contains("stream.send_data(chunk),"),
         "each bounded slice must get its own write-timeout wrapper call"
     );
-    let authorized_sender = client
-        .split("async fn send_h3_buffered_body_under_authorization<S>(")
-        .nth(1)
-        .expect("authorized chunked sender")
-        .split("async fn recv_h3_response_under_authorization(")
-        .next()
-        .expect("bounded authorized sender");
+    let authorized_sender = source_region(
+        client,
+        "async fn send_h3_buffered_body_under_authorization<S>(",
+        "async fn recv_h3_response_under_authorization(",
+    );
     assert!(
         authorized_sender.contains("for chunk in H3BufferedBodyChunks::new(body)")
             && authorized_sender.contains("await_h3_write_under_authorization(")

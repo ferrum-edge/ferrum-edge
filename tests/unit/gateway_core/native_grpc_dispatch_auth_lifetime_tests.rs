@@ -467,13 +467,14 @@ const GRPC_PROXY_SOURCE: &str = include_str!("../../../src/proxy/grpc_proxy.rs")
 
 /// The slice of `source` from the first `start` to the next `end` after it.
 fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    source
-        .split(start)
-        .nth(1)
-        .unwrap_or_else(|| panic!("missing region start {start:?}"))
-        .split(end)
-        .next()
-        .unwrap_or_else(|| panic!("missing region end {end:?}"))
+    let start_at = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing region start {start:?}"));
+    let tail = &source[start_at + start.len()..];
+    let end_at = tail
+        .find(end)
+        .unwrap_or_else(|| panic!("missing region end {end:?}"));
+    &tail[..end_at]
 }
 
 /// Code outside `//` comments with every whitespace character removed, so a
