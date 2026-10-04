@@ -1369,7 +1369,9 @@ async fn native_h3_candidate_failure_captures_transport_winner_before_pool_publi
     use ferrum_edge::_test_support::error_class_is_health_neutral_for_test;
     use ferrum_edge::config::EnvConfig;
     use ferrum_edge::dns::{CandidateConnectError, DnsCache, DnsConfig, connect_candidates};
-    use ferrum_edge::http3::client::{Http3ConnectionPool, h3_connection_checkout_metadata_for_test};
+    use ferrum_edge::http3::client::{
+        Http3ConnectionPool, h3_connection_checkout_metadata_for_test,
+    };
     use std::io::ErrorKind;
     use std::sync::OnceLock;
 
@@ -1600,7 +1602,12 @@ async fn native_h3_cancelled_creation_releases_resources_and_waiter_elects_indep
             let termination = StreamAuthTermination::CredentialExpired;
             assert_eq!(
                 h3_connection_checkout_metadata_for_test(&error),
-                (Some(termination), false, false, ErrorClass::ClientDisconnect)
+                (
+                    Some(termination),
+                    false,
+                    false,
+                    ErrorClass::ClientDisconnect
+                )
             );
             assert!(!error.request_on_wire());
             assert!(error_class_is_health_neutral_for_test(
