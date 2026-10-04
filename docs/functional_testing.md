@@ -4,6 +4,20 @@ This guide covers Ferrum Edge functional testing, with a focus on Control Plane 
 
 ## Test Files
 
+### gRPC acquisition expiry and attempt spans (#6006)
+
+`functional_h1_h2_auth_lifetime_test.rs` isolates its buffered and streamed
+sender-acquisition cases from binary startup capability probes with the cold
+in-process harness. A backend preface barrier and observed socket closure
+prove cancellation without sending RPC frames; a completed healthy follow-up
+checks pool recovery, breaker neutrality, and stable once-only expiry accounting.
+
+`functional_otel_attempt_spans_test.rs` retains one frontend H2 connection for
+both live RPCs, completes their bodies, and holds the scripted backend open
+through trace inspection. One backend accept/handshake independently proves
+reuse while strict per-attempt timing and parentage assertions remain in place.
+See [the hosted failures and causal evidence](grpc_qualification_6006.md).
+
 ### scripted_backend_matrix_tests.rs
 
 Located in `tests/functional/scripted_backend_matrix_tests.rs`; cross-protocol

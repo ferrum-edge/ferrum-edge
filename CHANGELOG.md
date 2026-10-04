@@ -100,6 +100,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **gRPC qualification fixtures prove acquisition expiry and physical reuse**
+  (#6006). Isolate buffered and streamed acquisition from the binary startup
+  probe's shorter coalesced connect budget; observe preface, socket closure,
+  absence of RPC frames, exactly one expiry, and successful pool/breaker recovery
+  without a sleep-based settlement. Retain one frontend H2 connection for both
+  live OTEL RPCs and prove one backend accept/handshake while preserving cold
+  setup timings, genuine reuse without setup attributes, attempt parentage, and
+  three connect-failure retry spans. Production lifetime and pool semantics are
+  unchanged. Fresh hosted qualification remains pending; see
+  [the root-cause record](docs/grpc_qualification_6006.md).
+
 - **H1/H2 listener dispatch keeps large child futures out of enclosing poll
   frames** (#5993). The frontend boxes its concrete handler rather than an
   async trampoline, and routing/backend dispatch boxes its selected child

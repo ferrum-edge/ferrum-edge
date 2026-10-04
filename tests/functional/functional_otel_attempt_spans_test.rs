@@ -10,7 +10,8 @@
 //! * gRPC: connect-failure retries against a refused target (the attempt set up
 //!   a connection that never came up), then two RPCs on a live target: the
 //!   first establishes the pooled connection with its measured setup phases,
-//!   the second rides it.
+//!   the second rides it on the same frontend H2 connection. A backend accept
+//!   count proves physical reuse independently of the exported attribute.
 //! * A client that aborts while a slow backend holds the attempt: the dropped
 //!   request still exports the attempt, as `cancelled`, so the backend's
 //!   parent span exists.
@@ -328,8 +329,9 @@ fn grpc_frame(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Send one unary gRPC call through the gateway and return its `grpc-status`.
-async fn send_grpc(gateway_addr: &str, path: &str) -> String {
+/// Keep the frontend sender alive across calls: gRPC shard affinity belongs to
+/// this H2 connection, and a different connection may create a different shard.
+async fn connect_grpc(gateway_addr: &str) -> http2::SendRequest<Full<Bytes>> {
     let addr: SocketAddr = gateway_addr.parse().expect("gateway address");
     let stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -340,19 +342,35 @@ async fn send_grpc(gateway_addr: &str, path: &str) -> String {
     tokio::spawn(async move {
         let _ = conn.await;
     });
+    sender.ready().await.expect("gateway sender ready");
+    sender
+}
+
+/// Complete one unary RPC, including its response body and trailers, before
+/// allowing the next call on the same frontend connection.
+async fn send_grpc(
+    sender: &mut http2::SendRequest<Full<Bytes>>,
+    gateway_addr: &str,
+    path: &str,
+) -> String {
+    sender.ready().await.expect("gateway sender ready");
     let request = Request::builder()
         .method("POST")
-        .uri(format!("http://{addr}{path}"))
+        .uri(format!("http://{gateway_addr}{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(Full::new(Bytes::from(grpc_frame(b"ping"))))
         .expect("request");
     let response = sender.send_request(request).await.expect("response");
     assert_eq!(response.status(), http::StatusCode::OK);
-    if let Some(status) = response.headers().get("grpc-status") {
-        return status.to_str().expect("ascii").to_string();
-    }
+    let head_status = response
+        .headers()
+        .get("grpc-status")
+        .map(|status| status.to_str().expect("ascii").to_string());
     let collected = response.into_body().collect().await.expect("body");
+    if let Some(status) = head_status {
+        return status;
+    }
     collected
         .trailers()
         .and_then(|trailers| trailers.get("grpc-status"))
@@ -387,6 +405,9 @@ async fn grpc_attempt_spans_cover_connect_retries_and_pooled_connection_reuse() 
     let backend = ScriptedGrpcBackend::builder_plain(listener)
         .steps(unary_rpc())
         .steps(unary_rpc())
+        // Keep the physical connection alive through the reuse/span checks.
+        // The one-shot fixture otherwise stops its driver after a 100ms tail.
+        .step(GrpcStep::AwaitTestSignal)
         .spawn()
         .expect("spawn backend");
 
@@ -437,20 +458,38 @@ async fn grpc_attempt_spans_cover_connect_retries_and_pooled_connection_reuse() 
         .trim_start_matches("http://")
         .to_string();
 
+    let mut sender = connect_grpc(&gateway_addr).await;
     assert_eq!(
-        send_grpc(&gateway_addr, "/down/ferrum.Echo/Ping").await,
+        send_grpc(
+            &mut sender,
+            &gateway_addr,
+            "/down/ferrum.Echo/Ping",
+        )
+        .await,
         "14",
         "every attempt against the refused target fails"
     );
     for _ in 0..2 {
         assert_eq!(
-            send_grpc(&gateway_addr, "/grpc/ferrum.Echo/Ping").await,
+            send_grpc(
+                &mut sender,
+                &gateway_addr,
+                "/grpc/ferrum.Echo/Ping",
+            )
+            .await,
             "0"
         );
     }
     backend.assert_no_step_errors().await;
     let streams = backend.received_streams().await;
     assert_eq!(streams.len(), 2);
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "both completed RPCs must use the same physical backend connection: {:?}",
+        backend.accept_log()
+    );
+    assert_eq!(backend.handshakes_completed(), 1);
     let live: Vec<(String, String)> = streams
         .iter()
         .map(|stream| traceparent_ids(stream.header("traceparent").expect("traceparent")))
@@ -554,6 +593,11 @@ async fn grpc_attempt_spans_cover_connect_retries_and_pooled_connection_reuse() 
             "a reused connection reports {key}"
         );
     }
+
+    assert_ne!(live[0].0, live[1].0, "each RPC has its own trace");
+    assert_ne!(live[0].1, live[1].1, "each RPC has its own attempt span");
+    assert_eq!(backend.accepted_connections(), 1);
+    backend.release_test_signal();
 
     drop(refused);
 }
