@@ -13,6 +13,7 @@ mod changelog_upgrade_parity_tests;
 mod circuit_breaker_config_tests;
 mod conf_file_aware_var_reads_tests;
 mod conf_file_tests;
+mod conditional_live_stores_ci_tests;
 mod config_backup_tests;
 mod config_change_watch_tests;
 mod config_file_loader_tests;

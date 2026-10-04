@@ -1442,41 +1442,109 @@ jobs:
 
       - name: Start conditional restore live stores
         if: matrix.conditional_live_stores == true
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          docker run -d --name conditional-postgres -p 5432:5432 \
-            -e POSTGRES_DB=ferrum -e POSTGRES_USER=ferrum -e POSTGRES_PASSWORD=ferrum \
-            postgres:16-alpine
-          docker run -d --name conditional-mysql -p 3306:3306 \
-            -e MYSQL_DATABASE=ferrum -e MYSQL_USER=ferrum -e MYSQL_PASSWORD=ferrum \
-            -e MYSQL_ROOT_PASSWORD=ferrum mysql:8
-          docker run -d --name conditional-mongo --network host \
-            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+          set +x
+          # Docker Hub OCI index digests verified against registry-1.docker.io
+          # on 2026-10-04. Preserve the existing tags/majors and client versions.
+          postgres_image='postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea'
+          mysql_image='mysql:8@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242'
+          mongo_image='mongo:7@sha256:1f995ad6fdb93244a1addab1b58f934a0bc2f5643c38e02f5e9d7f0c7d227a7b'
+          deadline=$((SECONDS + 480))
+          fixture_phase='initializing credentials'
+          cleanup_on_failure() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              echo "::error::conditional live stores failed while $fixture_phase"
+              timeout --kill-after=5s 20s docker rm -f -v \
+                conditional-postgres conditional-mysql conditional-mongo \
+                conditional-postgres-client conditional-mysql-client >/dev/null 2>&1 \
+                || echo '::warning::fixture cleanup incomplete; the always-run cleanup will retry'
+            fi
+            exit "$status"
+          }
+          trap cleanup_on_failure EXIT
+          bounded() {
+            local limit="$1"
+            shift
+            local remaining=$((deadline - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            if [ "$remaining" -lt "$limit" ]; then
+              limit="$remaining"
+            fi
+            timeout --kill-after=5s "${limit}s" "$@"
+          }
+          wait_for_store() {
+            fixture_phase="$1"
+            shift
+            until bounded 15 "$@" >/dev/null 2>&1; do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::conditional live stores readiness deadline exceeded while $fixture_phase"
+                return 1
+              fi
+              bounded 3 sleep 2 || return 1
+            done
+          }
+          # Per-run credentials travel in environment variables, never client
+          # argv. Mask both passwords and test URLs before any later step logs.
+          POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+          MYSQL_PASSWORD="$(openssl rand -hex 24)"
+          MYSQL_ROOT_PASSWORD="$(openssl rand -hex 24)"
+          for password in "$POSTGRES_PASSWORD" "$MYSQL_PASSWORD" "$MYSQL_ROOT_PASSWORD"; do
+            printf '::add-mask::%s\n' "$password"
+          done
+          export POSTGRES_PASSWORD MYSQL_PASSWORD MYSQL_ROOT_PASSWORD
+          export PGPASSWORD="$POSTGRES_PASSWORD" MYSQL_PWD="$MYSQL_PASSWORD"
+          postgres_url="postgres://ferrum:${POSTGRES_PASSWORD}@127.0.0.1:5432/ferrum"
+          mysql_url="mysql://ferrum:${MYSQL_PASSWORD}@127.0.0.1:3306/ferrum"
+          printf '::add-mask::%s\n' "$postgres_url" "$mysql_url"
+          printf 'CONDITIONAL_POSTGRES_URL=%s\nCONDITIONAL_MYSQL_URL=%s\n' \
+            "$postgres_url" "$mysql_url" >> "$GITHUB_ENV"
+          fixture_phase='pulling pinned database images'
+          bounded 120 docker pull "$postgres_image"
+          bounded 120 docker pull "$mysql_image"
+          bounded 120 docker pull "$mongo_image"
+          fixture_phase='starting loopback database fixtures and TCP clients'
+          bounded 30 docker run -d --name conditional-postgres -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_DB=ferrum -e POSTGRES_USER=ferrum -e POSTGRES_PASSWORD \
+            "$postgres_image"
+          bounded 30 docker run -d --name conditional-mysql -p 127.0.0.1:3306:3306 \
+            -e MYSQL_DATABASE=ferrum -e MYSQL_USER=ferrum -e MYSQL_PASSWORD \
+            -e MYSQL_ROOT_PASSWORD "$mysql_image"
+          bounded 30 docker run -d --name conditional-mongo --network host \
+            "$mongo_image" --replSet rs0 --port 27020 --bind_ip 127.0.0.1 \
             --setParameter transactionLifetimeLimitSeconds=180
-          for attempt in $(seq 1 90); do
-            if docker exec conditional-postgres pg_isready -U ferrum -d ferrum \
-              && docker exec conditional-mysql mysql -uferrum -pferrum ferrum -e 'SELECT 1' \
-              && docker exec conditional-mongo mongosh --quiet --port 27020 \
-                --eval 'quit(db.adminCommand({ping: 1}).ok === 1 ? 0 : 1)'; then
-              break
-            fi
-            if [ "$attempt" = 90 ]; then
-              echo "::error::conditional restore databases did not become ready"
-              exit 1
-            fi
-            sleep 2
-          done
-          docker exec conditional-mongo mongosh --quiet --port 27020 --eval \
-            'rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27020"}]})'
-          for attempt in $(seq 1 60); do
-            if docker exec conditional-mongo mongosh --quiet --port 27020 \
-              --eval 'quit(db.hello().isWritablePrimary === true ? 0 : 1)'; then
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::conditional restore MongoDB replica set has no writable primary"
-          exit 1
+          # These sleeping client containers share the RUNNER network namespace.
+          # Explicit TCP queries authenticate against the published test ports,
+          # never the temporary init server's container-local SQL socket.
+          bounded 30 docker run -d --name conditional-postgres-client --network host \
+            -e PGPASSWORD -e PGCONNECT_TIMEOUT=3 --entrypoint sleep "$postgres_image" infinity
+          bounded 30 docker run -d --name conditional-mysql-client --network host \
+            -e MYSQL_PWD --entrypoint sleep "$mysql_image" infinity
+          wait_for_store 'authenticating PostgreSQL at 127.0.0.1:5432/ferrum' \
+            docker exec conditional-postgres-client psql --no-psqlrc --no-password \
+              --host=127.0.0.1 --port=5432 --username=ferrum --dbname=ferrum \
+              --set=ON_ERROR_STOP=1 --command='SELECT 1'
+          wait_for_store 'authenticating MySQL at 127.0.0.1:3306/ferrum' \
+            docker exec conditional-mysql-client mysql --protocol=TCP \
+              --host=127.0.0.1 --port=3306 --user=ferrum --database=ferrum \
+              --connect-timeout=3 --execute='SELECT 1'
+          wait_for_store 'probing MongoDB at 127.0.0.1:27020' \
+            docker exec conditional-mongo mongosh --quiet \
+              'mongodb://127.0.0.1:27020/?directConnection=true&serverSelectionTimeoutMS=3000' \
+              --eval 'quit(db.adminCommand({ping: 1}).ok === 1 ? 0 : 1)'
+          fixture_phase='initiating the MongoDB replica set'
+          bounded 15 docker exec conditional-mongo mongosh --quiet \
+            'mongodb://127.0.0.1:27020/?directConnection=true&serverSelectionTimeoutMS=3000' \
+            --eval 'quit(rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27020"}]}).ok === 1 ? 0 : 1)' \
+            >/dev/null 2>&1
+          wait_for_store 'waiting for MongoDB rs0 writable primary at 127.0.0.1:27020' \
+            docker exec conditional-mongo mongosh --quiet \
+              'mongodb://127.0.0.1:27020/?replicaSet=rs0&serverSelectionTimeoutMS=3000' \
+              --eval 'quit(db.hello().isWritablePrimary === true ? 0 : 1)'
+          echo 'Conditional live stores authenticated on runner loopback; MongoDB rs0 is writable.'
 
       - name: Run integration test shard
         # Mirrors the `test-functional` shard runner. Each filter line is a
@@ -1498,6 +1566,9 @@ jobs:
           done <<< "$INTEGRATION_FILTERS"
           nextest_args=()
           if [ "$CONDITIONAL_LIVE_STORES" = "true" ]; then
+            : "${POSTGRES_URL:?conditional live stores require POSTGRES_URL}"
+            : "${MYSQL_URL:?conditional live stores require MYSQL_URL}"
+            : "${MONGO_URL:?conditional live stores require MONGO_URL}"
             nextest_args+=(--run-ignored=all -j 1)
           fi
           cargo nextest run \
@@ -1509,19 +1580,27 @@ jobs:
         env:
           INTEGRATION_FILTERS: ${{ matrix.filters }}
           CONDITIONAL_LIVE_STORES: ${{ matrix.conditional_live_stores == true && 'true' || 'false' }}
-          POSTGRES_URL: ${{ matrix.conditional_live_stores == true && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
-          MYSQL_URL: ${{ matrix.conditional_live_stores == true && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
+          POSTGRES_URL: ${{ matrix.conditional_live_stores == true && env.CONDITIONAL_POSTGRES_URL || '' }}
+          MYSQL_URL: ${{ matrix.conditional_live_stores == true && env.CONDITIONAL_MYSQL_URL || '' }}
           MONGO_URL: ${{ matrix.conditional_live_stores == true && 'mongodb://127.0.0.1:27020/?replicaSet=rs0' || '' }}
           RUST_BACKTRACE: 1
         timeout-minutes: 30
 
       - name: Stop conditional restore live stores
         if: always() && matrix.conditional_live_stores == true
+        timeout-minutes: 2
         run: |
-          docker logs conditional-postgres || true
-          docker logs conditional-mysql || true
-          docker logs conditional-mongo || true
-          docker rm -f conditional-postgres conditional-mysql conditional-mongo || true
+          set -euo pipefail
+          # Never dump credential-bearing database logs or inspect environment.
+          # Discovery makes cleanup idempotent after a partial startup failure.
+          container_ids="$(timeout --kill-after=5s 20s docker ps -aq \
+            --filter 'name=^/conditional-(postgres|mysql|mongo)(-client)?$')" \
+            || { echo '::error::conditional live store cleanup could not list containers'; exit 1; }
+          if [ -n "$container_ids" ]; then
+            mapfile -t containers <<< "$container_ids"
+            timeout --kill-after=5s 20s docker rm -f -v "${containers[@]}" >/dev/null \
+              || { echo '::error::conditional live store cleanup failed'; exit 1; }
+          fi
 
       - name: Check the test run left the checkout clean
         # Same guard as the Unit Tests job (issue #5706). The downloaded
