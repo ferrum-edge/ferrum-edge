@@ -1,3 +1,4 @@
+use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     oidc_open_session_cookie_for_test, oidc_resolve_discovery_for_test,
@@ -7,6 +8,8 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{AuthMode, GatewayConfig, PluginConfig, PluginScope};
+use ferrum_edge::fips::backend::rand::{SecureRandom, SystemRandom};
+use ferrum_edge::plugins::utils::session_cookie::normalize_secret;
 use ferrum_edge::plugins::validate_plugin_config;
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, key_auth::KeyAuth,
@@ -4384,12 +4387,17 @@ fn the_config_component_agrees_with_constructor_admission() {
 /// placeholder, its own sequential test fixtures, the Foundry OIDC template key
 /// (GHSA-hjw6-685j-p5hw), and obvious placeholder words — must be refused for
 /// both the current and the previous secret at the shared validation entry
-/// point every write path uses.
+/// point every write path uses, including Base64 spellings of the same material.
 #[test]
 fn published_or_placeholder_session_secrets_are_rejected_for_both_fields() {
     const DENIED: &[&str] = &[
         // Documented placeholder, stored literally rather than resolved.
         "${OIDC_SESSION_SECRET_32_BYTES_MIN}",
+        // Unresolved templates must be detected at any position.
+        "oidc-${OIDC_SESSION_SECRET_32_BYTES_MIN}",
+        "0123456789abcdef0123456789abcdef${KEY}",
+        "0123456789abcdef${KEY}0123456789abcdef",
+        "0123456789abcdef0123456789abcdef${KEY",
         // The key Ferrum Foundry's OIDC template published.
         "change-me-32-byte-minimum-secret!!",
         // Sequential fixtures Edge's own tests and examples used.
@@ -4399,32 +4407,49 @@ fn published_or_placeholder_session_secrets_are_rejected_for_both_fields() {
         // Obvious placeholders (case-insensitive substrings).
         "changeme-please-and-thank-you-000000",
         "ChAnGe-Me",
+        "ChAnGe-Me-000000000000000000000000",
         "change_me",
+        "change_me-000000000000000000000000",
         "replace-me-with-a-random-secret",
+        "replace-me-with-a-random-secret-000000",
         "REPLACE_ME",
+        "REPLACE_ME-000000000000000000000000",
         "placeholder-secret-value-00000000000",
         "example-secret-value-00000000000000",
         "your-secret-00000000000000000000000",
         "your_secret",
+        "your_secret-000000000000000000000000",
     ];
-    for secret in DENIED {
-        let mut on_current = base_config();
-        on_current["session"]["encryption_secret"] = json!(secret);
-        let error = validate_plugin_config("oidc_relying_party", &on_current)
-            .expect_err("published/placeholder current secret must be rejected");
-        assert!(
-            error.contains("session.encryption_secret"),
-            "published/placeholder current secret {secret:?} was not named in: {error}"
-        );
-
-        let mut on_previous = base_config();
-        on_previous["session"]["encryption_secret_previous"] = json!(secret);
-        let error = validate_plugin_config("oidc_relying_party", &on_previous)
-            .expect_err("published/placeholder previous secret must be rejected");
-        assert!(
-            error.contains("session.encryption_secret_previous"),
-            "published/placeholder previous secret {secret:?} was not named in: {error}"
-        );
+    let (logs, _guard) = super::plugin_utils::capture_logs();
+    for &secret in DENIED {
+        let mut spellings = vec![secret.to_string()];
+        if secret.len() >= 32 {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(secret);
+            assert_eq!(
+                normalize_secret(&encoded).unwrap(),
+                normalize_secret(secret).unwrap(),
+                "Base64 fixture must preserve the effective key material"
+            );
+            spellings.push(encoded);
+        }
+        for spelling in spellings {
+            for field in ["encryption_secret", "encryption_secret_previous"] {
+                let mut config = base_config();
+                config["session"][field] = json!(spelling);
+                let error = validate_plugin_config("oidc_relying_party", &config)
+                    .expect_err("published/placeholder secret must be rejected");
+                assert_eq!(
+                    error,
+                    format!(
+                        "oidc_relying_party: `session.{field}` must not be a published or \
+                         placeholder secret; generate a unique random value"
+                    )
+                );
+                let diagnostics = format!("{error}\n{}", logs.contents());
+                assert!(!diagnostics.contains(&spelling));
+                assert!(!diagnostics.contains(secret));
+            }
+        }
     }
 }
 
@@ -4437,6 +4462,30 @@ fn unique_session_secrets_are_admitted_on_both_fields() {
     config["session"]["encryption_secret_previous"] = json!("2d8b6f0a4c1e9375b8d2f6a0c4e19753");
     validate_plugin_config("oidc_relying_party", &config)
         .expect("unique current and previous secrets must be admitted");
+}
+
+#[test]
+fn generated_session_secrets_are_admitted_on_both_fields() {
+    let rng = SystemRandom::new();
+    // A 24-byte decode falls back to the 32-character raw Base64 spelling;
+    // larger values exercise decoded binary key material instead.
+    for key_bytes in [24, 32, 64] {
+        let mut current = vec![0u8; key_bytes];
+        let mut previous = vec![0u8; key_bytes];
+        rng.fill(&mut current).expect("generate current secret");
+        rng.fill(&mut previous).expect("generate previous secret");
+        let current = base64::engine::general_purpose::STANDARD.encode(current);
+        let previous = base64::engine::general_purpose::STANDARD.encode(previous);
+        for current in [current.clone(), format!("oidc:{current}")] {
+            for previous in [previous.clone(), format!("oidc:{previous}")] {
+                let mut config = base_config();
+                config["session"]["encryption_secret"] = json!(current);
+                config["session"]["encryption_secret_previous"] = json!(previous);
+                validate_plugin_config("oidc_relying_party", &config)
+                    .expect("generated current and previous secrets must be admitted");
+            }
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────

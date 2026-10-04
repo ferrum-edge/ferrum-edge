@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secrets Ferrum's own tests used, and obvious placeholders (`changeme`,
   `change-me`/`change_me`, `replace-me`/`replace_me`, `placeholder`, `example`,
   `your-secret`). Both fields are now screened against a small documented
-  deny-list at the shared plugin-config validation entry point, so Admin API
+  deny-list over both the supplied value and the effective pre-HKDF key
+  material, so Base64 spellings cannot bypass rejection. Unresolved `${...}`
+  templates are refused anywhere in either textual value. Screening runs at
+  the shared plugin-config validation entry point, so Admin API
   create/update, batch, restore, and file/database config load all reject with a
   `400` naming the field. Disabled configs may still be saved before an operator
   supplies a key. Generate a unique random secret of at least 32 bytes and

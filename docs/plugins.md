@@ -2788,10 +2788,14 @@ load) against a small deny-list of known-public secrets: Ferrum's documented
 Ferrum Foundry's OIDC relying-party template published, the sequential secrets
 Ferrum's own examples and tests used, and obvious placeholders such as
 `changeme`, `change-me`/`change_me`, `replace-me`/`replace_me`, `placeholder`,
-`example`, and `your-secret`. A rejected value returns an Admin API `400` naming
-the offending field. Generate a unique random secret of at least 32 bytes per
-deployment, and rotate through `session.encryption_secret_previous` instead of
-reusing a published value.
+`example`, and `your-secret`. The supplied value and its effective key material
+are both screened: standard Base64 is decoded only when it yields at least 32
+bytes, otherwise the raw value is used before HKDF. Base64 spellings of denied
+values are rejected, as are unresolved `${...}` templates anywhere in either
+textual value. A rejected value returns an Admin API `400` naming the offending
+field without revealing the secret. Generate a unique random secret of at least
+32 bytes per deployment, and rotate through `session.encryption_secret_previous`
+instead of reusing a published value.
 
 ```yaml
 plugin_name: oidc_relying_party

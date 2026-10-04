@@ -141,25 +141,35 @@ const DENIED_SESSION_SECRET_SUBSTRINGS: &[&str] = &[
 /// value that is a published or placeholder secret. `field` is the dotted
 /// config path used in the error so an Admin API 400 names the offending key.
 ///
-/// An unresolved `${...}` env placeholder is refused as well: the value would
-/// be stored literally rather than resolved before admission.
+/// Screen both the supplied spelling and the effective pre-HKDF key material,
+/// using the same normalization as key derivation. An unresolved `${...}` env
+/// placeholder anywhere in either value is refused as well: it would be stored
+/// literally rather than resolved before admission.
 pub fn reject_published_session_secret(secret: &str, field: &str) -> Result<(), String> {
-    let trimmed = secret.trim();
-    let lowered = trimmed.to_ascii_lowercase();
-    let unresolved_placeholder = trimmed.starts_with("${");
-    let denied_exact = DENIED_SESSION_SECRETS
-        .iter()
-        .any(|known| trimmed.eq_ignore_ascii_case(known));
-    let denied_substring = DENIED_SESSION_SECRET_SUBSTRINGS
-        .iter()
-        .any(|token| lowered.contains(*token));
-    if unresolved_placeholder || denied_exact || denied_substring {
+    // Known public values and templates are textual; binary Base64 key
+    // material remains supported without interpreting it as a template.
+    if is_denied_session_secret(secret)
+        || std::str::from_utf8(&normalize_secret(secret)?).is_ok_and(is_denied_session_secret)
+    {
         return Err(format!(
             "oidc_relying_party: `{field}` must not be a published or placeholder secret; \
              generate a unique random value"
         ));
     }
     Ok(())
+}
+
+fn is_denied_session_secret(secret: &str) -> bool {
+    let trimmed = secret.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    let unresolved_placeholder = trimmed.contains("${");
+    let denied_exact = DENIED_SESSION_SECRETS
+        .iter()
+        .any(|known| trimmed.eq_ignore_ascii_case(known));
+    let denied_substring = DENIED_SESSION_SECRET_SUBSTRINGS
+        .iter()
+        .any(|token| lowered.contains(*token));
+    unresolved_placeholder || denied_exact || denied_substring
 }
 
 pub fn normalize_secret(secret: &str) -> Result<Vec<u8>, String> {
