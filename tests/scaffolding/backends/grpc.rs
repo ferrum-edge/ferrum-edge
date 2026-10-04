@@ -229,7 +229,10 @@ impl ScriptedGrpcBackendBuilder {
                 lowered.push(H2Step::DrainRequestBody);
             }
             for step in steps {
-                if matches!(step, GrpcStep::AcceptRpc(_) | GrpcStep::AcceptStreamingRpc(_)) {
+                if matches!(
+                    step,
+                    GrpcStep::AcceptRpc(_) | GrpcStep::AcceptStreamingRpc(_)
+                ) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "RPC script must handle exactly one RPC",
@@ -632,7 +635,10 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(3), response)
                 .await
                 .expect("invalid RPC must fail promptly");
-            assert!(result.is_err(), "unmatched or ambiguous RPC must not succeed");
+            assert!(
+                result.is_err(),
+                "unmatched or ambiguous RPC must not succeed"
+            );
             assert_eq!(backend.matcher_mismatches(), 1);
             assert_eq!(backend.received_stream_count(), 1);
         }
