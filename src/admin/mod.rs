@@ -12409,14 +12409,6 @@ pub(crate) fn error_persistence_failure_redacted(surface: &'static str) {
     );
 }
 
-pub(crate) fn debug_persistence_failure_redacted(surface: &'static str) {
-    debug!(
-        surface = surface,
-        detail_withheld = true,
-        "Persistence failure in admin API; error detail withheld"
-    );
-}
-
 /// Create a copy of the consumer with sensitive credential values redacted
 /// for safe inclusion in API responses.
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {

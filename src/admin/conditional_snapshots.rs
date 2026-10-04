@@ -350,10 +350,10 @@ pub(super) async fn restore(
             response["restored"].clone(),
         ),
     );
-    if let Some(db) = &state.db {
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
-            super::log_audit_enqueue_failure(&error);
-        }
+    if let Some(db) = &state.db
+        && let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await
+    {
+        super::log_audit_enqueue_failure(&error);
     }
     json_response(StatusCode::OK, &response)
 }

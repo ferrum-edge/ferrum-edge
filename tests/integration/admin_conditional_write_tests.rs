@@ -66,7 +66,7 @@ fn admin_token() -> String {
     token_with_role(JWT_SECRET, "admin")
 }
 
-async fn make_store(dir: &TempDir) -> Arc<dyn DatabaseBackend> {
+async fn make_store(dir: &TempDir) -> Arc<DatabaseStore> {
     let db_path = dir
         .path()
         .join(format!("conditional-{}.db", uuid::Uuid::new_v4()));
@@ -1389,10 +1389,10 @@ async fn sqlite_conditional_restore_checks_state_and_lease_inside_the_transactio
     let db = make_store(&dir).await;
     assert_transaction_precondition(db.as_ref()).await;
     let pool = db.pool();
-    assert_restore_renewal_and_fencing(db, move |namespace, ttl| {
+    assert_restore_renewal_and_fencing(db.clone(), move |namespace, ttl| {
         let pool = pool.clone();
         async move {
-            sqlx::query(
+            let result = sqlx::query(
                 "UPDATE config_admission_locks SET expires_at = \
                  CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + ? \
                  WHERE namespace = ?",
@@ -1402,9 +1402,11 @@ async fn sqlite_conditional_restore_checks_state_and_lease_inside_the_transactio
             .execute(&pool)
             .await
             .unwrap();
+            assert_eq!(result.rows_affected(), 1);
         }
     })
     .await;
+    db.pool().close().await;
 }
 
 /// Healthy keepers must extend live leases, including after a wait beyond the
@@ -1666,6 +1668,14 @@ where
     db.release_namespace_config_admission_lease(&namespace, &competitor)
         .await
         .unwrap();
+    drop(guard);
+    let local = tokio::time::timeout(
+        Duration::from_secs(15),
+        ferrum_edge::_test_support::lock_namespace_config_admission_for_test(&namespace),
+    )
+    .await
+    .expect("restore cleanup completes before fixture pool closure");
+    drop(local);
 }
 
 /// A row lock held without a server timeout blocks both renewal and release.

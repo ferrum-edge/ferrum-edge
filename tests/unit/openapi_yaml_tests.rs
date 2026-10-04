@@ -1340,10 +1340,72 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         Some(&json!(false)),
         "POST /batch envelope must reject unknown top-level keys"
     );
+    let backup = &spec["components"]["schemas"]["BackupResponse"];
+    let backup_modes = backup["allOf"].as_array().expect("backup credential modes");
+    assert_eq!(backup_modes.len(), 1);
+    assert_eq!(backup_modes[0]["if"], json!({"required": ["conditional"]}));
     assert_eq!(
-        spec.pointer("/components/schemas/BackupResponse/properties/consumers/items/$ref"),
-        Some(&json!("#/components/schemas/ConsumerBackup"))
+        backup_modes[0].pointer("/then/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerVerification")),
+        "only conditional exports may carry exact historical credential shapes"
     );
+    assert_eq!(
+        backup_modes[0].pointer("/else/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerBackup")),
+        "ordinary exports must retain the archival credential contract"
+    );
+    assert!(backup["properties"]["consumers"].get("items").is_none());
+    assert_eq!(
+        backup["properties"]["conditional"]["$ref"],
+        json!("#/components/schemas/ConditionalBackupMetadata")
+    );
+    assert_eq!(
+        paths["/consumers/{id}/verification"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/ConsumerVerification")
+    );
+    let verification = &spec["components"]["schemas"]["ConsumerVerification"];
+    assert_eq!(verification["unevaluatedProperties"], false);
+    assert_eq!(
+        verification["allOf"][0]["$ref"],
+        json!("#/components/schemas/ConsumerBase")
+    );
+    assert_eq!(
+        verification["allOf"][1]["properties"]["credentials"],
+        json!({"type": "object", "additionalProperties": true})
+    );
+    assert_component_validity(&spec, "ConsumerVerification", &stored_value, true);
+    let legacy_value = serde_json::to_value(&legacy_consumer).unwrap();
+    assert_component_validity(&spec, "ConsumerVerification", &legacy_value, true);
+    assert_component_validity(&spec, "Consumer", &legacy_value, false);
+    for rejected in [
+        json!({"username": "alice", "unknown_top_level": true}),
+        json!({"username": "alice", "credentials": []}),
+        json!({"username": "alice", "credentials": "not-an-object"}),
+    ] {
+        assert_component_validity(&spec, "ConsumerVerification", &rejected, false);
+    }
+    let mut export = json!({
+        "version": "1",
+        "ferrum_version": "0.9.9",
+        "exported_at": "2026-10-04T00:00:00Z",
+        "source": "database",
+        "counts": {
+            "proxies": 0, "consumers": 1, "upstreams": 0, "plugin_configs": 0,
+            "api_specs": 0, "gateway_trust_bundles": 0
+        },
+        "proxies": [], "consumers": [stored_value], "upstreams": [], "plugin_configs": []
+    });
+    assert_component_validity(&spec, "BackupResponse", &export, true);
+    export["consumers"] = json!([legacy_value]);
+    assert_component_validity(&spec, "BackupResponse", &export, false);
+    export["conditional"] = json!({
+        "namespace_etag": "\"namespace-tag\"",
+        "row_etags": {"proxies": {}, "consumers": {}, "upstreams": {}, "plugin_configs": {}}
+    });
+    assert_component_validity(&spec, "BackupResponse", &export, true);
+    export["conditional"] = json!({});
+    assert_component_validity(&spec, "BackupResponse", &export, false);
     assert_eq!(
         spec.pointer("/components/schemas/RestoreRequest/properties/consumers/items/$ref"),
         Some(&json!("#/components/schemas/ConsumerRestoreItem"))
@@ -18382,6 +18444,7 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         ("exported_at", json!("2026-09-16T00:00:00Z")),
         ("source", json!("database")),
         ("counts", json!({})),
+        ("conditional", json!({"namespace_etag": "\"tag\"", "row_etags": {}})),
     ]);
 
     let published: BTreeSet<&str> = restore["properties"]
@@ -18428,6 +18491,17 @@ fn restore_request_publishes_the_complete_closed_envelope() {
     ferrum_edge::_test_support::restore_envelope_admission_for_test(whole.to_string().as_bytes())
         .unwrap();
     assert_component_validity(&spec, "RestoreRequest", &whole, true);
+    assert_eq!(restore["properties"]["conditional"]["type"], json!("object"));
+    assert_eq!(
+        restore["properties"]["conditional"]["additionalProperties"],
+        true
+    );
+    let future_metadata = json!({"conditional": {"future_metadata": [1, "opaque"]}});
+    ferrum_edge::_test_support::restore_envelope_admission_for_test(
+        future_metadata.to_string().as_bytes(),
+    )
+    .unwrap();
+    assert_component_validity(&spec, "RestoreRequest", &future_metadata, true);
 
     // Closed on both axes, in the schema and in the runtime alike.
     for rejected in [
@@ -18440,6 +18514,10 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         json!({"counts": 5}),
         json!({"counts": "3"}),
         json!({"counts": true}),
+        json!({"conditional": []}),
+        json!({"conditional": 5}),
+        json!({"conditional": "tag"}),
+        json!({"conditional": true}),
         json!([]),
         json!(["1", [], [], [], []]),
         json!("a string"),
@@ -18549,6 +18627,7 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         ("exported_at", json!("2026-09-16T00:00:00Z")),
         ("source", json!("database")),
         ("counts", json!({})),
+        ("conditional", json!({"namespace_etag": "\"tag\"", "row_etags": {}})),
         ("api_specs", json!({"section_version": "2", "items": []})),
         ("gateway_trust_bundles", json!([])),
     ]);
@@ -18592,6 +18671,18 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         "a complete GET /backup artifact must still round-trip through POST /batch"
     );
     assert_component_validity(&spec, "BatchCreateRequest", &whole, true);
+    assert_eq!(batch["properties"]["conditional"]["type"], json!("object"));
+    assert_eq!(
+        batch["properties"]["conditional"]["additionalProperties"],
+        true
+    );
+    let future_metadata = json!({"conditional": {"future_metadata": [1, "opaque"]}});
+    assert!(
+        ferrum_edge::_test_support::batch_envelope_admits_for_test(
+            future_metadata.to_string().as_bytes(),
+        )
+    );
+    assert_component_validity(&spec, "BatchCreateRequest", &future_metadata, true);
 
     // Schema-invalid metadata is a `400` on POST /batch, same parse restore
     // uses: non-object `counts`, an array `api_specs`, a non-array
@@ -18607,6 +18698,10 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         json!({"gateway_trust_bundles": {}}),
         json!({"gateway_trust_bundles": "not-an-array"}),
         json!({"gateway_trust_bundles": 1}),
+        json!({"conditional": []}),
+        json!({"conditional": 5}),
+        json!({"conditional": "tag"}),
+        json!({"conditional": true}),
         json!({"proxise": []}),
         json!({"proxies": [], "unknown_top_level": true}),
         json!([]),

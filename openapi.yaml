@@ -19428,6 +19428,19 @@ components:
     BackupResponse:
       type: object
       required: [version, ferrum_version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
+      allOf:
+        - if:
+            required: [conditional]
+          then:
+            properties:
+              consumers:
+                items:
+                  $ref: "#/components/schemas/ConsumerVerification"
+          else:
+            properties:
+              consumers:
+                items:
+                  $ref: "#/components/schemas/ConsumerBackup"
       properties:
         conditional:
           $ref: "#/components/schemas/ConditionalBackupMetadata"
@@ -19477,10 +19490,6 @@ components:
             $ref: "#/components/schemas/Proxy"
         consumers:
           type: array
-          items:
-            anyOf:
-              - $ref: "#/components/schemas/ConsumerBackup"
-              - $ref: "#/components/schemas/ConsumerVerification"
         plugin_configs:
           type: array
           items:

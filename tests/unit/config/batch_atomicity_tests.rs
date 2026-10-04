@@ -286,9 +286,22 @@ fn typed_refusals_are_recoverable_from_an_error_chain() {
 /// `begin()`, one `commit()`, every phase between them.
 #[test]
 fn sql_atomic_batch_uses_a_single_transaction_for_every_phase() {
+    let wrapper = SQL_STORE_SOURCE
+        .split("    pub async fn batch_create_config_graph_atomically(")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("\n    async fn write_config_graph_atomically(")
+                .next()
+        })
+        .expect("SQL batch delegates to the shared transaction writer");
+    let delegation = "self.write_config_graph_atomically(graph, mode, None).await";
+    assert!(wrapper.contains(delegation));
+    assert!(!wrapper.contains("begin_write_tx"));
+    assert!(!wrapper.contains("commit()"));
+
     let start = SQL_STORE_SOURCE
-        .find("    pub async fn batch_create_config_graph_atomically(")
-        .expect("SQL atomic batch writer must exist");
+        .find("    async fn write_config_graph_atomically(")
+        .expect("SQL shared atomic graph writer must exist");
     let end = SQL_STORE_SOURCE[start..]
         .find("\n    fn check_atomic_batch_fault(")
         .expect("fault helper must follow the writer")
@@ -322,10 +335,32 @@ fn sql_atomic_batch_uses_a_single_transaction_for_every_phase() {
     let revalidation = body
         .find("validate_namespace_admission_tx")
         .expect("in-transaction admission re-validation");
-    let lease = body
+    let entry_lease = body
         .find("verify_namespace_config_admission_lease_tx")
-        .expect("in-transaction lease verification");
+        .expect("restore entry lease pin");
+    let snapshot = body
+        .find("conditional_namespace_snapshot_tx")
+        .expect("conditional restore snapshot");
+    let clear = body
+        .find("delete_all_resources_in_tx")
+        .expect("conditional restore clear");
+    let batch_lease = body
+        .rfind("verify_namespace_config_admission_lease_tx")
+        .expect("batch commit lease fence");
+    let compaction = body
+        .find("compact_config_changes_tx")
+        .expect("change log compaction");
+    let renewal = body
+        .find("renew_pinned_restore_lease_tx")
+        .expect("restore commit lease renewal");
+    let commit_fault_call = "Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;";
+    let commit_fault = body
+        .find(commit_fault_call)
+        .expect("last rollback fault before commit");
     let commit = body.find("tx.commit()").expect("commit");
+    assert!(entry_lease < snapshot);
+    assert!(snapshot < clear);
+    assert!(clear < consumers);
     assert!(consumers < upstreams);
     assert!(upstreams < proxies);
     assert!(proxies < plugins, "plugin configs reference proxies");
@@ -335,10 +370,40 @@ fn sql_atomic_batch_uses_a_single_transaction_for_every_phase() {
     );
     assert!(associations < revalidation);
     assert!(
-        revalidation < lease,
-        "the lease check is the last gate before commit"
+        revalidation < batch_lease,
+        "batch ownership must be fenced after the exact candidate is validated"
     );
-    assert!(lease < commit);
+    assert!(batch_lease < compaction);
+    assert!(compaction < renewal);
+    assert!(renewal < commit_fault);
+    assert!(commit_fault < commit);
+    assert_eq!(
+        body.matches("verify_namespace_config_admission_lease_tx")
+            .count(),
+        2,
+        "restore pins at entry; batch fences after graph validation"
+    );
+    assert!(body.contains("if restore.is_none()\n            && let Some(lease)"));
+    assert!(body.contains("if restore.is_some()\n            && let Some(lease)"));
+    assert_eq!(
+        body[renewal..commit].matches(".await").count(),
+        1,
+        "only the final restore renewal may await after compaction and before commit"
+    );
+
+    let renewal_body = SQL_STORE_SOURCE
+        .split("    async fn renew_pinned_restore_lease_tx(")
+        .nth(1)
+        .and_then(|tail| tail.split("    pub async fn delete_all_resources(").next())
+        .expect("restore renewal remains inspectable");
+    assert!(renewal_body.contains("WHERE namespace = ? AND owner = ? AND generation = ?"));
+    assert!(renewal_body.contains(".bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)"));
+    assert!(renewal_body.contains(".bind(namespace)"));
+    assert!(renewal_body.contains(".bind(lease.owner)"));
+    assert!(renewal_body.contains(".bind(generation)"));
+    assert!(renewal_body.contains(".execute(&mut **tx)"));
+    assert!(renewal_body.contains("result.rows_affected() != 1"));
+    assert!(renewal_body.contains("anyhow::Error::new(BatchAdmissionLeaseLost)"));
 
     // Proxies are inserted without associations so a plugin config submitted in
     // the same graph is present before anything references it.
