@@ -9,12 +9,15 @@ const PRODUCTION_DOCKERFILES: &[(&str, &str)] = &[
         include_str!("../../../Dockerfile.release"),
     ),
     ("Dockerfile.test", include_str!("../../../Dockerfile.test")),
-    // The eBPF tools layer builds a published `-ebpf-tools` image, so it is as
-    // production as the other three. Omitting it is how `BASE_IMAGE` kept a
-    // digest-less default while this gate reported green.
+    // The eBPF tools layer builds a published `-ebpf-tools` image, so it is a
+    // production image and belongs in this inventory.
     (
         "Dockerfile.ebpf-tools-layer",
         include_str!("../../../Dockerfile.ebpf-tools-layer"),
+    ),
+    (
+        "Dockerfile.iproute2-layer",
+        include_str!("../../../Dockerfile.iproute2-layer"),
     ),
 ];
 

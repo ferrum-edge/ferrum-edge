@@ -571,16 +571,21 @@ silently accepted comment.
 ### Container build inputs (enforcement and refresh)
 
 Every registry image reference in `Dockerfile`, `Dockerfile.release`,
-`Dockerfile.test`, and `Dockerfile.ebpf-tools-layer` — both `FROM <ref>` and the
-`ARG <NAME>=<ref>` defaults those `FROM ${VAR}` lines expand — carries an
-`@sha256:` digest. `scratch` is the only admissible digest-less base, and a
-`FROM` naming an earlier `AS` alias is an internal stage edge, not an input.
+`Dockerfile.test`, `Dockerfile.ebpf-tools-layer`, and
+`Dockerfile.iproute2-layer` — both `FROM <ref>` and the `ARG <NAME>=<ref>`
+defaults those `FROM ${VAR}` lines expand — carries an `@sha256:` digest.
+`Dockerfile.iproute2-layer`'s default `BASE_IMAGE` matches the verified
+production runtime reference
+`gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97`;
+an explicit caller override remains supported. `scratch` is the only
+admissible digest-less base, and a `FROM` naming an earlier `AS` alias is an
+internal stage edge, not an input.
 
 Two independent gates enforce it, because each covers a hole the other leaves:
 
 - `check_dockerfile_image_pins()` in `.github/scripts/verify_ci_runtime_cache.py`,
   reached from the required `verify_required_ci.py` run. It extracts every
-  reference from all four Dockerfiles, requires a digest on each, and separately
+  reference from all five Dockerfiles, requires a digest on each, and separately
   rejects a bare `:latest`. It needs no Rust build, so it fails fast, and it
   binds an `ARG` image default even when no `FROM` consumes it. Its `--self-test`
   cases cover the pinned, unpinned-`FROM`, unpinned-`ARG`, stage-alias, and
@@ -591,7 +596,7 @@ Two independent gates enforce it, because each covers a hole the other leaves:
 Refresh is automated on two tracks, because Dependabot's `docker` ecosystem
 parses `FROM` lines only (`dependabot-core`, `docker/lib/dependabot/docker/file_parser.rb`:
 `FROM_LINE`); it discovers every file matching `/dockerfile|containerfile/i`, so
-all four are in scope, but it cannot see an `ARG` default — which is every input
+all five are in scope, but it cannot see an `ARG` default — which is every input
 of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
 
 - `.github/dependabot.yml` `docker` ecosystem: weekly, Monday, `deps` prefix,
@@ -607,8 +612,9 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   proves a new base before merge.
   The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
   so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
-  `BASE_IMAGE` is supplied by the preceding local image build; the refresh changes
-  only the digest-pinned external tooling input.
+  default `BASE_IMAGE` matches the verified production runtime digest; an
+  explicit caller override remains supported. The refresh workflow already
+  included this Dockerfile and updates its digest-pinned image references.
 
 Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
 fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the
