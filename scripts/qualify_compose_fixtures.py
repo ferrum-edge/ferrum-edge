@@ -9,8 +9,11 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+from test_compose_fixture_qualification import check_fixture_scan_helpers
 
 
 PG_IMAGE = (
@@ -59,6 +62,21 @@ def command_env(command, env):
     return result
 
 
+def command_failure(command, category, returncode=None):
+    # Select labels from a finite inventory, never interpolate command data.
+    operation, fields = command
+    stages = {
+        (operation, name): operation + "-" + label
+        for operation in ("inspect", "top", "logs")
+        for name, label in ((PG, "postgres"), (MYSQL, "mysql"))
+    }
+    stage = stages.get((operation, fields.get("container")), "fixture-command")
+    categories = {"failed", "deadline", "launch"}
+    category = category if category in categories else "failed"
+    status = str(returncode) if type(returncode) is int and -255 <= returncode <= 255 else "none"
+    return "Fixture command " + category + " stage=" + stage + " exit=" + status + " (output withheld)"
+
+
 def run(command, *, env=None, timeout=30, check=True):
     try:
         result = subprocess.run(
@@ -66,9 +84,11 @@ def run(command, *, env=None, timeout=30, check=True):
             env=command_env(command, env), capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Fixture command exceeded its deadline") from None
+        raise RuntimeError(command_failure(command, "deadline")) from None
+    except OSError:
+        raise RuntimeError(command_failure(command, "launch")) from None
     if check:
-        require(result.returncode == 0, "Fixture command failed (output withheld)")
+        require(result.returncode == 0, command_failure(command, "failed", result.returncode))
     return result
 
 
@@ -592,28 +612,99 @@ def observed_mysql_query(certs, *, rogue, case):
     return proven
 
 
-def assert_no_exposure(names, passwords):
-    for name in names:
-        container = inspect(name)
-        surfaces = json.dumps(container["Config"]["Healthcheck"])
-        surfaces += run(request("top", container=name)).stdout
-        logs = run(request("logs", container=name))
-        surfaces += logs.stdout
-        # Logs can be emitted on either stream by the image entrypoint.
-        surfaces += logs.stderr
+def parse_process_inventory(output):
+    require(len(output) <= 1048576, "Oversized SQL process inventory")
+    lines = output.splitlines()
+    require(len(lines) > 1 and lines[0].split() == ["PID", "COMMAND"],
+            "Missing SQL process inventory or PID/argv columns")
+    processes = {}
+    for line in lines[1:]:
+        match = re.fullmatch(r"[ \t]*([1-9][0-9]*)[ \t]+(.+)", line)
+        require(match is not None, "Malformed SQL process inventory")
+        pid = int(match.group(1))
+        require(pid not in processes, "Duplicate SQL process inventory PID")
+        processes[pid] = match.group(2)
+    return processes
+
+
+def process_inventory(name):
+    return parse_process_inventory(run(request("top", container=name)).stdout)
+
+
+def reject_credentials(surfaces, passwords):
+    require(len(passwords) == 3 and all(re.fullmatch(r"[0-9a-f]{64}", value)
+                                      for value in passwords),
+            "Invalid SQL credential canaries")
+    for surface in surfaces:
         for password in passwords:
-            require(password not in surfaces, "Credential found in healthcheck, process argv or logs")
-        require(not any("PASSWORD=" in item or "MYSQL_PWD=" in item
-                        for item in container["Config"]["Env"]),
-                "Plaintext SQL password found in Docker environment configuration")
-    # Include host Docker CLI argv, not only the SQL clients inside containers.
-    for path in Path("/proc").glob("[0-9]*/cmdline"):
+            require(password.encode("ascii") not in surface,
+                    "Credential found in SQL configuration, process argv or logs")
+
+
+def host_process_inventory(probes):
+    # Docker exec replaces the dispatcher at the same PID. Require both owned
+    # Docker clients to be alive and readable; a partial /proc scan cannot pass.
+    probes = tuple(probes)
+    expected = {process.pid: query.encode("ascii") for process, query in probes}
+    require(len(expected) == 2 and all(process.poll() is None for process, _ in probes),
+            "Live host SQL probe processes missing")
+    observed = set()
+    surfaces = []
+    try:
+        directories = list(Path("/proc").iterdir())
+    except OSError:
+        raise RuntimeError("Host process argv scan could not enumerate processes") from None
+    for directory in directories:
+        if not directory.name.isdecimal():
+            continue
+        pid = int(directory.name)
+        path = directory / "cmdline"
         try:
             data = path.read_bytes()
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError):
+            # Unrelated processes may exit between enumeration and read.
+            require(pid not in expected, "Live host SQL probe exited during argv scan")
             continue
-        for password in passwords:
-            require(password.encode() not in data, "Credential found in host process argv")
+        except OSError:
+            raise RuntimeError("Host process argv scan could not read a process") from None
+        if pid in expected:
+            args = data.split(b"\0")
+            require(args and args[0].rsplit(b"/", 1)[-1] == b"docker"
+                    and expected[pid] in args,
+                    "Live host SQL probe argv missing")
+            observed.add(pid)
+        surfaces.append(data)
+    require(observed == set(expected), "Live host SQL probe argv scan incomplete")
+    return surfaces
+
+
+def assert_no_exposure(names, passwords, inventories, host_argv):
+    reject_credentials(host_argv, passwords)
+    for name in names:
+        container = inspect(name)
+        config = container["Config"]
+        healthcheck = config.get("Healthcheck")
+        require(isinstance(healthcheck, dict) and isinstance(healthcheck.get("Test"), list)
+                and len(healthcheck["Test"]) > 1 and healthcheck["Test"][0] in ("CMD", "CMD-SHELL"),
+                "SQL healthcheck configuration missing or disabled")
+        health = container["State"].get("Health")
+        require(isinstance(health, dict) and health.get("Status") == "healthy"
+                and isinstance(health.get("Log"), list) and health["Log"],
+                "SQL healthcheck history missing or unhealthy")
+        require(all(isinstance(entry, dict) and isinstance(entry.get("Output"), str)
+                    for entry in health["Log"]), "SQL healthcheck output missing")
+        processes = inventories[name]
+        require(container["State"]["Pid"] in processes, "SQL server argv missing from inventory")
+        logs = run(request("logs", container=name))
+        require(logs.stdout or logs.stderr, "SQL container logs missing")
+        # Scan complete Docker config, retained healthcheck output, every captured
+        # process row, and both container-log streams. Keep all bytes private.
+        surfaces = [json.dumps(config), json.dumps(health), logs.stdout, logs.stderr,
+                    *processes.values()]
+        reject_credentials([surface.encode("utf-8") for surface in surfaces], passwords)
+        require(not any("PASSWORD=" in item or "MYSQL_PWD=" in item
+                        for item in config["Env"]),
+                "Plaintext SQL password found in Docker environment configuration")
 
 
 def qualify_sql(work):
@@ -761,13 +852,16 @@ def qualify_sql(work):
                 ))
             deadline = time.monotonic() + 3
             while True:
-                pg_top = run(request("top", container=PG)).stdout
-                mysql_top = run(request("top", container=MYSQL)).stdout
-                if "SELECT pg_sleep(4)" in pg_top and "SELECT SLEEP(4)" in mysql_top:
+                inventories = {name: process_inventory(name) for name in (PG, MYSQL)}
+                if (any("SELECT pg_sleep(4)" in argv for argv in inventories[PG].values())
+                        and any("SELECT SLEEP(4)" in argv for argv in inventories[MYSQL].values())):
                     break
                 require(time.monotonic() < deadline, "Did not observe live SQL probe processes")
                 time.sleep(0.1)
-            assert_no_exposure((PG, MYSQL), passwords)
+            host_argv = host_process_inventory(
+                zip(processes, ("SELECT pg_sleep(4)", "SELECT SLEEP(4)")),
+            )
+            assert_no_exposure((PG, MYSQL), passwords, inventories, host_argv)
             for process in processes:
                 process.communicate(timeout=10)
                 require(process.returncode == 0, "Live SQL probe failed")
@@ -791,6 +885,7 @@ def main():
     check_mysql_classifier()
     check_mysql_observation_parser()
     check_mysql_certificate_parser()
+    check_fixture_scan_helpers(sys.modules[__name__])
     os.umask(0o077)
     work = Path(os.environ["RUNNER_TEMP"]) / "compose-fixture-qualification"
     work.mkdir(mode=0o700)

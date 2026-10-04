@@ -15,7 +15,9 @@ case "${FIXTURE_OPERATION:?}" in
         exec docker inspect "${FIXTURE_CONTAINER:?}"
         ;;
     top)
-        exec docker top "${FIXTURE_CONTAINER:?}" -eo args
+        # The daemon filters host ps output by PID; args alone is rejected.
+        # Two wide flags retain the entire argv, including a trailing canary.
+        exec docker top "${FIXTURE_CONTAINER:?}" -eo pid,args -ww
         ;;
     logs)
         exec docker logs "${FIXTURE_CONTAINER:?}"

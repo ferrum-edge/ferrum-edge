@@ -199,6 +199,7 @@ when recording exact-head qualification/review evidence):
 | `docker-compose.tls-test.yml` | Loopback SQL, private mounts, verified readiness |
 | `scripts/setup_db_tls.sh` | Full SQL generation, startup, ownership and cleanup implementation |
 | `scripts/qualify_compose_fixtures.py` | Hosted assertions, private capture, bounded diagnostic admission |
+| `scripts/test_compose_fixture_qualification.py` | Hosted synthetic canary, inventory and command-failure controls |
 | `scripts/compose_fixture_command.sh` | Explicit command graph for all qualifier subprocesses |
 | `scripts/mysql_cli_tls_observer.c` | Hosted-only public OpenSSL observation of the unchanged MySQL CLI argv |
 | `tests/scripts/setup_db_tls.sh` | Released manual entrypoint forwarder |
@@ -430,7 +431,55 @@ noncertificate and unbound observations. Synthetic self-checks are never
 runtime evidence. Remaining availability and credential argv/log scans
 still run before the final fail-closed assertion.
 
-This source is **not yet hosted-qualified**. Root must independently review all
+The [feadc91cf hosted qualification](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37202471389/job/111436786371)
+passed both instrumented original default CLI TLS 1.3 `SELECT 1` positives,
+the same original rogue-client invocation with `2013` plus an incoming
+`unknown_ca` alert, and the subsequent uninstrumented trusted query. It then
+failed at `CHECK: live SQL process argv, healthcheck configuration and logs`
+with the generic withheld command error. Unconditional cleanup passed.
+This establishes the observed invocation's certificate refusal, but supplies
+no completed credential scan or whole-candidate approval.
+
+Static inspection identifies a deterministic defect in the next command:
+`docker top ... -eo args` omits the PID header required by Docker's
+[daemon process filter](https://github.com/moby/moby/blob/v28.0.4/daemon/top_unix.go#L64).
+The daemon invokes host `ps` and rejects output without that header; it does
+not depend on `ps` being installed in either SQL image. The withheld stderr
+does not prove the precise error text from that run. The repaired command
+uses `-eo pid,args -ww`, retaining the required PID and full-width argv.
+Nonzero exit, launch failure and deadline diagnostics now name only a fixed
+operation/container stage and bounded numeric exit status, never command
+inputs or output. No deadline or sleep-query duration was increased.
+
+The live scan validates nonempty PID/argv inventories, observes both sleeping
+clients, and scans those same complete snapshots rather than taking another
+snapshot after the clients may have finished. Each inventory must contain its
+inspected server PID. The host scan enumerates `/proc` directly and requires
+both owned Docker clients alive with readable argv containing their exact
+query argument. An unreadable process or missing owned client fails; only an
+unrelated process that exits between enumeration and reading is absent from
+the snapshot. Kernel processes with an empty cmdline have no userspace argv.
+The scan checks all three generated credential canaries against complete
+Docker configuration, retained `State.Health.Log` output, every container argv
+row, both container-log streams and host argv. Disabled/missing healthchecks,
+missing health history/output, unhealthy state and empty container logs fail.
+Raw argv, environment, logs and private observer records remain withheld.
+
+The dedicated scanner tests run inside the existing hosted qualifier before
+fixture startup. They inject each synthetic canary into every required surface
+for both SQL containers, including trailing bytes in a long argv, and require
+rejection. They also cover malformed/empty/duplicate process inventories,
+missing health/log surfaces, failed commands, timeouts, launch failures and
+incomplete/unreadable/exited owned host processes. Test exception details stay
+in a private in-memory unittest stream; only a fixed aggregate result is
+printed. These synthetic controls supply no runtime fixture evidence.
+
+The scan repair leaves the C observer, strict full-record incoming-alert
+parser, original CLI/TLS profiles, image pins, ownership labels and all cleanup
+paths unchanged. Its exact pushed head still needs hosted execution and root's
+review before approval. No workflow, Cargo or guarded consumer change is made.
+
+This source is **not yet completely hosted-qualified**. Root must independently review all
 new observation, parser, command and cleanup logic, inspect exact-head hosted
 capability and positive/negative evidence, and confirm the original controls and
 credential scan/cleanup still pass. If dynamic interposition is unsupported or
