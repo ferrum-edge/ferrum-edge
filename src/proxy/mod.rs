@@ -40472,8 +40472,7 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     &current_url,
                     &method,
-                    initial_attempt_span
-                        .headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
+                    initial_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
                     client_request_body,
                     upstream_target.as_deref(),
                     &plugins,

@@ -4000,7 +4000,13 @@ mod tests {
 
         backend_task.await.expect("backend task");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while manager.state.overload.active_requests.load(Ordering::Acquire) != 0 {
+            while manager
+                .state
+                .overload
+                .active_requests
+                .load(Ordering::Acquire)
+                != 0
+            {
                 tokio::task::yield_now().await;
             }
         })
