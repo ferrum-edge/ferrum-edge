@@ -11765,15 +11765,9 @@ pub mod _test_support {
             )
             .await
         } else {
-            pool.request_streaming_under_authorization(
-                proxy,
-                "POST",
-                url,
-                &[],
-                body,
-                bound,
-                || tls_config,
-            )
+            pool.request_streaming_under_authorization(proxy, "POST", url, &[], body, bound, || {
+                tls_config
+            })
             .await
         };
         result.map_err(|error| {

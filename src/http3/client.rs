@@ -953,7 +953,8 @@ impl<'a, S: h3::quic::SendStream<bytes::Bytes>> H3UploadResetGuard<'a, S> {
 impl<S: h3::quic::SendStream<bytes::Bytes>> Drop for H3UploadResetGuard<'_, S> {
     fn drop(&mut self) {
         if !self.completed {
-            self.stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            self.stream
+                .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
         }
     }
 }

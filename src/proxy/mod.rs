@@ -53352,8 +53352,7 @@ pub(crate) fn route_deadline_expiry_response(
         return http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, None);
     }
     *timeout_phase = Some(expiry.phase(handed_to_backend));
-    let mut response =
-        route_request_timeout_response(None, expiry.error_class(handed_to_backend));
+    let mut response = route_request_timeout_response(None, expiry.error_class(handed_to_backend));
     response.request_on_wire = handed_to_backend;
     response
 }
@@ -65884,11 +65883,8 @@ mod tests {
 
     #[test]
     fn mesh_grpc_response_buffering_refusal_preserves_backend_server_error() {
-        let resp = mesh_grpc_response_buffering_refusal_response(
-            503,
-            true,
-            Some("127.0.0.2".to_string()),
-        );
+        let resp =
+            mesh_grpc_response_buffering_refusal_response(503, true, Some("127.0.0.2".to_string()));
 
         assert_eq!(resp.status_code, 503);
         assert!(!resp.connection_error);

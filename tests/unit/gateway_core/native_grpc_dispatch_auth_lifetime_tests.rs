@@ -1063,13 +1063,16 @@ fn authorization_placeholders_keep_actual_handoff_separate_from_neutral_health()
         (false, true, Some(ErrorClass::ClientDisconnect), "ambiguous")
     );
     let proxy = include_str!("../../../src/proxy/mod.rs");
-    assert!(!proxy.contains(
-        "record_backend_dispatch_outcome(result.error_class, !result.connection_error)"
-    ));
+    assert!(
+        !proxy.contains(
+            "record_backend_dispatch_outcome(result.error_class, !result.connection_error)"
+        )
+    );
     let compact_proxy: String = proxy.chars().filter(|ch| !ch.is_whitespace()).collect();
     assert!(
-        compact_proxy
-            .contains("authorization_expired_dispatch_placeholder(resolved_ip,e.request_on_wire())")
+        compact_proxy.contains(
+            "authorization_expired_dispatch_placeholder(resolved_ip,e.request_on_wire())"
+        )
     );
 }
 

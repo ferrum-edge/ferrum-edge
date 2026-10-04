@@ -3472,14 +3472,9 @@ async fn h3_pool_authorization_expiry_during_checkout_sends_zero_backend_request
         assert!(backend.received_requests().await.is_empty());
         // Prove zero hits came from expiry rather than an unusable fixture.
         let response = pool
-            .request(
-                &proxy,
-                "GET",
-                &url,
-                &[],
-                bytes::Bytes::new(),
-                || std::future::ready(Ok(client_tls)),
-            )
+            .request(&proxy, "GET", &url, &[], bytes::Bytes::new(), || {
+                std::future::ready(Ok(client_tls))
+            })
             .await
             .expect("healthy backend after refused acquisition");
         assert_eq!(response.status, 200);
@@ -3502,14 +3497,9 @@ async fn h3_pool_expired_plan_refuses_cached_sender_before_backend_headers() {
         proxy.pool_http3_connections_per_backend = Some(1);
         let url = format!("https://127.0.0.1:{port}/");
         let tls = client_tls.clone();
-        pool.request(
-            &proxy,
-            "GET",
-            &url,
-            &[],
-            bytes::Bytes::new(),
-            || std::future::ready(Ok(tls)),
-        )
+        pool.request(&proxy, "GET", &url, &[], bytes::Bytes::new(), || {
+            std::future::ready(Ok(tls))
+        })
         .await
         .expect("warm live sender");
         let plan = (
@@ -3538,14 +3528,9 @@ async fn h3_pool_expired_plan_refuses_cached_sender_before_backend_headers() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(backend.received_requests().await.len(), 1);
         let response = pool
-            .request(
-                &proxy,
-                "GET",
-                &url,
-                &[],
-                bytes::Bytes::new(),
-                || std::future::ready(Ok(client_tls)),
-            )
+            .request(&proxy, "GET", &url, &[], bytes::Bytes::new(), || {
+                std::future::ready(Ok(client_tls))
+            })
             .await
             .expect("refusal must preserve the healthy sender");
         assert_eq!(response.status, 200);
@@ -3574,14 +3559,9 @@ async fn h3_pool_upload_expiry_after_transmission_retains_post_handoff_provenanc
     proxy.pool_http3_connections_per_backend = Some(1);
     let url = format!("https://127.0.0.1:{port}/");
     let tls = client_tls.clone();
-    pool.request(
-        &proxy,
-        "GET",
-        &url,
-        &[],
-        bytes::Bytes::new(),
-        || std::future::ready(Ok(tls)),
-    )
+    pool.request(&proxy, "GET", &url, &[], bytes::Bytes::new(), || {
+        std::future::ready(Ok(tls))
+    })
     .await
     .expect("warm live sender");
     let plan = (
@@ -3605,7 +3585,10 @@ async fn h3_pool_upload_expiry_after_transmission_retains_post_handoff_provenanc
     .err()
     .expect("authorization must cancel the pending upload");
     assert_eq!(error.0, Some(StreamAuthTermination::CredentialExpired));
-    assert!(error.1, "completed HEADERS retain the actual handoff marker");
+    assert!(
+        error.1,
+        "completed HEADERS retain the actual handoff marker"
+    );
     assert_eq!(backend.received_requests().await.len(), 2);
     assert_eq!(backend.accepted_connections(), 1);
     assert_eq!(
