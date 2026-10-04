@@ -6,13 +6,16 @@
 //! functional::scripted_backend_h2_tests.
 
 use std::collections::VecDeque;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body::Frame;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{BoxError, PUMP_SOURCE_ERROR, PUMP_SOURCE_RESET};
 use super::{UploadPumpJoin, UploadPumpOutcome, UploadPumpSource};
@@ -86,6 +89,46 @@ impl std::fmt::Display for WrappedError {
 impl std::error::Error for WrappedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
+    }
+}
+
+// Accept the server's SETTINGS write, then fault while it reads the preface.
+#[derive(Debug)]
+struct CancelReadIo {
+    releases: Arc<AtomicUsize>,
+}
+
+impl Drop for CancelReadIo {
+    fn drop(&mut self) {
+        self.releases.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl AsyncRead for CancelReadIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::other(h2::Error::from(h2::Reason::CANCEL))))
+    }
+}
+
+impl AsyncWrite for CancelReadIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -177,8 +220,30 @@ async fn noncancel_reasons_and_cancel_text_remain_generic_redacted_source_errors
     }
     // A typed outer H2 I/O error has no reset reason. A deeper CANCEL must
     // not override that authoritative non-reset error.
-    let cause = std::io::Error::other(h2::Error::from(h2::Reason::CANCEL));
-    assert_source_error(h2::Error::from(cause), true, false).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let io = CancelReadIo {
+            releases: Arc::clone(&releases),
+        };
+        let error = h2::server::handshake(io)
+            .await
+            .expect_err("read failure must fail the public H2 handshake");
+        assert!(error.is_io());
+        assert_eq!(error.reason(), None);
+        assert!(!error.is_reset());
+        let nested = error
+            .get_io()
+            .expect("H2 transport error")
+            .get_ref()
+            .expect("typed inner error")
+            .downcast_ref::<h2::Error>()
+            .expect("nested H2 CANCEL");
+        assert_eq!(nested.reason(), Some(h2::Reason::CANCEL));
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        assert_source_error(error, true, false).await;
+    })
+    .await
+    .expect("H2 I/O source error proof must finish");
     assert_source_error(PRIVATE_DETAIL.to_string(), true, false).await;
     assert_source_error(std::io::Error::other(PRIVATE_DETAIL), true, false).await;
     let boxed: BoxError = PRIVATE_DETAIL.into();
