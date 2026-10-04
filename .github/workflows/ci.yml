@@ -1711,11 +1711,11 @@ jobs:
           mkdir -p "$evidence"
           python3 .github/scripts/verify_hyper_patch_stack.py --self-test
           curl --fail --location --retry 5 --silent --show-error \
-            https://static.crates.io/crates/hyper/hyper-1.9.0.crate \
-            --output "$evidence/hyper-1.9.0.crate"
-          echo "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca  $evidence/hyper-1.9.0.crate" | sha256sum --check
+            https://static.crates.io/crates/hyper/hyper-1.10.0.crate \
+            --output "$evidence/hyper-1.10.0.crate"
+          echo "eb92f162bf56536459fc83c79b974bb12837acfed43d6bc370a7916d0ae15ecc  $evidence/hyper-1.10.0.crate" | sha256sum --check
           python3 .github/scripts/verify_hyper_patch_stack.py \
-            --archive "$evidence/hyper-1.9.0.crate" --evidence "$evidence" \
+            --archive "$evidence/hyper-1.10.0.crate" --evidence "$evidence" \
             2>&1 | tee "$evidence/verification.log"
 
       - name: Retain Hyper patch reconstruction evidence
@@ -2024,26 +2024,26 @@ jobs:
         env:
           RUSTFLAGS: "--cap-lints=warn"
         run: |
-          cargo update --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.19
-          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
+          cargo update --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.19
+          cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
           # Patch 002: every positive amount of HTTP/2 flow-control capacity
           # permits body progress, including a 512-byte peer stream window and
           # the final byte of connection capacity (hyperium/hyper#4212).
-          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_h2_flow_control_progress
+          cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_h2_flow_control_progress
           # Patch 003: an HTTP/1 read that returned a full TLS record keeps
           # reading while more is ready (issue #5588).
-          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
+          cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
           # Patch 004: an HTTP/2 request body that stops being written past
           # its Http2BodyWriteTimeout resets the stream; a slow client never
           # trips it (issue #5588).
-          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
+          cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
           # The gateway runs hyper on the vendored h2 (h2-001), so run every
           # Ferrum hyper regression on that combination as well.
           h2_vendored='patch.crates-io.h2.path="vendor/h2-0.4.19-ferrum-patched"'
           # Fail unless the combination really resolves the vendored h2.
-          cargo tree -i h2 --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full \
+          cargo tree -i h2 --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full \
             --config "$h2_vendored" | grep -F 'h2 v0.4.19 (' | grep -F 'vendor/h2-0.4.19-ferrum-patched)'
-          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_ \
+          cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_ \
             --config "$h2_vendored"
 
       - name: Run vendored h2 DATA-frame regressions

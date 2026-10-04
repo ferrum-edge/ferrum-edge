@@ -47,7 +47,7 @@
     },
     {
       "id": "reqwest-connection-admission",
-      "description": "Patch 004 adds a defaulted method to patch 003's ConnectionAdmission trait; both live in vendor/reqwest-0.13.3-ferrum-patched and must retire together.",
+      "description": "Patch 004 adds a defaulted method to patch 003's ConnectionAdmission trait; both live in vendor/reqwest-0.13.4-ferrum-patched and must retire together.",
       "patch_ids": [
         "reqwest-003-connection-admission-hook",
         "reqwest-004-connection-established-fd"
@@ -100,8 +100,8 @@
       "id": "reqwest-001-per-request-connect-timeout",
       "label": "reqwest per-request connect_timeout",
       "crate": "reqwest",
-      "vendored_version": "0.13.3",
-      "vendor_path": "vendor/reqwest-0.13.3-ferrum-patched",
+      "vendored_version": "0.13.4",
+      "vendor_path": "vendor/reqwest-0.13.4-ferrum-patched",
       "docs_path": "docs/upstream-reqwest-patches/001-per-request-connect-timeout/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
@@ -131,8 +131,8 @@
       "id": "reqwest-002-selectable-rustls-provider",
       "label": "reqwest selectable rustls provider fallback",
       "crate": "reqwest",
-      "vendored_version": "0.13.3",
-      "vendor_path": "vendor/reqwest-0.13.3-ferrum-patched",
+      "vendored_version": "0.13.4",
+      "vendor_path": "vendor/reqwest-0.13.4-ferrum-patched",
       "docs_path": "docs/upstream-reqwest-patches/002-selectable-rustls-provider/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
@@ -164,8 +164,8 @@
       "id": "reqwest-003-connection-admission-hook",
       "label": "reqwest physical-connection admission hook",
       "crate": "reqwest",
-      "vendored_version": "0.13.3",
-      "vendor_path": "vendor/reqwest-0.13.3-ferrum-patched",
+      "vendored_version": "0.13.4",
+      "vendor_path": "vendor/reqwest-0.13.4-ferrum-patched",
       "docs_path": "docs/upstream-reqwest-patches/003-connection-admission-hook/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
@@ -197,8 +197,8 @@
       "id": "reqwest-004-connection-established-fd",
       "label": "reqwest established-connection socket callback",
       "crate": "reqwest",
-      "vendored_version": "0.13.3",
-      "vendor_path": "vendor/reqwest-0.13.3-ferrum-patched",
+      "vendored_version": "0.13.4",
+      "vendor_path": "vendor/reqwest-0.13.4-ferrum-patched",
       "docs_path": "docs/upstream-reqwest-patches/004-connection-established-fd/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
@@ -738,8 +738,8 @@
       "id": "hyper-001-upgraded-h2-connect-error-reset",
       "label": "hyper upgraded HTTP/2 stream resets with CONNECT_ERROR",
       "crate": "hyper",
-      "vendored_version": "1.9.0",
-      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
       "docs_path": "docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
@@ -761,7 +761,7 @@
         }
       },
       "regression_tests": [
-        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::upgrade::ferrum_connect_error_reset_tests)",
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::upgrade::ferrum_connect_error_reset_tests)",
         "tests/integration/mesh_hbone_tests.rs"
       ]
     },
@@ -769,8 +769,8 @@
       "id": "hyper-002-min-data-frame-capacity",
       "label": "hyper HTTP/2 body pipe preserves progress for every positive window",
       "crate": "hyper",
-      "vendored_version": "1.9.0",
-      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
       "docs_path": "docs/upstream-hyper-patches/002-min-data-frame-capacity/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
@@ -792,7 +792,7 @@
         }
       },
       "regression_tests": [
-        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_h2_flow_control_progress_tests)",
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_flow_control_progress_tests)",
         "tests/functional/scripted_backend_h2_tests.rs (grpc_upload_progresses_with_512_byte_backend_stream_window)"
       ]
     },
@@ -800,8 +800,8 @@
       "id": "hyper-003-greedy-h1-read",
       "label": "hyper HTTP/1 reads past one TLS record while more is ready",
       "crate": "hyper",
-      "vendored_version": "1.9.0",
-      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
       "docs_path": "docs/upstream-hyper-patches/003-greedy-h1-read/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
@@ -823,15 +823,15 @@
         }
       },
       "regression_tests": [
-        "vendor/hyper-1.9.0-ferrum-patched (proto::h1::io::tests::ferrum_greedy_read_*)"
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h1::io::tests::ferrum_greedy_read_*)"
       ]
     },
     {
       "id": "hyper-004-h2-body-write-timeout",
       "label": "hyper HTTP/2 client bounds request body write stalls",
       "crate": "hyper",
-      "vendored_version": "1.9.0",
-      "vendor_path": "vendor/hyper-1.9.0-ferrum-patched",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
       "docs_path": "docs/upstream-hyper-patches/004-h2-body-write-timeout/",
       "owner": "Ferrum Edge maintainers",
       "owner_github": null,
@@ -853,7 +853,7 @@
         }
       },
       "regression_tests": [
-        "vendor/hyper-1.9.0-ferrum-patched (proto::h2::ferrum_body_write_timeout_tests)",
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_body_write_timeout_tests)",
         "tests/functional/scripted_backend_h2_tests.rs (grpc_streaming_backend_write_timeout_maps_to_deadline_exceeded, h2_direct_passthrough_backend_write_timeout_maps_to_504, grpc_streaming_zero_write_timeout_is_not_cut)"
       ]
     },

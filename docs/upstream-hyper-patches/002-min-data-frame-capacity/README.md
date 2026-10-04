@@ -1,7 +1,7 @@
 # hyper: preserve HTTP/2 body progress at every positive window
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/hyper-1.9.0-ferrum-patched/` must regenerate the
+> Any change to `vendor/hyper-1.10.0-ferrum-patched/` must regenerate the
 > drift manifest (`scripts/update_vendor_integrity.sh`).
 
 ## Status
@@ -64,13 +64,15 @@ minimum DATA-frame size:
 
 - an empty end-of-stream chunk requires no capacity;
 - a non-empty chunk waits only while assigned capacity is zero;
-- the existing one-byte reservation is retained, allowing a legal small peer
-  window and the last byte of connection capacity to make progress;
+- Hyper 1.10's body-first polling and reservation for the real chunk length
+  are retained, so an idle body cannot pin a byte of connection window;
+- every positive assigned capacity still allows a legal small peer window
+  and the last byte of connection capacity to make progress;
 - h2 expands the reservation for the remaining buffered data after
   `send_data`.
 
 [`hyper-min-data-frame-capacity.patch`](hyper-min-data-frame-capacity.patch)
-is the complete patch against the published Hyper 1.9.0 crate with patch 001
+is the complete patch against the published Hyper 1.10.0 crate with patch 001
 applied. It introduces the pending-body foundation and progress regressions;
 it does not require the former patch 002 or patch 004 as a preimage. Apply
 [the complete ordered stack](../README.md) to reconstruct the current vendor
@@ -84,7 +86,7 @@ in-memory transport. It verifies both a complete 2 KiB upload through a
 byte of connection capacity. Run it with:
 
 ```bash
-cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_h2_flow_control_progress
+cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_h2_flow_control_progress
 ```
 
 The ignored functional test exercises the same 512-byte window through the

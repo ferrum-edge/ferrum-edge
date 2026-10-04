@@ -279,7 +279,7 @@ fn incidental_vendor_lockfiles_are_not_hashed() {
     // and added to GOVERNED_VENDOR_LOCKFILES.
     for path in [
         "vendor/h3-0.0.8-ferrum-patched/Cargo.lock",
-        "vendor/reqwest-0.13.3-ferrum-patched/Cargo.lock",
+        "vendor/reqwest-0.13.4-ferrum-patched/Cargo.lock",
         "vendor/tungstenite-0.29.0-ferrum-patched/Cargo.lock",
         "vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.lock",
     ] {
@@ -310,8 +310,8 @@ fn known_text_vendor_paths_use_lf_normalization() {
         "vendor/dimpl-0.6.1-ferrum-patched/.gitignore",
         "vendor/dimpl-0.6.1-ferrum-patched/.cargo-ok",
         "vendor/h3-0.0.8-ferrum-patched/LICENSE",
-        "vendor/reqwest-0.13.3-ferrum-patched/LICENSE-MIT",
-        "vendor/reqwest-0.13.3-ferrum-patched/LICENSE-APACHE",
+        "vendor/reqwest-0.13.4-ferrum-patched/LICENSE-MIT",
+        "vendor/reqwest-0.13.4-ferrum-patched/LICENSE-APACHE",
         "vendor/dimpl-0.6.1-ferrum-patched/.cargo_vcs_info.json",
         "docs/note.md",
         "script.sh",

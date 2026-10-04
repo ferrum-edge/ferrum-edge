@@ -1,21 +1,23 @@
 # Reproducible Hyper patch stack
 
-Ferrum vendors Hyper **1.9.0** from the published
-[`hyper-1.9.0.crate`](https://static.crates.io/crates/hyper/hyper-1.9.0.crate)
+Ferrum vendors Hyper **1.10.0** from the published
+[`hyper-1.10.0.crate`](https://static.crates.io/crates/hyper/hyper-1.10.0.crate)
 archive, not from a moving upstream branch. The crates.io index pins its SHA-256
-as `6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca`.
+as `eb92f162bf56536459fc83c79b974bb12837acfed43d6bc370a7916d0ae15ecc`.
 The archive's `.cargo_vcs_info.json` identifies upstream revision
-`0d6c7d5469baa09e2fb127ee3758a79b3271a4f0`.
+`79dbab620bf14b96cd5d53a60ca35d7fe2ddbaf1` and includes `dirty: true`.
+The pinned archive, rather than a clean checkout of that revision, is the
+source baseline; the verifier records and checks this published marker.
 
 Apply the complete diffs in [`series`](series) order, from the extracted crate
 root. Each patch is based on the output of all preceding patches:
 
 | Patch | Baseline | Purpose |
 |---|---|---|
-| [001](001-upgraded-h2-connect-error-reset/README.md) | Published Hyper 1.9.0 | Reset failed upgraded HTTP/2 CONNECT streams |
-| [002](002-min-data-frame-capacity/README.md) | Hyper 1.9.0 + 001 | Pending body chunk foundation, positive-capacity progress and regressions |
-| [003](003-greedy-h1-read/README.md) | Hyper 1.9.0 + 001 + 002 | HTTP/1 read-ahead and upgrade error handoff |
-| [004](004-h2-body-write-timeout/README.md) | Hyper 1.9.0 + 001 + 002 + 003 | HTTP/2 request-body write-stall bound |
+| [001](001-upgraded-h2-connect-error-reset/README.md) | Published Hyper 1.10.0 | Reset failed upgraded HTTP/2 CONNECT streams |
+| [002](002-min-data-frame-capacity/README.md) | Hyper 1.10.0 + 001 | Pending body chunk foundation, positive-capacity progress and regressions |
+| [003](003-greedy-h1-read/README.md) | Hyper 1.10.0 + 001 + 002 | HTTP/1 read-ahead and upgrade error handoff |
+| [004](004-h2-body-write-timeout/README.md) | Hyper 1.10.0 + 001 + 002 + 003 | HTTP/2 request-body write-stall bound |
 
 Patch 002 supplies `pending_data`; patch 004 builds on it. Patch 002 is a
 complete diff from its stated baseline, replacing the former incremental
@@ -32,8 +34,8 @@ before Cargo touches the vendor tree. It applies all four patches with
 copies source from `vendor/` over it.
 
 The verifier requires the complete file sets to match for all shipped Hyper
-files: `src/**`, `Cargo.toml`, `LICENSE` and `README.md`. Those are the 67 files
-currently retained in `vendor/hyper-1.9.0-ferrum-patched/`. Upstream packaging
+files: `src/**`, `Cargo.toml`, `LICENSE` and `README.md`. Those are the 68 files
+currently retained in `vendor/hyper-1.10.0-ferrum-patched/`. Upstream packaging
 files, examples and upstream integration tests outside that retained set are
 not shipped by this vendor copy. Every retained file, including untouched
 source, must match both the vendor bytes exactly and the LF-normalized SHA-256
@@ -47,7 +49,10 @@ and reconstructed source hashes as `hyper-patch-stack-<SHA>-<attempt>` evidence.
 Artifact-only changes and verifier changes select this job through the CI
 planner without depending on skipped Rust build artifacts, so syntax-only patch
 parsing cannot stand in for reconstruction.
-This artifact refresh preserves all vendor runtime bytes and their manifest.
+The #5912 refresh ports the complete stack to the published 1.10.0 source.
+The existing CI archive/test bindings still need the automation owner's update;
+the optional security lockfile producer uses the new pins. See
+[the security upgrade record](../dependency-security-upgrade-5912.md).
 
 ## Lifecycle
 

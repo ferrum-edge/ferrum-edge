@@ -1,7 +1,7 @@
 # Vendored reqwest patch: per-request `connect_timeout`
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/reqwest-0.13.3-ferrum-patched/` must regenerate the drift
+> Any change to `vendor/reqwest-0.13.4-ferrum-patched/` must regenerate the drift
 > manifest (`scripts/update_vendor_integrity.sh`).
 
 ## What this patches
@@ -38,25 +38,21 @@ they're applied per-request and override the (now absent) client default.
 
 ## Vendored crate
 
-- Path: `vendor/reqwest-0.13.3-ferrum-patched/`
-- Base release: reqwest **v0.13.3** (matches the version in `Cargo.lock`
+- Path: `vendor/reqwest-0.13.4-ferrum-patched/`
+- Base release: reqwest **v0.13.4** (matches the version in `Cargo.lock`
   before vendoring)
 - Wired in via `[patch.crates-io]` in the workspace `Cargo.toml`
 
 ## Patch fidelity
 
-The upstream PR diff (`reqwest-3017.patch`) was authored against
-reqwest's `master` branch and is preserved verbatim for audit purposes. The
-v0.13.3 base carries the same `src/connect.rs` context lines as `master`
-(`log::debug!("proxy({proxy:?}) intercepts '{:?}'", dst.host());` and
-`log::debug!("starting new connection '{:?}'", dst.host());`), so the vendored
-source matches the PR diff. The earlier v0.13.2 base needed those two
-log-line context strings adjusted.
+The historical upstream PR diff (`reqwest-3017.patch`) is preserved verbatim
+for filing evidence. The current 0.13.4 vendor source includes that behavior,
+patches 002–004 and later local corrections. Apply the complete
+[`reqwest-ferrum.patch`](../reqwest-ferrum.patch) to the published archive;
+see [the baseline record](../README.md). The historical PR artifact alone
+is not sufficient to reconstruct the shipped crate.
 
-The provider-selection deviation is documented independently under
-`../002-selectable-rustls-provider/`; it is not part of upstream PR #3017.
-
-## Files copied into `vendor/reqwest-0.13.3-ferrum-patched/`
+## Files copied into `vendor/reqwest-0.13.4-ferrum-patched/`
 
 - `src/` — the entire crate source (with the patch applied)
 - `Cargo.toml` — patched to set `autotests = false` and `autoexamples = false`
@@ -81,7 +77,7 @@ from the vendored source.
    to whatever release contains the merged PR.
 2. **Remove the `reqwest` line** from the `[patch.crates-io]` block in the
    workspace `Cargo.toml` and its mirror in `tests/performance/mesh/Cargo.toml`.
-3. **Delete the vendor directory**: `git rm -r vendor/reqwest-0.13.3-ferrum-patched/`,
+3. **Delete the vendor directory**: `git rm -r vendor/reqwest-0.13.4-ferrum-patched/`,
    then regenerate the drift manifest (`scripts/update_vendor_integrity.sh`).
 4. **Retire the governance records**: remove the inventory row in
    `docs/dependency-policy.md` and the entry in
@@ -112,7 +108,7 @@ curl -sL https://patch-diff.githubusercontent.com/raw/seanmonstar/reqwest/pull/3
   -o docs/upstream-reqwest-patches/001-per-request-connect-timeout/reqwest-3017.patch
 ```
 
-Then in a scratch clone of `seanmonstar/reqwest` at tag `v0.13.3`, re-apply
+Then in a scratch clone of `seanmonstar/reqwest` at tag `v0.13.4`, re-apply
 the diff together with patches 002–004, copy `src/` over the vendored
 directory, regenerate the drift manifest, and re-run `cargo build --lib && cargo test --test unit_tests
 && cargo test --test integration_tests`.
