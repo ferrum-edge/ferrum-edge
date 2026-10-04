@@ -48,13 +48,19 @@ def inspect(name):
     return json.loads(run(["docker", "inspect", name]).stdout)[0]
 
 
-def refused(args, *, env=None, reasons):
-    result = run(args, env=env, check=False)
-    require(result.returncode != 0, "Negative TLS/authentication control succeeded")
+def refused(args, *, case, env=None, reasons):
+    # Case names are fixed literals, never commands, credentials or captured output.
+    print("CHECK: negative control " + case, flush=True)
+    try:
+        result = run(args, env=env, check=False)
+    except RuntimeError:
+        raise RuntimeError(case + ": negative control exceeded its deadline") from None
+    require(result.returncode != 0, case + ": negative TLS/authentication control succeeded")
     require(
         any(reason.lower() in result.stderr.lower() for reason in reasons),
-        "Negative control failed without the expected TLS/authentication diagnostic",
+        case + ": negative control failed without the expected TLS/authentication diagnostic",
     )
+    print("PASS: negative control " + case, flush=True)
 
 
 def qualify_profiles(work):
@@ -139,7 +145,7 @@ def qualify_profiles(work):
         refused(
             ["docker", "exec", "ferrum-mongodb-db", "mongosh", "--quiet", "--nodb", "--eval",
              "new Mongo('mongodb://ferrum:dev-password-change-in-production@localhost:27017/?authSource=admin')"],
-            reasons=("authentication failed",),
+            case="mongo-historical-password", reasons=("authentication failed",),
         )
         # A valid initialized volume must not bypass either empty-input guard.
         for value in (None, ""):
@@ -246,14 +252,17 @@ def qualify_sql(work):
              "-subj", "/CN=Untrusted Fixture CA", "-keyout", str(certs / "client/bad-ca.key"),
              "-out", str(certs / "client/bad-ca.crt")])
         refused(pg_args(connection.replace("/client/ca.crt", "/client/bad-ca.crt")), env=pg_env,
-                reasons=("certificate verify failed",))
+                case="pg-wrong-ca", reasons=("certificate verify failed",))
         refused(pg_args(connection.replace("host=localhost", "host=wrong.invalid hostaddr=127.0.0.1")),
-                env=pg_env, reasons=("does not match host name",))
-        refused(mysql_args("--ssl-ca=/client/bad-ca.crt"), reasons=("SSL connection error",))
-        refused(mysql_args("--host=127.0.0.2"), reasons=("SSL connection error",))
+                env=pg_env, case="pg-wrong-hostname", reasons=("does not match host name",))
+        refused(mysql_args("--ssl-ca=/client/bad-ca.crt"), case="mysql-wrong-ca",
+                reasons=("SSL connection error",))
+        refused(mysql_args("--host=127.0.0.2"), case="mysql-wrong-hostname",
+                reasons=("SSL connection error",))
         refused(pg_args(connection.replace("sslmode=verify-full", "sslmode=disable")), env=pg_env,
-                reasons=("pg_hba.conf rejects connection", "no pg_hba.conf entry"))
-        refused(mysql_args("--ssl-mode=DISABLED"), reasons=("insecure transport", "secure transport",))
+                case="pg-plaintext", reasons=("pg_hba.conf rejects connection", "no pg_hba.conf entry"))
+        refused(mysql_args("--ssl-mode=DISABLED"), case="mysql-plaintext",
+                reasons=("insecure transport", "secure transport",))
 
         # Require a client certificate after the ordinary verified TLS positives.
         print("CHECK: SQL mutual TLS positives and invalid client controls", flush=True)
@@ -268,7 +277,8 @@ def qualify_sql(work):
         while run(no_client, env=pg_env, check=False).returncode == 0:
             require(time.monotonic() < deadline, "PostgreSQL did not require client certificates")
             time.sleep(0.2)
-        refused(no_client, env=pg_env, reasons=("valid client certificate", "certificate required"))
+        refused(no_client, env=pg_env, case="pg-missing-client",
+                reasons=("valid client certificate", "certificate required"))
         ssl = run(pg_args(connection, "SELECT ssl, client_dn FROM pg_stat_ssl WHERE pid=pg_backend_pid()"),
                   env=pg_env).stdout.strip()
         require(ssl.startswith("t|") and "ferrum" in ssl, "PostgreSQL mTLS positive failed")
@@ -280,7 +290,7 @@ def qualify_sql(work):
                                     if not line.startswith(("ssl-cert=", "ssl-key="))) + "\n"
         (certs / "client/no-client.cnf").write_text(no_mysql_client)
         refused(["docker", "exec", MYSQL, "mysql", "--defaults-extra-file=/client/no-client.cnf",
-                 "-e", "SELECT 1"], reasons=("Access denied",))
+                 "-e", "SELECT 1"], case="mysql-missing-client", reasons=("Access denied",))
         run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=ferrum",
              "-keyout", str(certs / "client/rogue.key"), "-out", str(certs / "client/rogue.csr")])
         (certs / "client/rogue.cnf").write_text("extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n")
@@ -290,9 +300,28 @@ def qualify_sql(work):
              "-out", str(certs / "client/rogue.crt")])
         refused(pg_args(connection.replace("/client/client.crt", "/client/rogue.crt")
                         .replace("/client/client.key", "/client/rogue.key")), env=pg_env,
+                case="pg-untrusted-client",
                 reasons=("unknown ca", "certificate verify failed", "certificate unknown"))
-        refused(mysql_args("--ssl-cert=/client/rogue.crt", "--ssl-key=/client/rogue.key"),
-                reasons=("SSL connection error", "Access denied",))
+        rogue_options = ("--ssl-cert=/client/rogue.crt", "--ssl-key=/client/rogue.key")
+        # TLS 1.3 can finish SSL_connect before the server checks the client cert.
+        # MySQL then masks the fatal alert as CR_SERVER_LOST while reading auth.
+        # Require a certificate-specific TLS 1.2 alert from the same client/server
+        # before allowing those exact late-disconnect messages on the default path.
+        require(run(mysql_args("--tls-version=TLSv1.2")).stdout.strip() == "1",
+                "MySQL TLS 1.2 mTLS positive failed")
+        refused(mysql_args("--tls-version=TLSv1.2", *rogue_options),
+                case="mysql-untrusted-client-tls12",
+                reasons=("alert unknown ca", "alert bad certificate", "alert certificate unknown"))
+        refused(mysql_args(*rogue_options), case="mysql-untrusted-client-default",
+                reasons=(
+                    "SSL connection error", "Access denied",
+                    "ERROR 2013 (HY000): Lost connection to MySQL server at "
+                    "'reading authorization packet', system error: 0",
+                    "ERROR 2013 (HY000): Lost connection to MySQL server at "
+                    "'reading final connect information', system error: 0",
+                ))
+        require(run(mysql_args()).stdout.strip() == "1",
+                "MySQL default mTLS positive after untrusted-client rejection failed")
 
         # Observe live, authenticated clients during a bounded query, then scan argv.
         print("CHECK: live SQL process argv, healthcheck configuration and logs", flush=True)

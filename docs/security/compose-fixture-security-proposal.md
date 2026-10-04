@@ -181,14 +181,68 @@ not runtime qualification):
 
 Concrete separate dependency: five SQL TLS cells in
 `tests/functional/functional_db_tls_test.rs` embed `test-password` in their
-base URL (`test_postgresql_tls_verify_full`, `test_postgresql_tls_require`,
-`test_mysql_tls_verify_identity`, `test_mysql_tls_required`, and
-`test_health_endpoint_shows_db_status`). They need private input URL support,
-including percent encoding when accepting arbitrary passwords, before they
-can consume this generated fixture. The data-plane setup inside
+base URL. This is the complete five-call inventory at candidate base
+`0c17ded8b`; the line numbers refer to that unchanged file:
+
+| Consumer | Base URL call line | Private generated input | Retained gateway TLS policy |
+| --- | --- | --- | --- |
+| `test_postgresql_tls_verify_full` | 507 | `PG_TLS_URL` | `verify-full` and generated CA |
+| `test_postgresql_tls_require` | 557 | `PG_TLS_URL` | `require` |
+| `test_mysql_tls_verify_identity` | 616 | `MYSQL_TLS_URL` | `verify-full` and generated CA |
+| `test_mysql_tls_required` | 665 | `MYSQL_TLS_URL` | `require` |
+| `test_health_endpoint_shows_db_status` | 763 | `PG_TLS_URL` | `require`; retain current minimal health assertion |
+
+Proposed adoption diff for the test owner (not applied in this proposal): add
+one test-only `sql_tls_base_url(key)` reader for the helper's private
+`connections.env`, selected by a proposed
+`FERRUM_TEST_SQL_TLS_CONNECTIONS_FILE` path. Parse the two `KEY=value` records
+as data, without sourcing a shell file or echoing values. Require a readable
+private file, both nonempty URLs, the expected scheme/user/loopback host/fixture
+port, and the generated hexadecimal password contract. Missing/malformed input
+must fail with a fixed credential-free diagnostic when a SQL fixture is
+present or `FERRUM_DB_TLS_REQUIRED=1`; do not fall back to a historical password
+or skip a present fixture. If a future extension accepts arbitrary passwords,
+percent-encode only the password component when constructing a URL, and retain
+decoding for the container client. Document any new `FERRUM_*` test input in
+`docs/configuration.md` and `ferrum.conf` in that separately approved change.
+
+Replace each of the five literal-base-URL calls using its table key:
+
+```rust
+let base_url = sql_tls_base_url("PG_TLS_URL"); // MYSQL_TLS_URL for the two MySQL cells
+let (db_url, _isolated_db) = provision_isolated_sql_database(&base_url);
+```
+
+Keep the per-cell database isolation and gateway-before-database drop order.
+The shared implementation in `tests/common/backend_availability.rs` also
+needs an adoption review: PostgreSQL create/drop currently uses the local
+trusted socket; MySQL create/drop forwards the URL's decoded password through
+`MYSQL_PWD`. For the TLS MySQL container only, propose using the mounted
+`/run/secrets/mysql-client.cnf` as the first client option for create/drop,
+retaining authenticated CA/hostname-verified queries and redacted errors.
+Leave the ordinary `ferrum-ci-postgres`/`ferrum-ci-mysql` consumers on their
+existing separate contract. The five gateway TLS policies and Admin API
+behavior need no change for credential adoption.
+
+The data-plane setup inside
 `.github/workflows/ci.yml` independently provisions the old SQL passwords and
-the Mongo TLS/mTLS fixtures; its guarded job must receive a separately approved
-contract/generation update if it is to adopt this helper or generated inputs.
+the Mongo TLS/mTLS fixtures. Its separate, owner-approved adoption must update
+SQL generation (lines 2216–2316), SQL readiness and grants (2520–2550), test
+input wiring (the functional test step near 2653), and final cleanup together.
+Generate the same private file/mount layout and separate root secret; pass only
+the connections-file path and existing `FERRUM_TEST_CERT_DIR` to tests, and
+retain `FERRUM_DB_TLS_REQUIRED=1`. Replace SQL readiness with authenticated
+verified `SELECT 1`, use the private root option file for grants, withhold raw
+failure logs, and remove private material in unconditional cleanup. Any use of
+this helper by a guarded workflow needs its own approved reachability/contract
+update; keep the independently provisioned Mongo TLS/mTLS fixtures intact.
+
+Before proposal landing, root must coordinate the test/common-helper owner and
+guarded-CI owner into one compatible adoption batch, obtain the required policy
+approval for those files, and collect exact-head hosted evidence for all five
+cells, database cleanup and credential exposure checks. This round inventories
+and proposes that batch; it does not implement or approve it. The candidate's
+own SQL client probes remain independent of these Rust/Admin consumers.
 This candidate changes neither that job nor any frozen verifier, planner,
 aggregate, publication inventory, or required check. The new optional check
 does not certify the Rust gateway's database trust implementation or the
@@ -198,12 +252,42 @@ unchanged guarded fixtures, and is not added to branch protection.
 
 Verified during preparation: source/consumer inspection, imported/API draft
 state, published image index identities, and local `git diff --check` only.
-**Hosted execution, format, compile, tests, real Docker binds, and TLS handshakes
-are unverified at handoff.** This document describes test intent and source
-behavior, not a successful hosted run. Root must attach the exact candidate
-SHA and hosted run URL/result, independently review the changes, and resolve
-any failures before seeking owner approval. No local repository code, builds,
-tests, formatters, Compose, or fixture scripts were executed.
+The [first hosted qualification](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37195808893/job/111417306382)
+for `0c17ded8b` passed the profile/Mongo phase and reached SQL mTLS after the
+ordinary TLS controls, then failed with the generic negative-control diagnostic.
+The independent review recorded no other static blocker across the seven-file
+proposal. Cleanup completed, but the live SQL argv/log credential scan was not
+reached. This failed run is not qualification approval.
+
+Static diagnosis points to `mysql-untrusted-client-default`: MySQL's
+[`sslaccept`/X509 path](https://github.com/mysql/mysql-server/blob/8.0/sql/auth/sql_authentication.cc)
+drops invalid client certificates during the handshake. In TLS 1.3,
+[`SSL_connect` can finish before the server verifies the client](https://mta.openssl.org/pipermail/openssl-users/2022-October/015568.html);
+the MySQL [client read path](https://github.com/mysql/mysql-server/blob/8.0/sql-common/client.cc)
+can then report `ERROR 2013 (HY000)` while reading the authorization packet or
+final connect information, rather than `SSL connection error`/`Access denied`.
+The old helper accepted only the latter diagnostics. The precise historical
+stderr was withheld, so this attribution is a source-based inference, not an
+observed case/message from that run.
+
+The repair names every negative case using fixed, credential-free labels and
+keeps subprocess output private. The untrusted MySQL client must still fail on
+the default protocol. The two exact late-read error-2013 messages with system
+error 0 are admitted only after the same rogue certificate/key produces a
+certificate-specific TLS 1.2 alert, alongside a trusted TLS 1.2 SQL positive.
+A trusted default-protocol SQL positive follows the rejection. A disconnect,
+timeout, unsupported TLS version, or arbitrary error alone cannot pass this
+paired control. Other negative checks keep their TLS/authentication diagnostics.
+The server's allowed protocols and ordinary/default client options are unchanged.
+
+**The repaired head still requires a fresh complete hosted run.** Root must
+record its exact SHA and checkout/merge-tree identity, run URL/result, all
+default/PostgreSQL and Mongo checks, SQL TLS/mTLS positives and every wrong
+CA/hostname/plaintext/missing/untrusted-client rejection, the later live
+argv/healthcheck/log credential scan, and successful cleanup before owner
+approval. An earlier-head pass, an unreached scan, or a partial run is
+insufficient. No local repository code, builds, tests, formatters, Compose, or
+fixture scripts were executed.
 
 Remaining boundaries: host administrators/local same-user processes can read
 secrets; loopback publication does not isolate local users, Docker bridge peers,
