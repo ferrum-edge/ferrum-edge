@@ -14824,8 +14824,8 @@ async fn handle_connection(
                 None => (request.await, None),
             };
             apply_h1_framing_connection_close(&mut response, http1_framing_result);
-            // A streamed gRPC upload retains the count after an early response
-            // until its independent upload-terminal observer fires too.
+            // A streamed gRPC upload shares its affinity count with the backend
+            // H2 transport until queued DATA drains or the stream resets.
             if let Some(stream) = frontend_stream {
                 response =
                     response.map(|response| response.map(|body| body.with_frontend_stream(stream)));
@@ -23778,8 +23778,8 @@ async fn handle_tls_connection(
                 None => (request.await, None),
             };
             apply_h1_framing_connection_close(&mut response, http1_framing_result);
-            // A streamed gRPC upload retains the count after an early response
-            // until its independent upload-terminal observer fires too.
+            // A streamed gRPC upload shares its affinity count with the backend
+            // H2 transport until queued DATA drains or the stream resets.
             if let Some(stream) = frontend_stream {
                 response =
                     response.map(|response| response.map(|body| body.with_frontend_stream(stream)));
