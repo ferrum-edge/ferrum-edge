@@ -26,6 +26,7 @@ GCP_CHAIN = {
 AWS_CHAIN = {
     "aws-smithy-json": "0.62.7",
     "aws-smithy-runtime-api": "1.12.3",
+    "aws-smithy-runtime-api-macros": "1.0.0",
     "aws-smithy-types": "1.4.9",
     "aws-smithy-schema": "0.1.0",
     "aws-smithy-async": "1.2.14",

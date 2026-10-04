@@ -80,6 +80,7 @@ jobs:
           cargo update -p aws-smithy-runtime-api --precise 1.12.3
           cargo update -p aws-smithy-types --precise 1.4.9
           cargo update -p aws-smithy-async --precise 1.2.14
+          cargo update -p aws-smithy-runtime-api-macros --precise 1.0.0
           cargo update -p opentelemetry-semantic-conventions --precise 0.32.0
           cargo update -p xxhash-rust --precise 0.8.16
           cargo metadata --locked --format-version 1 --features cloud-secrets \
