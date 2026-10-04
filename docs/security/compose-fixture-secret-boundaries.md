@@ -111,11 +111,15 @@ proves the required default CLI positives and certificate-specific refusal.
 Cleanup remains in the original `finally` and unconditional workflow step.
 There is no aggregate PASS for an unresolved CLI disconnect.
 
-No new subprocess executable, dispatcher operation, helper, workflow or
-trusted-policy admission is introduced. The literal finite command graph,
-frozen checker and job digest, required trust checks, other CI jobs, release
-publication, runtime, Cargo/dependencies and existing image/TLS profile pins
-are unchanged.
+The optional hosted qualification path adds a C observer executable compiled
+with GCC on the runner. Its finite dispatcher adds the
+`mysql-observer-compile`, `mysql-observer-server-der` and
+`mysql-observer-client-der` operations to compile the observer and derive the
+pinned server/client certificate signatures it checks. These additions do not
+change the frozen checker or job digest, required trust checks, other CI jobs,
+release publication, runtime, Cargo/dependencies or existing image/TLS profile
+pins. The observer runs only in hosted qualification; this requires no local
+execution and adds no guarded-job edit or trusted-policy admission.
 
 The released CLI still emits error 2013 for the observed rogue-client
 attempt because its SQL diagnostic loses the TLS read reason. The observer

@@ -14,6 +14,7 @@ on:
       - scripts/test_compose_fixture_qualification.py
       - docs/database_tls.md
       - docs/security/compose-fixture-security-proposal.md
+      - docs/security/compose-fixture-secret-boundaries.md
       - .github/workflows/compose-fixture-qualification.yml
   workflow_dispatch:
 
