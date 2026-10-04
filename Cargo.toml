@@ -708,12 +708,15 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # for gRPC frontend affinity (issue #5991); see
 # `docs/upstream-h2-patches/002-stream-lifetime/README.md`.
 #
-# Retirement plan: when an h2 release batches DATA frames into one write
-# (hyperium/h2#903 or an equivalent) AND offers an equivalent owned stream
-# completion hook (or Ferrum stops using h2), remove the `h2` line below (here, in
-# `tests/performance/mesh/Cargo.toml` and in `fuzz/Cargo.toml`), drop
-# `vendor/h2-0.4.19-ferrum-patched/`, and update the three lockfiles and the
-# drift manifest. See `docs/upstream-h2-patches/001-coalesce-data-frame-writes/README.md`.
+# Retirement plan: retire all three h2 patches before dropping the vendored crate.
+# An adopted h2 release must batch DATA frames into one write (hyperium/h2#903
+# or an equivalent), update the automatic DATA-frame budget with runtime target
+# window changes (hyperium/h2#965 or an equivalent), AND offer an equivalent
+# owned stream-completion hook. Alternatively, Ferrum must stop using h2.
+# Then remove the `h2` line below (here, in `tests/performance/mesh/Cargo.toml`
+# and in `fuzz/Cargo.toml`), drop `vendor/h2-0.4.19-ferrum-patched/`, and update
+# the three lockfiles and the drift manifest. See
+# `docs/upstream-h2-patches/001-coalesce-data-frame-writes/README.md`.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }

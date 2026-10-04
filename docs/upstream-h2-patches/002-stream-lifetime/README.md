@@ -52,6 +52,12 @@ then [`h2-stream-lifetime.patch`](h2-stream-lifetime.patch), to the published
 h2 0.4.19 archive (SHA-256
 `ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16`,
 upstream revision `d57d1b852fec9dda6d42d3454502006d52104da8`).
+The lifetime artifact is generated against the complete coalescing and
+runtime-budget baseline. Its hunk positions and context must match that baseline
+exactly, without offsets or fuzz: offset application can create `.orig` backups
+under `src/`, which the strict source inventory rejects. Refreshing this artifact
+leaves shipped source bytes and observer pre/postimage hashes unchanged.
+
 All reconstructed `src/` files must match the shipped crate and
 `vendor/VENDOR_INTEGRITY.sha256`. The merged manifest entries were
 updated using ordinary SHA-256 reads; no project tooling ran locally.
