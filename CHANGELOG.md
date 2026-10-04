@@ -39,6 +39,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no DNS probes, exposes no CIDRs or credentials, and preserves the existing
   default mode and connect-time policy.
 
+- **Pin the iproute2 runtime base to the production distroless digest**
+  (GHSA-c3r8-6276-9678). `Dockerfile.iproute2-layer` now defaults
+  `BASE_IMAGE` to the verified OCI index digest used by the production runtime.
+  The existing base-image digest refresh workflow already includes this
+  Dockerfile, and callers that set an explicit `BASE_IMAGE` override keep that
+  behavior.
+- **OIDC session encryption secrets reject published and placeholder values**
+  (#5987; cross-repo hardening from Ferrum Foundry GHSA-hjw6-685j-p5hw). The
+  `oidc_relying_party` session config previously checked
+  `session.encryption_secret` and `session.encryption_secret_previous` only for
+  minimum length, so it accepted values that anyone can read from Ferrum's own
+  documentation and examples: the literal `${OIDC_SESSION_SECRET_32_BYTES_MIN}`
+  placeholder, the key Ferrum Foundry's OIDC template published, the sequential
+  secrets Ferrum's own tests used, and obvious placeholders (`changeme`,
+  `change-me`/`change_me`, `replace-me`/`replace_me`, `placeholder`, `example`,
+  `your-secret`). Both fields are now screened against a small documented
+  deny-list over both the supplied value and the effective pre-HKDF key
+  material, so Base64 spellings cannot bypass rejection. Unresolved `${...}`
+  templates are refused anywhere in either textual value. Screening runs at
+  the shared plugin-config validation entry point, so Admin API
+  create/update, batch, restore, and file/database config load all reject with a
+  `400` naming the field. Disabled configs may still be saved before an operator
+  supplies a key. Generate a unique random secret of at least 32 bytes and
+  rotate through `session.encryption_secret_previous`.
 - **Backend connection checkout and request handoff are held to the
   authorization lifetime** (GHSA-xcg4-wj3x-gjj2; regression from the direct
   HTTP/1.1 pool, #5961). The direct HTTP/1.1 pool checked out its connection
@@ -75,6 +99,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary. Startup and cleanup are bounded; generated credentials are masked
   and passed through environment variables. All three live regressions remain
   mandatory with ignored tests enabled and serial execution.
+- **Redis semantic-cache quarantine now compares the observed value atomically** (#5986). Invalid
+  bounded values are deleted only if their raw bytes still match the value read, preserving a
+  concurrent replacement. The dedicated watched comparison transfers at most the observed
+  length plus one byte, even if a large value replaces a small invalid entry. Values larger than
+  the read bound remain in Redis until their TTL expires, while a bounded local quarantine
+  marker suppresses repeated processing without counting an unattempted delete as a failure.
+  The required Redis-backed CI gate exercises plugin admission, quarantine races, and bounded
+  transfer regressions.
 
 - The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
   entry generation it selected. A concurrent same-key refresh survives the cleanup
