@@ -1709,7 +1709,10 @@ async fn assert_postgres_cancelled_handoff_settles_operations(db: Arc<DatabaseSt
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(remaining > 115_000, "the production TTL must remain 120 seconds");
+        assert!(
+            remaining > 115_000,
+            "the production TTL must remain 120 seconds"
+        );
 
         sqlx::query(&format!("DROP TRIGGER {trigger} ON config_admission_locks"))
             .execute(&pool)
