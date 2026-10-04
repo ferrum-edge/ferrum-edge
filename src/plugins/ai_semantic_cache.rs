@@ -243,8 +243,8 @@ const CLEANUP_INTERVAL_SECONDS: u64 = 30;
 
 /// How long a per-key local Redis quarantine marker suppresses repeated
 /// download/parse/delete of the same inadmissible remote value after a
-/// quarantine `DEL` fails. Bounded so a repaired/replaced remote value is
-/// reconsidered within this interval without a config knob.
+/// quarantine `DEL` fails or the remote value exceeds the read cap. Bounded so
+/// a repaired/replaced value is reconsidered within this interval without a knob.
 const REDIS_QUARANTINE_TTL_SECONDS: u64 = 30;
 /// Hard ceiling on per-instance local Redis quarantine markers. Keeps memory
 /// and key-cardinality strictly bounded even when `max_entries` is large.
@@ -410,6 +410,7 @@ struct CacheEntry {
     headers: HashMap<String, String>,
     body: Bytes,
     inserted_at: Instant,
+    generation: u64,
     approx_size: usize,
     semantic_scope_key: Option<String>,
     embedding: Option<EmbeddingPoint>,
@@ -716,7 +717,7 @@ impl Drop for EmbeddingFlightCleanup {
     }
 }
 
-/// Local negative marker for a Redis key whose quarantine `DEL` failed.
+/// Local negative marker for an oversized Redis value or a failed quarantine `DEL`.
 ///
 /// `fingerprint` identifies the observed inadmissible remote value so a
 /// repaired/replaced payload can be distinguished when the marker is
@@ -726,7 +727,7 @@ struct RedisQuarantineMarker {
     expires_at: Instant,
 }
 
-/// Bounded per-plugin suppressor for failed Redis quarantine deletes.
+/// Bounded per-plugin suppressor for oversized values and failed quarantine deletes.
 ///
 /// Prevents the same poisoned remote value from being re-downloaded, reparsed,
 /// and re-deleted on every request when Redis write/ACL failures leave the key
@@ -799,6 +800,10 @@ impl RedisQuarantineSuppressor {
 
     fn record_delete_failure(&self, cache_key: &str, fingerprint: [u8; 32], now: Instant) {
         self.delete_failures_total.fetch_add(1, Ordering::Relaxed);
+        self.record_suppression(cache_key, fingerprint, now);
+    }
+
+    fn record_suppression(&self, cache_key: &str, fingerprint: [u8; 32], now: Instant) {
         let marker = RedisQuarantineMarker {
             fingerprint,
             expires_at: now + self.ttl,
@@ -1005,6 +1010,8 @@ pub struct AiSemanticCache {
     http_client: PluginHttpClient,
     /// Local in-memory cache.
     cache: Arc<DashMap<String, CacheEntry>>,
+    /// Assigns each retained value a distinct version for conditional eviction.
+    next_entry_generation: AtomicU64,
     /// Immutable HNSW snapshot for semantic lookup.
     vector_index: Arc<ArcSwapOption<VectorSnapshot>>,
     /// First successfully admitted embedding dimension for this instance.
@@ -1012,7 +1019,7 @@ pub struct AiSemanticCache {
     embedding_dimension: Arc<OnceLock<usize>>,
     /// Optional Redis client for centralized caching.
     redis_client: Option<Arc<RedisRateLimitClient>>,
-    /// Bounded local suppressor for Redis keys whose quarantine delete failed.
+    /// Bounded local suppressor for oversized values or failed quarantine deletes.
     /// Prevents immediate re-download/parse/delete amplification of the same
     /// inadmissible remote value. Per-instance so reload generations isolate.
     redis_quarantine: RedisQuarantineSuppressor,
@@ -1258,6 +1265,7 @@ impl AiSemanticCache {
             embedding_flights: Arc::new(DashMap::with_shard_amount(shard_amount)),
             http_client,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            next_entry_generation: AtomicU64::new(1),
             vector_index: Arc::new(ArcSwapOption::empty()),
             embedding_dimension: Arc::new(OnceLock::new()),
             redis_client,
@@ -1826,7 +1834,8 @@ impl AiSemanticCache {
         })
     }
 
-    /// Apply a Redis quarantine-`DEL` outcome (production and test seam).
+    /// Apply a Redis quarantine compare-and-delete outcome (production and test
+    /// seam).
     ///
     /// Success clears any local suppressor. Failure installs a fingerprint+TTL
     /// marker and emits a rate-limited redacted warning. Never converts a miss
@@ -1848,16 +1857,26 @@ impl AiSemanticCache {
             .maybe_warn_delete_failure(self.instance_id, self.created_at);
     }
 
-    /// Quarantine an inadmissible Redis entry: attempt `DEL`, then map the
-    /// outcome through [`Self::apply_redis_quarantine_delete_outcome`].
+    /// Quarantine an inadmissible Redis entry only if its raw bytes have not
+    /// changed since lookup, then map the outcome through
+    /// [`Self::apply_redis_quarantine_delete_outcome`]. Withheld maintenance
+    /// permissions install the same local marker without making Redis
+    /// unavailable; the bounded helper distinguishes them from I/O failures.
     async fn quarantine_invalid_redis_entry(
         &self,
         redis: &RedisRateLimitClient,
         redis_key: &str,
         cache_key: &str,
         fingerprint: [u8; 32],
+        observed_value: &[u8],
     ) {
-        let delete_ok = redis.delete(redis_key).await.is_ok();
+        // A false result means a concurrent writer changed or removed the
+        // value. That is a successful race outcome: leave the replacement
+        // untouched and allow a later lookup to reconsider it.
+        let delete_ok = redis
+            .delete_if_value_matches_bounded(redis_key, observed_value)
+            .await
+            .is_ok();
         self.apply_redis_quarantine_delete_outcome(cache_key, fingerprint, delete_ok);
     }
 
@@ -2266,6 +2285,18 @@ impl AiSemanticCache {
     /// semantic (embedded) entry was removed so callers can re-dirty the vector
     /// index. Entry byte leases release when the removed `CacheEntry` drops.
     fn run_cleanup(cache: &DashMap<String, CacheEntry>, ttl: Duration, max_entries: usize) -> bool {
+        Self::run_cleanup_with_hook(cache, ttl, max_entries, || {})
+    }
+
+    fn run_cleanup_with_hook<F>(
+        cache: &DashMap<String, CacheEntry>,
+        ttl: Duration,
+        max_entries: usize,
+        before_eviction: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
         let now = Instant::now();
         let mut removed_semantic_entry = false;
         cache.retain(|_, entry| {
@@ -2282,27 +2313,52 @@ impl AiSemanticCache {
         // sort (O(n log n)) — we only need to identify the k oldest, not
         // sort the entire cache.
         if cache.len() > max_entries {
-            let mut entries_with_time: Vec<(String, Instant)> = cache
+            let mut entries_with_version: Vec<(String, Instant, u64)> = cache
                 .iter()
-                .map(|entry| (entry.key().clone(), entry.value().inserted_at))
+                .map(|entry| {
+                    (
+                        entry.key().clone(),
+                        entry.value().inserted_at,
+                        entry.value().generation,
+                    )
+                })
                 .collect();
 
             let to_remove = cache.len().saturating_sub(max_entries);
-            if to_remove > 0 && to_remove < entries_with_time.len() {
+            if to_remove > 0 && to_remove < entries_with_version.len() {
                 // After this call, indices [0..to_remove) hold the
                 // `to_remove` oldest entries (in unspecified order among
                 // themselves), which is all we need for eviction.
-                entries_with_time.select_nth_unstable_by_key(to_remove - 1, |(_, t)| *t);
+                entries_with_version.select_nth_unstable_by_key(to_remove - 1, |(_, t, _)| *t);
             }
 
-            for (key, _) in entries_with_time.into_iter().take(to_remove) {
-                if let Some((_, removed)) = cache.remove(&key) {
+            before_eviction();
+
+            for (key, _, generation) in entries_with_version.into_iter().take(to_remove) {
+                if let Some((_, removed)) =
+                    cache.remove_if(&key, |_, entry| entry.generation == generation)
+                {
                     removed_semantic_entry |= removed.embedding.is_some();
                     // Lease releases when `removed` drops.
                 }
             }
         }
         removed_semantic_entry
+    }
+
+    fn remove_expired_entry_with_hook<F>(
+        cache: &DashMap<String, CacheEntry>,
+        key: &str,
+        observed_generation: u64,
+        after_expiry_check: F,
+    ) -> Option<CacheEntry>
+    where
+        F: FnOnce(),
+    {
+        after_expiry_check();
+        cache
+            .remove_if(key, |_, entry| entry.generation == observed_generation)
+            .map(|(_, removed)| removed)
     }
 
     /// Synchronous cleanup used only by the external test crate's
@@ -4941,9 +4997,10 @@ impl Plugin for AiSemanticCache {
         // and re-validated against the same status/content-type/size/JSON/header
         // admission contract as a local store, and any entry that fails is
         // quarantined so it cannot inject an oversized, non-JSON, wrong-status,
-        // or unsanitized response. Quarantine `DEL` failures are observed and
-        // locally suppressed (TTL + content fingerprint) so the same poisoned
-        // remote value cannot amplify download/parse/delete on every request.
+        // or unsanitized response. Quarantine compare-delete failures are
+        // observed and locally suppressed (TTL + content fingerprint) so the
+        // same poisoned remote value cannot amplify download/parse/delete on
+        // every request.
         if let Some(ref redis) = self.redis_client {
             // Always consult the local suppressor first so a failed quarantine
             // delete remains observable even while Redis is marked unavailable
@@ -5003,6 +5060,7 @@ impl Plugin for AiSemanticCache {
                                         &redis_key,
                                         &cache_key,
                                         fingerprint,
+                                        &data,
                                     )
                                     .await;
                                 }
@@ -5021,15 +5079,17 @@ impl Plugin for AiSemanticCache {
                             debug!(
                                 length,
                                 cap = self.redis_value_byte_cap(),
-                                "ai_semantic_cache: quarantining oversized Redis entry"
+                                "ai_semantic_cache: suppressing oversized Redis entry without a delete attempt"
                             );
-                            self.quarantine_invalid_redis_entry(
-                                redis,
-                                &redis_key,
+                            // The bounded read intentionally does not retain
+                            // the full oversized value, so it cannot be used
+                            // as a compare token. Suppress repeat probes rather
+                            // than risk deleting a concurrent replacement.
+                            self.redis_quarantine.record_suppression(
                                 &cache_key,
                                 fingerprint,
-                            )
-                            .await;
+                                Instant::now(),
+                            );
                         }
                     }
                     Ok(BoundedRedisValue::Empty) => {
@@ -5047,6 +5107,7 @@ impl Plugin for AiSemanticCache {
                                 &redis_key,
                                 &cache_key,
                                 fingerprint,
+                                b"",
                             )
                             .await;
                         }
@@ -5077,9 +5138,14 @@ impl Plugin for AiSemanticCache {
             }
             // Expired — remove. Lease releases when `removed` drops (including
             // when the embedding guard fails after remove succeeds).
+            let observed_generation = entry.generation;
             drop(entry);
-            if let Some((_, removed)) = self.cache.remove(&cache_key)
-                && removed.embedding.is_some()
+            if let Some(removed) = Self::remove_expired_entry_with_hook(
+                &self.cache,
+                &cache_key,
+                observed_generation,
+                || {},
+            ) && removed.embedding.is_some()
             {
                 self.mark_vector_index_dirty();
                 self.signal_vector_index_refresh_if_due();
@@ -5348,6 +5414,7 @@ impl Plugin for AiSemanticCache {
             headers: safe_headers.clone(),
             body: Bytes::from(body.to_vec()),
             inserted_at: Instant::now(),
+            generation: self.next_entry_generation.fetch_add(1, Ordering::Relaxed),
             approx_size,
             semantic_scope_key: semantic_scope_key.clone(),
             embedding: embedding.clone(),
@@ -5745,6 +5812,7 @@ mod tests {
             body: Bytes::from_static(b"\x00\x00\x00\x00\x00\x00\x00\x00"),
             headers: HashMap::new(),
             inserted_at,
+            generation: plugin.next_entry_generation.fetch_add(1, Ordering::Relaxed),
             approx_size,
             semantic_scope_key: None,
             embedding: None,
@@ -5814,6 +5882,86 @@ mod tests {
             plugin.cache.contains_key("e"),
             "newest 'e' must be retained"
         );
+    }
+
+    #[test]
+    fn eviction_skips_entry_replaced_after_candidate_capture() {
+        let plugin = AiSemanticCache::new(
+            &json!({"ttl_seconds": 600, "max_entries": 1}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|err| panic!("test config should be valid: {err}"));
+
+        let now = Instant::now();
+        insert_synthetic(&plugin, "selected", now - Duration::from_secs(2));
+        insert_synthetic(&plugin, "other", now - Duration::from_secs(1));
+        let selected_generation = plugin
+            .cache
+            .get("selected")
+            .expect("selected entry must exist")
+            .generation;
+
+        let removed_semantic_entry = AiSemanticCache::run_cleanup_with_hook(
+            &plugin.cache,
+            plugin.ttl,
+            plugin.max_entries,
+            || insert_synthetic(&plugin, "selected", Instant::now()),
+        );
+
+        assert!(!removed_semantic_entry);
+        let selected = plugin
+            .cache
+            .get("selected")
+            .expect("fresh same-key replacement must survive");
+        assert_ne!(selected.generation, selected_generation);
+        assert!(plugin.cache.contains_key("other"));
+        assert_eq!(plugin.cache.len(), 2);
+        assert_eq!(plugin.cache_budget_used_for_tests(), 16);
+        // Release the shard read guard before cleanup takes write locks.
+        drop(selected);
+
+        AiSemanticCache::run_cleanup(&plugin.cache, plugin.ttl, plugin.max_entries);
+
+        assert!(plugin.cache.contains_key("selected"));
+        assert!(!plugin.cache.contains_key("other"));
+        assert_eq!(plugin.cache.len(), 1);
+    }
+
+    #[test]
+    fn expired_lookup_skips_same_key_replacement_after_expiry_check() {
+        let plugin = AiSemanticCache::new(
+            &json!({"ttl_seconds": 600, "max_entries": 10}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|err| panic!("test config should be valid: {err}"));
+
+        insert_synthetic(
+            &plugin,
+            "expired",
+            Instant::now() - Duration::from_secs(601),
+        );
+        let entry = plugin
+            .cache
+            .get("expired")
+            .expect("expired entry must exist");
+        let observed_generation = entry.generation;
+        drop(entry);
+
+        let removed = AiSemanticCache::remove_expired_entry_with_hook(
+            &plugin.cache,
+            "expired",
+            observed_generation,
+            || insert_synthetic(&plugin, "expired", Instant::now()),
+        );
+
+        assert!(removed.is_none());
+        let replacement = plugin
+            .cache
+            .get("expired")
+            .expect("fresh same-key replacement must survive");
+        assert_ne!(replacement.generation, observed_generation);
+        assert!(Instant::now().duration_since(replacement.inserted_at) < plugin.ttl);
+        assert_eq!(plugin.cache.len(), 1);
     }
 
     #[test]

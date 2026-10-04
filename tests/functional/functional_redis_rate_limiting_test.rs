@@ -3596,6 +3596,56 @@ async fn test_request_deduplication_redis_finalized_empty_synthetic_successes_re
     let default_prefix = format!("{namespace}:dedup");
     delete_redis_keys_by_prefix(&default_prefix).await;
 
+    // Released deduplication profiles need GET for ownership release, but not
+    // the semantic cache's EXISTS/STRLEN/GETRANGE bounded-read commands.
+    let username = format!("dedup-release-{}", Uuid::new_v4().simple());
+    let password = Uuid::new_v4().simple().to_string();
+    let mut admin = redis::Client::open(REDIS_URL)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(&username)
+        .arg("reset")
+        .arg("on")
+        .arg(format!(">{password}"))
+        .arg(format!("~{default_prefix}*"))
+        .arg("+auth")
+        .arg("+hello")
+        .arg("+select")
+        .arg("+client")
+        .arg("+ping")
+        .arg("+info")
+        .arg("+get")
+        .arg("+set")
+        .arg("+watch")
+        .arg("+unwatch")
+        .arg("+multi")
+        .arg("+exec")
+        .arg("+del")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let restricted_url = format!("redis://{username}:{password}@127.0.0.1:6379/15");
+    let mut restricted = redis::Client::open(restricted_url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let probe_key = format!("{default_prefix}:acl-probe");
+    for command in ["EXISTS", "STRLEN", "GETRANGE"] {
+        let mut probe = redis::cmd(command);
+        probe.arg(&probe_key);
+        if command == "GETRANGE" {
+            probe.arg(0).arg(1);
+        }
+        let result: Result<redis::Value, redis::RedisError> =
+            probe.query_async(&mut restricted).await;
+        assert_eq!(result.unwrap_err().code(), Some("NOPERM"));
+    }
+
     let config = format!(
         r#"
 version: "1"
@@ -3622,7 +3672,7 @@ plugin_configs:
     enabled: true
     config:
       sync_mode: "redis"
-      redis_url: "{REDIS_URL}"
+      redis_url: "{restricted_url}"
       ttl_seconds: 60
       inflight_ttl_seconds: 60
       scope_by_consumer: false
@@ -3680,6 +3730,12 @@ plugin_configs:
 
     delete_redis_keys_by_prefix(&default_prefix).await;
     gateway.shutdown();
+    let _: i64 = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&username)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
     println!(
         "test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks PASSED"
     );

@@ -6686,13 +6686,61 @@ fn redis_quarantine_delete_outcome_handler_is_shared() {
         .expect("quarantine_invalid_redis_entry region");
     assert!(
         production.contains("apply_redis_quarantine_delete_outcome(")
-            && production.contains("redis.delete(redis_key).await.is_ok()"),
-        "production must map the real Redis DEL result through the shared handler"
+            && production.contains(".delete_if_value_matches_bounded(redis_key, observed_value)")
+            && production.contains(".await\n            .is_ok()"),
+        "production must map exact observed-byte compare-delete, including false, through the shared handler"
     );
     assert!(
         !production.contains("record_delete_failure(")
             && !production.contains("maybe_warn_delete_failure("),
         "production quarantine path must not re-implement outcome mapping inline"
+    );
+    assert!(
+        !production.contains(".delete(") && !production.contains(".get_bytes("),
+        "quarantine must not delete unconditionally or re-read an unbounded value"
+    );
+    let lookup = source
+        .split_once("Ok(BoundedRedisValue::Found(data)) => {")
+        .and_then(|(_, rest)| rest.split_once("Ok(BoundedRedisValue::Missing) => {"))
+        .map(|(body, _)| body)
+        .expect("Redis invalid-value lookup branches");
+    let (found, remaining) = lookup
+        .split_once("Ok(BoundedRedisValue::Oversized { length }) => {")
+        .expect("oversized branch");
+    let (oversized, empty) = remaining
+        .split_once("Ok(BoundedRedisValue::Empty) => {")
+        .expect("empty branch");
+    assert!(
+        found.contains(
+            "quarantine_invalid_redis_entry(\n                                        redis,\n                                        &redis_key,\n                                        &cache_key,\n                                        fingerprint,\n                                        &data,"
+        ),
+        "every deserialization/admission failure must fence deletion with the observed full bytes"
+    );
+    assert!(
+        empty.contains(
+            "quarantine_invalid_redis_entry(\n                                redis,\n                                &redis_key,\n                                &cache_key,\n                                fingerprint,\n                                b\"\","
+        ),
+        "empty entries must compare exactly against an empty byte string"
+    );
+    assert!(
+        oversized.contains(
+            "self.redis_quarantine.record_suppression(\n                                &cache_key,\n                                fingerprint,\n                                Instant::now(),"
+        ) && !oversized.contains("quarantine_invalid_redis_entry(")
+            && !oversized.contains("apply_redis_quarantine_delete_outcome(")
+            && !oversized.contains(".delete"),
+        "unobserved oversized values must only install a bounded marker, without DEL or delete-failure accounting"
+    );
+    let suppression = source
+        .split_once("fn record_suppression(")
+        .and_then(|(_, rest)| rest.split_once("fn clear("))
+        .map(|(body, _)| body)
+        .expect("suppression handler");
+    assert!(
+        suppression.contains("expires_at: now + self.ttl")
+            && suppression.contains("self.insert(cache_key, marker)")
+            && !suppression.contains("delete_failures_total")
+            && !suppression.contains("warn"),
+        "oversized suppression must preserve TTL/capacity without reporting a failed delete"
     );
     let test_seam = source
         .split_once("fn apply_redis_quarantine_delete_outcome_for_tests(")
@@ -6707,6 +6755,49 @@ fn redis_quarantine_delete_outcome_handler_is_shared() {
         !test_seam.contains("record_delete_failure(")
             && !test_seam.contains("maybe_warn_delete_failure("),
         "test seam must not duplicate success/failure mapping"
+    );
+}
+
+#[test]
+fn redis_quarantine_compare_delete_read_is_bounded_and_watched() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    let helper = source
+        .split_once("pub async fn delete_if_value_matches_bounded(")
+        .and_then(|(_, rest)| rest.split_once("/// Charge one request against EVERY"))
+        .map(|(body, _)| body)
+        .expect("compare-delete helper");
+    let checked_index = helper
+        .find("redis_getrange_end_index(expected.len())")
+        .unwrap();
+    let connection = helper.find("get_dedicated_connection()").unwrap();
+    let watch = helper.find("redis::cmd(\"WATCH\")").unwrap();
+    let range = helper.find(".cmd(\"GETRANGE\")").unwrap();
+    let delete = helper.find("redis::cmd(\"DEL\")").unwrap();
+    assert!(checked_index < connection && connection < watch && watch < range && range < delete);
+    assert!(
+        helper.contains("expected.len().checked_add(1)")
+            && helper.contains("if expected.is_empty() {\n            0")
+            && helper.contains(".cmd(\"EXISTS\")\n            .arg(key)")
+            && helper.contains(".cmd(\"STRLEN\")\n            .arg(key)")
+            && helper.contains(".arg(0)\n            .arg(end)")
+            && helper.contains("prefix.len() > max_prefix")
+            && helper.contains("exists == 1 && length == expected.len() && prefix == expected")
+            && helper.contains("redis::cmd(\"MULTI\")")
+            && helper.contains("redis::cmd(\"EXEC\")")
+            && helper.contains("Ok(reply) if reply == \"QUEUED\" => {}"),
+        "only a full bounded byte/length match on the dedicated watched connection may authorize DEL"
+    );
+    let multi = helper.find("redis::cmd(\"MULTI\")").unwrap();
+    let multi_error = helper.find("if let Err(e) = multi {").unwrap();
+    let exec = helper.find("redis::cmd(\"EXEC\")").unwrap();
+    assert!(range < multi && multi < multi_error && multi_error < delete && delete < exec);
+    assert!(
+        !helper.contains(".atomic()")
+            && !helper.contains("cmd(\"GET\")")
+            && !helper.contains("get_connection()")
+            && !helper.contains(".get_bytes(")
+            && !helper.contains("cmd(\"EVAL"),
+        "compare-delete must remain bounded, dedicated, and RESP-compatible without Lua"
     );
 }
 
