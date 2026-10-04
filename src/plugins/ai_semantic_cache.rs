@@ -1830,7 +1830,8 @@ impl AiSemanticCache {
         })
     }
 
-    /// Apply a Redis quarantine-`DEL` outcome (production and test seam).
+    /// Apply a Redis quarantine compare-and-delete outcome (production and test
+    /// seam).
     ///
     /// Success clears any local suppressor. Failure installs a fingerprint+TTL
     /// marker and emits a rate-limited redacted warning. Never converts a miss
@@ -1852,16 +1853,24 @@ impl AiSemanticCache {
             .maybe_warn_delete_failure(self.instance_id, self.created_at);
     }
 
-    /// Quarantine an inadmissible Redis entry: attempt `DEL`, then map the
-    /// outcome through [`Self::apply_redis_quarantine_delete_outcome`].
+    /// Quarantine an inadmissible Redis entry only if its raw bytes have not
+    /// changed since lookup, then map the outcome through
+    /// [`Self::apply_redis_quarantine_delete_outcome`].
     async fn quarantine_invalid_redis_entry(
         &self,
         redis: &RedisRateLimitClient,
         redis_key: &str,
         cache_key: &str,
         fingerprint: [u8; 32],
+        observed_value: &[u8],
     ) {
-        let delete_ok = redis.delete(redis_key).await.is_ok();
+        // A false result means a concurrent writer changed or removed the
+        // value. That is a successful race outcome: leave the replacement
+        // untouched and allow a later lookup to reconsider it.
+        let delete_ok = redis
+            .delete_if_value_matches(redis_key, observed_value)
+            .await
+            .is_ok();
         self.apply_redis_quarantine_delete_outcome(cache_key, fingerprint, delete_ok);
     }
 
@@ -4982,9 +4991,10 @@ impl Plugin for AiSemanticCache {
         // and re-validated against the same status/content-type/size/JSON/header
         // admission contract as a local store, and any entry that fails is
         // quarantined so it cannot inject an oversized, non-JSON, wrong-status,
-        // or unsanitized response. Quarantine `DEL` failures are observed and
-        // locally suppressed (TTL + content fingerprint) so the same poisoned
-        // remote value cannot amplify download/parse/delete on every request.
+        // or unsanitized response. Quarantine compare-delete failures are
+        // observed and locally suppressed (TTL + content fingerprint) so the
+        // same poisoned remote value cannot amplify download/parse/delete on
+        // every request.
         if let Some(ref redis) = self.redis_client {
             // Always consult the local suppressor first so a failed quarantine
             // delete remains observable even while Redis is marked unavailable
@@ -5044,6 +5054,7 @@ impl Plugin for AiSemanticCache {
                                         &redis_key,
                                         &cache_key,
                                         fingerprint,
+                                        &data,
                                     )
                                     .await;
                                 }
@@ -5064,13 +5075,15 @@ impl Plugin for AiSemanticCache {
                                 cap = self.redis_value_byte_cap(),
                                 "ai_semantic_cache: quarantining oversized Redis entry"
                             );
-                            self.quarantine_invalid_redis_entry(
-                                redis,
-                                &redis_key,
+                            // The bounded read intentionally does not retain
+                            // the full oversized value, so it cannot be used
+                            // as a compare token. Suppress repeat probes rather
+                            // than risk deleting a concurrent replacement.
+                            self.apply_redis_quarantine_delete_outcome(
                                 &cache_key,
                                 fingerprint,
-                            )
-                            .await;
+                                false,
+                            );
                         }
                     }
                     Ok(BoundedRedisValue::Empty) => {
@@ -5088,6 +5101,7 @@ impl Plugin for AiSemanticCache {
                                 &redis_key,
                                 &cache_key,
                                 fingerprint,
+                                b"",
                             )
                             .await;
                         }

@@ -192,6 +192,97 @@ async fn functional_ai_semantic_cache_rewrites_once_across_h1_h2_h3() {
     origin.abort();
 }
 
+#[tokio::test]
+#[ignore]
+async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_safe() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        BoundedRedisValue, RedisConfig, RedisRateLimitClient,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    if tokio::net::TcpStream::connect("127.0.0.1:6379")
+        .await
+        .is_err()
+    {
+        assert!(
+            std::env::var("FERRUM_REDIS_REQUIRED").as_deref() != Ok("1"),
+            "the Redis semantic-cache regression gate requires a reachable Redis service"
+        );
+        eprintln!("Redis not available at 127.0.0.1:6379 — skipping semantic-cache Redis test");
+        return;
+    }
+
+    const REDIS_URL: &str = "redis://127.0.0.1:6379/15";
+    let prefix = format!("ferrum-test:ai-semantic-cache-quarantine:{}", Uuid::new_v4());
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": REDIS_URL,
+            "redis_key_prefix": prefix,
+        }),
+        &prefix,
+    )
+    .expect("Redis configuration is valid")
+    .expect("Redis mode is enabled");
+    let redis = RedisRateLimitClient::new(config, None, false, None)
+        .expect("client construction without a CA path succeeds");
+    let key = redis.make_key(&["interleaved-entry"]);
+
+    // Read an invalid payload exactly as the plugin does. Replace it before
+    // quarantine, then ensure compare-and-delete preserves the valid writer's
+    // bytes (including arbitrary binary payloads).
+    let observed_invalid = b"not-json\0\xff";
+    let valid_replacement = b"{\"schema_version\":1,\"valid\":true}";
+    redis
+        .set_bytes_with_expire(&key, observed_invalid, 60)
+        .await
+        .expect("write initial invalid payload");
+    let BoundedRedisValue::Found(observed) = redis
+        .get_bytes_bounded(&key, 128)
+        .await
+        .expect("read invalid payload")
+    else {
+        panic!("initial payload must be returned within the read bound");
+    };
+    assert_eq!(observed, observed_invalid);
+
+    redis
+        .set_bytes_with_expire(&key, valid_replacement, 60)
+        .await
+        .expect("write concurrent valid replacement");
+    assert!(!redis
+        .delete_if_value_matches(&key, &observed)
+        .await
+        .expect("compare-and-delete succeeds"));
+    assert!(matches!(
+        redis.get_bytes_bounded(&key, 128).await,
+        Ok(BoundedRedisValue::Found(value)) if value.as_slice() == valid_replacement
+    ));
+
+    // An unchanged malformed/binary value is still removable by exact raw
+    // bytes, so quarantine does not leave known poison behind.
+    redis
+        .set_bytes_with_expire(&key, observed_invalid, 60)
+        .await
+        .expect("restore invalid binary payload");
+    let BoundedRedisValue::Found(observed) = redis
+        .get_bytes_bounded(&key, 128)
+        .await
+        .expect("read unchanged invalid payload")
+    else {
+        panic!("binary payload must be returned within the read bound");
+    };
+    assert!(redis
+        .delete_if_value_matches(&key, &observed)
+        .await
+        .expect("compare-and-delete succeeds"));
+    assert!(matches!(
+        redis.get_bytes_bounded(&key, 128).await,
+        Ok(BoundedRedisValue::Missing)
+    ));
+}
+
 // ============================================================================
 // Echo Server Helper
 // ============================================================================
