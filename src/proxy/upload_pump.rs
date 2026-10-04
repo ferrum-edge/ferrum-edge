@@ -194,7 +194,7 @@ const PUMP_WRITE_TIMEOUT: u8 = 6;
 /// pump when the bridge closes, and overwritten by the pump's own terminal.
 /// `code_outcome` maps it to `None` like any unknown code.
 const PUMP_CONSUMER_DONE: u8 = 7;
-/// Hyper masked an inbound H2 reset as EOF without receive-side END_STREAM.
+/// An inbound H2 reset, either explicit or masked as EOF without END_STREAM.
 /// Still a source error for lifecycle accounting, but retain its wire meaning
 /// so the backend receives CANCEL rather than a clean or internal-error end.
 const PUMP_SOURCE_RESET: u8 = 8;
@@ -270,7 +270,7 @@ pub(crate) const fn upload_pump_error_message(outcome: UploadPumpOutcome) -> &'s
 ///
 /// Write-timeout uses a typed `io::ErrorKind::TimedOut` so the existing
 /// `classify_body_error` / `classify_reqwest_error` walks map it to
-/// `ReadWriteTimeout` without a second string heuristic. A masked H2 reset
+/// `ReadWriteTimeout` without a second string heuristic. An H2 cancellation
 /// retains a typed CANCEL for hyper's backend writer. Other terminals keep
 /// the redacted literal.
 fn pump_terminal_error(terminal: u8) -> BoxError {
@@ -923,7 +923,7 @@ pub(crate) fn spawn_upload_pump<B>(
 ) -> (UploadPumpSource, UploadPumpJoin)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
-    B::Error: Send,
+    B::Error: Into<BoxError> + Send,
 {
     spawn_upload_pump_with_write_start(
         body,
@@ -951,7 +951,7 @@ pub(crate) fn spawn_upload_pump_with_deferred_write<B>(
 ) -> (UploadPumpSource, UploadPumpJoin)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
-    B::Error: Send,
+    B::Error: Into<BoxError> + Send,
 {
     spawn_upload_pump_with_write_start(
         body,
@@ -988,7 +988,7 @@ fn spawn_upload_pump_with_write_start<B>(
 ) -> (UploadPumpSource, UploadPumpJoin)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
-    B::Error: Send,
+    B::Error: Into<BoxError> + Send,
 {
     let initial_hint = http_body::Body::size_hint(&body);
     let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_PUMP_CHANNEL_CAPACITY);
@@ -1173,6 +1173,32 @@ struct UploadPumpTask<B> {
     socket: BackendSocketSlot,
 }
 
+/// Inspect only the typed cancellation reason; never retain or forward the
+/// original source error, which may contain client-controlled details. Keep
+/// conversion and traversal synchronous so no boxed error crosses an await.
+fn is_h2_source_cancel(error: BoxError) -> bool {
+    let mut source: &(dyn std::error::Error + 'static) = error.as_ref();
+    // Hyper's incoming-body chain is shallow. Bound traversal so a cyclic or
+    // unexpectedly deep wrapper fails closed with the generic source error.
+    for _ in 0..16 {
+        if let Some(error) = source.downcast_ref::<h2::Error>() {
+            return error.reason() == Some(h2::Reason::CANCEL);
+        }
+        // io::Error::source() skips its immediate payload. Inspect that
+        // payload first so a wrapped typed reason is not lost.
+        let next = if let Some(error) = source.downcast_ref::<std::io::Error>() {
+            error.get_ref().map(|inner| inner as &dyn std::error::Error)
+        } else {
+            source.source()
+        };
+        match next {
+            Some(error) => source = error,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// The relay itself. Its return value is the pump's terminal, published to the
 /// shared state — and the client body and bridge sender released — BEFORE it
 /// returns, so whichever task awaits this future (inline dispatcher or
@@ -1180,6 +1206,7 @@ struct UploadPumpTask<B> {
 async fn run_upload_pump<B>(task: UploadPumpTask<B>) -> UploadPumpOutcome
 where
     B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
 {
     let UploadPumpTask {
         mut body,
@@ -1316,7 +1343,15 @@ where
                 let last = http_body::Body::is_end_stream(&body);
                 permit.send(BridgedFrame { frame, last });
             }
-            Some(Err(_)) => break UploadPumpOutcome::SourceError,
+            Some(Err(error)) => {
+                // Hyper 1.10 exposes CANCEL as an error instead of masking it
+                // as EOF. Preserve only that typed wire fact through the
+                // redacted terminal, just as the masked EOF arm above does.
+                if require_end_stream {
+                    source_reset = is_h2_source_cancel(error.into());
+                }
+                break UploadPumpOutcome::SourceError;
+            }
         }
     };
     // Publish BEFORE the sender drops: the transport side reads this exactly
@@ -1870,3 +1905,7 @@ pub(crate) fn spawn_replayable_upload_pump_with_deferred_write(
         WriteWatermarkArm::Dispatcher,
     ))
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/gateway_core/upload_pump_source_error_tests.rs"]
+mod source_error_tests;
