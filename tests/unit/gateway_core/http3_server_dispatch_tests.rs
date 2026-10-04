@@ -930,6 +930,9 @@ fn h3_native_buffered_response_writes_are_deadline_bounded() {
     assert!(writer.contains("await_response_write_before_deadline("));
     assert!(writer.contains("await_terminal_response_write_before_deadline("));
     assert!(writer.contains("await_buffered_h3_write!(stream.finish())"));
+    assert!(writer.contains("terminal_authorization_write_at"));
+    assert!(writer.contains("H3_POST_DEADLINE_TERMINAL_WRITE_GRACE"));
+    assert!(writer.contains("await_buffered_h3_write!(stream.send_trailers(trailers), true)"));
 }
 
 #[test]
@@ -4164,7 +4167,7 @@ fn h3_native_grpc_bidi_open_is_pre_wire_and_splits() {
         "the request head must receive the receipt-anchored deadline after connection acquisition"
     );
     let pooled_openers = client
-        .split("pub async fn open_bidi_backend_stream<")
+        .split("pub(crate) async fn open_bidi_backend_stream<")
         .nth(1)
         .unwrap()
         .split("/// Execute an HTTP/3 request, streaming the request body from a hyper")
@@ -5824,4 +5827,44 @@ fn h3_plain_bridge_counts_request_messages_in_the_upload_framing() {
         grpc.contains("record_native_grpc_message_count("),
         "the native gRPC dispatch keeps its native-framing counter"
     );
+}
+
+#[test]
+fn h3_plain_authorization_failure_write_is_bounded_before_guard_settlement() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let writer = source
+        .split("async fn send_h3_backend_failure_response(")
+        .nth(1)
+        .expect("plain failure writer")
+        .split("/// Send an HTTP/3 rejection response with custom headers.")
+        .next()
+        .expect("bounded failure writer");
+    assert!(writer.contains("authorization_termination_latch().observed().is_some()"));
+    assert!(writer.contains("await_post_deadline_terminal_response_write(write)"));
+    assert!(writer.contains("abort_response_stream(stream)"));
+    assert!(writer.contains("halt_request_body(stream)"));
+    let branch = source
+        .split("// ===== STREAMING REQUEST + RESPONSE PATH =====")
+        .nth(1)
+        .expect("native streaming dispatch")
+        .split("let backend_admission_response_elapsed =")
+        .next()
+        .expect("dispatch failure branch");
+    let latch = branch
+        .rfind("record_authorization_termination_once(")
+        .expect("typed expiry latch");
+    let write = branch
+        .rfind("send_h3_backend_failure_response(")
+        .expect("terminal write");
+    let permits = branch
+        .rfind("record_h3_backend_admission_outcome(")
+        .expect("admission release");
+    let connections = branch
+        .rfind("drop(lb_connection_guard)")
+        .expect("connection release");
+    let summary = branch
+        .rfind("let summary = TransactionSummary {")
+        .expect("actual summary");
+    assert!(latch < write && write < permits && permits < connections && connections < summary);
+    assert!(branch.contains("body_completed: reject_sent"));
 }

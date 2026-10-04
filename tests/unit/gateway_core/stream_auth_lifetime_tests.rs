@@ -5773,33 +5773,27 @@ fn native_h3_grpc_dispatch_phases_compose_the_authorization_lifetime() {
         precommit.contains("let dispatch_deadline_at = dispatch_bound.deadline();"),
         "the awaited instant must be a projection of the captured composition"
     );
-    // Both phases check authorization FIRST, so a policy expiry is never
-    // reported as a backend timeout and never downgrades the H3 capability.
-    assert_eq!(
-        dispatch
-            .matches("Some(termination) => Err(termination),")
-            .count(),
-        2,
-        "a native-H3 gRPC dispatch phase lost its authorization attribution"
-    );
-    // ...and both attribute from the CAPTURED composition. Re-reading the clock
-    // after the timeout returns would report the security decision for a phase
-    // a strictly earlier client `grpc-timeout` actually bounded, whenever this
-    // task was not scheduled again until after the later authorization deadline
-    // had also passed.
+    // Opening now receives a typed pool outcome: its post-DNS cold-connect
+    // deadline can beat the outer lifetime on a late wake. The header race
+    // still attributes from the captured dispatch composition.
+    assert!(precommit.contains("let open_auth = crate::http3::client::H3Authorization::new("));
+    assert_eq!(precommit.matches("open_auth,").count(), 2);
+    assert!(precommit.contains("error.authorization_expiry()"));
+    assert!(precommit.contains("attempt_span.scope(open_fut).await"));
+    assert!(!precommit.contains("await_deadline_first(dispatch_deadline_at,"));
     assert_eq!(
         dispatch
             .matches("Err(()) => match dispatch_bound.expired_authorization() {")
             .count(),
-        2,
-        "a native-H3 gRPC dispatch phase re-derives its owner from the clock"
+        1,
+        "the header race must retain its captured owner"
     );
     assert_eq!(
         dispatch
             .matches("await_deadline_first(dispatch_deadline_at,")
             .count(),
-        2,
-        "both pre-commitment native-H3 gRPC waits must use the shared expiry-first primitive"
+        1,
+        "the header race must remain expiry-first"
     );
     assert!(
         !dispatch.contains("timeout_at(at, open_fut)")

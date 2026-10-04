@@ -1093,3 +1093,243 @@ fn every_plain_h3_frontend_pool_route_carries_the_captured_plan() {
         assert!(call.split_once(");").unwrap().0.contains("auth,"));
     }
 }
+
+/// Drive the actual cold-checkout composer after its creator published the
+/// post-DNS connect instant. No repoll occurs until every deadline has elapsed.
+#[tokio::test(start_paused = true)]
+async fn native_h3_cold_checkout_retains_earliest_connect_client_or_authorization_winner() {
+    use ferrum_edge::http3::client::await_h3_connection_checkout_for_test;
+    use std::sync::OnceLock;
+
+    for (connect_ms, client_ms, auth_ms, expected_auth, expected_client) in [
+        (40, 80, 100, false, false),
+        (40, 100, 80, false, false),
+        (80, 40, 100, false, true),
+        (80, 100, 40, true, false),
+        (40, 100, 40, true, false),
+        (40, 40, 100, false, true),
+    ] {
+        let started = tokio::time::Instant::now();
+        let plan = plan_after(Duration::from_millis(auth_ms));
+        let connect_at = OnceLock::new();
+        let polls = AtomicUsize::new(0);
+        let late_error_ready = AtomicBool::new(false);
+        let checkout = futures_util::future::poll_fn(|_| {
+            polls.fetch_add(1, Ordering::Relaxed);
+            let _ = connect_at.set(started + Duration::from_millis(connect_ms));
+            if late_error_ready.load(Ordering::Relaxed) {
+                Poll::Ready(Err::<(), _>(anyhow::anyhow!("late transport error")))
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut wait = Box::pin(await_h3_connection_checkout_for_test(
+            Some(started + Duration::from_millis(client_ms)),
+            Some(&plan),
+            &connect_at,
+            checkout,
+        ));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        late_error_ready.store(true, Ordering::Relaxed);
+        let (termination, request_on_wire, client_expired, class) =
+            wait.await.expect_err("the captured earliest bound must win");
+        assert_eq!(
+            termination,
+            expected_auth.then_some(StreamAuthTermination::CredentialExpired)
+        );
+        assert!(
+            !request_on_wire,
+            "cold acquisition never sends request HEADERS"
+        );
+        assert_eq!(client_expired, expected_client);
+        assert_eq!(
+            class,
+            if expected_auth || expected_client {
+                ErrorClass::ClientDisconnect
+            } else {
+                ErrorClass::ConnectionTimeout
+            }
+        );
+        assert_eq!(plan.2.observed(), termination);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn generic_grpc_late_attempt_clock_cannot_replace_authorization_or_actual_handoff() {
+    use ferrum_edge::_test_support::{
+        request_upload_auth_deadline_for_test, set_request_credential_deadline_for_test,
+    };
+    use ferrum_edge::plugins::RequestContext;
+    use ferrum_edge::proxy::authorization_dispatch_test_support::{
+        authorization_response, charge_route_attempt, log_metadata,
+    };
+    use std::collections::HashMap;
+
+    for request_on_wire in [false, true] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/pkg.Svc/Call".to_string(),
+        );
+        ctx.headers.insert(
+            "content-type".to_string(),
+            "application/grpc".to_string(),
+        );
+        ctx.authenticated_identity = Some("accepted-principal".to_string());
+        set_request_credential_deadline_for_test(
+            &mut ctx,
+            Some(tokio::time::Instant::now() + Duration::from_millis(40)),
+        );
+        ctx.route_override_attempt_timeout_ms = Some(80);
+        ctx.arm_route_request_deadline(true);
+        let plan = request_upload_auth_deadline_for_test(&ctx, 900).expect("admitted plan");
+        assert_eq!(plan.1, StreamAuthProtocolFamily::Grpc);
+        let result = ferrum_edge::_test_support::await_native_h3_dispatch_for_test(
+            ctx.grpc_deadline_at(),
+            Some(&plan),
+            request_on_wire,
+            std::future::pending::<Result<(), ferrum_edge::http3::client::H3PoolError>>(),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err((
+                Some(StreamAuthTermination::CredentialExpired),
+                request_on_wire,
+                false,
+            ))
+        );
+        // The dispatch already chose authorization. A delayed caller now sees
+        // the later route-attempt instant too, and a preparation marker is true.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut response = authorization_response(request_on_wire);
+        let headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+        assert!(!charge_route_attempt(&ctx, &headers, true, &mut response));
+        assert_eq!(response.status_code, 401);
+        assert_eq!(response.request_on_wire, request_on_wire);
+        assert_eq!(response.error_class, Some(ErrorClass::ClientDisconnect));
+        assert!(!response.connection_error);
+        let metadata = log_metadata(&ctx);
+        assert_eq!(
+            metadata
+                .get(ferrum_edge::proxy::auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY)
+                .map(String::as_str),
+            Some("credential_expired")
+        );
+        assert!(!plan.2.record_once(StreamAuthTermination::CredentialExpired, plan.1));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn generic_grpc_charges_only_its_deadline_terminal_after_observable_handoff() {
+    use ferrum_edge::_test_support::{
+        request_upload_auth_deadline_for_test, set_request_credential_deadline_for_test,
+    };
+    use ferrum_edge::plugins::RequestContext;
+    use ferrum_edge::proxy::authorization_dispatch_test_support::{
+        authorization_response, charge_route_attempt, client_deadline_response,
+    };
+    use std::collections::HashMap;
+
+    for content_type in [
+        "application/grpc",
+        "application/grpc-web+proto",
+        "application/grpc-web-text+proto",
+    ] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/pkg.Svc/Call".to_string(),
+        );
+        ctx.authenticated_identity = Some("accepted-principal".to_string());
+        set_request_credential_deadline_for_test(
+            &mut ctx,
+            Some(tokio::time::Instant::now() + Duration::from_millis(80)),
+        );
+        let plan = request_upload_auth_deadline_for_test(&ctx, 900).expect("admitted plan");
+        ctx.route_override_attempt_timeout_ms = Some(40);
+        ctx.arm_route_request_deadline(true);
+        let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        let mut response = client_deadline_response(&ctx, &headers, false);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(plan.2.record_once(StreamAuthTermination::CredentialExpired, plan.1));
+        assert!(!charge_route_attempt(&ctx, &headers, true, &mut response));
+        assert!(!response.request_on_wire);
+        assert_eq!(response.error_class, Some(ErrorClass::ClientDisconnect));
+
+        let mut cancellation = authorization_response(true);
+        cancellation.status_code = 502;
+        assert!(!charge_route_attempt(&ctx, &headers, true, &mut cancellation));
+        assert_eq!(cancellation.error_class, Some(ErrorClass::ClientDisconnect));
+
+        let mut response = client_deadline_response(&ctx, &headers, true);
+        assert!(charge_route_attempt(&ctx, &headers, true, &mut response));
+        assert_eq!(response.error_class, Some(ErrorClass::ReadWriteTimeout));
+        assert!(response.request_on_wire);
+    }
+}
+
+#[test]
+fn native_h3_grpc_failure_carrier_keeps_handoff_separate_from_neutral_health() {
+    use ferrum_edge::http3::server::h3_grpc_authorization_failure_provenance_for_test;
+
+    assert_eq!(
+        h3_grpc_authorization_failure_provenance_for_test(false),
+        (false, false, ErrorClass::ClientDisconnect, "pre_wire")
+    );
+    assert_eq!(
+        h3_grpc_authorization_failure_provenance_for_test(true),
+        (true, false, ErrorClass::ClientDisconnect, "ambiguous")
+    );
+    let server = include_str!("../../../src/http3/server.rs");
+    let recorder = source_region(
+        server,
+        "async fn record_failed_h3_grpc_dispatch(",
+        "/// Sole owner of the native-H3 gRPC request-upload pump",
+    );
+    assert!(recorder.contains("record_h3_grpc_dispatch_attempt(ctx, &failure)"));
+    assert!(!recorder.contains("request_reached_wire("));
+}
+
+#[test]
+fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside() {
+    let client = include_str!("../../../src/http3/client.rs");
+    for (start, end) in [
+        (
+            "async fn create_connection(",
+            "/// Create a new QUIC connection + h3 session to an explicit",
+        ),
+        (
+            "async fn create_connection_to_target(",
+            "/// Execute an HTTP/3 request on an existing",
+        ),
+    ] {
+        let constructor = source_region(client, start, end);
+        let dns = constructor
+            .find("resolve_backend_addrs_cached(")
+            .expect("DNS resolution");
+        let connect = constructor
+            .find("connect_at.set(")
+            .expect("captured connect instant");
+        let candidate = constructor
+            .find("crate::dns::connect_candidates(")
+            .expect("dial scope");
+        let quic = constructor
+            .find(".connect_with(")
+            .expect("QUIC/TLS handshake");
+        let h3 = constructor
+            .find(".build(h3_quinn::Connection::new(connection))")
+            .expect("H3 readiness");
+        assert!(dns < connect && connect < candidate && candidate < quic && quic < h3);
+        assert!(constructor[dns..connect].contains(".await?;"));
+    }
+    assert_eq!(
+        client
+            .matches("match await_h3_connection_checkout(auth, &connect_at, create,")
+            .count(),
+        8
+    );
+}

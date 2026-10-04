@@ -3596,3 +3596,70 @@ async fn h3_pool_upload_expiry_after_transmission_retains_post_handoff_provenanc
         (false, true, Some(ErrorClass::ClientDisconnect), "ambiguous")
     );
 }
+
+/// A real cold QUIC acquisition has a shorter connect budget than its admitted
+/// lifetime. The silent peer keeps the UDP socket bound, so this exercises the
+/// connect/handshake timeout rather than an immediate refused-address error.
+#[tokio::test]
+async fn h3_cold_connect_timeout_does_not_become_an_authorization_refusal() {
+    use ferrum_edge::_test_support::native_h3_pooled_dispatch_for_test;
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use std::time::Duration;
+
+    for explicit_target in [false, true] {
+        let (backend, port, client_tls) = capped_h3_backend("h3-cold-connect-winner", 1).await;
+        let silent = crate::scaffolding::ports::reserve_udp_port()
+            .await
+            .expect("silent UDP peer");
+        let silent_port = silent.port;
+        let _silent_socket = silent.into_socket();
+        let (pool, _, mut proxy) = capped_h3_pool(1, silent_port);
+        proxy.backend_connect_timeout_ms = 100;
+        let plan = (
+            StreamAuthDeadline {
+                at: tokio::time::Instant::now() + Duration::from_secs(2),
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Http,
+            StreamAuthTerminationLatch::default(),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            native_h3_pooled_dispatch_for_test(
+                &pool,
+                &proxy,
+                &format!("https://127.0.0.1:{silent_port}/"),
+                bytes::Bytes::new(),
+                &plan,
+                explicit_target,
+                std::future::ready(Ok(client_tls.clone())),
+            ),
+        )
+        .await
+        .expect("the operator connect timeout must precede authorization");
+        assert_eq!(result.err(), Some((None, false, false)));
+        assert_eq!(plan.2.observed(), None);
+        assert_eq!(backend.accepted_connections(), 0);
+
+        // Positive control: the same TLS config and pool can reach the live
+        // fixture, so the zero-request outcome came from the cold timeout.
+        proxy.backend_port = port;
+        proxy.backend_connect_timeout_ms = 5000;
+        let response = pool
+            .request(
+                &proxy,
+                "GET",
+                &format!("https://127.0.0.1:{port}/"),
+                &[],
+                bytes::Bytes::new(),
+                || std::future::ready(Ok(client_tls)),
+            )
+            .await
+            .expect("usable H3 fixture after timeout");
+        assert_eq!(response.status, 200);
+        assert_eq!(backend.received_requests().await.len(), 1);
+    }
+}

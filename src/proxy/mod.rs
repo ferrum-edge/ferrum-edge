@@ -5009,6 +5009,14 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
     let mut metadata = ctx.metadata.clone();
+    // Detached uploads publish through the shared latch. Import its bounded
+    // class even when no response relay copied it into the request context.
+    if let Some(termination) = ctx.authorization_termination_latch().observed() {
+        metadata.insert(
+            auth_lifetime::STREAM_AUTH_TERMINATION_METADATA_KEY.to_string(),
+            termination.as_str().to_string(),
+        );
+    }
     ctx.project_correlation_ids(&mut metadata);
     redact_request_body_from_log_metadata(&mut metadata);
     ctx.apply_waf_owned_log_metadata(&mut metadata);
@@ -53504,8 +53512,15 @@ pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry(
     handed_to_backend: bool,
     response: &mut retry::BackendResponse,
 ) -> bool {
+    let authorization_won = ctx.authorization_termination_latch().observed().is_some()
+        && ctx
+            .precommit_response_phase_bound()
+            .expired_authorization()
+            .is_some();
     if !handed_to_backend
+        || !response.request_on_wire
         || response.error_class != Some(retry::ErrorClass::ClientDisconnect)
+        || authorization_won
         || !ctx.grpc_deadline_is_route_attempt_budget()
         || !ctx
             .grpc_deadline_at()
@@ -53513,10 +53528,57 @@ pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry(
     {
         return false;
     }
+    // ClientDisconnect also covers authorization refusal and client upload
+    // cancellation. Only the captured RPC-deadline terminal may be charged;
+    // an elapsed attempt clock alone cannot turn another winner into a timeout.
+    let terminal = client_grpc_deadline_exceeded_response_for_request(ctx, request_headers, None);
+    let same_body = match (&response.body, &terminal.body) {
+        (ResponseBody::Buffered(actual), ResponseBody::Buffered(expected)) => actual == expected,
+        _ => false,
+    };
+    if response.status_code != terminal.status_code
+        || response.headers != terminal.headers
+        || !same_body
+    {
+        return false;
+    }
     let resolved_ip = response.backend_resolved_ip.take();
     *response =
         grpc_deadline_exceeded_response_for_request(ctx, request_headers, resolved_ip, true);
     true
+}
+
+/// Direct access to production dispatch settlement for external regressions.
+#[doc(hidden)]
+pub mod authorization_dispatch_test_support {
+    use super::*;
+
+    pub fn authorization_response(request_on_wire: bool) -> retry::BackendResponse {
+        authorization_expired_dispatch_placeholder(None, request_on_wire)
+    }
+
+    pub fn client_deadline_response(
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        request_on_wire: bool,
+    ) -> retry::BackendResponse {
+        let mut response = client_grpc_deadline_exceeded_response_for_request(ctx, headers, None);
+        response.request_on_wire = request_on_wire;
+        response
+    }
+
+    pub fn charge_route_attempt(
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        prepared_handoff: bool,
+        response: &mut retry::BackendResponse,
+    ) -> bool {
+        charge_generic_grpc_route_attempt_budget_expiry(ctx, headers, prepared_handoff, response)
+    }
+
+    pub fn log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
+        clone_log_metadata(ctx)
+    }
 }
 
 fn client_grpc_deadline_exceeded_response_for_optional_request(
