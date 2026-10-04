@@ -5100,7 +5100,7 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool) {
         assert_eq!(socket.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
         exercise_grpc_retained_uploads(socket, port, "https", ended_rx).await;
     } else {
-        let port = reqwest::Url::parse(&harness.proxy_base_url())
+        let port = reqwest::Url::parse(harness.proxy_base_url())
             .expect("frontend URL")
             .port()
             .expect("frontend port");
@@ -5156,9 +5156,9 @@ async fn exercise_grpc_retained_uploads<T>(
         drop(body);
         uploads.push(upload);
     }
-    assert!(backend_ids[..32].iter().all(|id| id == &backend_ids[0]));
+    assert!(backend_ids[..32].iter().all(|id| id == backend_ids[0]));
     assert!(
-        backend_ids[32..].iter().any(|id| id != &backend_ids[0]),
+        backend_ids[32..].iter().any(|id| id != backend_ids[0]),
         "uploads must remain counted after their terminal responses"
     );
     assert!(
@@ -5410,7 +5410,7 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
         .spawn()
         .await
         .expect("gateway");
-    let port = reqwest::Url::parse(&harness.proxy_base_url())
+    let port = reqwest::Url::parse(harness.proxy_base_url())
         .expect("frontend URL")
         .port()
         .expect("frontend port");
@@ -5486,9 +5486,9 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
             .expect("withheld-credit report");
         assert_eq!(blocked, index, "every response leaves its upload blocked");
     }
-    assert!(backend_ids[..32].iter().all(|id| id == &backend_ids[0]));
+    assert!(backend_ids[..32].iter().all(|id| id == backend_ids[0]));
     assert!(
-        backend_ids[32..].iter().any(|id| id != &backend_ids[0]),
+        backend_ids[32..].iter().any(|id| id != backend_ids[0]),
         "final DATA still queued after terminal responses must force spill"
     );
     assert!(
