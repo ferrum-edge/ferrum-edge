@@ -811,7 +811,12 @@ async fn conditional_reads_preserve_historical_credential_fields_and_shapes() {
         }
     }))
     .unwrap();
-    // Model an older stored row that current HTTP admission would reject.
+    // Model an older stored row that current HTTP admission would reject. The
+    // conditional verification and snapshot paths read the authoritative raw
+    // row, so they retain these stored credentials exactly. Archival `/backup`
+    // follows the released full-config load path: `quarantine_invalid_hmac_credentials`
+    // strips this legacy non-array `hmac_auth` before the canonical wrapper is
+    // serialized. Keep that fail-closed quarantine contract intact.
     db.create_consumer(&consumer).await.unwrap();
     let (base, _shutdown) = start_admin(admin_state(db, JWT_SECRET)).await;
     let complete = get(&base, "/consumers/historical/verification").await;
@@ -843,6 +848,13 @@ async fn conditional_reads_preserve_historical_credential_fields_and_shapes() {
     );
     let archival = get(&base, "/backup").await;
     assert_eq!(archival.status, 200, "{}", archival.body);
+    assert!(
+        !archival.body["consumers"][0]["credentials"]
+            .as_object()
+            .unwrap()
+            .contains_key("hmac_auth"),
+        "archival export omits the non-array hmac_auth credential quarantined during config load"
+    );
     assert_eq!(
         archival.body["consumers"][0]["credentials"],
         json!({
