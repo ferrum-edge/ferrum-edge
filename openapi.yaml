@@ -4855,6 +4855,16 @@ paths:
       operationId: backupConfig
       summary: Export full gateway configuration
       description: |
+        Opt in with `?conditional=true` for complete stored rows and per-row
+        strong ETags plus a namespace ETag from ONE primary database snapshot.
+        This requires an unfiltered export and snapshot transactions (SQL or
+        replica-set MongoDB); it never falls back to cached data. The namespace
+        token covers all resources, associations, API-spec documents, trust,
+        registry metadata and the durable namespace change watermark. Send it
+        as `If-Match` to `POST /restore?confirm=true` on this same namespace.
+        Consumer credentials on this path are copied exactly, including older
+        stored fields, rather than canonicalized for archival restoration.
+
         Returns the complete gateway configuration as a single JSON document
         suitable for archival or later restoration via `POST /restore`.
 
@@ -4941,12 +4951,25 @@ paths:
           schema:
             type: string
             example: "proxies,upstreams"
+        - name: conditional
+          in: query
+          description: |
+            Explicit opt-in to the coherent, credential-complete conditional
+            snapshot contract. Only true/false are accepted; duplicate values
+            or a resources filter combined with true return 400.
+          schema:
+            type: boolean
+            default: false
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
           description: Full configuration backup
           headers:
+            ETag:
+              description: Strong namespace revision; emitted only for conditional=true.
+              schema:
+                type: string
             Content-Disposition:
               schema:
                 type: string
@@ -4964,6 +4987,12 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "501":
+          description: Conditional snapshots require a transaction-capable MongoDB deployment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4974,6 +5003,15 @@ paths:
       operationId: restoreConfig
       summary: Replace all configuration from a backup
       description: |
+        With `If-Match` from `/backup?conditional=true`, the namespace revision
+        comparison and the ENTIRE replacement commit in one transaction.
+        Concurrent changes yield 412 without mutation. Unsupported MongoDB
+        topology yields 501 before mutation; the path never degrades to the
+        legacy independently committed clear/import flow. A weak tag cannot
+        match, malformed headers and `*` return 400. Missing If-Match preserves
+        the existing unconditional restore behavior. Body metadata is accepted
+        and ignored; only the header establishes a precondition.
+
         **Replacement operation** — snapshots the current namespace, deletes
         all existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
@@ -5065,6 +5103,7 @@ paths:
         (generated via `GET /backup?resources=proxies`, etc.).
       tags: [Backup & Restore]
       parameters:
+        - $ref: "#/components/parameters/NamespaceIfMatch"
         - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: confirm
@@ -5092,6 +5131,18 @@ paths:
             schema:
               $ref: "#/components/schemas/RestoreRequest"
       responses:
+        "412":
+          description: Namespace changed; nothing from the conditional restore was applied.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: Conditional restore requires a transaction-capable MongoDB deployment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
@@ -5692,6 +5743,44 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+
+  /consumers/{id}/verification:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: verifyCompleteConsumer
+      summary: Read the complete stored consumer with its strong ETag
+      description: |
+        Requires an admin-role JWT and the same namespace authorization as
+        consumer CRUD. Operators, viewers, metrics credentials and anonymous
+        callers cannot read this endpoint. Returns every stored credential
+        field (Basic authentication uses password_hash, never plaintext) and
+        the SAME ETag as GET /consumers/{id}, bound to this exact full row.
+        Never uses cached fallback. A security audit record must be admitted
+        before the credential-bearing response is released. Audit metadata
+        contains no credential values or tokens. Responses use no-store.
+      tags: [Consumers]
+      responses:
+        "200":
+          description: Complete stored consumer
+          headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConsumerVerification"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /consumers/{id}:
     parameters:
@@ -8174,6 +8263,20 @@ components:
 
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:
+    NamespaceIfMatch:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+      description: |
+        The strong namespace ETag from GET /backup?conditional=true on the same
+        X-Ferrum-Namespace. Comparison and all replacement writes are atomic.
+        Weak tags fail with 412, malformed/empty headers and * return 400.
+        A comma-separated tag list matches when any strong member matches.
+        Omission preserves unconditional restore behavior. Shared admin JWT
+        secrets are required for tags to agree between replicas.
+
     IfMatch:
       name: If-Match
       in: header
@@ -8198,7 +8301,8 @@ components:
         Omitting the header keeps the write unconditional. A malformed or
         empty header is `400`, never treated as absent. `If-Match` is only
         evaluated on `PUT`/`DELETE` of `/proxies/{id}`, `/upstreams/{id}`,
-        `/consumers/{id}`, and `/plugins/config/{id}`; any other `POST`,
+        `/consumers/{id}`, and `/plugins/config/{id}`. `POST /restore` uses
+        the separate NamespaceIfMatch contract; any other `POST`,
         `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
         than applied unconditionally. As RFC 9110 §13.2.1 requires, a request
         that would otherwise be `404` is `404` regardless of the precondition.
@@ -10962,6 +11066,21 @@ components:
           properties:
             credentials:
               $ref: "#/components/schemas/ConsumerCredentialsUpdateInput"
+
+    ConsumerVerification:
+      description: |
+        Exact stored consumer credential representation for admin verification.
+        Unlike archival ConsumerBackup, historical credential shapes and fields
+        are preserved so the complete row and its strong ETag can be verified.
+        Such historical values may require repair before restore accepts them.
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/ConsumerBase"
+        - type: object
+          properties:
+            credentials:
+              type: object
+              additionalProperties: true
 
     ConsumerBackup:
       description: >-
@@ -18905,6 +19024,10 @@ components:
         persist `api_specs` or `gateway_trust_bundles` — use `POST /restore`
         or the dedicated endpoints.
       properties:
+        conditional:
+          type: object
+          additionalProperties: true
+          description: Backup metadata, accepted and ignored. Use If-Match for conditional restore.
         proxies:
           type: array
           items:
@@ -19188,10 +19311,46 @@ components:
           minItems: 1
       additionalProperties: false
 
+    ConditionalBackupMetadata:
+      type: object
+      required: [namespace_etag, row_etags]
+      additionalProperties: false
+      description: |
+        Present only for conditional=true; every token is derived from the
+        same complete primary snapshot as the exported rows. Tokens are keyed
+        HMACs, never unkeyed credential digests. Read timestamps and audit events
+        do not advance the namespace revision. Real resource mutations, including
+        delete/recreate, do. Namespace registry metadata is covered but not exported.
+      properties:
+        namespace_etag:
+          type: string
+          description: Quoted strong ETag for If-Match on POST /restore.
+        row_etags:
+          type: object
+          required: [proxies, consumers, upstreams, plugin_configs]
+          additionalProperties: false
+          properties:
+            proxies:
+              $ref: "#/components/schemas/ResourceETagMap"
+            consumers:
+              $ref: "#/components/schemas/ResourceETagMap"
+            upstreams:
+              $ref: "#/components/schemas/ResourceETagMap"
+            plugin_configs:
+              $ref: "#/components/schemas/ResourceETagMap"
+
+    ResourceETagMap:
+      type: object
+      description: Resource id to quoted strong ETag accepted by conditional CRUD.
+      additionalProperties:
+        type: string
+
     BackupResponse:
       type: object
       required: [version, ferrum_version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
       properties:
+        conditional:
+          $ref: "#/components/schemas/ConditionalBackupMetadata"
         version:
           type: string
           description: Configuration schema version
@@ -19239,7 +19398,9 @@ components:
         consumers:
           type: array
           items:
-            $ref: "#/components/schemas/ConsumerBackup"
+            anyOf:
+              - $ref: "#/components/schemas/ConsumerBackup"
+              - $ref: "#/components/schemas/ConsumerVerification"
         plugin_configs:
           type: array
           items:
@@ -19468,6 +19629,10 @@ components:
         backup artifact round-trips.
       additionalProperties: false
       properties:
+        conditional:
+          type: object
+          additionalProperties: true
+          description: Backup metadata, accepted and ignored. Use If-Match for conditional restore.
         version:
           type: string
           description: |

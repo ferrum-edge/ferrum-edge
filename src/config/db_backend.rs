@@ -27,6 +27,88 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{info, warn};
 
+/// Complete primary snapshot for opt-in conditional administrative exports.
+/// Runtime-only state and read timestamps never contribute to the revision.
+pub struct ConditionalNamespaceSnapshot {
+    pub config: GatewayConfig,
+    pub api_specs: Vec<ApiSpec>,
+    pub namespace_record: Option<crate::config::namespace_registry::NamespaceRecord>,
+    pub change_sequence: u64,
+}
+
+impl ConditionalNamespaceSnapshot {
+    /// Stable full stored representation, including credentials, associations,
+    /// spec documents, trust and registry metadata. The durable namespace
+    /// change watermark also fences delete/recreate and reverted mutations.
+    pub fn representation(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut proxies = self.config.proxies.clone();
+        proxies.sort_by(|a, b| a.id.cmp(&b.id));
+        for proxy in &mut proxies {
+            proxy
+                .plugins
+                .sort_by(|a, b| a.plugin_config_id.cmp(&b.plugin_config_id));
+        }
+        let mut consumers = self.config.consumers.clone();
+        consumers.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut upstreams = self.config.upstreams.clone();
+        upstreams.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut plugins = self.config.plugin_configs.clone();
+        plugins.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut specs = self.api_specs.clone();
+        specs.sort_by(|a, b| a.id.cmp(&b.id));
+        serde_json::to_value((
+            proxies,
+            consumers,
+            upstreams,
+            plugins,
+            &self.config.gateway_trust_bundles,
+            specs,
+            &self.namespace_record,
+            self.change_sequence,
+        ))
+    }
+}
+
+/// A validated replacement plus the exact namespace state it may replace.
+/// Stores compare `expected` inside the same transaction as every mutation and
+/// re-verify the admission lease before commit. No fallback to chunked restore.
+pub struct ConditionalNamespaceRestore<'a> {
+    pub graph: AtomicBatchGraph<'a>,
+    pub expected: &'a serde_json::Value,
+    pub api_specs: &'a [ApiSpec],
+    /// Omission preserves trust; an empty slice explicitly revokes it.
+    pub gateway_trust_bundles: Option<&'a [GatewayTrustBundleRecord]>,
+}
+
+impl ConditionalNamespaceRestore<'_> {
+    pub(crate) fn validate_scope(&self) -> Result<(), anyhow::Error> {
+        if self.graph.admission_lease.is_none() {
+            anyhow::bail!("Conditional restore requires a namespace admission lease");
+        }
+        let namespace = self.graph.namespace;
+        if self.graph.admission_namespaces() != [namespace]
+            || self.api_specs.iter().any(|spec| spec.namespace != namespace)
+            || self.gateway_trust_bundles.is_some_and(|records| {
+                records.len() > 1 || records.iter().any(|record| record.namespace != namespace)
+            })
+        {
+            anyhow::bail!("Conditional restore requires a single namespace");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct NamespacePreconditionFailed;
+
+impl std::fmt::Display for NamespacePreconditionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Namespace changed; conditional restore was not applied")
+    }
+}
+
+impl std::error::Error for NamespacePreconditionFailed {}
+
 /// Bounded, credential-free snapshot of sticky DB failover topology.
 ///
 /// Exposed on authenticated `/health` detail and used by admin write gating so
@@ -1679,6 +1761,27 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         &self,
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error>;
+
+    /// Read all namespace resources and their revision in ONE primary snapshot.
+    /// A deployment without snapshot transactions must refuse this safe path.
+    async fn load_conditional_namespace_snapshot(
+        &self,
+        _namespace: &str,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        Err(anyhow::anyhow!(
+            "Conditional namespace snapshots are unsupported"
+        ))
+    }
+
+    /// Compare and replace the complete namespace in ONE transaction. Empty
+    /// graphs still check the precondition and can delete existing resources.
+    async fn restore_namespace_conditionally(
+        &self,
+        _restore: &ConditionalNamespaceRestore<'_>,
+        _mode: &BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error> {
+        Err(anyhow::anyhow!("Conditional namespace restore is unsupported"))
+    }
 
     /// Load the namespace policy graph (proxies + plugin_configs) without
     /// consumers or upstreams.

@@ -4,6 +4,7 @@ pub mod api_specs;
 pub mod audit;
 pub mod audit_spool;
 mod backup;
+mod conditional_snapshots;
 pub mod config_export;
 pub mod conn_limit;
 pub(crate) mod crud;
@@ -4359,6 +4360,19 @@ async fn handle_admin_request_inner(
         (Method::GET, ["consumers", id]) => {
             crud::handle_get::<Consumer>(&state, id, auth.role, &namespace).await
         }
+        (Method::GET, ["consumers", id, "verification"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            conditional_snapshots::consumer_verification(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                &audit_request_ctx,
+            )
+            .await
+        }
         (Method::PUT, ["consumers", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
@@ -4753,6 +4767,7 @@ async fn handle_admin_request_inner(
                 query.as_deref(),
                 &namespace,
                 provisioner.as_deref(),
+                route_if_match!(),
             )
             .await
         }
@@ -6606,6 +6621,7 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
         _exported_at: None,
         _source: None,
         _counts: None,
+        _conditional: None,
     }
 }
 
@@ -6651,6 +6667,7 @@ impl RestoreSnapshot {
             _exported_at: None,
             _source: None,
             _counts: None,
+            _conditional: None,
         };
         if !self.api_specs.is_empty() || self.payload.api_specs.is_some() {
             payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&self.api_specs));
@@ -6695,11 +6712,15 @@ struct PersistCounts {
 
 const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
 pub(crate) const IF_MATCH_UNSUPPORTED_MESSAGE: &str = "If-Match is only supported on PUT and \
-     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, and /plugins/config/{id}";
+     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, /plugins/config/{id}, \
+     and POST /restore";
 
 /// Routes that evaluate `If-Match` (see `preconditions`). Every other mutating
 /// route refuses the header instead of ignoring it.
 fn if_match_route(method: &Method, segments: &[&str]) -> bool {
+    if method == Method::POST && segments == ["restore"] {
+        return true;
+    }
     (method == Method::PUT || method == Method::DELETE)
         && matches!(
             segments,
@@ -7129,6 +7150,7 @@ fn snapshot_resources_missing_after_intervening_write(
         _exported_at: None,
         _source: None,
         _counts: None,
+        _conditional: None,
     }
 }
 
@@ -9729,6 +9751,7 @@ fn serialize_backup_payload(
         upstreams,
         gateway_trust_bundles,
         api_specs: api_specs_section,
+        conditional: None,
     };
 
     let body_bytes = serde_json::to_vec(&backup).unwrap_or_else(|_| b"{}".to_vec());
@@ -9884,6 +9907,36 @@ async fn handle_backup(
             StatusCode::BAD_REQUEST,
             &json!({"error": BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR}),
         ));
+    }
+
+    match conditional_snapshots::parse_backup_opt_in(query) {
+        Ok(true) => {
+            return conditional_snapshots::backup(
+                state,
+                actor,
+                namespace,
+                request_ctx,
+                resource_filter.as_ref(),
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(message) => {
+            audit_backup_failure(
+                state,
+                actor,
+                namespace,
+                request_ctx,
+                resource_filter.as_ref(),
+                audit::failure_category::VALIDATION_FAILED,
+                audit::outcome::VALIDATION_FAILED,
+            )
+            .await;
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": message}),
+            ));
+        }
     }
 
     let include_api_specs = backup_resource_includes(resource_filter.as_ref(), "api_specs");
@@ -10182,6 +10235,7 @@ async fn handle_restore(
     query: Option<&str>,
     namespace: &str,
     provisioner: Option<&str>,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let apply_mode = match parse_live_apply_mode_query(query) {
         Ok(mode) => mode,
@@ -10212,6 +10266,17 @@ async fn handle_restore(
                 "error": "Restore is a destructive operation that replaces all existing configuration. Pass ?confirm=true to proceed."
             }),
         ));
+    }
+    if let Some(if_match) = if_match {
+        if matches!(if_match, preconditions::IfMatch::Any) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Conditional restore requires a strong namespace ETag; '*' is not accepted"}),
+            ));
+        }
+        if let Err(unsupported) = db.ensure_atomic_batch_supported() {
+            return Ok(atomic_batch_unsupported_response(&unsupported));
+        }
     }
     let mut namespace_config_admission_guard = match crud::lock_namespace_config_admission(
         db.clone(),
@@ -10643,6 +10708,47 @@ async fn handle_restore(
     let restore_mode = BatchConfigWriteMode::GuardedAdmission {
         guard_owner: restore_guard.guard_owner().to_string(),
     };
+
+    if let Some(if_match) = if_match {
+        let completion = namespace_config_admission_guard
+            .run_to_completion_while_held(conditional_snapshots::restore(
+                state,
+                actor,
+                db.as_ref(),
+                namespace,
+                &payload,
+                if_match,
+                &restore_mode,
+                namespace_config_admission_guard.lease_ref(),
+            ))
+            .await;
+        let response = match completion {
+            Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+            Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => result,
+            Err(_) => json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
+            ),
+        };
+        if restore_guard.release().await.is_err() {
+            error_persistence_failure_redacted("conditional_restore_guard_release");
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "Conditional restore outcome requires verification; admission guard release failed"}),
+            ));
+        }
+        if response.status().is_success() {
+            return Ok(state
+                .complete_live_config_mutation_after_commit_boxed(
+                    namespace,
+                    (namespace_config_admission_guard, _write_permit),
+                    response,
+                    apply_mode,
+                )
+                .await);
+        }
+        return Ok(response);
+    }
 
     // Snapshot the namespace before deletion so a failure in any independently
     // committed import chunk (or a partial clear) can be compensated on every

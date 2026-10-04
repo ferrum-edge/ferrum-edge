@@ -3020,7 +3020,7 @@ pub(crate) async fn handle_update<R: AdminResource>(
 
 /// The current strong tag for a stored resource, or `None` when no tag key is
 /// configured or the resource cannot be rendered.
-fn current_etag<R: AdminResource>(state: &AdminState, resource: &R) -> Option<String> {
+pub(crate) fn current_etag<R: AdminResource>(state: &AdminState, resource: &R) -> Option<String> {
     let key = state.jwt_manager.resource_etag_key()?;
     let representation = R::etag_representation(resource).ok()?;
     Some(preconditions::resource_etag(
