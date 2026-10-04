@@ -143,6 +143,11 @@ pub enum H2Step {
     /// headers against `matcher`. Mismatch is counted but doesn't stop the
     /// script — see [`ScriptedH2Backend::matcher_mismatches`].
     ExpectHeaders(MatchHeaders),
+    /// Select exactly one script for the current stream by its request headers.
+    /// Run its steps before continuing this connection's script. An unmatched
+    /// or ambiguous stream records a matcher mismatch and fails the script.
+    /// Used by the gRPC fixture to route RPCs independently of connection reuse.
+    SelectStreamScript(Vec<(MatchHeaders, Vec<H2Step>)>),
     /// Read exactly one request DATA frame without waiting for END_STREAM.
     /// The bytes are appended to `ReceivedStream.body`. Use this to prove an
     /// upstream observes request DATA while the downstream upload remains open.
@@ -1038,13 +1043,16 @@ async fn run_script(
     let mut current_body_sender: Option<h2::SendStream<Bytes>> = None;
 
     loop {
-        for (step_index, step) in script.iter().cloned().enumerate() {
+        let mut steps = script.clone().into_iter();
+        let mut step_index = 0;
+        while let Some(step) = steps.next() {
             // In repeat mode the fixture is an ordinary server: a peer that hangs
             // up while we sit at the top of the script is closing an *idle*
             // connection at a request boundary, which is orderly, not a fixture
             // failure. Anywhere else, "connection closed before any stream
             // arrived" stays an error.
             let closed_channel_is_clean_exit = repeat_script && step_index == 0;
+            step_index += 1;
             match step {
                 H2Step::ExpectHeaders(matcher) => {
                     current_body_sender = None;
@@ -1091,6 +1099,33 @@ async fn run_script(
                             );
                         }
                     }
+                }
+                H2Step::SelectStreamScript(scripts) => {
+                    let Some(cs) = current_stream.as_ref() else {
+                        return Err("SelectStreamScript: no current stream".into());
+                    };
+                    let mut matching = scripts
+                        .into_iter()
+                        .filter(|(matcher, _)| (matcher.0)(&cs.recorded));
+                    let Some((_, selected)) = matching.next() else {
+                        state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
+                        return Err(format!(
+                            "SelectStreamScript: no script for {} {}",
+                            cs.recorded.method, cs.recorded.path
+                        ));
+                    };
+                    if matching.next().is_some() {
+                        state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
+                        return Err(format!(
+                            "SelectStreamScript: multiple scripts for {} {}",
+                            cs.recorded.method, cs.recorded.path
+                        ));
+                    }
+                    steps = selected
+                        .into_iter()
+                        .chain(steps)
+                        .collect::<Vec<_>>()
+                        .into_iter();
                 }
                 H2Step::DrainRequestBody => {
                     let Some(cs) = current_stream.as_mut() else {

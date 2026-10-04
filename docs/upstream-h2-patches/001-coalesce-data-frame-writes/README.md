@@ -105,11 +105,19 @@ They check that:
 
 h2's library suite also passes, apart from the HPACK fixture tests, which read data files the published crate does not ship.
 
-CI also runs every Ferrum hyper regression (`ferrum_*`, including patch 002's DATA-frame capacity test) against this h2 (the `Vendored Patch Regressions` job), and the H2 guard observation lane builds its observed h2 from the verified archive plus this patch.
+CI also runs every Ferrum Hyper regression (`ferrum_*`, including patch 002's
+flow-control progress tests) against this h2, then runs h2 patch 002's dynamic
+budget tests (the `Vendored Patch Regressions` job). The H2 guard observation
+lane builds its observed h2 from the verified archive plus these patches.
 
 ## Retirement
 
-Retire this patch when an h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or when Ferrum stops using h2. Patch [002-stream-lifetime](../002-stream-lifetime/README.md) must also retire before dropping the vendored crate. To retire the crate after both patches are superseded:
+Retire this patch when an h2 release containing hyperium/h2#903 (or another
+change that batches DATA frames into one write) is adopted, or when Ferrum
+stops using h2. The [runtime-budget](../002-runtime-data-frame-budget/README.md)
+and [stream-lifetime](../002-stream-lifetime/README.md) patches must also retire
+before dropping the vendored crate. To retire the crate after all three
+patches are superseded:
 
 1. Remove the `h2` line from `[patch.crates-io]` in `Cargo.toml`, `tests/performance/mesh/Cargo.toml` and `fuzz/Cargo.toml`.
 2. Drop `vendor/h2-0.4.19-ferrum-patched/` and update the three lockfiles.

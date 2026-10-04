@@ -70,6 +70,8 @@ The base is the crates.io `hyper` 1.9.0 source (package checksum
 commit `0d6c7d5469baa09e2fb127ee3758a79b3271a4f0`). Only three files under
 `src/` differ; the unified diff is
 [`hyper-upgraded-h2-connect-error-reset.patch`](hyper-upgraded-h2-connect-error-reset.patch).
+It is patch 001 of [the complete ordered stack](../README.md), based on the
+published Hyper 1.9.0 crate archive.
 The crate's `Cargo.lock`, `Cargo.toml.orig` and `.cargo_vcs_info.json` are not
 vendored.
 

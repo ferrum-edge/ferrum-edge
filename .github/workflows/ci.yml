@@ -1704,6 +1704,28 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
+      - name: Reconstruct the complete pinned Hyper patch stack
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/hyper-patch-stack"
+          mkdir -p "$evidence"
+          python3 .github/scripts/verify_hyper_patch_stack.py --self-test
+          curl --fail --location --retry 5 --silent --show-error \
+            https://static.crates.io/crates/hyper/hyper-1.9.0.crate \
+            --output "$evidence/hyper-1.9.0.crate"
+          echo "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca  $evidence/hyper-1.9.0.crate" | sha256sum --check
+          python3 .github/scripts/verify_hyper_patch_stack.py \
+            --archive "$evidence/hyper-1.9.0.crate" --evidence "$evidence" \
+            2>&1 | tee "$evidence/verification.log"
+
+      - name: Retain Hyper patch reconstruction evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hyper-patch-stack-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hyper-patch-stack
+          retention-days: 30
+
       - name: BoringCache Cargo
         uses: ./.github/actions/setup-boringcache
         with:
@@ -2004,9 +2026,10 @@ jobs:
         run: |
           cargo update --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml -p h2 --precise 0.4.19
           cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
-          # Patch 002: a body chunk is not cut into sliver DATA frames that h2
-          # >= 0.4.16 peers GOAWAY on (issue #5588, hyperium/hyper#4211).
-          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_min_data_frame_capacity
+          # Patch 002: every positive amount of HTTP/2 flow-control capacity
+          # permits body progress, including a 512-byte peer stream window and
+          # the final byte of connection capacity (hyperium/hyper#4212).
+          cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_h2_flow_control_progress
           # Patch 003: an HTTP/1 read that returned a full TLS record keeps
           # reading while more is ready (issue #5588).
           cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
@@ -2023,7 +2046,7 @@ jobs:
           cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_ \
             --config "$h2_vendored"
 
-      - name: Run vendored h2 DATA-frame coalescing regressions
+      - name: Run vendored h2 DATA-frame regressions
         # DATA frames staged together leave in one write, byte-exact, while
         # the write buffer stays within about 64 KiB; a larger payload is
         # still chained without a copy, and a grown buffer is dropped once the
@@ -2033,6 +2056,9 @@ jobs:
           RUSTFLAGS: "--cap-lints=warn"
         run: |
           cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib ferrum_coalesce_data_frame_writes
+          # Patch 002: an automatic small-DATA-frame budget follows runtime
+          # target-window changes without resetting outstanding charges.
+          cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib budget
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
