@@ -1,0 +1,48 @@
+# Optional candidate evidence; does not alter any guarded job or release gate.
+name: Compose Fixture Qualification
+
+on:
+  pull_request:
+    paths:
+      - docker-compose.yml
+      - docker-compose.tls-test.yml
+      - tests/scripts/setup_db_tls.sh
+      - tests/scripts/qualify_compose_fixtures.py
+      - docs/database_tls.md
+      - docs/security/compose-fixture-security-proposal.md
+      - .github/workflows/compose-fixture-qualification.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: Compose fixture secret and TLS boundaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Qualify disposable profiles on the hosted runner
+        run: |
+          set +x
+          set -euo pipefail
+          timeout --kill-after=15s 10m python3 tests/scripts/qualify_compose_fixtures.py
+      - name: Remove any remaining owned fixtures
+        if: always()
+        run: |
+          set +x
+          set -euo pipefail
+          timeout 30s docker ps -aq --filter label=org.ferrum.fixture.qualification=true \
+            | xargs -r timeout 60s docker rm -fv >/dev/null
+          fixture_dir="${RUNNER_TEMP}/compose-fixture-qualification/sql"
+          if [ -f "$fixture_dir/.fixture-owned" ]; then
+            timeout --kill-after=5s 60s bash tests/scripts/setup_db_tls.sh --cleanup "$fixture_dir"
+          fi
+          timeout 30s docker volume ls -q --filter label=com.docker.compose.project=ferrum-fixture-qualification \
+            | xargs -r timeout 60s docker volume rm >/dev/null
+          timeout 30s docker network ls -q --filter label=com.docker.compose.project=ferrum-fixture-qualification \
+            | xargs -r timeout 60s docker network rm >/dev/null
+          rm -rf -- "${RUNNER_TEMP}/compose-fixture-qualification"

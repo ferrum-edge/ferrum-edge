@@ -528,6 +528,15 @@ when the containers are not running.
 
 ### Setup
 
+The Compose/SQL setup changes on this candidate branch require owner approval
+before adoption for the released 0.9.10 profiles. See
+[the fixture security proposal](security/compose-fixture-security-proposal.md).
+The SQL helper generates fresh passwords, a separate MySQL root password, and
+seven-day certificates in a newly created directory. It refuses an existing
+directory or container instead of replacing it. Its default directory remains
+`/tmp/ferrum-db-tls-certs`; pass another absolute path with an existing parent
+to isolate the material. Do not use a shared directory or real database data.
+
 ```bash
 # Generate certificates and start TLS-enabled PostgreSQL/MySQL containers
 ./tests/scripts/setup_db_tls.sh
@@ -538,6 +547,56 @@ when the containers are not running.
 # Build the gateway
 cargo build
 ```
+
+Both SQL ports publish explicitly on `127.0.0.1` (`15432` and `13306`). The
+private directory is mode `0700`; keys, passwords, client option files, and
+`connections.env` are mode `0600`. Compose passes password file paths to the
+official image entrypoints, and the healthchecks run authenticated `SELECT 1`
+with CA and hostname verification. MySQL clients use an option file; PostgreSQL
+clients pass the password through `PGPASSWORD`. Passwords are absent from the
+client/Docker CLI argument lists and the healthcheck configuration. They can
+still be read by the operator, Docker administrators, or privileged processes
+through files, memory, and process environments. Compose file-backed secrets
+are bind mounts, not encrypted secret storage; host permissions matter.
+
+`connections.env` contains `PG_TLS_URL` and `MYSQL_TLS_URL`, without printing
+them during setup. These generated passwords are hexadecimal, so their URI
+password components require no percent encoding. Read the file privately into
+a client environment; do not print it, pass a credential-bearing URI as a CLI
+argument, enable shell tracing, or commit it. TLS settings still need explicit
+CA/hostname verification when a client consumes these URLs. Operator-supplied
+material for direct Compose use must follow the file layout in the helper,
+including the client option files and PostgreSQL HBA file; arbitrary passwords
+also require correct MySQL option-file quoting and URI percent encoding.
+`CERTS_DIR` is required for direct Compose use and has no shared-directory
+fallback. The helper is the supported path for generating the complete layout.
+
+**Candidate compatibility dependency:** the SQL cells in
+`tests/functional/functional_db_tls_test.rs` currently construct URLs with
+`test-password`. They will not connect to these fresh credentials. Hosted
+data-plane CI continues to provision its own unchanged fixtures inline in
+`.github/workflows/ci.yml`. Before adopting this helper for the Rust suite,
+the test owner must replace the hard-coded SQL credentials with private input
+URLs and approve any matching change to the guarded hosted fixture contract.
+The new `Compose Fixture Qualification` workflow exercises this candidate
+separately; its result is not evidence that the existing Rust suite supports
+generated credentials. Do not restore the known password to make those cells
+work. The commands below describe the existing suite and require that consumer
+update when using this candidate's helper.
+
+For the ordinary Mongo Compose sample, set `MONGO_PASSWORD` to at least 32
+hexadecimal characters (for example, a fresh `openssl rand -hex 32` value).
+Start just its services with
+`docker compose --profile mongodb up -d mongodb ferrum-mongodb`. Both Mongo
+services now belong to that profile. Missing, empty, too-short, and
+non-hexadecimal passwords fail in the Mongo container entrypoint before the
+official initialization script runs, including when a database volume exists.
+Compose `config` still accepts an absent Mongo password: validation is at
+startup, allowing unrelated profiles to interpolate without that variable.
+The sample does not publish port `27017`; network peers on its Compose bridge
+can reach Mongo, and any added publication or route changes that exposure.
+Changing an initialization password does not rotate existing Mongo users;
+follow the proposal's volume rotation requirements before reuse.
 
 ### Run Tests
 
@@ -585,6 +644,16 @@ Each test performs a complete CRUD cycle:
 # Stop and remove the PostgreSQL/MySQL TLS test containers
 ./tests/scripts/setup_db_tls.sh --cleanup
 ```
+
+Pass the same custom directory after `--cleanup` if one was used at setup.
+Cleanup verifies the ownership marker and container path labels, then removes
+the disposable containers, their volumes/network, and the private directory.
+Startup failure attempts the same cleanup without dumping database logs.
+Successful setup retains the material until explicit cleanup. Unlinking is
+not guaranteed secure erasure; interrupted cleanup or daemon failure can leave
+material and must be handled by the operator. An old helper directory lacks
+the ownership marker and is deliberately refused: retire the old containers
+and private material explicitly before adopting the candidate.
 
 ## Troubleshooting
 

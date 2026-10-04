@@ -1,58 +1,137 @@
-version: "3.8"
-
+# Disposable fixtures only. Generate private material with tests/scripts/setup_db_tls.sh.
+# CERTS_DIR must be an absolute path; direct Compose use needs the same file layout.
 services:
   postgres-tls:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     container_name: ferrum-test-pg-tls
+    labels:
+      org.ferrum.fixture.path: ${CERTS_DIR:?Generate private TLS fixture material first}
     ports:
-      - "15432:5432"
+      - "127.0.0.1:15432:5432"
     environment:
       POSTGRES_DB: ferrum
       POSTGRES_USER: ferrum
-      POSTGRES_PASSWORD: test-password
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg-password
+    secrets:
+      - pg-password
     volumes:
-      - ${CERTS_DIR:-/tmp/ferrum-db-tls-certs}:/certs:ro
-    command:
-      - -c
-      - ssl=on
-      - -c
-      - ssl_cert_file=/certs/pg-server.crt
-      - -c
-      - ssl_key_file=/certs/pg-server.key
-      - -c
-      - ssl_ca_file=/certs/ca.crt
+      - type: bind
+        source: ${CERTS_DIR:?Generate private TLS fixture material first}/postgres
+        target: /certs-src
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CERTS_DIR:?Generate private TLS fixture material first}/client
+        target: /client
+        read_only: true
+        bind:
+          create_host_path: false
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        mkdir -p /var/lib/postgresql/tls
+        cp /certs-src/* /var/lib/postgresql/tls/
+        chown -R postgres:postgres /var/lib/postgresql/tls
+        chmod 700 /var/lib/postgresql/tls
+        chmod 600 /var/lib/postgresql/tls/server.key
+        exec /usr/local/bin/docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/var/lib/postgresql/tls/server.crt \
+          -c ssl_key_file=/var/lib/postgresql/tls/server.key \
+          -c ssl_ca_file=/var/lib/postgresql/tls/ca.crt \
+          -c hba_file=/var/lib/postgresql/tls/pg_hba.conf
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ferrum -d ferrum"]
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$$(cat /run/secrets/pg-password)"
+          psql 'host=localhost user=ferrum dbname=ferrum connect_timeout=3
+          sslmode=verify-full sslrootcert=/client/ca.crt
+          sslcert=/client/client.crt sslkey=/client/client.key'
+          -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 24
+      start_period: 10s
     networks:
       - ferrum-tls-test-network
 
   mysql-tls:
-    image: mysql:8.0
+    image: mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
     container_name: ferrum-test-mysql-tls
+    labels:
+      org.ferrum.fixture.path: ${CERTS_DIR:?Generate private TLS fixture material first}
     ports:
-      - "13306:3306"
+      - "127.0.0.1:13306:3306"
     environment:
       MYSQL_DATABASE: ferrum
       MYSQL_USER: ferrum
-      MYSQL_PASSWORD: test-password
-      MYSQL_ROOT_PASSWORD: root-test-password
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql-password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql-root-password
+      MYSQL_ROOT_HOST: localhost
+    secrets:
+      - mysql-password
+      - mysql-root-password
+      - mysql-client.cnf
+      - mysql-root.cnf
     volumes:
-      - ${CERTS_DIR:-/tmp/ferrum-db-tls-certs}:/certs:ro
-    command:
-      - --require-secure-transport=ON
-      - --ssl-cert=/certs/mysql-server.crt
-      - --ssl-key=/certs/mysql-server.key
-      - --ssl-ca=/certs/ca.crt
+      - type: bind
+        source: ${CERTS_DIR:?Generate private TLS fixture material first}/mysql
+        target: /certs-src
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CERTS_DIR:?Generate private TLS fixture material first}/client
+        target: /client
+        read_only: true
+        bind:
+          create_host_path: false
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        mkdir -p /var/lib/mysql-tls
+        cp /certs-src/server.crt /certs-src/server.key /certs-src/ca.crt /var/lib/mysql-tls/
+        chown -R mysql:mysql /var/lib/mysql-tls
+        chmod 700 /var/lib/mysql-tls
+        chmod 600 /var/lib/mysql-tls/server.key
+        cp /certs-src/init.sql /docker-entrypoint-initdb.d/10-grants.sql
+        chmod 644 /docker-entrypoint-initdb.d/10-grants.sql
+        exec /usr/local/bin/docker-entrypoint.sh mysqld \
+          --require-secure-transport=ON \
+          --ssl-cert=/var/lib/mysql-tls/server.crt \
+          --ssl-key=/var/lib/mysql-tls/server.key \
+          --ssl-ca=/var/lib/mysql-tls/ca.crt
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot-test-password"]
+      test:
+        - CMD
+        - mysql
+        - --defaults-extra-file=/run/secrets/mysql-client.cnf
+        - --batch
+        - --skip-column-names
+        - -e
+        - SELECT 1
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 24
+      start_period: 10s
     networks:
       - ferrum-tls-test-network
+
+secrets:
+  pg-password:
+    file: ${CERTS_DIR:?Generate private TLS fixture material first}/pg-password
+  mysql-password:
+    file: ${CERTS_DIR:?Generate private TLS fixture material first}/mysql-password
+  mysql-root-password:
+    file: ${CERTS_DIR:?Generate private TLS fixture material first}/mysql-root-password
+  mysql-client.cnf:
+    file: ${CERTS_DIR:?Generate private TLS fixture material first}/mysql-client.cnf
+  mysql-root.cnf:
+    file: ${CERTS_DIR:?Generate private TLS fixture material first}/mysql-root.cnf
 
 networks:
   ferrum-tls-test-network:
