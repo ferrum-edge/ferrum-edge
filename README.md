@@ -591,13 +591,17 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The latest published tag is **contracts-edge-0.9.9**; it also
-applies to **v0.9.10**, which changed no contract source.
+Edge source. The latest published tag is
+[`contracts-edge-0.9.9-r2`](https://github.com/ferrum-edge/ferrum-contracts/tree/591c73a3f965fdab440c3a76b2707accdf491ba5)
+at `591c73a3f965fdab440c3a76b2707accdf491ba5`. It carries the published
+**v0.9.9/v0.9.10 contract baseline**; v0.9.10 changed no contract source.
 
 The **v0.9.11 release draft** includes new conditional admin snapshot/restore
-and backend egress discovery contracts. Their ferrum-contracts publication and
-downstream adoption are pending; the existing tag does not cover those new
-surfaces. See the [release draft](docs/releases/v0.9.11.md) and
+and backend egress discovery contracts. These additions remain pending until
+the actual Edge release, canonical release evidence, and consumer qualification
+are complete. The existing tag does not cover these new surfaces, and
+historical published tags must remain unchanged. See the
+[release draft](docs/releases/v0.9.11.md) and
 [contracts handoff](docs/admin_contracts_handoff_5992_5994.md) before updating
 consumer pins.
 
