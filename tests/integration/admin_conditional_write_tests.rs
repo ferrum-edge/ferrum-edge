@@ -817,17 +817,42 @@ async fn conditional_reads_preserve_historical_credential_fields_and_shapes() {
     let complete = get(&base, "/consumers/historical/verification").await;
     assert_eq!(complete.status, 200, "{}", complete.body);
     assert_eq!(complete.body, serde_json::to_value(&consumer).unwrap());
+    assert_eq!(
+        complete.body["credentials"],
+        json!({
+            "jwt": [{
+                "secret": "historical-jwt-secret-with-at-least-32-characters",
+                "algorithm": "HS256"
+            }],
+            "hmac_auth": {
+                "secret": "historical-hmac-secret-with-at-least-32-characters"
+            },
+            "custom_auth": {"opaque_stored_field": "historical-custom-value"}
+        })
+    );
     let backup = get(&base, "/backup?conditional=true").await;
     assert_eq!(backup.status, 200, "{}", backup.body);
     assert_eq!(backup.body["consumers"][0], complete.body);
+    assert_eq!(
+        backup.body["consumers"][0]["credentials"],
+        complete.body["credentials"]
+    );
     assert_eq!(
         backup.body["conditional"]["row_etags"]["consumers"]["historical"],
         complete.etag.unwrap()
     );
     let archival = get(&base, "/backup").await;
     assert_eq!(archival.status, 200, "{}", archival.body);
-    assert!(archival.body["consumers"][0]["credentials"]["jwt"][0]["algorithm"].is_null());
-    assert!(archival.body["consumers"][0]["credentials"]["hmac_auth"].is_array());
+    assert_eq!(
+        archival.body["consumers"][0]["credentials"],
+        json!({
+            "jwt": [{"secret": "historical-jwt-secret-with-at-least-32-characters"}],
+            "hmac_auth": [{
+                "secret": "historical-hmac-secret-with-at-least-32-characters"
+            }],
+            "custom_auth": [{"opaque_stored_field": "historical-custom-value"}]
+        })
+    );
 }
 
 #[tokio::test]
@@ -985,7 +1010,7 @@ async fn namespace_revision_fences_other_resource_changes_and_delete_recreate() 
         None,
     )
     .await;
-    assert_eq!(deleted.status, 200);
+    assert_eq!(deleted.status, 204, "{}", deleted.body);
     // Content returned to its previous state, but the durable change watermark
     // prevents the old namespace token from becoming authoritative again.
     let stale = send(
