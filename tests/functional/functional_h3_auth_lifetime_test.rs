@@ -2003,8 +2003,7 @@ async fn assert_h3_upload_expiry_summary(harness: &GatewayHarness, completed: bo
         "the sole admitted upload must record credential expiry while its frontend owner is alive"
     );
     assert_eq!(
-        summary["metadata"]["authorization.termination_reason"],
-        "[REDACTED]",
+        summary["metadata"]["authorization.termination_reason"], "[REDACTED]",
         "plugin-writable authorization metadata must not be used as expiry evidence"
     );
     assert_eq!(
