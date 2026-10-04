@@ -281,8 +281,7 @@ fn get_sender_with_purpose_joins_coalesced_attempt_for_probe_and_request() {
         "probe and request must join the coalesced pending attempt"
     );
     assert!(
-        unprofiled
-            .contains("|attempt| note_grpc_establishment_waiter_failure(attempt, purpose)"),
+        unprofiled.contains("|attempt| note_grpc_establishment_waiter_failure(attempt, purpose)"),
         "a request waiter must be able to upgrade a probe-only DEBUG"
     );
     assert!(
