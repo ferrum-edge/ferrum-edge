@@ -1016,6 +1016,10 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
             "api_specs/handlers.rs",
             include_str!("../../../src/admin/api_specs/handlers.rs"),
         ),
+        (
+            "conditional_snapshots.rs",
+            include_str!("../../../src/admin/conditional_snapshots.rs"),
+        ),
     ];
     let tls_source = include_str!("../../../src/admin/tls_management.rs");
 
@@ -1121,29 +1125,120 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
 /// the write-topology pin, then release pins before the coordinator wait.
 #[test]
 fn live_apply_handlers_capture_sequence_before_releasing_pins() {
+    use std::collections::BTreeMap;
+
     let config_db_sources = [
-        include_str!("../../../src/admin/mod.rs"),
-        include_str!("../../../src/admin/crud.rs"),
-        include_str!("../../../src/admin/api_specs/handlers.rs"),
+        ("mod.rs", include_str!("../../../src/admin/mod.rs")),
+        ("crud.rs", include_str!("../../../src/admin/crud.rs")),
+        (
+            "api_specs/handlers.rs",
+            include_str!("../../../src/admin/api_specs/handlers.rs"),
+        ),
+        (
+            "conditional_snapshots.rs",
+            include_str!("../../../src/admin/conditional_snapshots.rs"),
+        ),
     ];
-    let joined = config_db_sources.join("\n");
+    let joined = config_db_sources
+        .iter()
+        .map(|(_, source)| *source)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
         !joined.contains("finish_live_config_mutation(")
             && !joined.contains("await_live_apply_after_commit("),
         "the post-drop sequence re-query helpers must not exist"
     );
-    // Count the boxed factory's CALL SITES rather than the bare substring: the
-    // factory's own name contains the inner helper's name, so a substring
-    // count conflates definitions, doc links, and calls. `..._boxed<` is the
-    // definition and `..._boxed(` is a call, so this counts calls only.
-    assert_eq!(
-        joined
-            .matches("complete_live_config_mutation_after_commit_boxed(")
-            .count(),
-        13,
-        "thirteen wired mutation completions, every one through the boxed factory"
-    );
+    // Inventory the handlers and their pin responsibilities, rather than a
+    // total that could hide a missing path behind an unrelated new caller.
+    // Restore and generic DELETE each have two independently wired paths.
+    let topology = "_write_permit";
+    let namespace_and_topology = "(namespace_config_admission_guard,_write_permit)";
+    let expected = BTreeMap::from([
+        (("mod.rs", "handle_update_credentials"), (1, topology)),
+        (("mod.rs", "handle_delete_credentials"), (1, topology)),
+        (("mod.rs", "handle_append_credential"), (1, topology)),
+        (
+            ("mod.rs", "handle_delete_credential_by_index"),
+            (1, topology),
+        ),
+        (
+            ("mod.rs", "handle_batch_create"),
+            (1, namespace_and_topology),
+        ),
+        (("mod.rs", "handle_restore"), (2, namespace_and_topology)),
+        (
+            ("mod.rs", "complete_namespace_registry_mutation"),
+            (1, "pins"),
+        ),
+        (("crud.rs", "handle_delete"), (2, topology)),
+        (("crud.rs", "handle_write"), (1, topology)),
+        (
+            ("api_specs/handlers.rs", "handle_post_api_spec"),
+            (1, topology),
+        ),
+        (
+            ("api_specs/handlers.rs", "handle_put_api_spec"),
+            (1, topology),
+        ),
+        (
+            ("api_specs/handlers.rs", "handle_delete_api_spec"),
+            (1, topology),
+        ),
+    ]);
+    let function_header =
+        regex::Regex::new(r"(?m)^(?:pub(?:\([^)]*\))? )?(?:async )?fn ([a-zA-Z_][a-zA-Z0-9_]*)")
+            .unwrap();
+    let call = "complete_live_config_mutation_after_commit_boxed(";
+    let mut observed = BTreeMap::new();
+    for (file, source) in config_db_sources {
+        let functions: Vec<_> = function_header
+            .captures_iter(source)
+            .map(|capture| {
+                let start = capture.get(0).unwrap().start();
+                let name = capture.get(1).unwrap().as_str();
+                (start, name)
+            })
+            .collect();
+        let mut accounted = 0;
+        for (index, (start, name)) in functions.iter().enumerate() {
+            let end = functions
+                .get(index + 1)
+                .map_or(source.len(), |(start, _)| *start);
+            let body = &source[*start..end];
+            let count = body.matches(call).count();
+            if count == 0 {
+                continue;
+            }
+            let (_, pins) = expected
+                .get(&(file, *name))
+                .unwrap_or_else(|| panic!("unexpected completion caller {file}::{name}"));
+            for (position, _) in body.match_indices(call) {
+                let arguments: String = body[position + call.len()..]
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .take(100)
+                    .collect();
+                assert!(
+                    arguments.starts_with(&format!("namespace,{pins},")),
+                    "{file}::{name} must retain {pins} through sequence capture"
+                );
+            }
+            observed.insert((file, *name), count);
+            accounted += count;
+        }
+        assert_eq!(
+            accounted,
+            source.matches(call).count(),
+            "every completion in {file} must belong to an inventoried handler"
+        );
+    }
+    let expected_counts: BTreeMap<_, _> = expected
+        .iter()
+        .map(|(handler, (count, _))| (*handler, *count))
+        .collect();
+    assert_eq!(observed, expected_counts);
     // The inner async helper must have exactly one caller — the factory. Any
     // handler awaiting it directly would put the whole future back into that
     // handler's coroutine frame, which is what overflowed the stack in the
@@ -1189,12 +1284,20 @@ fn live_apply_handlers_capture_sequence_before_releasing_pins() {
         .nth(1)
         .and_then(|tail| tail.split("pub async fn admit_write").next())
         .expect("complete_live_config_mutation_after_commit remains inspectable");
-    let drop_pins = complete
+    let success_path = complete
+        .split("let topology_epoch = pins.topology_epoch();")
+        .nth(1)
+        .expect("successful mutations capture under their topology pin");
+    let capture = success_path
+        .find(".prepare_live_apply_after_commit(")
+        .expect("sequence captured while pins remain held");
+    let drop_pins = success_path
         .find("drop(pins)")
         .expect("pins dropped after capture");
-    let finish = complete
+    let finish = success_path
         .find("finish_prepared_live_apply")
         .expect("wait runs after pin release");
+    assert!(capture < drop_pins);
     assert!(
         drop_pins < finish,
         "topology/namespace pins must drop before the coordinator wait"
@@ -1213,11 +1316,48 @@ fn live_apply_handlers_capture_sequence_before_releasing_pins() {
     let restore = admin_source
         .split("async fn handle_restore")
         .nth(1)
+        .and_then(|tail| tail.split("fn parse_audit_filter").next())
         .expect("restore remains inspectable");
     assert!(
         restore.contains("(namespace_config_admission_guard, _write_permit)"),
         "restore must capture the covering sequence before releasing the namespace guard"
     );
+    let conditional_restore = restore
+        .split("let response = conditional_snapshots::restore(")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("// Snapshot the namespace before deletion")
+                .next()
+        })
+        .expect("conditional restore completion remains inspectable");
+    assert_eq!(conditional_restore.matches(call).count(), 1);
+    let success = conditional_restore
+        .find("if response.status().is_success() {")
+        .expect("failed preconditions must skip live apply");
+    let completion = conditional_restore.find(call).unwrap();
+    let failed_response = conditional_restore.rfind("return Ok(response);").unwrap();
+    assert!(success < completion && completion < failed_response);
+
+    // Conditional reads expose credentials and restore replaces the entire
+    // namespace. All three routes retain the Admin gate before dispatch.
+    for (route, dispatch) in [
+        (
+            "(Method::GET, [\"consumers\", id, \"verification\"]) => {",
+            "conditional_snapshots::consumer_verification(",
+        ),
+        ("(Method::GET, [\"backup\"]) => {", "handle_backup("),
+        ("(Method::POST, [\"restore\"]) => {", "handle_restore("),
+    ] {
+        let arm = admin_source
+            .split(route)
+            .nth(1)
+            .and_then(|tail| tail.split("\n        (Method::").next())
+            .unwrap_or_else(|| panic!("route remains inspectable: {route}"));
+        let role = arm
+            .find("require_admin_role(&auth, AdminRole::Admin)")
+            .unwrap_or_else(|| panic!("{route} must require Admin"));
+        assert!(role < arm.find(dispatch).expect("route dispatch"));
+    }
 }
 
 /// The aggregate admin route future must stay off the request worker stack.

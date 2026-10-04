@@ -3167,6 +3167,18 @@ pub mod _test_support {
     pub struct TestNamespaceConfigAdmissionGuard(crate::admin::crud::NamespaceConfigAdmissionGuard);
 
     impl TestNamespaceConfigAdmissionGuard {
+        /// Exercise the production keeper-to-transaction handoff.
+        pub async fn hand_off_to_restore_transaction(&mut self) -> Result<(), String> {
+            self.0
+                .hand_off_to_restore_transaction()
+                .await
+                .map_err(|_| "namespace config admission handoff refused".to_string())
+        }
+
+        pub fn lease_ref(&self) -> crate::config::db_backend::NamespaceConfigAdmissionLeaseRef<'_> {
+            self.0.lease_ref()
+        }
+
         /// Force the lease into the lost state without waiting for TTL/renewal.
         pub fn force_lose(&self) {
             self.0.force_lose_for_test();

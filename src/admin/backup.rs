@@ -253,6 +253,8 @@ pub(crate) struct BackupPayload<'a> {
     pub(crate) consumers: &'a [Consumer],
     pub(crate) plugin_configs: &'a [PluginConfig],
     pub(crate) upstreams: &'a [Upstream],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) conditional: Option<&'a ConditionalBackupMetadata>,
     /// Namespace-keyed gateway trust bundles (issue #3727).
     ///
     /// Always emitted (possibly empty) on database-backed exports so a restore
@@ -268,6 +270,14 @@ pub(crate) struct BackupPayload<'a> {
     /// cannot describe managed relationships.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) api_specs: Option<&'a ApiSpecsBackupSection>,
+}
+
+/// Opt-in tokens from the exact complete namespace snapshot exported above.
+#[derive(Serialize)]
+pub(crate) struct ConditionalBackupMetadata {
+    pub(crate) namespace_etag: String,
+    pub(crate) row_etags:
+        std::collections::BTreeMap<&'static str, std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -500,6 +510,8 @@ pub(crate) struct BatchCreateRequest {
     /// A non-object is a `400` instead of being accepted and ignored.
     #[serde(default, rename = "counts")]
     _counts: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, rename = "conditional")]
+    _conditional: Option<serde_json::Map<String, serde_json::Value>>,
     /// Same object-only `api_specs` section restore types. Batch still ignores
     /// the section after admission; `deserialize_optional_object` rejects a
     /// JSON array so it cannot be read as a positional struct.
@@ -529,6 +541,7 @@ impl From<BatchCreateRequest> for RestorePayload {
             _exported_at: _,
             _source: _,
             _counts: _,
+            _conditional: _,
             _api_specs: _,
             _gateway_trust_bundles: _,
         } = request;
@@ -544,6 +557,7 @@ impl From<BatchCreateRequest> for RestorePayload {
             _exported_at: None,
             _source: None,
             _counts: None,
+            _conditional: None,
         }
     }
 }
@@ -637,6 +651,8 @@ pub(crate) struct RestorePayload {
     /// accepted and ignored.
     #[serde(default, rename = "counts")]
     pub(crate) _counts: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, rename = "conditional")]
+    pub(crate) _conditional: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Project a cached multi-namespace snapshot onto one namespace for a

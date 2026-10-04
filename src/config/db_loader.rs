@@ -23,7 +23,10 @@
 //! - `ArcSwap`-based pool swap enables zero-downtime DNS re-resolution on failover
 //! - Batch chunking (`BATCH_CHUNK_SIZE`) for large imports to stay within DB limits
 
-use crate::config::db_backend::GatewayTrustBundleRevisionConflict;
+use crate::config::db_backend::{
+    ConditionalNamespaceRestore, ConditionalNamespaceSnapshot, GatewayTrustBundleRevisionConflict,
+    NamespacePreconditionFailed,
+};
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
     NamespaceRegistryError as RegistryError, NamespaceRegistryPhase as RegistryPhase,
@@ -2918,6 +2921,78 @@ impl DatabaseStore {
         config.normalize_fields();
         self.check_slow_query("load_namespace_policy_graph", start);
         Ok(config)
+    }
+
+    async fn conditional_namespace_snapshot_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        let purpose = FullLoadPurpose::RestoreSnapshot;
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies: self.load_proxies_tx(namespace, purpose, tx).await?,
+            consumers: self.load_consumers_tx(namespace, purpose, tx).await?,
+            plugin_configs: self.load_plugin_configs_tx(namespace, purpose, tx).await?,
+            upstreams: self.load_upstreams_tx(namespace, purpose, tx).await?,
+            gateway_trust_bundles: self
+                .load_gateway_trust_bundle_tx(namespace, tx)
+                .await?
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        config.normalize_fields();
+        let rows = sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id"))
+            .bind(namespace)
+            .fetch_all(&mut **tx)
+            .await?;
+        let api_specs = rows
+            .iter()
+            .map(row_to_api_spec)
+            .collect::<Result<Vec<_>, _>>()?;
+        let namespace_record = self.get_namespace_tx(tx, namespace).await?;
+        let row = sqlx::query(&self.q(
+            "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM config_changes WHERE namespace = ?",
+        ))
+        .bind(namespace)
+        .fetch_one(&mut **tx)
+        .await?;
+        let sequence: i64 = row.try_get("sequence")?;
+        let retention = sqlx::query(
+            &self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
+        )
+        .bind(namespace)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let retained: i64 = retention
+            .map(|row| row.try_get("retained_sequence"))
+            .transpose()?
+            .unwrap_or(0);
+        if sequence < 0 || retained < 0 {
+            anyhow::bail!("Invalid namespace change watermark");
+        }
+        let change_sequence = u64::try_from(sequence.max(retained))
+            .map_err(|_| anyhow::anyhow!("Invalid namespace change watermark"))?;
+        Ok(ConditionalNamespaceSnapshot {
+            config,
+            api_specs,
+            namespace_record,
+            change_sequence,
+        })
+    }
+
+    pub async fn load_conditional_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+        let snapshot = self
+            .conditional_namespace_snapshot_tx(&mut tx, namespace)
+            .await?;
+        tx.commit().await?;
+        Ok(snapshot)
     }
 
     /// Count ApiSpecs from the authoritative primary pool without hydrating rows.
@@ -7624,8 +7699,17 @@ impl DatabaseStore {
         graph: &AtomicBatchGraph<'_>,
         mode: &BatchConfigWriteMode,
     ) -> Result<AtomicBatchCounts, anyhow::Error> {
+        self.write_config_graph_atomically(graph, mode, None).await
+    }
+
+    async fn write_config_graph_atomically(
+        &self,
+        graph: &AtomicBatchGraph<'_>,
+        mode: &BatchConfigWriteMode,
+        restore: Option<&ConditionalNamespaceRestore<'_>>,
+    ) -> Result<AtomicBatchCounts, anyhow::Error> {
         let start = Instant::now();
-        if graph.is_empty() {
+        if graph.is_empty() && restore.is_none() {
             return Ok(AtomicBatchCounts::default());
         }
         let (fault, chunk_size_override) =
@@ -7637,12 +7721,43 @@ impl DatabaseStore {
         let admission_namespaces = graph.admission_namespaces();
 
         let mut tx = self.begin_write_tx().await?;
+        if restore.is_some() {
+            self.use_delete_capture_snapshot_tx(&mut tx).await?;
+            if self.db_type == "mysql" {
+                let isolation = Self::mysql_transaction_isolation(&mut tx).await?;
+                if !Self::is_mysql_repeatable_read(&isolation) {
+                    anyhow::bail!("MySQL conditional restore requires REPEATABLE READ isolation");
+                }
+            }
+            // Pin the live lease before establishing the resource snapshot.
+            // The Admin keeper has handed renewal to this transaction. A row
+            // lock prevents takeover even if the original TTL elapses, and the
+            // commit gate renews only this pinned owner and generation.
+            let lease = graph
+                .admission_lease
+                .as_ref()
+                .ok_or(BatchAdmissionLeaseLost)?;
+            self.verify_namespace_config_admission_lease_tx(&mut tx, graph.namespace, lease)
+                .await?;
+        }
         for namespace in &admission_namespaces {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
         self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
             .await?;
+        if let Some(restore) = restore {
+            let current = self
+                .conditional_namespace_snapshot_tx(&mut tx, graph.namespace)
+                .await?;
+            if current.representation()? != *restore.expected {
+                return Err(anyhow::Error::new(NamespacePreconditionFailed));
+            }
+            crate::config::batch_atomicity::pause_conditional_restore_for_test(graph.namespace)
+                .await;
+            self.delete_all_resources_in_tx(&mut tx, graph.namespace, mode)
+                .await?;
+        }
         let mut touched_namespaces = HashSet::new();
 
         Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Consumers, 0)?;
@@ -7694,18 +7809,121 @@ impl DatabaseStore {
             }
         }
 
+        if let Some(restore) = restore {
+            // Ordinary batch inserts intentionally omit ownership. Restore
+            // validated the complete ownership graph before entering this tx.
+            for spec in restore.api_specs {
+                self.insert_api_spec_tx(&mut tx, spec).await?;
+            }
+            for (table, rows) in [
+                (
+                    "proxies",
+                    graph
+                        .proxies
+                        .iter()
+                        .map(|p| (&p.id, &p.api_spec_id))
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "upstreams",
+                    graph
+                        .upstreams
+                        .iter()
+                        .map(|p| (&p.id, &p.api_spec_id))
+                        .collect(),
+                ),
+                (
+                    "plugin_configs",
+                    graph
+                        .plugin_configs
+                        .iter()
+                        .map(|p| (&p.id, &p.api_spec_id))
+                        .collect(),
+                ),
+            ] {
+                for (id, spec_id) in rows {
+                    if let Some(spec_id) = spec_id {
+                        sqlx::query(&self.q(&format!(
+                            "UPDATE {table} SET api_spec_id = ? WHERE namespace = ? AND id = ?"
+                        )))
+                        .bind(spec_id)
+                        .bind(graph.namespace)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+            if let Some(records) = restore.gateway_trust_bundles {
+                if let Some(current) = self
+                    .load_gateway_trust_bundle_tx(graph.namespace, &mut tx)
+                    .await?
+                {
+                    sqlx::query(&self.q(GATEWAY_TRUST_BUNDLE_DELETE_SQL))
+                        .bind(graph.namespace)
+                        .bind(&current.id)
+                        .execute(&mut *tx)
+                        .await?;
+                    self.record_config_change_tx(
+                        &mut tx,
+                        graph.namespace,
+                        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                        &current.id,
+                        "delete",
+                    )
+                    .await?;
+                }
+                for record in records {
+                    let revision = self
+                        .record_config_change_returning_sequence_tx(
+                            &mut tx,
+                            graph.namespace,
+                            GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                            &record.id,
+                            "upsert",
+                        )
+                        .await?;
+                    let revision = i64::try_from(revision)
+                        .map_err(|_| anyhow::anyhow!("Trust revision exceeds BIGINT range"))?;
+                    sqlx::query(&self.q(GATEWAY_TRUST_BUNDLE_INSERT_SQL))
+                        .bind(graph.namespace)
+                        .bind(&record.id)
+                        .bind(&record.trust_domain)
+                        .bind(serde_json::to_string(&record.bundle)?)
+                        .bind(revision)
+                        .bind(&record.updated_by)
+                        .bind(record.created_at.to_rfc3339())
+                        .bind(record.updated_at.to_rfc3339())
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            touched_namespaces.insert(graph.namespace.to_string());
+        }
+
         // Ownership is re-read inside the transaction that is about to commit,
         // while this transaction still holds every touched namespace's
         // admission row. Any writer that could have invalidated the validated
         // graph had to take the lease first, so a matching owner and generation
         // here proves nobody interleaved.
-        if let Some(lease) = graph.admission_lease {
+        if restore.is_none()
+            && let Some(lease) = graph.admission_lease
+        {
             self.verify_namespace_config_admission_lease_tx(&mut tx, graph.namespace, &lease)
                 .await?;
         }
 
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+
+        // Keep renewal adjacent to commit, after potentially lengthy change-log
+        // compaction. The live entry pin remains held throughout both phases.
+        if restore.is_some()
+            && let Some(lease) = graph.admission_lease
+        {
+            self.renew_pinned_restore_lease_tx(&mut tx, graph.namespace, &lease)
+                .await?;
         }
 
         Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
@@ -7772,6 +7990,36 @@ impl DatabaseStore {
                  held at commit"
             )))
         }
+    }
+
+    /// Renew the lease already locked and verified live at restore entry.
+    /// Expiry here does not permit takeover: the same row has remained locked
+    /// for this entire transaction. Never use this gate without that entry pin.
+    async fn renew_pinned_restore_lease_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        lease: &crate::config::batch_atomicity::NamespaceConfigAdmissionLeaseRef<'_>,
+    ) -> Result<(), anyhow::Error> {
+        let now = self.config_admission_lease_now_sql();
+        let sql = self.q(&format!(
+            "UPDATE config_admission_locks SET expires_at = {now} + ? \
+             WHERE namespace = ? AND owner = ? AND generation = ?"
+        ));
+        let generation = i64::try_from(lease.generation).map_err(|_| {
+            anyhow::anyhow!("namespace config admission generation is out of range")
+        })?;
+        let result = sqlx::query(&sql)
+            .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
+            .bind(namespace)
+            .bind(lease.owner)
+            .bind(generation)
+            .execute(&mut **tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow::Error::new(BatchAdmissionLeaseLost));
+        }
+        Ok(())
     }
 
     /// Delete all resources from all tables in a single transaction.
@@ -11619,6 +11867,24 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_namespace_snapshot(self, namespace).await
+    }
+
+    async fn load_conditional_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        DatabaseStore::load_conditional_namespace_snapshot(self, namespace).await
+    }
+
+    async fn restore_namespace_conditionally(
+        &self,
+        restore: &ConditionalNamespaceRestore<'_>,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error> {
+        restore.validate_scope()?;
+        self.write_config_graph_atomically(&restore.graph, mode, Some(restore))
+            .await?;
+        Ok(())
     }
 
     async fn load_namespace_policy_graph(
