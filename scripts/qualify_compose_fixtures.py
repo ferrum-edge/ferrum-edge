@@ -6,6 +6,7 @@ import re
 import secrets
 import signal
 import socket
+import ssl
 import subprocess
 import time
 from pathlib import Path
@@ -26,6 +27,14 @@ EDGE_IMAGE = (
 PROJECT = "ferrum-fixture-qualification"
 PG = "ferrum-test-pg-tls"
 MYSQL = "ferrum-test-mysql-tls"
+MYSQL_IMAGE = (
+    "mysql:8.0@sha256:"
+    "7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b"
+)
+
+
+class QualificationInterrupted(RuntimeError):
+    pass
 
 
 def require(condition, message):
@@ -71,9 +80,12 @@ def mysql_failure(stderr):
     # Retain neither the raw message nor SQLSTATE, user/host, paths or key bytes.
     if len(stderr) > 8192:
         return None, "oversized-diagnostic"
-    errors = [line for line in stderr.splitlines() if line.startswith("ERROR ")]
+    lines = stderr.splitlines()
+    errors = [line for line in lines if line.startswith("ERROR ")]
     if len(errors) != 1:
         return None, "missing-or-multiple-errors"
+    if lines != errors:
+        return None, "unexpected-diagnostic-lines"
     match = re.fullmatch(r"ERROR ([0-9]{4}) \(([A-Z0-9]{5})\): (.+)", errors[0])
     if match is None:
         return None, "unrecognized-error-header"
@@ -81,12 +93,15 @@ def mysql_failure(stderr):
     sqlstate = match.group(2)
     message = match.group(3)
     if code == 2026 and message.startswith("SSL connection error: "):
-        for alert, category in (
-            ("alert unknown ca", "tls-alert-unknown-ca"),
-            ("alert bad certificate", "tls-alert-bad-certificate"),
-            ("alert certificate unknown", "tls-alert-certificate-unknown"),
+        # The pinned OpenSSL 3 client uses ERR_error_string_n. Match its complete
+        # library/reason record, not certificate words in arbitrary diagnostics.
+        for tls_error, category in (
+            ("error:0A000418:SSL routines::tlsv1 alert unknown ca", "tls-alert-unknown-ca"),
+            ("error:0A000412:SSL routines::sslv3 alert bad certificate", "tls-alert-bad-certificate"),
+            ("error:0A000416:SSL routines::sslv3 alert certificate unknown",
+             "tls-alert-certificate-unknown"),
         ):
-            if alert in message.lower():
+            if sqlstate == "HY000" and message == "SSL connection error: " + tls_error:
                 return code, category
         return code, "tls-connection-error"
     if code == 1045 and message.startswith("Access denied for user "):
@@ -123,10 +138,8 @@ MYSQL_CERTIFICATE_ALERTS = (
     (2026, "tls-alert-bad-certificate"),
     (2026, "tls-alert-certificate-unknown"),
 )
-MYSQL_DEFAULT_REJECTIONS = MYSQL_CERTIFICATE_ALERTS + (
-    (1045, "authentication-rejected"),
-    (2013, "late-auth-read-zero"),
-)
+# Authentication failures and late disconnects do not identify a certificate cause.
+MYSQL_DEFAULT_REJECTIONS = MYSQL_CERTIFICATE_ALERTS
 
 
 def check_mysql_classifier():
@@ -135,13 +148,31 @@ def check_mysql_classifier():
         "'reading authorization packet', system error: "
     )
     cases = (
-        ("ERROR 2026 (HY000): SSL connection error: tlsv1 alert unknown ca",
+        ("ERROR 2026 (HY000): SSL connection error: "
+         "error:0A000418:SSL routines::tlsv1 alert unknown ca",
          (2026, "tls-alert-unknown-ca"), True),
+        ("ERROR 2026 (HY000): SSL connection error: "
+         "error:0A000412:SSL routines::sslv3 alert bad certificate",
+         (2026, "tls-alert-bad-certificate"), True),
+        ("ERROR 2026 (HY000): SSL connection error: "
+         "error:0A000416:SSL routines::sslv3 alert certificate unknown",
+         (2026, "tls-alert-certificate-unknown"), True),
+        ("ERROR 2026 (HY000): SSL connection error: tlsv1 alert unknown ca",
+         (2026, "tls-connection-error"), False),
+        ("ERROR 2026 (HY000): SSL connection error: "
+         "error:0A000418:SSL routines::tlsv1 alert unknown ca private-user",
+         (2026, "tls-connection-error"), False),
+        ("ERROR 2026 (HY001): SSL connection error: "
+         "error:0A000418:SSL routines::tlsv1 alert unknown ca",
+         (2026, "tls-connection-error"), False),
+        ("ERROR 2026 (HY000): SSL connection error: "
+         "error:0A000417:SSL routines::tlsv1 alert unknown ca",
+         (2026, "tls-connection-error"), False),
         ("ERROR 1045 (28000): Access denied for user 'private-user'@'private-host'",
-         (1045, "authentication-rejected"), True),
-        (late_read + "0", (2013, "late-auth-read-zero"), True),
+         (1045, "authentication-rejected"), False),
+        (late_read + "0", (2013, "late-auth-read-zero"), False),
         (late_read.replace("authorization packet", "final connect information") + "0",
-         (2013, "late-auth-read-zero"), True),
+         (2013, "late-auth-read-zero"), False),
         (late_read + "104", (2013, "late-auth-read-connection-reset"), False),
         (late_read + "1", (2013, "late-auth-read-other-system-error"), False),
         (late_read + "0 trailing text", (2013, "unclassified"), False),
@@ -165,6 +196,9 @@ def check_mysql_classifier():
          (2026, "tls-connection-error"), False),
         ("ERROR 2003 (HY000): Can't connect to MySQL server", (2003, "unclassified"), False),
         ("private stderr with no MySQL error", (None, "missing-or-multiple-errors"), False),
+        ("unexpected output\nERROR 2026 (HY000): SSL connection error: "
+         "error:0A000418:SSL routines::tlsv1 alert unknown ca",
+         (None, "unexpected-diagnostic-lines"), False),
         (late_read + "0\n" + late_read + "0", (None, "missing-or-multiple-errors"), False),
         ("x" * 8193, (None, "oversized-diagnostic"), False),
     )
@@ -181,6 +215,8 @@ def refused(command, *, case, env=None, reasons=(), mysql_categories=None):
     print("CHECK: negative control " + case, flush=True)
     try:
         result = run(command, env=env, check=False)
+    except QualificationInterrupted:
+        raise
     except RuntimeError:
         raise RuntimeError(case + ": negative control exceeded its deadline") from None
     require(result.returncode != 0, case + ": negative TLS/authentication control succeeded")
@@ -191,7 +227,8 @@ def refused(command, *, case, env=None, reasons=(), mysql_categories=None):
         print("DIAGNOSTIC: " + case + " mysql_error="
               + (str(code) if code is not None else "none") + " category=" + category, flush=True)
     accepted = (
-        diagnostic in mysql_categories if mysql_categories is not None
+        (result.returncode == 1 and not result.stdout and diagnostic in mysql_categories)
+        if mysql_categories is not None
         else any(reason.lower() in result.stderr.lower() for reason in reasons)
     )
     require(
@@ -293,6 +330,257 @@ def pg_args(connection, query="SELECT 1"):
 
 def mysql_args(mode="trusted", query="SELECT 1"):
     return request("mysql-query", mysql_mode=mode, query=query)
+
+
+def handshake_body(data, kind):
+    if (len(data) < 4 or len(data) > 16384 or data[0] != kind
+            or int.from_bytes(data[1:4], "big") != len(data) - 4):
+        return None
+    return data[4:]
+
+
+def tls13_leaf(data):
+    body = handshake_body(data, 11)
+    # Initial TLS 1.3 Certificate messages have an empty request context.
+    if (body is None or len(body) < 4 or body[0] != 0
+            or int.from_bytes(body[1:4], "big") != len(body) - 4):
+        return None
+    offset, leaves = 4, []
+    while offset < len(body):
+        if len(leaves) == 4 or offset + 3 > len(body):
+            return None
+        size = int.from_bytes(body[offset:offset + 3], "big")
+        offset += 3
+        if not 0 < size <= 8192 or offset + size + 2 > len(body):
+            return None
+        leaves.append(body[offset:offset + size])
+        offset += size
+        extensions = int.from_bytes(body[offset:offset + 2], "big")
+        offset += 2 + extensions
+        if offset > len(body):
+            return None
+    return leaves[0] if leaves else None
+
+
+TLS13_ROGUE_EVENTS = [
+    "client-hello", "server-hello", "certificate-request", "server-certificate",
+    "server-finished", "client-certificate", "client-signature", "client-finished",
+    "unknown-ca",
+]
+
+
+def mysql_tls13_observer(server_der, client_der):
+    evidence = {"socket": None, "events": [], "bytes": 0, "messages": 0,
+                "ambiguous": False, "verified": False, "protocol": None, "connection": 0}
+
+    def observe(connection, direction, version, content_type, kind, data):
+        evidence["bytes"] += len(data)
+        evidence["messages"] += 1
+        if (connection is not evidence["socket"] or direction not in ("read", "write")
+                or evidence["bytes"] > 65536 or evidence["messages"] > 128):
+            evidence["ambiguous"] = True
+        if evidence["ambiguous"]:
+            return
+        event = None
+        if content_type == 21:  # Alert, decrypted by this connection's OpenSSL.
+            if (direction == "read" and version == ssl.TLSVersion.TLSv1_3
+                    and kind == 48 and data == b"\x02\x30"):
+                event = "unknown-ca"
+            else:
+                evidence["ambiguous"] = True
+        elif content_type == 22:  # Handshake, never application data.
+            body = handshake_body(data, kind)
+            if body is None:
+                evidence["ambiguous"] = True
+                return
+            if kind in (1, 2):
+                event = {("write", 1): "client-hello", ("read", 2): "server-hello"}.get(
+                    (direction, kind)
+                )
+                evidence["ambiguous"] |= event is None
+            elif kind in (11, 13, 15, 20):
+                if version != ssl.TLSVersion.TLSv1_3:
+                    evidence["ambiguous"] = True
+                    return
+                if kind == 13:
+                    if (direction == "read" and len(body) >= 3 and body[0] == 0
+                            and int.from_bytes(body[1:3], "big") == len(body) - 3):
+                        event = "certificate-request"
+                elif kind == 11:
+                    expected = server_der if direction == "read" else client_der
+                    if tls13_leaf(data) == expected:
+                        event = "server-certificate" if direction == "read" else "client-certificate"
+                elif kind == 15:
+                    if direction == "read":
+                        # The completed verified handshake validates the server signature.
+                        return
+                    # Generated client keys are RSA-2048; TLS 1.3 uses RSA-PSS.
+                    if (len(body) == 260 and body[:2] in (b"\x08\x04", b"\x08\x05", b"\x08\x06")
+                            and body[2:4] == b"\x01\x00" and any(body[4:])):
+                        event = "client-signature"
+                elif kind == 20 and len(body) in (32, 48):
+                    event = "server-finished" if direction == "read" else "client-finished"
+                evidence["ambiguous"] |= event is None
+            elif kind != 8:  # Only EncryptedExtensions is unrecorded in this initial handshake.
+                evidence["ambiguous"] = True
+        if event is not None:
+            evidence["events"].append(event)
+
+    return evidence, observe
+
+
+def bound_mysql_unknown_ca(evidence, error):
+    return (
+        not evidence["ambiguous"] and evidence["verified"]
+        and evidence["protocol"] == "TLSv1.3" and 0 < evidence["connection"] <= 0xffffffff
+        and evidence["events"] == TLS13_ROGUE_EVENTS
+        and error.errno == ssl.SSL_ERROR_SSL and getattr(error, "library", None) == "SSL"
+        and getattr(error, "reason", None) == "TLSV1_ALERT_UNKNOWN_CA"
+    )
+
+
+def check_mysql_tls13_parser():
+    # Structural/adversarial self-checks only; these bytes are not a TLS fixture
+    # or runtime rejection evidence. Only the live probe may report that evidence.
+    leaf = b"parser-only"
+    entry = len(leaf).to_bytes(3, "big") + leaf + b"\0\0"
+    body = b"\0" + len(entry).to_bytes(3, "big") + entry
+    message = b"\x0b" + len(body).to_bytes(3, "big") + body
+    require(tls13_leaf(message) == leaf, "TLS certificate parser self-check failed")
+    for malformed in (
+        b"", message[:3], message[:-1], message + b"\0", b"\x0c" + message[1:],
+        message[:4] + b"\x01" + message[5:],
+        message[:5] + b"\xff\xff\xff" + message[8:],
+        message[:8] + b"\0\0\0" + message[11:],
+        message[:-2] + b"\xff\xff", b"x" * 16385,
+    ):
+        require(tls13_leaf(malformed) is None, "Malformed TLS certificate admitted")
+    evidence, observe = mysql_tls13_observer(leaf, leaf)
+    connection = object()
+    evidence["socket"] = connection
+    observe(connection, "read", ssl.TLSVersion.TLSv1_3, 21, 48, b"\x02\x30")
+    error = ssl.SSLError(ssl.SSL_ERROR_SSL, "self-check only")
+    error.library, error.reason = "SSL", "TLSV1_ALERT_UNKNOWN_CA"
+    require(not bound_mysql_unknown_ca(evidence, error), "Unbound TLS alert admitted")
+    for direction, version, kind, data in (
+        ("write", ssl.TLSVersion.TLSv1_3, 48, b"\x02\x30"),
+        ("read", ssl.TLSVersion.TLSv1_2, 48, b"\x02\x30"),
+        ("read", ssl.TLSVersion.TLSv1_3, 42, b"\x02\x2a"),
+        ("read", ssl.TLSVersion.TLSv1_3, 48, b"\x01\x30"),
+        ("read", ssl.TLSVersion.TLSv1_3, 48, b"\x02\x30\0"),
+    ):
+        rejected, callback = mysql_tls13_observer(leaf, leaf)
+        rejected["socket"] = connection
+        callback(connection, direction, version, 21, kind, data)
+        require(rejected["ambiguous"], "Nonmatching TLS alert admitted")
+    for other, data in ((object(), message), (connection, b"x" * 65537)):
+        rejected, callback = mysql_tls13_observer(leaf, leaf)
+        rejected["socket"] = connection
+        callback(other, "write", ssl.TLSVersion.TLSv1_3, 22, 11, data)
+        require(rejected["ambiguous"], "Unbound or oversized TLS message admitted")
+    rejected, callback = mysql_tls13_observer(leaf, b"different-certificate-signature")
+    rejected["socket"] = connection
+    callback(connection, "write", ssl.TLSVersion.TLSv1_3, 22, 11, message)
+    require(rejected["ambiguous"], "Different TLS client certificate admitted")
+    print("PASS: TLS parser negative self-checks; no runtime rejection evidence", flush=True)
+
+
+def mysql_tls13_probe(certs):
+    # A distinct no-authentication attempt, not instrumentation of the mysql CLI.
+    # No SQL option file, password, auth response, query, transcript or key log.
+    print("CHECK: separate MySQL default TLS 1.3 rogue-certificate handshake", flush=True)
+    category = "unbound-tls-error"
+    try:
+        container = inspect(MYSQL)
+        require(container["Config"]["Image"] == MYSQL_IMAGE, "Probe image differs")
+        mounts = [item for item in container["Mounts"] if item["Destination"] == "/client"]
+        require(len(mounts) == 1 and not mounts[0]["RW"]
+                and mounts[0]["Source"] == str((certs / "client").resolve()),
+                "Probe client material differs")
+        paths = [certs / name for name in (
+            "mysql/server.crt", "client/ca.crt", "client/rogue.crt", "client/rogue.key",
+        )]
+        require(all(path.stat().st_size <= 16384 for path in paths), "Probe material oversized")
+        snapshot = [path.read_bytes() for path in paths]
+        server_der = ssl.PEM_cert_to_DER_cert(snapshot[0].decode("ascii"))
+        client_der = ssl.PEM_cert_to_DER_cert(snapshot[2].decode("ascii"))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        require(context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED,
+                "Probe server verification disabled")
+        require(context.keylog_filename is None, "Probe key logging enabled")
+        require(context.minimum_version == ssl.TLSVersion.TLSv1_2
+                and context.maximum_version == ssl.TLSVersion.MAXIMUM_SUPPORTED
+                and ssl.HAS_TLSv1_3,
+                "Probe default protocol range differs")
+        require(hasattr(type(context), "_msg_callback"), "Probe callback unavailable")
+        context.load_verify_locations(cafile=paths[1])
+        context.load_cert_chain(certfile=paths[2], keyfile=paths[3])
+        evidence, context._msg_callback = mysql_tls13_observer(server_der, client_der)
+        deadline = time.monotonic() + 5
+        with socket.create_connection(("127.0.0.1", 13306), timeout=3) as raw:
+            def remaining():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                return min(3, left)
+
+            def receive(size):
+                data = b""
+                while len(data) < size:
+                    raw.settimeout(remaining())
+                    part = raw.recv(size - len(data))
+                    require(part, "Probe initial disconnect")
+                    data += part
+                return data
+
+            header = receive(4)
+            size = int.from_bytes(header[:3], "little")
+            require(header[3] == 0 and 21 <= size <= 4096, "Probe greeting differs")
+            greeting = receive(size)
+            end = greeting.find(b"\0", 1)
+            require(greeting[0] == 10 and greeting[1:end] == b"8.0.46"
+                    and end > 1 and end + 16 <= len(greeting), "Probe server differs")
+            evidence["connection"] = int.from_bytes(greeting[end + 1:end + 5], "little")
+            require(greeting[end + 13] == 0
+                    and int.from_bytes(greeting[end + 14:end + 16], "little") & 0x800,
+                    "Probe server lacks TLS")
+            # MySQL SSLRequest, as used by OpenSSL's -starttls mysql; no auth payload.
+            raw.settimeout(remaining())
+            raw.sendall(b"\x20\x00\x00\x01\x85\xae\x7f\x00\x00\x00\x00\x01\x21" + bytes(23))
+            with context.wrap_socket(raw, server_hostname="localhost",
+                                     do_handshake_on_connect=False) as secure:
+                evidence["socket"] = secure
+                try:
+                    secure.settimeout(remaining())
+                    secure.do_handshake()
+                    evidence["protocol"] = secure.version()
+                    evidence["verified"] = secure.getpeercert(binary_form=True) == server_der
+                    secure.settimeout(remaining())
+                    data = secure.recv(1)
+                    category = "unexpected-application-data" if data else "unexpected-eof"
+                except ssl.SSLError as error:
+                    if bound_mysql_unknown_ca(evidence, error):
+                        category = "tls13-bound-unknown-ca"
+        require(inspect(MYSQL)["Id"] == container["Id"], "Probe server replaced")
+        require(snapshot == [path.read_bytes() for path in paths], "Probe material replaced")
+    except TimeoutError:
+        category = "timeout"
+    except ssl.SSLError:
+        category = "unbound-tls-error"
+    except OSError:
+        category = "network-or-material-failure"
+    except QualificationInterrupted:
+        raise
+    except RuntimeError:
+        category = "probe-capability-or-provenance-failure"
+    # Even the certificate bytes/signatures and connection greeting stay in memory.
+    proven = category == "tls13-bound-unknown-ca"
+    numbers = (" tls_protocol=13 mysql_connection=" + str(evidence["connection"])
+               + " tls_alert=48") if proven else ""
+    print("DIAGNOSTIC: mysql-rogue-handshake-default category=" + category + numbers, flush=True)
+    print(("PASS: " if proven else "UNQUALIFIED: ")
+          + "separate MySQL default TLS 1.3 rogue-certificate handshake", flush=True)
+    return proven
 
 
 def assert_no_exposure(names, passwords):
@@ -410,24 +698,42 @@ def qualify_sql(work):
                         .replace("/client/client.key", "/client/rogue.key")), env=pg_env,
                 case="pg-untrusted-client",
                 reasons=("unknown ca", "certificate verify failed", "certificate unknown"))
-        # TLS 1.3 can finish SSL_connect before the server checks the client cert.
-        # MySQL then masks the fatal alert as CR_SERVER_LOST while reading auth.
-        # Require a certificate-specific TLS 1.2 alert from the same client/server
-        # before allowing those exact late-disconnect messages on the default path.
+        # Keep TLS 1.2 evidence separate from the default CLI and TLS 1.3 probe.
+        # A late SQL/auth disconnect never establishes a certificate cause.
         require(run(mysql_args("trusted-tls12")).stdout.strip() == "1",
                 "MySQL TLS 1.2 mTLS positive failed")
         refused(mysql_args("rogue-tls12"),
                 case="mysql-untrusted-client-tls12",
                 mysql_categories=MYSQL_CERTIFICATE_ALERTS)
+        mysql_default_proven = False
         try:
             refused(mysql_args("rogue-default"), case="mysql-untrusted-client-default",
                     mysql_categories=MYSQL_DEFAULT_REJECTIONS)
+            mysql_default_proven = True
+        except QualificationInterrupted:
+            raise
+        except RuntimeError:
+            # Collect the remaining controls/scans, then fail the whole qualification.
+            # A separate handshake probe cannot relabel this exact CLI attempt.
+            print("UNQUALIFIED: MySQL default CLI certificate rejection", flush=True)
         finally:
             # Prove availability after the wrong certificate even on an unidentified
             # rejection. A positive never converts that unresolved negative to PASS.
             require(run(mysql_args()).stdout.strip() == "1",
                     "MySQL default mTLS positive after untrusted-client rejection failed")
             print("PASS: MySQL default mTLS SELECT 1 after untrusted-client attempt", flush=True)
+
+        mysql_tls13_proven = False
+        try:
+            protocol = run(mysql_args(query="SHOW SESSION STATUS LIKE 'Ssl_version'")).stdout.strip()
+            if protocol == "Ssl_version\tTLSv1.3":
+                mysql_tls13_proven = mysql_tls13_probe(certs)
+            else:
+                print("UNQUALIFIED: MySQL default CLI did not negotiate TLS 1.3", flush=True)
+        finally:
+            require(run(mysql_args()).stdout.strip() == "1",
+                    "MySQL default mTLS positive after separate handshake probe failed")
+            print("PASS: MySQL default mTLS SELECT 1 after separate handshake probe", flush=True)
 
         # Observe live, authenticated clients during a bounded query, then scan argv.
         print("CHECK: live SQL process argv, healthcheck configuration and logs", flush=True)
@@ -457,6 +763,10 @@ def qualify_sql(work):
                 if process.poll() is None:
                     process.kill()
                     process.communicate(timeout=5)
+        print("PASS: live SQL argv, healthcheck and log credential scan", flush=True)
+        require(mysql_tls13_proven, "Separate default TLS 1.3 probe lacks bound certificate evidence")
+        require(mysql_default_proven,
+                "Default MySQL CLI lacks certificate-specific evidence; separate probe is a distinct attempt")
         print("PASS: actual loopback bindings, private files, SQL CRUD, argv/log checks, TLS and mTLS controls")
     finally:
         if (certs / ".fixture-owned").exists():
@@ -467,6 +777,7 @@ def qualify_sql(work):
 def main():
     require(os.environ.get("GITHUB_ACTIONS") == "true", "This qualification runs only on hosted Actions")
     check_mysql_classifier()
+    check_mysql_tls13_parser()
     os.umask(0o077)
     work = Path(os.environ["RUNNER_TEMP"]) / "compose-fixture-qualification"
     work.mkdir(mode=0o700)
@@ -476,7 +787,7 @@ def main():
 
 
 def interrupted(*_):
-    raise RuntimeError("Qualification interrupted")
+    raise QualificationInterrupted("Qualification interrupted")
 
 
 if __name__ == "__main__":
