@@ -5,7 +5,7 @@
   "url": "https://static.crates.io/crates/h2/h2-0.4.19.crate",
   "sha256": "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16",
   "revision": "d57d1b852fec9dda6d42d3454502006d52104da8",
-  "patch_sha256": "b3076a728860dca539d2b43b78b3e19f3e516d1a3c590c99e9e2ea3eb2f0b064",
+  "patch_sha256": "8273b17232265bcbd85aa1725afa8ccfc6ed61496d6a9fce1b7d6df8d98cf5e5",
   "files": {
     "src/lib.rs": {
       "before": "c8680fc4eb13ccb4ce944716042bd33c6554677cf8261c371442f91fbee352e0",
@@ -16,25 +16,25 @@
       "after": "6d89842e80dc2247a968bdc231242c356a982e770c9b406620ae2a1c44b73f89"
     },
     "src/proto/streams/counts.rs": {
-      "before": "aba319047c01074d9e97afde4999c28e14f0ef21d1d39b7d6c6db4aebc786b79",
-      "after": "58b38853d490ca75a172996b3f04650b392fc65af7e3f5a219154cf8c56c0d1f"
+      "before": "9c0a1326fe0edf1e0636e1664915ceeb09e762c90fa8184bc6af0ca6ad077449",
+      "after": "c8caf8e45e985ae07497547f117bfa7f84280bb011fe4d2e5470d2ffe511e01c"
     },
     "src/proto/streams/mod.rs": {
-      "before": "3f7afa89a19943b1ac56052f64c4e220dbf0e951a4ac74405adbf83ea7050c27",
-      "after": "964a8e124583211fd35190dd36ad6b91347ed1e2ff392a46686114ddca19fbaf"
+      "before": "49a9d42775813e08ae6318441314c3a4dca58a345a04b73275cd9755e348a621",
+      "after": "1fad4e03b3a268c47c37236d6c5c04cffba59518f11a096033901b9f8d3fa3d4"
     },
     "src/proto/streams/recv.rs": {
-      "before": "49888eca03594469393d8b3bf328036007aff0e87df704f61a4556e4272386f8",
-      "after": "9aae67b0f29dcd05f4af1c74ba1a268ebe5337446e672d3d4bc8f0c78a1fd40b"
+      "before": "fed37fe0528eadc27acdbaea7f2367e1ebc88c45de1a5739b446142c610badf4",
+      "after": "c58c186df6564e29c97e7160917fd52384aee52b159543128bb31e4b50931009"
     },
     "src/proto/streams/streams.rs": {
-      "before": "e9cdf456ed6207fa024c86e571cc8ade4b57957cc0a0fcb6add7318a93cfb3d6",
-      "after": "fecc962c7a0cf2b5e4ba8a7e7a3cc91fb36ce6cf515047087b7204c6d4e4e952"
+      "before": "28b74ed10ceb24d404008652af0b5b9818bb9ea3e492bb6517e6ed2c935ad33a",
+      "after": "7e3a2c92d90acd877ec44e247325501fa599d3e15c7672f7daa937f771ef75bd"
     }
   },
   "assets": {
     "observer.rs": "23b0d7a833e12538e3516e21b12312e27bf0a53a9b4635579397cc944e6ad1b1",
-    "guard_tests.rs": "48d5bb259409470d3b45aa7f11c0d88279ec628fc55de6c9bb44f9cb6c9099ec",
+    "guard_tests.rs": "0b83f5cd9af4bde1b6b86e359319db4f8281297801e0cdec00fe3df8e410074e",
     "metrics-hook.txt": "c3e18b33e790351221a7383fd83e7bfa53b59a96b26e7b434a565d714454d539"
   },
   "context_files": {

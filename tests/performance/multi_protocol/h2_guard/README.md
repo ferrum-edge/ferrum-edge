@@ -17,8 +17,9 @@ The ordinary Cargo manifests, lockfiles, vendored inventory and published
 images continue to use the existing dependency graph. `prepare.py` requires a
 GitHub-hosted Linux runner, copies the checkout into a new temporary directory,
 verifies the immutable h2 0.4.19 archive/revision, applies Ferrum's vendored
-h2 patch (`docs/upstream-h2-patches/001-coalesce-data-frame-writes/`) without
-fuzz and requires every `src/` file to match `vendor/h2-0.4.19-ferrum-patched`'s
+h2 patches (`docs/upstream-h2-patches/001-coalesce-data-frame-writes/` and
+`docs/upstream-h2-patches/002-runtime-data-frame-budget/`) without fuzz and
+requires every `src/` file to match `vendor/h2-0.4.19-ferrum-patched`'s
 drift-manifest hash, so the observed crate is the h2 the gateway ships. It then
 verifies every observer preimage, applies the reviewed observer patch without
 fuzz, verifies postimages and injected assets, and selects the result only in
