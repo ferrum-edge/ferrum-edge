@@ -2528,7 +2528,10 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
         .expect("bounded complete unary RPC");
         stream_ids.push(stream_id);
     }
-    assert_ne!(stream_ids[0], stream_ids[1], "two distinct frontend streams");
+    assert_ne!(
+        stream_ids[0], stream_ids[1],
+        "two distinct frontend streams"
+    );
     wait_for_backend_awaiting_test_signal(&backend, Duration::from_secs(5)).await;
 
     // Accept/handshake and stream recording precede the scripted replies.

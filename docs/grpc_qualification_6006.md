@@ -54,6 +54,13 @@ the socket. No timer releases that fixture gate. The tests require:
 - no expired request or additional expiry count after that completed recovery.
 
 The fixture owns its accept task and a `JoinSet` of recovery connections.
+The frontend driver is also owned by a `JoinSet`, with bounded readiness and
+cleanup. One watchdog covers the expired RPC's send, preface observation,
+response body, and trailers; recovery readiness, send, body, and trailers share
+the existing termination-grace watchdog. Even a trailers-only status is accepted
+only after the body ends. The shared terminal parser's buffered-response sibling
+also bounds body/trailer completion. Previously these cases timed out only the
+response head, so a missing terminal could strand the remaining assertions.
 Timeouts only bound failed observations; sleeps no longer stand in for
 acquisition cancellation or absence of a late request. Counter assertions
 read the in-process lifetime counters directly, avoiding the runtime snapshot
@@ -88,6 +95,26 @@ when exports are reordered. It still requires a cold first RPC with measured
 setup/DNS/TCP phases, a genuinely reused second RPC with **no** setup timing
 attributes, distinct RPC traces/attempt IDs, correct SERVER parentage, and
 exactly three CLIENT spans for the refused target's first attempt plus retries.
+
+Independent review identified an unbounded wait in response collection: a
+missing response terminal could keep `send_grpc` pending forever, preventing
+the test from reaching `release_test_signal`. Functional nextest supplies no
+termination timeout for this case. The repaired helper uses one 20-second
+watchdog for sender readiness, send, complete body collection, and trailers,
+including the refused-target RPC. Frontend connection/readiness and normal
+driver cleanup each have a five-second bound. An owned `JoinSet` retains the
+driver through all reuse/span assertions and aborts it on timeout or assertion
+unwind. Normal cleanup releases the backend gate, drops the sender, and joins
+the driver. No timeout releases the gate during successful inspection.
+
+`ScriptedGrpcBackend::shutdown`, including its drop path, now explicitly
+releases the test signal before aborting its accept and connection-script
+tasks. Their control senders are then dropped; the existing H2 driver exits
+on control-channel closure with a 200ms flush bound. This covers failures
+before the explicit release without relying on reaching the final assertion.
+Abort-on-drop schedules task cancellation; failed assertions do not perform
+asynchronous joins. The gated acquisition backend separately aborts its accept
+task, whose owned recovery `JoinSet` aborts those connections when dropped.
 
 The shared production siblings are unchanged: buffered and streamed native
 gRPC retain the same acquisition/handoff bounds, the H3 gRPC bridge consumes
@@ -140,6 +167,17 @@ the owned driver under a five-second bound; dropping the `JoinSet` also aborts
 the driver on a failed assertion or timeout. The backend retains its existing
 drop shutdown. No shard-count override, affinity bypass, reconnection-as-reuse,
 weaker message assertion, or production change is introduced.
+
+Inspection confirmed that this sequential-reuse fixture already bounds its
+entire RPC and owns its frontend driver. Its RPC behavior needs no further
+change for the completion finding; it receives the shared backend's signal
+release on shutdown. The four exact formatter hunks from
+[CI Plan job 111489249137](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37220349894/job/111489249137)
+were applied by hand. The later head `5f66db02d` also exposed one formatter
+hunk in its distinct-stream assertion in
+[CI Plan job 111490626071](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37220824175/job/111490626071);
+that exact hunk is applied too. Neither deterministic formatting failure was
+rerun.
 
 ## Validation and integration
 

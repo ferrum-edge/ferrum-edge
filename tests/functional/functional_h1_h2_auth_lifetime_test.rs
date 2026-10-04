@@ -769,7 +769,10 @@ fn spawn_gated_preface_h2c_backend(listener: tokio::net::TcpListener) -> GatedGr
         let (mut stalled, _) = listener.accept().await.expect("stalled acquisition TCP");
         accept_count.fetch_add(1, Ordering::SeqCst);
         let mut preface = [0u8; 24];
-        stalled.read_exact(&mut preface).await.expect("client preface");
+        stalled
+            .read_exact(&mut preface)
+            .await
+            .expect("client preface");
         assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
         preface_tx.send(()).expect("publish stalled preface");
         let mut frames = Vec::new();
@@ -866,19 +869,23 @@ fn assert_no_rpc_frames(mut frames: &[u8]) {
 }
 
 /// The terminal `grpc-status` of a gRPC response: from a trailers-only head,
-/// or else from the trailers after the body.
+/// or else from the trailers after the body. Always finish the body first.
 async fn grpc_status_of(response: http::Response<h2::RecvStream>) -> Option<String> {
     let (head, mut body) = response.into_parts();
-    if let Some(status) = head.headers.get("grpc-status") {
-        return status.to_str().ok().map(str::to_owned);
-    }
+    let head_status = head
+        .headers
+        .get("grpc-status")
+        .and_then(|status| status.to_str().ok())
+        .map(str::to_owned);
     while let Some(chunk) = body.data().await {
-        if chunk.is_err() {
-            break;
-        }
+        let chunk = chunk.ok()?;
+        body.flow_control().release_capacity(chunk.len()).ok()?;
     }
-    let trailers = body.trailers().await.ok().flatten()?;
-    trailers
+    let trailers = body.trailers().await.ok()?;
+    if let Some(status) = head_status {
+        return Some(status);
+    }
+    trailers?
         .get("grpc-status")?
         .to_str()
         .ok()
@@ -907,55 +914,60 @@ async fn assert_stalled_grpc_acquisition_never_reaches_the_backend(buffered: boo
         ferrum_edge::proxy::auth_lifetime::counters().credential_expired["grpc"],
         0
     );
-    let tcp = tokio::net::TcpStream::connect(authority.as_str())
-        .await
-        .expect("connect to the gateway plaintext port");
-    let (send_request, connection) = h2::client::handshake(tcp)
-        .await
-        .expect("h2c handshake with the gateway");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let mut send_request = send_request
-        .ready()
-        .await
-        .expect("the h2 connection must accept a new stream");
-    // Mint after frontend readiness, so startup cannot consume the validity
-    // needed to reach the backend's explicit preface barrier.
-    let token = mint_short_lived_token(ExpShape::Integer);
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("http://{authority}/grpc{STALLED_GRPC_PATH}"))
-        .header("authorization", format!("Bearer {token}"))
-        .header("content-type", "application/grpc")
-        .header("te", "trailers")
-        .body(())
-        .expect("build gRPC request");
-    let (response, mut upload) = send_request
-        .send_request(request, false)
-        .expect("send the authenticated gRPC request");
-    // One empty, uncompressed gRPC message, then end of stream.
-    upload
-        .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
-        .expect("send the gRPC message");
-
+    let mut frontend_driver = tokio::task::JoinSet::new();
+    let mut send_request = tokio::time::timeout(TERMINATION_GRACE, async {
+        let tcp = tokio::net::TcpStream::connect(authority.as_str())
+            .await
+            .expect("connect to the gateway plaintext port");
+        let (send_request, connection) = h2::client::handshake(tcp)
+            .await
+            .expect("h2c handshake with the gateway");
+        frontend_driver.spawn(connection);
+        send_request
+            .ready()
+            .await
+            .expect("the h2 connection must accept a new stream")
+    })
+    .await
+    .expect("bounded frontend readiness");
     let wait = Duration::from_secs(TOKEN_TTL_SECS as u64) + TERMINATION_GRACE;
-    tokio::time::timeout(wait, &mut backend.preface_received)
-        .await
-        .expect("the admitted RPC must reach sender establishment")
-        .expect("the backend must read the client's preface");
-    assert_eq!(backend.accepts.load(Ordering::SeqCst), 1);
-    // No peer SETTINGS are released. The credential must cancel acquisition
-    // before the 60s operator timeout, rather than waiting for fixture time.
-    let Ok(response) = tokio::time::timeout(wait, response).await else {
+    let (http_status, grpc_status) = tokio::time::timeout(wait, async {
+        // Mint after frontend readiness, so startup cannot consume the validity
+        // needed to reach the backend's explicit preface barrier.
+        let token = mint_short_lived_token(ExpShape::Integer);
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://{authority}/grpc{STALLED_GRPC_PATH}"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .expect("build gRPC request");
+        let (response, mut upload) = send_request
+            .send_request(request, false)
+            .expect("send the authenticated gRPC request");
+        // One empty, uncompressed gRPC message, then end of stream.
+        upload
+            .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+            .expect("send the gRPC message");
+        (&mut backend.preface_received)
+            .await
+            .expect("the backend must read the client's preface");
+        assert_eq!(backend.accepts.load(Ordering::SeqCst), 1);
+        // No peer SETTINGS are released. The credential must cancel acquisition
+        // before the 60s operator timeout, rather than waiting for fixture time.
+        // The same watchdog includes terminal body/trailer parsing.
+        let response = response.await.expect("gRPC response head");
+        let http_status = response.status().as_u16();
+        (http_status, grpc_status_of(response).await)
+    })
+    .await
+    .unwrap_or_else(|_| {
         panic!(
-            "the gateway never answered the stalled-acquisition RPC; logs:\n{}",
+            "the gateway never completed the stalled-acquisition RPC; logs:\n{}",
             harness.captured_combined().unwrap_or_default()
-        );
-    };
-    let response = response.expect("gRPC response head");
-    let http_status = response.status().as_u16();
-    let grpc_status = grpc_status_of(response).await;
+        )
+    });
     assert_eq!(
         (http_status, grpc_status.as_deref()),
         (200, Some("16")),
@@ -963,13 +975,10 @@ async fn assert_stalled_grpc_acquisition_never_reaches_the_backend(buffered: boo
          the fixed UNAUTHENTICATED terminal, never DEADLINE_EXCEEDED or UNAVAILABLE; logs:\n{}",
         harness.captured_combined().unwrap_or_default()
     );
-    let frames = tokio::time::timeout(
-        TERMINATION_GRACE,
-        &mut backend.acquisition_closed,
-    )
-    .await
-    .expect("expiry must close the acquisition socket")
-    .expect("observe actual backend EOF/reset");
+    let frames = tokio::time::timeout(TERMINATION_GRACE, &mut backend.acquisition_closed)
+        .await
+        .expect("expiry must close the acquisition socket")
+        .expect("observe actual backend EOF/reset");
     assert_no_rpc_frames(&frames);
     assert_eq!(
         backend.expired_requests.load(Ordering::SeqCst),
@@ -990,28 +999,31 @@ async fn assert_stalled_grpc_acquisition_never_reaches_the_backend(buffered: boo
         1,
         "expiry must not retry"
     );
-    let token = mint_token_with_ttl(ExpShape::Integer, 60);
-    send_request = send_request.ready().await.expect("recovery frontend ready");
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("http://{authority}/grpc{HEALTHY_GRPC_PATH}"))
-        .header("authorization", format!("Bearer {token}"))
-        .header("content-type", "application/grpc")
-        .header("te", "trailers")
-        .body(())
-        .expect("recovery request");
-    let (response, mut upload) = send_request
-        .send_request(request, false)
-        .expect("recovery send");
-    upload
-        .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
-        .expect("recovery message");
-    let response = tokio::time::timeout(TERMINATION_GRACE, response)
-        .await
-        .expect("the pool and threshold-one breaker must remain usable")
-        .expect("recovery response");
-    assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(grpc_status_of(response).await.as_deref(), Some("0"));
+    let (send_request, http_status, grpc_status) = tokio::time::timeout(TERMINATION_GRACE, async {
+        let token = mint_token_with_ttl(ExpShape::Integer, 60);
+        let mut send_request = send_request.ready().await.expect("recovery frontend ready");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://{authority}/grpc{HEALTHY_GRPC_PATH}"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .expect("recovery request");
+        let (response, mut upload) = send_request
+            .send_request(request, false)
+            .expect("recovery send");
+        upload
+            .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+            .expect("recovery message");
+        let response = response.await.expect("recovery response");
+        let http_status = response.status().as_u16();
+        (send_request, http_status, grpc_status_of(response).await)
+    })
+    .await
+    .expect("the pool and threshold-one breaker must complete recovery");
+    assert_eq!(http_status, 200);
+    assert_eq!(grpc_status.as_deref(), Some("0"));
     assert_eq!(backend.accepts.load(Ordering::SeqCst), 2);
     assert_eq!(backend.expired_requests.load(Ordering::SeqCst), 0);
     assert_eq!(backend.healthy_requests.load(Ordering::SeqCst), 1);
@@ -1020,6 +1032,13 @@ async fn assert_stalled_grpc_acquisition_never_reaches_the_backend(buffered: boo
         1,
         "successful recovery must not recount the cancelled RPC"
     );
+    drop(send_request);
+    tokio::time::timeout(TERMINATION_GRACE, frontend_driver.join_next())
+        .await
+        .expect("bounded frontend cleanup")
+        .expect("owned frontend driver")
+        .expect("join frontend driver")
+        .expect("frontend closed cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1095,7 +1114,10 @@ async fn h1_h2_auth_lifetime_buffered_grpc_response_collect_commits_only_the_exp
         Some("16"),
         "no backend head may commit while the buffered collect is still pending"
     );
-    assert_eq!(grpc_status_of(response).await.as_deref(), Some("16"));
+    let grpc_status = tokio::time::timeout(TERMINATION_GRACE, grpc_status_of(response))
+        .await
+        .expect("bounded expiry terminal body and trailers");
+    assert_eq!(grpc_status.as_deref(), Some("16"));
     assert_eq!(
         backend.received_stream_count(),
         1,

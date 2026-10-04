@@ -376,8 +376,10 @@ impl ScriptedGrpcBackend {
         self.inner.assert_no_step_errors().await
     }
 
-    /// Signal shutdown + abort.
+    /// Release any test gate, then signal shutdown + abort. Drop also takes
+    /// this path when an assertion unwinds before the explicit signal release.
     pub fn shutdown(&mut self) {
+        self.release_test_signal();
         self.inner.shutdown();
     }
 }

@@ -11,11 +11,17 @@ sender-acquisition cases from binary startup capability probes with the cold
 in-process harness. A backend preface barrier and observed socket closure
 prove cancellation without sending RPC frames; a completed healthy follow-up
 checks pool recovery, breaker neutrality, and stable once-only expiry accounting.
+Readiness and cleanup are bounded, and the expired and recovery RPC watchdogs
+include complete response bodies and terminal trailers. The frontend driver
+and backend recovery connections have task owners that abort on failure.
 
 `functional_otel_attempt_spans_test.rs` retains one frontend H2 connection for
 both live RPCs, completes their bodies, and holds the scripted backend open
 through trace inspection. One backend accept/handshake independently proves
 reuse while strict per-attempt timing and parentage assertions remain in place.
+One 20-second watchdog includes readiness, send, body, and trailers for every
+RPC. Its frontend driver remains owned through inspection and is joined under
+a five-second cleanup bound, or aborted when an assertion unwinds.
 
 `scripted_backend_h2_tests.rs::h2_direct_pool_reuses_connection_across_requests`
 also retains one frontend H2 sender and an owned driver. It requires distinct
@@ -26,6 +32,8 @@ replace the former counter-settlement sleep. Sender cleanup is joined under
 a bounded watchdog. New frontend connections may intentionally create new
 gRPC affinity shards, so separate `GrpcClient::unary` calls cannot prove this
 same-frontend reuse invariant.
+Both scripted gRPC fixtures release `AwaitTestSignal` on backend shutdown/drop,
+including failure before explicit release, and abort their backend scripts.
 See [the hosted failures and causal evidence](grpc_qualification_6006.md).
 
 ### scripted_backend_matrix_tests.rs

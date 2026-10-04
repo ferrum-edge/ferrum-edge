@@ -112,8 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"one"` / `"two"` bodies and success trailers, and exactly two backend streams
   on one accept/handshake; hold the script open through inspection and join
   frontend cleanup under a bound. Completed responses replace its counter
-  settlement sleep. Production lifetime and pool semantics are
-  unchanged. Fresh hosted qualification remains pending; see
+  settlement sleep. Bound OTEL RPC readiness, send, complete body, and trailers
+  under one watchdog; own its frontend driver through inspection and release
+  the scripted backend gate on shutdown/unwind. Acquisition and recovery
+  watchdogs also include terminal body/trailer completion. Production lifetime
+  and pool semantics are unchanged. Fresh hosted qualification remains pending; see
   [the root-cause record](docs/grpc_qualification_6006.md).
 
 - **H1/H2 listener dispatch keeps large child futures out of enclosing poll
