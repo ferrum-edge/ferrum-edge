@@ -3425,3 +3425,299 @@ async fn h3_overload_keepalive_pressure_sends_one_goaway_and_still_admits_new_co
     driver.abort();
     server.abort();
 }
+
+/// Exercise the shipped pool, not a fake enqueue counter: the backend remains
+/// usable after each refused request, and sees no connection or request from it.
+#[tokio::test]
+async fn h3_pool_authorization_expiry_during_checkout_sends_zero_backend_requests() {
+    use ferrum_edge::_test_support::native_h3_pooled_dispatch_for_test;
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use std::time::Duration;
+
+    for explicit_target in [false, true] {
+        let (backend, port, client_tls) = capped_h3_backend("h3-auth-checkout", 1).await;
+        let (pool, _, mut proxy) = capped_h3_pool(1, port);
+        proxy.pool_http3_connections_per_backend = Some(1);
+        let url = format!("https://127.0.0.1:{port}/");
+        let headers = [(
+            http::header::HOST,
+            http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+                .expect("backend authority"),
+        )];
+        let plan = (
+            StreamAuthDeadline {
+                at: tokio::time::Instant::now() + Duration::from_millis(100),
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Http,
+            StreamAuthTerminationLatch::default(),
+        );
+        let tls = client_tls.clone();
+        let result = native_h3_pooled_dispatch_for_test(
+            &pool,
+            &proxy,
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            &plan,
+            explicit_target,
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(tls)
+            },
+        )
+        .await;
+        let error = result.err().expect("checkout must expire");
+        assert_eq!(error.0, Some(StreamAuthTermination::CredentialExpired));
+        assert!(!error.1);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(backend.accepted_connections(), 0);
+        assert!(backend.received_requests().await.is_empty());
+        // Prove zero hits came from expiry rather than an unusable fixture.
+        let response = pool
+            .request(&proxy, "GET", &url, &headers, bytes::Bytes::new(), || {
+                std::future::ready(Ok(client_tls))
+            })
+            .await
+            .expect("healthy backend after refused acquisition");
+        assert_eq!(response.status, 200);
+        assert_eq!(backend.received_requests().await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn h3_pool_expired_plan_refuses_cached_sender_before_backend_headers() {
+    use ferrum_edge::_test_support::native_h3_pooled_dispatch_for_test;
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use std::time::Duration;
+
+    for explicit_target in [false, true] {
+        let (backend, port, client_tls) = capped_h3_backend("h3-auth-cached", 2).await;
+        let (pool, _, mut proxy) = capped_h3_pool(1, port);
+        proxy.pool_http3_connections_per_backend = Some(1);
+        let url = format!("https://127.0.0.1:{port}/");
+        let headers = [(
+            http::header::HOST,
+            http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+                .expect("backend authority"),
+        )];
+        let tls = client_tls.clone();
+        pool.request(&proxy, "GET", &url, &headers, bytes::Bytes::new(), || {
+            std::future::ready(Ok(tls))
+        })
+        .await
+        .expect("warm live sender");
+        let plan = (
+            StreamAuthDeadline {
+                at: tokio::time::Instant::now(),
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Http,
+            StreamAuthTerminationLatch::default(),
+        );
+        let result = native_h3_pooled_dispatch_for_test(
+            &pool,
+            &proxy,
+            &url,
+            &headers,
+            bytes::Bytes::new(),
+            &plan,
+            explicit_target,
+            std::future::ready(Ok(client_tls.clone())),
+        )
+        .await;
+        let error = result
+            .err()
+            .expect("cached send must refuse the expired credential");
+        assert_eq!(error.0, Some(StreamAuthTermination::CredentialExpired));
+        assert!(!error.1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(backend.received_requests().await.len(), 1);
+        let response = pool
+            .request(&proxy, "GET", &url, &headers, bytes::Bytes::new(), || {
+                std::future::ready(Ok(client_tls))
+            })
+            .await
+            .expect("refusal must preserve the healthy sender");
+        assert_eq!(response.status, 200);
+        assert_eq!(backend.accepted_connections(), 1);
+        assert_eq!(backend.received_requests().await.len(), 2);
+    }
+}
+
+/// Contrast the zero-request cases with a completed HEADERS handoff. The
+/// backend keeps its receive half open without consuming the upload, so DATA
+/// writes exceed stream credit and remain pending until the captured expiry.
+#[tokio::test]
+async fn h3_pool_upload_expiry_after_transmission_retains_post_handoff_provenance() {
+    use ferrum_edge::_test_support::{
+        authorization_dispatch_provenance_for_test, native_h3_pooled_dispatch_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use ferrum_edge::retry::ErrorClass;
+    use std::time::Duration;
+
+    let (backend, port, client_tls) = capped_h3_backend("h3-auth-post-handoff", 2).await;
+    let (pool, _, mut proxy) = capped_h3_pool(1, port);
+    proxy.pool_http3_connections_per_backend = Some(1);
+    let url = format!("https://127.0.0.1:{port}/");
+    let headers = [(
+        http::header::HOST,
+        http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+            .expect("backend authority"),
+    )];
+    let tls = client_tls.clone();
+    pool.request(&proxy, "GET", &url, &headers, bytes::Bytes::new(), || {
+        std::future::ready(Ok(tls))
+    })
+    .await
+    .expect("warm live sender");
+    let plan = (
+        StreamAuthDeadline {
+            at: tokio::time::Instant::now() + Duration::from_secs(2),
+            termination: StreamAuthTermination::CredentialExpired,
+        },
+        StreamAuthProtocolFamily::Http,
+        StreamAuthTerminationLatch::default(),
+    );
+    let error = native_h3_pooled_dispatch_for_test(
+        &pool,
+        &proxy,
+        &url,
+        &headers,
+        bytes::Bytes::from(vec![b'x'; 4 * 1024 * 1024]),
+        &plan,
+        false,
+        std::future::ready(Ok(client_tls)),
+    )
+    .await
+    .err()
+    .expect("authorization must cancel the pending upload");
+    assert_eq!(error.0, Some(StreamAuthTermination::CredentialExpired));
+    assert!(
+        error.1,
+        "completed HEADERS retain the actual handoff marker"
+    );
+    assert_eq!(backend.received_requests().await.len(), 2);
+    assert_eq!(backend.accepted_connections(), 1);
+    assert_eq!(
+        authorization_dispatch_provenance_for_test(error.1),
+        (false, true, Some(ErrorClass::ClientDisconnect), "ambiguous")
+    );
+}
+
+/// State ceilings complement the real cold acquisition below: state size does
+/// not measure compiler poll-frame temporaries, so both guards are needed on
+/// ordinary test/Tokio stacks, including debug builds.
+#[test]
+fn h3_cold_dispatch_future_state_stays_within_the_stack_budget() {
+    use ferrum_edge::http3::client::Http3ConnectionPool;
+
+    let sizes = Http3ConnectionPool::buffered_dispatch_future_sizes_for_test();
+    for ((name, ceiling), actual) in [
+        ("proxy dispatch", 32 * 1024),
+        ("target dispatch", 32 * 1024),
+        ("proxy pool create", 16 * 1024),
+        ("target pool create", 16 * 1024),
+        ("proxy connection", 16 * 1024),
+        ("target connection", 16 * 1024),
+        ("buffered exchange", 32 * 1024),
+        ("streaming exchange", 32 * 1024),
+    ]
+    .into_iter()
+    .zip(sizes)
+    {
+        assert!(
+            actual <= ceiling,
+            "{name} future is {actual} bytes, exceeding its {ceiling}-byte state budget"
+        );
+    }
+}
+
+/// A real cold QUIC acquisition has a shorter connect budget than its admitted
+/// lifetime. The silent peer keeps the UDP socket bound, so this exercises the
+/// connect/handshake timeout rather than an immediate refused-address error.
+#[tokio::test]
+async fn h3_cold_connect_timeout_does_not_become_an_authorization_refusal() {
+    use ferrum_edge::_test_support::native_h3_pooled_dispatch_for_test;
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use std::time::Duration;
+
+    for explicit_target in [false, true] {
+        let (backend, port, client_tls) = capped_h3_backend("h3-cold-connect-winner", 1).await;
+        let silent = crate::scaffolding::ports::reserve_udp_port()
+            .await
+            .expect("silent UDP peer");
+        let silent_port = silent.port;
+        let _silent_socket = silent.into_socket();
+        let (pool, _, mut proxy) = capped_h3_pool(1, silent_port);
+        proxy.backend_connect_timeout_ms = 100;
+        let silent_url = format!("https://127.0.0.1:{silent_port}/");
+        let silent_headers = [(
+            http::header::HOST,
+            http::header::HeaderValue::from_str(&format!("127.0.0.1:{silent_port}"))
+                .expect("silent backend authority"),
+        )];
+        let plan = (
+            StreamAuthDeadline {
+                at: tokio::time::Instant::now() + Duration::from_secs(2),
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Http,
+            StreamAuthTerminationLatch::default(),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            native_h3_pooled_dispatch_for_test(
+                &pool,
+                &proxy,
+                &silent_url,
+                &silent_headers,
+                bytes::Bytes::new(),
+                &plan,
+                explicit_target,
+                std::future::ready(Ok(client_tls.clone())),
+            ),
+        )
+        .await
+        .expect("the operator connect timeout must precede authorization");
+        assert_eq!(result.err(), Some((None, false, false)));
+        assert_eq!(plan.2.observed(), None);
+        assert_eq!(backend.accepted_connections(), 0);
+
+        // Positive control: the same TLS config and pool can reach the live
+        // fixture, so the zero-request outcome came from the cold timeout.
+        proxy.backend_port = port;
+        proxy.backend_connect_timeout_ms = 5000;
+        let headers = [(
+            http::header::HOST,
+            http::header::HeaderValue::from_str(&format!("127.0.0.1:{port}"))
+                .expect("live backend authority"),
+        )];
+        let response = pool
+            .request(
+                &proxy,
+                "GET",
+                &format!("https://127.0.0.1:{port}/"),
+                &headers,
+                bytes::Bytes::new(),
+                || std::future::ready(Ok(client_tls)),
+            )
+            .await
+            .expect("usable H3 fixture after timeout");
+        assert_eq!(response.status, 200);
+        assert_eq!(backend.received_requests().await.len(), 1);
+    }
+}

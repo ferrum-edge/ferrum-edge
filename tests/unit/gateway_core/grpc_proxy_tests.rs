@@ -518,20 +518,82 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
     );
 
     let proxy_src = include_str!("../../../src/proxy/mod.rs");
-    assert_eq!(
-        proxy_src
-            .matches("grpc_proxy::attach_held_frontend_grpc_upload(")
-            .count(),
-        3,
-        "all three terminal native/gRPC-Web error shapes must attach the held upload"
-    );
-    assert_eq!(
-        proxy_src
-            .matches("held_frontend_grpc_upload.take()")
-            .count(),
-        3,
-        "each terminal error attachment must consume the held upload exactly once"
-    );
+    let native_start = proxy_src
+        .find("Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {")
+        .expect("native gRPC response terminals");
+    let native_tail = &proxy_src[native_start..];
+    let native_end = native_tail
+        .find("// Keep only the independently owned header map")
+        .expect("native gRPC response terminals end");
+    let proxy_src = &native_tail[..native_end];
+    // Check each terminal's own scope: two pre-commitment gates, dispatch
+    // expiry, and all three native/gRPC-Web backend-error shapes. A duplicate
+    // attachment elsewhere cannot compensate for a lost one here.
+    for (start, end) in [
+        (
+            "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
+            "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
+        ),
+        (
+            "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
+            "Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {",
+        ),
+        (
+            "Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {",
+            "Err(e) => {",
+        ),
+        (
+            concat!(
+                "if let Some(content_type) = grpc_web_response_content_type {\n",
+                "                    let response = boxed_grpc_web_gateway_error_response(",
+            ),
+            "if grpc_request_is_web_translated\n",
+        ),
+        (
+            "if grpc_request_is_web_translated\n",
+            concat!(
+                "return Ok(grpc_proxy::attach_held_frontend_grpc_upload(\n",
+                "                    grpc_proxy::build_grpc_error_response_with_policy(",
+            ),
+        ),
+        (
+            concat!(
+                "return Ok(grpc_proxy::attach_held_frontend_grpc_upload(\n",
+                "                    grpc_proxy::build_grpc_error_response_with_policy(",
+            ),
+            "\n            }\n",
+        ),
+    ] {
+        let start_at = proxy_src.find(start).expect("gRPC terminal start");
+        let tail = &proxy_src[start_at..];
+        let end_at = tail.find(end).expect("gRPC terminal end");
+        let terminal = &tail[..end_at];
+        assert_eq!(
+            terminal
+                .matches("grpc_proxy::attach_held_frontend_grpc_upload(")
+                .count(),
+            1,
+            "terminal {start} must retain its held frontend upload exactly once"
+        );
+        assert_eq!(
+            terminal.matches("held_frontend_grpc_upload.take()").count(),
+            1,
+            "terminal {start} must consume its held upload exactly once"
+        );
+        for attachment in terminal
+            .split("grpc_proxy::attach_held_frontend_grpc_upload(")
+            .skip(1)
+        {
+            let end_at = attachment.find("));").expect("attachment return");
+            let attachment = &attachment[..end_at];
+            assert_eq!(
+                attachment
+                    .matches("held_frontend_grpc_upload.take()")
+                    .count(),
+                1
+            );
+        }
+    }
 }
 
 #[test]
@@ -979,6 +1041,7 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         &proxy_headers,
         false,
         0,
+        None,
         None,
     )
     .await;
@@ -2032,6 +2095,8 @@ fn grpc_channel_body(max_bytes: usize) -> GrpcChannelBodyFixture {
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let forwarded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let body = grpc_proxy::GrpcBody::Channel {
+        auth_deadline: None,
+        grpc_deadline_at: None,
         receiver,
         bytes_seen: 0,
         max_bytes,
@@ -3774,4 +3839,90 @@ fn grpc_streaming_upload_publishes_forwarded_request_bytes() {
         h3_src[..h3_publish].contains("ctx.bytes_sent_observed"),
         "the H3 gRPC bridge must mirror its forwarded upload bytes into the shared counter"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_channel_authorization_gate_rejects_queued_data_before_the_pump_repolls() {
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let (tx, mut body, exceeded, cancelled, forwarded) = grpc_channel_body(64);
+    let latch = StreamAuthTerminationLatch::default();
+    let deadline = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    if let grpc_proxy::GrpcBody::Channel { auth_deadline, .. } = &mut body {
+        *auth_deadline = Some((deadline, StreamAuthProtocolFamily::Grpc, latch.clone()));
+    } else {
+        panic!("fixture must supply a channel body");
+    }
+    tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+        b"protected",
+    ))))
+    .await
+    .unwrap();
+    // The independently-owned pump timer has not been polled. Queued DATA must
+    // still be refused by the actual backend body boundary after expiry.
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    assert!(body.frame().await.unwrap().is_err());
+    assert!(body.frame().await.is_none());
+    assert_eq!(forwarded.load(Ordering::Relaxed), 0);
+    assert!(cancelled.load(Ordering::Acquire));
+    assert!(!exceeded.load(Ordering::Acquire));
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(!latch.record_once(
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthProtocolFamily::Grpc,
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_channel_late_poll_preserves_an_earlier_client_deadline() {
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let (tx, mut body, _exceeded, cancelled, forwarded) = grpc_channel_body(64);
+    let latch = StreamAuthTerminationLatch::default();
+    let start = tokio::time::Instant::now();
+    if let grpc_proxy::GrpcBody::Channel {
+        auth_deadline,
+        grpc_deadline_at,
+        ..
+    } = &mut body
+    {
+        *auth_deadline = Some((
+            StreamAuthDeadline {
+                at: start + std::time::Duration::from_millis(200),
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Grpc,
+            latch.clone(),
+        ));
+        *grpc_deadline_at = Some(start + std::time::Duration::from_millis(50));
+    } else {
+        panic!("fixture must supply a channel body");
+    }
+    tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+        b"queued",
+    ))))
+    .await
+    .unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(300)).await;
+    let error = body.frame().await.unwrap().unwrap_err();
+    assert_eq!(error.to_string(), "gRPC client deadline exceeded");
+    assert_eq!(forwarded.load(Ordering::Relaxed), 0);
+    assert!(cancelled.load(Ordering::Acquire));
+    assert_eq!(latch.observed(), None);
 }

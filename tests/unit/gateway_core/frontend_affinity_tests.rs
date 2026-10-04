@@ -155,6 +155,30 @@ fn http1_requests_allocate_no_affinity_state() {
     assert!(stream.is_some());
 }
 
+/// Measure the concrete state machines, not just the pointer the service
+/// sees. An async trampoline still stores its awaited child, so pointer size
+/// alone cannot guard the routing and backend poll boundaries. Real H1/H2
+/// listener requests also run on ordinary Tokio stacks in the lib suite.
+#[test]
+fn frontend_and_backend_future_state_stays_within_the_stack_budget() {
+    let [boxed_frontend, frontend, handler, backend] =
+        ferrum_edge::proxy::request_stack_test_support::future_sizes();
+    assert_eq!(boxed_frontend, std::mem::size_of::<usize>());
+    // These are coroutine-state ceilings, not measurements of poll frames.
+    // Keep ample room on a default worker stack for debug-build temporaries,
+    // the Hyper driver, task-local scopes, and the selected transport's poll.
+    for (name, actual, ceiling) in [
+        ("frontend", frontend, 8 * 1024),
+        ("routing handler", handler, 128 * 1024),
+        ("backend attempt", backend, 64 * 1024),
+    ] {
+        assert!(
+            actual <= ceiling,
+            "{name} future is {actual} bytes, exceeding its {ceiling}-byte state budget"
+        );
+    }
+}
+
 #[tokio::test]
 async fn early_responses_keep_uploads_counted_until_both_halves_terminate() {
     use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;

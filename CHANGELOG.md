@@ -63,34 +63,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `400` naming the field. Disabled configs may still be saved before an operator
   supplies a key. Generate a unique random secret of at least 32 bytes and
   rotate through `session.encryption_secret_previous`.
-- **Backend connection checkout and request handoff are held to the
-  authorization lifetime** (GHSA-xcg4-wj3x-gjj2; regression from the direct
-  HTTP/1.1 pool, #5961). The direct HTTP/1.1 pool checked out its connection
-  (pool wait, dial, TLS handshake) under the response-header and client RPC
-  deadlines only, and composed the request's authorization lifetime only
-  after the checkout. A credential that expired while the checkout was
-  stalled therefore did not end the request, and because hyper enqueues the
-  request on its connection task synchronously, before any wait on the
-  response is polled, a request whose credential had already expired could
-  be handed to the connection and reach the backend. The plan is now composed
-  before the first checkout and bounds the checkout and its idle-race replay
-  at the same absolute instant, and it is re-checked immediately before the
-  request is enqueued, so an expired request is refused with nothing sent.
-  The expiry is reported as the gateway's own health-neutral authorization
-  decision (the fixed pre-commitment terminal and one `credential_expired` /
-  `authenticated_stream_max_lifetime` count), never as a `504` or a client
-  RPC deadline; an earlier client or operator bound keeps its own terminal,
-  and an exact tie with the response-header read bound is a `504`, as on the
-  reqwest path. The same checkout bound and handoff gate now also cover the
-  Unix-socket HTTP/1.1 pool, the HBONE inner HTTP/1.1 lease (CONNECT and inner
-  handshake), and the direct-H2 sender acquisition. A checkout that is ready
-  on its first poll (a pooled connection or live HTTP/2 sender) never arms a
-  timer. Unauthenticated requests are unchanged. **Still unbounded**, tracked
-  in #5990: sender acquisition and handoff on sidecar mesh-mTLS dispatch
-  (including the Unix-socket h2c carrier), native gRPC dispatch, and possibly
-  the native HTTP/3 backend.
+- **Backend dispatch acquisition, handoff, and response-header waits are held
+  to the admitted request's authorization lifetime** (GHSA-xcg4-wj3x-gjj2,
+  including #5961 and #5990). The composed absolute plan bounds the direct
+  HTTP/1.1 pool, its Unix-socket and HBONE inner-pool variants, direct-H2,
+  sidecar mesh mTLS and its Unix-socket h2c carrier, both native gRPC dispatch
+  shapes and their retries, the H3 cross-protocol gRPC bridge, and native H3
+  backend dispatch. It covers connection or sender acquisition, the final
+  handoff check, and the applicable response-header wait; buffered bridge
+  drains and streamed uploads also retain the same plan. A retry cannot extend
+  the captured instant. Existing attribution keeps the winning authorization,
+  client, or operator bound even when observed late. Authorization expiry is
+  latched and counted once, is never retried, and remains neutral to circuit
+  breakers, passive health, and backend admission. Each protocol keeps its
+  existing pre-commitment terminal; for native gRPC this is HTTP 200 with
+  `grpc-status: 16` (`UNAUTHENTICATED`), while an earlier client deadline or
+  operator read bound keeps its existing terminal. The native H3 pool exposes
+  its wire marker at HEADERS completion; a pending send poll may already have
+  offered partial HEADERS, so the marker does not identify the exact first
+  wire submission. Lifetime errors suppress replay regardless of that marker.
+  An immediately ready sender still takes the timer-free fast path, and an
+  unauthenticated dispatch still avoids the authorization clock read.
+  Unauthenticated requests retain their existing behavior. See
+  [request lifetime dispatch](docs/request_lifetime_dispatch.md).
 
 ### Fixed
+
+- **H1/H2 listener dispatch keeps large child futures out of enclosing poll
+  frames** (#5993). The frontend boxes its concrete handler rather than an
+  async trampoline, and routing/backend dispatch boxes its selected child
+  futures through synchronous out-of-line factories. This adds one frontend
+  allocation per request beyond the existing routing box and one box per
+  backend attempt. Generic HBONE, sidecar mTLS, H3, direct-H2, and direct-H1
+  dispatch also box the selected transport. Polling and cancellation stay in
+  the request's task, preserving affinity scopes and request/body/backend
+  ownership. Ordinary
+  hosted tests cover concrete future-size budgets and real H1/H2 listener
+  traffic on default worker stacks.
 
 - Conditional restore CI now pins the PostgreSQL 16 Alpine, MySQL 8, and
   MongoDB 7 OCI indexes and confines the new fixtures to runner loopback.

@@ -958,6 +958,7 @@ async fn grpc_dispatches_over_sidecar_mesh_mtls_and_relays_status_trailers() {
         false,
         0,
         None,
+        None,
     )
     .await
     .expect("gRPC over the sidecar mesh mTLS transport must succeed");
@@ -1041,6 +1042,7 @@ async fn grpc_over_mesh_mtls_fails_closed_when_the_pinned_peer_does_not_match() 
         false,
         0,
         None,
+        None,
     )
     .await;
 
@@ -1095,6 +1097,7 @@ async fn grpc_dispatches_over_same_cluster_ambient_hbone_and_relays_status_trail
         &proxy_headers,
         false,
         0,
+        None,
         None,
     )
     .await
@@ -1184,6 +1187,7 @@ async fn grpc_over_ambient_hbone_fails_closed_when_the_pinned_peer_does_not_matc
         false,
         0,
         None,
+        None,
     )
     .await;
 
@@ -1237,6 +1241,7 @@ async fn grpc_over_ambient_hbone_bounds_the_nested_h2_handshake_by_connect_timeo
         &proxy_headers,
         false,
         0,
+        None,
         None,
     )
     .await;
@@ -1305,6 +1310,7 @@ async fn grpc_over_ambient_hbone_classifies_a_rejected_inner_handshake_as_h2c() 
         false,
         0,
         None,
+        None,
     )
     .await;
 
@@ -1361,6 +1367,7 @@ async fn grpc_dispatches_over_cross_cluster_ambient_hbone_through_the_east_west_
         &proxy_headers,
         false,
         0,
+        None,
         None,
     )
     .await
@@ -1450,6 +1457,7 @@ async fn grpc_streams_request_data_incrementally_over_ambient_hbone() {
         None,
         &mut held_upload,
         None,
+        None,
     )
     .await
     .expect("bidirectional gRPC over the Ambient HBONE transport must succeed");
@@ -1534,6 +1542,7 @@ async fn grpc_over_ambient_hbone_honors_the_client_deadline() {
         false,
         0,
         Some(deadline),
+        None,
     )
     .await;
 
@@ -1590,6 +1599,7 @@ async fn grpc_over_ambient_hbone_relays_a_non_zero_status_and_custom_trailers() 
         &proxy_headers,
         false,
         0,
+        None,
         None,
     )
     .await
