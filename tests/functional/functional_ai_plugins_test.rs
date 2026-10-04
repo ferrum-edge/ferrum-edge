@@ -737,15 +737,16 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             .arg("+ping")
             .arg("+info")
             .arg("+set")
+            .arg("+expire")
+            .arg("+multi")
+            .arg("+exec")
             .arg("+exists")
             .arg("+strlen")
-            .arg("+getrange")
-            .arg("+del");
+            .arg("+getrange");
         if denied != "released" {
             acl.arg("+watch")
                 .arg("+unwatch")
-                .arg("+multi")
-                .arg("+exec")
+                .arg("+del")
                 .arg(format!("-{}", denied.to_ascii_lowercase()));
         }
         let _: () = acl.query_async(&mut admin).await.unwrap();
@@ -758,6 +759,16 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             .unwrap()
             .unwrap();
         let acl_compare = RedisRateLimitClient::new(client_config, None, false, None).unwrap();
+        if denied == "released" {
+            acl_compare
+                .set_bytes_with_expire(&key, b"released-profile-store", 60)
+                .await
+                .expect("released semantic ACL must allow the atomic store profile");
+            assert!(matches!(
+                acl_compare.get_bytes_bounded(&key, READ_CAP).await,
+                Ok(BoundedRedisValue::Found(value)) if value == b"released-profile-store"
+            ));
+        }
         redis
             .set_bytes_with_expire(&key, MALFORMED, 60)
             .await
