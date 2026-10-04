@@ -1369,7 +1369,7 @@ async fn native_h3_candidate_failure_captures_transport_winner_before_pool_publi
     use ferrum_edge::_test_support::error_class_is_health_neutral_for_test;
     use ferrum_edge::config::EnvConfig;
     use ferrum_edge::dns::{CandidateConnectError, DnsCache, DnsConfig, connect_candidates};
-    use ferrum_edge::http3::client::{Http3ConnectionPool, classify_http3_error};
+    use ferrum_edge::http3::client::{Http3ConnectionPool, h3_connection_checkout_metadata_for_test};
     use std::io::ErrorKind;
     use std::sync::OnceLock;
 
@@ -1394,10 +1394,7 @@ async fn native_h3_candidate_failure_captures_transport_winner_before_pool_publi
             .resolve_candidates("127.0.0.1", None, None)
             .await
             .unwrap();
-        let pool = Http3ConnectionPool::new(
-            Arc::new(EnvConfig::default()),
-            dns,
-        );
+        let pool = Http3ConnectionPool::new(Arc::new(EnvConfig::default()), dns);
         let idle_state = pool.creation_state_for_test();
         assert_eq!(idle_state.0, 0);
         let started = tokio::time::Instant::now();
@@ -1489,14 +1486,11 @@ async fn native_h3_candidate_failure_captures_transport_winner_before_pool_publi
             let expected_client = client_ms < auth_ms && client_ms <= failure_ms;
             let termination = expected_auth.then_some(StreamAuthTermination::CredentialExpired);
             let lifetime_wins = expected_auth || expected_client;
-            let class = if error.lifetime_expired() {
-                ErrorClass::ClientDisconnect
-            } else {
-                classify_http3_error(error.as_ref())
-            };
-            assert_eq!(error.authorization_expiry(), termination);
-            assert_eq!(error.client_deadline_expired(), expected_client);
-            assert!(!error.request_on_wire());
+            let (authorization_expiry, on_wire, client_expired, class) =
+                h3_connection_checkout_metadata_for_test(error);
+            assert_eq!(authorization_expiry, termination);
+            assert_eq!(client_expired, expected_client);
+            assert!(!on_wire);
             assert_eq!(
                 class,
                 if lifetime_wins {
@@ -1515,7 +1509,8 @@ async fn native_h3_candidate_failure_captures_transport_winner_before_pool_publi
                 assert_eq!(error.to_string(), message);
             }
         }
-        if !creator_error.lifetime_expired() {
+        let creator_metadata = h3_connection_checkout_metadata_for_test(&creator_error);
+        if creator_metadata.0.is_none() && !creator_metadata.2 {
             let mut source: Option<&(dyn std::error::Error + 'static)> =
                 Some(creator_error.as_ref());
             let mut typed_kind = None;
@@ -1547,7 +1542,9 @@ async fn native_h3_cancelled_creation_releases_resources_and_waiter_elects_indep
     use ferrum_edge::_test_support::error_class_is_health_neutral_for_test;
     use ferrum_edge::config::EnvConfig;
     use ferrum_edge::dns::{DnsCache, DnsConfig};
-    use ferrum_edge::http3::client::{Http3ConnectionPool, classify_http3_error};
+    use ferrum_edge::http3::client::{
+        Http3ConnectionPool, classify_http3_error, h3_connection_checkout_metadata_for_test,
+    };
     use std::sync::OnceLock;
 
     for expire_creator in [false, true] {
@@ -1586,11 +1583,8 @@ async fn native_h3_cancelled_creation_releases_resources_and_waiter_elects_indep
                 waiter_connect_at
                     .set(started + Duration::from_millis(60))
                     .unwrap();
-                std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    "fresh waiter dial",
-                )
-                .into()
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "fresh waiter dial")
+                    .into()
             },
         ));
         let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
@@ -1604,9 +1598,14 @@ async fn native_h3_cancelled_creation_releases_resources_and_waiter_elects_indep
             tokio::time::advance(Duration::from_millis(20)).await;
             let error = creator.await.unwrap_err();
             let termination = StreamAuthTermination::CredentialExpired;
-            assert_eq!(error.authorization_expiry(), Some(termination));
+            assert_eq!(
+                h3_connection_checkout_metadata_for_test(&error),
+                (Some(termination), false, false, ErrorClass::ClientDisconnect)
+            );
             assert!(!error.request_on_wire());
-            assert!(error_class_is_health_neutral_for_test(ErrorClass::ClientDisconnect));
+            assert!(error_class_is_health_neutral_for_test(
+                ErrorClass::ClientDisconnect
+            ));
             assert!(!creator_plan.2.record_once(termination, creator_plan.1));
         } else {
             drop(creator);
@@ -1616,7 +1615,10 @@ async fn native_h3_cancelled_creation_releases_resources_and_waiter_elects_indep
         assert_eq!(pool.creation_state_for_test(), idle_state);
 
         let error = waiter.await.unwrap_err();
-        assert!(!error.lifetime_expired());
+        assert_eq!(
+            h3_connection_checkout_metadata_for_test(&error),
+            (None, false, false, ErrorClass::ConnectionRefused)
+        );
         assert!(!error.request_on_wire());
         assert_eq!(
             classify_http3_error(error.as_ref()),

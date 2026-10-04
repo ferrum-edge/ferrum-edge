@@ -1527,6 +1527,15 @@ where
 }
 
 fn h3_connection_checkout_error_for_test(error: H3PoolError) -> H3ConnectionCheckoutErrorForTest {
+    h3_connection_checkout_metadata_for_test(&error)
+}
+
+/// Borrow checkout metadata without consuming the typed error or its source chain.
+/// Returns authorization expiry, wire commitment, client expiry, and the verified error class.
+#[doc(hidden)]
+pub fn h3_connection_checkout_metadata_for_test(
+    error: &H3PoolError,
+) -> H3ConnectionCheckoutErrorForTest {
     (
         error.authorization_expiry(),
         error.request_on_wire(),
@@ -2230,18 +2239,12 @@ impl Http3ConnectionPool {
     where
         F: std::future::Future<Output = anyhow::Error>,
     {
-        self.await_coalesced_connection_error_for_test(
-            key,
-            client_at,
-            plan,
-            connect_at,
-            failure,
-        )
-        .await
-        .map_err(|error| {
-            let message = error.to_string();
-            (h3_connection_checkout_error_for_test(error), message)
-        })
+        self.await_coalesced_connection_error_for_test(key, client_at, plan, connect_at, failure)
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                (h3_connection_checkout_error_for_test(error), message)
+            })
     }
 
     /// The same production pool/adapter path, retaining the creator's typed
