@@ -1349,6 +1349,82 @@ where
     }
 }
 
+/// Cold H3 checkout gives the admitted lifetime precedence over an equal
+/// operator connect deadline. The response-header composer keeps its existing
+/// operator-first ties for the other protocol paths.
+fn compose_h3_connection_checkout_bound(
+    connect_at: Option<tokio::time::Instant>,
+    dispatch: crate::proxy::DispatchPhaseBound,
+) -> crate::proxy::BackendHandoffBound {
+    let lifetime = crate::proxy::compose_backend_handoff_bound(None, dispatch);
+    match connect_at {
+        Some(connect) if lifetime.at.is_none_or(|at| connect < at) => {
+            crate::proxy::BackendHandoffBound {
+                at: Some(connect),
+                source: crate::proxy::BackendHandoffBoundSource::ResponseHeader,
+            }
+        }
+        _ => lifetime,
+    }
+}
+
+/// The creator keeps its typed source; waiters receive the pool's cloneable
+/// class, context, and transport timing. Neither shape carries request auth.
+#[derive(Debug)]
+struct H3ConnectionCreateError {
+    inner: anyhow::Error,
+    shared: crate::pool::SharedPoolCreateError,
+}
+
+impl H3ConnectionCreateError {
+    fn capture(
+        inner: anyhow::Error,
+        connect_at: Option<&OnceLock<tokio::time::Instant>>,
+    ) -> Self {
+        let occurred_at = tokio::time::Instant::now();
+        let shared = crate::pool::SharedPoolCreateError::capture(inner.as_ref());
+        let deadline_at = if shared.error_class() == crate::retry::ErrorClass::ConnectionTimeout {
+            connect_at.and_then(|at| at.get().copied())
+        } else {
+            None
+        };
+        Self {
+            inner,
+            shared: shared.with_failure_timing(crate::pool::PoolCreateFailureTiming {
+                occurred_at,
+                deadline_at,
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for H3ConnectionCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl std::error::Error for H3ConnectionCreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.inner.as_ref())
+    }
+}
+
+impl crate::pool::ShareablePoolCreateError for H3ConnectionCreateError {
+    fn to_shared(&self) -> crate::pool::SharedPoolCreateError {
+        self.shared.clone()
+    }
+}
+
+impl From<crate::pool::SharedPoolCreateError> for H3ConnectionCreateError {
+    fn from(shared: crate::pool::SharedPoolCreateError) -> Self {
+        Self {
+            inner: anyhow::Error::new(shared.clone()),
+            shared,
+        }
+    }
+}
+
 /// The cold-connect deadline starts after DNS, at the candidate dial, and
 /// includes QUIC/TLS and H3 readiness. The creator publishes that instant before
 /// polling the dial. A late checkout wake must keep this earlier winner rather
@@ -1365,7 +1441,28 @@ where
     let dispatch = auth.compose(None);
     let initial = crate::proxy::compose_backend_handoff_bound(None, dispatch);
     let result = crate::proxy::await_backend_handoff_bound(initial, checkout).await;
-    let bound = crate::proxy::compose_backend_handoff_bound(connect_at.get().copied(), dispatch);
+    if let Ok(Err(error)) = &result
+        && let Some(create_error) = error.downcast_ref::<H3ConnectionCreateError>()
+        && let Some(timing) = create_error.shared.failure_timing()
+    {
+        // A timeout keeps the operator instant that selected it, even when
+        // the creator ran late. Other failures keep their captured occurrence.
+        // Compare these facts with THIS caller's admitted lifetime, never with
+        // the creator's plan or the waiter's wake clock. Lifetime wins ties.
+        let failure_at = timing
+            .deadline_at
+            .map_or(timing.occurred_at, |at| at.min(timing.occurred_at));
+        if dispatch.at.is_some_and(|at| at <= failure_at) {
+            return Err(h3_authorization_error(dispatch, auth, false));
+        }
+        // Preserve the original typed/source error and shared context rather
+        // than manufacturing a timeout from the waiter's own destination.
+        return match result {
+            Ok(result) => result.map_err(H3PoolError::pre_wire),
+            Err(_) => Err(h3_authorization_error(dispatch, auth, false)),
+        };
+    }
+    let bound = compose_h3_connection_checkout_bound(connect_at.get().copied(), dispatch);
     // Only the creator has a connect instant. Pool waiters keep their own
     // admitted lifetime; they do not inherit another request's authorization.
     if (connect_at.get().is_some() || !matches!(&result, Ok(Ok(_))))
@@ -1417,18 +1514,20 @@ where
         },
     )
     .await
-    .map_err(|error| {
-        (
-            error.authorization_expiry(),
-            error.request_on_wire(),
-            error.client_deadline_expired(),
-            if error.lifetime_expired() {
-                crate::retry::ErrorClass::ClientDisconnect
-            } else {
-                classify_http3_error(error.as_ref())
-            },
-        )
-    })
+    .map_err(h3_connection_checkout_error_for_test)
+}
+
+fn h3_connection_checkout_error_for_test(error: H3PoolError) -> H3ConnectionCheckoutErrorForTest {
+    (
+        error.authorization_expiry(),
+        error.request_on_wire(),
+        error.client_deadline_expired(),
+        if error.lifetime_expired() {
+            crate::retry::ErrorClass::ClientDisconnect
+        } else {
+            classify_http3_error(error.as_ref())
+        },
+    )
 }
 
 /// Check before EVERY poll, including the poll that opens a QUIC stream or
@@ -2087,6 +2186,62 @@ impl Http3ConnectionPool {
         0..conns_per_backend
     }
 
+    /// Use one typed failure adapter for both H3 creation paths so the pool
+    /// publishes transport facts before notifying any coalesced waiter.
+    async fn create_or_get_sender<F>(
+        &self,
+        key: String,
+        connect_at: Option<&OnceLock<tokio::time::Instant>>,
+        create: F,
+    ) -> Result<H3PooledConnection, anyhow::Error>
+    where
+        F: std::future::Future<Output = Result<H3PooledConnection, anyhow::Error>>,
+    {
+        self.pool
+            .create_or_get_existing_owned(key, |_| async move {
+                create
+                    .await
+                    .map_err(|error| H3ConnectionCreateError::capture(error, connect_at))
+            })
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Controlled creation failure through the actual H3 pool, shared-error
+    /// publication, coalescing, and cold-checkout lifetime arbitration.
+    #[doc(hidden)]
+    pub async fn await_coalesced_connection_failure_for_test<F>(
+        &self,
+        key: String,
+        client_at: Option<tokio::time::Instant>,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        connect_at: &OnceLock<tokio::time::Instant>,
+        failure: F,
+    ) -> Result<(), (H3ConnectionCheckoutErrorForTest, String)>
+    where
+        F: std::future::Future<Output = anyhow::Error>,
+    {
+        let create = self.create_or_get_sender(key, Some(connect_at), async { Err(failure.await) });
+        await_h3_connection_checkout(
+            H3Authorization::new(client_at, plan),
+            connect_at,
+            create,
+            || {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "captured cold connect timeout",
+                )
+                .into()
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            let message = error.to_string();
+            (h3_connection_checkout_error_for_test(error), message)
+        })
+    }
+
     async fn create_or_get_proxy_sender(
         &self,
         key: String,
@@ -2110,16 +2265,11 @@ impl Http3ConnectionPool {
     ) -> Result<H3PooledConnection, anyhow::Error> {
         // H3 is the one pool that needs extra creation context beyond the
         // `Proxy`, so it uses the shared shell's explicit creation closure.
-        self.pool
-            .create_or_get_existing_owned(key, |_| {
-                let tls_config = tls_config.clone();
-                let h3_config = h3_config.clone();
-                async move {
-                    self.create_connection(proxy, &tls_config, Some(&h3_config), connect_at)
-                        .await
-                }
-            })
-            .await
+        self.create_or_get_sender(key, connect_at, async {
+            self.create_connection(proxy, &tls_config, Some(&h3_config), connect_at)
+                .await
+        })
+        .await
     }
 
     /// `policy_port` is the DestinationRule policy port for this dispatch; see
@@ -2150,24 +2300,19 @@ impl Http3ConnectionPool {
         h3_config: super::config::Http3ServerConfig,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
-        self.pool
-            .create_or_get_existing_owned(key, |_| {
-                let tls_config = tls_config.clone();
-                let h3_config = h3_config.clone();
-                async move {
-                    self.create_connection_to_target(
-                        proxy,
-                        target.host,
-                        target.port,
-                        target.policy_port,
-                        &tls_config,
-                        Some(&h3_config),
-                        connect_at,
-                    )
-                    .await
-                }
-            })
+        self.create_or_get_sender(key, connect_at, async {
+            self.create_connection_to_target(
+                proxy,
+                target.host,
+                target.port,
+                target.policy_port,
+                &tls_config,
+                Some(&h3_config),
+                connect_at,
+            )
             .await
+        })
+        .await
     }
 
     /// Recover from a create the destination's `maxConnections` ceiling refused

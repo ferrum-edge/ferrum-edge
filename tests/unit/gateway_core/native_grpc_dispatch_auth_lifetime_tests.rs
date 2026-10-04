@@ -1098,6 +1098,7 @@ fn every_plain_h3_frontend_pool_route_carries_the_captured_plan() {
 /// post-DNS connect instant. No repoll occurs until every deadline has elapsed.
 #[tokio::test(start_paused = true)]
 async fn native_h3_cold_checkout_retains_earliest_connect_client_or_authorization_winner() {
+    use ferrum_edge::_test_support::error_class_is_health_neutral_for_test;
     use ferrum_edge::http3::client::await_h3_connection_checkout_for_test;
     use std::sync::OnceLock;
 
@@ -1108,6 +1109,8 @@ async fn native_h3_cold_checkout_retains_earliest_connect_client_or_authorizatio
         (80, 100, 40, true, false),
         (40, 100, 40, true, false),
         (40, 40, 100, false, true),
+        (80, 40, 40, true, false),
+        (40, 40, 40, true, false),
     ] {
         let started = tokio::time::Instant::now();
         let plan = plan_after(Duration::from_millis(auth_ms));
@@ -1155,7 +1158,251 @@ async fn native_h3_cold_checkout_retains_earliest_connect_client_or_authorizatio
             }
         );
         assert_eq!(plan.2.observed(), termination);
+        assert_eq!(
+            error_class_is_health_neutral_for_test(class),
+            expected_auth || expected_client
+        );
     }
+}
+
+/// The production H3 pool publishes one typed failure, then the coalesced
+/// waiter remains unpolled until all of its own deadlines have elapsed.
+#[tokio::test(start_paused = true)]
+async fn native_h3_coalesced_creation_late_wake_keeps_shared_failure_and_own_lifetime() {
+    use ferrum_edge::_test_support::error_class_is_health_neutral_for_test;
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::http3::client::Http3ConnectionPool;
+    use std::io::ErrorKind::{ConnectionRefused, TimedOut};
+    use std::sync::OnceLock;
+
+    for (connect_ms, publish_ms, client_ms, auth_ms, kind, expected_auth, expected_client) in [
+        (40, 40, 100, 80, TimedOut, false, false),
+        (40, 40, 80, 100, TimedOut, false, false),
+        (40, 40, 100, 40, TimedOut, true, false),
+        (40, 40, 40, 100, TimedOut, false, true),
+        (40, 40, 40, 40, TimedOut, true, false),
+        (40, 40, 100, 30, TimedOut, true, false),
+        (40, 40, 30, 100, TimedOut, false, true),
+        (20, 40, 100, 30, TimedOut, false, false),
+        (80, 20, 100, 40, ConnectionRefused, false, false),
+        (80, 40, 100, 30, ConnectionRefused, true, false),
+    ] {
+        let pool = Http3ConnectionPool::new(
+            Arc::new(EnvConfig::default()),
+            DnsCache::new(DnsConfig::default()),
+        );
+        let started = tokio::time::Instant::now();
+        let creator_plan = plan_after(Duration::from_millis(200));
+        let waiter_plan = plan_after(Duration::from_millis(auth_ms));
+        let creator_connect_at = OnceLock::new();
+        let waiter_connect_at = OnceLock::new();
+        let ready = AtomicBool::new(false);
+        let creator_polls = AtomicUsize::new(0);
+        let waiter_creates = AtomicUsize::new(0);
+        // The typed io class must survive the misleading TLS text as well as
+        // the pool fan-out; the waiter must not manufacture its own context.
+        let message = "creator TLS handshake failure before HEADERS";
+        let failure = std::future::poll_fn(|_| {
+            creator_polls.fetch_add(1, Ordering::Relaxed);
+            let _ = creator_connect_at.set(started + Duration::from_millis(connect_ms));
+            if ready.load(Ordering::Relaxed) {
+                Poll::Ready(std::io::Error::new(kind, message).into())
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut creator = Box::pin(pool.await_coalesced_connection_failure_for_test(
+            "coalesced-cold-checkout".to_string(),
+            None,
+            Some(&creator_plan),
+            &creator_connect_at,
+            failure,
+        ));
+        let mut waiter = Box::pin(pool.await_coalesced_connection_failure_for_test(
+            "coalesced-cold-checkout".to_string(),
+            Some(started + Duration::from_millis(client_ms)),
+            Some(&waiter_plan),
+            &waiter_connect_at,
+            async {
+                waiter_creates.fetch_add(1, Ordering::Relaxed);
+                anyhow::anyhow!("coalesced waiter must not create another connection")
+            },
+        ));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(creator.as_mut().poll(&mut cx).is_pending());
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(creator_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(waiter_creates.load(Ordering::Relaxed), 0);
+
+        tokio::time::advance(Duration::from_millis(publish_ms)).await;
+        ready.store(true, Ordering::Relaxed);
+        let (creator_error, creator_message) = creator.await.unwrap_err();
+        let transport_class = match kind {
+            TimedOut => ErrorClass::ConnectionTimeout,
+            _ => ErrorClass::ConnectionRefused,
+        };
+        assert_eq!(creator_error, (None, false, false, transport_class));
+        assert_eq!(creator_message, message);
+        assert_eq!(creator_plan.2.observed(), None);
+        assert_eq!(creator_polls.load(Ordering::Relaxed), 2);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (waiter_error, waiter_message) = waiter.await.unwrap_err();
+        let termination = expected_auth.then_some(StreamAuthTermination::CredentialExpired);
+        let lifetime_wins = expected_auth || expected_client;
+        assert_eq!(
+            waiter_error,
+            (
+                termination,
+                false,
+                expected_client,
+                if lifetime_wins {
+                    ErrorClass::ClientDisconnect
+                } else {
+                    transport_class
+                },
+            )
+        );
+        if !lifetime_wins {
+            assert_eq!(waiter_message, message);
+        }
+        assert_eq!(waiter_plan.2.observed(), termination);
+        if let Some(termination) = termination {
+            let recorded_again = waiter_plan.2.record_once(termination, waiter_plan.1);
+            assert!(!recorded_again);
+        }
+        assert_eq!(
+            error_class_is_health_neutral_for_test(waiter_error.3),
+            lifetime_wins
+        );
+        assert!(waiter_connect_at.get().is_none());
+        assert_eq!(waiter_creates.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.pool_size(), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_h3_coalesced_waiter_does_not_inherit_creator_authorization_terminal() {
+    use ferrum_edge::_test_support::error_class_is_health_neutral_for_test;
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::http3::client::Http3ConnectionPool;
+    use std::sync::OnceLock;
+
+    let pool = Http3ConnectionPool::new(
+        Arc::new(EnvConfig::default()),
+        DnsCache::new(DnsConfig::default()),
+    );
+    let started = tokio::time::Instant::now();
+    let creator_plan = plan_after(Duration::from_millis(20));
+    let waiter_plan = plan_after(Duration::from_millis(80));
+    let creator_connect_at = OnceLock::new();
+    let waiter_connect_at = OnceLock::new();
+    let ready = AtomicBool::new(false);
+    let waiter_creates = AtomicUsize::new(0);
+    let message = "creator transport connect timeout";
+    let failure = std::future::poll_fn(|_| {
+        let _ = creator_connect_at.set(started + Duration::from_millis(40));
+        if ready.load(Ordering::Relaxed) {
+            Poll::Ready(std::io::Error::new(std::io::ErrorKind::TimedOut, message).into())
+        } else {
+            Poll::Pending
+        }
+    });
+    let mut creator = Box::pin(pool.await_coalesced_connection_failure_for_test(
+        "creator-auth-isolation".to_string(),
+        None,
+        Some(&creator_plan),
+        &creator_connect_at,
+        failure,
+    ));
+    let mut waiter = Box::pin(pool.await_coalesced_connection_failure_for_test(
+        "creator-auth-isolation".to_string(),
+        None,
+        Some(&waiter_plan),
+        &waiter_connect_at,
+        async {
+            waiter_creates.fetch_add(1, Ordering::Relaxed);
+            anyhow::anyhow!("waiter must consume the shared transport failure")
+        },
+    ));
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(creator.as_mut().poll(&mut cx).is_pending());
+    assert!(waiter.as_mut().poll(&mut cx).is_pending());
+
+    tokio::time::advance(Duration::from_millis(40)).await;
+    ready.store(true, Ordering::Relaxed);
+    let (creator_error, _) = creator.await.unwrap_err();
+    assert_eq!(
+        creator_error,
+        (
+            Some(StreamAuthTermination::CredentialExpired),
+            false,
+            false,
+            ErrorClass::ClientDisconnect,
+        )
+    );
+    assert!(error_class_is_health_neutral_for_test(creator_error.3));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let (waiter_error, waiter_message) = waiter.await.unwrap_err();
+    assert_eq!(
+        waiter_error,
+        (None, false, false, ErrorClass::ConnectionTimeout)
+    );
+    assert_eq!(waiter_message, message);
+    assert_eq!(waiter_plan.2.observed(), None);
+    assert!(waiter_connect_at.get().is_none());
+    assert_eq!(waiter_creates.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        creator_plan.2.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_h3_cold_checkout_success_after_expiry_cannot_handoff_headers() {
+    use ferrum_edge::_test_support::await_native_h3_dispatch_for_test;
+    use ferrum_edge::http3::client::await_h3_connection_checkout_for_test;
+    use std::sync::OnceLock;
+
+    let plan = plan_after(Duration::from_millis(50));
+    let connect_at = OnceLock::new();
+    let ready = AtomicBool::new(false);
+    let checkout = std::future::poll_fn(|_| {
+        if ready.load(Ordering::Relaxed) {
+            Poll::Ready(Ok::<(), anyhow::Error>(()))
+        } else {
+            Poll::Pending
+        }
+    });
+    let mut wait = Box::pin(await_h3_connection_checkout_for_test(
+        None,
+        Some(&plan),
+        &connect_at,
+        checkout,
+    ));
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    tokio::time::advance(Duration::from_millis(100)).await;
+    ready.store(true, Ordering::Relaxed);
+    wait.await.unwrap();
+
+    let backend_headers = AtomicUsize::new(0);
+    let send = std::future::poll_fn(|_| {
+        backend_headers.fetch_add(1, Ordering::Relaxed);
+        Poll::Ready(Ok::<(), ferrum_edge::http3::client::H3PoolError>(()))
+    });
+    assert_eq!(
+        await_native_h3_dispatch_for_test(None, Some(&plan), false, send).await,
+        Err((Some(StreamAuthTermination::CredentialExpired), false, false))
+    );
+    assert_eq!(backend_headers.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        plan.2.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
 }
 
 #[tokio::test(start_paused = true)]
