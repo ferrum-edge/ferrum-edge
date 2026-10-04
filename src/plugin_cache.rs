@@ -1038,6 +1038,49 @@ pub(crate) fn validate_correlation_id_composition(
 
 #[async_trait]
 impl Plugin for PluginInstanceWrapper {
+    fn early_route_total_participant(&self) -> bool {
+        self.inner.early_route_total_participant()
+    }
+
+    fn may_publish_route_authorization(&self) -> bool {
+        self.inner.may_publish_route_authorization()
+    }
+
+    fn route_authorization_may_be_pending(
+        &self,
+        ctx: &RequestContext,
+        identity_ready: bool,
+    ) -> bool {
+        if let Some(gate) = &self.trigger {
+            match gate.early_route_decision(ctx, identity_ready) {
+                Some(false) => return false,
+                None => return true,
+                Some(true) => {}
+            }
+        }
+        self.inner
+            .route_authorization_may_be_pending(ctx, identity_ready)
+    }
+
+    fn early_route_total<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        headers: &HashMap<String, String>,
+        host: Option<&'a str>,
+        query: Option<&crate::plugins::utils::query::CanonicalQuery>,
+        facts: crate::plugins::early_route_total::EarlyRouteTotalFacts,
+    ) -> crate::plugins::early_route_total::EarlyRouteTotalStep<'a> {
+        use crate::plugins::early_route_total::EarlyRouteTotalStep;
+        if let Some(gate) = &self.trigger {
+            match gate.early_route_decision(ctx, facts.identity_ready) {
+                Some(false) => return EarlyRouteTotalStep::NoMatch,
+                None => return EarlyRouteTotalStep::Unresolved,
+                Some(true) => {}
+            }
+        }
+        self.inner.early_route_total(ctx, headers, host, query, facts)
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -4876,6 +4919,8 @@ pub struct PluginPhaseData {
     pub conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Reload-compiled pure route selection and dependency topology.
+    early_route_total_plan: Arc<crate::plugins::early_route_total::EarlyRouteTotalPlan>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
     /// Content-derived digest of the effective static response-side
@@ -5083,6 +5128,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
             conditional_unbounded_trailer_policy_plugins,
         ),
         response_committed_plugins: Arc::new(response_committed),
+        early_route_total_plan: Arc::new(
+            crate::plugins::early_route_total::EarlyRouteTotalPlan::compile(plugins),
+        ),
         capabilities: PluginCapabilities(caps),
         response_presentation_policy_digest: (!presentation_policy_unprovable)
             .then(|| presentation_policy_digest(presentation_policy_contributions)),
@@ -5980,6 +6028,7 @@ impl PluginCacheInner {
             ),
             response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
             response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
+            early_route_total_plan: Arc::clone(&entry.phase.early_route_total_plan),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
@@ -6008,6 +6057,7 @@ impl PluginCacheInner {
             conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
             response_committed_plugins: Arc::new(Vec::new()),
             response_presentation_policy_digest: None,
+            early_route_total_plan: Arc::default(),
             capabilities: PluginCapabilities::default(),
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
@@ -6058,6 +6108,7 @@ pub struct PluginCacheRequestView {
     conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_presentation_policy_digest: Option<[u8; 32]>,
+    early_route_total_plan: Arc<crate::plugins::early_route_total::EarlyRouteTotalPlan>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -6068,6 +6119,21 @@ pub struct PluginCacheRequestView {
 }
 
 impl PluginCacheRequestView {
+    pub(crate) fn early_route_total_selection(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        identity_ready: bool,
+        authorization_ready: bool,
+    ) -> crate::plugins::early_route_total::EarlyRouteTotalSelection {
+        self.early_route_total_plan.select(
+            ctx,
+            headers,
+            identity_ready,
+            authorization_ready,
+        )
+    }
+
     /// Strictest active client-facing request-body ceiling for this
     /// proxy/protocol pair, or `None` when no matched plugin enforces one.
     ///

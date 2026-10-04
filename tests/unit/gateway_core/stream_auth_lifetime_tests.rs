@@ -2224,10 +2224,10 @@ fn the_authorized_buffered_collect_composes_its_protocol_bound_exactly_once() {
 }
 
 #[test]
-fn the_pre_authentication_prebuffer_stays_on_the_unbounded_collect() {
-    // `buffer_request_body_for_before_proxy` runs BEFORE any principal is
-    // admitted, so there is no authorization lifetime to enforce there and no
-    // credential deadline to read. Widening it would be a false bound.
+fn pre_authentication_prebuffer_uses_a_private_witness_without_inventing_authorization() {
+    // #6008 adds a pure route/read/RPC witness to early collectors. It does
+    // not publish an identity or route override, invoke before_proxy early,
+    // or invent an authorization lifetime before a principal is admitted.
     // Bounded by the function that FOLLOWS it. `request_may_have_body` is
     // declared ahead of the prebuffer, so splitting on it left this pin reading
     // the whole rest of the module and asserting nothing about the prebuffer.
@@ -2240,9 +2240,18 @@ fn the_pre_authentication_prebuffer_stays_on_the_unbounded_collect() {
         .expect("bounded prebuffer body");
     assert!(
         prebuffer.contains("collect_request_body_with_deadline("),
-        "the prebuffer must still be the unbounded, deadline-only collect"
+        "the untimed fallback must preserve its existing protocol/read collect"
     );
+    assert!(prebuffer.contains("Some(bound) => bound"));
+    assert!(prebuffer.contains(".collect(limited.collect())"));
     assert!(!prebuffer.contains("collect_request_body_under_authorization"));
+    assert!(!prebuffer.contains("arm_route_request_deadline("));
+    assert!(!prebuffer.contains("plugin.before_proxy("));
+    assert_eq!(
+        PROXY_SOURCE.matches("early_upload::EarlyCollectorWitness::select(").count(),
+        3,
+        "all H1/H2 early phases use the same pure witness"
+    );
 }
 
 #[test]

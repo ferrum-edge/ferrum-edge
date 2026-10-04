@@ -202,26 +202,39 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     );
     assert_eq!(
         mesh_collection.matches("cb_probe.release_neutral(").count(),
-        3,
+        5,
         "mesh upload collection must release the HALF_OPEN probe on each terminal reject branch"
     );
 
-    let oversize = mesh_collection
-        .split("Ok(None)")
+    let capacity = mesh_collection
+        .split("Ok(RetainedH3Body::CapacityExceeded)")
         .nth(1)
-        .expect("missing mesh collection branch: Ok(None)")
+        .expect("missing retained capacity refusal")
+        .split("Ok(RetainedH3Body::TooLarge)")
+        .next()
+        .expect("bounded retained capacity refusal");
+    assert!(
+        capacity.find("cb_probe.release_neutral()").unwrap()
+            < capacity.find("write_retained_request_capacity_terminal(").unwrap(),
+        "capacity refusal must release the probe before its bounded terminal write"
+    );
+
+    let oversize = mesh_collection
+        .split("Ok(RetainedH3Body::TooLarge)")
+        .nth(1)
+        .expect("missing mesh collection branch: Ok(RetainedH3Body::TooLarge)")
         .split("H3RequestBodyReadError::DeadlineExceeded")
         .next()
-        .expect("bounded mesh collection Ok(None) branch");
+        .expect("bounded mesh collection Ok(RetainedH3Body::TooLarge) branch");
     let oversize_release = oversize
         .find("cb_probe.release_neutral()")
-        .expect("Ok(None) must release HALF_OPEN probe");
+        .expect("Ok(RetainedH3Body::TooLarge) must release HALF_OPEN probe");
     let oversize_write = oversize
         .find("write_plain_gateway_error(")
-        .expect("Ok(None) must write plain gateway error");
+        .expect("Ok(RetainedH3Body::TooLarge) must write plain gateway error");
     assert!(
         oversize_release < oversize_write,
-        "Ok(None) must release probe before terminal write"
+        "Ok(RetainedH3Body::TooLarge) must release probe before terminal write"
     );
 
     // Bind the exact force-buffer DeadlineExceeded arm, including the typed
@@ -476,15 +489,15 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .expect("H3 terminal provider dispatch must remain bounded");
     assert!(terminal_dispatch.contains("collect_h3_request_body_under_authorization("));
     assert!(terminal_dispatch.contains("drain_h3_request_body("));
-    // Ok(None): idle recv after a completed oversize drain — the flavor-aware
+    // TooLarge: idle recv after a completed oversize drain — the flavor-aware
     // writer already halts after HEADERS; do not duplicate STOP_SENDING.
     // Read: client gone — halt, finalize cleanup, no response write.
     // TimedOut: mid-recv_data cancel — write under post-deadline grace with
     // halt_recv=false, then let the wrapper halt through the vendored transport.
     let oversize = terminal_dispatch
-        .split("Ok(None)")
+        .split("Ok(RetainedH3Body::TooLarge)")
         .nth(1)
-        .expect("missing terminal upload branch: Ok(None)")
+        .expect("missing terminal upload branch: Ok(RetainedH3Body::TooLarge)")
         .split("H3RequestBodyReadError::Read(error)")
         .next()
         .expect("bounded terminal upload branch");

@@ -11297,6 +11297,156 @@ pub mod _test_support {
         }
     }
 
+    /// Pinned, compiled effective route chain; reload never changes this probe.
+    pub struct EarlyRouteTotalPlanForTest(crate::plugins::early_route_total::EarlyRouteTotalPlan);
+
+    impl EarlyRouteTotalPlanForTest {
+        pub fn new(plugins: &[Arc<dyn crate::plugins::Plugin>]) -> Self {
+            let plan = crate::plugins::early_route_total::EarlyRouteTotalPlan::compile(plugins);
+            Self(plan)
+        }
+
+        pub fn selection(
+            &self,
+            ctx: &crate::plugins::RequestContext,
+            headers: &HashMap<String, String>,
+            identity_ready: bool,
+        ) -> (&'static str, Option<u64>) {
+            self.selection_at_boundary(
+                ctx,
+                headers,
+                identity_ready,
+                identity_ready,
+            )
+        }
+
+        pub fn selection_at_boundary(
+            &self,
+            ctx: &crate::plugins::RequestContext,
+            headers: &HashMap<String, String>,
+            identity_ready: bool,
+            authorization_ready: bool,
+        ) -> (&'static str, Option<u64>) {
+            use crate::plugins::early_route_total::EarlyRouteTotalSelection as Selection;
+            match self.0.select(
+                ctx,
+                headers,
+                identity_ready,
+                authorization_ready,
+            ) {
+                Selection::NoMatch => ("no_match", None),
+                Selection::Untimed => ("untimed", None),
+                Selection::Timed(ms) => ("timed", Some(ms)),
+                Selection::Terminal => ("terminal", None),
+                Selection::Unresolved => ("unresolved", None),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct CapturedRouteUploadBoundForTest(crate::proxy::early_upload::CapturedUploadBound);
+
+    fn upload_owner_label(expiry: crate::proxy::early_upload::UploadExpiry) -> &'static str {
+        use crate::proxy::early_upload::UploadExpiry;
+        match expiry {
+            UploadExpiry::Read => "read",
+            UploadExpiry::Rpc => "rpc",
+            UploadExpiry::Route => "route",
+            UploadExpiry::Authorization(_) => "authorization",
+            UploadExpiry::Unresolved => "unresolved",
+        }
+    }
+
+    pub fn capture_early_route_upload_bound_for_test(
+        view: &crate::plugin_cache::PluginCacheRequestView,
+        ctx: &crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        identity_ready: bool,
+        read_ms: u64,
+    ) -> Result<CapturedRouteUploadBoundForTest, &'static str> {
+        crate::proxy::early_upload::EarlyCollectorWitness::select(
+            view,
+            ctx,
+            headers,
+            identity_ready,
+            identity_ready,
+        )
+        .capture(ctx, read_ms, None, false)
+        .map(CapturedRouteUploadBoundForTest)
+        .map_err(upload_owner_label)
+    }
+
+    pub fn mark_early_upload_terminal_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.mark_early_upload_terminal_selected();
+    }
+
+    pub fn early_upload_unresolved_result_for_test() -> crate::plugins::PluginResult {
+        crate::proxy::early_upload::unresolved_policy_result()
+    }
+
+    /// The actual native-H3 early collector seam, including dependency refusal
+    /// before polling an admission/partial-buffer future.
+    pub async fn collect_h3_early_route_upload_for_test<F, T, E>(
+        view: &crate::plugin_cache::PluginCacheRequestView,
+        ctx: &crate::plugins::RequestContext,
+        identity_ready: bool,
+        grpc: bool,
+        read_ms: u64,
+        collect: F,
+    ) -> Result<T, &'static str>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        use crate::http3::server::H3RequestBodyReadError;
+
+        let bound = crate::proxy::early_upload::EarlyCollectorWitness::select(
+            view,
+            ctx,
+            &ctx.headers,
+            identity_ready,
+            identity_ready,
+        )
+        .capture(ctx, read_ms, None, grpc);
+        crate::http3::server::collect_h3_early_request_body(collect, bound)
+            .await
+            .map_err(|error| match error {
+                H3RequestBodyReadError::Policy(expiry) => upload_owner_label(expiry),
+                H3RequestBodyReadError::Read(_) => "read_error",
+                H3RequestBodyReadError::TimedOut => "read",
+                H3RequestBodyReadError::DeadlineExceeded(None) => "rpc",
+                H3RequestBodyReadError::DeadlineExceeded(Some(_)) => "authorization",
+            })
+    }
+
+    pub fn capture_route_upload_bound_for_test(
+        ctx: &crate::plugins::RequestContext,
+        route_ms: Option<u64>,
+        read_ms: u64,
+        auth: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> CapturedRouteUploadBoundForTest {
+        let bound = crate::proxy::early_upload::CapturedUploadBound::compose(
+            ctx.grpc_deadline_at(),
+            ctx.receipt_anchored_route_total(route_ms)
+                .map(|at| (at, crate::proxy::early_upload::UploadExpiry::Route)),
+            auth,
+            read_ms,
+        );
+        CapturedRouteUploadBoundForTest(bound)
+    }
+
+    impl CapturedRouteUploadBoundForTest {
+        pub fn owner(&self) -> Option<&'static str> {
+            self.0.0.map(|(_, owner)| upload_owner_label(owner))
+        }
+
+        pub async fn collect<F, T>(self, collect: F) -> Result<T, &'static str>
+        where
+            F: std::future::Future<Output = T>,
+        {
+            self.0.collect(collect).await.map_err(upload_owner_label)
+        }
+    }
+
     /// A composed early-upload protocol bound (client RPC deadline vs operator
     /// whole-upload stall timeout), carried from composition time to wait time
     /// so a test can put arbitrary scheduling delay between the two and prove
@@ -14629,6 +14779,13 @@ pub mod _test_support {
     pub const REQUEST_BUFFER_OVERLOAD_ERROR_CLASS: crate::retry::ErrorClass =
         crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS;
 
+    /// Real native-H3 retained collector outcome, exposed only as test support.
+    pub enum RetainedRequestOutcomeForTest {
+        Collected(bytes::Bytes),
+        TooLarge,
+        CapacityExceeded,
+    }
+
     /// An isolated aggregate buffered-REQUEST budget built from the SAME
     /// [`crate::proxy::response_buffer_budget`] code the process-global one
     /// uses — same clamping, same non-blocking admission, same release-on-drop
@@ -14660,6 +14817,34 @@ pub mod _test_support {
     }
 
     impl RequestBufferBudgetProbe {
+        pub async fn collect_retained_chunks<S>(
+            &self,
+            chunks: S,
+            effective_limit: usize,
+        ) -> Result<RetainedRequestOutcomeForTest, ()>
+        where
+            S: futures_util::Stream<Item = Result<bytes::Bytes, ()>>,
+        {
+            use crate::proxy::response_buffer_budget::{
+                RetainedRequestCollector, RetainedRequestOutcome, collect_retained_request_chunks,
+            };
+            let ceiling = self.0.buffered_request_body_ceiling(effective_limit);
+            let result = collect_retained_request_chunks(chunks, || {
+                let permit = self.0.try_reserve_request_permit(ceiling)?;
+                RetainedRequestCollector::with_permit(ceiling, permit)
+            })
+            .await?;
+            Ok(match result {
+                RetainedRequestOutcome::Collected(data, charge) => {
+                    RetainedRequestOutcomeForTest::Collected(charge.bytes(data))
+                }
+                RetainedRequestOutcome::TooLarge => RetainedRequestOutcomeForTest::TooLarge,
+                RetainedRequestOutcome::CapacityExceeded => {
+                    RetainedRequestOutcomeForTest::CapacityExceeded
+                }
+            })
+        }
+
         pub fn new(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
             Self(crate::proxy::response_buffer_budget::IsolatedBudget::new(
                 fallback_per_request_bytes,
@@ -15697,6 +15882,9 @@ pub mod _test_support {
             Err(crate::http3::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {
                 Err(EarlyUploadWaitError::DeadlineExceeded)
             }
+            Err(crate::http3::server::H3RequestBodyReadError::Policy(_)) => {
+                Err(EarlyUploadWaitError::DeadlineExceeded)
+            }
             Err(crate::http3::server::H3RequestBodyReadError::Read(_)) => {
                 Err(EarlyUploadWaitError::Read)
             }
@@ -15719,6 +15907,7 @@ pub mod _test_support {
         /// The composed absolute bound fired and the admitted credential's
         /// authorization lifetime is the captured winner.
         AuthorizationExpired(crate::proxy::auth_lifetime::StreamAuthTermination),
+        RouteDeadlineExceeded,
     }
 
     /// Compose the native-H3 buffered-upload bound exactly as all seven
@@ -15755,6 +15944,7 @@ pub mod _test_support {
         .await
         {
             Ok(()) => H3UploadWaitOutcomeForTest::Collected,
+            Err(H3UploadError::Policy(_)) => H3UploadWaitOutcomeForTest::RouteDeadlineExceeded,
             Err(H3UploadError::Read(())) => H3UploadWaitOutcomeForTest::ClientError,
             Err(H3UploadError::TimedOut) => H3UploadWaitOutcomeForTest::TimedOut,
             Err(H3UploadError::DeadlineExceeded(None)) => {

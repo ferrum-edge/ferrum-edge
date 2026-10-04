@@ -2780,6 +2780,12 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
 
 #[async_trait]
 impl Plugin for MeshAuthz {
+    fn may_publish_route_authorization(&self) -> bool {
+        // Computed while constructing this immutable generation. No policy
+        // evaluation or authorization stamp is published by the early selector.
+        self.has_scoped_policies || self.service_waypoint_destination_scope_required
+    }
+
     fn name(&self) -> &str {
         "mesh_authz"
     }

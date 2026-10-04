@@ -1422,6 +1422,19 @@ fn reject_node_waypoint_authz_destination_override(
     ctx: &RequestContext,
     destination: &RouteDestination,
 ) -> Option<PluginResult> {
+    node_waypoint_authz_destination_override_reason(ctx, destination).map(|reason| {
+        PluginResult::Reject {
+            status_code: 403,
+            body: reason.to_string(),
+            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+        }
+    })
+}
+
+fn node_waypoint_authz_destination_override_reason(
+    ctx: &RequestContext,
+    destination: &RouteDestination,
+) -> Option<&'static str> {
     let authorized_upstream_id = ctx
         .metadata
         .get(NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA);
@@ -1437,13 +1450,9 @@ fn reject_node_waypoint_authz_destination_override(
                 .get(NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA)
                 .is_some_and(|value| value == "true")
         {
-            return Some(PluginResult::Reject {
-                status_code: 403,
-                body:
-                    "node-waypoint mesh authorization requires an authorized destination before route override"
-                        .to_string(),
-                headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
-            });
+            return Some(
+                "node-waypoint mesh authorization requires an authorized destination before route override",
+            );
         }
         return None;
     }
@@ -1469,13 +1478,7 @@ fn reject_node_waypoint_authz_destination_override(
     {
         return None;
     }
-    Some(PluginResult::Reject {
-        status_code: 403,
-        body:
-            "node-waypoint mesh authorization forbids route override to an unauthorized destination"
-                .to_string(),
-        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
-    })
+    Some("node-waypoint mesh authorization forbids route override to an unauthorized destination")
 }
 
 fn node_waypoint_backend_metadata_value(host: &str, port: u16) -> Option<String> {
@@ -2056,6 +2059,80 @@ fn compile_header_matchers(
 
 #[async_trait]
 impl Plugin for MeshRouteDispatch {
+    fn early_route_total_participant(&self) -> bool {
+        true
+    }
+
+    fn early_route_total<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        headers: &HashMap<String, String>,
+        host: Option<&'a str>,
+        query: Option<&CanonicalQuery>,
+        facts: super::early_route_total::EarlyRouteTotalFacts,
+    ) -> super::early_route_total::EarlyRouteTotalStep<'a> {
+        use super::early_route_total::EarlyRouteTotalStep;
+        if ctx.has_ai_stream_router_claim() {
+            return EarlyRouteTotalStep::NoMatch;
+        }
+        if self.has_query_predicates && query.is_some_and(|q| q.first_ambiguity().is_some()) {
+            return EarlyRouteTotalStep::Terminal;
+        }
+        for rule in &self.config.rules {
+            if !rule_matches_with_host(rule, ctx, headers, host, query) {
+                continue;
+            }
+            // These actions precede timeout publication. A stochastic fault
+            // cannot be previewed without executing it; its total is unresolved.
+            if rule.redirect.is_some() {
+                return EarlyRouteTotalStep::Terminal;
+            }
+            if let Some(fault) = &rule.fault {
+                return if fault
+                    .abort
+                    .as_ref()
+                    .is_some_and(|abort| abort.percentage == 100.0)
+                    && fault.delay.is_none()
+                {
+                    EarlyRouteTotalStep::Terminal
+                } else {
+                    EarlyRouteTotalStep::Unresolved
+                };
+            }
+            // Authorization may publish a waypoint destination after this drain.
+            if !facts.authorization_ready
+                && !rule.destination.is_empty()
+                && (facts.waypoint_authorization_pending
+                    || (rule.destination.requires_node_waypoint_authz
+                        && ctx
+                            .metadata
+                            .get(NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA)
+                            .is_some_and(|value| value == "true")))
+            {
+                return EarlyRouteTotalStep::Unresolved;
+            }
+            if node_waypoint_authz_destination_override_reason(ctx, &rule.destination).is_some() {
+                return EarlyRouteTotalStep::Terminal;
+            }
+            let next_host = match rule.rewrite.as_ref().and_then(|r| r.authority.as_deref()) {
+                Some(authority) => Some(authority),
+                None if !ctx.headers.is_empty() => ctx.headers.get("host").map(String::as_str),
+                None => host,
+            };
+            return EarlyRouteTotalStep::Matched {
+                timeout_ms: rule.request_timeout_ms,
+                host: next_host,
+            };
+        }
+        if self.config.reject_unmatched
+            && !self.aggregate_reject_unmatched.load(Ordering::Relaxed)
+        {
+            EarlyRouteTotalStep::Terminal
+        } else {
+            EarlyRouteTotalStep::NoMatch
+        }
+    }
+
     fn name(&self) -> &str {
         "mesh_route_dispatch"
     }
@@ -2700,6 +2777,22 @@ fn rule_matches(
     headers: &HashMap<String, String>,
     canonical_query: Option<&CanonicalQuery>,
 ) -> bool {
+    rule_matches_with_host(
+        rule,
+        ctx,
+        headers,
+        headers.get("host").map(String::as_str),
+        canonical_query,
+    )
+}
+
+fn rule_matches_with_host(
+    rule: &RouteRule,
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    host: Option<&str>,
+    canonical_query: Option<&CanonicalQuery>,
+) -> bool {
     let m = &rule.match_;
     if m.is_empty() {
         // Empty match means "match all". `normalize_and_validate` accepts
@@ -2741,7 +2834,12 @@ fn rule_matches(
     // (regex included) — the hot path is one HashMap lookup plus the
     // matcher op per configured header.
     for (name, matcher) in &rule.headers_compiled {
-        match headers.get(name.as_str()) {
+        let actual = if name == "host" {
+            host
+        } else {
+            headers.get(name.as_str()).map(String::as_str)
+        };
+        match actual {
             Some(actual) if matcher.matches(actual) => {}
             _ => return false,
         }
@@ -2798,7 +2896,7 @@ fn rule_matches(
         // Do not route-normalize here. Istio `authority` is a `StringMatch`;
         // exact/prefix comparisons are case-sensitive and include an explicit
         // port when the client sent one.
-        let Some(authority) = headers.get("host").or_else(|| headers.get(":authority")) else {
+        let Some(authority) = host.or_else(|| headers.get(":authority").map(String::as_str)) else {
             return false;
         };
         if !matcher.matches(authority) {

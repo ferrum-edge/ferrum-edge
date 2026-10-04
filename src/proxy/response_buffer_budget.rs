@@ -759,6 +759,142 @@ impl RequestBufferPermit {
     }
 }
 
+/// Shared ownership for native-H3's retained body across plugin preparation,
+/// backend handoff and cheap Bytes clones. The one reservation is never retaken.
+#[derive(Clone)]
+pub(crate) struct SharedRequestBufferCharge(std::sync::Arc<RequestBufferPermit>);
+
+impl std::fmt::Debug for SharedRequestBufferCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedRequestBufferCharge")
+    }
+}
+
+impl SharedRequestBufferCharge {
+    pub(crate) fn new(permit: RequestBufferPermit) -> Self {
+        Self(std::sync::Arc::new(permit))
+    }
+
+    pub(crate) fn bytes(&self, data: Vec<u8>) -> Bytes {
+        struct Owner {
+            data: Vec<u8>,
+            _charge: SharedRequestBufferCharge,
+        }
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+        // Keep empty allocations charged too: Vec capacity, not length, is the
+        // retained allocation. The collector reserves exactly its finite cap.
+        Bytes::from_owner(Owner {
+            data,
+            _charge: self.clone(),
+        })
+    }
+
+    fn reserved_bytes(&self) -> usize {
+        self.0.reserved_bytes()
+    }
+}
+
+/// Actual finite retained-request collector used by native H3. Admission and
+/// allocation live inside the future that owns it; cancellation drops both.
+pub(crate) struct RetainedRequestCollector {
+    data: Vec<u8>,
+    ceiling: usize,
+    charge: SharedRequestBufferCharge,
+}
+
+impl RetainedRequestCollector {
+    pub(crate) fn new(effective_limit: usize) -> Option<Self> {
+        let ceiling = buffered_request_body_ceiling(effective_limit);
+        let permit = RequestBufferPermit::reserve(ceiling)?;
+        Self::with_permit(ceiling, permit)
+    }
+
+    pub(crate) fn with_permit(ceiling: usize, permit: RequestBufferPermit) -> Option<Self> {
+        if ceiling > permit.reserved_bytes() {
+            return None;
+        }
+        Some(Self {
+            data: Vec::new(),
+            ceiling,
+            charge: SharedRequestBufferCharge::new(permit),
+        })
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<bool, ()> {
+        if bytes.len() > self.ceiling.saturating_sub(self.data.len()) {
+            return Ok(false);
+        }
+        let needed = self.data.len() + bytes.len();
+        if needed > self.data.capacity() {
+            // Controlled geometric growth never exceeds the admitted ceiling.
+            // try_reserve_exact prevents Vec's implicit growth from exceeding it.
+            let capacity = needed
+                .max(self.data.capacity().saturating_mul(2))
+                .min(self.ceiling);
+            self.data
+                .try_reserve_exact(capacity - self.data.len())
+                .map_err(|_| ())?;
+            if self.data.capacity() > self.charge.reserved_bytes() {
+                return Err(());
+            }
+        }
+        self.data.extend_from_slice(bytes);
+        Ok(true)
+    }
+
+    fn finish(mut self) -> (Vec<u8>, SharedRequestBufferCharge) {
+        // No charge clones exist until publication. Narrow to actual capacity,
+        // retaining every block for as long as any body/metadata/retry owner lives.
+        if let Some(permit) = std::sync::Arc::get_mut(&mut self.charge.0) {
+            let _: bool = permit.reservation.narrow_to_covered(self.data.capacity());
+        }
+        (self.data, self.charge)
+    }
+}
+
+pub(crate) enum RetainedRequestOutcome {
+    Collected(Vec<u8>, SharedRequestBufferCharge),
+    TooLarge,
+    CapacityExceeded,
+}
+
+/// Shared actual collector loop. The admission closure runs before polling the
+/// source. Both the partial allocation and permit are owned by this future.
+pub(crate) async fn collect_retained_request_chunks<S, B, E>(
+    chunks: S,
+    admit: impl FnOnce() -> Option<RetainedRequestCollector>,
+) -> Result<RetainedRequestOutcome, E>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: bytes::Buf,
+{
+    use futures_util::StreamExt;
+
+    let Some(mut collector) = admit() else {
+        return Ok(RetainedRequestOutcome::CapacityExceeded);
+    };
+    futures_util::pin_mut!(chunks);
+    while let Some(chunk) = chunks.next().await {
+        let mut chunk = chunk?;
+        while chunk.has_remaining() {
+            let bytes = chunk.chunk();
+            match collector.push(bytes) {
+                Ok(true) => {}
+                Ok(false) => return Ok(RetainedRequestOutcome::TooLarge),
+                Err(()) => return Ok(RetainedRequestOutcome::CapacityExceeded),
+            }
+            let len = bytes.len();
+            chunk.advance(len);
+        }
+    }
+    let (body, charge) = collector.finish();
+    Ok(RetainedRequestOutcome::Collected(body, charge))
+}
+
 /// Operator-facing pressure on the aggregate buffered-request budget.
 ///
 /// Surfaced only to AUTHENTICATED `/overload` callers: the coarse

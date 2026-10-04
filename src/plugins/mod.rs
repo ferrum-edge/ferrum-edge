@@ -71,6 +71,8 @@ pub(crate) mod charged_decode;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
+#[doc(hidden)]
+pub mod early_route_total;
 pub mod fault_injection;
 pub mod geo_restriction;
 pub mod graphql;
@@ -2576,6 +2578,9 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Captured early upload route/policy terminal. Keeps its winning owner
+    /// through cleanup without selecting the gRPC-only deadline representation.
+    early_upload_terminal_selected: bool,
     /// Whether the response in hand is proxy core's charged backend deadline
     /// terminal (`Backend deadline exceeded`, #5744): a gRPC attempt budget
     /// expiry charged to the backend after the request was sent. It is written
@@ -3189,6 +3194,9 @@ pub struct RequestContext {
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
+    /// Native-H3 retained upload admission. Private, unlogged and clone-owned.
+    pub(crate) request_buffer_charge:
+        Option<crate::proxy::response_buffer_budget::SharedRequestBufferCharge>,
     /// Precomputed body hashes for integrity-verifying authentication plugins.
     /// Keeping fixed-size hashes avoids retaining a second full body while the
     /// sole buffered representation continues to the backend.
@@ -4041,6 +4049,7 @@ impl RequestContext {
             grpc_route_attempt_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            early_upload_terminal_selected: false,
             charged_backend_deadline_terminal: false,
             route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
@@ -4123,6 +4132,7 @@ impl RequestContext {
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            request_buffer_charge: None,
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: 0,
@@ -4418,6 +4428,14 @@ impl RequestContext {
         self.authorization_termination
     }
 
+    pub(crate) fn mark_early_upload_terminal_selected(&mut self) {
+        self.early_upload_terminal_selected = true;
+    }
+
+    pub(crate) fn early_upload_terminal_selected(&self) -> bool {
+        self.early_upload_terminal_selected
+    }
+
     pub(crate) fn mark_gateway_deadline_response_selected(&mut self) {
         self.gateway_deadline_response_selected = true;
     }
@@ -4612,10 +4630,39 @@ impl RequestContext {
         self.end_grpc_route_attempt();
         self.grpc_route_attempt_timeout = None;
         self.route_attempt_timeout = attempt_timeout;
-        self.route_request_deadline_at = request_timeout_ms.and_then(|timeout_ms| {
+        self.route_request_deadline_at = self.receipt_anchored_route_total(request_timeout_ms);
+    }
+
+    pub(crate) fn charged_retained_request_bytes(&self, data: Vec<u8>) -> bytes::Bytes {
+        match &self.request_buffer_charge {
+            Some(charge) => charge.bytes(data),
+            None => bytes::Bytes::from(data),
+        }
+    }
+
+    pub(crate) fn charged_retained_request_copy(&self, data: &[u8]) -> bytes::Bytes {
+        match &self.request_buffer_charge {
+            Some(charge) => charge.bytes(data.to_vec()),
+            None => bytes::Bytes::copy_from_slice(data),
+        }
+    }
+
+    pub(crate) fn discard_retained_request_metadata(&mut self) {
+        self.request_body_bytes = None;
+        self.metadata.remove("request_body");
+        self.request_buffer_charge = None;
+    }
+
+    /// Pure calculation shared by the collector and the later arm/rearm.
+    /// It publishes no override and does not start an attempt clock.
+    pub(crate) fn receipt_anchored_route_total(
+        &self,
+        timeout_ms: Option<u64>,
+    ) -> Option<tokio::time::Instant> {
+        timeout_ms.filter(|ms| *ms > 0).and_then(|ms| {
             self.grpc_deadline_received_at
-                .checked_add(Duration::from_millis(timeout_ms))
-        });
+                .checked_add(Duration::from_millis(ms))
+        })
     }
 
     /// The matched route rule's per-attempt total budget for this NON-gRPC
@@ -5544,6 +5591,7 @@ impl RequestContext {
             grpc_route_attempt_deadline_at: self.grpc_route_attempt_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            early_upload_terminal_selected: self.early_upload_terminal_selected,
             charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
             route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
@@ -5724,6 +5772,7 @@ impl RequestContext {
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            request_buffer_charge: None,
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: self.max_response_body_size_bytes,
@@ -9162,7 +9211,7 @@ pub async fn log_with_mirror_before_buffered_response(
     summary: TransactionSummary,
     ctx: &RequestContext,
 ) {
-    if ctx.grpc_deadline_at().is_none() {
+    if ctx.grpc_deadline_at().is_none() && !ctx.early_upload_terminal_selected() {
         log_with_mirror(plugins, &summary, ctx).await;
         return;
     }
@@ -10125,6 +10174,46 @@ pub enum BackendAdmissionDecision {
 pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
+
+    /// Cold-path participation in the pure early route-total projection.
+    /// Wrappers delegate; unknown input mutators conservatively remain unresolved.
+    #[doc(hidden)]
+    fn early_route_total_participant(&self) -> bool {
+        self.modifies_request_headers()
+            || self.modifies_request_query()
+            || self.modifies_request_destination()
+    }
+
+    /// Cold-path indication that authorization can publish a waypoint
+    /// destination stamp used by the later route-dispatch veto.
+    #[doc(hidden)]
+    fn may_publish_route_authorization(&self) -> bool {
+        false
+    }
+
+    /// Pure request projection of a reload-cached authorization publisher.
+    /// Wrappers preserve a false trigger; undecided identity remains pending.
+    #[doc(hidden)]
+    fn route_authorization_may_be_pending(
+        &self,
+        _ctx: &RequestContext,
+        _identity_ready: bool,
+    ) -> bool {
+        self.may_publish_route_authorization()
+    }
+
+    /// Read-only projection. Never call a lifecycle hook here, even on a clone.
+    #[doc(hidden)]
+    fn early_route_total<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        _headers: &HashMap<String, String>,
+        _host: Option<&'a str>,
+        _query: Option<&utils::query::CanonicalQuery>,
+        _facts: early_route_total::EarlyRouteTotalFacts,
+    ) -> early_route_total::EarlyRouteTotalStep<'a> {
+        early_route_total::EarlyRouteTotalStep::Unresolved
+    }
 
     /// Returns the immutable country-MMDB snapshot retained by this plugin.
     ///

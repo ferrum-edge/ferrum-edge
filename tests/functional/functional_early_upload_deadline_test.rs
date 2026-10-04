@@ -675,3 +675,195 @@ async fn h3_slow_cancelled_stream_does_not_block_independent_sibling_stream() {
 
     gateway.shutdown();
 }
+
+// The following use actual SOAP authentication plugins and real ingress stacks.
+// No credential is parsed because the deliberately open upload must expire first.
+fn soap_route_upload_yaml(backend_port: u16, identity: &str) -> String {
+    let cert = include_str!("../certs/server.crt");
+    let security = match identity {
+        "username" => json!({
+            "username_token": {
+                "enabled": true, "password_type": "PasswordText",
+                "credentials": [{"username": "alice", "password": "test-password"}]
+            },
+            "timestamp": {"require": false}
+        }),
+        "x509" => json!({
+            "x509_signature": {"enabled": true, "trusted_certs": [cert]},
+            "timestamp": {"require": true}, "content_type": {"allow_mtom": false}
+        }),
+        "saml" => json!({
+            "saml": {
+                "enabled": true, "trusted_issuers": ["https://idp.example"],
+                "trusted_signing_certs": [cert], "audience": "https://service.example",
+                "recipient": "https://service.example/upload"
+            },
+            "timestamp": {"require": false}, "nonce": {"replay_scope": "process"}
+        }),
+        "timestamp" => json!({"timestamp": {"require": true}}),
+        _ => panic!("unknown test identity"),
+    };
+    serde_yaml::to_string(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "soap-upload", "listen_path": "/upload", "backend_scheme": "http",
+            "backend_host": "127.0.0.1", "backend_port": backend_port,
+            "backend_read_timeout_ms": 0,
+            "circuit_breaker": {"failure_threshold": 1, "timeout_seconds": 60},
+            "plugins": [{"plugin_config_id": "soap"}, {"plugin_config_id": "route"}]
+        }],
+        "plugin_configs": [
+            {"id": "soap", "plugin_name": "soap_ws_security", "scope": "proxy",
+             "proxy_id": "soap-upload", "enabled": true, "config": security},
+            {"id": "route", "plugin_name": "mesh_route_dispatch", "scope": "proxy",
+             "proxy_id": "soap-upload", "enabled": true, "config": {"rules": [{
+                 "match": {"methods": ["POST", "GET", "HEAD", "OPTIONS"]},
+                 "destination": {"backend_host": "127.0.0.1", "backend_port": backend_port},
+                 "request_timeout_ms": 150
+             }]}}
+        ]
+    }))
+    .expect("SOAP route yaml")
+}
+
+async fn assert_no_soap_backend(backend: &ScriptedHttp1Backend) {
+    assert!(
+        backend
+            .received_requests()
+            .await
+            .iter()
+            .all(|request| !request.path.starts_with("/upload")),
+        "a pre-dispatch route expiry must not contact a backend"
+    );
+}
+
+fn assert_no_soap_health_charge(metrics: &serde_json::Value) {
+    for breaker in metrics["circuit_breakers"].as_array().expect("breaker snapshot") {
+        if breaker["proxy_id"] == "soap-upload" {
+            assert_eq!(breaker["failure_count"], 0, "client upload is health-neutral");
+            assert_eq!(breaker["state"], "closed");
+        }
+    }
+    assert_eq!(metrics["health_check"]["unhealthy_target_count"], 0);
+    assert!(metrics["load_balancers"]["active_connections"]
+        .as_array()
+        .expect("load-balancer snapshot")
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn soap_identity_route_total_bounds_h1_chunked_and_content_length() {
+    for identity in ["username", "x509", "saml", "timestamp"] {
+        let (port, backend) = spawn_ok_backend().await;
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(soap_route_upload_yaml(port, identity))
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("SOAP gateway");
+        for length in [None, Some("100000")] {
+            let (body, keeper, _tx) = stalled_json_body();
+            let client = harness.http_client().expect("HTTP/1 client");
+            let mut request = client
+                .as_reqwest()
+                .post(harness.proxy_url("/upload"))
+                .header(reqwest::header::CONTENT_TYPE, "text/xml")
+                .body(body)
+                .timeout(Duration::from_secs(5));
+            if let Some(length) = length {
+                request = request.header(reqwest::header::CONTENT_LENGTH, length);
+            }
+            let response = request.send().await.expect("SOAP stalled response");
+            keeper.abort();
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT, "{identity}");
+            assert_eq!(response.headers()["x-gateway-error"], "request_timeout");
+            assert!(!response.headers().contains_key("grpc-status"));
+            assert_eq!(
+                response.text().await.unwrap(),
+                r#"{"error":"Request timeout"}"#
+            );
+            assert_no_soap_backend(&backend).await;
+            let metrics = harness.get_admin_json("/admin/metrics").await.unwrap();
+            assert_no_soap_health_charge(&metrics);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn soap_identity_route_total_bounds_h2_open_data_without_content_length() {
+    for identity in ["username", "x509", "saml", "timestamp"] {
+        let (port, backend) = spawn_ok_backend().await;
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(soap_route_upload_yaml(port, identity))
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("SOAP gateway");
+        let client = Http2Client::h2c_prior_knowledge().expect("H2 client");
+        for method in [
+            reqwest::Method::POST,
+            reqwest::Method::GET,
+            reqwest::Method::HEAD,
+            reqwest::Method::OPTIONS,
+        ] {
+            let (body, keeper, _tx) = stalled_json_body();
+            let response = client
+                .as_reqwest()
+                .request(method, harness.proxy_url("/upload"))
+                .header(reqwest::header::CONTENT_TYPE, "text/xml")
+                .body(body)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .expect("open H2 DATA response");
+            keeper.abort();
+            assert_eq!(response.version(), reqwest::Version::HTTP_2);
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT, "{identity}");
+            assert_eq!(response.headers()["x-gateway-error"], "request_timeout");
+            assert!(!response.headers().contains_key("grpc-status"));
+            assert_no_soap_backend(&backend).await;
+            let metrics = harness.get_admin_json("/admin/metrics").await.unwrap();
+            assert_no_soap_health_charge(&metrics);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn soap_identity_route_total_bounds_native_h3_before_stopping_upload() {
+    for identity in ["username", "x509", "saml", "timestamp"] {
+        let (port, backend) = spawn_ok_backend().await;
+        let (mut gateway, https_port) =
+            spawn_h3_gateway(soap_route_upload_yaml(port, identity)).await;
+        let url = format!("https://127.0.0.1:{https_port}/upload");
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
+        let response = h3_post_stalled_body(&url, "localhost", addr, "text/xml", None)
+            .await
+            .expect("observable H3 terminal HEADERS before STOP_SENDING");
+        assert_eq!(response.status, StatusCode::GATEWAY_TIMEOUT, "{identity}");
+        assert_eq!(response.headers["x-gateway-error"], "request_timeout");
+        assert!(!response.headers.contains_key("grpc-status"));
+        assert_eq!(
+            response.body_bytes,
+            Bytes::from_static(br#"{"error":"Request timeout"}"#)
+        );
+        assert_no_soap_backend(&backend).await;
+        let metrics = reqwest::Client::new()
+            .get(gateway.admin_url("/admin/metrics"))
+            .bearer_auth(gateway.admin_token())
+            .send()
+            .await
+            .expect("authenticated H3 admin snapshot")
+            .error_for_status()
+            .expect("admin metrics status")
+            .json::<serde_json::Value>()
+            .await
+            .expect("admin metrics JSON");
+        assert_no_soap_health_charge(&metrics);
+        gateway.shutdown();
+    }
+}

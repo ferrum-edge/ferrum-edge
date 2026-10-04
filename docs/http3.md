@@ -1696,3 +1696,14 @@ backend response collection; its channel guard prevents queued upload frames cro
 Gateway-selected authorization expiry is health-neutral and never retries the request. See
 [Authorization lifetime during backend dispatch](request_lifetime_dispatch.md) for the phase
 bounds and pre-commitment terminals.
+
+## Draft early retained-upload parity (#6008/#6009)
+
+Native H3 authenticate, authorize and pre-before_proxy collection shares the
+receipt-anchored deterministic route-total selector with H1/H2. Captured timeout
+ownership preserves 504/request_timeout before dispatch and existing RPC/read/
+authorization precedence. All retained native-H3 drains use finite fallback and
+aggregate request-buffer admission before allocation; Bytes clones retain the
+charge. Response-before-STOP_SENDING and bounded terminal write grace remain.
+The unresolved-selection refusal is an unapproved supported-profile proposal;
+see [the draft policy and qualification requirements](early_upload_policy.md).

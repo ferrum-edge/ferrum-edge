@@ -17355,7 +17355,11 @@ components:
           type: object
           description: |
             Aggregate buffered-request budget pressure
-            (`FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES`). Present only in the
+            (`FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES`). Draft #6009 applies
+            admission before allocation to native-H3 retained early collectors,
+            including finite fallback at effective zero and charge ownership
+            through final retained Bytes clones. Streaming zero is unchanged.
+            Present only in the
             authenticated detail snapshot and only when the gateway has a
             proxy state; the coarse unauthenticated response carries `level`
             alone.
@@ -25474,7 +25478,15 @@ components:
                   HTTP/3 stream with `H3_REQUEST_CANCELLED`; a gRPC request
                   folds it into its RPC deadline and ends with
                   `DEADLINE_EXCEEDED`. HTTP/1.1, HTTP/2 and native HTTP/3
-                  enforce it alike. Expiry is charged to a backend's health
+                  enforce it alike. Draft issues #6008/#6009 extend this
+                  receipt-anchored bound to deterministically selectable early
+                  authenticate/authorize/pre-before_proxy body collectors,
+                  including SOAP UsernameToken, X.509 and SAML on H1/H2 and
+                  native H3. The proposed fixed 503 for unresolved identity/body/
+                  intervening-mutation selection is NOT owner-approved; see
+                  docs/early_upload_policy.md. This draft does not declare
+                  v0.9.11 patched or close GHSA-gxfv-924p-wvx4.
+                  Expiry is charged to a backend's health
                   only when that backend held the cancelled attempt; expiry
                   before the attempt was handed to a backend, in retry backoff,
                   or after the response head is health-neutral. Upgraded

@@ -7078,3 +7078,12 @@ Mesh mode reuses several CP/DP environment variables. See [cp_dp_mode.md](cp_dp_
 - `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` -- primary CP retry interval on fallback.
 - `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` -- per-ADS-stream response queue capacity.
 - DP gRPC TLS variables (`FERRUM_DP_GRPC_TLS_*`).
+
+## Draft deterministic early-upload selection (#6008)
+
+[The draft early-upload policy](early_upload_policy.md) shares compiled mesh
+matching with a private collector witness on H1/H2 and native H3. First-match,
+effective scope/protocol/priority, Host/query projections, later untimed clearing,
+AI claim precedence and deferred overrides are preserved. Identity/body/mutation
+dependencies remain explicit; their proposed fail-closed disposition has no
+owner approval. This is not an advisory-closure or patched-v0.9.11 claim.

@@ -28,8 +28,8 @@
 //!   recv half is drained OR the backend cancels, both sides unwind
 //!   cleanly without a dangling task. If the caller pre-buffered the
 //!   body (plugin phase already collected it), the buffered bytes are
-//!   passed to reqwest directly via `Body::from(Vec<u8>)` — one
-//!   allocation, no bridge.
+//!   passed to reqwest directly as charged, cheaply cloneable `Bytes` — no
+//!   second upload admission or bridge.
 //!
 //! - **gRPC flavor — duplex streaming when replay is unnecessary.**
 //!   With no retry, request/response body buffering, or pre-buffered body, the
@@ -140,6 +140,7 @@ use crate::proxy::headers::{
     sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
     strip_response_hop_by_hop_trailers,
 };
+use crate::proxy::response_buffer_budget::RetainedRequestOutcome as RetainedH3Body;
 use crate::proxy::{
     BufferedUploadReplay, absolute_response_header_read_bound, await_upload_write_watermark_first,
     install_buffered_upload_write_watermark, optional_sleep_elapsed,
@@ -251,7 +252,7 @@ where
     pub cb_target_key: Option<&'a str>,
     pub cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
     pub flavor: HttpFlavor,
-    pub prebuffered_body: Option<Vec<u8>>,
+    pub prebuffered_body: Option<Bytes>,
     /// The request body was already transformed and passed through final-body
     /// hooks before transport selection in the H3 frontend.
     pub request_body_prepared: bool,
@@ -1011,12 +1012,14 @@ where
             // they do on the H1/H2 dispatch path. This bridge path has no
             // `:method` pseudo-header for the no-context hook to consult.
             let grpc_deadline_at = ctx.grpc_deadline_at();
+            let transform_body = body.to_vec();
+            drop(body);
             let transformed = crate::proxy::apply_request_body_plugins_with_context(
                 plugins,
                 Some(&mut *ctx),
                 grpc_deadline_at,
                 proxy_headers,
-                body,
+                transform_body,
             )
             .await;
             // Run validators. Reject = emit a trailers-only native gRPC error,
@@ -1032,8 +1035,10 @@ where
             )
             .await
             {
-                PluginResult::Continue => Some(transformed),
+                PluginResult::Continue => Some(ctx.charged_retained_request_bytes(transformed)),
                 reject => {
+                    drop(transformed);
+                    ctx.discard_retained_request_metadata();
                     // This is a client/request-body policy outcome before any
                     // backend dispatch. Release a HALF_OPEN probe neutrally so
                     // a client-fault rejection cannot wedge the breaker.
@@ -3152,7 +3157,7 @@ fn boxed_dispatch_plain<'a, S>(
     upstream_balancer: Option<&'a Arc<LoadBalancer>>,
     cb_target_key: Option<&'a str>,
     cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
-    prebuffered_body: Option<Vec<u8>>,
+    prebuffered_body: Option<Bytes>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &'a str,
     xff_append_ip: &'a str,
@@ -3227,7 +3232,7 @@ async fn dispatch_plain<S>(
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
     cb_probe: &crate::proxy::HalfOpenProbeGuard,
-    prebuffered_body: Option<Vec<u8>>,
+    prebuffered_body: Option<Bytes>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
     xff_append_ip: &str,
@@ -3389,14 +3394,27 @@ where
         )
         .await
         {
-            Ok(Some(body)) => {
+            Ok(RetainedH3Body::Collected(body, charge)) => {
+                ctx.request_buffer_charge = Some(charge);
                 let len = body.len() as u64;
                 // No request body hook runs on this drain, so the client's
                 // bytes are the backend-visible body (#5819).
                 crate::plugins::grpc_web::record_request_grpc_message_count(ctx, &body);
-                (Some(body), len)
+                (Some(ctx.charged_retained_request_bytes(body)), len)
             }
-            Ok(None) => {
+            Ok(RetainedH3Body::CapacityExceeded) => {
+                cb_probe.release_neutral();
+                return write_retained_request_capacity_terminal(
+                    stream,
+                    ctx,
+                    false,
+                    backend_start,
+                    0,
+                    initial_response_header_policy_plugins,
+                )
+                .await;
+            }
+            Ok(RetainedH3Body::TooLarge) => {
                 cb_probe.release_neutral();
                 return write_plain_gateway_error(
                     stream,
@@ -3412,6 +3430,18 @@ where
             // The winner was captured where BOTH instants were known, so a late
             // wake cannot reattribute a strictly earlier client RPC deadline to
             // the gateway's security decision.
+            Err(super::server::H3RequestBodyReadError::Policy(_)) => {
+                cb_probe.release_neutral();
+                return write_plain_route_timeout(
+                    stream,
+                    plugins,
+                    ctx,
+                    backend_start,
+                    0,
+                    backend_url,
+                )
+                .await;
+            }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded(authorization_expiry)) => {
                 cb_probe.release_neutral();
                 if let Some(termination) = authorization_expiry {
@@ -3618,7 +3648,7 @@ where
                                 &current_url,
                                 method,
                                 attempt_span.headers(proxy_headers),
-                                Bytes::from(buffered_body.clone()),
+                                buffered_body.clone(),
                                 target,
                                 plugins,
                                 ctx,
@@ -4030,7 +4060,7 @@ where
                         ctx.is_early_data,
                         grpc_web_deadline_at,
                     );
-                    let plain_upload_bytes = Bytes::from(buffered_body.clone());
+                    let plain_upload_bytes = buffered_body.clone();
                     let (plain_upload_body, mut plain_upload_pump) =
                         install_buffered_upload_write_watermark(
                             plain_upload_bytes.clone(),
@@ -7958,7 +7988,7 @@ async fn dispatch_grpc<S>(
     upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
     cb_probe: &crate::proxy::HalfOpenProbeGuard,
-    prebuffered_body: Option<Vec<u8>>,
+    prebuffered_body: Option<Bytes>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
     xff_append_ip: &str,
@@ -8075,8 +8105,23 @@ where
         )
         .await
         {
-            Ok(Some(b)) => b,
-            Ok(None) => {
+            Ok(RetainedH3Body::Collected(body, charge)) => {
+                ctx.request_buffer_charge = Some(charge);
+                ctx.charged_retained_request_bytes(body)
+            }
+            Ok(RetainedH3Body::CapacityExceeded) => {
+                cb_probe.release_neutral();
+                return write_retained_request_capacity_terminal(
+                    stream,
+                    ctx,
+                    true,
+                    backend_start,
+                    0,
+                    initial_response_header_policy_plugins,
+                )
+                .await;
+            }
+            Ok(RetainedH3Body::TooLarge) => {
                 // Default writer emits HEADERS then STOP_SENDING; do not reverse
                 // that order with a pre-write halt (would duplicate STOP_SENDING).
                 cb_probe.release_neutral();
@@ -8159,6 +8204,10 @@ where
                     };
                 crate::http3::stream_util::halt_request_body(stream);
                 return result;
+            }
+            Err(super::server::H3RequestBodyReadError::Policy(_)) => {
+                cb_probe.release_neutral();
+                return Err(anyhow::anyhow!("unexpected route owner on a gRPC upload"));
             }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {
                 ctx.record_authorization_termination_once(termination, grpc_auth_family(ctx));
@@ -8252,7 +8301,7 @@ where
         ctx,
         requires_response_body_buffering,
     );
-    let body_bytes = Bytes::from(body);
+    let body_bytes = body;
     let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry {
         (
             hmap.clone(),
@@ -11725,12 +11774,12 @@ pub(crate) fn collect_reqwest_response_headers(
 // H3 body drain + response writers
 // ---------------------------------------------------------------------------
 
-/// Drain the H3 stream body into a `Vec<u8>` with a size ceiling. Returns
-/// `Ok(None)` when the limit is exceeded (caller emits 413).
+/// Shared admitted native-H3 retained drain. The caller adopts the charge on
+/// success; size/capacity refusal drops partial storage before any writer runs.
 async fn drain_h3_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     max_bytes: usize,
-) -> Result<Option<Vec<u8>>, h3::error::StreamError>
+) -> Result<RetainedH3Body, h3::error::StreamError>
 where
     S: RecvStream,
 {
@@ -11992,6 +12041,74 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
         return deadline_replaced;
     }
     false
+}
+
+/// Capacity is gateway-local. Offer the fixed terminal before halting the
+/// receive half, with the same bounded write grace as an expired upload.
+async fn write_retained_request_capacity_terminal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    grpc: bool,
+    backend_start: Instant,
+    bytes_sent: u64,
+    initial_policy: &[Arc<dyn Plugin>],
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    use crate::proxy::response_buffer_budget as budget;
+
+    let grpc = grpc || crate::plugins::grpc_web::client_uses_grpc_web(ctx);
+    let response_status = if grpc {
+        200
+    } else {
+        budget::REQUEST_BUFFER_OVERLOAD_STATUS
+    };
+    let write = async {
+        if grpc {
+            write_grpc_error_for_request_with_recv_halt(
+                stream,
+                ctx,
+                budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
+                budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE,
+                backend_start,
+                bytes_sent,
+                initial_policy,
+                false,
+            )
+            .await
+        } else {
+            let headers = HashMap::new();
+            write_plain_gateway_reject_with_recv_halt(
+                stream,
+                ctx,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Bytes::from_static(budget::REQUEST_BUFFER_OVERLOAD_BODY.as_bytes()),
+                &headers,
+                backend_start,
+                bytes_sent,
+                false,
+            )
+            .await
+        }
+    };
+    let mut outcome =
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                terminal_deadline_write_aborted_outcome(
+                    response_status,
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    matches!(error, crate::http3::stream_util::H3ResponseWriteError::Write(_)),
+                )
+            }
+        };
+    crate::http3::stream_util::halt_request_body(stream);
+    outcome.error_class = Some(budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS);
+    Ok(outcome)
 }
 
 async fn write_plain_gateway_error<S>(

@@ -208,6 +208,22 @@ impl PluginTriggerGate {
         decision
     }
 
+    /// Pure preview preserves a memoized wrapper decision. An identity predicate
+    /// with no authoritative identity boundary is explicitly unresolved.
+    pub(crate) fn early_route_decision(
+        &self,
+        ctx: &RequestContext,
+        identity_ready: bool,
+    ) -> Option<bool> {
+        ctx.plugin_trigger_decision(self.token).or_else(|| {
+            if self.compiled.reads_authenticated_identity() && !identity_ready {
+                None
+            } else {
+                Some(self.compiled.evaluate(&HttpTriggerFacts::new(ctx)))
+            }
+        })
+    }
+
     /// Read-only view of an already-memoized decision.
     ///
     /// Used by the `&RequestContext` capability predicates (buffering,

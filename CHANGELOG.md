@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Draft security remediation
+
+- Draft #6008/#6009 restores receipt-anchored route totals for deterministically
+  selectable early SOAP/body collectors on H1/H2 and native H3, captures timeout
+  ownership, and restores shared retained-request admission for native H3.
+  The unresolved-selection 503 policy is **not owner-approved**. The entire
+  candidate remains draft; GHSA-gxfv-924p-wvx4 is not closed and v0.9.11 is not
+  patched. See [the concrete policy proposal](docs/early_upload_policy.md).
+  ferrum-contracts parity is required for the next qualified release.
+
 ## [0.9.11] - 2026-10-04
 
 Release candidate prepared on 2026-10-04 UTC; this is the planned cut/preparation

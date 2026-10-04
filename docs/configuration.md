@@ -995,6 +995,12 @@ calling out:
 
 See [plugins.md](plugins.md) for the per-plugin enforcement points.
 
+Draft #6008/#6009 extends the retained-request admission contract to all native-H3
+early collectors: finite fallback at effective zero, aggregate reservation before
+allocation, and charge ownership through retained Bytes/retry clones. Genuine
+streaming zero behavior is unchanged. The early route-total and unresolved-policy
+proposal remains [draft pending owner approval](early_upload_policy.md).
+
 ### DNS
 
 | Variable | Required | Default | Description |

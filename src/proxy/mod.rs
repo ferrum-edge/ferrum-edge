@@ -42,6 +42,7 @@ pub mod body;
 pub mod client_ip;
 pub mod datagram_client_address;
 pub mod deferred_log;
+pub(crate) mod early_upload;
 /// Pre-request admission bound for the data-plane HTTP frontend (issue #4152).
 /// Covers the H1-vs-H2 version sniff and HTTP/2 SETTINGS/header windows that
 /// hyper's HTTP/1 `header_read_timeout` cannot see, without closing idle
@@ -3839,6 +3840,7 @@ struct BufferedClientRequestBody {
 }
 
 enum RequestBodyBufferError {
+    EarlyPolicy(early_upload::UploadExpiry),
     TooLarge,
     ClientDisconnected(String),
     TimedOut,
@@ -3966,7 +3968,7 @@ pub(crate) fn classify_direct_h2_upload_outcome(
 /// Later early-phase consumers must reuse one already-drained prebuffer rather
 /// than starting (and deducting) a second fresh whole-upload timeout.
 #[inline]
-pub(crate) fn early_upload_phase_needs_fresh_drain(prebuffered_body: &Option<Vec<u8>>) -> bool {
+pub(crate) fn early_upload_phase_needs_fresh_drain<T>(prebuffered_body: &Option<T>) -> bool {
     prebuffered_body.is_none()
 }
 
@@ -4020,14 +4022,14 @@ where
 {
     match composed_bound {
         Some((effective_deadline, EarlyUploadBoundKind::OperatorTimeout)) => {
-            tokio::time::timeout_at(effective_deadline, collect)
+            crate::plugins::await_deadline_first(Some(effective_deadline), collect)
                 .await
-                .map_err(|_| RequestBodyWaitError::TimedOut)
+                .map_err(|()| RequestBodyWaitError::TimedOut)
         }
         Some((effective_deadline, EarlyUploadBoundKind::RpcDeadline)) => {
-            tokio::time::timeout_at(effective_deadline, collect)
+            crate::plugins::await_deadline_first(Some(effective_deadline), collect)
                 .await
-                .map_err(|_| RequestBodyWaitError::DeadlineExceeded)
+                .map_err(|()| RequestBodyWaitError::DeadlineExceeded)
         }
         None => collect_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
     }
@@ -4197,6 +4199,28 @@ async fn buffer_request_body_for_before_proxy(
     request_body_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<ClientRequestBody, RequestBodyBufferError> {
+    buffer_request_body_with_early_bound(
+        request,
+        method,
+        headers,
+        max_request_body_size_bytes,
+        request_body_read_timeout_ms,
+        grpc_deadline_at,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn buffer_request_body_with_early_bound(
+    request: Request<Incoming>,
+    method: &str,
+    headers: &HashMap<String, String>,
+    max_request_body_size_bytes: usize,
+    request_body_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    early_bound: Option<Result<early_upload::CapturedUploadBound, early_upload::UploadExpiry>>,
+) -> Result<ClientRequestBody, RequestBodyBufferError> {
     // Keep the existing no-collection fast path only when the method/header
     // classification and the protocol body state agree that the request is
     // empty. In particular, an H2 GET/HEAD/OPTIONS request can omit
@@ -4225,6 +4249,9 @@ async fn buffer_request_body_for_before_proxy(
         return Err(RequestBodyBufferError::TooLarge);
     }
 
+    let early_bound = early_bound
+        .transpose()
+        .map_err(RequestBodyBufferError::EarlyPolicy)?;
     let (parts, body) = request.into_parts();
     // Aggregate admission BEFORE the buffer is allocated. Sized to the ceiling,
     // because the ceiling is the most this collect can retain and admission has
@@ -4235,12 +4262,22 @@ async fn buffer_request_body_for_before_proxy(
     let budget_permit = response_buffer_budget::RequestBufferPermit::reserve(ceiling)
         .ok_or(RequestBodyBufferError::BufferCapacityExceeded)?;
     let limited = http_body_util::Limited::new(body, ceiling);
-    let collected = collect_request_body_with_deadline(
-        limited.collect(),
-        grpc_deadline_at,
-        request_body_read_timeout_ms,
-    )
-    .await?;
+    let collected = match early_bound {
+        Some(bound) => bound
+            .collect(limited.collect())
+            .await
+            .map_err(|expiry| match expiry {
+                early_upload::UploadExpiry::Read => RequestBodyBufferError::TimedOut,
+                early_upload::UploadExpiry::Rpc => RequestBodyBufferError::DeadlineExceeded,
+                other => RequestBodyBufferError::EarlyPolicy(other),
+            })?,
+        None => collect_request_body_with_deadline(
+            limited.collect(),
+            grpc_deadline_at,
+            request_body_read_timeout_ms,
+        )
+        .await?,
+    };
     // Limited::collect() returns either a LengthLimitError (the body actually
     // exceeded the cap -> 413) or the underlying transport error (the client
     // dropped the connection mid-upload -> 499). Distinguish them so a client
@@ -4307,6 +4344,18 @@ async fn prepare_mesh_request_body(
         )
         .await
         .map_err(|error| match error {
+            RequestBodyBufferError::EarlyPolicy(_) => retry::BackendResponse {
+                status_code: 503,
+                body: ResponseBody::buffered(
+                    br#"{"error":"Request body policy cannot be resolved"}"#.to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: None,
+                error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                request_on_wire: false,
+                buffered_trailers: None,
+            },
             RequestBodyBufferError::TooLarge => retry::BackendResponse {
                 status_code: 413,
                 body: ResponseBody::buffered(
@@ -24475,7 +24524,7 @@ fn rejection_selects_gateway_deadline(
     ctx: &RequestContext,
     charged_backend_deadline: bool,
 ) -> bool {
-    if charged_backend_deadline {
+    if charged_backend_deadline || ctx.early_upload_terminal_selected() {
         return false;
     }
     ctx.gateway_deadline_response_selected()
@@ -24574,13 +24623,31 @@ async fn run_after_proxy_hooks_on_rejection(
         // cleanup hooks still run. A charged backend deadline terminal
         // (#5744) is bounded the same way, with or without an RPC deadline in
         // force.
-        let post_deadline_terminal = terminal_gateway_deadline || charged_backend_deadline;
+        let post_deadline_terminal = terminal_gateway_deadline
+            || charged_backend_deadline
+            || ctx.early_upload_terminal_selected();
         if (post_deadline_terminal || terminal_gateway_capacity)
             && plugin.may_replace_rejection_response()
         {
             continue;
         }
         let result = if post_deadline_terminal {
+            if ctx.early_upload_terminal_selected()
+                && ctx
+                    .precommit_response_phase_bound()
+                    .elapsed_authorization()
+                    .is_some()
+            {
+                // The collector's earlier owner remains authoritative. Do not
+                // poll protected cleanup after a later credential expiry or
+                // relabel this terminal as that later authorization deadline.
+                restore_rejection_response_markers(
+                    ctx,
+                    previous_marker,
+                    previous_replaceable_marker,
+                );
+                return;
+            }
             // A charged terminal composes the credential's lifetime: an elapsed
             // one answers with the fixed authorization terminal before the hook
             // is polled, and a pending hook detaches only under it. The gate is
@@ -25065,7 +25132,10 @@ fn enforce_synthetic_response_body_limit(
     // representation `400`. A smaller route body-size ceiling must not
     // recategorize either fixed, redaction-safe error as a backend
     // representation failure.
-    if ctx.gateway_capacity_response_selected() || ctx.gateway_representation_response_selected() {
+    if ctx.gateway_capacity_response_selected()
+        || ctx.gateway_representation_response_selected()
+        || ctx.early_upload_terminal_selected()
+    {
         return false;
     }
     if body.is_empty() || synthetic_response_omits_body(&ctx.method, *status) {
@@ -25446,6 +25516,7 @@ async fn reenforce_final_synthetic_client_visible_response_body_policy(
     // answer. Re-deciding policy against a gateway error payload is exactly what
     // the first-pass loops refuse to do.
     if ctx.authorization_termination().is_some()
+        || ctx.early_upload_terminal_selected()
         || ctx.gateway_capacity_response_selected()
         || ctx.gateway_deadline_response_selected()
         || ctx.gateway_representation_response_selected()
@@ -25701,6 +25772,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // `apply_reject_after_proxy_and_synthetic_body_hooks` over the final
     // response, so running them here would consume one-shot response state twice.
     let admission = if ctx.gateway_capacity_response_selected()
+        || ctx.early_upload_terminal_selected()
         || ctx.gateway_representation_response_selected()
     {
         terminal_body_response_selected = true;
@@ -26197,13 +26269,14 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 continue;
             }
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+            let early_upload_terminal = ctx.early_upload_terminal_selected();
             let (pending_hook, detached_bound) = match run_response_committed_hook_until_deadline(
                 Arc::clone(plugin),
                 ctx,
                 normalized.http_status.as_u16(),
                 &normalized.headers,
                 normalized.body.clone(),
-                terminal_gateway_deadline,
+                terminal_gateway_deadline || early_upload_terminal,
                 false,
             )
             .await
@@ -26225,7 +26298,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                     break;
                 }
             };
-            if !terminal_gateway_deadline {
+            if !terminal_gateway_deadline && !ctx.early_upload_terminal_selected() {
                 ctx.mark_gateway_deadline_response_selected();
                 replace_rejection_with_gateway_deadline(ctx, status, Some(body), headers);
             }
@@ -29054,6 +29127,70 @@ async fn evaluate_final_client_visible_response_header_policy(
     None
 }
 
+/// Preserve the captured collector terminal while closing its header map.
+/// Header policies get one ready poll while authorization permits it. A refusal,
+/// pending policy or later authorization expiry removes all optional headers;
+/// no rejected decoration survives and no later deadline acquires attribution.
+async fn close_early_upload_terminal_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+    body_len: usize,
+) -> bool {
+    let mut minimal = ctx
+        .precommit_response_phase_bound()
+        .elapsed_authorization()
+        .is_some();
+    if !minimal {
+        for plugin in plugins {
+            if !plugin.enforces_final_client_visible_response_headers(ctx) {
+                continue;
+            }
+            if ctx
+                .precommit_response_phase_bound()
+                .elapsed_authorization()
+                .is_some()
+            {
+                minimal = true;
+                break;
+            }
+            let outcome = {
+                let hook = plugin.finalize_client_visible_response_headers(
+                    ctx,
+                    response_status,
+                    response_headers,
+                );
+                tokio::pin!(hook);
+                std::future::poll_fn(|cx| {
+                    Poll::Ready(match std::future::Future::poll(hook.as_mut(), cx) {
+                        Poll::Ready(result) => Some(result),
+                        Poll::Pending => None,
+                    })
+                })
+                .await
+            };
+            if !matches!(outcome, Some(PluginResult::Continue)) {
+                minimal = true;
+                break;
+            }
+        }
+    }
+    if minimal {
+        response_headers.clear();
+        response_headers.insert("content-type".to_string(), "application/json".to_string());
+        response_headers.insert("content-length".to_string(), body_len.to_string());
+        if response_status == 504 {
+            response_headers.insert(
+                X_GATEWAY_ERROR_HEADER.to_string(),
+                X_GATEWAY_ERROR_REQUEST_TIMEOUT.to_string(),
+            );
+        }
+        ctx.record_deadline_response_header_mutations(response_headers);
+    }
+    minimal
+}
+
 /// Run the authoritative final client-visible response HEADER policy phase.
 ///
 /// This is the last rejecting phase in the response lifecycle. It runs at the
@@ -29095,6 +29232,16 @@ async fn enforce_final_client_visible_response_header_policy(
     response_body: &mut Bytes,
     preserve_from_gateway_provenance: bool,
 ) -> bool {
+    if ctx.early_upload_terminal_selected() {
+        return close_early_upload_terminal_headers(
+            plugins,
+            ctx,
+            *response_status,
+            response_headers,
+            response_body.len(),
+        )
+        .await;
+    }
     // A pre-commitment authorization expiry is already the gateway's fixed,
     // redaction-safe terminal. Re-entering a plugin policy under the elapsed
     // authorization bound would select that terminal again and the permitted
@@ -29866,6 +30013,11 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
     let detached_bound = DetachedResponseCommittedBound {
         authorization_at: bound.authorization_deadline_at(),
     };
+    if ctx.early_upload_terminal_selected() && bound.elapsed_authorization().is_some() {
+        // No protected observer gets a poll, and a later security deadline
+        // cannot acquire attribution for the collector's earlier terminal.
+        return ResponseCommittedHookOutcome::Completed;
+    }
     let one_poll_terminal = terminal_gateway_deadline || charged_terminal;
     if !one_poll_terminal && deadline.is_none() {
         plugin
@@ -30623,6 +30775,102 @@ async fn handle_backend_admission_rejection(
         return response;
     }
     build_response_from_normalized_reject(reject)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_early_upload_policy_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    expiry: early_upload::UploadExpiry,
+    grpc: bool,
+    grpc_web: Option<&str>,
+) -> Response<ProxyBody> {
+    use early_upload::UploadExpiry;
+
+    let (result, phase) = match expiry {
+        UploadExpiry::Read => {
+            return build_request_body_timeout_response(grpc, grpc_web, &[]);
+        }
+        UploadExpiry::Rpc => {
+            return boxed_finalize_upload_deadline_rejection(
+                plugins,
+                ctx,
+                state,
+                start_time,
+                "grpc_deadline_early_upload",
+                plugin_execution_ns,
+                None,
+                grpc_web,
+            )
+            .await;
+        }
+        UploadExpiry::Route => {
+            ctx.mark_route_request_timeout_exceeded(ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH);
+            (
+                PluginResult::Reject {
+                    status_code: 504,
+                    body: ROUTE_REQUEST_TIMEOUT_BODY.to_string(),
+                    headers: HashMap::from([
+                        ("content-type".to_string(), "application/json".to_string()),
+                        (
+                            X_GATEWAY_ERROR_HEADER.to_string(),
+                            X_GATEWAY_ERROR_REQUEST_TIMEOUT.to_string(),
+                        ),
+                    ]),
+                },
+                "route_request_timeout_early_upload",
+            )
+        }
+        UploadExpiry::Authorization(termination) => {
+            ctx.record_authorization_termination_once(termination, request_upload_auth_family(ctx));
+            (
+                crate::plugins::authorization_expired_plugin_result(grpc, termination),
+                "authorization_lifetime_early_upload",
+            )
+        }
+        UploadExpiry::Unresolved => (
+            early_upload::unresolved_policy_result(),
+            "early_upload_policy_unresolved",
+        ),
+    };
+    if matches!(expiry, UploadExpiry::Route | UploadExpiry::Unresolved) {
+        ctx.mark_early_upload_terminal_selected();
+    }
+    let Some(reject) = plugin_result_into_reject_parts(result) else {
+        // Every branch above constructs a Reject. Keep the fallback explicit
+        // if the canonical terminal representation ever changes.
+        let mut response = Response::new(ProxyBody::full(Bytes::new()));
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        record_request(state, 500);
+        return response;
+    };
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        reject.body,
+        reject.headers,
+        grpc,
+        grpc_web.is_none(),
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &reject);
+    let grpc_web_response = build_grpc_web_reject_response(plugins, ctx, grpc_web, &reject).await;
+    let status = reject.http_status.as_u16();
+    log_pre_backend_rejected_request(
+        plugins,
+        ctx,
+        status,
+        start_time,
+        phase,
+        plugin_execution_ns,
+    )
+    .await;
+    record_request(state, status);
+    grpc_web_response.unwrap_or_else(|| build_response_from_normalized_reject(reject))
 }
 
 /// Finalize a client RPC deadline discovered while buffering the upload.
@@ -33996,7 +34244,7 @@ async fn handle_proxy_request_inner(
     if authenticate_body_requirements.required {
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
-                match buffer_request_body_for_before_proxy(
+                match buffer_request_body_with_early_bound(
                     *request,
                     &method,
                     &ctx.headers,
@@ -34011,6 +34259,24 @@ async fn handle_proxy_request_inner(
                     ),
                     proxy.backend_read_timeout_ms,
                     ctx.grpc_deadline_at(),
+                    Some(
+                        early_upload::EarlyCollectorWitness::select(
+                            &plugin_cache_view,
+                            &ctx,
+                            &ctx.headers,
+                            false,
+                            false,
+                        )
+                        .capture(
+                            &ctx,
+                            proxy.backend_read_timeout_ms,
+                            auth_lifetime::effective_request_auth_deadline(
+                                &ctx,
+                                state.env_config.authenticated_stream_max_lifetime_seconds,
+                            ),
+                            is_grpc_request,
+                        ),
+                    ),
                 )
                 .await
                 {
@@ -34045,6 +34311,19 @@ async fn handle_proxy_request_inner(
                             }
                         }
                         buffered
+                    }
+                    Err(RequestBodyBufferError::EarlyPolicy(expiry)) => {
+                        return Ok(finalize_early_upload_policy_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            expiry,
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        )
+                        .await);
                     }
                     Err(RequestBodyBufferError::TooLarge) => {
                         let response = build_request_body_too_large_response(
@@ -34149,6 +34428,8 @@ async fn handle_proxy_request_inner(
         )
         .await
         {
+            drop(client_request_body);
+            ctx.discard_retained_request_metadata();
             plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
             let reject = boxed_finalize_reject_response(
                 &plugins,
@@ -34211,13 +34492,31 @@ async fn handle_proxy_request_inner(
         );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
-                match buffer_request_body_for_before_proxy(
+                match buffer_request_body_with_early_bound(
                     *request,
                     &method,
                     &ctx.headers,
                     body_limit,
                     proxy.backend_read_timeout_ms,
                     ctx.grpc_deadline_at(),
+                    Some(
+                        early_upload::EarlyCollectorWitness::select(
+                            &plugin_cache_view,
+                            &ctx,
+                            &ctx.headers,
+                            true,
+                            false,
+                        )
+                        .capture(
+                            &ctx,
+                            proxy.backend_read_timeout_ms,
+                            auth_lifetime::effective_request_auth_deadline(
+                                &ctx,
+                                state.env_config.authenticated_stream_max_lifetime_seconds,
+                            ),
+                            is_grpc_request,
+                        ),
+                    ),
                 )
                 .await
                 {
@@ -34236,6 +34535,19 @@ async fn handle_proxy_request_inner(
                             );
                         }
                         buffered
+                    }
+                    Err(RequestBodyBufferError::EarlyPolicy(expiry)) => {
+                        return Ok(finalize_early_upload_policy_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            expiry,
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        )
+                        .await);
                     }
                     Err(RequestBodyBufferError::TooLarge) => {
                         let response = build_request_body_too_large_response(
@@ -34341,6 +34653,8 @@ async fn handle_proxy_request_inner(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
+                    drop(client_request_body);
+                    ctx.discard_retained_request_metadata();
                     crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                     let plugin_reject = plugin_result_into_reject_parts(reject)
                         .expect("reject result should convert to rejection parts");
@@ -34435,13 +34749,31 @@ async fn handle_proxy_request_inner(
         );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
-                match buffer_request_body_for_before_proxy(
+                match buffer_request_body_with_early_bound(
                     *request,
                     &method,
                     &ctx.headers,
                     body_limit,
                     proxy.backend_read_timeout_ms,
                     ctx.grpc_deadline_at(),
+                    Some(
+                        early_upload::EarlyCollectorWitness::select(
+                            &plugin_cache_view,
+                            &ctx,
+                            &ctx.headers,
+                            true,
+                            true,
+                        )
+                        .capture(
+                            &ctx,
+                            proxy.backend_read_timeout_ms,
+                            auth_lifetime::effective_request_auth_deadline(
+                                &ctx,
+                                state.env_config.authenticated_stream_max_lifetime_seconds,
+                            ),
+                            is_grpc_request,
+                        ),
+                    ),
                 )
                 .await
                 {
@@ -34466,6 +34798,19 @@ async fn handle_proxy_request_inner(
                             );
                         }
                         buffered
+                    }
+                    Err(RequestBodyBufferError::EarlyPolicy(expiry)) => {
+                        return Ok(finalize_early_upload_policy_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            expiry,
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        )
+                        .await);
                     }
                     Err(RequestBodyBufferError::TooLarge) => {
                         let response = build_request_body_too_large_response(
@@ -34705,6 +35050,8 @@ async fn handle_proxy_request_inner(
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                drop(client_request_body);
+                ctx.discard_retained_request_metadata();
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!("before_proxy rejection could not be normalized");
                     record_request(&state, 500);
@@ -34768,6 +35115,8 @@ async fn handle_proxy_request_inner(
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                drop(client_request_body);
+                ctx.discard_retained_request_metadata();
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!("before_proxy rejection could not be normalized");
                     ctx.headers = tmp_headers;
@@ -35291,7 +35640,8 @@ async fn handle_proxy_request_inner(
         let previous_proxy = Arc::clone(&proxy);
         proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
         // A deferred hook may have re-published route overrides, so re-arm.
-        // The receipt-anchored total only ever shortens, but a gRPC rule's
+        // A non-gRPC total can clear or extend at the same receipt anchor;
+        // a gRPC total only shortens, but a gRPC rule's
         // per-attempt budget restarts from now, which is still before the
         // handoff to the backend.
         ctx.arm_route_request_deadline(is_grpc_request);
@@ -35434,6 +35784,19 @@ async fn handle_proxy_request_inner(
                 .await
                 {
                     Ok(body) => body,
+                    Err(RequestBodyBufferError::EarlyPolicy(expiry)) => {
+                        return Ok(finalize_early_upload_policy_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            expiry,
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        )
+                        .await);
+                    }
                     Err(RequestBodyBufferError::TooLarge) => {
                         return Ok(finalize_terminal_request_body_read_rejection(
                             &state,
@@ -35902,6 +36265,19 @@ async fn handle_proxy_request_inner(
                 .await
                 {
                     Ok(body) => body,
+                    Err(RequestBodyBufferError::EarlyPolicy(expiry)) => {
+                        return Ok(finalize_early_upload_policy_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            expiry,
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        )
+                        .await);
+                    }
                     Err(RequestBodyBufferError::TooLarge) => {
                         cb_probe.release_neutral();
                         record_request(&state, 413);
@@ -44899,7 +45275,7 @@ pub(crate) async fn proxy_to_backend_retry(
     if let Some(body) = request_body
         && !body.is_empty()
     {
-        let body_bytes = Bytes::copy_from_slice(body);
+        let body_bytes = request_ctx.charged_retained_request_copy(body);
         let (upload_body, pump) = install_buffered_upload_write_watermark(
             body_bytes.clone(),
             proxy.backend_write_timeout_ms,
@@ -62101,7 +62477,7 @@ async fn proxy_to_backend_http3_retry(
         },
     );
 
-    let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
+    let body_bytes = request_ctx.charged_retained_request_copy(request_body.unwrap_or(&[]));
     let may_release_after_headers =
         !stream_response && plugins_may_release_response_body_under_retries(plugins, request_ctx);
     let retry_ctx = may_release_after_headers.then(|| retry_response_decision_context(request_ctx));

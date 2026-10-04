@@ -28,6 +28,13 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Unreleased
 
+Draft #6008/#6009 adds early route-total enforcement and native-H3 retained-body
+admission. It proposes withdrawing support for unresolved early-collection
+routing dependencies with a fixed 503; **no owner approval exists**. Review the
+[exact affected profiles and terminal](early_upload_policy.md) before adopting
+this draft. v0.9.11 remains the inspected affected release; its published
+artifacts and contracts are immutable. The advisory metadata remains unchanged.
+
 ## Upgrading to 0.9.11 (release draft)
 
 0.9.11 is not published or qualified yet. This candidate was prepared on

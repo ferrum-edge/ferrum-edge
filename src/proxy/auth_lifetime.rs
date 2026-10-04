@@ -578,6 +578,7 @@ pub struct ComposedAuthBound {
     authorization: Option<StreamAuthDeadline>,
     /// Whether `at` came from `authorization`.
     authorization_wins: bool,
+    route_wins: bool,
 }
 
 impl ComposedAuthBound {
@@ -597,19 +598,39 @@ impl ComposedAuthBound {
                 at: Some(plan.at),
                 authorization: Some(plan),
                 authorization_wins: true,
+                route_wins: false,
             },
             (Some(protocol), authorization) => Self {
                 at: Some(protocol),
                 authorization,
                 authorization_wins: false,
+                route_wins: false,
             },
             (None, Some(plan)) => Self {
                 at: Some(plan.at),
                 authorization: Some(plan),
                 authorization_wins: true,
+                route_wins: false,
             },
             (None, None) => Self::default(),
         }
+    }
+
+    /// Add a plain-HTTP total while retaining the actual earlier owner. Existing
+    /// RPC/authorization ties keep their established precedence.
+    pub(crate) fn with_route_total(mut self, route: Option<tokio::time::Instant>) -> Self {
+        if let Some(at) = route
+            && self.at.is_none_or(|current| at < current)
+        {
+            self.at = Some(at);
+            self.authorization_wins = false;
+            self.route_wins = true;
+        }
+        self
+    }
+
+    pub(crate) fn route_wins(self) -> bool {
+        self.route_wins
     }
 
     /// The instant the bounded work runs under: the earliest of the two.

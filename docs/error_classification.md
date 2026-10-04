@@ -762,3 +762,13 @@ Refer to the canonical-taxonomy table above for what each class means. A few cla
 - [`src/proxy/udp_proxy.rs`](../src/proxy/udp_proxy.rs) — `dtls_disconnect_cause`, `dtls_disconnect_direction`
 - [`src/http3/client.rs`](../src/http3/client.rs) — typed `H3PoolError` with `request_on_wire()` body-on-wire signal
 - [`src/proxy/http2_pool.rs`](../src/proxy/http2_pool.rs) — `Http2PoolError` typed classifier (exemplary template)
+
+## Draft early retained-upload timeout attribution (#6008/#6009)
+
+A deterministically selected early route total that wins collection returns the
+existing 504/request_timeout before backend dispatch, neutral to backend health.
+The captured earlier read/RPC/accepted-authorization owner survives late wakeups.
+Native-H3 capacity refusal uses the existing health-neutral 503 /
+gRPC RESOURCE_EXHAUSTED retained-request contract. The fixed unresolved
+selection 503 is an unapproved policy proposal, not timeout or authentication
+failure. See [draft policy scope and qualification](early_upload_policy.md).

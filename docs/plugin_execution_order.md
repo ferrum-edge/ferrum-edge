@@ -2183,3 +2183,15 @@ All plugins in the execution pipeline work transparently with gRPC requests. gRP
 - **Plugin rejections** are translated into trailers-only gRPC errors (`HTTP 200` with `grpc-status` / `grpc-message`) unless a plugin already supplied explicit gRPC error metadata.
 
 gRPC requests are detected by their `content-type: application/grpc` header and routed to the dedicated gRPC proxy path, which uses hyper's HTTP/2 client for trailer forwarding. The plugin pipeline runs before and after the gRPC backend call, just like HTTP requests.
+
+## Draft early route-total collector witness (#6008/#6009)
+
+The H1/H2 and native-H3 authenticate/authorize/pre-before_proxy sibling collectors
+preview only deterministic compiled mesh selection in their pinned generation.
+This pure selector runs no hooks and publishes no routing or authorization
+override. Normal before_proxy/deferred ordering and later arm/rearm remain;
+non-gRPC untimed replacement can clear or extend the receipt-anchored total.
+SOAP UsernameToken/X.509/SAML, timestamp-only SOAP, HMAC preverification,
+gRPC/gRPC-Web attempts, WebSocket/CONNECT exclusions and trailers retain their
+phase/protocol contracts. [Unresolved dependencies and the proposed 503](early_upload_policy.md)
+remain draft and require owner approval before release.
