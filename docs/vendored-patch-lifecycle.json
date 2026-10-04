@@ -52,6 +52,14 @@
         "reqwest-003-connection-admission-hook",
         "reqwest-004-connection-established-fd"
       ]
+    },
+    {
+      "id": "hyper-h2-body-progress-and-timeout",
+      "description": "Hyper patch 004 depends on patch 002's pending-body implementation. Retire both together after adopting an equivalent write-stall bound that preserves positive-capacity progress, or moving the HTTP/2 client off Hyper.",
+      "patch_ids": [
+        "hyper-002-min-data-frame-capacity",
+        "hyper-004-h2-body-write-timeout"
+      ]
     }
   ],
   "patches": [
@@ -768,19 +776,19 @@
       "owner_github": null,
       "reason": "The original 1 KiB minimum-capacity patch could deadlock a legal 512-byte peer stream window; Ferrum Edge 0.9.10 reproduced the failure with headers received but zero body bytes before timeout. The pending-body path used by the HTTP/2 write-timeout extension must preserve Hyper's invariant that every positive amount of assigned flow-control capacity permits progress.",
       "upstream": {
-        "filing": "filed",
+        "filing": "deliberate_fork_unfiled",
         "github_repo": "hyperium/hyper",
-        "pr_number": 4212,
+        "pr_number": null,
         "issue_number": 4211,
         "fork_ref": null
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "A Hyper release containing hyperium/hyper#4212's flow-control progress regressions is adopted and the pending-body implementation is upstream or retired with hyper patch 004.",
-        "co_retirement_group": null,
+        "trigger": "Retire Hyper patches 002 and 004 together when Ferrum adopts an equivalent upstream per-request HTTP/2 body write-stall bound preserving progress at every positive assigned capacity, or its HTTP/2 client moves off Hyper; hosted small-window, final-connection-byte, empty-EOS and write-stall regressions must pass against the replacement.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
         "compatible_release_test": {
           "status": "not_started",
-          "notes": null
+          "notes": "No compatible replacement release is selected or tested. Hyper #4212 closed unmerged on 2026-10-04 at 08:45:54 UTC and is historical context, not a release prerequisite."
         }
       },
       "regression_tests": [
@@ -837,11 +845,11 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "hyper offers an equivalent per-request bound on HTTP/2 request body write stalls, or Ferrum's HTTP/2 client moves off hyper.",
-        "co_retirement_group": null,
+        "trigger": "Retire Hyper patches 002 and 004 together when Ferrum adopts an equivalent upstream per-request HTTP/2 body write-stall bound preserving progress at every positive assigned capacity, or its HTTP/2 client moves off Hyper; hosted small-window, final-connection-byte, empty-EOS and write-stall regressions must pass against the replacement.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
         "compatible_release_test": {
           "status": "not_started",
-          "notes": null
+          "notes": "No compatible replacement release is selected or tested. Hyper #4212 closed unmerged on 2026-10-04 at 08:45:54 UTC and is historical context, not a release prerequisite."
         }
       },
       "regression_tests": [

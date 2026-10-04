@@ -1,3 +1,8 @@
+> Historical final description of Hyper #4212, which closed unmerged on
+> 2026-10-04 at 08:45:54 UTC. The validation below describes the upstream
+> proposal's historical checks, not verification of Ferrum's current ordered
+> vendor stack. See [the current status and retirement plan](README.md).
+
 The original version of this PR waited for at least 1 KiB of HTTP/2 send
 capacity before handing a body chunk to h2. Review correctly identified that
 this can hang when a peer advertises a smaller stream window.

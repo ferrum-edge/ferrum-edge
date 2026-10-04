@@ -1,3 +1,7 @@
+> Historical issue text for Hyper #4211. Its proposed fixed minimum was unsafe
+> for smaller legal peer windows and has been removed. Hyper #4212 closed
+> unmerged on 2026-10-04. See [the current patch and retirement plan](README.md).
+
 **Version**
 hyper 1.9.0 through `master` (c954d80), with h2 0.4.19.
 

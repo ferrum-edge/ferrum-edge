@@ -6,18 +6,27 @@
 
 ## Status
 
-Filed upstream on 2026-09-30 as
+The original workaround was filed on 2026-09-30 as
 [hyperium/hyper#4211](https://github.com/hyperium/hyper/issues/4211) and
-[hyperium/hyper#4212](https://github.com/hyperium/hyper/pull/4212). The first
-revision waited for at least 1 KiB of assigned send capacity. Review identified
-that a peer can legally advertise a smaller stream window, so that revision was
-unsafe. On 2026-10-04 the PR and Ferrum patch were revised to preserve progress
-for every positive amount of capacity instead.
+[hyperium/hyper#4212](https://github.com/hyperium/hyper/pull/4212). Its fixed
+1 KiB send-capacity threshold was unsafe for smaller legal peer windows.
+The PR was revised to test positive-capacity progress, then **closed unmerged
+on 2026-10-04 at 08:45:54 UTC**. It did not deliver an upstream implementation
+for adoption, and a release containing that PR is not a retirement trigger.
 
-[`issue.md`](issue.md) is the historical issue text.
-[`pr-description.md`](pr-description.md) is the current upstream PR
-description. Owner: Ferrum Edge maintainers. This work originated in Ferrum
-issue [#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588).
+The current pending-body implementation is a **deliberate fork**, governed by
+the [deliberate fork policy](../../dependency-policy.md#deliberate-fork-policy-and-sla).
+It is required by [Hyper patch 004](../004-h2-body-write-timeout/README.md).
+Owner: Ferrum Edge maintainers; dependency-governance owner:
+`@jeremyjpj0916`. No dated owner reaffirmation is recorded. Before the first
+stable release checkpoint, the owner must file a current equivalent upstream
+proposal or record a dated deliberate-fork reaffirmation in this README and
+the lifecycle inventory. The closed proposal is historical context, not
+upstream acceptance of the current fork.
+
+[`issue.md`](issue.md) and [`pr-description.md`](pr-description.md) archive the
+upstream issue and final PR description. This work originated in Ferrum issue
+[#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588).
 
 ## What was true
 
@@ -61,8 +70,11 @@ minimum DATA-frame size:
   `send_data`.
 
 [`hyper-min-data-frame-capacity.patch`](hyper-min-data-frame-capacity.patch)
-records the correction from the former fixed-minimum implementation to the
-current progress-preserving implementation.
+is the complete patch against the published Hyper 1.9.0 crate with patch 001
+applied. It introduces the pending-body foundation and progress regressions;
+it does not require the former patch 002 or patch 004 as a preimage. Apply
+[the complete ordered stack](../README.md) to reconstruct the current vendor
+source, including patch 004's timeout integration.
 
 ## Regression coverage
 
@@ -87,8 +99,18 @@ FERRUM_EDGE_TEST_BIN=target/debug/ferrum-edge \
 
 ## Retirement plan
 
-Retire this logical patch when a Hyper release containing PR #4212's regression
-coverage is adopted and the pending-body implementation is either upstream or
-retired with the body-write-timeout extension. The fixed 1 KiB behavior must
-not be restored. Retire h2 patch 002 independently when an h2 release containing
-PR #965 is adopted.
+Retire patches 002 and 004 together when Ferrum adopts an equivalent upstream
+HTTP/2 request-body write-stall bound that preserves progress for every positive
+assigned capacity, or when Ferrum's HTTP/2 client moves off Hyper. Both entries
+belong to the `hyper-h2-body-progress-and-timeout` co-retirement group. Upstream
+already permits positive-capacity progress in its ordinary body pipe; merely
+adopting that behavior does not replace Ferrum's pending-body timeout path.
+
+Before retirement, hosted tests must verify the 512-byte stream window, final
+connection byte, empty end-of-stream handling and write-stall timeout behavior
+against the proposed replacement. Keep the gateway behavioral regressions and
+regenerate any remaining patch stack. No compatible replacement release has
+been selected or tested. The fixed 1 KiB behavior must not be restored.
+
+Retire h2 patch 002 independently when an h2 release containing PR #965 or an
+equivalent runtime budget update is adopted and its accounting regressions pass.

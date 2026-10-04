@@ -40,7 +40,10 @@ default).
 
 The unified diff is
 [`hyper-h2-body-write-timeout.patch`](hyper-h2-body-write-timeout.patch),
-against hyper 1.9.0 with patches 001–003 applied.
+against the published hyper 1.9.0 crate with patches 001–003 applied.
+Apply [the complete ordered stack](../README.md); patch 002 supplies the
+pending-body foundation and permits progress at every positive capacity.
+Patch 004 never requires or restores the former fixed 1 KiB threshold.
 
 - **`hyper::ext::Http2BodyWriteTimeout`** (new, `src/ext/h2_body_write_timeout.rs`)
   is a request extension. It holds a duration and a shared `expired` flag that
@@ -200,7 +203,16 @@ Before proposing this to hyper:
 
 ## Retirement
 
-Retire when hyper offers an equivalent per-request bound on HTTP/2 body write
-stalls, or when Ferrum's HTTP/2 client moves off hyper. Until then the
-extension is Ferrum-only API, so it should be filed upstream (hyper or h2)
-before the deliberate-fork deadline.
+Retire together with [patch 002](../002-min-data-frame-capacity/README.md#retirement-plan)
+when Ferrum adopts an equivalent upstream per-request HTTP/2 body write-stall
+bound that preserves progress at every positive assigned capacity, or when
+Ferrum's HTTP/2 client moves off hyper. The shared pending-body implementation
+belongs to the `hyper-h2-body-progress-and-timeout` co-retirement group.
+Hosted replacement tests must cover small legal windows, the final connection
+byte, empty end-of-stream handling and write-stall bounds. No compatible
+replacement release has been selected or tested.
+
+Hyper #4212 closed unmerged; it is not an adoption path for this extension.
+Until a replacement is adopted, the extension is Ferrum-only API. The owner
+must file a current upstream proposal or record a dated reaffirmation in this
+README and the lifecycle inventory before the deliberate-fork checkpoint.

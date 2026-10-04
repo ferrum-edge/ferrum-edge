@@ -56,6 +56,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP/2 and gRPC uploads progress through small legal backend windows**
+  (#6001). The vendored Hyper body pipe previously waited for at least 1 KiB
+  of send capacity, so a backend advertising a 512-byte stream window could
+  receive headers but no body bytes before timeout. A pending non-empty chunk
+  now progresses whenever any capacity is assigned, including the final byte
+  of connection capacity; an empty end-of-stream chunk needs none. The existing
+  request-body write-stall bound still applies while a ready chunk cannot be
+  written, without treating a slow client as a backend write stall.
+- **Adaptive HTTP/2 receive windows keep their automatic small-DATA-frame
+  budget in sync** (#6001; hyperium/h2#965). The budget now follows runtime
+  target connection-window changes, preventing valid small DATA frames within
+  a grown advertised window from exhausting the initial budget and closing the
+  connection with `ENHANCE_YOUR_CALM`. Explicit budgets and outstanding framing
+  charges are preserved, including across window shrinkage. The lifetime limit
+  for empty non-final DATA frames is unchanged.
+
 - The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
   entry generation it selected. A concurrent same-key refresh survives the cleanup
   pass instead of being removed as stale. The expired-entry lookup path also removes

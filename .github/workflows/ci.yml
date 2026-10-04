@@ -1562,6 +1562,28 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
+      - name: Reconstruct the complete pinned Hyper patch stack
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/hyper-patch-stack"
+          mkdir -p "$evidence"
+          python3 .github/scripts/verify_hyper_patch_stack.py --self-test
+          curl --fail --location --retry 5 --silent --show-error \
+            https://static.crates.io/crates/hyper/hyper-1.9.0.crate \
+            --output "$evidence/hyper-1.9.0.crate"
+          echo "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca  $evidence/hyper-1.9.0.crate" | sha256sum --check
+          python3 .github/scripts/verify_hyper_patch_stack.py \
+            --archive "$evidence/hyper-1.9.0.crate" --evidence "$evidence" \
+            2>&1 | tee "$evidence/verification.log"
+
+      - name: Retain Hyper patch reconstruction evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hyper-patch-stack-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hyper-patch-stack
+          retention-days: 30
+
       - name: BoringCache Cargo
         uses: ./.github/actions/setup-boringcache
         with:
