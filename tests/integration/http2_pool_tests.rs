@@ -2790,7 +2790,6 @@ async fn test_direct_h1_handoff_gate_returns_the_untouched_connection_to_the_poo
 // Hyper's source EOF is earlier than h2 transport completion: final DATA may
 // be queued behind the backend window even after an early terminal response.
 async fn hyper_h2_lifetime_outlives_final_source_data(termination: u8) {
-    use http_body::Body as _;
     use http_body_util::{BodyExt, Full};
     use hyper::client::conn::http2;
     use std::convert::Infallible;
