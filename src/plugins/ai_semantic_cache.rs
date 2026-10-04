@@ -243,8 +243,8 @@ const CLEANUP_INTERVAL_SECONDS: u64 = 30;
 
 /// How long a per-key local Redis quarantine marker suppresses repeated
 /// download/parse/delete of the same inadmissible remote value after a
-/// quarantine `DEL` fails. Bounded so a repaired/replaced remote value is
-/// reconsidered within this interval without a config knob.
+/// quarantine `DEL` fails or the remote value exceeds the read cap. Bounded so
+/// a repaired/replaced value is reconsidered within this interval without a knob.
 const REDIS_QUARANTINE_TTL_SECONDS: u64 = 30;
 /// Hard ceiling on per-instance local Redis quarantine markers. Keeps memory
 /// and key-cardinality strictly bounded even when `max_entries` is large.
@@ -717,7 +717,7 @@ impl Drop for EmbeddingFlightCleanup {
     }
 }
 
-/// Local negative marker for a Redis key whose quarantine `DEL` failed.
+/// Local negative marker for an oversized Redis value or a failed quarantine `DEL`.
 ///
 /// `fingerprint` identifies the observed inadmissible remote value so a
 /// repaired/replaced payload can be distinguished when the marker is
@@ -727,7 +727,7 @@ struct RedisQuarantineMarker {
     expires_at: Instant,
 }
 
-/// Bounded per-plugin suppressor for failed Redis quarantine deletes.
+/// Bounded per-plugin suppressor for oversized values and failed quarantine deletes.
 ///
 /// Prevents the same poisoned remote value from being re-downloaded, reparsed,
 /// and re-deleted on every request when Redis write/ACL failures leave the key
@@ -800,6 +800,10 @@ impl RedisQuarantineSuppressor {
 
     fn record_delete_failure(&self, cache_key: &str, fingerprint: [u8; 32], now: Instant) {
         self.delete_failures_total.fetch_add(1, Ordering::Relaxed);
+        self.record_suppression(cache_key, fingerprint, now);
+    }
+
+    fn record_suppression(&self, cache_key: &str, fingerprint: [u8; 32], now: Instant) {
         let marker = RedisQuarantineMarker {
             fingerprint,
             expires_at: now + self.ttl,
@@ -1015,7 +1019,7 @@ pub struct AiSemanticCache {
     embedding_dimension: Arc<OnceLock<usize>>,
     /// Optional Redis client for centralized caching.
     redis_client: Option<Arc<RedisRateLimitClient>>,
-    /// Bounded local suppressor for Redis keys whose quarantine delete failed.
+    /// Bounded local suppressor for oversized values or failed quarantine deletes.
     /// Prevents immediate re-download/parse/delete amplification of the same
     /// inadmissible remote value. Per-instance so reload generations isolate.
     redis_quarantine: RedisQuarantineSuppressor,
@@ -1830,7 +1834,8 @@ impl AiSemanticCache {
         })
     }
 
-    /// Apply a Redis quarantine-`DEL` outcome (production and test seam).
+    /// Apply a Redis quarantine compare-and-delete outcome (production and test
+    /// seam).
     ///
     /// Success clears any local suppressor. Failure installs a fingerprint+TTL
     /// marker and emits a rate-limited redacted warning. Never converts a miss
@@ -1852,16 +1857,26 @@ impl AiSemanticCache {
             .maybe_warn_delete_failure(self.instance_id, self.created_at);
     }
 
-    /// Quarantine an inadmissible Redis entry: attempt `DEL`, then map the
-    /// outcome through [`Self::apply_redis_quarantine_delete_outcome`].
+    /// Quarantine an inadmissible Redis entry only if its raw bytes have not
+    /// changed since lookup, then map the outcome through
+    /// [`Self::apply_redis_quarantine_delete_outcome`]. Withheld maintenance
+    /// permissions install the same local marker without making Redis
+    /// unavailable; the bounded helper distinguishes them from I/O failures.
     async fn quarantine_invalid_redis_entry(
         &self,
         redis: &RedisRateLimitClient,
         redis_key: &str,
         cache_key: &str,
         fingerprint: [u8; 32],
+        observed_value: &[u8],
     ) {
-        let delete_ok = redis.delete(redis_key).await.is_ok();
+        // A false result means a concurrent writer changed or removed the
+        // value. That is a successful race outcome: leave the replacement
+        // untouched and allow a later lookup to reconsider it.
+        let delete_ok = redis
+            .delete_if_value_matches_bounded(redis_key, observed_value)
+            .await
+            .is_ok();
         self.apply_redis_quarantine_delete_outcome(cache_key, fingerprint, delete_ok);
     }
 
@@ -4982,9 +4997,10 @@ impl Plugin for AiSemanticCache {
         // and re-validated against the same status/content-type/size/JSON/header
         // admission contract as a local store, and any entry that fails is
         // quarantined so it cannot inject an oversized, non-JSON, wrong-status,
-        // or unsanitized response. Quarantine `DEL` failures are observed and
-        // locally suppressed (TTL + content fingerprint) so the same poisoned
-        // remote value cannot amplify download/parse/delete on every request.
+        // or unsanitized response. Quarantine compare-delete failures are
+        // observed and locally suppressed (TTL + content fingerprint) so the
+        // same poisoned remote value cannot amplify download/parse/delete on
+        // every request.
         if let Some(ref redis) = self.redis_client {
             // Always consult the local suppressor first so a failed quarantine
             // delete remains observable even while Redis is marked unavailable
@@ -5044,6 +5060,7 @@ impl Plugin for AiSemanticCache {
                                         &redis_key,
                                         &cache_key,
                                         fingerprint,
+                                        &data,
                                     )
                                     .await;
                                 }
@@ -5062,15 +5079,17 @@ impl Plugin for AiSemanticCache {
                             debug!(
                                 length,
                                 cap = self.redis_value_byte_cap(),
-                                "ai_semantic_cache: quarantining oversized Redis entry"
+                                "ai_semantic_cache: suppressing oversized Redis entry without a delete attempt"
                             );
-                            self.quarantine_invalid_redis_entry(
-                                redis,
-                                &redis_key,
+                            // The bounded read intentionally does not retain
+                            // the full oversized value, so it cannot be used
+                            // as a compare token. Suppress repeat probes rather
+                            // than risk deleting a concurrent replacement.
+                            self.redis_quarantine.record_suppression(
                                 &cache_key,
                                 fingerprint,
-                            )
-                            .await;
+                                Instant::now(),
+                            );
                         }
                     }
                     Ok(BoundedRedisValue::Empty) => {
@@ -5088,6 +5107,7 @@ impl Plugin for AiSemanticCache {
                                 &redis_key,
                                 &cache_key,
                                 fingerprint,
+                                b"",
                             )
                             .await;
                         }

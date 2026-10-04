@@ -62,6 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Redis semantic-cache quarantine now compares the observed value atomically** (#5986). Invalid
+  bounded values are deleted only if their raw bytes still match the value read, preserving a
+  concurrent replacement. The dedicated watched comparison transfers at most the observed
+  length plus one byte, even if a large value replaces a small invalid entry. Values larger than
+  the read bound remain in Redis until their TTL expires, while a bounded local quarantine
+  marker suppresses repeated processing without counting an unattempted delete as a failure.
+  The required Redis-backed CI gate exercises plugin admission, quarantine races, and bounded
+  transfer regressions.
+
 - The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
   entry generation it selected. A concurrent same-key refresh survives the cleanup
   pass instead of being removed as stale. The expired-entry lookup path also removes
