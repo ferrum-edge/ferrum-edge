@@ -796,9 +796,8 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
         // A later HIT through that same plugin proves permission denial did
         // not incorrectly mark it unavailable; health probes are 3600s apart.
         redis.delete(&key).await.unwrap();
-        let acl_plugin = Arc::new(
-            AiSemanticCache::new(&acl_config, PluginHttpClient::default()).unwrap(),
-        );
+        let acl_plugin =
+            Arc::new(AiSemanticCache::new(&acl_config, PluginHttpClient::default()).unwrap());
         let mut ctx = new_ctx();
         assert!(matches!(
             acl_plugin
@@ -843,7 +842,8 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             1
         );
         assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
-            &acl_plugin, &cache_key
+            &acl_plugin,
+            &cache_key
         ));
         assert!(matches!(
             redis.get_bytes_bounded(&key, READ_CAP).await,
@@ -872,7 +872,8 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             PluginResult::RejectBinary { status_code: 200, body, .. } if body.as_ref() == RESPONSE
         ));
         assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
-            &acl_plugin, &cache_key
+            &acl_plugin,
+            &cache_key
         ));
         assert!(matches!(
             redis.get_bytes_bounded(&key, READ_CAP).await,
