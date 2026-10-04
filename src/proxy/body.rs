@@ -2650,9 +2650,15 @@ impl UploadSource {
         incoming: Incoming,
         auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
+        require_end_stream: bool,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
         let mut source = UploadSource::Direct(incoming);
-        let join = source.install_pump_with_write_start(auth, write_timeout_ms, true);
+        let join = source.install_pump_with_write_start(
+            auth,
+            write_timeout_ms,
+            true,
+            require_end_stream,
+        );
         (source, join)
     }
 
@@ -2669,18 +2675,26 @@ impl UploadSource {
     ///
     /// Returns the source, the pump join (authorization lifetime only), and
     /// the write timeout to attach to the backend request (otherwise).
+    /// `require_end_stream` is captured from the frontend request version:
+    /// the pump must inspect the original H2 receive state before EOF is
+    /// converted to completion, while H1 chunked EOF needs no such proof.
     pub(crate) fn for_streaming_grpc_upload(
         incoming: Incoming,
         auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
+        require_end_stream: bool,
     ) -> (
         Self,
         Option<crate::proxy::upload_pump::UploadPumpJoin>,
         Option<hyper::ext::Http2BodyWriteTimeout>,
     ) {
         if auth.is_some() {
-            let (source, join) =
-                Self::for_streaming_upload_with_deferred_write(incoming, auth, write_timeout_ms);
+            let (source, join) = Self::for_streaming_upload_with_deferred_write(
+                incoming,
+                auth,
+                write_timeout_ms,
+                require_end_stream,
+            );
             return (source, join, None);
         }
         let write_timeout = (write_timeout_ms > 0 && !http_body::Body::is_end_stream(&incoming))
@@ -2749,7 +2763,7 @@ impl UploadSource {
         plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
     ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
-        self.install_pump_with_write_start(plan, write_timeout_ms, false)
+        self.install_pump_with_write_start(plan, write_timeout_ms, false, false)
     }
 
     fn install_pump_with_write_start(
@@ -2757,6 +2771,7 @@ impl UploadSource {
         plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
         defer_write_start: bool,
+        require_end_stream: bool,
     ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
         if plan.is_none() && write_timeout_ms == 0 {
             return None;
@@ -2768,6 +2783,7 @@ impl UploadSource {
                         incoming,
                         plan,
                         write_timeout_ms,
+                        require_end_stream,
                     )
                 } else {
                     crate::proxy::upload_pump::spawn_upload_pump(incoming, plan, write_timeout_ms)

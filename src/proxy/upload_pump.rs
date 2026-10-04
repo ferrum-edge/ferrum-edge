@@ -194,6 +194,10 @@ const PUMP_WRITE_TIMEOUT: u8 = 6;
 /// pump when the bridge closes, and overwritten by the pump's own terminal.
 /// `code_outcome` maps it to `None` like any unknown code.
 const PUMP_CONSUMER_DONE: u8 = 7;
+/// Hyper masked an inbound H2 reset as EOF without receive-side END_STREAM.
+/// Still a source error for lifecycle accounting, but retain its wire meaning
+/// so the backend receives CANCEL rather than a clean or internal-error end.
+const PUMP_SOURCE_RESET: u8 = 8;
 
 /// Terminal state of one gateway-owned upload pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,7 +237,7 @@ const fn outcome_code(outcome: UploadPumpOutcome) -> u8 {
 const fn code_outcome(code: u8) -> Option<UploadPumpOutcome> {
     match code {
         PUMP_COMPLETED => Some(UploadPumpOutcome::Completed),
-        PUMP_SOURCE_ERROR => Some(UploadPumpOutcome::SourceError),
+        PUMP_SOURCE_ERROR | PUMP_SOURCE_RESET => Some(UploadPumpOutcome::SourceError),
         PUMP_CANCELLED => Some(UploadPumpOutcome::Cancelled),
         PUMP_AUTHORIZATION_EXPIRED => Some(UploadPumpOutcome::AuthorizationExpired),
         PUMP_CONSUMER_GONE => Some(UploadPumpOutcome::ConsumerGone),
@@ -266,9 +270,14 @@ pub(crate) const fn upload_pump_error_message(outcome: UploadPumpOutcome) -> &'s
 ///
 /// Write-timeout uses a typed `io::ErrorKind::TimedOut` so the existing
 /// `classify_body_error` / `classify_reqwest_error` walks map it to
-/// `ReadWriteTimeout` without a second string heuristic. Other terminals keep
+/// `ReadWriteTimeout` without a second string heuristic. A masked H2 reset
+/// retains a typed CANCEL for hyper's backend writer. Other terminals keep
 /// the redacted literal.
-fn pump_terminal_error(outcome: UploadPumpOutcome) -> BoxError {
+fn pump_terminal_error(terminal: u8) -> BoxError {
+    if terminal == PUMP_SOURCE_RESET {
+        return Box::new(h2::Error::from(h2::Reason::CANCEL));
+    }
+    let outcome = code_outcome(terminal).unwrap_or(UploadPumpOutcome::ConsumerGone);
     let message = upload_pump_error_message(outcome);
     if outcome == UploadPumpOutcome::WriteTimeout {
         Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
@@ -449,11 +458,12 @@ impl UploadPumpSource {
         // A non-clean terminal is checked BEFORE the queue: a frame the pump
         // read from the client before the deadline but has not yet handed to
         // the transport is discarded rather than forwarded afterwards.
-        if let Some(outcome) = code_outcome(self.terminal.load(Ordering::Acquire))
+        let terminal = self.terminal.load(Ordering::Acquire);
+        if let Some(outcome) = code_outcome(terminal)
             && outcome != UploadPumpOutcome::Completed
         {
             self.reported_error = true;
-            return Poll::Ready(Some(Err(pump_terminal_error(outcome))));
+            return Poll::Ready(Some(Err(pump_terminal_error(terminal))));
         }
         match &mut self.frames {
             UploadFrames::Direct { frames, progress } => match frames.next_frame() {
@@ -493,20 +503,19 @@ impl UploadPumpSource {
                     // dropped mid-flight without reaching a terminal; fail
                     // closed with an error so the backend resets the stream
                     // instead of accepting a truncated upload as complete.
-                    match code_outcome(self.terminal.load(Ordering::Acquire)) {
+                    let terminal = self.terminal.load(Ordering::Acquire);
+                    match code_outcome(terminal) {
                         Some(UploadPumpOutcome::Completed) => {
                             self.ended = true;
                             Poll::Ready(None)
                         }
-                        Some(other) => {
+                        Some(_) => {
                             self.reported_error = true;
-                            Poll::Ready(Some(Err(pump_terminal_error(other))))
+                            Poll::Ready(Some(Err(pump_terminal_error(terminal))))
                         }
                         None => {
                             self.reported_error = true;
-                            Poll::Ready(Some(Err(pump_terminal_error(
-                                UploadPumpOutcome::ConsumerGone,
-                            ))))
+                            Poll::Ready(Some(Err(pump_terminal_error(PUMP_CONSUMER_GONE))))
                         }
                     }
                 }
@@ -916,7 +925,13 @@ where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Send,
 {
-    spawn_upload_pump_with_write_start(body, plan, write_timeout_ms, WriteWatermarkArm::Consumer)
+    spawn_upload_pump_with_write_start(
+        body,
+        plan,
+        write_timeout_ms,
+        WriteWatermarkArm::Consumer,
+        false,
+    )
 }
 
 /// Move a client request body into a pump whose authorization lifetime starts
@@ -932,12 +947,19 @@ pub(crate) fn spawn_upload_pump_with_deferred_write<B>(
     body: B,
     plan: Option<&RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
+    require_end_stream: bool,
 ) -> (UploadPumpSource, UploadPumpJoin)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Send,
 {
-    spawn_upload_pump_with_write_start(body, plan, write_timeout_ms, WriteWatermarkArm::Dispatcher)
+    spawn_upload_pump_with_write_start(
+        body,
+        plan,
+        write_timeout_ms,
+        WriteWatermarkArm::Dispatcher,
+        require_end_stream,
+    )
 }
 
 /// Who starts `backend_write_timeout_ms` for one pump (issue #4074).
@@ -962,6 +984,7 @@ fn spawn_upload_pump_with_write_start<B>(
     plan: Option<&RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
     arm: WriteWatermarkArm,
+    require_end_stream: bool,
 ) -> (UploadPumpSource, UploadPumpJoin)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
@@ -973,6 +996,7 @@ where
     let auth_armed = plan.is_some();
     let pump: PumpFuture = Box::pin(run_upload_pump(UploadPumpTask {
         body,
+        require_end_stream,
         sender,
         cancel_rx: side.cancel_rx,
         plan: plan.cloned(),
@@ -1137,6 +1161,9 @@ async fn await_oneshot_signal(
 /// publishes through the shared terminal before releasing anything.
 struct UploadPumpTask<B> {
     body: B,
+    /// Native H2 EOF must be backed by the original receive END_STREAM state.
+    /// Never set for H1: a valid chunked EOF need not update is_end_stream().
+    require_end_stream: bool,
     sender: tokio::sync::mpsc::Sender<BridgedFrame>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
     plan: Option<RequestAuthLifetimePlan>,
@@ -1156,6 +1183,7 @@ where
 {
     let UploadPumpTask {
         mut body,
+        require_end_stream,
         sender,
         cancel_rx,
         plan,
@@ -1190,6 +1218,7 @@ where
     let write_idle_dur = Duration::from_millis(write_timeout_ms);
     let write_idle = write_configured.then(|| tokio::time::sleep(write_idle_dur));
     tokio::pin!(write_idle);
+    let mut source_reset = false;
     let outcome = 'pump: loop {
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
@@ -1276,6 +1305,12 @@ where
             break next;
         };
         match frame {
+            // Inspect the ORIGINAL source before EOF becomes Completed and
+            // UploadPumpSource::ended hides the receive-side reset fact.
+            None if require_end_stream && !http_body::Body::is_end_stream(&body) => {
+                source_reset = true;
+                break UploadPumpOutcome::SourceError;
+            }
             None => break UploadPumpOutcome::Completed,
             Some(Ok(frame)) => {
                 let last = http_body::Body::is_end_stream(&body);
@@ -1287,7 +1322,12 @@ where
     // Publish BEFORE the sender drops: the transport side reads this exactly
     // when `poll_recv` observes the closed channel, and the channel close is
     // the synchronisation edge for this release store.
-    terminal.store(outcome_code(outcome), Ordering::Release);
+    let terminal_code = if source_reset {
+        PUMP_SOURCE_RESET
+    } else {
+        outcome_code(outcome)
+    };
+    terminal.store(terminal_code, Ordering::Release);
     drop(sender);
     // Explicit, and the whole point of this module: the gateway stops owning
     // the inbound client body here, whatever the backend transport is doing.

@@ -413,8 +413,9 @@ impl http_body::Body for GrpcBody {
                         }
                         // Hyper treats inbound H2 CANCEL/NO_ERROR as body EOF,
                         // but h2's receive state still distinguishes a reset
-                        // from END_STREAM. Do not turn an aborted upload into
-                        // a clean backend EOF after an early terminal response.
+                        // from END_STREAM. The authenticated pump checks that
+                        // original receive state before converting EOF into its
+                        // own terminal; this check covers the bare Incoming.
                         if *require_end_stream && !incoming.is_end_stream() {
                             let reset = h2::Error::from(h2::Reason::CANCEL);
                             return Poll::Ready(Some(Err(reset.into())));
@@ -4855,17 +4856,19 @@ pub async fn proxy_grpc_request_streaming(
     // transport body plus `UploadPumpSource` abort guard own upload teardown.
     // An upload with no authorization lifetime needs no pump: hyper's HTTP/2
     // pipe bounds the write itself (issue #5588).
+    let require_end_stream = parts.version == hyper::Version::HTTP_2;
     let (body, upload_pump, body_write_timeout) =
         crate::proxy::body::UploadSource::for_streaming_grpc_upload(
             body,
             auth,
             proxy.backend_write_timeout_ms,
+            require_end_stream,
         );
     let auth_deadline = auth.map(|(deadline, family, latch)| {
         crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
     });
     let grpc_body = GrpcBody::Streaming {
-        require_end_stream: parts.version == hyper::Version::HTTP_2,
+        require_end_stream,
         incoming: body,
         auth_deadline,
         bytes_seen: 0,
