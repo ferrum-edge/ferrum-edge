@@ -1220,7 +1220,8 @@ jobs:
   test-integration:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
-    # binary), so they ALSO don't need redis/mongo services. The shard split
+    # binary). The conditional-live-stores shard supplies real transactional
+    # stores for the ignored restore regressions. The shard split
     # below keeps every test-file filter visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
@@ -1233,6 +1234,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - shard: conditional-live-stores
+            conditional_live_stores: true
+            filters: |
+              integration::admin_conditional_write_tests::postgres_conditional_restore_checks_state_and_lease_in_transaction
+              integration::admin_conditional_write_tests::mysql_conditional_restore_checks_state_and_lease_in_transaction
+              integration::admin_conditional_write_tests::mongo_replica_set_conditional_restore_checks_state_and_lease_in_transaction
           - shard: admin-platform
             # Heavy admin API and cached-config surfaces share this shard with
             # the lower-count but setup-heavy k8s/telemetry/CNI platform tests.
@@ -1432,6 +1439,44 @@ jobs:
         # actions/download-artifact does not preserve the executable bit.
         run: chmod +x target/debug/ferrum-cni
 
+      - name: Start conditional restore live stores
+        if: matrix.conditional_live_stores == true
+        run: |
+          set -euo pipefail
+          docker run -d --name conditional-postgres -p 5432:5432 \
+            -e POSTGRES_DB=ferrum -e POSTGRES_USER=ferrum -e POSTGRES_PASSWORD=ferrum \
+            postgres:16-alpine
+          docker run -d --name conditional-mysql -p 3306:3306 \
+            -e MYSQL_DATABASE=ferrum -e MYSQL_USER=ferrum -e MYSQL_PASSWORD=ferrum \
+            -e MYSQL_ROOT_PASSWORD=ferrum mysql:8
+          docker run -d --name conditional-mongo --network host \
+            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            --setParameter transactionLifetimeLimitSeconds=180
+          for attempt in $(seq 1 90); do
+            if docker exec conditional-postgres pg_isready -U ferrum -d ferrum \
+              && docker exec conditional-mysql mysql -uferrum -pferrum ferrum -e 'SELECT 1' \
+              && docker exec conditional-mongo mongosh --quiet --port 27020 \
+                --eval 'quit(db.adminCommand({ping: 1}).ok === 1 ? 0 : 1)'; then
+              break
+            fi
+            if [ "$attempt" = 90 ]; then
+              echo "::error::conditional restore databases did not become ready"
+              exit 1
+            fi
+            sleep 2
+          done
+          docker exec conditional-mongo mongosh --quiet --port 27020 --eval \
+            'rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27020"}]})'
+          for attempt in $(seq 1 60); do
+            if docker exec conditional-mongo mongosh --quiet --port 27020 \
+              --eval 'quit(db.hello().isWritablePrimary === true ? 0 : 1)'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::conditional restore MongoDB replica set has no writable primary"
+          exit 1
+
       - name: Run integration test shard
         # Mirrors the `test-functional` shard runner. Each filter line is a
         # substring matched against the full test path
@@ -1450,15 +1495,32 @@ jobs:
             [ -z "$filter" ] && continue
             filters+=("$filter")
           done <<< "$INTEGRATION_FILTERS"
+          nextest_args=()
+          if [ "$CONDITIONAL_LIVE_STORES" = "true" ]; then
+            nextest_args+=(--run-ignored=all -j 1)
+          fi
           cargo nextest run \
             --archive-file "$archive_file" \
             --workspace-remap . \
             --no-fail-fast \
+            "${nextest_args[@]}" \
             "${filters[@]}"
         env:
           INTEGRATION_FILTERS: ${{ matrix.filters }}
+          CONDITIONAL_LIVE_STORES: ${{ matrix.conditional_live_stores == true && 'true' || 'false' }}
+          POSTGRES_URL: ${{ matrix.conditional_live_stores == true && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
+          MYSQL_URL: ${{ matrix.conditional_live_stores == true && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
+          MONGO_URL: ${{ matrix.conditional_live_stores == true && 'mongodb://127.0.0.1:27020/?replicaSet=rs0' || '' }}
           RUST_BACKTRACE: 1
         timeout-minutes: 30
+
+      - name: Stop conditional restore live stores
+        if: always() && matrix.conditional_live_stores == true
+        run: |
+          docker logs conditional-postgres || true
+          docker logs conditional-mysql || true
+          docker logs conditional-mongo || true
+          docker rm -f conditional-postgres conditional-mysql conditional-mongo || true
 
       - name: Check the test run left the checkout clean
         # Same guard as the Unit Tests job (issue #5706). The downloaded

@@ -10728,26 +10728,17 @@ async fn handle_restore(
     };
 
     if let Some(if_match) = if_match {
-        let completion = namespace_config_admission_guard
-            .run_to_completion_while_held(conditional_snapshots::restore(
-                state,
-                actor,
-                db.as_ref(),
-                namespace,
-                &payload,
-                if_match,
-                &restore_mode,
-                namespace_config_admission_guard.lease_ref(),
-            ))
-            .await;
-        let response = match completion {
-            Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-            Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => result,
-            Err(_) => json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
-            ),
-        };
+        let response = conditional_snapshots::restore(
+            state,
+            actor,
+            db.as_ref(),
+            namespace,
+            &payload,
+            if_match,
+            &restore_mode,
+            &mut namespace_config_admission_guard,
+        )
+        .await;
         if restore_guard.release().await.is_err() {
             error_persistence_failure_redacted("conditional_restore_guard_release");
             return Ok(json_response(

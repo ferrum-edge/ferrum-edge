@@ -22,8 +22,14 @@ fn metadata_captures_production_defaults_and_ignores_later_env_changes() {
     guard.set("FERRUM_BACKEND_DENY_CIDRS", "8.8.8.8/32");
     guard.set("FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES", "false");
     assert_eq!(env.backend_allow_ips.metadata(), metadata);
-    assert!(env.backend_allow_ips.is_allowed(&"10.0.0.1".parse().unwrap()));
-    assert!(!env.backend_allow_ips.is_allowed(&"169.254.169.254".parse().unwrap()));
+    assert!(
+        env.backend_allow_ips
+            .is_allowed(&"10.0.0.1".parse().unwrap())
+    );
+    assert!(
+        !env.backend_allow_ips
+            .is_allowed(&"169.254.169.254".parse().unwrap())
+    );
 }
 
 #[test]

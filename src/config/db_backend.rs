@@ -71,7 +71,9 @@ impl ConditionalNamespaceSnapshot {
 
 /// A validated replacement plus the exact namespace state it may replace.
 /// Stores compare `expected` inside the same transaction as every mutation and
-/// re-verify the admission lease before commit. No fallback to chunked restore.
+/// pin a live admission lease before reading the snapshot, then renew that
+/// pinned owner/generation before commit. Callers must stop and join external
+/// renewal before invoking this operation. No fallback to chunked restore.
 pub struct ConditionalNamespaceRestore<'a> {
     pub graph: AtomicBatchGraph<'a>,
     pub expected: &'a serde_json::Value,
@@ -87,7 +89,10 @@ impl ConditionalNamespaceRestore<'_> {
         }
         let namespace = self.graph.namespace;
         if self.graph.admission_namespaces() != [namespace]
-            || self.api_specs.iter().any(|spec| spec.namespace != namespace)
+            || self
+                .api_specs
+                .iter()
+                .any(|spec| spec.namespace != namespace)
             || self.gateway_trust_bundles.is_some_and(|records| {
                 records.len() > 1 || records.iter().any(|record| record.namespace != namespace)
             })
@@ -1780,7 +1785,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         _restore: &ConditionalNamespaceRestore<'_>,
         _mode: &BatchConfigWriteMode,
     ) -> Result<(), anyhow::Error> {
-        Err(anyhow::anyhow!("Conditional namespace restore is unsupported"))
+        Err(anyhow::anyhow!(
+            "Conditional namespace restore is unsupported"
+        ))
     }
 
     /// Load the namespace policy graph (proxies + plugin_configs) without

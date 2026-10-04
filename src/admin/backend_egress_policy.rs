@@ -60,8 +60,8 @@ pub(super) fn handle_get(state: &AdminState, namespace: &str) -> Response<Full<B
     // Any allow override may bypass the private/reserved block. Do not try to
     // reclassify or enumerate CIDRs here: a conservative false lets consumers
     // fail closed without duplicating the enforcement classifier.
-    let public_only_guaranteed = matches!(policy.allow_ips, BackendAllowIps::Public)
-        && !policy.allow_cidr_overrides_present;
+    let public_only_guaranteed =
+        matches!(policy.allow_ips, BackendAllowIps::Public) && !policy.allow_cidr_overrides_present;
     let response = BackendEgressPolicyResponse {
         schema_version: 1,
         ip_classification: "ferrum-private-reserved-v1",

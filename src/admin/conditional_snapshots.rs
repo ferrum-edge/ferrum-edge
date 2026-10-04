@@ -17,8 +17,7 @@ use super::preconditions::{self, IfMatch};
 use super::{AdminState, BackupExportPayload, json_response};
 use crate::config::db_backend::{
     AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
-    ConditionalNamespaceSnapshot, DatabaseBackend, NamespaceConfigAdmissionLeaseRef,
-    NamespacePreconditionFailed,
+    ConditionalNamespaceSnapshot, DatabaseBackend, NamespacePreconditionFailed,
 };
 use crate::config::types::{Consumer, PluginConfig, Proxy, Upstream, validate_resource_id};
 
@@ -287,7 +286,7 @@ pub(super) async fn restore(
     payload: &RestorePayload,
     if_match: &IfMatch,
     mode: &BatchConfigWriteMode,
-    lease: NamespaceConfigAdmissionLeaseRef<'_>,
+    admission: &mut crud::NamespaceConfigAdmissionGuard,
 ) -> Response<Full<Bytes>> {
     let snapshot = match db.load_conditional_namespace_snapshot(namespace).await {
         Ok(snapshot) => snapshot,
@@ -313,6 +312,9 @@ pub(super) async fn restore(
         Ok(specs) => specs.unwrap_or_default(),
         Err(_) => return unavailable(),
     };
+    if admission.hand_off_to_restore_transaction().await.is_err() {
+        return unavailable();
+    }
     let restore = ConditionalNamespaceRestore {
         graph: AtomicBatchGraph {
             namespace,
@@ -320,7 +322,7 @@ pub(super) async fn restore(
             upstreams: &payload.upstreams,
             proxies: &payload.proxies,
             plugin_configs: &payload.plugin_configs,
-            admission_lease: Some(lease),
+            admission_lease: Some(admission.lease_ref()),
         },
         expected: &expected,
         api_specs: &specs,

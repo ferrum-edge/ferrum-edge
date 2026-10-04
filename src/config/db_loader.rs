@@ -2930,6 +2930,7 @@ impl DatabaseStore {
     ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
         let purpose = FullLoadPurpose::RestoreSnapshot;
         let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies: self.load_proxies_tx(namespace, purpose, tx).await?,
             consumers: self.load_consumers_tx(namespace, purpose, tx).await?,
             plugin_configs: self.load_plugin_configs_tx(namespace, purpose, tx).await?,
@@ -2958,9 +2959,9 @@ impl DatabaseStore {
         .fetch_one(&mut **tx)
         .await?;
         let sequence: i64 = row.try_get("sequence")?;
-        let retention = sqlx::query(&self.q(
-            "SELECT retained_sequence FROM config_change_retention WHERE namespace = ?",
-        ))
+        let retention = sqlx::query(
+            &self.q("SELECT retained_sequence FROM config_change_retention WHERE namespace = ?"),
+        )
         .bind(namespace)
         .fetch_optional(&mut **tx)
         .await?;
@@ -7728,6 +7729,13 @@ impl DatabaseStore {
                     anyhow::bail!("MySQL conditional restore requires REPEATABLE READ isolation");
                 }
             }
+            // Pin the live lease before establishing the resource snapshot.
+            // The Admin keeper has handed renewal to this transaction. A row
+            // lock prevents takeover even if the original TTL elapses, and the
+            // commit gate renews only this pinned owner and generation.
+            let lease = graph.admission_lease.as_ref().ok_or(BatchAdmissionLeaseLost)?;
+            self.verify_namespace_config_admission_lease_tx(&mut tx, graph.namespace, lease)
+                .await?;
         }
         for namespace in &admission_namespaces {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
@@ -7742,6 +7750,8 @@ impl DatabaseStore {
             if current.representation()? != *restore.expected {
                 return Err(anyhow::Error::new(NamespacePreconditionFailed));
             }
+            crate::config::batch_atomicity::pause_conditional_restore_for_test(graph.namespace)
+                .await;
             self.delete_all_resources_in_tx(&mut tx, graph.namespace, mode)
                 .await?;
         }
@@ -7893,13 +7903,24 @@ impl DatabaseStore {
         // admission row. Any writer that could have invalidated the validated
         // graph had to take the lease first, so a matching owner and generation
         // here proves nobody interleaved.
-        if let Some(lease) = graph.admission_lease {
+        if restore.is_none()
+            && let Some(lease) = graph.admission_lease
+        {
             self.verify_namespace_config_admission_lease_tx(&mut tx, graph.namespace, &lease)
                 .await?;
         }
 
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+
+        // Keep renewal adjacent to commit, after potentially lengthy change-log
+        // compaction. The live entry pin remains held throughout both phases.
+        if restore.is_some()
+            && let Some(lease) = graph.admission_lease
+        {
+            self.renew_pinned_restore_lease_tx(&mut tx, graph.namespace, &lease)
+                .await?;
         }
 
         Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
@@ -7966,6 +7987,35 @@ impl DatabaseStore {
                  held at commit"
             )))
         }
+    }
+
+    /// Renew the lease already locked and verified live at restore entry.
+    /// Expiry here does not permit takeover: the same row has remained locked
+    /// for this entire transaction. Never use this gate without that entry pin.
+    async fn renew_pinned_restore_lease_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        lease: &crate::config::batch_atomicity::NamespaceConfigAdmissionLeaseRef<'_>,
+    ) -> Result<(), anyhow::Error> {
+        let now = self.config_admission_lease_now_sql();
+        let sql = self.q(&format!(
+            "UPDATE config_admission_locks SET expires_at = {now} + ? \
+             WHERE namespace = ? AND owner = ? AND generation = ?"
+        ));
+        let generation = i64::try_from(lease.generation)
+            .map_err(|_| anyhow::anyhow!("namespace config admission generation is out of range"))?;
+        let result = sqlx::query(&sql)
+            .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
+            .bind(namespace)
+            .bind(lease.owner)
+            .bind(generation)
+            .execute(&mut **tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(anyhow::Error::new(BatchAdmissionLeaseLost));
+        }
+        Ok(())
     }
 
     /// Delete all resources from all tables in a single transaction.

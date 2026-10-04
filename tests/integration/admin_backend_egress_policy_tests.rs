@@ -241,8 +241,8 @@ async fn overrides_are_bounded_and_public_only_proof_is_conservative() {
         ("", "10.45.67.89/32", true, true),
         ("", "", false, true),
     ] {
-        let policy = BackendEgressPolicy::from_env(BackendAllowIps::Public, allow, deny, baseline)
-            .unwrap();
+        let policy =
+            BackendEgressPolicy::from_env(BackendAllowIps::Public, allow, deny, baseline).unwrap();
         let harness = AdminHarness::start(admin_state("cp", policy)).await;
         let (status, body) = harness.get(Some(&reader), None).await;
         assert_eq!(status, StatusCode::OK);
@@ -484,7 +484,12 @@ fn openapi_metadata_vocabulary_and_default_example_match_the_endpoint() {
     );
     assert_eq!(
         properties["enforcement_scope"]["enum"],
-        json!(["local-data-plane", "unserved-namespace", "admission-only", "no-data-plane"])
+        json!([
+            "local-data-plane",
+            "unserved-namespace",
+            "admission-only",
+            "no-data-plane"
+        ])
     );
     let validator = jsonschema::draft202012::options().build(schema).unwrap();
     assert!(validator.is_valid(&expected));

@@ -173,16 +173,7 @@ async fn send(
     if_match: Option<&str>,
     body: Option<&Value>,
 ) -> Reply {
-    send_ns(
-        method,
-        base,
-        path,
-        token,
-        if_match,
-        body,
-        "ferrum",
-    )
-    .await
+    send_ns(method, base, path, token, if_match, body, "ferrum").await
 }
 
 async fn send_ns(
@@ -736,7 +727,10 @@ async fn consumer_verification_is_complete_admin_only_and_uses_the_existing_tag(
     assert_eq!(complete.status, 200, "{}", complete.body);
     assert_eq!(complete.etag, redacted.etag);
     assert_eq!(
-        complete.body["credentials"]["jwt"].as_array().unwrap().len(),
+        complete.body["credentials"]["jwt"]
+            .as_array()
+            .unwrap()
+            .len(),
         2
     );
     assert_eq!(
@@ -770,6 +764,10 @@ async fn consumer_verification_is_complete_admin_only_and_uses_the_existing_tag(
     assert_eq!(denied.status, 401);
     let backup = get(&base, "/backup?conditional=true").await;
     assert_eq!(backup.status, 200, "{}", backup.body);
+    assert_eq!(
+        backup.body["version"],
+        ferrum_edge::config::types::CURRENT_CONFIG_VERSION
+    );
     assert_eq!(backup.body["consumers"][0], complete.body);
     assert_eq!(
         backup.body["conditional"]["row_etags"]["consumers"]["verified"],
@@ -874,7 +872,13 @@ async fn conditional_backup_tags_match_every_complete_row_and_noop_keeps_revisio
             );
         }
     }
-    assert!(get(&base, "/backup").await.body.get("conditional").is_none());
+    assert!(
+        get(&base, "/backup")
+            .await
+            .body
+            .get("conditional")
+            .is_none()
+    );
     assert_eq!(
         get(&base, "/backup?conditional=true").await.etag,
         backup.etag
@@ -933,7 +937,13 @@ async fn concurrent_conditional_restores_have_one_winner_and_preserve_the_winner
     );
     let mut statuses = [a.status, b.status];
     statuses.sort();
-    assert_eq!(statuses, [200, 412], "first: {}; second: {}", a.body, b.body);
+    assert_eq!(
+        statuses,
+        [200, 412],
+        "first: {}; second: {}",
+        a.body,
+        b.body
+    );
     let expected = if a.status == 200 {
         "first.internal"
     } else {
@@ -1049,7 +1059,9 @@ async fn conditional_restore_rolls_back_all_phases_and_checks_empty_replacements
         snapshot
     );
     assert_eq!(
-        get_ns(&base, "/backup?conditional=true", &namespace).await.etag,
+        get_ns(&base, "/backup?conditional=true", &namespace)
+            .await
+            .etag,
         opened.etag
     );
     let empty = json!({});
@@ -1082,7 +1094,9 @@ async fn conditional_restore_rolls_back_all_phases_and_checks_empty_replacements
     .await;
     assert_eq!(cleared.status, 200, "{}", cleared.body);
     assert_eq!(
-        get_ns(&base, "/proxies/shared-proxy", &namespace).await.status,
+        get_ns(&base, "/proxies/shared-proxy", &namespace)
+            .await
+            .status,
         404
     );
     let current = get_ns(&base, "/backup?conditional=true", &namespace).await;
@@ -1098,7 +1112,9 @@ async fn conditional_restore_rolls_back_all_phases_and_checks_empty_replacements
     .await;
     assert_eq!(noop.status, 200, "{}", noop.body);
     assert_eq!(
-        get_ns(&base, "/backup?conditional=true", &namespace).await.etag,
+        get_ns(&base, "/backup?conditional=true", &namespace)
+            .await
+            .etag,
         current.etag
     );
 }
@@ -1175,9 +1191,7 @@ async fn conditional_snapshot_covers_spec_document_only_changes_and_restores_own
     .await;
     assert_eq!(imported.status, 201, "{}", imported.body);
     let opened = get(&base, "/backup?conditional=true").await;
-    let spec_id = opened.body["api_specs"]["items"][0]["id"]
-        .as_str()
-        .unwrap();
+    let spec_id = opened.body["api_specs"]["items"][0]["id"].as_str().unwrap();
     document["info"]["description"] = json!("Document metadata changed; resources unchanged");
     let updated = send(
         Method::PUT,
@@ -1232,6 +1246,14 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
     use ferrum_edge::config::types::Consumer;
 
     let namespace = format!("transaction-{}", uuid::Uuid::new_v4());
+    assert_eq!(
+        db.load_conditional_namespace_snapshot(&namespace)
+            .await
+            .unwrap()
+            .config
+            .version,
+        ferrum_edge::config::types::CURRENT_CONFIG_VERSION
+    );
     let expected = db
         .load_conditional_namespace_snapshot(&namespace)
         .await
@@ -1368,6 +1390,326 @@ async fn sqlite_conditional_restore_checks_state_and_lease_inside_the_transactio
     assert_transaction_precondition(db.as_ref()).await;
 }
 
+/// Exercise the real keeper handoff, a transaction spanning its 30-second
+/// renewal interval and the original datastore expiry, and competing owners.
+async fn assert_restore_renewal_and_fencing<F, Fut>(db: Arc<dyn DatabaseBackend>, set_expiry: F)
+where
+    F: Fn(String, i64) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use ferrum_edge::config::batch_atomicity::{
+        ConditionalRestoreTestPause, set_conditional_restore_pause,
+    };
+    use ferrum_edge::config::db_backend::{
+        AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
+        NamespaceConfigAdmissionLeaseRef, is_batch_admission_lease_lost,
+    };
+    use ferrum_edge::config::types::Consumer;
+    use std::time::Duration;
+
+    let namespace = format!("renewed-{}", uuid::Uuid::new_v4());
+    let consumer: Consumer = serde_json::from_value(json!({
+        "namespace": namespace, "id": "original", "username": "original"
+    }))
+    .unwrap();
+    db.create_consumer(&consumer).await.unwrap();
+    let expected = db
+        .load_conditional_namespace_snapshot(&namespace)
+        .await
+        .unwrap()
+        .representation()
+        .unwrap();
+    let mut guard = ferrum_edge::_test_support::lock_namespace_config_admission_db_for_test(
+        db.clone(),
+        &namespace,
+    )
+    .await
+    .unwrap();
+    guard.hand_off_to_restore_transaction().await.unwrap();
+    // This deliberately shortened datastore TTL must expire during the import.
+    // It is valid at entry; the transaction pin, rather than a stale expiry or
+    // an external keeper update, must then prevent takeover until commit.
+    set_expiry(namespace.clone(), 5_000).await;
+    let pause = Arc::new(ConditionalRestoreTestPause::default());
+    set_conditional_restore_pause(&namespace, Some(pause.clone()));
+    let restore = ConditionalNamespaceRestore {
+        graph: AtomicBatchGraph {
+            namespace: &namespace,
+            consumers: &[],
+            upstreams: &[],
+            proxies: &[],
+            plugin_configs: &[],
+            admission_lease: Some(guard.lease_ref()),
+        },
+        expected: &expected,
+        api_specs: &[],
+        gateway_trust_bundles: None,
+    };
+    let competitor = uuid::Uuid::new_v4().to_string();
+    let observer = async {
+        tokio::time::timeout(Duration::from_secs(15), pause.entered.notified())
+            .await
+            .expect("restore reached its pinned transaction snapshot");
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        // SQL blocks on the row pin; Mongo rejects a conflicting write. Neither
+        // backend may grant a new generation despite the elapsed original TTL.
+        let attempt = tokio::time::timeout(
+            Duration::from_millis(250),
+            db.try_acquire_namespace_config_admission_lease(&namespace, &competitor),
+        )
+        .await;
+        if let Ok(Ok(generation)) = attempt {
+            assert!(generation.is_none(), "takeover succeeded during restore");
+        }
+        pause.resume.notify_one();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(
+            db.restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission),
+            observer,
+        )
+    })
+    .await
+    .expect("renewed restore settled");
+    set_conditional_restore_pause(&namespace, None);
+    result.expect("restore spanning renewal and expiry commits under its transaction pin");
+    assert!(
+        db.get_consumer(&namespace, "original")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.try_acquire_namespace_config_admission_lease(&namespace, &competitor)
+            .await
+            .unwrap()
+            .is_none(),
+        "commit renewed the pinned lease before releasing its transaction fence"
+    );
+
+    // An already expired lease must never acquire a transaction pin, including
+    // when nobody has taken over yet. The unchanged namespace must survive.
+    db.create_consumer(&consumer).await.unwrap();
+    let current = db
+        .load_conditional_namespace_snapshot(&namespace)
+        .await
+        .unwrap()
+        .representation()
+        .unwrap();
+    let mut restore = restore;
+    restore.expected = &current;
+    set_expiry(namespace.clone(), -1).await;
+    let error = db
+        .restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
+        .await
+        .unwrap_err();
+    assert!(is_batch_admission_lease_lost(&error), "{error}");
+    assert_eq!(
+        db.load_conditional_namespace_snapshot(&namespace)
+            .await
+            .unwrap()
+            .representation()
+            .unwrap(),
+        current
+    );
+    let generation = db
+        .try_acquire_namespace_config_admission_lease(&namespace, &competitor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(generation, guard.lease_ref().generation);
+    let error = db
+        .restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
+        .await
+        .unwrap_err();
+    assert!(is_batch_admission_lease_lost(&error), "{error}");
+    assert_eq!(
+        db.load_conditional_namespace_snapshot(&namespace)
+            .await
+            .unwrap()
+            .representation()
+            .unwrap(),
+        current
+    );
+    // Restore succeeds only with the new live owner's exact generation.
+    restore.graph.admission_lease = Some(NamespaceConfigAdmissionLeaseRef {
+        owner: &competitor,
+        generation,
+    });
+    db.restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
+        .await
+        .unwrap();
+    db.release_namespace_config_admission_lease(&namespace, &competitor)
+        .await
+        .unwrap();
+}
+
+async fn assert_sql_restore_renewal(db: Arc<DatabaseStore>) {
+    let pool = db.pool();
+    let sql = match db.db_type_str() {
+        "postgres" => {
+            "UPDATE config_admission_locks SET expires_at = \
+             CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) + $2 \
+             WHERE namespace = $1"
+        }
+        "mysql" => {
+            "UPDATE config_admission_locks SET expires_at = \
+             CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED) + ? \
+             WHERE namespace = ?"
+        }
+        _ => panic!("live SQL restore regression requires PostgreSQL or MySQL"),
+    };
+    let mysql = db.db_type_str() == "mysql";
+    assert_restore_renewal_and_fencing(db, move |namespace, ttl| {
+        let pool = pool.clone();
+        async move {
+            let query = sqlx::query(sql);
+            let query = if mysql {
+                query.bind(ttl).bind(namespace)
+            } else {
+                query.bind(namespace).bind(ttl)
+            };
+            assert_eq!(query.execute(&pool).await.unwrap().rows_affected(), 1);
+        }
+    })
+    .await;
+}
+
+/// The HTTP path must hand off its automatically running production keeper,
+/// rather than merely relying on direct store callers to suppress renewal.
+async fn assert_http_restore_spans_keeper_renewal(db: Arc<dyn DatabaseBackend>) {
+    use ferrum_edge::config::batch_atomicity::{
+        ConditionalRestoreTestPause, set_conditional_restore_pause,
+    };
+    use ferrum_edge::config::types::Consumer;
+    use std::time::Duration;
+
+    let namespace = format!("http-renewed-{}", uuid::Uuid::new_v4());
+    let consumer: Consumer = serde_json::from_value(json!({
+        "namespace": namespace, "id": "original", "username": "original"
+    }))
+    .unwrap();
+    db.create_consumer(&consumer).await.unwrap();
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    let opened = get_ns(&base, "/backup?conditional=true", &namespace).await;
+    assert_eq!(opened.status, 200, "{}", opened.body);
+    let pause = Arc::new(ConditionalRestoreTestPause::default());
+    set_conditional_restore_pause(&namespace, Some(pause.clone()));
+    let bearer = admin_token();
+    let writer = send_ns(
+        Method::POST,
+        &base,
+        "/restore?confirm=true",
+        &bearer,
+        opened.etag.as_deref(),
+        Some(&opened.body),
+        &namespace,
+    );
+    let observer = async {
+        tokio::time::timeout(Duration::from_secs(15), pause.entered.notified())
+            .await
+            .expect("HTTP restore entered its fenced transaction");
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        pause.resume.notify_one();
+    };
+    let (restored, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(writer, observer)
+    })
+    .await
+    .expect("HTTP restore spanning keeper renewal settled");
+    set_conditional_restore_pause(&namespace, None);
+    assert_eq!(restored.status, 200, "{}", restored.body);
+    let verified = get_ns(&base, "/consumers/original/verification", &namespace).await;
+    assert_eq!(verified.status, 200, "{}", verified.body);
+    let mut expected = opened.body["consumers"][0].clone();
+    assert_ne!(verified.body["updated_at"], expected["updated_at"]);
+    expected["updated_at"] = verified.body["updated_at"].clone();
+    assert_eq!(verified.body, expected);
+}
+
+async fn assert_mongo_legacy_consumer_tags(db: Arc<dyn DatabaseBackend>, raw: &mongodb::Database) {
+    use ferrum_edge::config::types::Consumer;
+    use mongodb::bson::{Document, doc};
+
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    let consumers = raw.collection::<Document>("consumers");
+    for custom_id in ["", " \t "] {
+        let namespace = format!("legacy-{}", uuid::Uuid::new_v4());
+        let consumer: Consumer = serde_json::from_value(json!({
+            "namespace": namespace,
+            "id": "legacy",
+            "username": "legacy",
+            "custom_id": custom_id,
+            "credentials": {"mtls_auth": [{"identity": " legacy.example.com \t"}]},
+        }))
+        .unwrap();
+        // Insert an actual historical BSON row, bypassing current admission
+        // normalization and identity-index preparation deliberately.
+        let mut row = mongodb::bson::to_document(&consumer).unwrap();
+        row.insert("_id", format!("{namespace}:legacy"));
+        consumers.insert_one(row).await.unwrap();
+        let backup = get_ns(&base, "/backup?conditional=true", &namespace).await;
+        assert_eq!(backup.status, 200, "{}", backup.body);
+        assert_eq!(
+            backup.body["version"],
+            ferrum_edge::config::types::CURRENT_CONFIG_VERSION
+        );
+        let verified = get_ns(&base, "/consumers/legacy/verification", &namespace).await;
+        assert_eq!(verified.status, 200, "{}", verified.body);
+        assert_eq!(verified.body, serde_json::to_value(&consumer).unwrap());
+        assert_eq!(backup.body["consumers"][0], verified.body);
+        let tag = backup.body["conditional"]["row_etags"]["consumers"]["legacy"]
+            .as_str()
+            .unwrap();
+        assert_eq!(verified.etag.as_deref(), Some(tag));
+        let ordinary = get_ns(&base, "/consumers/legacy", &namespace).await;
+        assert_eq!(ordinary.etag.as_deref(), Some(tag));
+        let accepted = send_ns(
+            Method::PUT,
+            &base,
+            "/consumers/legacy",
+            &admin_token(),
+            Some(tag),
+            Some(&backup.body["consumers"][0]),
+            &namespace,
+        )
+        .await;
+        assert_eq!(accepted.status, 200, "unchanged row: {}", accepted.body);
+        let current = get_ns(&base, "/backup?conditional=true", &namespace).await;
+        let tag = current.body["conditional"]["row_etags"]["consumers"]["legacy"]
+            .as_str()
+            .unwrap();
+        // An out-of-band credential change must invalidate the row tag even
+        // without a config-change event or timestamp update.
+        consumers
+            .update_one(
+                doc! { "_id": format!("{namespace}:legacy") },
+                doc! { "$set": {
+                    "credentials.mtls_auth.0.identity": "changed.example.com",
+                } },
+            )
+            .await
+            .unwrap();
+        let stale = send_ns(
+            Method::PUT,
+            &base,
+            "/consumers/legacy",
+            &admin_token(),
+            Some(tag),
+            Some(&current.body["consumers"][0]),
+            &namespace,
+        )
+        .await;
+        assert_eq!(stale.status, 412, "changed credential: {}", stale.body);
+        assert_eq!(
+            get_ns(&base, "/consumers/legacy/verification", &namespace)
+                .await
+                .body["credentials"]["mtls_auth"][0]["identity"],
+            "changed.example.com"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "Requires a MongoDB replica set supplied by MONGO_URL"]
 async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transaction() {
@@ -1391,32 +1733,54 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     .unwrap();
     db.run_migrations().await.unwrap();
     assert_transaction_precondition(&db).await;
+    let db = Arc::new(db);
+    let raw = mongodb::Client::with_uri_str(&url)
+        .await
+        .unwrap()
+        .database(&database);
+    let locks = raw.collection::<mongodb::bson::Document>("config_admission_locks");
+    assert_restore_renewal_and_fencing(db.clone(), move |namespace, ttl| {
+        let locks = locks.clone();
+        async move {
+            let result = locks
+                .update_one(
+                    mongodb::bson::doc! { "_id": namespace },
+                    vec![mongodb::bson::doc! {
+                        "$set": { "expires_at": { "$add": [ "$$NOW", ttl ] } },
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.matched_count, 1);
+        }
+    })
+    .await;
+    assert_http_restore_spans_keeper_renewal(db.clone()).await;
+    assert_mongo_legacy_consumer_tags(db, &raw).await;
 }
 
 #[tokio::test]
 #[ignore = "Requires PostgreSQL supplied by POSTGRES_URL"]
 async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
     let url = std::env::var("POSTGRES_URL").expect("POSTGRES_URL is required");
-    let db = DatabaseStore::connect_with_pool_config(
-        "postgres",
-        &url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
+    let db = DatabaseStore::connect_with_pool_config("postgres", &url, DbPoolConfig::default())
+        .await
+        .unwrap();
     assert_transaction_precondition(&db).await;
+    let db = Arc::new(db);
+    assert_sql_restore_renewal(db.clone()).await;
+    assert_http_restore_spans_keeper_renewal(db).await;
 }
 
 #[tokio::test]
 #[ignore = "Requires MySQL supplied by MYSQL_URL"]
 async fn mysql_conditional_restore_checks_state_and_lease_in_transaction() {
     let url = std::env::var("MYSQL_URL").expect("MYSQL_URL is required");
-    let db = DatabaseStore::connect_with_pool_config(
-        "mysql",
-        &url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
+    let db = DatabaseStore::connect_with_pool_config("mysql", &url, DbPoolConfig::default())
+        .await
+        .unwrap();
     assert_transaction_precondition(&db).await;
+    let db = Arc::new(db);
+    assert_sql_restore_renewal(db.clone()).await;
+    assert_http_restore_spans_keeper_renewal(db).await;
 }

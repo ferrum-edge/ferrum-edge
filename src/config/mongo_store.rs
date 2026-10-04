@@ -58,15 +58,15 @@ mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, ConditionalNamespaceRestore,
         ConditionalNamespaceSnapshot, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
-        FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict,
-        NamespaceConfigAdmissionLeaseBackend, NamespacePreconditionFailed, NamespaceResourceCounts,
-        NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+        FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
+        MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespacePreconditionFailed,
+        NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
         ProxyDeleteAtomicityUnsupported, SnapshotDataIntegrityError, SortOrder,
         TcpConnectionThrottleAttachmentConflict,
     };
     use crate::config::db_loader::{
-        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash, format_consumer_identity_conflict,
-        mark_row_decode_rejection, proxy_route_key_hash,
+        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash,
+        format_consumer_identity_conflict, mark_row_decode_rejection, proxy_route_key_hash,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -5430,6 +5430,7 @@ mod inner {
             namespace: &str,
         ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
             let mut config = GatewayConfig {
+                version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
                 proxies: self
                     .load_full_proxies_opt_session(
                         namespace,
@@ -5467,7 +5468,13 @@ mod inner {
                     .await?,
                 ..Default::default()
             };
+            // Conditional exports verify the stored consumer, including legacy
+            // credential whitespace and blank optional identifiers. Preserve
+            // exactly the representation `get_consumer` returns; runtime and
+            // restore admission normalization must not rewrite verification.
+            let consumers = std::mem::take(&mut config.consumers);
             config.normalize_fields();
+            config.consumers = consumers;
             let collection: Collection<Document> = connection.db.collection("api_specs");
             let mut cursor = collection
                 .find(doc! { "namespace": namespace })
@@ -5499,7 +5506,10 @@ mod inner {
             let retained = retention
                 .as_ref()
                 .map(|doc| {
-                    mongo_change_sequence_from_bson(doc.get("retained_sequence"), "retained_sequence")
+                    mongo_change_sequence_from_bson(
+                        doc.get("retained_sequence"),
+                        "retained_sequence",
+                    )
                 })
                 .transpose()?
                 .unwrap_or(0);
@@ -5540,14 +5550,12 @@ mod inner {
             let replacement = MongoConditionalRestorePlan {
                 expected: restore.expected.clone(),
                 spec_docs,
-                trust: restore.gateway_trust_bundles.map(|records| records.to_vec()),
+                trust: restore
+                    .gateway_trust_bundles
+                    .map(|records| records.to_vec()),
             };
-            let plan = Self::prepare_atomic_batch_plan(
-                graph,
-                chunk_size,
-                fault,
-                Some(replacement),
-            )?;
+            let plan =
+                Self::prepare_atomic_batch_plan(graph, chunk_size, fault, Some(replacement))?;
             Self::run_mtls_dns_mutations(&mut mtls_leases, async {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5557,12 +5565,14 @@ mod inner {
                     .write_concern(WriteConcern::majority())
                     .and_run((self, &plan), |session, (this, plan)| {
                         Box::pin(async move {
-                            this.write_atomic_batch_graph_in_session(session, plan).await
+                            this.write_atomic_batch_graph_in_session(session, plan)
+                                .await
                         })
                     })
                     .await
                     .map_err(Self::atomic_batch_transaction_error)?;
-                self.compact_config_changes_best_effort(graph.namespace).await;
+                self.compact_config_changes_best_effort(graph.namespace)
+                    .await;
                 Ok::<_, anyhow::Error>(())
             })
             .await?;
@@ -5657,6 +5667,42 @@ mod inner {
             plan: &MongoAtomicBatchPlan,
         ) -> mongodb::error::Result<()> {
             if let Some(replacement) = &plan.replacement {
+                let Some((owner, generation)) = &plan.admission_lease else {
+                    return Err(mongodb::error::Error::custom(
+                        AtomicBatchAbort::AdmissionLeaseLost,
+                    ));
+                };
+                // A real write enlists the live lease in this transaction's
+                // write set before the resource snapshot. Renewal and takeover
+                // cannot change it until commit/abort. Every driver retry must
+                // prove live ownership anew; a prior attempt's pin is not proof.
+                if !self
+                    .verify_namespace_config_admission_lease_in_session(
+                        &mut *session,
+                        &plan.lease_namespace,
+                        owner,
+                        *generation,
+                    )
+                    .await?
+                {
+                    return Err(mongodb::error::Error::custom(
+                        AtomicBatchAbort::AdmissionLeaseLost,
+                    ));
+                }
+                // Force a changed value even when the preceding server-time
+                // touch lands in the same millisecond as acquisition. A no-op
+                // update is not sufficient to retain a document write fence.
+                self.config_admission_locks_in_transaction()
+                    .update_one(
+                        doc! {
+                            "_id": &plan.lease_namespace,
+                            "owner": owner,
+                            "generation": *generation,
+                        },
+                        doc! { "$set": { "restore_pin": Uuid::new_v4().to_string() } },
+                    )
+                    .session(&mut *session)
+                    .await?;
                 let connection = self.connection();
                 let current = self
                     .conditional_namespace_snapshot_in_session(
@@ -5674,6 +5720,10 @@ mod inner {
                 if representation != replacement.expected {
                     return Err(mongodb::error::Error::custom(NamespacePreconditionFailed));
                 }
+                crate::config::batch_atomicity::pause_conditional_restore_for_test(
+                    &plan.lease_namespace,
+                )
+                .await;
                 self.delete_all_namespace_resources_in_session(session, &plan.lease_namespace)
                     .await?;
             }
@@ -5857,18 +5907,28 @@ mod inner {
                 }
             }
 
-            if let Some((owner, generation)) = &plan.admission_lease
-                && !self
-                    .verify_namespace_config_admission_lease_in_session(
+            if let Some((owner, generation)) = &plan.admission_lease {
+                let held = if plan.replacement.is_some() {
+                    self.renew_pinned_restore_lease_in_session(
+                        &mut *session,
+                        &plan.lease_namespace,
+                        owner,
+                        *generation,
+                    )
+                    .await?
+                } else {
+                    self.verify_namespace_config_admission_lease_in_session(
                         &mut *session,
                         plan.lease_namespace.as_str(),
                         owner.as_str(),
                         *generation,
                     )
                     .await?
-            {
-                let abort = AtomicBatchAbort::AdmissionLeaseLost;
-                return Err(mongodb::error::Error::custom(abort));
+                };
+                if !held {
+                    let abort = AtomicBatchAbort::AdmissionLeaseLost;
+                    return Err(mongodb::error::Error::custom(abort));
+                }
             }
 
             Self::check_atomic_batch_fault_in_session(plan.fault, AtomicBatchPhase::Commit, 0)?;
@@ -5937,6 +5997,29 @@ mod inner {
                 }
                 result => result,
             }?;
+            Ok(result.matched_count == 1)
+        }
+
+        /// Renew only a lease already written and verified live by this restore
+        /// attempt. The transaction's write conflict fence prevents takeover
+        /// throughout the import, even beyond the original TTL. Unsupported
+        /// server-time pipeline updates fail closed rather than using a client
+        /// clock or weakening the transaction fence.
+        async fn renew_pinned_restore_lease_in_session(
+            &self,
+            session: &mut ClientSession,
+            key: &str,
+            owner: &str,
+            generation: i64,
+        ) -> mongodb::error::Result<bool> {
+            let result = self
+                .config_admission_locks_in_transaction()
+                .update_one(
+                    doc! { "_id": key, "owner": owner, "generation": generation },
+                    Self::server_time_lease_renew_pipeline(CONFIG_ADMISSION_LEASE_DURATION_MILLIS),
+                )
+                .session(&mut *session)
+                .await?;
             Ok(result.matched_count == 1)
         }
 

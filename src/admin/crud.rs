@@ -698,6 +698,32 @@ impl NamespaceConfigAdmissionGuard {
         }
     }
 
+    /// Hand renewal to an atomic restore transaction. Join the keeper before
+    /// starting the transaction so it cannot update a repeatable-read snapshot's
+    /// lease row behind that transaction. The store must check live ownership
+    /// and pin the lease before reading any resources, then renew it at commit.
+    /// A failed transaction leaves the original expiry in place; this guard is
+    /// retained for owner-qualified release and must not authorize another write.
+    pub(crate) async fn hand_off_to_restore_transaction(&mut self) -> Result<(), anyhow::Error> {
+        self.ensure_held()?;
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(task) = self.renew_task.take() {
+            let report = task.await.map_err(|_| {
+                anyhow::anyhow!("namespace config admission keeper stopped unexpectedly")
+            })?;
+            if report.outcome != LeaseRenewalOutcome::Stopped {
+                anyhow::bail!("namespace config admission lease was lost before transaction handoff");
+            }
+        }
+        let held = self.ensure_held();
+        // The identity remains available for the store's authoritative entry
+        // gate, but this stopped guard cannot authorize another mutation.
+        self.valid.store(false, Ordering::Release);
+        held
+    }
+
     /// Test-only: mark the lease invalid so [`Self::ensure_held`] and
     /// [`Self::run_to_completion_while_held`] observe loss without waiting for
     /// the production renewer / TTL.
