@@ -1,3 +1,5 @@
+use super::native_grpc_dispatch_auth_lifetime_tests::{direct_source_statement, source_group};
+
 /// Require both markers before inspecting a structural proof's source region.
 fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_at = source
@@ -4669,6 +4671,87 @@ fn h3_native_grpc_zero_data_trailer_uses_the_message_safe_rule() {
 
 // --- Buffered native-H3 request bodies write under an IDLE watermark (#4055) -
 
+const H3_AUTHORIZED_UPLOAD_FIN: &str = concat!(
+    "await_h3_write_under_authorization(auth,proxy.backend_write_timeout_ms,",
+    "upload.stream.finish(),\"finish\").await?;"
+);
+
+const H3_BUFFERED_UPLOAD_FIN: &str = concat!(
+    "await_h3_client_write_with_timeout(proxy.backend_write_timeout_ms,",
+    "upload.stream.finish(),\"finish\").await?;"
+);
+
+const H3_STANDALONE_FIN: &str = concat!(
+    "await_h3_client_write_with_timeout(proxy.backend_write_timeout_ms,",
+    "stream.finish(),\"finish\").await.map_err(anyhow::Error::new)?;"
+);
+
+const H3_REQUEST_FIN_ENTRY_POINTS: [(&str, &str, &str, &str, &str); 5] = [
+    (
+        "pooled buffered request",
+        "async fn do_request(",
+        "fn boxed_do_request_streaming<'a>(",
+        H3_BUFFERED_UPLOAD_FIN,
+        "upload.completed=true;drop(upload);",
+    ),
+    (
+        "pooled streaming-response request",
+        "async fn do_request_streaming(",
+        "async fn do_request_streaming_body(",
+        H3_AUTHORIZED_UPLOAD_FIN,
+        "upload.completed=true;drop(upload);",
+    ),
+    (
+        "standalone Http3Client::request",
+        "/// Send an HTTP/3 request to the specified backend.\n    pub async fn request(",
+        "\n}\n\n/// Create a shared QUIC endpoint",
+        H3_STANDALONE_FIN,
+        "letresponse=stream.recv_response().await?;",
+    ),
+    (
+        "streaming request body",
+        "async fn do_request_streaming_body(",
+        "async fn do_open_bidi_backend_stream(",
+        H3_AUTHORIZED_UPLOAD_FIN,
+        concat!(
+            "upload_complete.store(true,Ordering::Release);",
+            "upload.completed=true;drop(upload);"
+        ),
+    ),
+    (
+        "incoming request body",
+        "async fn forward_incoming_body_and_read_response(",
+        "pub(crate) async fn request_streaming_body_under_authorization<",
+        H3_AUTHORIZED_UPLOAD_FIN,
+        "upload.completed=true;drop(upload);",
+    ),
+];
+
+fn h3_request_fin_is_awaited_before_completion(
+    function: &str,
+    fin: &str,
+    completion: &str,
+) -> bool {
+    let compact = compact_code(function);
+    let Some(open_at) = compact.find('{') else {
+        return false;
+    };
+    let Some((body, _)) = source_group(&compact, open_at) else {
+        return false;
+    };
+    let completed_fin = format!("{fin}{completion}");
+    body.matches(".finish()").count() == 1
+        && direct_source_statement(body, &completed_fin)
+        && [
+            "upload.completed=true;",
+            "upload_complete.store(true,Ordering::Release);",
+        ]
+        .iter()
+        .all(|&marker| {
+            body.matches(marker).count() == completion.matches(marker).count()
+        })
+}
+
 #[test]
 fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
     let client = include_str!("../../../src/http3/client.rs");
@@ -4733,41 +4816,84 @@ fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
         client.contains("Some(self.remaining.split_to(take))"),
         "slicing must stay zero-copy — `split_to` hands out a refcounted view"
     );
+}
 
-    // Each pooled streaming FIN has its own authorization bound. Inspect the
-    // exact function regions independently so a sibling call cannot satisfy a
-    // missing guard, and squeeze whitespace so rustfmt wrapping is immaterial.
-    for (label, start, end) in [
-        (
-            "streaming response",
-            "async fn do_request_streaming(",
-            "async fn do_request_streaming_body(",
-        ),
-        (
-            "streaming request body",
-            "async fn do_request_streaming_body(",
-            "async fn do_open_bidi_backend_stream(",
-        ),
-        (
-            "incoming request body",
-            "async fn forward_incoming_body_and_read_response(",
-            "pub(crate) async fn request_streaming_body_under_authorization<",
-        ),
-    ] {
+#[test]
+fn every_h3_request_fin_is_awaited_and_error_propagated_before_upload_completion() {
+    let client = include_str!("../../../src/http3/client.rs");
+    // All three buffered entrypoints plus both streaming-upload siblings.
+    // Match a complete statement in each function's own body, including the
+    // await/error chain and completion, so `let _` cannot drop either result.
+    for (label, start, end, fin, completion) in H3_REQUEST_FIN_ENTRY_POINTS {
         let function = source_region(client, start, end);
-        let compact = compact_code(function);
-        assert_eq!(
-            compact.matches("upload.stream.finish()").count(),
-            1,
-            "{label} must retain exactly its own backend FIN"
-        );
         assert!(
-            compact.contains(concat!(
-                "await_h3_write_under_authorization(auth,proxy.backend_write_timeout_ms,",
-                "upload.stream.finish(),\"finish\")"
-            )),
-            "{label} backend FIN must remain under its own authorization bound"
+            h3_request_fin_is_awaited_before_completion(function, fin, completion),
+            "{label} must await its watermark/authorization-bound FIN, propagate failure, \
+             and only then complete its upload"
         );
+    }
+}
+
+#[test]
+fn the_h3_fin_source_guard_rejects_watermark_await_and_completion_bypasses() {
+    let client = include_str!("../../../src/http3/client.rs");
+    for (label, start, end, fin, completion) in H3_REQUEST_FIN_ENTRY_POINTS {
+        let function = compact_code(source_region(client, start, end));
+        assert!(h3_request_fin_is_awaited_before_completion(
+            &function,
+            fin,
+            completion
+        ));
+        let future = fin.split(".await").next().expect("FIN future");
+        for (mutation, replacement) in [
+            (
+                "disabled FIN watermark",
+                fin.replace("proxy.backend_write_timeout_ms", "0"),
+            ),
+            ("unpolled FIN future", format!("let_={future};")),
+            ("ignored FIN result", format!("let_={future}.await;")),
+            ("assigned FIN", format!("let_={fin}")),
+            ("conditional FIN", format!("if false{{{fin}}}")),
+        ] {
+            let mutated = function.replacen(fin, &replacement, 1);
+            assert_ne!(mutated, function, "mutation must change {mutation}");
+            assert!(
+                !h3_request_fin_is_awaited_before_completion(&mutated, fin, completion),
+                "{label}: the source guard must reject {mutation}"
+            );
+        }
+        if fin == H3_AUTHORIZED_UPLOAD_FIN {
+            let mutated = function.replacen(
+                fin,
+                &fin.replace("(auth,", "(H3Authorization::none(),"),
+                1,
+            );
+            assert_ne!(mutated, function);
+            assert!(!h3_request_fin_is_awaited_before_completion(
+                &mutated,
+                fin,
+                completion
+            ));
+        }
+        let mutated = function.replacen(
+            &format!("{fin}{completion}"),
+            &format!("{completion}{fin}"),
+            1,
+        );
+        assert_ne!(mutated, function);
+        assert!(!h3_request_fin_is_awaited_before_completion(
+            &mutated,
+            fin,
+            completion
+        ));
+        if completion.contains("upload.completed=true;") {
+            let mutated = function.replacen(fin, &format!("upload.completed=true;{fin}"), 1);
+            assert!(!h3_request_fin_is_awaited_before_completion(
+                &mutated,
+                fin,
+                completion
+            ));
+        }
     }
 }
 

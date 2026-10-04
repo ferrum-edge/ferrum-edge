@@ -489,6 +489,79 @@ fn compact_code(text: &str) -> String {
         .replace(",)", ")")
 }
 
+/// Match a complete group in compact source, ignoring delimiters in strings.
+/// These focused source regions use ordinary strings, not raw or char literals.
+pub(super) fn source_group(source: &str, open_at: usize) -> Option<(&str, usize)> {
+    let bytes = source.as_bytes();
+    let close = match *bytes.get(open_at)? {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        _ => return None,
+    };
+    let mut at = open_at + 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => at = source_string_end(bytes, at)?,
+            b'(' | b'[' | b'{' => at = source_group(source, at)?.1,
+            b')' | b']' | b'}' => {
+                return (bytes[at] == close).then_some((&source[open_at + 1..at], at + 1));
+            }
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+fn source_string_end(bytes: &[u8], quote_at: usize) -> Option<usize> {
+    let mut at = quote_at + 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => return Some(at + 1),
+            b'\\' => at += 2,
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// Require a whole statement at this scope, never a nested or assigned fragment.
+pub(super) fn direct_source_statement(body: &str, statement: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut at = 0;
+    let mut boundary = true;
+    while at < bytes.len() {
+        if boundary && body[at..].starts_with(statement) {
+            return true;
+        }
+        match bytes[at] {
+            b'"' => {
+                let Some(end) = source_string_end(bytes, at) else {
+                    return false;
+                };
+                boundary = false;
+                at = end;
+            }
+            b'(' | b'[' | b'{' => {
+                let Some((_, end)) = source_group(body, at) else {
+                    return false;
+                };
+                boundary = bytes[at] == b'{';
+                at = end;
+            }
+            b';' => {
+                boundary = true;
+                at += 1;
+            }
+            _ => {
+                boundary = false;
+                at += 1;
+            }
+        }
+    }
+    false
+}
+
 /// Byte offset of `pattern` in `haystack`, or a failure naming it.
 fn offset_of(haystack: &str, pattern: &str) -> usize {
     haystack
@@ -1831,6 +1904,97 @@ fn native_h3_grpc_failure_carrier_keeps_handoff_separate_from_neutral_health() {
     assert!(!recorder.contains("request_reached_wire("));
 }
 
+const H3_CANDIDATE_HANDSHAKES: &str = concat!(
+    "letendpoint=self.get_shared_endpoint(addr.is_ipv6()).await?;",
+    "letconnection=endpoint.connect_with(client_config,addr,tls_server_name)?",
+    ".await.map_err(|e|anyhow::anyhow!(\"QUICconnectionfailed:{}\",e))?;",
+    "letquic_conn=connection.clone();letmutbuilder=h3::client::builder();",
+    "builder.max_field_section_size(h3_backend_response_max_field_section_size)",
+    ".max_buffered_frame_len(h3_max_buffered_frame_len);",
+    "let(mutdriver,send_request)=",
+    "boxed_h3_future(||builder.build(h3_quinn::Connection::new(connection)))",
+    ".await.map_err(|e|anyhow::anyhow!(\"HTTP/3handshakefailed:{}\",e))?;"
+);
+
+const H3_CANDIDATE_AWAIT: &str = concat!(
+    ".await.map_err(|error|matcherror{",
+    "crate::dns::CandidateConnectError::TimedOut{..}=>{",
+    "h3_backend_connect_timeout(proxy,host,port,\"HTTP/3\")}",
+    "crate::dns::CandidateConnectError::Failed{source,..}=>source,})?;"
+);
+
+fn h3_cold_connect_has_bounded_candidate(constructor: &str) -> bool {
+    let compact = compact_code(constructor);
+    let Some(open_at) = compact.find('{') else {
+        return false;
+    };
+    let Some((body, _)) = source_group(&compact, open_at) else {
+        return false;
+    };
+    let dns = concat!(
+        "letcandidates=resolve_backend_addrs_cached(host,&self.dns_cache,",
+        "proxy.dns_override.as_deref(),proxy.dns_cache_ttl_seconds).await?;"
+    );
+    let arm = concat!(
+        "letconnect_timeout=Duration::from_millis(proxy.backend_connect_timeout_ms);",
+        "ifletSome(connect_at)=connect_at{",
+        "let_=connect_at.set(tokio::time::Instant::now()+connect_timeout);}"
+    );
+    let call = "let(pooled,addr)=crate::dns::connect_candidates(";
+    let Some(call_at) = body.find(call) else {
+        return false;
+    };
+    let Some((args, _)) = source_group(body, call_at + call.len() - 1) else {
+        return false;
+    };
+    let args_prefix = "&candidates,port,connect_timeout,|addr|";
+    if !args.starts_with(args_prefix) {
+        return false;
+    }
+    let Some((closure, end)) = source_group(args, args_prefix.len()) else {
+        return false;
+    };
+    if end != args.len() {
+        return false;
+    }
+    let child_prefix = concat!(
+        "letclient_config=client_config.clone();letconn_slot=conn_slot.clone();",
+        "boxed_h3_future(||asyncmove"
+    );
+    if !closure.starts_with(child_prefix) {
+        return false;
+    }
+    let Some((child, end)) = source_group(closure, child_prefix.len()) else {
+        return false;
+    };
+    if &closure[end..] != ")" {
+        return false;
+    }
+    let Some(driver) = child.strip_prefix(H3_CANDIDATE_HANDSHAKES) else {
+        return false;
+    };
+    if !driver.starts_with("tokio::spawn(") {
+        return false;
+    }
+    let Some((_, end)) = source_group(driver, "tokio::spawn".len()) else {
+        return false;
+    };
+    if &driver[end..] != ";Ok(H3PooledConnection::new(send_request,quic_conn))" {
+        return false;
+    }
+    let candidate = format!("{call}{args}){H3_CANDIDATE_AWAIT}");
+    direct_source_statement(body, dns)
+        && direct_source_statement(body, arm)
+        && direct_source_statement(body, &candidate)
+        && body.matches("resolve_backend_addrs_cached(").count() == 1
+        && body.matches("crate::dns::connect_candidates(").count() == 1
+        && body.find(dns).is_some_and(|at| {
+            body.find(arm).is_some_and(|arm_at| {
+                at + dns.len() <= arm_at && arm_at + arm.len() <= call_at
+            })
+        })
+}
+
 #[test]
 fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside() {
     let client = include_str!("../../../src/http3/client.rs");
@@ -1858,9 +2022,7 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
         let boxed_candidate = compact
             .find("boxed_h3_future(||asyncmove{")
             .expect("boxed authorization-bounded candidate future");
-        let quic = compact
-            .find(".connect_with(")
-            .expect("QUIC/TLS handshake");
+        let quic = compact.find(".connect_with(").expect("QUIC/TLS handshake");
         let h3 = compact
             .find("boxed_h3_future(||builder.build(h3_quinn::Connection::new(connection)))")
             .expect("boxed H3 readiness future");
@@ -1873,9 +2035,15 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
             concat!(
                 "DNS must precede the authorization envelope, which must contain ",
                 "candidate QUIC and H3 readiness: {constructor}"
-            )
+            ),
+            constructor = constructor
         );
         assert!(compact[dns..connect].contains(".await?;"));
+        assert!(
+            h3_cold_connect_has_bounded_candidate(constructor),
+            "the actual boxed candidate must await QUIC/TLS and boxed H3 readiness, \
+             propagate both errors, and return its pooled connection: {constructor}"
+        );
     }
     assert!(client.contains("#[inline(never)]\nfn boxed_h3_future<F>("));
     let factory = source_region(client, "fn boxed_h3_future<F>(", "\n}\n");
@@ -1895,4 +2063,100 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
             .count(),
         8
     );
+}
+
+#[test]
+fn the_h3_cold_connect_source_guard_rejects_candidate_scope_and_completion_bypasses() {
+    let client = include_str!("../../../src/http3/client.rs");
+    for (start, end) in [
+        (
+            "async fn create_connection(",
+            "async fn create_connection_to_target(",
+        ),
+        (
+            "async fn create_connection_to_target(",
+            "fn boxed_do_request<'a>(",
+        ),
+    ] {
+        let constructor = compact_code(source_region(client, start, end));
+        assert!(h3_cold_connect_has_bounded_candidate(&constructor));
+        for (label, from, to) in [
+            (
+                "unbounded candidate timeout",
+                "connect_candidates(&candidates,port,connect_timeout,",
+                "connect_candidates(&candidates,port,Duration::ZERO,",
+            ),
+            (
+                "QUIC future not awaited",
+                ".await.map_err(|e|anyhow::anyhow!(\"QUICconnectionfailed:{}\",e))?;",
+                ";",
+            ),
+            (
+                "QUIC error not propagated",
+                ".connect_with(client_config,addr,tls_server_name)?",
+                ".connect_with(client_config,addr,tls_server_name)",
+            ),
+            (
+                "H3 future not boxed",
+                "boxed_h3_future(||builder.build(h3_quinn::Connection::new(connection)))",
+                "builder.build(h3_quinn::Connection::new(connection))",
+            ),
+            (
+                "H3 future not awaited",
+                ".await.map_err(|e|anyhow::anyhow!(\"HTTP/3handshakefailed:{}\",e))?;",
+                ";",
+            ),
+            (
+                "H3 error not propagated",
+                ".await.map_err(|e|anyhow::anyhow!(\"HTTP/3handshakefailed:{}\",e))?;",
+                ".await;",
+            ),
+            (
+                "pooled connection not returned",
+                "Ok(H3PooledConnection::new(send_request,quic_conn))",
+                "let_=Ok(H3PooledConnection::new(send_request,quic_conn));",
+            ),
+            (
+                "candidate result ignored",
+                "let(pooled,addr)=crate::dns::connect_candidates(",
+                "let_=crate::dns::connect_candidates(",
+            ),
+        ] {
+            assert!(constructor.contains(from), "mutation must change {label}");
+            let mutated = constructor.replacen(from, to, 1);
+            assert!(
+                !h3_cold_connect_has_bounded_candidate(&mutated),
+                "{start}: the source guard must reject {label}"
+            );
+        }
+
+        // Preserve QUIC-before-H3 order while relocating readiness beyond the
+        // complete candidate call. A constructor-wide ordering scan accepts it.
+        let readiness = H3_CANDIDATE_HANDSHAKES
+            .split("letquic_conn=")
+            .nth(1)
+            .expect("H3 setup suffix");
+        let readiness = format!("letquic_conn={readiness}");
+        let without_readiness = constructor.replacen(&readiness, "", 1);
+        let moved = without_readiness.replacen(
+            H3_CANDIDATE_AWAIT,
+            &format!("{H3_CANDIDATE_AWAIT}{readiness}"),
+            1,
+        );
+        assert_ne!(moved, constructor);
+        assert!(!h3_cold_connect_has_bounded_candidate(&moved));
+
+        let dns = concat!(
+            "letcandidates=resolve_backend_addrs_cached(host,&self.dns_cache,",
+            "proxy.dns_override.as_deref(),proxy.dns_cache_ttl_seconds).await?;"
+        );
+        let without_dns = constructor.replacen(dns, "", 1);
+        let moved = without_dns.replacen(
+            "boxed_h3_future(||asyncmove{",
+            &format!("boxed_h3_future(||asyncmove{{{dns}"),
+            1,
+        );
+        assert_ne!(moved, constructor);
+        assert!(!h3_cold_connect_has_bounded_candidate(&moved));
+    }
 }
