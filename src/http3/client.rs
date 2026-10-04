@@ -2957,11 +2957,10 @@ impl Http3ConnectionPool {
                     builder
                         .max_field_section_size(h3_backend_response_max_field_section_size)
                         .max_buffered_frame_len(h3_max_buffered_frame_len);
-                    let (mut driver, send_request) = boxed_h3_future(|| {
-                        builder.build(h3_quinn::Connection::new(connection))
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+                    let (mut driver, send_request) =
+                        boxed_h3_future(|| builder.build(h3_quinn::Connection::new(connection)))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
 
                     tokio::spawn(async move {
                         // The `maxConnections` slot lives exactly as long as
@@ -3118,11 +3117,10 @@ impl Http3ConnectionPool {
                     builder
                         .max_field_section_size(h3_backend_response_max_field_section_size)
                         .max_buffered_frame_len(h3_max_buffered_frame_len);
-                    let (mut driver, send_request) = boxed_h3_future(|| {
-                        builder.build(h3_quinn::Connection::new(connection))
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+                    let (mut driver, send_request) =
+                        boxed_h3_future(|| builder.build(h3_quinn::Connection::new(connection)))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
 
                     tokio::spawn(async move {
                         // The `maxConnections` slot lives exactly as long as

@@ -2342,16 +2342,34 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         ("async fn proxy_to_backend_hbone_after_ready(", 2, 1, 2, 0),
         ("async fn proxy_to_backend_unix(", 2, 1, 2, 0),
         ("async fn proxy_to_backend_mesh_mtls(", 1, 0, 0, 0),
-        ("async fn proxy_to_backend_mesh_mtls_after_ready(", 1, 2, 3, 0),
+        (
+            "async fn proxy_to_backend_mesh_mtls_after_ready(",
+            1,
+            2,
+            3,
+            0,
+        ),
         ("async fn proxy_to_backend_http2(", 0, 2, 4, 0),
         ("async fn proxy_to_backend_http3(", 0, 0, 4, 0),
         ("async fn proxy_to_backend_http3_retry(", 0, 0, 2, 0),
-        ("async fn drain_h3_response_under_authorization(", 0, 0, 1, 0),
+        (
+            "async fn drain_h3_response_under_authorization(",
+            0,
+            0,
+            1,
+            0,
+        ),
         ("fn direct_h2_handoff_refusal(", 1, 0, 0, 0),
         ("fn direct_h2_sender_bound_expired(", 1, 1, 0, 1),
         ("fn direct_h2_handoff_bound_expired(", 0, 1, 1, 0),
         ("fn mesh_h1_handoff_bound_expired(", 0, 1, 1, 0),
-        ("async fn collect_response_under_authorization<F>(", 1, 1, 0, 0),
+        (
+            "async fn collect_response_under_authorization<F>(",
+            1,
+            1,
+            0,
+            0,
+        ),
     ] {
         let body = source_region(PROXY_SOURCE, anchor, "\n}\n");
         for (callee, expected) in [
@@ -2737,11 +2755,13 @@ fn every_buffered_response_collect_is_authorization_bounded() {
     ] {
         let body = source_region(PROXY_SOURCE, anchor, "\n}\n");
         assert_eq!(
-            body.matches("collect_response_under_authorization(").count(),
+            body.matches("collect_response_under_authorization(")
+                .count(),
             expected
         );
         assert_eq!(
-            body.matches("Err(ResponseCollectBound::AuthorizationExpired) => {").count(),
+            body.matches("Err(ResponseCollectBound::AuthorizationExpired) => {")
+                .count(),
             expected,
             "{anchor} must settle every buffered collect's authorization terminal"
         );

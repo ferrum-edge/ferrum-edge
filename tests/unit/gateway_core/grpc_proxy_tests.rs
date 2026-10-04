@@ -568,7 +568,9 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
         {
             let attachment = attachment.split("));").next().expect("attachment return");
             assert_eq!(
-                attachment.matches("held_frontend_grpc_upload.take()").count(),
+                attachment
+                    .matches("held_frontend_grpc_upload.take()")
+                    .count(),
                 1
             );
         }
