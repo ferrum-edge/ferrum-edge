@@ -1837,33 +1837,45 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
     for (start, end) in [
         (
             "async fn create_connection(",
-            "/// Create a new QUIC connection + h3 session to an explicit",
+            "async fn create_connection_to_target(",
         ),
         (
             "async fn create_connection_to_target(",
-            "/// Execute an HTTP/3 request on an existing",
+            "fn boxed_do_request<'a>(",
         ),
     ] {
         let constructor = source_region(client, start, end);
-        let dns = constructor
+        let compact = compact_code(constructor);
+        let dns = compact
             .find("resolve_backend_addrs_cached(")
             .expect("DNS resolution");
-        let connect = constructor
+        let connect = compact
             .find("connect_at.set(")
             .expect("captured connect instant");
-        let candidate = constructor
+        let candidate = compact
             .find("crate::dns::connect_candidates(")
             .expect("dial scope");
-        let quic = constructor
+        let boxed_candidate = compact
+            .find("boxed_h3_future(||asyncmove{")
+            .expect("boxed authorization-bounded candidate future");
+        let quic = compact
             .find(".connect_with(")
             .expect("QUIC/TLS handshake");
-        let h3 = constructor
-            .find(".build(h3_quinn::Connection::new(connection))")
-            .expect("H3 readiness");
-        assert!(dns < connect && connect < candidate && candidate < quic && quic < h3);
-        assert!(constructor[dns..connect].contains(".await?;"));
-        assert!(constructor.contains("boxed_h3_future(|| async move {"));
-        assert!(constructor.contains("let (mut driver, send_request) = boxed_h3_future(|| {"));
+        let h3 = compact
+            .find("boxed_h3_future(||builder.build(h3_quinn::Connection::new(connection)))")
+            .expect("boxed H3 readiness future");
+        assert!(
+            dns < connect
+                && connect < candidate
+                && candidate < boxed_candidate
+                && boxed_candidate < quic
+                && quic < h3,
+            concat!(
+                "DNS must precede the authorization envelope, which must contain ",
+                "candidate QUIC and H3 readiness: {constructor}"
+            )
+        );
+        assert!(compact[dns..connect].contains(".await?;"));
     }
     assert!(client.contains("#[inline(never)]\nfn boxed_h3_future<F>("));
     let factory = source_region(client, "fn boxed_h3_future<F>(", "\n}\n");

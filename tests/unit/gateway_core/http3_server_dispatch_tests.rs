@@ -10,6 +10,16 @@ fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     &tail[..end_at]
 }
 
+/// Strip line comments and whitespace from structural source assertions.
+fn compact_code(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")")
+}
+
 #[test]
 fn h3_native_forces_mesh_onto_bridge_and_refuses_unix_before_dispatch() {
     let src = include_str!("../../../src/http3/server.rs");
@@ -4724,14 +4734,41 @@ fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
         "slicing must stay zero-copy — `split_to` hands out a refcounted view"
     );
 
-    // `finish()` keeps its own separate bound, exactly as before. The
-    // `backend_stream.finish(),` writes on the streaming paths are deliberately
-    // excluded by the leading indentation anchor.
-    assert_eq!(
-        client.matches("\n            stream.finish(),").count(),
-        3,
-        "the three buffered entry points must each keep their separately bounded finish()"
-    );
+    // Each pooled streaming FIN has its own authorization bound. Inspect the
+    // exact function regions independently so a sibling call cannot satisfy a
+    // missing guard, and squeeze whitespace so rustfmt wrapping is immaterial.
+    for (label, start, end) in [
+        (
+            "streaming response",
+            "async fn do_request_streaming(",
+            "async fn do_request_streaming_body(",
+        ),
+        (
+            "streaming request body",
+            "async fn do_request_streaming_body(",
+            "async fn do_open_bidi_backend_stream(",
+        ),
+        (
+            "incoming request body",
+            "async fn forward_incoming_body_and_read_response(",
+            "pub(crate) async fn request_streaming_body_under_authorization<",
+        ),
+    ] {
+        let function = source_region(client, start, end);
+        let compact = compact_code(function);
+        assert_eq!(
+            compact.matches("upload.stream.finish()").count(),
+            1,
+            "{label} must retain exactly its own backend FIN"
+        );
+        assert!(
+            compact.contains(concat!(
+                "await_h3_write_under_authorization(auth,proxy.backend_write_timeout_ms,",
+                "upload.stream.finish(),\"finish\")"
+            )),
+            "{label} backend FIN must remain under its own authorization bound"
+        );
+    }
 }
 
 #[test]
