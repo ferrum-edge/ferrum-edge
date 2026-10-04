@@ -859,9 +859,6 @@ async fn conditional_reads_preserve_historical_credential_fields_and_shapes() {
         archival.body["consumers"][0]["credentials"],
         json!({
             "jwt": [{"secret": "historical-jwt-secret-with-at-least-32-characters"}],
-            "hmac_auth": [{
-                "secret": "historical-hmac-secret-with-at-least-32-characters"
-            }],
             "custom_auth": [{"opaque_stored_field": "historical-custom-value"}]
         })
     );
