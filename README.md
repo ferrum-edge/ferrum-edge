@@ -594,6 +594,13 @@ Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 Edge source. The latest published tag is **contracts-edge-0.9.9**; it also
 applies to **v0.9.10**, which changed no contract source.
 
+The **v0.9.11 release draft** includes new conditional admin snapshot/restore
+and backend egress discovery contracts. Their ferrum-contracts publication and
+downstream adoption are pending; the existing tag does not cover those new
+surfaces. See the [release draft](docs/releases/v0.9.11.md) and
+[contracts handoff](docs/admin_contracts_handoff_5992_5994.md) before updating
+consumer pins.
+
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the
 new release tag:

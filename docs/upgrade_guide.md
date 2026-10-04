@@ -28,6 +28,70 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Unreleased
 
+## Upgrading to 0.9.11 (release draft)
+
+0.9.11 is not published or qualified yet. The guidance below covers source
+changes already on main; dependency updates from
+[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) must be integrated
+and documented before qualification. Use the
+[release draft](releases/v0.9.11.md) for outstanding evidence and publication
+requirements. Version pins in this draft become usable only after publication.
+
+**TLS source selectors must match their field (issue #5959; breaking).**
+Correct references whose explicit fragment, Kubernetes data key, `?kind=` hint,
+or managed/ACME collection contradicts the material the field requires. CA
+fields require CA selectors, certificate fields require certificate selectors,
+and key fields require key selectors. A leaf certificate and its chain cannot
+be selected as a CA bundle through `managed://certificates/<id>#cert`.
+Unknown managed collections, unsupported ACME collections, and unknown kind
+hints are also refused. Check proxy/upstream TLS, Gateway frontend TLS,
+DestinationRule TLS, and environment TLS settings before rollout; admission
+and material loading both enforce this rule. Fragmentless
+`managed://ca-bundles/<id>` now works in CA expiry checks (issue #5957).
+Fragmentless Kubernetes and provider CA references check CA material rather
+than the leaf certificate. See [TLS source schemes](frontend_tls.md).
+
+**OIDC session secrets require unique random material (issue #5987).**
+Enabled `oidc_relying_party` configurations now reject published example keys,
+obvious placeholders, and unresolved templates in both
+`session.encryption_secret` and `session.encryption_secret_previous`, including
+Base64 spellings of rejected key material. Replace those values with unique
+random secrets of at least 32 bytes before config load or admin mutation.
+Disabled configurations may still be saved before a key is supplied. Rotation
+through the previous-secret field remains available, but it must also contain
+acceptable material. See [OIDC relying party](plugins.md#oidc_relying_party).
+
+**Backend authorization lifetimes cover dispatch waits (issues #5990 / #5995).**
+Acquisition, final handoff, response-header waits, and retries retain the
+admitted absolute authorization deadline across direct HTTP/1.1, HTTP/2,
+native gRPC, mesh transports, and HTTP/3. Authorization expiry is not retried
+and does not penalize backend health. Native gRPC preserves HTTP 200 with
+`grpc-status: 16` before response commitment; an earlier client or operator
+bound retains its existing attribution. Review clients that depended on a
+backend wait outliving authorization. See
+[authorization lifetime during backend dispatch](request_lifetime_dispatch.md).
+
+**HTTP/2 write stalls and shard affinity (issue #5588; PRs #5991 / #6001).**
+Direct HTTP/2 uploads with request-size limits disabled now honor a nonzero
+`backend_write_timeout_ms`. Before response headers the timeout produces the
+existing `504` / `backend_timeout` result; after headers it resets the stream.
+Native gRPC write stalls retain their deadline terminal before headers and
+reset after headers. A ready chunk can progress through any positive legal
+backend window. HTTP/2 frontend gRPC calls use one backend shard while up to
+32 calls are open, then spill to siblings; unfinished uploads remain counted
+through transport completion. Setting a route's write timeout to `0` disables
+that bound for every upload path on the route, so assess the whole route.
+
+**Direct HTTP/1.1 pool and memory sizing (issue #5961).**
+`FERRUM_POOL_HTTP1_DIRECT` now defaults to `true`; setting it to `false` selects
+the reqwest path. Retry attempts and requests with pending body-plugin work
+still use reqwest. Reassess memory sizing for jemalloc's new 128 KiB thread
+cache ceiling; `_RJEM_MALLOC_CONF=tcache_max:32768` restores its former default.
+Windows is unaffected by that allocator change. CP and DP must run the same
+build; follow the [upgrade order](#upgrade-order) and the build-out database
+rebuild procedure rather than treating this patch version as mixed-build or
+in-place schema compatibility.
+
 **Conditional admin snapshots and restore (#5992).** Use an admin-role JWT
 for `GET /consumers/{id}/verification` when checking the complete stored
 credential state. Ordinary consumer reads retain their redacted projection.

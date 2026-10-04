@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.11] - Unreleased
+
+Release draft; publication date and qualification evidence are pending. See the
+[0.9.11 release draft](docs/releases/v0.9.11.md). Dependency updates from
+[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) are not included
+until root integrates that PR into this branch through a normal merge of main.
+
 ### Security
 
 - **Conditional admin reads and restores use authoritative strong state tags**
@@ -6521,7 +6528,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.7...v0.9.8
