@@ -6686,7 +6686,7 @@ fn redis_quarantine_delete_outcome_handler_is_shared() {
         .expect("quarantine_invalid_redis_entry region");
     assert!(
         production.contains("apply_redis_quarantine_delete_outcome(")
-            && production.contains(".delete_if_value_matches(redis_key, observed_value)")
+            && production.contains(".delete_if_value_matches_bounded(redis_key, observed_value)")
             && production.contains(".await\n            .is_ok()"),
         "production must map exact observed-byte compare-delete, including false, through the shared handler"
     );
@@ -6762,7 +6762,7 @@ fn redis_quarantine_delete_outcome_handler_is_shared() {
 fn redis_quarantine_compare_delete_read_is_bounded_and_watched() {
     let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
     let helper = source
-        .split_once("pub async fn delete_if_value_matches(")
+        .split_once("pub async fn delete_if_value_matches_bounded(")
         .and_then(|(_, rest)| rest.split_once("/// Charge one request against EVERY"))
         .map(|(body, _)| body)
         .expect("compare-delete helper");
@@ -6772,7 +6772,7 @@ fn redis_quarantine_compare_delete_read_is_bounded_and_watched() {
     let connection = helper.find("get_dedicated_connection()").unwrap();
     let watch = helper.find("redis::cmd(\"WATCH\")").unwrap();
     let range = helper.find(".cmd(\"GETRANGE\")").unwrap();
-    let delete = helper.find(".cmd(\"DEL\")").unwrap();
+    let delete = helper.find("redis::cmd(\"DEL\")").unwrap();
     assert!(checked_index < connection && connection < watch && watch < range && range < delete);
     assert!(
         helper.contains("expected.len().checked_add(1)")
@@ -6782,11 +6782,18 @@ fn redis_quarantine_compare_delete_read_is_bounded_and_watched() {
             && helper.contains(".arg(0)\n            .arg(end)")
             && helper.contains("prefix.len() > max_prefix")
             && helper.contains("exists == 1 && length == expected.len() && prefix == expected")
-            && helper.contains(".atomic()\n            .cmd(\"DEL\")"),
+            && helper.contains("redis::cmd(\"MULTI\")")
+            && helper.contains("redis::cmd(\"EXEC\")")
+            && helper.contains("Ok(reply) if reply == \"QUEUED\" => {}"),
         "only a full bounded byte/length match on the dedicated watched connection may authorize DEL"
     );
+    let multi = helper.find("redis::cmd(\"MULTI\")").unwrap();
+    let multi_error = helper.find("if let Err(e) = multi {").unwrap();
+    let exec = helper.find("redis::cmd(\"EXEC\")").unwrap();
+    assert!(range < multi && multi < multi_error && multi_error < delete && delete < exec);
     assert!(
-        !helper.contains("cmd(\"GET\")")
+        !helper.contains(".atomic()")
+            && !helper.contains("cmd(\"GET\")")
             && !helper.contains("get_connection()")
             && !helper.contains(".get_bytes(")
             && !helper.contains("cmd(\"EVAL"),

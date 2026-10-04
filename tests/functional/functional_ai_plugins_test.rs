@@ -460,10 +460,8 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             .await,
         PluginResult::Continue
     ));
-    let response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/json".to_string(),
-    )]);
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     writer
         .on_final_response_body(&mut writer_ctx, 200, &response_headers, RESPONSE)
         .await;
@@ -507,7 +505,10 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
         serde_json::to_vec(&tampered).unwrap(),
         over_body_cap,
     ] {
-        redis.set_bytes_with_expire(&key, &poison, 60).await.unwrap();
+        redis
+            .set_bytes_with_expire(&key, &poison, 60)
+            .await
+            .unwrap();
         let deletes = relay.del_calls.load(Ordering::SeqCst);
         let mut ctx = new_ctx();
         assert!(matches!(
@@ -554,10 +555,7 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
         redis.set_bytes_with_expire(&key, &valid, 60).await.unwrap();
         // Model another in-flight request installing a marker during lookup.
         ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
-            &plugin,
-            &cache_key,
-            [1; 32],
-            false,
+            &plugin, &cache_key, [1; 32], false,
         );
         let failures = ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin);
         relay.resume.notify_one();
@@ -587,7 +585,10 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
     // observed prefix. Count real Redis reply bytes through the relay: the
     // comparison must transfer only expected.len()+1, not this 2 MiB value.
     let observed = MALFORMED;
-    redis.set_bytes_with_expire(&key, observed, 60).await.unwrap();
+    redis
+        .set_bytes_with_expire(&key, observed, 60)
+        .await
+        .unwrap();
     let persisted = redis.get_bytes_bounded(&key, READ_CAP).await.unwrap();
     let BoundedRedisValue::Found(observed_bytes) = persisted else {
         panic!("malformed value must be observed before replacement");
@@ -615,7 +616,7 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
     let before = relay.reply_bytes.load(Ordering::SeqCst);
     assert!(
         !compare
-            .delete_if_value_matches(&key, &observed_bytes)
+            .delete_if_value_matches_bounded(&key, &observed_bytes)
             .await
             .unwrap()
     );
@@ -680,26 +681,214 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
         &plugin, &cache_key
     ));
     redis.delete(&key).await.unwrap();
-    assert!(!compare.delete_if_value_matches(&key, b"").await.unwrap());
+    assert!(
+        !compare
+            .delete_if_value_matches_bounded(&key, b"")
+            .await
+            .unwrap()
+    );
     redis.set_bytes_with_expire(&key, b"", 60).await.unwrap();
-    assert!(compare.delete_if_value_matches(&key, b"").await.unwrap());
+    assert!(
+        compare
+            .delete_if_value_matches_bounded(&key, b"")
+            .await
+            .unwrap()
+    );
     redis
         .set_bytes_with_expire(&key, b"owner-token", 60)
         .await
         .unwrap();
     assert!(
         !compare
-            .delete_if_value_matches(&key, b"other-token")
+            .delete_if_value_matches_bounded(&key, b"other-token")
             .await
             .unwrap()
     );
     assert!(
         compare
-            .delete_if_value_matches(&key, b"owner-token")
+            .delete_if_value_matches_bounded(&key, b"owner-token")
             .await
             .unwrap()
     );
     assert_eq!(relay.get_calls.load(Ordering::SeqCst), 0);
+
+    // Exercise the released semantic command profile and every optional
+    // maintenance denial against real Redis ACLs. These cases live inside the
+    // already-selected mandatory Redis gate, including its no-service refusal.
+    let mut admin = redis::Client::open(REDIS_URL)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    for denied in ["released", "WATCH", "UNWATCH", "MULTI", "DEL", "EXEC"] {
+        let username = format!("semantic-quarantine-{}", Uuid::new_v4().simple());
+        let password = Uuid::new_v4().simple().to_string();
+        let mut acl = redis::cmd("ACL");
+        acl.arg("SETUSER")
+            .arg(&username)
+            .arg("reset")
+            .arg("on")
+            .arg(format!(">{password}"))
+            .arg(format!("~{prefix}*"))
+            .arg("+auth")
+            .arg("+hello")
+            .arg("+select")
+            .arg("+client")
+            .arg("+ping")
+            .arg("+info")
+            .arg("+set")
+            .arg("+exists")
+            .arg("+strlen")
+            .arg("+getrange")
+            .arg("+del");
+        if denied != "released" {
+            acl.arg("+watch")
+                .arg("+unwatch")
+                .arg("+multi")
+                .arg("+exec")
+                .arg(format!("-{}", denied.to_ascii_lowercase()));
+        }
+        let _: () = acl.query_async(&mut admin).await.unwrap();
+        let mut acl_config = plugin_config.clone();
+        acl_config["redis_url"] = json!(format!(
+            "redis://{username}:{password}@127.0.0.1:{}/15",
+            relay.port
+        ));
+        let client_config = RedisConfig::from_plugin_config(&acl_config, &prefix)
+            .unwrap()
+            .unwrap();
+        let acl_compare = RedisRateLimitClient::new(client_config, None, false, None).unwrap();
+        redis
+            .set_bytes_with_expire(&key, MALFORMED, 60)
+            .await
+            .unwrap();
+        let expected = if denied == "UNWATCH" {
+            b"different".as_slice()
+        } else {
+            MALFORMED
+        };
+        assert!(
+            acl_compare
+                .delete_if_value_matches_bounded(&key, expected)
+                .await
+                .is_err(),
+            "the restricted ACL must refuse the targeted quarantine operation"
+        );
+        assert!(
+            acl_compare.is_available(),
+            "optional quarantine permission denial must preserve backend availability"
+        );
+        assert!(matches!(
+            acl_compare.get_bytes_bounded(&key, READ_CAP).await,
+            Ok(BoundedRedisValue::Found(value)) if value == MALFORMED
+        ));
+        let remaining_ttl: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert!(
+            (1..=60).contains(&remaining_ttl),
+            "permission denial must leave the expiring remote entry's TTL intact"
+        );
+
+        // Prime the actual plugin's pooled read connection on an absent key.
+        // A later HIT through that same plugin proves permission denial did
+        // not incorrectly mark it unavailable; health probes are 3600s apart.
+        redis.delete(&key).await.unwrap();
+        let acl_plugin = Arc::new(
+            AiSemanticCache::new(&acl_config, PluginHttpClient::default()).unwrap(),
+        );
+        let mut ctx = new_ctx();
+        assert!(matches!(
+            acl_plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+                .await,
+            PluginResult::Continue
+        ));
+        let acl_staging_key =
+            ai_semantic_cache_staging_metadata_key_for_test(&acl_plugin, "cache_key");
+        assert_eq!(ctx.metadata[&acl_staging_key], cache_key);
+        redis
+            .set_bytes_with_expire(&key, MALFORMED, 60)
+            .await
+            .unwrap();
+        // WATCH/UNWATCH denials use a pre-WATCH replacement. Transaction
+        // denials use a post-comparison replacement; MULTI denial must never
+        // let a following DEL escape the transaction and erase that value.
+        let barrier = if matches!(denied, "released" | "WATCH" | "UNWATCH") {
+            1
+        } else {
+            2
+        };
+        relay.pause_on.store(barrier, Ordering::SeqCst);
+        let reader = Arc::clone(&acl_plugin);
+        let request_headers = headers.clone();
+        let lookup = tokio::spawn(async move {
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/v1/chat/completions".to_string(),
+            );
+            reader
+                .on_final_request_body_with_context(&mut ctx, &request_headers, REQUEST)
+                .await
+        });
+        relay.wait_for_pause().await;
+        redis.set_bytes_with_expire(&key, &valid, 60).await.unwrap();
+        relay.resume.notify_one();
+        assert!(matches!(lookup.await.unwrap(), PluginResult::Continue));
+        assert_eq!(
+            ai_semantic_cache_redis_quarantine_delete_failures_for_test(&acl_plugin),
+            1
+        );
+        assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+            &acl_plugin, &cache_key
+        ));
+        assert!(matches!(
+            redis.get_bytes_bounded(&key, READ_CAP).await,
+            Ok(BoundedRedisValue::Found(value)) if value == valid
+        ));
+        let before = relay.reply_bytes.load(Ordering::SeqCst);
+        let mut ctx = new_ctx();
+        assert!(matches!(
+            acl_plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(relay.reply_bytes.load(Ordering::SeqCst), before);
+        assert_eq!(
+            ai_semantic_cache_redis_quarantine_delete_failures_for_test(&acl_plugin),
+            1,
+            "local suppression must prevent repeated maintenance attempts"
+        );
+        ai_semantic_cache_expire_redis_quarantine_for_test(&acl_plugin, &cache_key);
+        let mut ctx = new_ctx();
+        assert!(matches!(
+            acl_plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, REQUEST)
+                .await,
+            PluginResult::RejectBinary { status_code: 200, body, .. } if body.as_ref() == RESPONSE
+        ));
+        assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
+            &acl_plugin, &cache_key
+        ));
+        assert!(matches!(
+            redis.get_bytes_bounded(&key, READ_CAP).await,
+            Ok(BoundedRedisValue::Found(value)) if value == valid
+        ));
+        drop(acl_plugin);
+        drop(acl_compare);
+        let _: i64 = redis::cmd("ACL")
+            .arg("DELUSER")
+            .arg(&username)
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+    }
+    assert_eq!(relay.get_calls.load(Ordering::SeqCst), 0);
+    redis.delete(&key).await.unwrap();
 }
 
 // ============================================================================

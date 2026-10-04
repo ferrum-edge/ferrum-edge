@@ -5709,6 +5709,44 @@ fn watch_transaction_path_pins_multiplexed_connection_not_connection_manager() {
     }
 }
 
+/// Deduplication ownership release keeps its released command profile; only
+/// semantic quarantine may opt into the separate bounded comparison.
+#[test]
+fn ownership_release_retains_get_without_semantic_read_acl_requirements() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    let ownership = source
+        .split_once("pub async fn delete_if_value_matches(")
+        .and_then(|(_, rest)| rest.split_once("pub async fn delete_if_value_matches_bounded("))
+        .map(|(body, _)| body)
+        .expect("separate ownership and bounded quarantine helpers");
+    for command in ["WATCH", "GET", "UNWATCH"] {
+        assert!(ownership.contains(&format!("redis::cmd(\"{command}\")")));
+    }
+    assert!(ownership.contains(".atomic()\n            .cmd(\"DEL\")"));
+    for command in ["EXISTS", "STRLEN", "GETRANGE"] {
+        assert!(!ownership.contains(&format!("cmd(\"{command}\")")));
+    }
+    let dedup = include_str!("../../../src/plugins/request_deduplication.rs");
+    assert!(dedup.contains(".delete_if_value_matches(&redis_key, &ownership.record)"));
+    assert!(!dedup.contains("delete_if_value_matches_bounded"));
+
+    let classification = source
+        .split_once("fn note_quarantine_command_failure(")
+        .and_then(|(_, rest)| rest.split_once("/// Charge one request against EVERY"))
+        .map(|(body, _)| body)
+        .expect("optional quarantine failure classifier");
+    let permission_branch = classification
+        .split_once("if is_permission_denied_error(error) && !topology_unsupported {")
+        .and_then(|(_, rest)| rest.split_once("return;"))
+        .map(|(body, _)| body)
+        .expect("permission denial must return before availability failure handling");
+    assert!(permission_branch.contains("classification = \"permission_denied\""));
+    assert!(!permission_branch.contains("mark_unavailable"));
+    assert!(!permission_branch.contains("note_command_failure"));
+    assert!(classification.contains("error.is_io_error()"));
+    assert!(classification.contains("self.note_command_failure(error)"));
+}
+
 /// Accept TCP, complete the redis-rs handshake with +OK replies, answer the
 /// first WATCH with +OK, then drop the socket before GET/EXEC. Counts SET/DEL
 /// payloads so a fail-open unconditional write would be observable.
@@ -5803,6 +5841,14 @@ async fn watch_cas_helpers_fail_closed_when_connection_drops_after_watch() {
     assert!(
         delete_result.is_err(),
         "disconnect after WATCH must fail closed on delete, got {delete_result:?}"
+    );
+
+    let bounded_delete_result = client
+        .delete_if_value_matches_bounded("fence-key", b"expected")
+        .await;
+    assert!(
+        bounded_delete_result.is_err(),
+        "disconnect after WATCH must fail closed on bounded quarantine delete"
     );
 
     assert_eq!(

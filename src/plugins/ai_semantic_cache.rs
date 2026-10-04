@@ -1859,7 +1859,9 @@ impl AiSemanticCache {
 
     /// Quarantine an inadmissible Redis entry only if its raw bytes have not
     /// changed since lookup, then map the outcome through
-    /// [`Self::apply_redis_quarantine_delete_outcome`].
+    /// [`Self::apply_redis_quarantine_delete_outcome`]. Withheld maintenance
+    /// permissions install the same local marker without making Redis
+    /// unavailable; the bounded helper distinguishes them from I/O failures.
     async fn quarantine_invalid_redis_entry(
         &self,
         redis: &RedisRateLimitClient,
@@ -1872,7 +1874,7 @@ impl AiSemanticCache {
         // value. That is a successful race outcome: leave the replacement
         // untouched and allow a later lookup to reconsider it.
         let delete_ok = redis
-            .delete_if_value_matches(redis_key, observed_value)
+            .delete_if_value_matches_bounded(redis_key, observed_value)
             .await
             .is_ok();
         self.apply_redis_quarantine_delete_outcome(cache_key, fingerprint, delete_ok);

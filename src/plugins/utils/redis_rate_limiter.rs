@@ -5479,21 +5479,9 @@ impl RedisRateLimitClient {
     /// never shared) non-reconnecting [`redis::aio::MultiplexedConnection`] so
     /// connection-local `WATCH` state can neither be interleaved by another
     /// command nor silently dropped by a transparent reconnect. Any I/O failure
-    /// at `WATCH`, the bounded read, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
-    /// The comparison transfers at most `expected.len() + 1` bytes, including
-    /// when a small ownership token or invalid cache value was replaced by a
-    /// much larger value. `EXISTS` distinguishes an absent key from an empty
-    /// string; `STRLEN` and the full bounded prefix must both match before DEL.
+    /// at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
     #[allow(clippy::result_unit_err)]
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
-        // Validate before dialing. For an empty expected value, end=0 reads
-        // one byte, enough to distinguish it from a nonempty replacement.
-        let end = if expected.is_empty() {
-            0
-        } else {
-            redis_getrange_end_index(expected.len()).map_err(|_| ())?
-        };
-        let max_prefix = expected.len().checked_add(1).ok_or(())?;
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
@@ -5510,29 +5498,10 @@ impl RedisRateLimitClient {
             return Err(());
         }
 
-        // WATCH covers every command through EXEC. A rewrite between these
-        // reads can only cause a false mismatch or abort the transaction; it
-        // cannot turn a matching prefix into permission to delete a replacement.
-        let current: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
-            .cmd("EXISTS")
-            .arg(key)
-            .cmd("STRLEN")
-            .arg(key)
-            .cmd("GETRANGE")
-            .arg(key)
-            .arg(0)
-            .arg(end)
-            .query_async(&mut conn)
-            .await;
+        let current: Result<Option<Vec<u8>>, redis::RedisError> =
+            redis::cmd("GET").arg(key).query_async(&mut conn).await;
         match current {
-            Ok((_, _, prefix)) if prefix.len() > max_prefix => {
-                // A nonconforming peer must not authorize a delete. Dropping
-                // this dedicated connection also discards its WATCH state.
-                self.mark_unavailable();
-                return Err(());
-            }
-            Ok((exists, length, prefix))
-                if exists == 1 && length == expected.len() && prefix == expected => {}
+            Ok(Some(current)) if current == expected => {}
             Ok(_) => {
                 let unwatch: Result<(), redis::RedisError> =
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
@@ -5552,7 +5521,7 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "compare-delete EXISTS+STRLEN+GETRANGE",
+                    operation = "compare-delete GET",
                     error = %e,
                     "Redis command failed"
                 );
@@ -5600,6 +5569,155 @@ impl RedisRateLimitClient {
                 Err(())
             }
         }
+    }
+
+    /// Delete an invalid cache entry only when its full observed bytes still match.
+    ///
+    /// Unlike ownership-token release, this comparison never downloads an
+    /// unbounded replacement: EXISTS, STRLEN and GETRANGE transfer at most
+    /// `expected.len() + 1` bytes. A dedicated non-reconnecting connection keeps
+    /// WATCH state intact through MULTI/EXEC; both byte equality and length
+    /// equality are required before DEL. No Lua or unconditional DEL fallback.
+    ///
+    /// Quarantine is optional maintenance. A permission denial (including one
+    /// nested in an EXECABORT) returns Err so the caller suppresses the key
+    /// locally until its marker expires, without changing Redis availability.
+    /// Transport/protocol failures and unsupported topology retain the ordinary
+    /// availability policy. Every exit drops the dedicated connection, so even
+    /// denied UNWATCH or an aborted transaction cannot leak connection state.
+    #[allow(clippy::result_unit_err)]
+    pub async fn delete_if_value_matches_bounded(
+        &self,
+        key: &str,
+        expected: &[u8],
+    ) -> Result<bool, ()> {
+        // Empty expected values still read one byte; a missing key is not an
+        // empty string. Validate indexes before dialing or sending a command.
+        let end = if expected.is_empty() {
+            0
+        } else {
+            redis_getrange_end_index(expected.len()).map_err(|_| ())?
+        };
+        let max_prefix = expected.len().checked_add(1).ok_or(())?;
+        let mut conn = self.get_dedicated_connection().await.ok_or(())?;
+
+        let watch: Result<(), redis::RedisError> =
+            redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
+        if let Err(e) = watch {
+            self.note_quarantine_command_failure(&e, "WATCH");
+            return Err(());
+        }
+
+        // Rewrites during these reads can only cause a mismatch or abort EXEC.
+        let current: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("EXISTS")
+            .arg(key)
+            .cmd("STRLEN")
+            .arg(key)
+            .cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(end)
+            .query_async(&mut conn)
+            .await;
+        match current {
+            Ok((_, _, prefix)) if prefix.len() > max_prefix => {
+                // A nonconforming reply is protocol uncertainty, never a match.
+                warn_sampled!(
+                    operation = "quarantine EXISTS+STRLEN+GETRANGE",
+                    classification = "malformed_response",
+                    "Redis quarantine comparison failed"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+            Ok((exists, length, prefix))
+                if exists == 1 && length == expected.len() && prefix == expected => {}
+            Ok(_) => {
+                let unwatch: Result<(), redis::RedisError> =
+                    redis::cmd("UNWATCH").query_async(&mut conn).await;
+                if let Err(e) = unwatch {
+                    self.note_quarantine_command_failure(&e, "UNWATCH");
+                    return Err(());
+                }
+                self.note_command_success()?;
+                return Ok(false);
+            }
+            Err(e) => {
+                self.note_quarantine_command_failure(&e, "EXISTS+STRLEN+GETRANGE");
+                return Err(());
+            }
+        }
+
+        // Never pipeline MULTI with DEL: if the ACL denies MULTI, a pipelined
+        // DEL could execute outside a transaction and erase a replacement.
+        let multi: Result<(), redis::RedisError> = redis::cmd("MULTI").query_async(&mut conn).await;
+        if let Err(e) = multi {
+            self.note_quarantine_command_failure(&e, "MULTI");
+            return Err(());
+        }
+        let queued: Result<String, redis::RedisError> =
+            redis::cmd("DEL").arg(key).query_async(&mut conn).await;
+        match queued {
+            Ok(reply) if reply == "QUEUED" => {}
+            Ok(_) => {
+                warn_sampled!(
+                    operation = "quarantine DEL",
+                    classification = "malformed_response",
+                    "Redis quarantine delete was not queued"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+            Err(e) => {
+                self.note_quarantine_command_failure(&e, "DEL");
+                return Err(());
+            }
+        }
+        let result: Result<Option<(i64,)>, redis::RedisError> =
+            redis::cmd("EXEC").query_async(&mut conn).await;
+        match result {
+            Ok(Some((deleted,))) => {
+                self.note_command_success()?;
+                Ok(deleted > 0)
+            }
+            Ok(None) => {
+                self.note_command_success()?;
+                Ok(false)
+            }
+            Err(e) => {
+                self.note_quarantine_command_failure(&e, "MULTI/DEL/EXEC");
+                Err(())
+            }
+        }
+    }
+
+    /// Classify optional quarantine failures without treating withheld
+    /// maintenance permissions as an outage. No server text or key is logged.
+    fn note_quarantine_command_failure(&self, error: &redis::RedisError, operation: &'static str) {
+        // A mixed server-error aggregate must not conceal proven Cluster topology.
+        let topology_unsupported = is_cluster_topology_error(error);
+        if is_permission_denied_error(error) && !topology_unsupported {
+            warn_sampled!(
+                operation,
+                classification = "permission_denied",
+                "Redis quarantine permission denied; suppressing the entry locally, retaining backend availability"
+            );
+            return;
+        }
+        let classification = if topology_unsupported {
+            "unsupported_topology"
+        } else if error.is_io_error() {
+            "transport_failed"
+        } else {
+            "command_failed"
+        };
+        warn_sampled!(
+            operation = operation,
+            classification = classification,
+            "Redis quarantine comparison failed"
+        );
+        self.note_command_failure(error);
     }
 
     /// Charge one request against EVERY configured rate-limit window in a
