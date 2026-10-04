@@ -315,7 +315,9 @@ index 316d6a180..931661a19 100644
      pub fn data_frame_budget(&mut self, budget: usize) -> &mut Self {
          self.data_frame_budget = proto::DataFrameBudget::Configured(budget);
          self
-@@ -1533,9 +1534,6 @@ where
+@@ -1531,14 +1532,11 @@ where
+                             remote_reset_stream_max: self.builder.pending_accept_reset_stream_max,
+                             local_error_reset_streams_max: self
                                  .builder
                                  .local_max_error_reset_streams,
                              settings: self.builder.settings.clone(),
@@ -326,3 +328,6 @@ index 316d6a180..931661a19 100644
 +                            data_frame_budget: self.builder.data_frame_budget,
                          },
                      );
+ 
+                     tracing::trace!("connection established!");
+                     let mut c = Connection { connection };
