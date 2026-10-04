@@ -3,7 +3,8 @@
 This supplements the [Compose fixture proposal](compose-fixture-security-proposal.md)
 in [draft PR #6002](https://github.com/ferrum-edge/ferrum-edge/pull/6002).
 It does not approve landing, consumer adoption, a release, or either draft
-advisory. The new probe has not been executed during this preparation.
+advisory. A hosted run has exercised the same-CLI observer, but exact-head
+qualification remains incomplete.
 
 ## Observed failure and published implementation
 
@@ -45,63 +46,47 @@ counts failures rather than identifying a certificate and verification reason.
 These findings explain the telemetry limitation; they do not prove which cause
 produced the recorded CLI error. No manufactured server-log record is used.
 
-## Narrow hosted capability probe
+## Same-attempt hosted MySQL CLI observation
 
-`scripts/qualify_compose_fixtures.py` now makes a separate connection to the
-existing loopback MySQL fixture using CPython's standard `ssl` module. This
-is a distinct attempt, not instrumentation of the MySQL CLI connection. It
-uses the same generated rogue certificate/key and fixture trust anchor,
-verifies `localhost`, and requires the expected server certificate bytes.
-It leaves the context's default TLS 1.2-to-maximum range in place and requires
-actual TLS 1.3 negotiation. A trusted default MySQL CLI query independently
-checks `Ssl_version=TLSv1.3` before the probe. No TLS version is pinned or
-disabled on the server or ordinary clients.
+The earlier CPython separate-connection probe described in prior revisions
+has been removed. It did not establish the certificate rejection cause for
+the MySQL CLI attempt. Hosted qualification now uses
+`scripts/mysql_cli_tls_observer.c`, a bounded private `LD_PRELOAD` observer
+injected into the original `/usr/bin/mysql` process by
+`scripts/qualify_compose_fixtures.py`. The observer does not implement TLS or
+change the command arguments, query, TLS policy, trust, or verification.
+The original CLI performs the handshake and `SELECT 1` itself.
 
-The probe sends only a MySQL SSLRequest, following the official
-[OpenSSL STARTTLS implementation](https://github.com/openssl/openssl/blob/85cf92f55d9e2ac5aacf92bedd33fb890b9f8b4c/apps/s_client.c#L2418).
-It sends no SQL authentication response, password or query, and reads no SQL
-credential option file. It uses a directly constructed `SSLContext` with the
-fixture CA, rather than loading system trust or an environment-selected TLS
-key log.
+Using the public OpenSSL info callback and read-only accessors, the observer
+requires one SSL object and one completed default TLS 1.3 handshake on the
+owner thread, successful server verification, verify-peer mode, the loopback
+MySQL peer on port 3306, and the expected server and selected client
+certificate signatures. A successful positive additionally requires the
+CLI's `SELECT 1` result. For a rogue-client attempt, it requires an incoming
+fatal TLS alert with a certificate-specific alert code admitted by the
+qualifier. The CLI's error 2013 by itself remains inadmissible; it only
+provides the expected failed-query outcome alongside the independently
+observed alert on that same attempt. Hosted evidence includes a trusted
+default CLI positive before and after the rogue attempt.
 
-CPython's [_msg_callback implementation](https://github.com/python/cpython/blob/f6650f9ad73359051f3e558c2431a109bc016664/Lib/ssl.py#L581)
-exposes the connection's decrypted TLS handshake/alert messages through
-[OpenSSL's message callback](https://docs.openssl.org/3.0/man3/SSL_CTX_set_msg_callback/).
-The observer requires the same socket object throughout. Following the
-[TLS 1.3 certificate and authentication formats](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4.2),
-it requires the initial client/server hello sequence, server certificate
-request, exact server leaf DER, server Finished, exact rogue leaf DER
-(including its certificate signature), a populated RSA-PSS CertificateVerify
-from the loaded matching RSA-2048 key, and client Finished. OpenSSL verifies
-the server's chain, hostname and handshake signature before the probe reads
-the delayed rejection.
+The observer fails closed if required symbols or expected library paths are
+unavailable, it cannot prove the executable and private observer inputs,
+callbacks are already present or change, the handshake/object lifecycle is
+unexpected, or any binding/evidence is incomplete. It resolves symbols from
+the CLI's existing OpenSSL mappings and does not load a second OpenSSL
+library. Its only output is one bounded numeric record to privately captured
+stderr at normal exit; malformed or missing records cannot pass. Certificate
+bytes, signatures, secrets, raw TLS data, callback arguments, and unredacted
+CLI output are not logged or uploaded. Synthetic parser self-check records
+test admission logic only and are not runtime proof.
 
-A probe pass additionally requires the received fatal alert bytes `02 30`
-(unknown CA), TLS version 1.3, and the exact OpenSSL exception tuple
-`SSL_ERROR_SSL / SSL / TLSV1_ALERT_UNKNOWN_CA`. The parsed MySQL connection ID
-must be nonzero. The container must use the existing image pin and unchanged
-container ID, its read-only `/client` mount must name the generated directory,
-and the expected certificate/CA/key files must remain unchanged across the
-probe. The bounded output category `tls13-bound-unknown-ca`, protocol number
-13, parsed numeric MySQL connection ID and alert number 48 describe only
-this separate attempt. They do not assign that reason to error 2013 from the
-CLI. Unproven attempts emit a fixed failure category without those numbers.
-
-The network attempt has one five-second deadline, with individual socket
-operations capped at three seconds. Greeting payloads are capped at 4 KiB;
-TLS handshake messages at 16 KiB; leaves at 8 KiB and four entries; total
-callback data at 64 KiB and 128 messages. Unexpected ordering, duplicate
-events, wrong socket/certificate/protocol, local material failures, generic
-EOF, timeout, absent server, application/authentication data and unrelated
-TLS errors cannot pass. Unsupported private callback behavior fails closed.
-Certificate bytes, signatures, subjects, keys, connection greetings and raw
-exceptions are never logged, uploaded or written as probe artifacts.
-
-Hosted parser self-checks exercise malformed/truncated/oversized certificate
-vectors, wrong alert direction/version/type/length, and unbound sockets or
-alerts. Their synthetic parser bytes are explicitly not certificate fixtures
-or runtime evidence. The live server, generated certificate and real alert
-are required independently.
+The hosted run at [job 111436786371](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37202471389/job/111436786371)
+reported the default CLI positive before the rogue attempt, an incoming
+`unknown_ca` alert paired with error 2013 on the same original CLI attempt,
+and the default CLI positive after it. The job then failed during the later
+process argv, healthcheck and log scan; unconditional cleanup passed. This is
+evidence for that MySQL CLI attempt only. It is not a complete qualification
+pass or evidence that the SQL profiles and consumers are ready for adoption.
 
 ## CLI admission and completion constraint
 
@@ -119,11 +104,10 @@ default-client proof. MySQL missing-client authentication rejection remains
 its separate control.
 
 An unresolved default CLI attempt is marked `UNQUALIFIED`, then its trusted
-default `SELECT 1` still runs in `finally`. The separate probe also has a
-subsequent trusted default `SELECT 1`. Existing profiles, positives, all
+default `SELECT 1` still runs in `finally`. Existing profiles, positives, all
 other negatives, readiness checks and live SQL argv/healthcheck/log credential
-scan continue. After those scans the final qualification still fails unless
-both the default CLI certificate diagnostic and separate probe are proven.
+scan continue. The final qualification fails unless the same-attempt observer
+proves the required default CLI positives and certificate-specific refusal.
 Cleanup remains in the original `finally` and unconditional workflow step.
 There is no aggregate PASS for an unresolved CLI disconnect.
 
@@ -133,19 +117,16 @@ frozen checker and job digest, required trust checks, other CI jobs, release
 publication, runtime, Cargo/dependencies and existing image/TLS profile pins
 are unchanged.
 
-The precise remaining constraint is the released CLI's loss of the SSL read
-reason, coupled with the absence of a connection-specific verification reason
-in the inspected server failure path. If the same CLI continues to emit only
-2013, this change deliberately cannot produce a complete qualification pass.
-A successful separate probe supplies reviewable certificate-cause evidence
-for its own default TLS 1.3 attempt. Root must decide whether that distinct
-proof scope is sufficient or assign independently reviewed instrumentation
-of the actual CLI/server connection. This round does not weaken that boundary
-or replace the CLI control with the new probe.
+The released CLI still emits error 2013 for the observed rogue-client
+attempt because its SQL diagnostic loses the TLS read reason. The observer
+provides independent same-attempt evidence through the incoming certificate-
+specific alert. Error 2013 alone remains insufficient, and hosted qualification
+must still pass the later argv, healthcheck and log scans before an aggregate
+PASS is possible.
 
-Root attention: collect exact-head hosted probe/scanner/cleanup results and
-unchanged trusted-policy results, perform a whole-candidate review and fresh
-focused security review of the new protocol parser, callback/provenance,
+Root attention: collect exact-head hosted qualification/scanner/cleanup
+results and unchanged trusted-policy results, perform a whole-candidate review
+and fresh focused security review of the observer callback/provenance,
 classifier admission and deferred failure. Keep the PR draft and defer the
 released SQL profile/consumer adoption owner decision until complete
 qualification. Local verification consists only of static inspection,
