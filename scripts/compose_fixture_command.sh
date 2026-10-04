@@ -81,7 +81,7 @@ case "${FIXTURE_OPERATION:?}" in
         client_file=/run/secrets/mysql-client.cnf
         set --
         case "${FIXTURE_MYSQL_MODE:?}" in
-            trusted) ;;
+            trusted|trusted-observed) ;;
             wrong-ca) set -- --ssl-ca=/client/bad-ca.crt ;;
             wrong-hostname) set -- --host=127.0.0.2 ;;
             plaintext) set -- --ssl-mode=DISABLED ;;
@@ -91,11 +91,42 @@ case "${FIXTURE_OPERATION:?}" in
                 set -- --tls-version=TLSv1.2 --ssl-cert=/client/rogue.crt \
                     --ssl-key=/client/rogue.key
                 ;;
-            rogue-default) set -- --ssl-cert=/client/rogue.crt --ssl-key=/client/rogue.key ;;
+            rogue-default|rogue-default-observed)
+                set -- --ssl-cert=/client/rogue.crt --ssl-key=/client/rogue.key
+                ;;
             *) exit 1 ;;
+        esac
+        case "$FIXTURE_MYSQL_MODE" in
+            trusted-observed|rogue-default-observed)
+                # Only the loader environment changes. Same immutable CLI, option
+                # file, query, endpoint and default protocol as the original probe.
+                exec docker exec -e LD_PRELOAD=/client/mysql-cli-tls-observer.so \
+                    ferrum-test-mysql-tls mysql "--defaults-extra-file=$client_file" \
+                    --batch --skip-column-names "$@" -e "${FIXTURE_QUERY:?}"
+                ;;
         esac
         exec docker exec ferrum-test-mysql-tls mysql "--defaults-extra-file=$client_file" \
             --batch --skip-column-names "$@" -e "${FIXTURE_QUERY:?}"
+        ;;
+    mysql-observer-compile)
+        # Never link the runner's libssl into the CLI. Resolve its existing
+        # public SSL functions at runtime, or leave qualification failed closed.
+        exec gcc -std=c11 -Wall -Wextra -Werror -fPIC -shared \
+            -Wl,-z,relro,-z,now -o "${FIXTURE_CERTS_DIR:?}/client/mysql-cli-tls-observer.so" \
+            scripts/mysql_cli_tls_observer.c -ldl
+        ;;
+    mysql-observer-server-der)
+        exec openssl x509 -in "${FIXTURE_CERTS_DIR:?}/mysql/server.crt" -outform DER \
+            -out "$FIXTURE_CERTS_DIR/client/mysql-observer-server.der"
+        ;;
+    mysql-observer-client-der)
+        case "${FIXTURE_MYSQL_MODE:?}" in
+            trusted) certificate=client.crt ;;
+            rogue-default) certificate=rogue.crt ;;
+            *) exit 1 ;;
+        esac
+        exec openssl x509 -in "${FIXTURE_CERTS_DIR:?}/client/$certificate" -outform DER \
+            -out "$FIXTURE_CERTS_DIR/client/mysql-observer-client.der"
         ;;
     untrusted-ca)
         exec openssl req -new -x509 -newkey rsa:2048 -nodes -days 1 \

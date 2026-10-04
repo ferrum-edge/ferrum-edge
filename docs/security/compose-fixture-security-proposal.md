@@ -176,7 +176,7 @@ The canonical frozen checker at
 commands now name the `scripts/` implementations directly. The qualifier's
 two subprocess call sites use a literal `bash scripts/compose_fixture_command.sh`
 argument list. That dispatcher enumerates the Compose, Docker SQL, Mongo, and
-OpenSSL operations with literal executable names and literal setup/cleanup
+OpenSSL and bounded observation-fixture GCC operations with literal executable names and literal setup/cleanup
 script edges. Operation selectors, paths, SQL queries, and connection settings
 are quoted environment data; no input is evaluated as shell source or selected
 as an executable. Unknown selectors fail. This makes the implementation and
@@ -200,6 +200,7 @@ when recording exact-head qualification/review evidence):
 | `scripts/setup_db_tls.sh` | Full SQL generation, startup, ownership and cleanup implementation |
 | `scripts/qualify_compose_fixtures.py` | Hosted assertions, private capture, bounded diagnostic admission |
 | `scripts/compose_fixture_command.sh` | Explicit command graph for all qualifier subprocesses |
+| `scripts/mysql_cli_tls_observer.c` | Hosted-only public OpenSSL observation of the unchanged MySQL CLI argv |
 | `tests/scripts/setup_db_tls.sh` | Released manual entrypoint forwarder |
 | `.github/workflows/compose-fixture-qualification.yml` | Hosted qualification and unconditional cleanup roots |
 | `docs/database_tls.md` | Setup/cleanup usage and consumer dependency |
@@ -338,18 +339,116 @@ diagnosis but is not newly admitted. Generic SSL errors (including local
 material failures/unsupported protocols), unknown errors, ambiguous/missing
 records and timeouts cannot pass the default rogue-client control.
 
-The untrusted MySQL client must still actually fail on the default protocol.
-Only the existing two exact late-read error-2013 messages, a certificate-specific
-TLS alert, or error-1045 authentication rejection can satisfy that negative,
-after the same rogue certificate/key produces a certificate-specific TLS 1.2
-alert alongside a trusted TLS 1.2 SQL positive. A trusted default-protocol
-`SELECT 1` now runs after the rogue attempt even if its diagnostic is unknown;
-that positive cannot convert an unknown negative to a pass. Hosted classifier
-self-checks cover allowed messages, a nonzero system error, altered SQLSTATE,
-trailing text, unsupported protocols, missing local material, connection
-failure, multiple errors, and oversized output. Other negative checks retain
-their TLS/authentication diagnostics. The server's allowed protocols and
-ordinary/default client options are unchanged.
+The untrusted MySQL client must actually fail on its default protocol. The
+current classifier admits only certificate-specific error-2026 alerts on its
+own; neither error 1045 nor any error-2013 message establishes certificate
+rejection. The TLS 1.2 certificate-specific negative and paired SQL positive
+remain a distinct control. A default trusted `SELECT 1` runs after the rogue
+attempt even if its cause is unknown; availability cannot upgrade an unresolved
+negative to PASS. The server's allowed protocols, client verification settings,
+and default CLI query/options remain unchanged.
+
+The [479abdf8 hosted qualification](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37201180556/job/111433021934)
+again reported default CLI `2013/client-server-lost-during-query`, explicitly
+`UNQUALIFIED`, while the TLS 1.2 control reported `2026/tls-alert-unknown-ca`
+and the subsequent default trusted `SELECT 1` passed. Its separate CPython TLS
+1.3 handshake probe reported `probe-capability-or-provenance-failure`; that was
+a **distinct attempt**, never evidence about the original CLI connection. The
+run reached the live argv/log scan but failed before reporting that scan PASS.
+Neither its default CLI cause nor a completed qualification is proved.
+
+This diagnosis replaces the private CPython message callback and separate
+handshake with public observation inside the existing immutable CLI invocation.
+The published pinned index selects amd64 manifest
+`sha256:62fb722c78b24245ddff1796a0fcee4a49cc5b87e0aaaf20c92d1da9e0a2497b`,
+whose [image source](https://github.com/docker-library/mysql/blob/7cf11d5360282effadb347353d5f82339506b106/8.0/Dockerfile.oracle)
+installs `8.0.46-1.el9` on Oracle Linux 9. The
+[matching MySQL VIO source](https://github.com/mysql/mysql-server/blob/mysql-8.0.46/vio/viossl.cc)
+calls `SSL_new` and `SSL_read`; its
+[connector source](https://github.com/mysql/mysql-server/blob/mysql-8.0.46/vio/viosslfactories.cc)
+configures peer verification and identity checking.
+[OpenSSL's public info callback](https://docs.openssl.org/3.0/man3/SSL_CTX_set_info_callback/)
+reports incoming alerts with `SSL_CB_READ_ALERT`. These primary sources make
+interposition plausible; published image/source metadata **does not prove**
+that the immutable binary dynamically interposes those functions. The hosted
+capability checks must establish that fact for each actual invocation.
+
+The explicit dispatcher compiles the small observer with GCC only on the
+hosted runner, into the private SQL client mount; it links no runner libssl.
+The preload changes only the loader environment of the original CLI argv:
+private option file, `SELECT 1`, endpoint, rogue certificate/key overrides and
+default protocol settings are identical. Real functions resolve through
+`dlsym(RTLD_NEXT)` from one `libssl.so.3` mapping; certificate getters resolve
+from one `libcrypto.so.3` mapping. The process executable must match
+`/usr/bin/mysql`. Unsupported symbols, mappings or interposition fail closed.
+
+The observer attaches once to the real `SSL_new` result only when neither an
+object nor a context info callback is already present. Pre-existing callbacks
+are left untouched and make this conservative observer unsupported, preserving
+their getter semantics as well as their events. If a context callback is
+introduced later, the observer removes its originally-null object override
+before forwarding that current event with unchanged arguments; future events
+use OpenSSL's normal context fallback. An application object setter is also
+respected. The observer never reinstalls itself to recover evidence. It
+preserves errno around its own work. It never sets verification modes,
+protocol limits, verification callbacks, key logging or message callbacks,
+performs TLS I/O, serializes certificates inside TLS, or reads/clears the
+OpenSSL error queue. Callback introduction/replacement makes observation
+unqualified. Another SSL
+object, handshake, thread or incoming alert, an outgoing fatal alert, changed
+binding, or a missing free also prevents qualification.
+
+A single bounded numeric record (at most 128 bytes) is emitted to privately
+captured stderr at normal process exit. It contains only fixed booleans,
+bounded counts, protocol 13, and numeric incoming-alert level/code. The harness
+separates this record from the original error without printing either raw
+record or raw error. A passing refusal requires a completed verified TLS 1.3
+handshake, peer-verification mode, socket peer `127.0.0.1:3306` or `[::1]:3306`,
+matching generated server/selected-client certificate signatures, one SSL
+object/handshake, intact callback observation through free, and an incoming
+fatal `unknown_ca(48)`, `certificate_unknown(46)` or `bad_certificate(42)`.
+An exact catalog error 2013 may accompany that same attempt's certificate
+alert; **bare 2013 remains insufficient**. Instrumented valid-client `SELECT 1`
+positives before and after must show the same verified default TLS 1.3 binding
+and no incoming alert; the subsequent original uninstrumented query must also
+pass. This qualifies the newly observed invocation only, and cannot
+retroactively prove the cause of any earlier unobserved 2013.
+
+Public certificate DER is generated by finite OpenSSL commands in runner temp;
+a strict outer-DER parser extracts only the generated RSA signature for private
+comparison through `X509_get0_signature`/ASN.1 getters. No signature, hash, key,
+password, user, server message or TLS session secret reaches hosted output.
+The harness requires the pinned container identity, matching read-only client
+and option-file mounts, and unchanged private material across each invocation.
+All generated `.so`, DER/signature inputs and finite `.records` files stay
+under the existing runner-temp SQL directory: mode `0600`, runner ownership,
+single links, regular files and explicit size limits. The existing private
+directory, `finally` cleanup, SIGTERM/SIGINT handling and unconditional workflow
+cleanup cover success, failure and signals; no artifact/cache/upload is added.
+Parser/admission self-checks cover duplicate, missing, malformed, oversized,
+noncertificate and unbound observations. Synthetic self-checks are never
+runtime evidence. Remaining availability and credential argv/log scans
+still run before the final fail-closed assertion.
+
+This source is **not yet hosted-qualified**. Root must independently review all
+new observation, parser, command and cleanup logic, inspect exact-head hosted
+capability and positive/negative evidence, and confirm the original controls and
+credential scan/cleanup still pass. If dynamic interposition is unsupported or
+the actual CLI exposes no certificate-specific alert, retain failed qualification
+with the fixed nonsecret capability/binding/refusal category. Do not retry an
+uninvestigated failure or classify it as an external blocker.
+
+Concrete redesign for fresh root/security-owner review if this client-side
+instrumentation proves infeasible: preserve the original CLI failure as an
+unqualified diagnostic; separately qualify the security invariant that default
+TLS 1.3 on this immutable server admits the trusted certificate/query and
+refuses the generated untrusted certificate at server-side verification. A
+server-side public OpenSSL observer would need to bind the actual server
+verification result to the original CLI's socket/peer and selected certificate,
+preserve existing callbacks/verification, retain the same privacy/lifecycle
+limits, and pair it with availability/credential scans. Adopting that gate would
+require an explicit reviewed qualification-contract decision; neither a
+separate client probe nor a generic disconnect satisfies the current gate.
 
 **Focused re-review required:** the new diagnostic/admission code, post-attempt
 positive in `finally`, command/environment boundary, dispatcher operation
