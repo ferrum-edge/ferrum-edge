@@ -1142,23 +1142,32 @@ async fn grpc_deadline_after_partial_data_resets_stream_and_preserves_backend_he
         let reservation = reserve_port().await.expect("reserve port");
         let backend_port = reservation.port;
         let partial_message = Bytes::from_static(b"partial");
-        let builder = ScriptedGrpcBackend::builder_plain(reservation.into_listener());
-        let builder = if bidi {
-            builder.step(GrpcStep::AcceptStreamingRpc(MatchRpc::method(method)))
+        let accept = if bidi {
+            GrpcStep::AcceptStreamingRpc(MatchRpc::method(method))
         } else {
-            builder.step(GrpcStep::AcceptRpc(MatchRpc::method(method)))
+            GrpcStep::AcceptRpc(MatchRpc::method(method))
         };
-        let backend = builder
-            .step(GrpcStep::SendInitialHeaders)
-            .step(GrpcStep::RespondMessage(partial_message.clone()))
-            .step(GrpcStep::ExpectReset(Duration::from_secs(4)))
-            .step(GrpcStep::AcceptRpc(MatchRpc::method("/ferrum.Echo/Health")))
-            .step(GrpcStep::SendInitialHeaders)
-            .step(GrpcStep::RespondMessage(Bytes::from_static(b"healthy")))
-            .step(GrpcStep::RespondStatus {
-                code: 0,
-                message: "",
-            })
+        // Health uses a new frontend connection and may select another backend
+        // shard. Its response must not depend on reusing the reset connection.
+        let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+            .rpc_scripts([
+                vec![
+                    accept,
+                    GrpcStep::SendInitialHeaders,
+                    GrpcStep::RespondMessage(partial_message.clone()),
+                    GrpcStep::ExpectReset(Duration::from_secs(4)),
+                ],
+                vec![
+                    GrpcStep::AcceptRpc(MatchRpc::method("/ferrum.Echo/Health")),
+                    GrpcStep::SendInitialHeaders,
+                    GrpcStep::RespondMessage(Bytes::from_static(b"healthy")),
+                    GrpcStep::RespondStatus {
+                        code: 0,
+                        message: "",
+                    },
+                ],
+            ])
+            .expect("method-routed RPC scripts")
             .spawn()
             .expect("spawn backend");
         let harness = GatewayHarness::builder()
@@ -1232,12 +1241,21 @@ async fn grpc_deadline_after_partial_data_resets_stream_and_preserves_backend_he
             .unwrap_or_else(|error| panic!("{case}: health RPC failed: {error}"));
         assert_eq!(health.grpc_status(), Some(0), "{case}: health RPC");
         assert_eq!(
+            health.messages,
+            vec![Bytes::from_static(b"healthy")],
+            "{case}: health RPC must receive its own response"
+        );
+        assert_eq!(
             backend.received_stream_count(),
             2,
             "{case}: client deadline must not trip the one-failure circuit breaker"
         );
-        backend.assert_no_matcher_mismatches().await;
-        backend.assert_no_step_errors().await;
+        assert_grpc_backend_rpc_paths(
+            &backend,
+            &[method, "/ferrum.Echo/Health"],
+            case,
+        )
+        .await;
     }
 }
 
@@ -1685,26 +1703,64 @@ async fn native_grpc_builders_write_the_gateway_owned_error_token() {
     }
 }
 
+/// Prove each method reached the backend once, without assuming a connection
+/// count or allowing a retry to hide a wrong fixture response.
+async fn assert_grpc_backend_rpc_paths(backend: &ScriptedGrpcBackend, paths: &[&str], case: &str) {
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), paths.len(), "{case}: {streams:?}");
+    assert_eq!(
+        backend.received_stream_count() as usize,
+        paths.len(),
+        "{case}: {streams:?}"
+    );
+    for path in paths {
+        assert_eq!(
+            streams
+                .iter()
+                .filter(|stream| stream.method == "POST" && stream.path == *path)
+                .count(),
+            1,
+            "{case}: expected one backend RPC for {path}: {streams:?}"
+        );
+    }
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
 async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
+    const SUCCESS: &str = "/ferrum.Echo/Success";
+    const FAILURE: &str = "/ferrum.Echo/Failure";
+    const MALFORMED: &str = "/ferrum.Echo/Malformed";
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
-    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondMessage(Bytes::from_static(b"ok")))
-        .step(GrpcStep::RespondStatus {
-            code: 0,
-            message: "",
-        })
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondStatus {
-            code: 4,
-            message: "deadline exceeded",
-        })
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondRawStatus { value: "malformed" })
+    // /grpc is stripped by grpc_file_config_with_log_config. Each unary call
+    // opens a frontend connection, so route by the rewritten backend method.
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .rpc_scripts([
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(SUCCESS)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondMessage(Bytes::from_static(b"ok")),
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+            ],
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(FAILURE)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 4,
+                    message: "deadline exceeded",
+                },
+            ],
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(MALFORMED)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondRawStatus { value: "malformed" },
+            ],
+        ])
+        .expect("method-routed RPC scripts")
         .spawn()
         .expect("spawn backend");
     let yaml = grpc_file_config_with_log_config(
@@ -1741,6 +1797,35 @@ async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
         .await
         .expect("malformed-status RPC response");
     assert_eq!(malformed.grpc_status(), None, "{case}: {malformed:?}");
+    assert_eq!(
+        success.messages,
+        vec![Bytes::from_static(b"ok")],
+        "{case}"
+    );
+    for (response, status) in [(&success, "0"), (&failure, "4"), (&malformed, "malformed")] {
+        assert_eq!(response.http_status, 200, "{case}: {response:?}");
+        assert!(response.stream_error.is_none(), "{case}: {response:?}");
+        assert!(!response.initial_headers_end_stream, "{case}: {response:?}");
+        assert!(!response.headers.contains_key("grpc-status"), "{case}: {response:?}");
+        assert_eq!(
+            response
+                .trailers
+                .as_ref()
+                .and_then(|trailers| trailers.get("grpc-status"))
+                .and_then(|value| value.to_str().ok()),
+            Some(status),
+            "{case}: terminal wire status must be preserved: {response:?}"
+        );
+    }
+    for response in [&failure, &malformed] {
+        assert!(response.raw_body_frames.is_empty(), "{case}: {response:?}");
+    }
+    assert_grpc_backend_rpc_paths(
+        &backend,
+        &[SUCCESS, FAILURE, MALFORMED],
+        case,
+    )
+    .await;
 
     let logs = harness
         .wait_for_log_contains(
@@ -1798,21 +1883,32 @@ async fn stdout_errors_only_covers_streamed_and_buffered_h2_grpc_status() {
 }
 
 async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case: &str) {
+    const SUCCESS: &str = "/echo.Echo/Success";
+    const FAILURE: &str = "/echo.Echo/Failure";
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
-    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondStatus {
-            code: 0,
-            message: "",
-        })
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondStatus {
-            code: 14,
-            message: "unavailable",
-        })
+    // grpc_chargeback_file_config strips /grpc. A connection-local sequence
+    // would return status 0 again if /Failure selects another backend shard.
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .rpc_scripts([
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(SUCCESS)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+            ],
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(FAILURE)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 14,
+                    message: "unavailable",
+                },
+            ],
+        ])
+        .expect("method-routed RPC scripts")
         .spawn()
         .expect("spawn backend");
     let harness = GatewayHarness::builder()
@@ -1842,6 +1938,27 @@ async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case:
         .expect("failed-status RPC response");
     assert_eq!(failure.http_status, 200, "{case}: {failure:?}");
     assert_eq!(failure.grpc_status(), Some(14), "{case}: {failure:?}");
+    for (response, status) in [(&success, "0"), (&failure, "14")] {
+        assert!(response.stream_error.is_none(), "{case}: {response:?}");
+        assert!(response.raw_body_frames.is_empty(), "{case}: {response:?}");
+        assert!(!response.initial_headers_end_stream, "{case}: {response:?}");
+        assert!(!response.headers.contains_key("grpc-status"), "{case}: {response:?}");
+        assert_eq!(
+            response
+                .trailers
+                .as_ref()
+                .and_then(|trailers| trailers.get("grpc-status"))
+                .and_then(|value| value.to_str().ok()),
+            Some(status),
+            "{case}: terminal wire status must be preserved: {response:?}"
+        );
+    }
+    assert_grpc_backend_rpc_paths(
+        &backend,
+        &[SUCCESS, FAILURE],
+        case,
+    )
+    .await;
 
     let charges = wait_for_chargeback_statuses(
         &harness,
