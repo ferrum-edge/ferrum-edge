@@ -58,6 +58,7 @@ AMBIENT_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ambient-host-udp-live.
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKERFILE_RELEASE = REPO_ROOT / "Dockerfile.release"
 DOCKERFILE_EBPF_TOOLS_LAYER = REPO_ROOT / "Dockerfile.ebpf-tools-layer"
+DOCKERFILE_IPROUTE2_LAYER = REPO_ROOT / "Dockerfile.iproute2-layer"
 DOCKERFILE_TEST = REPO_ROOT / "Dockerfile.test"
 SETUP_RUST = REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 SETUP_SCCACHE = REPO_ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
@@ -5169,6 +5170,7 @@ def check_dockerfile(failures: list[str]) -> None:
     )
     release = DOCKERFILE_RELEASE.read_text(encoding="utf-8")
     ebpf_tools_layer = DOCKERFILE_EBPF_TOOLS_LAYER.read_text(encoding="utf-8")
+    iproute2_layer = DOCKERFILE_IPROUTE2_LAYER.read_text(encoding="utf-8")
     check_dockerfile_log_level("Dockerfile", dockerfile, failures)
     check_dockerfile_log_level("Dockerfile.release", release, failures)
     check_dockerfile_log_level(
@@ -5179,6 +5181,7 @@ def check_dockerfile(failures: list[str]) -> None:
         ("Dockerfile.release", release),
         ("Dockerfile.test", DOCKERFILE_TEST.read_text(encoding="utf-8")),
         ("Dockerfile.ebpf-tools-layer", ebpf_tools_layer),
+        ("Dockerfile.iproute2-layer", iproute2_layer),
     ):
         check_dockerfile_image_pins(label, text, failures)
 
@@ -5501,6 +5504,18 @@ def self_test() -> int:
     require(
         len(pin_failures) == 1 and "ARG RUNTIME_BASE" in pin_failures[0],
         "self-test: an unpinned ARG image default must fail closed",
+        failures,
+    )
+    pin_failures = []
+    check_dockerfile_image_pins(
+        "Dockerfile.iproute2-layer",
+        "ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot\n"
+        "FROM ${BASE_IMAGE} AS runtime-base\n",
+        pin_failures,
+    )
+    require(
+        len(pin_failures) == 1 and "ARG BASE_IMAGE" in pin_failures[0],
+        "self-test: a mutable iproute2 runtime BASE_IMAGE default must fail closed",
         failures,
     )
     pin_failures = []

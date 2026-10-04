@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Pin the iproute2 runtime base to the production distroless digest**
+  (GHSA-c3r8-6276-9678). `Dockerfile.iproute2-layer` now defaults
+  `BASE_IMAGE` to the verified OCI index digest used by the production runtime.
+  The existing base-image digest refresh workflow already includes this
+  Dockerfile, and callers that set an explicit `BASE_IMAGE` override keep that
+  behavior.
 - **OIDC session encryption secrets reject published and placeholder values**
   (#5987; cross-repo hardening from Ferrum Foundry GHSA-hjw6-685j-p5hw). The
   `oidc_relying_party` session config previously checked
