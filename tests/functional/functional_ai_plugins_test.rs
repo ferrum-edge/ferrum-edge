@@ -760,13 +760,53 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             .unwrap();
         let acl_compare = RedisRateLimitClient::new(client_config, None, false, None).unwrap();
         if denied == "released" {
-            acl_compare
-                .set_bytes_with_expire(&key, b"released-profile-store", 60)
-                .await
-                .expect("released semantic ACL must allow the atomic store profile");
+            let restricted_store =
+                AiSemanticCache::new(&acl_config, PluginHttpClient::default()).unwrap();
+            let mut store_ctx = new_ctx();
             assert!(matches!(
-                acl_compare.get_bytes_bounded(&key, READ_CAP).await,
-                Ok(BoundedRedisValue::Found(value)) if value == b"released-profile-store"
+                restricted_store
+                    .on_final_request_body_with_context(&mut store_ctx, &headers, REQUEST)
+                    .await,
+                PluginResult::Continue
+            ));
+            let store_staging_key =
+                ai_semantic_cache_staging_metadata_key_for_test(&restricted_store, "cache_key");
+            assert_eq!(store_ctx.metadata[&store_staging_key], cache_key);
+            let response_headers =
+                HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+            restricted_store
+                .on_final_response_body(&mut store_ctx, 200, &response_headers, RESPONSE)
+                .await;
+
+            let persisted = redis.get_bytes_bounded(&key, READ_CAP).await.unwrap();
+            let BoundedRedisValue::Found(envelope) = persisted else {
+                panic!("restricted plugin must persist a sealed cache envelope");
+            };
+            let envelope: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+            assert!(envelope["version"].as_u64().is_some());
+            assert_eq!(envelope["status_code"], 200);
+            assert!(envelope["integrity"].as_str().is_some_and(|mac| !mac.is_empty()));
+            let remaining_ttl: i64 = redis::cmd("TTL")
+                .arg(&key)
+                .query_async(&mut admin)
+                .await
+                .unwrap();
+            assert!(
+                (1..=60).contains(&remaining_ttl),
+                "restricted plugin store must apply its configured Redis TTL"
+            );
+
+            // A new instance has no local entry, so this HIT must read and
+            // admit the envelope persisted under the restricted ACL.
+            let restricted_reader =
+                AiSemanticCache::new(&acl_config, PluginHttpClient::default()).unwrap();
+            let mut reader_ctx = new_ctx();
+            assert!(matches!(
+                restricted_reader
+                    .on_final_request_body_with_context(&mut reader_ctx, &headers, REQUEST)
+                    .await,
+                PluginResult::RejectBinary { status_code: 200, body, .. }
+                    if body.as_ref() == RESPONSE
             ));
         }
         redis
