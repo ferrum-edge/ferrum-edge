@@ -105,7 +105,10 @@ They check that:
 
 h2's library suite also passes, apart from the HPACK fixture tests, which read data files the published crate does not ship.
 
-CI also runs every Ferrum hyper regression (`ferrum_*`, including patch 002's DATA-frame capacity test) against this h2 (the `Vendored Patch Regressions` job), and the H2 guard observation lane builds its observed h2 from the verified archive plus this patch.
+CI also runs every Ferrum Hyper regression (`ferrum_*`, including patch 002's
+flow-control progress tests) against this h2, then runs h2 patch 002's dynamic
+budget tests (the `Vendored Patch Regressions` job). The H2 guard observation
+lane builds its observed h2 from the verified archive plus these patches.
 
 ## Retirement
 
