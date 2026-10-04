@@ -1377,14 +1377,22 @@ struct H3ConnectionCreateError {
 }
 
 impl H3ConnectionCreateError {
-    fn capture(
-        inner: anyhow::Error,
-        connect_at: Option<&OnceLock<tokio::time::Instant>>,
-    ) -> Self {
+    fn capture(inner: anyhow::Error, connect_at: Option<&OnceLock<tokio::time::Instant>>) -> Self {
         let occurred_at = tokio::time::Instant::now();
+        let connect_deadline = connect_at.and_then(|at| at.get().copied());
+        // Tokio's candidate timeout polls the dial before its elapsed timer.
+        // A ready failure on a delayed poll can therefore be non-timeout even
+        // after the operator bound. Capture the transport winner BEFORE pool
+        // publication, independently of every caller's authorization/client
+        // lifetime. Timely failures retain their original typed source/context.
+        let inner = if connect_deadline.is_some_and(|at| at <= occurred_at) {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, inner).into()
+        } else {
+            inner
+        };
         let shared = crate::pool::SharedPoolCreateError::capture(inner.as_ref());
         let deadline_at = if shared.error_class() == crate::retry::ErrorClass::ConnectionTimeout {
-            connect_at.and_then(|at| at.get().copied())
+            connect_deadline
         } else {
             None
         };
@@ -1445,8 +1453,9 @@ where
         && let Some(create_error) = error.downcast_ref::<H3ConnectionCreateError>()
         && let Some(timing) = create_error.shared.failure_timing()
     {
-        // A timeout keeps the operator instant that selected it, even when
-        // the creator ran late. Other failures keep their captured occurrence.
+        // The adapter already selected the transport winner before publication:
+        // an elapsed operator bound keeps its instant, while a timely failure
+        // keeps its captured occurrence and original typed class/context.
         // Compare these facts with THIS caller's admitted lifetime, never with
         // the creator's plan or the waiter's wake clock. Lifetime wins ties.
         let failure_at = timing
@@ -2221,6 +2230,34 @@ impl Http3ConnectionPool {
     where
         F: std::future::Future<Output = anyhow::Error>,
     {
+        self.await_coalesced_connection_error_for_test(
+            key,
+            client_at,
+            plan,
+            connect_at,
+            failure,
+        )
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            (h3_connection_checkout_error_for_test(error), message)
+        })
+    }
+
+    /// The same production pool/adapter path, retaining the creator's typed
+    /// source chain for cold-connection regression assertions.
+    #[doc(hidden)]
+    pub async fn await_coalesced_connection_error_for_test<F>(
+        &self,
+        key: String,
+        client_at: Option<tokio::time::Instant>,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        connect_at: &OnceLock<tokio::time::Instant>,
+        failure: F,
+    ) -> H3PoolResult<()>
+    where
+        F: std::future::Future<Output = anyhow::Error>,
+    {
         let create = self.create_or_get_sender(key, Some(connect_at), async { Err(failure.await) });
         await_h3_connection_checkout(
             H3Authorization::new(client_at, plan),
@@ -2236,10 +2273,12 @@ impl Http3ConnectionPool {
         )
         .await
         .map(|_| ())
-        .map_err(|error| {
-            let message = error.to_string();
-            (h3_connection_checkout_error_for_test(error), message)
-        })
+    }
+
+    /// Pending creations and available permits for cold-path lifecycle tests.
+    #[doc(hidden)]
+    pub fn creation_state_for_test(&self) -> (usize, usize) {
+        self.pool.creation_state_for_test()
     }
 
     async fn create_or_get_proxy_sender(

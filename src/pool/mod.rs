@@ -830,6 +830,15 @@ impl<M: PoolManager> GenericPool<M> {
         self.entries.len()
     }
 
+    /// Pending creations and available permits for cold-path lifecycle tests.
+    #[doc(hidden)]
+    pub fn creation_state_for_test(&self) -> (usize, usize) {
+        (
+            self.pending_creations.len(),
+            self.inflight.available_permits(),
+        )
+    }
+
     pub fn stats(&self) -> PoolStats {
         PoolStats {
             size: self.entries.len(),

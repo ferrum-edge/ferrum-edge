@@ -1361,6 +1361,275 @@ async fn native_h3_coalesced_waiter_does_not_inherit_creator_authorization_termi
     );
 }
 
+/// Exercise the ready-dial-first timeout in production connect_candidates,
+/// then the actual H3 typed adapter and GenericPool/Http3PoolManager fan-out.
+/// The creator resumes after both bounds; the waiter resumes still later.
+#[tokio::test(start_paused = true)]
+async fn native_h3_candidate_failure_captures_transport_winner_before_pool_publication() {
+    use ferrum_edge::_test_support::error_class_is_health_neutral_for_test;
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::dns::{CandidateConnectError, DnsCache, DnsConfig, connect_candidates};
+    use ferrum_edge::http3::client::{Http3ConnectionPool, classify_http3_error};
+    use std::io::ErrorKind;
+    use std::sync::OnceLock;
+
+    // connect, publication, creator client/auth, waiter client/auth (ms).
+    for (connect_ms, publish_ms, creator_client_ms, creator_auth_ms, client_ms, auth_ms) in [
+        (40, 100, 120, 80, 120, 80),
+        (40, 100, 80, 120, 80, 120),
+        (40, 100, 120, 40, 120, 80),
+        (40, 100, 40, 120, 120, 80),
+        (40, 100, 120, 80, 120, 40),
+        (40, 100, 120, 80, 40, 120),
+        (40, 100, 120, 40, 40, 40),
+        (40, 100, 120, 20, 120, 80),
+        (40, 100, 120, 80, 120, 20),
+        (40, 100, 20, 120, 120, 80),
+        (40, 100, 120, 80, 20, 120),
+        (40, 40, 120, 80, 120, 80),
+        (80, 20, 120, 60, 120, 40),
+    ] {
+        let dns = DnsCache::new(DnsConfig::default());
+        let candidates = dns
+            .resolve_candidates("127.0.0.1", None, None)
+            .await
+            .unwrap();
+        let pool = Http3ConnectionPool::new(
+            Arc::new(EnvConfig::default()),
+            dns,
+        );
+        let idle_state = pool.creation_state_for_test();
+        assert_eq!(idle_state.0, 0);
+        let started = tokio::time::Instant::now();
+        let creator_plan = plan_after(Duration::from_millis(creator_auth_ms));
+        let waiter_plan = plan_after(Duration::from_millis(auth_ms));
+        let creator_connect_at = OnceLock::new();
+        let waiter_connect_at = OnceLock::new();
+        let ready = AtomicBool::new(false);
+        let dial_polls = AtomicUsize::new(0);
+        let waiter_creates = AtomicUsize::new(0);
+        let (dial_guard, _, dropped) = stalled();
+        // The context deliberately looks like TLS; only the genuine typed
+        // source, or the captured operator timeout, may decide the class.
+        let message = "creator TLS handshake failure before HEADERS";
+        let failure = async {
+            let _dial_guard = dial_guard;
+            let budget = Duration::from_millis(connect_ms);
+            creator_connect_at.set(started + budget).unwrap();
+            let result = connect_candidates(&candidates, 443, budget, |_| {
+                std::future::poll_fn(|_| {
+                    dial_polls.fetch_add(1, Ordering::Relaxed);
+                    if ready.load(Ordering::Relaxed) {
+                        Poll::Ready(Err::<(), _>(std::io::Error::new(
+                            ErrorKind::ConnectionRefused,
+                            "typed dial refusal",
+                        )))
+                    } else {
+                        Poll::Pending
+                    }
+                })
+            })
+            .await;
+            match result {
+                Err(CandidateConnectError::Failed { source, .. }) => {
+                    anyhow::Error::new(source).context(message)
+                }
+                _ => panic!("the ready non-timeout dial must beat Tokio's elapsed timer"),
+            }
+        };
+        let mut creator = Box::pin(pool.await_coalesced_connection_error_for_test(
+            "candidate-failure-publication".to_string(),
+            Some(started + Duration::from_millis(creator_client_ms)),
+            Some(&creator_plan),
+            &creator_connect_at,
+            failure,
+        ));
+        let mut waiter = Box::pin(pool.await_coalesced_connection_error_for_test(
+            "candidate-failure-publication".to_string(),
+            Some(started + Duration::from_millis(client_ms)),
+            Some(&waiter_plan),
+            &waiter_connect_at,
+            async {
+                waiter_creates.fetch_add(1, Ordering::Relaxed);
+                anyhow::anyhow!("waiter must consume the shared transport winner")
+            },
+        ));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(creator.as_mut().poll(&mut cx).is_pending());
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(pool.creation_state_for_test().0, 1);
+        assert_eq!(dial_polls.load(Ordering::Relaxed), 1);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        tokio::time::advance(Duration::from_millis(publish_ms)).await;
+        ready.store(true, Ordering::Relaxed);
+        let creator_error = creator.await.unwrap_err();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(dial_polls.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.creation_state_for_test(), idle_state);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let waiter_error = waiter.await.unwrap_err();
+
+        let failure_ms = connect_ms.min(publish_ms);
+        let transport_class = if publish_ms >= connect_ms {
+            ErrorClass::ConnectionTimeout
+        } else {
+            ErrorClass::ConnectionRefused
+        };
+        for (error, plan, client_ms, auth_ms) in [
+            (
+                &creator_error,
+                &creator_plan,
+                creator_client_ms,
+                creator_auth_ms,
+            ),
+            (&waiter_error, &waiter_plan, client_ms, auth_ms),
+        ] {
+            let expected_auth = auth_ms <= client_ms && auth_ms <= failure_ms;
+            let expected_client = client_ms < auth_ms && client_ms <= failure_ms;
+            let termination = expected_auth.then_some(StreamAuthTermination::CredentialExpired);
+            let lifetime_wins = expected_auth || expected_client;
+            let class = if error.lifetime_expired() {
+                ErrorClass::ClientDisconnect
+            } else {
+                classify_http3_error(error.as_ref())
+            };
+            assert_eq!(error.authorization_expiry(), termination);
+            assert_eq!(error.client_deadline_expired(), expected_client);
+            assert!(!error.request_on_wire());
+            assert_eq!(
+                class,
+                if lifetime_wins {
+                    ErrorClass::ClientDisconnect
+                } else {
+                    transport_class
+                }
+            );
+            let health_neutral = error_class_is_health_neutral_for_test(class);
+            assert_eq!(health_neutral, lifetime_wins);
+            assert_eq!(plan.2.observed(), termination);
+            if let Some(termination) = termination {
+                assert!(!plan.2.record_once(termination, plan.1));
+            }
+            if !lifetime_wins {
+                assert_eq!(error.to_string(), message);
+            }
+        }
+        if !creator_error.lifetime_expired() {
+            let mut source: Option<&(dyn std::error::Error + 'static)> =
+                Some(creator_error.as_ref());
+            let mut typed_kind = None;
+            while let Some(error) = source {
+                if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                    typed_kind = Some(io.kind());
+                    break;
+                }
+                source = error.source();
+            }
+            assert_eq!(
+                typed_kind,
+                Some(if publish_ms >= connect_ms {
+                    ErrorKind::TimedOut
+                } else {
+                    ErrorKind::ConnectionRefused
+                })
+            );
+        }
+        assert!(waiter_connect_at.get().is_none());
+        assert_eq!(waiter_creates.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.pool_size(), 0);
+        assert_eq!(pool.creation_state_for_test(), idle_state);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_h3_cancelled_creation_releases_resources_and_waiter_elects_independently() {
+    use ferrum_edge::_test_support::error_class_is_health_neutral_for_test;
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::http3::client::{Http3ConnectionPool, classify_http3_error};
+    use std::sync::OnceLock;
+
+    for expire_creator in [false, true] {
+        let pool = Http3ConnectionPool::new(
+            Arc::new(EnvConfig::default()),
+            DnsCache::new(DnsConfig::default()),
+        );
+        let idle_state = pool.creation_state_for_test();
+        let started = tokio::time::Instant::now();
+        let creator_plan = plan_after(Duration::from_millis(20));
+        let waiter_plan = plan_after(Duration::from_millis(80));
+        let creator_connect_at = OnceLock::new();
+        let waiter_connect_at = OnceLock::new();
+        let waiter_creates = AtomicUsize::new(0);
+        let (dial, polled, dropped) = stalled();
+        let mut creator = Box::pin(pool.await_coalesced_connection_error_for_test(
+            "cancelled-cold-creation".to_string(),
+            None,
+            Some(&creator_plan),
+            &creator_connect_at,
+            async {
+                creator_connect_at
+                    .set(started + Duration::from_millis(40))
+                    .unwrap();
+                dial.await;
+                anyhow::anyhow!("cancelled dial must never finish")
+            },
+        ));
+        let mut waiter = Box::pin(pool.await_coalesced_connection_error_for_test(
+            "cancelled-cold-creation".to_string(),
+            None,
+            Some(&waiter_plan),
+            &waiter_connect_at,
+            async {
+                waiter_creates.fetch_add(1, Ordering::Relaxed);
+                waiter_connect_at
+                    .set(started + Duration::from_millis(60))
+                    .unwrap();
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "fresh waiter dial",
+                )
+                .into()
+            },
+        ));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(creator.as_mut().poll(&mut cx).is_pending());
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        assert!(polled.load(Ordering::SeqCst));
+        assert_eq!(waiter_creates.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.creation_state_for_test().0, 1);
+
+        if expire_creator {
+            tokio::time::advance(Duration::from_millis(20)).await;
+            let error = creator.await.unwrap_err();
+            let termination = StreamAuthTermination::CredentialExpired;
+            assert_eq!(error.authorization_expiry(), Some(termination));
+            assert!(!error.request_on_wire());
+            assert!(error_class_is_health_neutral_for_test(ErrorClass::ClientDisconnect));
+            assert!(!creator_plan.2.record_once(termination, creator_plan.1));
+        } else {
+            drop(creator);
+            assert_eq!(creator_plan.2.observed(), None);
+        }
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(pool.creation_state_for_test(), idle_state);
+
+        let error = waiter.await.unwrap_err();
+        assert!(!error.lifetime_expired());
+        assert!(!error.request_on_wire());
+        assert_eq!(
+            classify_http3_error(error.as_ref()),
+            ErrorClass::ConnectionRefused
+        );
+        assert_eq!(error.to_string(), "fresh waiter dial");
+        assert_eq!(waiter_plan.2.observed(), None);
+        assert_eq!(waiter_creates.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.creation_state_for_test(), idle_state);
+        assert_eq!(pool.pool_size(), 0);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn native_h3_cold_checkout_success_after_expiry_cannot_handoff_headers() {
     use ferrum_edge::_test_support::await_native_h3_dispatch_for_test;
