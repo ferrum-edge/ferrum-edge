@@ -1254,6 +1254,7 @@ jobs:
               integration::admin_config_export_tests
               integration::audit_retention_tests
               integration::admin_backend_capabilities_tests
+              integration::admin_backend_egress_policy_tests
               integration::admin_batch_atomicity_tests
               integration::admin_batch_reference_check_tests
               integration::admin_runtime_metrics_tests
