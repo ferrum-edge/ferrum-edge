@@ -4,9 +4,14 @@ The release qualification run [37217985798](https://github.com/ferrum-edge/ferru
 tested release PR #6005 at `5bab92a367c69ececaaa81e535fca45ba4436f38`.
 Its production source, tests, vendor copies, and workflows matched main
 `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; release metadata differed.
-These failures require fixture repairs and fresh hosted qualification, not a
-blind rerun or reliance on older green heads. No production behavior changes
-are made by this repair.
+These historical failures required fixture repairs and fresh hosted
+qualification. The repairs qualified at final fixture head
+`9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2` and merged through PR #6007
+as `3ce21ad101f164f70cb7f7f77fb033db828b9518`; issue #6006 is closed.
+The failed release and main runs remain causal evidence, not rerunnable green
+qualification for a new candidate. No production behavior changes were made
+by this repair. The newly integrated release head still requires fresh review
+and hosted qualification.
 
 ## Authorization expiry during sender acquisition
 
@@ -183,8 +188,40 @@ rerun.
 
 Local validation is static source/diff inspection and `git diff --check`
 only. No formatter, compiler, tests, repository script, or other project
-tooling was executed locally. Formatting, lint, compilation, ordinary/FIPS
-tests, and both functional shards remain **pending for the exact pushed head**.
-No workflows, dependencies, public API, configuration, or published Edge
-contracts change. Root owns fresh hosted gates, independent review, and later
-integration into the still-draft release PR #6005 before release/tagging.
+tooling was executed locally. At initial authoring, fixture formatting, lint,
+compilation, ordinary/FIPS tests, and the functional shards were pending.
+That authored-pending state is superseded by the completed qualification below.
+No production source, workflows, dependencies, public API, configuration, or
+published Edge contracts changed.
+
+Root reviewed the complete final 1,122-line diff at
+`9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2` and all fix deltas. Fresh
+independent whole/focused review2 returned **NO FINDINGS** after the accepted
+response-completion finding was fixed. All 12 head-associated hosted workflows
+succeeded. All 80 reported check runs completed: 49 successful and 31
+nonapplicable PR skips. All nine protected Actions `15368` contexts passed,
+including [Tests](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37221404613/job/111497123584),
+[FIPS Build & Test](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37221404632/job/111497115431),
+and [Trusted Cross Build Policy](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37221402537/job/111492323617).
+The [protocol functional shard](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37221404613/job/111494299218)
+qualified both strict acquisition-expiry shapes, healthy recovery, and direct
+sequential physical reuse; the
+[application functional shard](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37221404613/job/111494299059)
+qualified same-frontend OTEL physical reuse and strict attempt telemetry.
+Zero review threads and no further thread pagination were verified before
+landing.
+
+[PR #6007](https://github.com/ferrum-edge/ferrum-edge/pull/6007) was
+squash-merged at 2026-10-04 18:08:04 UTC into
+`3ce21ad101f164f70cb7f7f77fb033db828b9518`.
+[Issue #6006](https://github.com/ferrum-edge/ferrum-edge/issues/6006) closed
+at 18:08:06 UTC. Release PR #6005 now normally integrates that main commit,
+preserving the qualified fixture source bytes. See the
+[complete workflow evidence](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
+
+Fresh exact-release-head whole review, independent review, and all new hosted
+gates remain **PENDING**. Root owns the eventual release merge commit and its
+second-parent check, main merge freeze while all push gates qualify, immutable
+tag, release/assets/Docker verification, contracts publication, and downstream
+adoption. Fixture-head success does not qualify the new release head or its
+future main merge/tag target, and neither failed historical head is a substitute.

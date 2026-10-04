@@ -28,23 +28,113 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Unreleased
 
-**gRPC qualification fixtures (#6006).** No configuration or runtime change is
-required. Acquisition-expiry coverage now owns a cold pool without a shorter
-startup probe, observes cancellation before any RPC frames, and proves healthy
-recovery. Attempt-span coverage holds one frontend H2 connection and independently
-checks physical backend reuse. The strict authorization and telemetry assertions
-remain required. Fresh hosted gates and root integration into release PR #6005
-are pending; see [the failure analysis](grpc_qualification_6006.md).
+## Upgrading to 0.9.11 (release draft)
 
-**Dependency security chain candidate (#5912).** The proposed Hyper 1.10.0
+0.9.11 is not published or qualified yet. This candidate was prepared on
+2026-10-04 UTC, the planned cut date rather than a publication timestamp; root
+must adjust the date before the actual cut if it changes. The guidance below
+covers main through `3ce21ad101f164f70cb7f7f77fb033db828b9518`, including
+the merged dependency security fix
+[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) and qualified gRPC
+fixture repair [#6007](https://github.com/ferrum-edge/ferrum-edge/pull/6007).
+Use the [release draft](releases/v0.9.11.md) for outstanding evidence and publication
+requirements. Version pins in this draft become usable only after publication.
+
+**TLS source selectors must match their field (issue #5959; breaking).**
+Correct references whose explicit fragment, Kubernetes data key, `?kind=` hint,
+or managed/ACME collection contradicts the material the field requires. CA
+fields require CA selectors, certificate fields require certificate selectors,
+and key fields require key selectors. A leaf certificate and its chain cannot
+be selected as a CA bundle through `managed://certificates/<id>#cert`.
+Unknown managed collections, unsupported ACME collections, and unknown kind
+hints are also refused. Check proxy/upstream TLS, Gateway frontend TLS,
+DestinationRule TLS, and environment TLS settings before rollout; admission
+and material loading both enforce this rule. Fragmentless
+`managed://ca-bundles/<id>` now works in CA expiry checks (issue #5957).
+Fragmentless Kubernetes and provider CA references check CA material rather
+than the leaf certificate. See [TLS source schemes](frontend_tls.md).
+
+**OIDC session secrets require unique random material (issue #5987).**
+Enabled `oidc_relying_party` configurations now reject published example keys,
+obvious placeholders, and unresolved templates in both
+`session.encryption_secret` and `session.encryption_secret_previous`, including
+Base64 spellings of rejected key material. Replace those values with unique
+random secrets of at least 32 bytes before config load or admin mutation.
+Disabled configurations may still be saved before a key is supplied. Rotation
+through the previous-secret field remains available, but it must also contain
+acceptable material. See [OIDC relying party](plugins.md#oidc_relying_party).
+
+**Backend authorization lifetimes cover dispatch waits (issues #5990 / #5995).**
+Acquisition, final handoff, response-header waits, and retries retain the
+admitted absolute authorization deadline across direct HTTP/1.1, HTTP/2,
+native gRPC, mesh transports, and HTTP/3. Authorization expiry is not retried
+and does not penalize backend health. Native gRPC preserves HTTP 200 with
+`grpc-status: 16` before response commitment; an earlier client or operator
+bound retains its existing attribution. Review clients that depended on a
+backend wait outliving authorization. See
+[authorization lifetime during backend dispatch](request_lifetime_dispatch.md).
+
+**HTTP/2 write stalls and shard affinity (issue #5588; PRs #5991 / #6001).**
+Direct HTTP/2 uploads with request-size limits disabled now honor a nonzero
+`backend_write_timeout_ms`. Before response headers the timeout produces the
+existing `504` / `backend_timeout` result; after headers it resets the stream.
+Native gRPC write stalls retain their deadline terminal before headers and
+reset after headers. A ready chunk can progress through any positive legal
+backend window. HTTP/2 frontend gRPC calls use one backend shard while up to
+32 calls are open, then spill to siblings; unfinished uploads remain counted
+through transport completion. Setting a route's write timeout to `0` disables
+that bound for every upload path on the route, so assess the whole route.
+
+**Direct HTTP/1.1 pool and memory sizing (issue #5961).**
+`FERRUM_POOL_HTTP1_DIRECT` now defaults to `true`; setting it to `false` selects
+the reqwest path. Retry attempts and requests with pending body-plugin work
+still use reqwest. Reassess memory sizing for jemalloc's new 128 KiB thread
+cache ceiling; `_RJEM_MALLOC_CONF=tcache_max:32768` restores its former default.
+Windows is unaffected by that allocator change. CP and DP must run the same
+build; follow the [upgrade order](#upgrade-order) and the build-out database
+rebuild procedure rather than treating this patch version as mixed-build or
+in-place schema compatibility.
+
+**gRPC qualification fixtures (#6006 / #6007).** No configuration or runtime
+change is required. Buffered and streamed acquisition-expiry coverage owns a
+cold pool without a shorter startup probe, observes cancellation before any
+RPC frames, requires exactly one expiry, and proves healthy recovery on the
+same frontend through a threshold-one breaker. OTEL attempt-span and direct
+sequential-reuse coverage retain one frontend H2 connection and independently
+require one backend accept/handshake, complete bodies, and success trailers.
+Strict authorization, telemetry, physical reuse, and bounded cleanup remain
+required. Final fixture head `9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2`
+received complete root review and fresh independent whole/focused review2
+with no findings after the accepted completion finding was fixed. All 12
+hosted workflows succeeded; all 80 checks completed (49 successful and 31
+nonapplicable PR skips), all nine protected Actions contexts passed, and there
+were zero review threads. PR #6007 merged and issue #6006 closed on
+2026-10-04; this release branch now normally integrates the fix. The failed
+historical `5bab92a367c69ececaaa81e535fca45ba4436f38` release run and
+`66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017` main run remain failure evidence,
+not candidates for blind reruns. Fresh exact-release-head review and hosted
+gates, the eventual main merge/push gates, tag, and artifact verification are
+still pending. See [the failure analysis](grpc_qualification_6006.md) and
+[fixture source qualification](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
+
+**Dependency security chain (#5912 / #6004).** The integrated Hyper 1.10.0
 and reqwest 0.13.4 vendor refresh retains every local patch and preserves the
-selected ordinary/FIPS crypto profiles. GCP uses the compatible GAX 0.7.14 /
-OpenTelemetry 0.32 generation with SDK >=0.32.1; Smithy JSON and xxhash have
-fixed-version constraints. The root, mesh and fuzz lockfiles were generated by the successful hosted
-Cargo producer and verified before import. Hosted compilation, behavior and
-root-owned CI bindings still require validation before merge or release. See
+selected ordinary/FIPS crypto profiles. GCP uses the compatible GAX-internal
+0.7.14 / GAX 1.11.0 / OpenTelemetry 0.32 generation with SDK 0.32.1; root
+locks Smithy JSON 0.62.7, root/mesh lock xxhash 0.8.16, and fuzz retains xxhash
+0.8.18. The root, mesh and fuzz lockfiles came from the verified hosted Cargo
+producer; this release
+changes only their own `ferrum-edge` package version to 0.9.11. Dependency
+versions, checksums, graph inputs and producer provenance are unchanged from
+main's security fix. Hosted source qualification passed at the reviewed
+#6004 head and issue #5912 is closed; fresh integrated-release qualification
+and published artifacts are still pending. Cloud secrets remain unsupported
+in enforcing FIPS mode. See
 [the security upgrade record](dependency-security-upgrade-5912.md) for exact
-provenance, patch-port risks and the root-owned CI binding updates.
+producer provenance and patch-port risks, and the
+[completed source integration evidence](releases/v0.9.11.md#dependency-source-integration-evidence)
+for the merge and exact-head hosted proof. Upgrade deployed binaries only after
+the release is qualified and its artifacts are verified.
 
 **Conditional admin snapshots and restore (#5992).** Use an admin-role JWT
 for `GET /consumers/{id}/verification` when checking the complete stored

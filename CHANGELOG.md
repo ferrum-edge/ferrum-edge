@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-10-04
+
+Release candidate prepared on 2026-10-04 UTC; this is the planned cut/preparation
+date, not an asserted publication timestamp. Root must adjust it before the
+actual cut if the calendar date changes. Publication and final qualification
+evidence remain pending. See the [0.9.11 release draft](docs/releases/v0.9.11.md).
+
 ### Security
 
 - **Upgrade the dependency security chain** (#5912,
@@ -16,9 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Smithy/xxhash versions, and add an optional hosted lockfile producer.
   Import real root/mesh/fuzz lockfiles from the verified hosted Cargo artifact;
   they resolve SDK 0.32.1, Smithy JSON 0.62.7 and fixed xxhash with one patched
-  Hyper/reqwest pair per production graph. Hosted compilation, behavior and
-  owner-controlled CI binding updates remain pending. See
-  [the evidence and remaining gates](docs/dependency-security-upgrade-5912.md).
+  Hyper/reqwest pair per production graph. The source fix was merged through
+  [PR #6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) at
+  `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; issue #5912 is closed. Its
+  exact-head hosted checks passed, but 0.9.11 qualification and publication
+  remain pending. See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
+  and [completed source integration evidence](docs/releases/v0.9.11.md#dependency-source-integration-evidence).
 
 - **Conditional admin reads and restores use authoritative strong state tags**
   (#5992). Admin-only `GET /consumers/{id}/verification` returns the complete
@@ -116,8 +126,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under one watchdog; own its frontend driver through inspection and release
   the scripted backend gate on shutdown/unwind. Acquisition and recovery
   watchdogs also include terminal body/trailer completion. Production lifetime
-  and pool semantics are unchanged. Fresh hosted qualification remains pending; see
-  [the root-cause record](docs/grpc_qualification_6006.md).
+  and pool semantics are unchanged. Final fixture head
+  `9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2` received complete root review
+  and fresh independent whole/focused review2 with no findings after the
+  accepted completion finding was fixed. All 12 hosted workflows succeeded;
+  all 80 checks completed (49 successful, 31 nonapplicable PR skips), all nine
+  protected Actions contexts passed, and there were zero review threads.
+  PR #6007 merged at `3ce21ad101f164f70cb7f7f77fb033db828b9518` and
+  issue #6006 closed on 2026-10-04. This release branch normally integrates
+  that fix; new release-head qualification and publication remain pending.
+  See [the root-cause record](docs/grpc_qualification_6006.md) and
+  [completed fixture source evidence](docs/releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
 
 - **H1/H2 listener dispatch keeps large child futures out of enclosing poll
   frames** (#5993). The frontend boxes its concrete handler rather than an
@@ -6551,7 +6570,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.11...HEAD
+[0.9.11]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.7...v0.9.8
