@@ -5037,7 +5037,18 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool) {
                             }
                         }
                         if let Some(upload_id) = upload_id {
-                            let _ = ended_tx.send((upload_id, reset));
+                            if !reset {
+                                let trailers = body.trailers().await.expect("upload trailers");
+                                if upload_id % 4 == 0 {
+                                    let trailers = trailers.expect("native request trailers");
+                                    assert_eq!(trailers["x-client-trailer"], "end");
+                                } else {
+                                    assert!(trailers.is_none(), "DATA EOF has no trailers");
+                                }
+                            }
+                            ended_tx
+                                .send((upload_id, reset))
+                                .expect("report upload termination");
                         }
                     });
                 }
@@ -5166,13 +5177,22 @@ async fn exercise_grpc_retained_uploads<T>(
         "none of the retained uploads ended yet"
     );
 
-    // EOF and RST both terminate the independent upload half. Every upload
-    // must be observed exactly once, then further calls must regain affinity.
+    // DATA EOF, terminal trailers, and RST terminate the independent upload
+    // half. Observe each exactly once, then further calls must regain affinity.
     for (index, mut upload) in uploads.into_iter().enumerate() {
-        if index % 2 == 0 {
+        if index % 4 == 0 {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("x-client-trailer", http::HeaderValue::from_static("end"));
+            upload.send_trailers(trailers).expect("upload trailers");
+        } else if index % 2 == 0 {
             upload.send_data(Bytes::new(), true).expect("upload EOF");
         } else {
-            upload.send_reset(h2::Reason::CANCEL);
+            let reason = if index % 4 == 1 {
+                h2::Reason::CANCEL
+            } else {
+                h2::Reason::NO_ERROR
+            };
+            upload.send_reset(reason);
         }
     }
     let mut seen = [false; UPLOADS];
@@ -5183,7 +5203,11 @@ async fn exercise_grpc_retained_uploads<T>(
             .expect("upload termination");
         assert!(!seen[index], "upload terminates once");
         seen[index] = true;
-        assert_eq!(reset, index % 2 != 0);
+        assert_eq!(
+            reset,
+            index % 2 != 0,
+            "upload {index} reset versus clean EOF"
+        );
     }
     for _ in 0..16 {
         client = client.ready().await.expect("client ready after releases");
@@ -5454,9 +5478,19 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
             .await
             .expect("early response timeout")
             .expect("early response");
-        backend_ids.push(response.headers()["x-backend-connection"].clone());
-        if !web {
+        assert_eq!(response.status(), http::StatusCode::OK);
+        if web {
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/grpc-web+proto"
+            );
+            assert!(
+                !response.headers().contains_key("x-backend-connection"),
+                "Trailers-Only application metadata belongs in the terminal DATA frame"
+            );
+        } else {
             assert_eq!(response.headers()["grpc-status"], "0");
+            backend_ids.push(response.headers()["x-backend-connection"].clone());
         }
         let mut body = response.into_body();
         let mut response_bytes = Vec::new();
@@ -5471,10 +5505,38 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
             response_bytes.extend_from_slice(&chunk);
         }
         if web {
+            // All application metadata in a native Trailers-Only response is
+            // terminal. Translation moves the connection ID with grpc-status
+            // into one 0x80 DATA frame, rather than leaving it in initial headers.
+            assert!(response_bytes.len() >= 5, "complete trailer frame header");
+            assert_eq!(response_bytes[0], 0x80, "uncompressed terminal frame");
+            let length_bytes: [u8; 4] = response_bytes[1..5].try_into().expect("trailer length");
+            let trailer_len = u32::from_be_bytes(length_bytes) as usize;
+            assert_eq!(
+                response_bytes.len(),
+                5 + trailer_len,
+                "exactly one complete terminal frame"
+            );
+            let trailers = std::str::from_utf8(&response_bytes[5..]).expect("ASCII trailers");
+            assert!(trailers.ends_with("\r\n"), "terminated trailer lines");
+            assert_eq!(
+                trailers
+                    .lines()
+                    .filter(|line| *line == "grpc-status: 0")
+                    .count(),
+                1,
+                "exactly one successful terminal status"
+            );
+            let mut connection_ids = trailers
+                .lines()
+                .filter_map(|line| line.strip_prefix("x-backend-connection: "));
+            let connection_id = connection_ids.next().expect("terminal connection ID");
             assert!(
-                response_bytes
-                    .windows(16)
-                    .any(|bytes| bytes == b"grpc-status: 0\r\n")
+                connection_ids.next().is_none(),
+                "exactly one terminal connection ID"
+            );
+            backend_ids.push(
+                http::HeaderValue::from_str(connection_id).expect("connection ID"),
             );
         } else {
             assert!(response_bytes.is_empty());

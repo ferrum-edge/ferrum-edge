@@ -200,6 +200,10 @@ pub enum GrpcBody {
     /// observe `bytes_seen` from another task after `into_reqwest_body()`
     /// moves ownership — `GrpcBody` has no such cross-task read path.
     Streaming {
+        /// Only H2 receive state proves END_STREAM after body EOF. A clean
+        /// H1 chunked body can yield `None` without `is_end_stream()` becoming
+        /// true, so that transport must not use this reset check.
+        require_end_stream: bool,
         /// The client body, or — for an AUTHENTICATED request — a bounded
         /// bridge fed by a gateway-owned pump task (issue #3815).
         ///
@@ -336,6 +340,7 @@ impl http_body::Body for GrpcBody {
             }
             GrpcBody::Pumped(source) => source.poll_frame(cx),
             GrpcBody::Streaming {
+                require_end_stream,
                 incoming,
                 bytes_seen,
                 max_bytes,
@@ -403,10 +408,18 @@ impl http_body::Body for GrpcBody {
                         Poll::Ready(Some(Err(e)))
                     }
                     Poll::Ready(None) => {
-                        // Source EOF: h2 may still hold queued upload DATA.
                         if let Some(accounting) = request_bytes.as_mut() {
                             accounting.publish(*bytes_seen as u64);
                         }
+                        // Hyper treats inbound H2 CANCEL/NO_ERROR as body EOF,
+                        // but h2's receive state still distinguishes a reset
+                        // from END_STREAM. Do not turn an aborted upload into
+                        // a clean backend EOF after an early terminal response.
+                        if *require_end_stream && !incoming.is_end_stream() {
+                            let reset = h2::Error::from(h2::Reason::CANCEL);
+                            return Poll::Ready(Some(Err(reset.into())));
+                        }
+                        // Clean source EOF: h2 may still hold queued upload DATA.
                         Poll::Ready(None)
                     }
                     Poll::Pending => Poll::Pending,
@@ -4852,6 +4865,7 @@ pub async fn proxy_grpc_request_streaming(
         crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
     });
     let grpc_body = GrpcBody::Streaming {
+        require_end_stream: parts.version == hyper::Version::HTTP_2,
         incoming: body,
         auth_deadline,
         bytes_seen: 0,
