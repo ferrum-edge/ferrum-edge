@@ -182,7 +182,7 @@ Because every path enforces the rule's timeouts, HTTP/3 stays advertised (`Alt-S
 
 When the matched proxy has `backend_scheme: https`, the concrete backend target has already been classified as H3-capable, and the request flavor is `Plain`, the gateway keeps the request entirely on QUIC:
 
-- Request body: streamed frame-by-frame via `Http3ConnectionPool::request_streaming_body()`, reading from `RequestStream::recv_data()` on the frontend and `send_data()` on the backend-side stream. No buffering.
+- Request body: streamed frame-by-frame via `Http3ConnectionPool::request_streaming_body_under_authorization()`, reading from `RequestStream::recv_data()` on the frontend and `send_data()` on the backend-side stream. The admitted authorization plan bounds acquisition, HEADERS, upload, and response headers; cancellation resets an unfinished backend upload with `H3_REQUEST_CANCELLED`. No buffering. See [dispatch authorization lifetime](request_lifetime_dispatch.md).
 - Response body: written straight to the client stream with the shared H3 coalescing window (see [Coalescing and frame cadence](#coalescing-and-frame-cadence)).
 - Zero copies of the body to userspace at either end; h3's chunks are `Bytes` pass-throughs.
 
@@ -1685,3 +1685,14 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` | `120` | Seconds a tunnel may carry no datagram in either direction (clamped 1–86400). The default is the two minutes RFC 9298 §3.2 says a UDP proxy SHOULD NOT go below. This value is also the floor for the frontend QUIC connection idle timeout while the profile is enabled, so the advertised tunnel lifetime is the one that actually holds. |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | `65,527` | Largest relayed UDP payload (clamped 1–65527, the RFC 9298 §5 Context ID 0 ceiling). Scales every per-session buffer — see [Bounds and lifecycle](#bounds-and-lifecycle). |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |
+
+## Authorization lifetime at backend handoff
+
+Native H3 backend dispatch and the H3 to gRPC bridge keep the admitted request's absolute
+authorization plan through connection acquisition, stream readiness, request upload, and response
+headers. Native H3 checks before each send-future poll, including resumption after QUIC stream
+credit becomes available. The gRPC bridge also bounds buffered frontend drains and buffered
+backend response collection; its channel guard prevents queued upload frames crossing expiry.
+Gateway-selected authorization expiry is health-neutral and never retries the request. See
+[Authorization lifetime during backend dispatch](request_lifetime_dispatch.md) for the phase
+bounds and pre-commitment terminals.

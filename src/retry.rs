@@ -623,6 +623,10 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
             GrpcTimeoutKind::Read => ErrorClass::ReadWriteTimeout,
         },
         GrpcProxyError::ClientDeadlineExceeded(_) => ErrorClass::ClientDisconnect,
+        // The gateway's own authorization-lifetime decision before the response
+        // head (GHSA-xcg4-wj3x-gjj2): never retried and backend-health neutral,
+        // the same class the H1/H2 authorization placeholder carries.
+        GrpcProxyError::AuthorizationExpired { .. } => ErrorClass::ClientDisconnect,
         GrpcProxyError::BackendUnavailable {
             kind,
             message,
@@ -1817,6 +1821,10 @@ pub struct BackendResponse {
     /// DNS resolution failure, TLS handshake error, connect timeout, etc.
     /// False when we got an actual HTTP response (even if it's a 502).
     pub connection_error: bool,
+    /// Actual request handoff state, independent of backend-health classification.
+    /// Gateway-owned authorization refusals are health-neutral both before and
+    /// after transmission; their `connection_error` bit cannot carry this fact.
+    pub request_on_wire: bool,
     /// The DNS-resolved IP address of the backend that was connected to.
     /// Populated from the DNS cache before the request is sent. `None` when
     /// DNS resolution fails or the request never reaches the backend.
