@@ -4,6 +4,49 @@ This guide covers Ferrum Edge functional testing, with a focus on Control Plane 
 
 ## Test Files
 
+### gRPC acquisition expiry, attempt spans, and sequential reuse (#6006)
+
+`functional_h1_h2_auth_lifetime_test.rs` isolates its buffered and streamed
+sender-acquisition cases from binary startup capability probes with the cold
+in-process harness. A backend preface barrier and observed socket closure
+prove cancellation without sending RPC frames; a completed healthy follow-up
+checks pool recovery, breaker neutrality, and stable once-only expiry accounting.
+Readiness and cleanup are bounded, and the expired and recovery RPC watchdogs
+include complete response bodies and terminal trailers. The frontend driver
+and backend recovery connections have task owners that abort on failure.
+
+`functional_otel_attempt_spans_test.rs` retains one frontend H2 connection for
+both live RPCs, completes their bodies, and holds the scripted backend open
+through trace inspection. One backend accept/handshake independently proves
+reuse while strict per-attempt timing and parentage assertions remain in place.
+One 20-second watchdog includes readiness, send, body, and trailers for every
+RPC. Its frontend driver remains owned through inspection and is joined under
+a five-second cleanup bound, or aborted when an assertion unwinds.
+
+`scripted_backend_h2_tests.rs::h2_direct_pool_reuses_connection_across_requests`
+also retains one frontend H2 sender and an owned driver. It requires distinct
+frontend stream IDs, complete exact `"one"` / `"two"` gRPC bodies and success
+trailers, exactly two backend RPC records, and one backend accept/handshake.
+The script stays at `AwaitTestSignal` through inspection; completed responses
+replace the former counter-settlement sleep. Sender cleanup is joined under
+a bounded watchdog. New frontend connections may intentionally create new
+gRPC affinity shards, so separate `GrpcClient::unary` calls cannot prove this
+same-frontend reuse invariant.
+Both scripted gRPC fixtures release `AwaitTestSignal` on backend shutdown/drop,
+including failure before explicit release, and abort their backend scripts.
+See [the hosted failures and causal evidence](grpc_qualification_6006.md).
+
+These fixtures qualified at final head
+`9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2` after complete root review and
+fresh independent whole/focused review2 with no findings after the accepted
+completion finding was fixed. All 12 hosted workflows succeeded; all 80
+checks completed (49 successful, 31 nonapplicable PR skips), all nine protected
+Actions contexts passed, and there were zero review threads. PR #6007 merged
+as `3ce21ad101f164f70cb7f7f77fb033db828b9518` and issue #6006 closed on
+2026-10-04. The integrated 0.9.11 release candidate still requires fresh
+exact-head review and hosted gates before main push/tag/publication evidence.
+See [the fixture qualification record](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
+
 ### scripted_backend_matrix_tests.rs
 
 Located in `tests/functional/scripted_backend_matrix_tests.rs`; cross-protocol

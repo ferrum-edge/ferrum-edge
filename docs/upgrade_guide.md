@@ -33,10 +33,11 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 0.9.11 is not published or qualified yet. This candidate was prepared on
 2026-10-04 UTC, the planned cut date rather than a publication timestamp; root
 must adjust the date before the actual cut if it changes. The guidance below
-covers main through `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`, including
+covers main through `3ce21ad101f164f70cb7f7f77fb033db828b9518`, including
 the merged dependency security fix
-[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004). Use the
-[release draft](releases/v0.9.11.md) for outstanding evidence and publication
+[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) and qualified gRPC
+fixture repair [#6007](https://github.com/ferrum-edge/ferrum-edge/pull/6007).
+Use the [release draft](releases/v0.9.11.md) for outstanding evidence and publication
 requirements. Version pins in this draft become usable only after publication.
 
 **TLS source selectors must match their field (issue #5959; breaking).**
@@ -93,6 +94,28 @@ Windows is unaffected by that allocator change. CP and DP must run the same
 build; follow the [upgrade order](#upgrade-order) and the build-out database
 rebuild procedure rather than treating this patch version as mixed-build or
 in-place schema compatibility.
+
+**gRPC qualification fixtures (#6006 / #6007).** No configuration or runtime
+change is required. Buffered and streamed acquisition-expiry coverage owns a
+cold pool without a shorter startup probe, observes cancellation before any
+RPC frames, requires exactly one expiry, and proves healthy recovery on the
+same frontend through a threshold-one breaker. OTEL attempt-span and direct
+sequential-reuse coverage retain one frontend H2 connection and independently
+require one backend accept/handshake, complete bodies, and success trailers.
+Strict authorization, telemetry, physical reuse, and bounded cleanup remain
+required. Final fixture head `9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2`
+received complete root review and fresh independent whole/focused review2
+with no findings after the accepted completion finding was fixed. All 12
+hosted workflows succeeded; all 80 checks completed (49 successful and 31
+nonapplicable PR skips), all nine protected Actions contexts passed, and there
+were zero review threads. PR #6007 merged and issue #6006 closed on
+2026-10-04; this release branch now normally integrates the fix. The failed
+historical `5bab92a367c69ececaaa81e535fca45ba4436f38` release run and
+`66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017` main run remain failure evidence,
+not candidates for blind reruns. Fresh exact-release-head review and hosted
+gates, the eventual main merge/push gates, tag, and artifact verification are
+still pending. See [the failure analysis](grpc_qualification_6006.md) and
+[fixture source qualification](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
 
 **Dependency security chain (#5912 / #6004).** The integrated Hyper 1.10.0
 and reqwest 0.13.4 vendor refresh retains every local patch and preserves the

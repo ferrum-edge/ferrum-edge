@@ -2416,12 +2416,11 @@ async fn h2_buffered_response_body_stall_triggers_backend_read_timeout() {
 // single h2 connection at the backend. If every request opens a fresh TCP
 // connection, the pool isn't reusing, which is a regression.
 //
-// Observable: `backend.accepted_connections() == 1` after both requests.
-//
-// NOTE: on h2c the gateway's gRPC pool opens a connection on first use
-// and holds it; when this test was authored the pool was sharded but
-// reuse-on-hit. If the sharding policy changes, this test may need
-// tuning (e.g. pin to shard 0 via a request header).
+// Observable: one backend TCP accept and H2 handshake, with two completed
+// RPCs returning distinct scripted messages. Keep one frontend H2 connection
+// alive: gRPC affinity deliberately creates a missing shard for a new frontend,
+// even when a sibling shard is ready. GrpcClient::unary opens a new frontend
+// per call, so it cannot establish this same-connection reuse invariant.
 //
 // Migrated to `HarnessMode::InProcess` — the assertion is on
 // `backend.accepted_connections()` and `backend.received_streams()`,
@@ -2450,6 +2449,8 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
             code: 0,
             message: "",
         })
+        // Keep the backend connection alive through all reuse assertions.
+        .step(GrpcStep::AwaitTestSignal)
         .spawn()
         .expect("spawn backend");
 
@@ -2468,38 +2469,76 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .expect("gateway port");
-    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
-
-    let r1 = client
-        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+    let (client, connection) = tokio::time::timeout(Duration::from_secs(5), async {
+        let socket = tokio::net::TcpStream::connect(("127.0.0.1", gw_port))
+            .await
+            .expect("connect frontend");
+        h2::client::handshake(socket).await.expect("frontend h2")
+    })
+    .await
+    .expect("bounded frontend connection");
+    // JoinSet owns the driver even if an RPC assertion panics or times out.
+    // Retain the sender until backend inspection, then close and join it.
+    let mut frontend_driver = tokio::task::JoinSet::new();
+    frontend_driver.spawn(connection);
+    let mut stream_ids = Vec::new();
+    for expected in [b"\0\0\0\0\x03one", b"\0\0\0\0\x03two"] {
+        let stream_id = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut sender = client.clone().ready().await.expect("frontend ready");
+            let request = http::Request::builder()
+                .method("POST")
+                .uri(format!("http://127.0.0.1:{gw_port}/grpc/ferrum.Echo/Ping"))
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(())
+                .expect("unary request");
+            let (response, mut request_body) = sender
+                .send_request(request, false)
+                .expect("send unary request");
+            let stream_id = request_body.stream_id();
+            request_body
+                .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+                .expect("send empty gRPC message");
+            let response = response.await.expect("unary response");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut response_body = response.into_body();
+            let mut framed_message = Vec::new();
+            while let Some(chunk) = response_body.data().await {
+                let chunk = chunk.expect("response DATA");
+                response_body
+                    .flow_control()
+                    .release_capacity(chunk.len())
+                    .expect("release response capacity");
+                framed_message.extend_from_slice(&chunk);
+            }
+            let trailers = response_body
+                .trailers()
+                .await
+                .expect("response trailers")
+                .expect("successful RPC has trailers");
+            assert_eq!(trailers["grpc-status"], "0", "RPC succeeded");
+            assert_eq!(
+                framed_message.as_slice(),
+                expected.as_slice(),
+                "complete scripted gRPC message on stream {stream_id:?}"
+            );
+            stream_id
+        })
         .await
-        .expect("first response");
-    assert_eq!(r1.grpc_status(), Some(0), "first RPC succeeded");
-    assert!(
-        r1.messages.iter().any(|m| m.as_ref() == b"one"),
-        "first message missing from {:?}",
-        r1.messages
+        .expect("bounded complete unary RPC");
+        stream_ids.push(stream_id);
+    }
+    assert_ne!(
+        stream_ids[0], stream_ids[1],
+        "two distinct frontend streams"
     );
+    wait_for_backend_awaiting_test_signal(&backend, Duration::from_secs(5)).await;
 
-    let r2 = client
-        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
-        .await
-        .expect("second response");
-    assert_eq!(r2.grpc_status(), Some(0), "second RPC succeeded");
-    assert!(
-        r2.messages.iter().any(|m| m.as_ref() == b"two"),
-        "second message missing from {:?}",
-        r2.messages
-    );
-
-    // Give the pool a moment to settle its accepted-connection counter.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Accept/handshake and stream recording precede the scripted replies.
+    // Receipt of both complete bodies/trailers is the counter barrier.
     let backend_streams = backend.received_streams().await;
-    assert!(
-        backend_streams.len() >= 2,
-        "expected at least 2 streams, got {}",
-        backend_streams.len()
-    );
+    assert_eq!(backend_streams.len(), 2, "two actual backend RPC streams");
+    assert_eq!(backend.handshakes_completed(), 1);
     // The critical observation: only one TCP connection was accepted.
     // If the pool opened a fresh connection for the second request, this
     // would be >= 2.
@@ -2510,6 +2549,21 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
          expected connection reuse (each RPC should have ridden the same \
          h2 connection)"
     );
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+    assert!(
+        frontend_driver.try_join_next().is_none(),
+        "frontend connection must stay alive through reuse inspection"
+    );
+
+    backend.release_test_signal();
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), frontend_driver.join_next())
+        .await
+        .expect("bounded frontend cleanup")
+        .expect("owned frontend driver")
+        .expect("join frontend driver")
+        .expect("frontend closed cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
