@@ -1917,7 +1917,10 @@ async fn read_mongo_wire_frame<R: tokio::io::AsyncRead + Unpin>(
     let mut length = [0_u8; 4];
     reader.read_exact(&mut length).await?;
     let length = i32::from_le_bytes(length);
-    assert!((16..=8_388_608).contains(&length), "invalid fixture frame size");
+    assert!(
+        (16..=8_388_608).contains(&length),
+        "invalid fixture frame size"
+    );
     let mut frame = vec![0_u8; length as usize];
     frame[..4].copy_from_slice(&length.to_le_bytes());
     reader.read_exact(&mut frame[4..]).await?;
@@ -2167,7 +2170,10 @@ async fn assert_mongo_cancelled_renewals_cannot_revive(url: &str) {
             .unwrap();
         assert_eq!(released.get_str("owner").unwrap(), owner);
         assert_eq!(
-            released.get_datetime("expires_at").unwrap().timestamp_millis(),
+            released
+                .get_datetime("expires_at")
+                .unwrap()
+                .timestamp_millis(),
             0
         );
         drop(local);
@@ -2190,7 +2196,10 @@ async fn assert_mongo_cancelled_renewals_cannot_revive(url: &str) {
             .unwrap()
             .unwrap();
         assert_eq!(
-            before.get_datetime("expires_at").unwrap().timestamp_millis(),
+            before
+                .get_datetime("expires_at")
+                .unwrap()
+                .timestamp_millis(),
             0
         );
         let expected_generation = if after_takeover {
