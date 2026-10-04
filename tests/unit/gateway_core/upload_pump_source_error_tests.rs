@@ -125,7 +125,10 @@ async fn assert_terminal(
     }
     assert!(error.source().is_none(), "never retain the source error");
     assert!(!error.to_string().contains(PRIVATE_DETAIL));
-    assert!(!source.is_end_stream(), "no END_STREAM on a truncated upload");
+    assert!(
+        !source.is_end_stream(),
+        "no END_STREAM on a truncated upload"
+    );
     assert_eq!(source.size_hint().exact(), Some(7 - source.delivered));
     let fused = std::future::poll_fn(|cx| source.poll_frame(cx)).await;
     assert!(fused.is_none());
