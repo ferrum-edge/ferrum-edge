@@ -1787,6 +1787,11 @@ async fn assert_native_h3_partial_upload_is_reset(
             .await
             .is_some()
     );
+    assert_eq!(
+        credential_expired_count(&harness, "http").await,
+        0,
+        "the fresh gateway must have no credential expiries before the sole upload"
+    );
     let token = mint_short_lived_token();
     // Keep the frontend owner alive until the backend reset is observed. Dropping
     // it would cause a client disconnect and would not prove credential expiry.
@@ -1962,7 +1967,10 @@ async fn h3_auth_lifetime_native_h3_buffered_write_expiry_resets_partial_upload(
 }
 
 /// Read actual access summaries from the listener's terminal path, including
-/// an unsuccessful terminal write. Detached-upload metadata must survive once.
+/// an unsuccessful terminal write. Authorization metadata must stay redacted;
+/// the typed lifetime counter independently proves why the sole upload ended.
+/// Callers keep the frontend owner alive and open no follow-up request until
+/// both the summary and the once-only expiry accounting have been asserted.
 async fn assert_h3_upload_expiry_summary(harness: &GatewayHarness, completed: bool) {
     let summary_count = |logs: &str| {
         logs.lines()
@@ -1988,9 +1996,16 @@ async fn assert_h3_upload_expiry_summary(harness: &GatewayHarness, completed: bo
         })
         .expect("expiry summary");
     assert_eq!(summary["response_status_code"], 401);
+    assert_eq!(summary["consumer_username"], CONSUMER);
+    assert_eq!(
+        credential_expired_count(harness, "http").await,
+        1,
+        "the sole admitted upload must record credential expiry while its frontend owner is alive"
+    );
     assert_eq!(
         summary["metadata"]["authorization.termination_reason"],
-        "credential_expired"
+        "[REDACTED]",
+        "plugin-writable authorization metadata must not be used as expiry evidence"
     );
     assert_eq!(
         summary["body_completed"].as_bool().unwrap_or(false),
