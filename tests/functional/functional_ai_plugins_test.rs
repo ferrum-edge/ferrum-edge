@@ -214,7 +214,10 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
     }
 
     const REDIS_URL: &str = "redis://127.0.0.1:6379/15";
-    let prefix = format!("ferrum-test:ai-semantic-cache-quarantine:{}", Uuid::new_v4());
+    let prefix = format!(
+        "ferrum-test:ai-semantic-cache-quarantine:{}",
+        Uuid::new_v4()
+    );
     let config = RedisConfig::from_plugin_config(
         &json!({
             "sync_mode": "redis",
@@ -251,10 +254,12 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
         .set_bytes_with_expire(&key, valid_replacement, 60)
         .await
         .expect("write concurrent valid replacement");
-    assert!(!redis
-        .delete_if_value_matches(&key, &observed)
-        .await
-        .expect("compare-and-delete succeeds"));
+    assert!(
+        !redis
+            .delete_if_value_matches(&key, &observed)
+            .await
+            .expect("compare-and-delete succeeds")
+    );
     assert!(matches!(
         redis.get_bytes_bounded(&key, 128).await,
         Ok(BoundedRedisValue::Found(value)) if value.as_slice() == valid_replacement
@@ -273,10 +278,12 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
     else {
         panic!("binary payload must be returned within the read bound");
     };
-    assert!(redis
-        .delete_if_value_matches(&key, &observed)
-        .await
-        .expect("compare-and-delete succeeds"));
+    assert!(
+        redis
+            .delete_if_value_matches(&key, &observed)
+            .await
+            .expect("compare-and-delete succeeds")
+    );
     assert!(matches!(
         redis.get_bytes_bounded(&key, 128).await,
         Ok(BoundedRedisValue::Missing)
