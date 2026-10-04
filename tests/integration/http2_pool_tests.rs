@@ -2565,14 +2565,22 @@ async fn test_grpc_pool_cancelled_affinity_create_borrows_and_retries_after_cool
         stream.run(pool.get_sender(&proxy)).await.unwrap();
     }
     assert_eq!(accepted.load(Ordering::Relaxed), 2);
-    assert_eq!(pool.pool_size(), 1, "borrowing must not alias another shard");
+    assert_eq!(
+        pool.pool_size(),
+        1,
+        "borrowing must not alias another shard"
+    );
     assert_eq!(pool.shard_create_backoff_work(), (1, 0));
 
     stall.store(false, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(2_100)).await;
     stream.run(pool.get_sender(&proxy)).await.unwrap();
     assert_eq!(accepted.load(Ordering::Relaxed), 3);
-    assert_eq!(pool.pool_size(), 2, "preferred shard recovers after cooldown");
+    assert_eq!(
+        pool.pool_size(),
+        2,
+        "preferred shard recovers after cooldown"
+    );
 }
 
 #[tokio::test]
@@ -2685,7 +2693,10 @@ async fn test_grpc_pool_backoff_has_bounded_occupancy_and_constant_eviction_work
     }
     assert_eq!(outage_started.elapsed(), Duration::ZERO);
     assert_eq!(pool.shard_create_backoff_len(), 4_096);
-    assert_eq!(pool.shard_create_backoff_work(), (KEYS + 2, KEYS + 2 - 4_096));
+    assert_eq!(
+        pool.shard_create_backoff_work(),
+        (KEYS + 2, KEYS + 2 - 4_096)
+    );
     assert_eq!(accepted.load(Ordering::Relaxed), 1);
     assert_eq!(pool.pool_size(), 1);
 }

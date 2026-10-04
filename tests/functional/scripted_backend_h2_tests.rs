@@ -5066,14 +5066,8 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool) {
         let port = reservation.drop_and_take_port();
         builder = builder
             .env("FERRUM_PROXY_HTTPS_PORT", port.to_string())
-            .env(
-                "FERRUM_FRONTEND_TLS_CERT_PATH",
-                cert_path.to_string_lossy(),
-            )
-            .env(
-                "FERRUM_FRONTEND_TLS_KEY_PATH",
-                key_path.to_string_lossy(),
-            );
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path.to_string_lossy())
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path.to_string_lossy());
         Some(port)
     } else {
         None
@@ -5099,11 +5093,11 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool) {
             .expect("TLS socket");
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let name = rustls::pki_types::ServerName::try_from("localhost").expect("SNI");
-        let socket = connector.connect(name, socket).await.expect("TLS handshake");
-        assert_eq!(
-            socket.get_ref().1.alpn_protocol(),
-            Some(b"h2".as_slice())
-        );
+        let socket = connector
+            .connect(name, socket)
+            .await
+            .expect("TLS handshake");
+        assert_eq!(socket.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
         exercise_grpc_retained_uploads(socket, port, "https", ended_rx).await;
     } else {
         let port = reqwest::Url::parse(&harness.proxy_base_url())
@@ -5133,9 +5127,7 @@ async fn exercise_grpc_retained_uploads<T>(
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     const UPLOADS: usize = 40;
-    let (mut client, connection) = h2::client::handshake(socket)
-        .await
-        .expect("frontend h2");
+    let (mut client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
     let driver = tokio::spawn(connection);
     let mut uploads = Vec::new();
     let mut backend_ids = Vec::new();
@@ -5149,9 +5141,7 @@ async fn exercise_grpc_retained_uploads<T>(
             .header("x-upload-id", index.to_string())
             .body(())
             .expect("request");
-        let (response, mut upload) = client
-            .send_request(request, false)
-            .expect("open upload");
+        let (response, mut upload) = client.send_request(request, false).expect("open upload");
         upload
             .send_data(Bytes::from_static(&[0, 0, 0, 0, 1, b'x']), false)
             .expect("initial DATA");
@@ -5204,9 +5194,7 @@ async fn exercise_grpc_retained_uploads<T>(
             .header("te", "trailers")
             .body(())
             .expect("probe request");
-        let (response, _) = client
-            .send_request(request, true)
-            .expect("finished upload");
+        let (response, _) = client.send_request(request, true).expect("finished upload");
         let response = tokio::time::timeout(Duration::from_secs(5), response)
             .await
             .expect("probe timeout")

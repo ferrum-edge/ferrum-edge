@@ -725,8 +725,9 @@ impl ShardCreateBackoff {
         if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
             return true;
         }
-        self.failures
-            .remove_if(key, |_, failure| failure.at.elapsed() >= SHARD_CREATE_BACKOFF);
+        self.failures.remove_if(key, |_, failure| {
+            failure.at.elapsed() >= SHARD_CREATE_BACKOFF
+        });
         false
     }
 
@@ -1112,11 +1113,7 @@ impl GrpcConnectionPool {
             buf.clear();
             buf.push_str(&key[..base_len]);
             for offset in 1..shards {
-                Self::write_shard_key_inplace(
-                    &mut buf,
-                    base_len,
-                    (start + offset) % shards,
-                );
+                Self::write_shard_key_inplace(&mut buf, base_len, (start + offset) % shards);
                 if let Some(mut sender) = self.pool.cached(&buf)
                     && matches!(
                         futures_util::FutureExt::now_or_never(sender.ready()),
