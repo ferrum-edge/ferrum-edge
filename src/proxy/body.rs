@@ -13,7 +13,7 @@ use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -68,8 +68,8 @@ pub struct ProxyBody {
     /// Dropped when the client-visible response body finishes, decrementing
     /// per-IP in-flight request accounting.
     _per_ip_request_guard: Option<super::PerIpRequestGuard>,
-    /// Dropped when the client-visible response body finishes, closing the
-    /// stream in its HTTP/2 frontend connection's gRPC shard-affinity count.
+    /// Marks response termination when dropped. A streamed gRPC upload keeps
+    /// the affinity count until its upload-terminal observer has also fired.
     _frontend_stream: Option<super::frontend_affinity::FrontendStream>,
     /// Dropped when a streaming backend response body reaches terminal state
     /// (EOF, error, or client disconnect), ensuring least-connections
@@ -3163,6 +3163,9 @@ pub(crate) fn direct_h2_uses_limit_adapter(
 pub struct DirectH2BytesLatch {
     done: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
+    /// Streaming gRPC reuses this already allocated latch for the frontend
+    /// upload/response join instead of allocating another per-RPC Arc.
+    pub(crate) frontend_upload_join: OnceLock<super::frontend_affinity::StreamUploadJoin>,
 }
 
 impl Default for DirectH2BytesLatch {
@@ -3176,6 +3179,7 @@ impl DirectH2BytesLatch {
         Self {
             done: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
+            frontend_upload_join: OnceLock::new(),
         }
     }
 

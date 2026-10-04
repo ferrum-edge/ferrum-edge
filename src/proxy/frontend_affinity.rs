@@ -13,8 +13,9 @@
 //! h2c) now takes a slot on its first HTTP/2 request and holds it for its
 //! lifetime; HTTP/1.x connections allocate nothing. Slots are taken least-loaded, so long-lived
 //! connections stay spread evenly however many short-lived ones come and go.
-//! Each of its streams counts as open from the request until its response body
-//! ends or is dropped ([`FrontendStream`] rides in the response body), and runs
+//! Each stream counts until its response terminates; a streamed gRPC request
+//! also retains the count until its upload terminates, even after an early
+//! terminal response. [`FrontendStream`] rides in the response body and runs
 //! with the connection in a task-local. The gRPC pool reads it through
 //! [`shard_start`]:
 //!
@@ -30,10 +31,10 @@
 //!   [`AFFINITY_MAX_OPEN_STREAMS`] of its calls to its own shard; the rest are
 //!   spread round-robin over all shards (its own included), and it still
 //!   widens the pool.
-//! - A shard whose affinity or spill create just failed (a DestinationRule
-//!   `maxConnections` below the shard count, or a backend refusing new
-//!   connections) is borrowed around for a short backoff instead of being
-//!   dialled again on every call.
+//! - A failed or cancelled affinity/spill create puts the shard on a short
+//!   borrow cooldown when a ready sibling exists. A cold pool can retry
+//!   immediately. The bounded cache records only physical attempts, never
+//!   coalesced waiters, and does at most one FIFO eviction per failure.
 //! - Calls with no frontend connection in scope (HTTP/1.1 and HTTP/3
 //!   frontends, spawned work) keep the original round-robin probe.
 //!
@@ -52,8 +53,9 @@
 //! protocol benchmark the same affinity made HTTP/2 slower (up to about 20% at
 //! 1–5 MiB on one runner type), while gRPC gained at 10 KiB on every runner.
 
+use std::cell::RefCell;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crossbeam_utils::CachePadded;
@@ -155,13 +157,14 @@ impl FrontendConnectionAffinity {
     }
 
     /// Open one stream of this connection. The stream counts as open until the
-    /// returned guard drops, exactly once, whether the response body ends,
-    /// errors or the request is cancelled.
+    /// returned guard drops, exactly once. A streaming gRPC upload joins its
+    /// own termination with that response-side guard.
     pub fn open_stream(self: &Arc<Self>) -> FrontendStream {
         self.slot.get_or_init(|| self.table.acquire());
         self.open_streams.fetch_add(1, Ordering::Relaxed);
         FrontendStream {
             connection: Arc::clone(self),
+            upload_join: None,
         }
     }
 
@@ -201,6 +204,9 @@ impl LazyConnectionAffinity {
 /// One open stream of a frontend connection.
 pub struct FrontendStream {
     connection: Arc<FrontendConnectionAffinity>,
+    // Streaming gRPC reuses its request-byte latch for two independent
+    // transport owners. Other H2 requests keep one guard.
+    upload_join: Option<Arc<super::body::DirectH2BytesLatch>>,
 }
 
 impl FrontendStream {
@@ -211,16 +217,110 @@ impl FrontendStream {
             .scope(Arc::clone(&self.connection), request)
             .await
     }
+
+    /// Scope a frontend handler and return its response-side guard. The
+    /// request-body constructor may register an upload observer while the
+    /// handler runs. Keeping the guard inside the scope makes cancellation
+    /// release the response half even before a response body exists.
+    pub async fn run_request<F: Future>(self, request: F) -> (F::Output, Self) {
+        let connection = Arc::clone(&self.connection);
+        FRONTEND_STREAM
+            .scope(
+                connection,
+                FRONTEND_REQUEST.scope(RefCell::new(Some(self)), async move {
+                    let output = request.await;
+                    let stream = FRONTEND_REQUEST.with(|stream| stream.borrow_mut().take());
+                    // This scope owns exactly one guard; only this terminal
+                    // handoff takes it out. Upload registration borrows it.
+                    let stream = stream.expect("frontend request scope owns its stream guard");
+                    (output, stream)
+                }),
+            )
+            .await
+    }
 }
 
 impl Drop for FrontendStream {
     fn drop(&mut self) {
-        self.connection.open_streams.fetch_sub(1, Ordering::Relaxed);
+        if let Some(join) = self.upload_join.as_ref() {
+            if let Some(join) = join.frontend_upload_join.get() {
+                join.terminate(RESPONSE_TERMINATED);
+            }
+        } else {
+            self.connection.open_streams.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
 tokio::task_local! {
     static FRONTEND_STREAM: Arc<FrontendConnectionAffinity>;
+    static FRONTEND_REQUEST: RefCell<Option<FrontendStream>>;
+}
+
+const UPLOAD_TERMINATED: u8 = 1;
+const RESPONSE_TERMINATED: u8 = 2;
+const BOTH_TERMINATED: u8 = UPLOAD_TERMINATED | RESPONSE_TERMINATED;
+
+pub(crate) struct StreamUploadJoin {
+    connection: Arc<FrontendConnectionAffinity>,
+    terminated: AtomicU8,
+    observer: Option<Arc<dyn super::grpc_proxy::GrpcUploadTerminationObserver>>,
+}
+
+impl StreamUploadJoin {
+    fn terminate(&self, half: u8) -> bool {
+        let previous = self.terminated.fetch_or(half, Ordering::AcqRel);
+        if previous != BOTH_TERMINATED && previous | half == BOTH_TERMINATED {
+            self.connection.open_streams.fetch_sub(1, Ordering::Relaxed);
+        }
+        previous & half == 0
+    }
+}
+
+impl super::grpc_proxy::GrpcUploadTerminationObserver for super::body::DirectH2BytesLatch {
+    fn on_upload_terminated(&self) {
+        if let Some(join) = self.frontend_upload_join.get()
+            && join.terminate(UPLOAD_TERMINATED)
+            && let Some(observer) = join.observer.as_ref()
+        {
+            observer.on_upload_terminated();
+        }
+    }
+}
+
+/// Join the streamed gRPC upload's existing terminal observer with the
+/// frontend response lifetime. Unscoped dispatches retain their observer.
+/// Called immediately before constructing the body that owns the observer.
+/// Reuses the request-byte latch when supplied; standalone callers without
+/// byte accounting allocate a latch only if a frontend request is in scope.
+pub fn retain_upload(
+    observer: Option<Arc<dyn super::grpc_proxy::GrpcUploadTerminationObserver>>,
+    request_latch: Option<&Arc<super::body::DirectH2BytesLatch>>,
+) -> Option<Arc<dyn super::grpc_proxy::GrpcUploadTerminationObserver>> {
+    let mut observer = observer;
+    let joined = FRONTEND_REQUEST.try_with(|stream| {
+        let mut stream = stream.borrow_mut();
+        let stream = stream.as_mut()?;
+        let latch = match request_latch {
+            Some(latch) => Arc::clone(latch),
+            None => Arc::new(super::body::DirectH2BytesLatch::new()),
+        };
+        let join = StreamUploadJoin {
+            connection: Arc::clone(&stream.connection),
+            terminated: AtomicU8::new(0),
+            observer: observer.take(),
+        };
+        if let Err(join) = latch.frontend_upload_join.set(join) {
+            // A latch belongs to one upload. Leave an already registered
+            // owner intact if a caller attempts to register it again.
+            observer = join.observer;
+            return None;
+        }
+        stream.upload_join = Some(Arc::clone(&latch));
+        let latch: Arc<dyn super::grpc_proxy::GrpcUploadTerminationObserver> = latch;
+        Some(latch)
+    });
+    joined.ok().flatten().or(observer)
 }
 
 /// Where the gRPC pool's shard probe starts for the current call.

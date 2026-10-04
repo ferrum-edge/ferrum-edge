@@ -2506,6 +2506,190 @@ async fn test_grpc_pool_affinity_under_a_connection_cap_borrows_without_redialli
     assert_eq!(pool.shard_create_backoff_len(), 1);
 }
 
+async fn wait_for_affinity_accepts(accepted: &AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while accepted.load(Ordering::Relaxed) < expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("backend accepted the physical attempt");
+}
+
+#[tokio::test]
+async fn test_grpc_pool_cancelled_affinity_create_borrows_and_retries_after_cooldown() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    use futures_util::FutureExt;
+
+    let (port, accepted, stall) = start_stallable_h2c_backend().await;
+    let pool = affinity_grpc_pool(4);
+    let mut proxy = h2c_proxy_with_max_connections(port, None);
+    proxy.backend_connect_timeout_ms = 5_000;
+    let table = affinity_slot_table();
+    let first = FrontendConnectionAffinity::with_table(table);
+    first
+        .open_stream()
+        .run(pool.get_sender(&proxy))
+        .await
+        .unwrap();
+    stall.store(true, Ordering::Relaxed);
+    let second = FrontendConnectionAffinity::with_table(table);
+    let stream = second.open_stream();
+    let mut creator = Box::pin(stream.run(pool.get_sender(&proxy)));
+    tokio::select! {
+        result = &mut creator => panic!("create should stall: {result:?}"),
+        _ = wait_for_affinity_accepts(&accepted, 2) => {}
+    }
+    let mut waiters: Vec<_> = (0..16)
+        .map(|_| {
+            Box::pin(async {
+                let stream = second.open_stream();
+                stream.run(pool.get_sender(&proxy)).await
+            })
+        })
+        .collect();
+    for waiter in &mut waiters {
+        assert!(waiter.as_mut().now_or_never().is_none());
+    }
+    // All waiters have joined the stalled attempt. Cancel well before the
+    // backend connect timeout, as an RPC/auth deadline would do.
+    drop(creator);
+    assert_eq!(pool.shard_create_backoff_work(), (1, 0));
+    for waiter in waiters {
+        tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("waiter borrows promptly after cancellation")
+            .expect("healthy sibling");
+    }
+    for _ in 0..10 {
+        stream.run(pool.get_sender(&proxy)).await.unwrap();
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(pool.pool_size(), 1, "borrowing must not alias another shard");
+    assert_eq!(pool.shard_create_backoff_work(), (1, 0));
+
+    stall.store(false, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    stream.run(pool.get_sender(&proxy)).await.unwrap();
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    assert_eq!(pool.pool_size(), 2, "preferred shard recovers after cooldown");
+}
+
+#[tokio::test]
+async fn test_grpc_pool_cancelled_cold_create_recovers_without_waiting_for_cooldown() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+
+    let (port, accepted, stall) = start_stallable_h2c_backend().await;
+    let pool = affinity_grpc_pool(4);
+    let proxy = h2c_proxy_with_max_connections(port, None);
+    let connection = FrontendConnectionAffinity::with_table(affinity_slot_table());
+    let stream = connection.open_stream();
+    stall.store(true, Ordering::Relaxed);
+    let mut creator = Box::pin(stream.run(pool.get_sender(&proxy)));
+    tokio::select! {
+        result = &mut creator => panic!("create should stall: {result:?}"),
+        _ = wait_for_affinity_accepts(&accepted, 1) => {}
+    }
+    drop(creator);
+    assert_eq!(pool.shard_create_backoff_work(), (1, 0));
+    stall.store(false, Ordering::Relaxed);
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        stream.run(pool.get_sender(&proxy)),
+    )
+    .await
+    .expect("a cold pool must retry immediately")
+    .expect("fresh sender");
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(pool.pool_size(), 1);
+}
+
+#[tokio::test]
+async fn test_grpc_pool_failure_fanout_records_only_the_physical_attempt() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+    use futures_util::FutureExt;
+
+    let (port, accepted, stall) = start_stallable_h2c_backend().await;
+    let pool = affinity_grpc_pool(4);
+    let mut proxy = h2c_proxy_with_max_connections(port, None);
+    proxy.backend_connect_timeout_ms = 500;
+    let table = affinity_slot_table();
+    let first = FrontendConnectionAffinity::with_table(table);
+    first
+        .open_stream()
+        .run(pool.get_sender(&proxy))
+        .await
+        .unwrap();
+    stall.store(true, Ordering::Relaxed);
+    let second = FrontendConnectionAffinity::with_table(table);
+    let stream = second.open_stream();
+    let mut creator = Box::pin(stream.run(pool.get_sender(&proxy)));
+    tokio::select! {
+        result = &mut creator => panic!("create should stall: {result:?}"),
+        _ = wait_for_affinity_accepts(&accepted, 2) => {}
+    }
+    let mut waiters: Vec<_> = (0..64)
+        .map(|_| Box::pin(stream.run(pool.get_sender(&proxy))))
+        .collect();
+    for waiter in &mut waiters {
+        assert!(waiter.as_mut().now_or_never().is_none());
+    }
+    waiters.push(creator);
+    for result in futures_util::future::join_all(waiters).await {
+        result.expect("failed create borrows the healthy sibling");
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(pool.shard_create_backoff_work(), (1, 0));
+    assert_eq!(pool.shard_create_backoff_len(), 1);
+}
+
+#[tokio::test]
+async fn test_grpc_pool_backoff_has_bounded_occupancy_and_constant_eviction_work() {
+    use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
+
+    const KEYS: usize = 4_224;
+    let (port, accepted) = start_counting_h2c_backend().await;
+    let pool = affinity_grpc_pool(4);
+    pool.attach_backend_conn_limit(Arc::new(BackendConnectionLimiter::new()));
+    let proxy = h2c_proxy_with_max_connections(port, Some(1));
+    let connection = FrontendConnectionAffinity::with_table(affinity_slot_table());
+    let stream = connection.open_stream();
+    stream.run(pool.get_sender(&proxy)).await.unwrap();
+
+    // Freeze cooldown time after the real handshake. Every failed key below
+    // remains live, so expiration cannot hide excess occupancy or scan work.
+    tokio::time::pause();
+    let outage_started = tokio::time::Instant::now();
+    let mut refreshed = proxy.clone();
+    refreshed.upstream_subset = Some("outage-refreshed".to_string());
+    for _ in 0..2 {
+        assert!(stream.run(pool.get_sender(&refreshed)).await.is_err());
+    }
+    // Distinct pool identities at one capped physical destination: every
+    // create fails while the unrelated original shard remains healthy.
+    for index in 0..KEYS {
+        let mut failed = proxy.clone();
+        failed.upstream_subset = Some(format!("outage-{index}"));
+        assert!(stream.run(pool.get_sender(&failed)).await.is_err());
+        assert!(pool.shard_create_backoff_len() <= 4_096);
+        if index == 4_094 {
+            assert_eq!(
+                pool.shard_create_backoff_len(),
+                4_096,
+                "evicting the older FIFO record must preserve a same-clock refresh"
+            );
+        }
+        if index % 64 == 0 {
+            stream.run(pool.get_sender(&proxy)).await.unwrap();
+        }
+    }
+    assert_eq!(outage_started.elapsed(), Duration::ZERO);
+    assert_eq!(pool.shard_create_backoff_len(), 4_096);
+    assert_eq!(pool.shard_create_backoff_work(), (KEYS + 2, KEYS + 2 - 4_096));
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(pool.pool_size(), 1);
+}
+
 /// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A
 /// checked-out connection whose request bound elapsed before the handoff never
 /// carried the request, so the gate refuses it and returns it to the idle set

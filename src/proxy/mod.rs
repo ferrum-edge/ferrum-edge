@@ -14816,12 +14816,16 @@ async fn handle_connection(
                 None,
                 connection_metadata,
             );
-            let mut response = match frontend_stream.as_ref() {
-                Some(stream) => stream.run(request).await,
-                None => request.await,
+            let (mut response, frontend_stream) = match frontend_stream {
+                Some(stream) => {
+                    let (response, stream) = stream.run_request(request).await;
+                    (response, Some(stream))
+                }
+                None => (request.await, None),
             };
             apply_h1_framing_connection_close(&mut response, http1_framing_result);
-            // The stream stays open until its response body ends or drops.
+            // A streamed gRPC upload retains the count after an early response
+            // until its independent upload-terminal observer fires too.
             if let Some(stream) = frontend_stream {
                 response =
                     response.map(|response| response.map(|body| body.with_frontend_stream(stream)));
@@ -23766,12 +23770,16 @@ async fn handle_tls_connection(
                 mtls_auth_connection_cache,
                 connection_metadata,
             );
-            let mut response = match frontend_stream.as_ref() {
-                Some(stream) => stream.run(request).await,
-                None => request.await,
+            let (mut response, frontend_stream) = match frontend_stream {
+                Some(stream) => {
+                    let (response, stream) = stream.run_request(request).await;
+                    (response, Some(stream))
+                }
+                None => (request.await, None),
             };
             apply_h1_framing_connection_close(&mut response, http1_framing_result);
-            // The stream stays open until its response body ends or drops.
+            // A streamed gRPC upload retains the count after an early response
+            // until its independent upload-terminal observer fires too.
             if let Some(stream) = frontend_stream {
                 response =
                     response.map(|response| response.map(|body| body.with_frontend_stream(stream)));

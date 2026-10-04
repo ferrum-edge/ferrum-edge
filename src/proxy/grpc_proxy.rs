@@ -32,10 +32,10 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -675,22 +675,100 @@ fn write_grpc_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize)
 pub struct GrpcConnectionPool {
     pool: Arc<GenericPool<GrpcPoolManager>>,
     rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
-    /// Shard keys whose affinity or spill create failed recently, with the
+    /// Shard keys whose affinity or spill create failed or was cancelled, with the
     /// failure time (issue #5588). Until [`SHARD_CREATE_BACKOFF`] passes, a
     /// missing or closed shard listed here is treated like any other missing
     /// shard: the probe borrows a ready neighbour instead of dialling again on
     /// every call (a DestinationRule `maxConnections` below the shard count,
     /// or a backend refusing new connections). Consulted only when the
     /// preferred shard is missing or closed.
-    shard_create_backoff: Arc<DashMap<String, std::time::Instant>>,
+    shard_create_backoff: ShardCreateBackoff,
 }
 
 /// How long a failed affinity or spill shard create keeps that shard on the
 /// borrow path before it is dialled again.
 const SHARD_CREATE_BACKOFF: Duration = Duration::from_secs(2);
 
-/// Above this many entries, recording a failure first drops expired ones.
-const SHARD_CREATE_BACKOFF_RETAIN_ABOVE: usize = 4096;
+/// Hard bound on retained failure keys and FIFO records. Recording one
+/// physical failure evicts at most one record; there are no full-map scans.
+const SHARD_CREATE_BACKOFF_CAPACITY: usize = 4096;
+
+struct ShardCreateBackoff {
+    failures: DashMap<Arc<str>, ShardCreateFailure>,
+    // Only physical failed/cancelled creates take this lock. Warm requests
+    // never consult the backoff cache, and coalesced waiters never record.
+    order: Mutex<VecDeque<(Arc<str>, usize)>>,
+    recorded: AtomicUsize,
+    evicted: AtomicUsize,
+}
+
+struct ShardCreateFailure {
+    at: tokio::time::Instant,
+    generation: usize,
+}
+
+impl ShardCreateBackoff {
+    fn new(shards: usize) -> Self {
+        Self {
+            failures: DashMap::with_shard_amount(shards),
+            order: Mutex::new(VecDeque::with_capacity(SHARD_CREATE_BACKOFF_CAPACITY)),
+            recorded: AtomicUsize::new(0),
+            evicted: AtomicUsize::new(0),
+        }
+    }
+
+    fn backed_off(&self, key: &str) -> bool {
+        let failed_at = match self.failures.get(key) {
+            Some(entry) => entry.at,
+            None => return false,
+        };
+        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
+            return true;
+        }
+        self.failures
+            .remove_if(key, |_, failure| failure.at.elapsed() >= SHARD_CREATE_BACKOFF);
+        false
+    }
+
+    fn record(&self, key: String) {
+        // Recover the bounded bookkeeping after a panic without dropping the
+        // cancellation cooldown. No user work runs while this lock is held.
+        let mut order = self.order.lock().unwrap_or_else(|err| err.into_inner());
+        if order.len() == SHARD_CREATE_BACKOFF_CAPACITY
+            && let Some((old_key, old_generation)) = order.pop_front()
+        {
+            self.failures.remove_if(old_key.as_ref(), |_, failure| {
+                failure.generation == old_generation
+            });
+            self.evicted.fetch_add(1, Ordering::Relaxed);
+        }
+        let key: Arc<str> = key.into();
+        let generation = self.recorded.fetch_add(1, Ordering::Relaxed);
+        self.failures.insert(
+            Arc::clone(&key),
+            ShardCreateFailure {
+                at: tokio::time::Instant::now(),
+                generation,
+            },
+        );
+        order.push_back((key, generation));
+    }
+}
+
+/// Lives inside the elected physical creator, so cancellation records the
+/// cooldown before GenericPool wakes waiters to elect the next creator.
+struct ShardCreateGuard<'a> {
+    backoff: &'a ShardCreateBackoff,
+    key: Option<String>,
+}
+
+impl Drop for ShardCreateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.backoff.record(key);
+        }
+    }
+}
 
 #[derive(Clone)]
 struct GrpcPoolManager {
@@ -785,7 +863,7 @@ impl GrpcConnectionPool {
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
-            shard_create_backoff: Arc::new(DashMap::with_shard_amount(shards)),
+            shard_create_backoff: ShardCreateBackoff::new(shards),
         }
     }
 
@@ -1002,31 +1080,54 @@ impl GrpcConnectionPool {
     /// create.
     #[allow(dead_code)] // exercised from integration tests
     pub fn shard_create_backoff_len(&self) -> usize {
-        self.shard_create_backoff.len()
+        self.shard_create_backoff.failures.len()
     }
 
-    /// Whether the shard `key` failed an affinity or spill create within
-    /// [`SHARD_CREATE_BACKOFF`]. An expired entry is removed.
+    /// Physical failure records and bounded FIFO eviction operations. Exposed
+    /// for outage/fanout regression coverage, not logical request counts.
+    #[doc(hidden)]
+    pub fn shard_create_backoff_work(&self) -> (usize, usize) {
+        (
+            self.shard_create_backoff.recorded.load(Ordering::Relaxed),
+            self.shard_create_backoff.evicted.load(Ordering::Relaxed),
+        )
+    }
+
     fn shard_create_backed_off(&self, key: &str) -> bool {
-        let failed_at = match self.shard_create_backoff.get(key) {
-            Some(entry) => *entry.value(),
-            None => return false,
-        };
-        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
-            return true;
-        }
-        self.shard_create_backoff
-            .remove_if(key, |_, at| at.elapsed() >= SHARD_CREATE_BACKOFF);
-        false
+        self.shard_create_backoff.backed_off(key)
     }
 
-    fn record_shard_create_failure(&self, key: &str) {
-        if self.shard_create_backoff.len() > SHARD_CREATE_BACKOFF_RETAIN_ABOVE {
-            self.shard_create_backoff
-                .retain(|_, at| at.elapsed() < SHARD_CREATE_BACKOFF);
-        }
-        self.shard_create_backoff
-            .insert(key.to_owned(), std::time::Instant::now());
+    fn ready_sibling(
+        &self,
+        key: &str,
+        base_len: usize,
+        start: usize,
+        shards: usize,
+    ) -> Option<GrpcPooledSender> {
+        // Cold creator recheck only. Reuse the thread-local key buffer rather
+        // than allocating one key per sibling, and never alias the borrowed
+        // sender into the failed shard's cache entry.
+        GRPC_POOL_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.push_str(&key[..base_len]);
+            for offset in 1..shards {
+                Self::write_shard_key_inplace(
+                    &mut buf,
+                    base_len,
+                    (start + offset) % shards,
+                );
+                if let Some(mut sender) = self.pool.cached(&buf)
+                    && matches!(
+                        futures_util::FutureExt::now_or_never(sender.ready()),
+                        Some(Ok(()))
+                    )
+                {
+                    return Some(sender);
+                }
+            }
+            None
+        })
     }
 
     #[allow(dead_code)] // exercised from unit tests
@@ -1251,12 +1352,22 @@ impl GrpcConnectionPool {
         crate::profile_pool_event!(Fallback);
         let manager = Arc::clone(self.pool.manager());
         let acquired = crate::profile_pool_future!(FallbackPoll, {
-            self.pool.create_or_get_existing_owned_with_attempt(
+            self.pool.create_or_get_existing_owned_with_recovery(
                 selected_key,
                 |attempt| note_grpc_establishment_join(attempt, purpose),
                 |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
+                |key| {
+                    if create_if_missing && self.shard_create_backed_off(key) {
+                        self.ready_sibling(key, base_len, start, shard_count)
+                    } else {
+                        None
+                    }
+                },
                 |key, attempt| async move {
-                    let _ = key;
+                    let mut guard = ShardCreateGuard {
+                        backoff: &self.shard_create_backoff,
+                        key: create_if_missing.then_some(key),
+                    };
                     // Only the creator runs this closure, so the connection
                     // this attempt waits on is one it set up (issue #5864).
                     let setup_started =
@@ -1265,6 +1376,7 @@ impl GrpcConnectionPool {
                         .create_connection(proxy, svid_generation, purpose, Some(attempt))
                         .await;
                     if created.is_ok() {
+                        guard.key = None;
                         crate::plugins::otel_tracing::note_backend_connection_established_since(
                             setup_started,
                         );
@@ -1283,12 +1395,6 @@ impl GrpcConnectionPool {
                 crate::profile_pool_event!(Recovery);
                 let recovered = self.with_pool_key(proxy, svid_generation, |key_buf| {
                     debug_assert_eq!(key_buf.len(), base_len);
-                    if create_if_missing {
-                        // Back the failed affinity/spill shard off so the next
-                        // calls borrow instead of dialling it again.
-                        Self::write_shard_key_inplace(key_buf, base_len, start);
-                        self.record_shard_create_failure(key_buf);
-                    }
                     for offset in 1..shard_count {
                         let shard = (start + offset) % shard_count;
                         Self::write_shard_key_inplace(key_buf, base_len, shard);
@@ -4744,6 +4850,10 @@ pub async fn proxy_grpc_request_streaming(
     let auth_deadline = auth.map(|(deadline, family, latch)| {
         crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
     });
+    let upload_observer = super::frontend_affinity::retain_upload(
+        upload_observer,
+        request_bytes.as_ref().map(|accounting| &accounting.latch),
+    );
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
         auth_deadline,

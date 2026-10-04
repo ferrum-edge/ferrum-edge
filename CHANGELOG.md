@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **gRPC shard affinity now accounts for cancelled creates and unfinished
+  uploads** (#5991). Failed or cancelled physical shard creates record one
+  cooldown before waiting callers elect another creator; those callers borrow
+  a ready sibling during cooldown, while a cold pool can still recover
+  immediately. Early terminal responses retain a streaming upload's affinity
+  count until both halves end, including EOF and reset, so more than 32 open
+  uploads spill across the shard ring. The join reuses the request-byte latch.
+  Failure bookkeeping is capped at 4,096 keys and FIFO records with at most one
+  eviction per physical failure, replacing full-map scans on failed requests.
+
 - The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
   entry generation it selected. A concurrent same-key refresh survives the cleanup
   pass instead of being removed as stale. The expired-entry lookup path also removes

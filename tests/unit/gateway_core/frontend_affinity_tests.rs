@@ -1,6 +1,6 @@
 //! gRPC backend-shard affinity for an HTTP/2 frontend connection (issue #5588):
 //! the slot table, the per-connection open-stream bound, the shard start the
-//! gRPC pool reads, and a source guard on the frontend wiring. The pool-level
+//! gRPC pool reads, and the upload/response terminal join. The pool-level
 //! behaviour is covered against a real pool in
 //! `tests/integration/http2_pool_tests.rs`.
 
@@ -155,21 +155,123 @@ fn http1_requests_allocate_no_affinity_state() {
     assert!(stream.is_some());
 }
 
-#[test]
-fn both_frontends_open_a_stream_per_http2_request_and_keep_it_with_the_body() {
-    let proxy = include_str!("../../../src/proxy/mod.rs");
-    for needle in [
-        "let connection_affinity = frontend_affinity::LazyConnectionAffinity::new();",
-        "let frontend_stream = connection_affinity.open_stream(req.version());",
-        "Some(stream) => stream.run(request).await,",
-        "response.map(|response| response.map(|body| body.with_frontend_stream(stream)));",
-    ] {
-        assert_eq!(
-            proxy.matches(needle).count(),
-            2,
-            "plaintext and TLS frontends must both carry `{needle}`"
-        );
+#[tokio::test]
+async fn early_responses_keep_uploads_counted_until_both_halves_terminate() {
+    use ferrum_edge::proxy::frontend_affinity::retain_upload;
+
+    let connection = FrontendConnectionAffinity::with_table(table());
+    let mut uploads = Vec::new();
+    for _ in 0..AFFINITY_MAX_OPEN_STREAMS {
+        let (upload, response) = connection
+            .open_stream()
+            .run_request(async { retain_upload(None, None).expect("upload observer") })
+            .await;
+        drop(response);
+        uploads.push(upload);
     }
-    let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
-    assert!(grpc.contains("match shard_start(shard_count) {"));
+    assert_eq!(connection.open_streams(), AFFINITY_MAX_OPEN_STREAMS);
+    let next = connection.open_stream();
+    assert_eq!(next.run(async { shard_start(4) }).await, ShardStart::Spill);
+    drop(next);
+
+    for upload in uploads {
+        upload.on_upload_terminated();
+        upload.on_upload_terminated();
+    }
+    assert_eq!(connection.open_streams(), 0, "each join releases once");
+}
+
+#[tokio::test]
+async fn upload_completion_waits_for_the_response_and_preserves_the_previous_observer() {
+    use ferrum_edge::proxy::frontend_affinity::retain_upload;
+    use ferrum_edge::proxy::grpc_proxy::GrpcUploadTerminationObserver;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Observer(AtomicUsize);
+    impl GrpcUploadTerminationObserver for Observer {
+        fn on_upload_terminated(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let observed = Arc::new(Observer(AtomicUsize::new(0)));
+    let observer: Arc<dyn GrpcUploadTerminationObserver> = observed.clone();
+    let connection = FrontendConnectionAffinity::with_table(table());
+    let latch = Arc::new(ferrum_edge::proxy::body::DirectH2BytesLatch::new());
+    let (upload, response) = connection
+        .open_stream()
+        .run_request(async {
+            retain_upload(Some(observer), Some(&latch)).expect("joined observer")
+        })
+        .await;
+    let reused: Arc<dyn GrpcUploadTerminationObserver> = latch.clone();
+    assert!(
+        Arc::ptr_eq(&upload, &reused),
+        "reuse the request-byte latch allocation"
+    );
+    upload.on_upload_terminated();
+    upload.on_upload_terminated();
+    assert_eq!(observed.0.load(Ordering::Relaxed), 1);
+    assert_eq!(connection.open_streams(), 1);
+    drop(response);
+    assert_eq!(connection.open_streams(), 0);
+    upload.on_upload_terminated();
+    assert_eq!(connection.open_streams(), 0);
+}
+
+#[tokio::test]
+async fn handler_cancellation_joins_the_still_owned_upload() {
+    use ferrum_edge::proxy::frontend_affinity::retain_upload;
+
+    let connection = FrontendConnectionAffinity::with_table(table());
+    let stream = connection.open_stream();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handler = tokio::spawn(async move {
+        stream
+            .run_request(async move {
+                let upload = retain_upload(None, None).expect("upload observer");
+                assert!(tx.send(upload).is_ok());
+                std::future::pending::<()>().await;
+            })
+            .await
+    });
+    let upload = rx.await.expect("registered upload");
+    handler.abort();
+    let _ = handler.await;
+    assert_eq!(connection.open_streams(), 1);
+    upload.on_upload_terminated();
+    assert_eq!(connection.open_streams(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_upload_and_response_termination_releases_each_stream_once() {
+    use ferrum_edge::proxy::frontend_affinity::retain_upload;
+    use std::sync::Arc;
+
+    let connection = FrontendConnectionAffinity::with_table(table());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2 * AFFINITY_MAX_OPEN_STREAMS + 1));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..AFFINITY_MAX_OPEN_STREAMS {
+        let (upload, response) = connection
+            .open_stream()
+            .run_request(async { retain_upload(None, None).expect("upload observer") })
+            .await;
+        let upload_barrier = Arc::clone(&barrier);
+        tasks.spawn(async move {
+            upload_barrier.wait().await;
+            upload.on_upload_terminated();
+            upload.on_upload_terminated();
+        });
+        let response_barrier = Arc::clone(&barrier);
+        tasks.spawn(async move {
+            response_barrier.wait().await;
+            drop(response);
+        });
+    }
+    assert_eq!(connection.open_streams(), AFFINITY_MAX_OPEN_STREAMS);
+    barrier.wait().await;
+    while let Some(result) = tasks.join_next().await {
+        result.expect("terminal task");
+    }
+    assert_eq!(connection.open_streams(), 0);
 }
