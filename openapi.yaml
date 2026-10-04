@@ -78,7 +78,9 @@ info:
     rejected with `403 Forbidden`. A control plane serving multiple namespaces
     (`FERRUM_CP_NAMESPACES` names more than one namespace or `*`) engages this
     enforcement automatically. With the flag unset and no multi-namespace CP
-    scope, any valid admin JWT may address any namespace. The `/namespaces` registry is not
+    scope, any valid admin JWT may address any namespace; read-only
+    `/config/export` and `/backend-egress-policy` still enforce a present ns
+    claim. The `/namespaces` registry is not
     selected by `X-Ferrum-Namespace`: list results are filtered to claimed
     names (a token with no `ns` claim sees an empty list), and
     create/get/rename/delete of a specific name return `403` when the token
@@ -216,6 +218,8 @@ tags:
     description: CP/DP cluster status and operational introspection
   - name: Backend Capabilities
     description: Inspect and force-refresh the per-backend-target protocol classification cache (H1/H2/H3/h2c/gRPC)
+  - name: Backend Egress Policy
+    description: Read the loaded backend address enforcement policy without exposing address lists
   - name: Diagnostics
     description: Resolve opaque gateway diagnostic references (X-Ferrum-Diagnostic-Ref) to scoped, operator-only detail
   - name: Node-Waypoint
@@ -2445,6 +2449,82 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /backend-egress-policy:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: getBackendEgressPolicy
+      summary: Read the effective backend address policy
+      description: |
+        JWT-only read metadata for viewer, operator, and admin roles, including
+        viewer-key JWTs. Metrics tokens and metrics CIDR allowlists grant no
+        access. Namespace read authorization applies: a present ns claim must
+        include X-Ferrum-Namespace even when optional claim enforcement is off;
+        the viewer-key namespace ceiling always applies. A missing ns claim is
+        refused when claim enforcement is enabled (including multi-namespace CP).
+
+        Describes the immutable loaded BackendEgressPolicy, using ProxyState's
+        actual policy on serving processes. Never rereads raw environment values,
+        reveals CIDRs/addresses/counts/secrets, or performs DNS validation.
+        Available on read-only admin listeners as well as writable ones.
+
+        The policy is process-wide. enforcement_scope distinguishes a local
+        data plane serving the selected namespace from an unserved namespace,
+        CP admission-only policy, or a process without a data plane. CP metadata
+        does not attest its DPs: check every serving gateway independently.
+
+        Mode class lists describe the last evaluation stage, not unconditional
+        effective permissions: allow CIDRs override deny CIDRs, the dangerous
+        baseline, and mode. public_only_guaranteed is conservative and true only
+        for public mode with no allow overrides. It describes the loaded policy,
+        not external firewalls, DNS ownership, or successful socket connections.
+        The ordinary runtime enforcement remains authoritative; this endpoint
+        does not add enforcement to any outbound path.
+
+        Consumers requiring public-only backends must fail closed on missing or
+        unknown schema/classification/labels, unexpected namespace, an enforcement
+        scope other than local-data-plane, or public_only_guaranteed=false.
+        See docs/admin_api.md#backend-egress-policy for exact v1 classifications,
+        embedded IPv4 handling, precedence, defaults, and integration guidance.
+      tags: [Backend Egress Policy]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Loaded policy metadata (Cache-Control no-store)
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackendEgressPolicyResponse"
+              examples:
+                defaultControlPlane:
+                  summary: Production default; admission policy only on a CP
+                  value:
+                    schema_version: 1
+                    ip_classification: ferrum-private-reserved-v1
+                    namespace: ferrum
+                    policy_scope: process
+                    enforcement_scope: admission-only
+                    mode: both
+                    mode_allowed_ip_classes: [public, private-reserved]
+                    mode_blocked_ip_classes: []
+                    dangerous_ranges_blocked: true
+                    allow_cidr_overrides_present: false
+                    deny_cidr_overrides_present: false
+                    evaluation_order: [allow-cidrs, deny-cidrs, dangerous-ranges, ip-mode]
+                    public_only_guaranteed: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   # ── Backend Capabilities ────────────────────────────────────────────
   /backend-capabilities:
@@ -38959,6 +39039,121 @@ components:
         message:
           type: string
           description: Informational message
+
+    BackendEgressPolicyResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - ip_classification
+        - namespace
+        - policy_scope
+        - enforcement_scope
+        - mode
+        - mode_allowed_ip_classes
+        - mode_blocked_ip_classes
+        - dangerous_ranges_blocked
+        - allow_cidr_overrides_present
+        - deny_cidr_overrides_present
+        - evaluation_order
+        - public_only_guaranteed
+      properties:
+        schema_version:
+          type: integer
+          enum: [1]
+          description: Version of this response vocabulary; unknown versions must fail closed
+        ip_classification:
+          type: string
+          enum: [ferrum-private-reserved-v1]
+          description: |
+            Versioned Edge is_private_ip classification, not a DNS lookup or an
+            external registry. public is its complement. private-reserved
+            includes loopback, RFC1918/ULA, link-local, CGNAT, metadata,
+            documentation, benchmarking, multicast, unspecified, reserved and
+            non-global special-purpose addresses, including recognized IPv4
+            embeddings. The exact v1 ranges and globally reachable IETF
+            exceptions are documented in docs/admin_api.md#backend-egress-policy.
+        namespace:
+          type: string
+          description: Authorized request namespace; absent header selects ferrum
+        policy_scope:
+          type: string
+          enum: [process]
+          description: The policy is process-wide, not a per-namespace override
+        enforcement_scope:
+          type: string
+          enum: [local-data-plane, unserved-namespace, admission-only, no-data-plane]
+          description: |
+            local-data-plane means this process has a ProxyState serving the
+            requested namespace. unserved-namespace means its local data plane
+            serves another namespace. admission-only is CP without a local
+            proxy; no-data-plane covers node_agent and other non-serving states.
+            Neither admission-only nor no-data-plane attests remote DP policy.
+        mode:
+          type: string
+          enum: [both, public, private]
+          description: Loaded mode; the production default is both
+        mode_allowed_ip_classes:
+          type: array
+          uniqueItems: true
+          maxItems: 2
+          items:
+            type: string
+            enum: [public, private-reserved]
+          description: |
+            Classes allowed by mode before overlays/baseline: both has
+            [public, private-reserved], public has [public], private has
+            [private-reserved]. These are not unconditional effective allows.
+        mode_blocked_ip_classes:
+          type: array
+          uniqueItems: true
+          maxItems: 1
+          items:
+            type: string
+            enum: [public, private-reserved]
+          description: |
+            both has [], public has [private-reserved], private has [public].
+            Allow CIDR overrides can bypass these blocks.
+        dangerous_ranges_blocked:
+          type: boolean
+          description: |
+            Loaded dangerous-range baseline (production default true). It
+            blocks metadata/link-local, multicast, unspecified/this-host and
+            limited broadcast, unless an explicit allow override applies.
+            It permits ordinary loopback and RFC1918/ULA under both mode;
+            baseline-on alone never proves public-only egress.
+        allow_cidr_overrides_present:
+          type: boolean
+          description: Any loaded explicit allow CIDRs; entries and counts are withheld
+        deny_cidr_overrides_present:
+          type: boolean
+          description: Any loaded explicit deny CIDRs; entries and counts are withheld
+        evaluation_order:
+          type: array
+          minItems: 4
+          maxItems: 4
+          prefixItems:
+            - type: string
+              const: allow-cidrs
+            - type: string
+              const: deny-cidrs
+            - type: string
+              const: dangerous-ranges
+            - type: string
+              const: ip-mode
+          items: false
+          description: |
+            First-match precedence for an address and each recognized embedded
+            IPv4 candidate. Ambiguous NAT64 local-use embeddings must pass both
+            decoded candidates and then the literal IPv6 policy; see v1 docs.
+        public_only_guaranteed:
+          type: boolean
+          description: |
+            True exactly when mode=public and allow_cidr_overrides_present=false.
+            Deny overrides only restrict. False is conservative: even a wholly
+            public allow list prevents certification, since CIDRs are withheld.
+            This policy guarantee requires enforcement_scope=local-data-plane
+            before it is usable as evidence about a serving gateway.
 
     # ── Backend Capabilities ─────────────────────────────────────────
     ProtocolSupport:

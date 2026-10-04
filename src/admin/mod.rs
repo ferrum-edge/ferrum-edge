@@ -3,6 +3,7 @@
 pub mod api_specs;
 pub mod audit;
 pub mod audit_spool;
+mod backend_egress_policy;
 mod backup;
 mod conditional_snapshots;
 pub mod config_export;
@@ -2318,6 +2319,9 @@ fn namespace_scoped_resource_kind(segments: &[&str]) -> Option<&'static str> {
         "api-specs" => "api-specs",
         "batch" => "batch",
         "backup" => "backup",
+        // Process policy applicable to this tenant, disclosed only through
+        // namespace read authorization (including the viewer-key ceiling).
+        "backend-egress-policy" if segments.len() == 1 => "backend-egress-policy",
         // Only the export: `/config/apply-status` is a process-topology
         // surface, not a tenant-addressed resource.
         "config" if segments.get(1) == Some(&"export") => "config-export",
@@ -3984,6 +3988,20 @@ async fn handle_admin_request_inner(
         return Ok(resp);
     }
     match (method.clone(), segments_peek.as_slice()) {
+        (Method::GET, ["backend-egress-policy"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Viewer) {
+                return Ok(resp);
+            }
+            // Like /config/export, a present ns claim always constrains this
+            // read, including when optional claim enforcement is disabled.
+            if auth.allowed_namespaces.is_present()
+                && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
+            {
+                return Ok(resp);
+            }
+            drop(req.into_body());
+            return Ok(backend_egress_policy::handle_get(&state, &namespace));
+        }
         (Method::POST, ["api-specs"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);

@@ -1,6 +1,7 @@
 mod admin_api_specs_handler_tests;
 mod admin_audit_rbac_tests;
 mod admin_backend_capabilities_tests;
+mod admin_backend_egress_policy_tests;
 mod admin_backup_audit_tests;
 mod admin_batch_atomicity_tests;
 mod admin_batch_reference_check_tests;
