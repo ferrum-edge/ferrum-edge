@@ -1159,20 +1159,37 @@ fn live_apply_handlers_capture_sequence_before_releasing_pins() {
         (("mod.rs", "handle_update_credentials"), (1, topology)),
         (("mod.rs", "handle_delete_credentials"), (1, topology)),
         (("mod.rs", "handle_append_credential"), (1, topology)),
-        (("mod.rs", "handle_delete_credential_by_index"), (1, topology)),
-        (("mod.rs", "handle_batch_create"), (1, namespace_and_topology)),
+        (
+            ("mod.rs", "handle_delete_credential_by_index"),
+            (1, topology),
+        ),
+        (
+            ("mod.rs", "handle_batch_create"),
+            (1, namespace_and_topology),
+        ),
         (("mod.rs", "handle_restore"), (2, namespace_and_topology)),
-        (("mod.rs", "complete_namespace_registry_mutation"), (1, "pins")),
+        (
+            ("mod.rs", "complete_namespace_registry_mutation"),
+            (1, "pins"),
+        ),
         (("crud.rs", "handle_delete"), (2, topology)),
         (("crud.rs", "handle_write"), (1, topology)),
-        (("api_specs/handlers.rs", "handle_post_api_spec"), (1, topology)),
-        (("api_specs/handlers.rs", "handle_put_api_spec"), (1, topology)),
-        (("api_specs/handlers.rs", "handle_delete_api_spec"), (1, topology)),
+        (
+            ("api_specs/handlers.rs", "handle_post_api_spec"),
+            (1, topology),
+        ),
+        (
+            ("api_specs/handlers.rs", "handle_put_api_spec"),
+            (1, topology),
+        ),
+        (
+            ("api_specs/handlers.rs", "handle_delete_api_spec"),
+            (1, topology),
+        ),
     ]);
-    let function_header = regex::Regex::new(
-        r"(?m)^(?:pub(?:\([^)]*\))? )?(?:async )?fn ([a-zA-Z_][a-zA-Z0-9_]*)",
-    )
-    .unwrap();
+    let function_header =
+        regex::Regex::new(r"(?m)^(?:pub(?:\([^)]*\))? )?(?:async )?fn ([a-zA-Z_][a-zA-Z0-9_]*)")
+            .unwrap();
     let call = "complete_live_config_mutation_after_commit_boxed(";
     let mut observed = BTreeMap::new();
     for (file, source) in config_db_sources {

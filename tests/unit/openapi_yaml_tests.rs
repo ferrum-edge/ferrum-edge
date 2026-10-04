@@ -1360,8 +1360,8 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         json!("#/components/schemas/ConditionalBackupMetadata")
     );
     assert_eq!(
-        paths["/consumers/{id}/verification"]["get"]["responses"]["200"]["content"]
-            ["application/json"]["schema"]["$ref"],
+        paths["/consumers/{id}/verification"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
         json!("#/components/schemas/ConsumerVerification")
     );
     let verification = &spec["components"]["schemas"]["ConsumerVerification"];
@@ -18444,7 +18444,10 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         ("exported_at", json!("2026-09-16T00:00:00Z")),
         ("source", json!("database")),
         ("counts", json!({})),
-        ("conditional", json!({"namespace_etag": "\"tag\"", "row_etags": {}})),
+        (
+            "conditional",
+            json!({"namespace_etag": "\"tag\"", "row_etags": {}}),
+        ),
     ]);
 
     let published: BTreeSet<&str> = restore["properties"]
@@ -18491,7 +18494,10 @@ fn restore_request_publishes_the_complete_closed_envelope() {
     ferrum_edge::_test_support::restore_envelope_admission_for_test(whole.to_string().as_bytes())
         .unwrap();
     assert_component_validity(&spec, "RestoreRequest", &whole, true);
-    assert_eq!(restore["properties"]["conditional"]["type"], json!("object"));
+    assert_eq!(
+        restore["properties"]["conditional"]["type"],
+        json!("object")
+    );
     assert_eq!(
         restore["properties"]["conditional"]["additionalProperties"],
         true
@@ -18627,7 +18633,10 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         ("exported_at", json!("2026-09-16T00:00:00Z")),
         ("source", json!("database")),
         ("counts", json!({})),
-        ("conditional", json!({"namespace_etag": "\"tag\"", "row_etags": {}})),
+        (
+            "conditional",
+            json!({"namespace_etag": "\"tag\"", "row_etags": {}}),
+        ),
         ("api_specs", json!({"section_version": "2", "items": []})),
         ("gateway_trust_bundles", json!([])),
     ]);
@@ -18677,11 +18686,9 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         true
     );
     let future_metadata = json!({"conditional": {"future_metadata": [1, "opaque"]}});
-    assert!(
-        ferrum_edge::_test_support::batch_envelope_admits_for_test(
-            future_metadata.to_string().as_bytes(),
-        )
-    );
+    assert!(ferrum_edge::_test_support::batch_envelope_admits_for_test(
+        future_metadata.to_string().as_bytes(),
+    ));
     assert_component_validity(&spec, "BatchCreateRequest", &future_metadata, true);
 
     // Schema-invalid metadata is a `400` on POST /batch, same parse restore

@@ -340,14 +340,8 @@ fn validate_workflow(workflow: &Value) -> GuardResult<()> {
         None,
     )
     .map_err(|_| "fixture credential/readiness/deadline contract changed")?;
-    validate_step(
-        &steps[selected[1]],
-        None,
-        30,
-        RUN_PROGRAM,
-        Some(RUN_ENV),
-    )
-    .map_err(|_| "active runner/filter/serial/URL contract changed")?;
+    validate_step(&steps[selected[1]], None, 30, RUN_PROGRAM, Some(RUN_ENV))
+        .map_err(|_| "active runner/filter/serial/URL contract changed")?;
     validate_step(
         &steps[selected[2]],
         Some("always() && matrix.conditional_live_stores == true"),
@@ -523,7 +517,10 @@ fn conditional_live_guards_reject_password_argv_and_unmasked_credentials() {
             ),
             ("-e MYSQL_PWD", "-e MYSQL_PWD=\"$MYSQL_PASSWORD\""),
             ("-e PGPASSWORD ", "-e PGPASSWORD=\"$POSTGRES_PASSWORD\" "),
-            ("-e MYSQL_PASSWORD ", "-e MYSQL_PASSWORD=\"$MYSQL_PASSWORD\" "),
+            (
+                "-e MYSQL_PASSWORD ",
+                "-e MYSQL_PASSWORD=\"$MYSQL_PASSWORD\" ",
+            ),
             (
                 "-e POSTGRES_PASSWORD ",
                 "-e POSTGRES_PASSWORD=\"$POSTGRES_PASSWORD\" ",
@@ -533,7 +530,10 @@ fn conditional_live_guards_reject_password_argv_and_unmasked_credentials() {
                 "MYSQL_PASSWORD=ferrum",
             ),
             ("set +x", "set -x"),
-            ("printf '::add-mask::%s\\n' \"$password\"", "echo \"$password\""),
+            (
+                "printf '::add-mask::%s\\n' \"$password\"",
+                "echo \"$password\"",
+            ),
             (
                 "printf '::add-mask::%s\\n' \"$postgres_url\" \"$mysql_url\"",
                 "echo \"$postgres_url\" \"$mysql_url\"",
@@ -590,7 +590,10 @@ fn conditional_live_guards_reject_socket_readiness_and_exposed_fixtures() {
                 "--username=ferrum --dbname=ferrum",
                 "--username=postgres --dbname=postgres",
             ),
-            ("--user=ferrum --database=ferrum", "--user=root --database=mysql"),
+            (
+                "--user=ferrum --database=ferrum",
+                "--user=root --database=mysql",
+            ),
             ("--command='SELECT 1'", "--command='SELECT 0'"),
             ("--execute='SELECT 1'", "--execute='SELECT 0'"),
             ("rs.initiate(", "print("),
@@ -637,12 +640,24 @@ fn conditional_live_guards_reject_nonfatal_or_unbounded_failure_handlers() {
     reject_program_mutations(
         START_STEP,
         &[
-            ("deadline=$((SECONDS + 480))", "deadline=$((SECONDS + 48000))"),
-            ("[ \"$remaining\" -gt 0 ] || return 124", "[ \"$remaining\" -gt 0 ] || return 0"),
+            (
+                "deadline=$((SECONDS + 480))",
+                "deadline=$((SECONDS + 48000))",
+            ),
+            (
+                "[ \"$remaining\" -gt 0 ] || return 124",
+                "[ \"$remaining\" -gt 0 ] || return 0",
+            ),
             ("timeout --kill-after=5s \"${limit}s\" \"$@\"", "\"$@\""),
-            ("bounded 120 docker pull \"$mysql_image\"", "docker pull \"$mysql_image\""),
+            (
+                "bounded 120 docker pull \"$mysql_image\"",
+                "docker pull \"$mysql_image\"",
+            ),
             ("until bounded 15 \"$@\"", "until \"$@\""),
-            ("bounded 3 sleep 2 || return 1", "bounded 3 sleep 2 || return 0"),
+            (
+                "bounded 3 sleep 2 || return 1",
+                "bounded 3 sleep 2 || return 0",
+            ),
             ("trap cleanup_on_failure EXIT", "trap : EXIT"),
             ("exit \"$status\"", "exit 0"),
             ("timeout --kill-after=5s 20s docker rm", "docker inspect"),
