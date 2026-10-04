@@ -1,5 +1,5 @@
 name: BoringCache Cargo
-description: Restore Cargo downloads and install BoringCache for target and compiler caching.
+description: Restore Cargo downloads and install BoringCache for nonpublication target and compiler caching.
 inputs:
   cache-profiles:
     description: Comma-separated archive cache profiles to restore and save
@@ -41,7 +41,9 @@ runs:
         diagnostics: summary
         fail-on-cache-error: true
 
-    - name: Expose the verified compiler cache
+    # The executable pin authenticates the wrapper, not restored object bytes.
+    # Publication producers must not call this action or consume these outputs.
+    - name: Expose the checksum-pinned compiler wrapper
       if: steps.backend.outputs.enabled == 'true' && env.FERRUM_SCCACHE_BIN != ''
       shell: bash
       run: |

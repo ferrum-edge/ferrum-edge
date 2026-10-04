@@ -1,0 +1,34 @@
+name: Automation Trust Proposal Checks
+
+# Hosted-only checks. This lane has no provider credential, deployment,
+# publication token, model invocation, or policy-admission authority.
+on:
+  push:
+    branches: [proposal/review-and-publication-trust]
+  pull_request:
+    paths:
+      - .github/workflows/claude-review.yml
+      - .github/workflows/llm-review-publish.yml
+      - .github/workflows/main-latest-image.yml
+      - .github/workflows/release.yml
+      - .github/workflows/automation-trust-proposal-checks.yml
+      - .github/actions/setup-boringcache/action.yml
+      - .github/scripts/llm_review_io.py
+      - .github/scripts/generate_llm_review.py
+      - .github/scripts/publish_llm_review.py
+      - .github/scripts/test_automation_trust.py
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Exercise artifact, approval, and publication producer/consumer contracts
+        run: python3 -I .github/scripts/test_automation_trust.py

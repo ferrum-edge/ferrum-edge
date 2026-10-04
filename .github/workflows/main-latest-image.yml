@@ -353,6 +353,8 @@ jobs:
         with:
           context: https://github.com/ferrum-edge/ferrum-edge.git#${{ needs.resolve.outputs.sha }}
           github-token: ""
+          # Recompile inside the isolated builder; never import compiler layers.
+          no-cache: true
           target: runtime
           platforms: ${{ matrix.platform }}
           build-args: |

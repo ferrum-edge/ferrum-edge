@@ -1,0 +1,102 @@
+name: Publish Approved LLM Review
+
+# Proposal only. This switch stays unset/false until independent owner review.
+# An environment label alone is NOT authorization: the script requires a real
+# named human's approval in THIS run's GitHub review history before any write.
+on:
+  workflow_dispatch:
+    inputs:
+      review_run_id:
+        description: Successful first-attempt model run on this automation revision
+        required: true
+        type: string
+      pr_number:
+        description: The reviewed pull request number
+        required: true
+        type: string
+      head_sha:
+        description: Exact reviewed pull request head SHA
+        required: true
+        type: string
+      input_sha256:
+        description: SHA-256 of input.json inspected by the human
+        required: true
+        type: string
+      output_sha256:
+        description: SHA-256 of review.txt inspected by the human
+        required: true
+        type: string
+      comment_sha256:
+        description: SHA-256 of comment.txt inspected by the human
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llm-review-publication-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: github.repository == 'ferrum-edge/ferrum-edge' && github.ref == 'refs/heads/main' && vars.LLM_REVIEW_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/publish_llm_review.py
+            .github/scripts/llm_review_io.py
+          sparse-checkout-cone-mode: false
+
+      - name: Verify the exact artifact and PR before requesting approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_RUN_ID: ${{ inputs.review_run_id }}
+          REVIEW_PR: ${{ inputs.pr_number }}
+          REVIEW_HEAD: ${{ inputs.head_sha }}
+          REVIEW_INPUT_SHA256: ${{ inputs.input_sha256 }}
+          REVIEW_OUTPUT_SHA256: ${{ inputs.output_sha256 }}
+          REVIEW_COMMENT_SHA256: ${{ inputs.comment_sha256 }}
+        run: python3 -I .github/scripts/publish_llm_review.py inspect
+
+  publish:
+    needs: inspect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: llm-review-publication
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      issues: write
+    steps:
+      # Trusted main's exact automation revision, never PR source or a script
+      # from the model artifact. No model/provider runs in this job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/publish_llm_review.py
+            .github/scripts/llm_review_io.py
+          sparse-checkout-cone-mode: false
+
+      - name: Reverify approval, artifact, and live head; publish one literal comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_RUN_ID: ${{ inputs.review_run_id }}
+          REVIEW_PR: ${{ inputs.pr_number }}
+          REVIEW_HEAD: ${{ inputs.head_sha }}
+          REVIEW_INPUT_SHA256: ${{ inputs.input_sha256 }}
+          REVIEW_OUTPUT_SHA256: ${{ inputs.output_sha256 }}
+          REVIEW_COMMENT_SHA256: ${{ inputs.comment_sha256 }}
+        run: python3 -I .github/scripts/publish_llm_review.py publish
