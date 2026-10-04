@@ -37741,10 +37741,21 @@ async fn handle_proxy_request_inner(
             }
         }
 
-        // Record non-streaming final backend outcomes to the circuit breaker
-        // once, here, and disarm the neutral-release guard. Buffered gRPC
-        // results and dispatch errors have no late streaming request-body flag,
-        // so they can mirror the HTTP path and record before response handling.
+        if grpc_result.is_ok()
+            && let Some(termination) = request_authorization_termination(
+                &ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            )
+        {
+            grpc_result = Err(GrpcProxyError::AuthorizationExpired {
+                termination,
+                handed_to_backend: true,
+            });
+        }
+
+        // Record final dispatch errors to the circuit breaker once here and
+        // disarm the neutral-release guard. Buffered gRPC responses settle after
+        // their precommit authorization gate, so expiry stays health-neutral.
         // Streaming responses defer to the streaming arm so it can sample the
         // request-body flag at response-header time and arm the post-header
         // probe guard before response hooks run.
@@ -37756,7 +37767,10 @@ async fn handle_proxy_request_inner(
         // failures (and disarmed the guard) for rotated targets, and
         // grpc_skip_final_cb_record marks the case where a rotated retry's
         // breaker rejected (already recorded for the prior target).
-        if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
+        if !grpc_skip_final_cb_record
+            && !matches!(&grpc_result, Ok(GrpcResponseKind::Buffered(_)))
+            && let Some(cb_config) = &proxy.circuit_breaker
+        {
             let cb = state.circuit_breaker_cache.get_or_create(
                 &proxy.namespace,
                 &proxy.id,
@@ -37770,8 +37784,8 @@ async fn handle_proxy_request_inner(
                 // (neutral arm below); streaming responses defer to the
                 // streaming arm, where HALF_OPEN fast-path probes can
                 // neutralize late upload overflows via the deferred recorder.
-                Ok(GrpcResponseKind::Buffered(r)) => {
-                    record_grpc_backend_status_outcome(&cb, r.status, cb_probe.take_slot());
+                Ok(GrpcResponseKind::Buffered(_)) => {
+                    // Defer until the final authorization gate, after hooks/logging.
                 }
                 Ok(GrpcResponseKind::Streaming(_)) => {
                     // Defer: the streaming arm finalizes via
@@ -38256,6 +38270,45 @@ async fn handle_proxy_request_inner(
                         streamed,
                     );
 
+                let grpc_resolved_ip = if !plugins.is_empty() {
+                    state
+                        .dns_cache
+                        .resolve(
+                            &proxy.backend_host,
+                            proxy.dns_override.as_deref(),
+                            proxy.dns_cache_ttl_seconds,
+                        )
+                        .await
+                        .ok()
+                        .map(|ip| ip.to_string())
+                } else {
+                    None
+                };
+
+                if let Some(termination) = request_authorization_termination(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                ) {
+                    cb_probe.release_neutral();
+                    drop(backend_admission_permits.take());
+                    drop(grpc_lb_connection_guard.take());
+                    let response = boxed_finalize_authorization_expired_rejection(
+                        &plugins,
+                        &mut ctx,
+                        &state,
+                        start_time,
+                        "authorization_expired_grpc_precommit",
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                        grpc_web_response_content_type,
+                        termination,
+                    )
+                    .await;
+                    return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
+                        response,
+                        held_frontend_grpc_upload.take(),
+                    ));
+                }
                 // Build the summary up front so we can either log synchronously
                 // (body_exceeded early-return path) or defer via the streaming
                 // body wrapper (non-exceeded streaming path).
@@ -38274,21 +38327,6 @@ async fn handle_proxy_request_inner(
                         ),
                     )
                 } else if !plugins.is_empty() || streamed || final_error_class.is_some() {
-                    let grpc_resolved_ip = if !plugins.is_empty() {
-                        state
-                            .dns_cache
-                            .resolve(
-                                &proxy.backend_host,
-                                proxy.dns_override.as_deref(),
-                                proxy.dns_cache_ttl_seconds,
-                            )
-                            .await
-                            .ok()
-                            .map(|ip| ip.to_string())
-                    } else {
-                        None
-                    };
-
                     // Read counters populated earlier in the gRPC body
                     // handling (request bytes) and by the streaming deferred
                     // logger (response bytes, patched at fire time). For
@@ -38785,6 +38823,7 @@ async fn handle_proxy_request_inner(
                 }
             }
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
+                let grpc_backend_admission_elapsed = grpc_backend_admission_started_at.elapsed();
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
@@ -38817,37 +38856,6 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                     response_status,
                 );
-                if let Some(permits) = backend_admission_permits.take() {
-                    // gRPC application failures ride in the `grpc-status` trailer
-                    // (or header, for trailers-only) under HTTP 200, so the HTTP
-                    // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
-                    // healthy success. Map the effective non-OK gRPC status to HTTP
-                    // so a server-side failure surfaces as 5xx and shrinks the limit,
-                    // while client-side statuses stay <500 (healthy). The backend's
-                    // trailers are still intact here — plugin-view merge and wire
-                    // writeback happen below.
-                    permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: grpc_backend_dispatch_status,
-                        connection_error: false,
-                        error_class: None,
-                        backend_elapsed: grpc_backend_admission_started_at.elapsed(),
-                    });
-                }
-                if !grpc_skip_final_cb_record {
-                    record_grpc_backend_dispatch_outcome(
-                        &state,
-                        &proxy,
-                        &epoch.load_balancer,
-                        upstream_balancer.as_ref(),
-                        grpc_final_upstream_target.as_ref(),
-                        grpc_final_cb_key.as_deref(),
-                        grpc_backend_dispatch_status,
-                        false,
-                        None,
-                        grpc_backend_admission_started_at.elapsed(),
-                    );
-                }
-                drop(grpc_lb_connection_guard.take());
 
                 // Plugins historically saw a merged header+trailer map on the
                 // buffered gRPC path because trailers were inserted into
@@ -39502,6 +39510,75 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                 }
+
+                // Hooks and logging may have consumed the remaining lifetime.
+                // This is the final gate before constructing the client head.
+                if let Some(termination) = request_authorization_termination(
+                    &ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                ) {
+                    cb_probe.release_neutral();
+                    drop(backend_admission_permits.take());
+                    drop(grpc_lb_connection_guard.take());
+                    let response = boxed_finalize_authorization_expired_rejection(
+                        &plugins,
+                        &mut ctx,
+                        &state,
+                        start_time,
+                        "authorization_expired_grpc_precommit",
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                        grpc_web_response_content_type,
+                        termination,
+                    )
+                    .await;
+                    return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
+                        response,
+                        held_frontend_grpc_upload.take(),
+                    ));
+                }
+                if !grpc_skip_final_cb_record
+                    && let Some(cb_config) = &proxy.circuit_breaker
+                {
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
+                        &proxy.id,
+                        grpc_final_cb_key.as_deref(),
+                        cb_config,
+                    );
+                    record_grpc_backend_status_outcome(&cb, grpc_resp.status, cb_probe.take_slot());
+                }
+                if let Some(permits) = backend_admission_permits.take() {
+                    // gRPC application failures ride in the `grpc-status` trailer
+                    // (or header, for trailers-only) under HTTP 200, so the HTTP
+                    // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
+                    // healthy success. Map the effective non-OK gRPC status to HTTP
+                    // so a server-side failure surfaces as 5xx and shrinks the limit,
+                    // while client-side statuses stay <500 (healthy). The backend's
+                    // trailers are still intact here — plugin-view merge and wire
+                    // writeback happen below.
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: grpc_backend_dispatch_status,
+                        connection_error: false,
+                        error_class: None,
+                        backend_elapsed: grpc_backend_admission_elapsed,
+                    });
+                }
+                if !grpc_skip_final_cb_record {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        grpc_backend_admission_elapsed,
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
 
                 record_request(&state, response_status);
 
@@ -47384,6 +47461,7 @@ async fn proxy_to_backend(
             client_request_body,
             plugins,
             ctx,
+            request_ctx,
             request_ctx.grpc_deadline_at(),
             response_decision_ctx,
             upstream_target,
@@ -53989,6 +54067,25 @@ where
         sleep: None,
         bound,
         prechecked: false,
+        precheck_every_poll: false,
+    }
+}
+
+/// Poll-before-timer phase wait whose work has no following enqueue gate.
+#[inline]
+pub(crate) fn await_backend_dispatch_bound<F>(
+    bound: BackendHandoffBound,
+    work: F,
+) -> BackendHandoffBounded<F>
+where
+    F: std::future::Future,
+{
+    BackendHandoffBounded {
+        checkout: work,
+        sleep: None,
+        bound,
+        prechecked: false,
+        precheck_every_poll: true,
     }
 }
 
@@ -54004,6 +54101,7 @@ pin_project_lite::pin_project! {
         sleep: Option<tokio::time::Sleep>,
         bound: BackendHandoffBound,
         prechecked: bool,
+        precheck_every_poll: bool,
     }
 }
 
@@ -54022,7 +54120,7 @@ where
         let Some(at) = this.bound.at else {
             return this.checkout.as_mut().poll(cx).map(Ok);
         };
-        if !*this.prechecked {
+        if !*this.prechecked || *this.precheck_every_poll {
             *this.prechecked = true;
             // Expiry first: an already-elapsed bound never polls the checkout.
             if tokio::time::Instant::now() >= at {
@@ -54041,6 +54139,27 @@ where
             None => std::task::Poll::Pending,
         }
     }
+}
+
+/// A failed checkout has no subsequent enqueue gate. Keep its captured bound
+/// ahead of a late transport error, without another clock read on success.
+#[inline]
+pub(crate) fn await_backend_handoff_result<F, T, E>(
+    bound: BackendHandoffBound,
+    checkout: F,
+) -> impl std::future::Future<Output = Result<Result<T, E>, BackendHandoffBoundSource>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    futures_util::FutureExt::map(await_backend_handoff_bound(bound, checkout), move |result| {
+        match result {
+            Ok(Err(error)) => match bound.elapsed() {
+                Some(source) => Err(source),
+                None => Ok(Err(error)),
+            },
+            other => other,
+        }
+    })
 }
 
 /// The fail-closed handoff gate in front of a leased connection
@@ -54378,6 +54497,30 @@ pub(crate) fn authorization_expired_pre_commitment_response(
     )
 }
 
+/// Decide the shared pre-commitment terminal without constructing a body.
+#[inline]
+pub(crate) fn request_authorization_termination(
+    ctx: &RequestContext,
+    max_lifetime_seconds: u64,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    use crate::proxy::auth_lifetime::{effective_request_auth_deadline, expired_authorization};
+
+    let termination = match ctx.authorization_termination_latch.observed() {
+        Some(termination) => termination,
+        None => {
+            let plan = effective_request_auth_deadline(ctx, max_lifetime_seconds);
+            let elapsed = expired_authorization(plan)?;
+            // Record through the shared latch so this counts exactly once for
+            // the request even though no body wrapper fired.
+            let family = request_upload_auth_family(ctx);
+            ctx.authorization_termination_latch
+                .record_once(elapsed, family);
+            elapsed
+        }
+    };
+    Some(termination)
+}
+
 /// Decide, record, and APPLY the fixed pre-commitment authorization terminal —
 /// entirely out of line (issues #3815 / #3764).
 ///
@@ -54408,21 +54551,7 @@ pub(crate) fn apply_precommit_authorization_terminal(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut ResponseBody,
 ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
-    use crate::proxy::auth_lifetime::{effective_request_auth_deadline, expired_authorization};
-
-    let termination = match ctx.authorization_termination_latch.observed() {
-        Some(termination) => termination,
-        None => {
-            let plan = effective_request_auth_deadline(ctx, max_lifetime_seconds);
-            let elapsed = expired_authorization(plan)?;
-            // Record through the shared latch so this counts exactly once for
-            // the request even though no body wrapper fired.
-            let family = request_upload_auth_family(ctx);
-            ctx.authorization_termination_latch
-                .record_once(elapsed, family);
-            elapsed
-        }
-    };
+    let termination = request_authorization_termination(ctx, max_lifetime_seconds)?;
     let (terminal_status, terminal_headers, terminal_body) =
         authorization_expired_pre_commitment_response(
             ctx,
@@ -57691,6 +57820,13 @@ async fn proxy_to_backend_mesh_mtls(
     // retires every carrier for a replaced path before another request byte.
     // Concurrent RPCs share one connection's streams, and a closed/GOAWAY
     // carrier is replaced rather than reused.
+    let checkout_auth = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let checkout_dispatch =
+        compose_dispatch_phase_auth_bound(client_grpc_deadline_at, checkout_auth.as_ref());
+    let checkout_bound = compose_backend_handoff_bound(None, checkout_dispatch);
     let sender_result = if let Some(socket_path) = unix_socket_path {
         // Target-effective proxy for pool identity and per-dispatch pool policy
         // only — see `proxy_to_backend_unix` (issue #3764), including why the
@@ -57714,23 +57850,22 @@ async fn proxy_to_backend_mesh_mtls(
         // The client's end-to-end RPC deadline caps the dial exactly as it caps
         // the pooled sender acquisition below: a wedged local app must not
         // outlive the deadline the caller already committed to.
-        let dialed = if let Some(deadline) = client_grpc_deadline_at {
-            match tokio::time::timeout_at(deadline, dial).await {
-                Ok(result) => result,
-                Err(_) => {
-                    return (
-                        client_grpc_deadline_exceeded_response_for_request(
-                            request_ctx,
-                            headers,
-                            resolved_ip,
-                        ),
-                        None,
-                        None,
-                    );
-                }
+        let dialed = match await_backend_handoff_result(checkout_bound, dial).await {
+            Ok(result) => result,
+            Err(source) => {
+                return (
+                    direct_h2_handoff_bound_expired(
+                        Some(request_ctx),
+                        headers,
+                        source,
+                        checkout_dispatch,
+                        checkout_auth.as_ref(),
+                        resolved_ip,
+                    ),
+                    None,
+                    None,
+                );
             }
-        } else {
-            dial.await
         };
         match dialed {
             Ok(sender) => Ok(sender),
@@ -57758,23 +57893,22 @@ async fn proxy_to_backend_mesh_mtls(
             expected_trust_domain.as_ref(),
             sni_override,
         );
-        if let Some(deadline) = client_grpc_deadline_at {
-            match tokio::time::timeout_at(deadline, get_sender).await {
-                Ok(result) => result,
-                Err(_) => {
-                    return (
-                        client_grpc_deadline_exceeded_response_for_request(
-                            request_ctx,
-                            headers,
-                            resolved_ip,
-                        ),
-                        None,
-                        None,
-                    );
-                }
+        match await_backend_handoff_result(checkout_bound, get_sender).await {
+            Ok(result) => result,
+            Err(source) => {
+                return (
+                    direct_h2_handoff_bound_expired(
+                        Some(request_ctx),
+                        headers,
+                        source,
+                        checkout_dispatch,
+                        checkout_auth.as_ref(),
+                        resolved_ip,
+                    ),
+                    None,
+                    None,
+                );
             }
-        } else {
-            get_sender.await
         }
     };
     let mut sender = match sender_result {
@@ -57822,15 +57956,24 @@ async fn proxy_to_backend_mesh_mtls(
         // unrepresentable clock duration therefore expires immediately instead
         // of falling through to the legacy mesh-pool "no deadline" behavior.
         .or_else(|| unix_socket_path.is_some().then_some(readiness_started_at));
-    let ready_deadline = match (client_grpc_deadline_at, connect_deadline) {
-        (Some(client), Some(connect)) => Some(client.min(connect)),
-        (Some(client), None) => Some(client),
-        (None, connect) => connect,
-    };
-    let ready_result = if let Some(deadline) = ready_deadline {
-        tokio::time::timeout_at(deadline, sender.ready()).await
-    } else {
-        Ok(sender.ready().await)
+    let readiness_bound = compose_backend_handoff_bound(connect_deadline, checkout_dispatch);
+    let ready_result = match await_backend_handoff_result(readiness_bound, sender.ready()).await {
+        Ok(result) => Ok(result),
+        Err(BackendHandoffBoundSource::ResponseHeader) => Err(()),
+        Err(source) => {
+            return (
+                direct_h2_handoff_bound_expired(
+                    Some(request_ctx),
+                    headers,
+                    source,
+                    checkout_dispatch,
+                    checkout_auth.as_ref(),
+                    resolved_ip,
+                ),
+                None,
+                None,
+            );
+        }
     };
     match ready_result {
         Ok(Ok(())) => {}
@@ -58359,6 +58502,44 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     }
 
     let backend_req = Request::from_parts(parts, body);
+    // `send_request` covers upload plus the response-header wait. The same
+    // absolute RPC instant is reused; retries and earlier gateway work cannot
+    // re-arm it by rewriting a relative header.
+    // Composed with the admitted stream's authorization lifetime (#3815): the
+    // native-gRPC regime leaves the client deadline UNCAPPED and both regimes
+    // allow no bound at all, neither of which may outlive the credential.
+    let send_auth_deadline = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let send_bound = compose_dispatch_phase_auth_bound(
+        if is_grpc_flavored {
+            grpc_send_deadline
+        } else {
+            backend_read_deadline
+        },
+        send_auth_deadline.as_ref(),
+    );
+    let handoff_bound = compose_backend_handoff_bound(None, send_bound);
+    if let Some(source) = handoff_bound.elapsed() {
+        let response = if source == BackendHandoffBoundSource::Authorization {
+            let _ = dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref());
+            authorization_expired_dispatch_placeholder(resolved_ip)
+        } else if is_grpc_flavored {
+            if grpc_send_deadline_is_client {
+                client_grpc_deadline_exceeded_response_for_request(
+                    request_ctx,
+                    headers,
+                    resolved_ip,
+                )
+            } else {
+                mesh_grpc_deadline_exceeded_response(resolved_ip)
+            }
+        } else {
+            http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
+        };
+        return (response, None, None);
+    }
     let send_fut = match sender.send_request(backend_req) {
         Ok(fut) => fut,
         Err(err) => {
@@ -58385,24 +58566,6 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             );
         }
     };
-    // `send_request` covers upload plus the response-header wait. The same
-    // absolute RPC instant is reused; retries and earlier gateway work cannot
-    // re-arm it by rewriting a relative header.
-    // Composed with the admitted stream's authorization lifetime (#3815): the
-    // native-gRPC regime leaves the client deadline UNCAPPED and both regimes
-    // allow no bound at all, neither of which may outlive the credential.
-    let send_auth_deadline = request_upload_auth_deadline(
-        Some(request_ctx),
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
-    let send_bound = compose_dispatch_phase_auth_bound(
-        if is_grpc_flavored {
-            grpc_send_deadline
-        } else {
-            backend_read_deadline
-        },
-        send_auth_deadline.as_ref(),
-    );
     let send_result = if let Some(deadline) = send_bound.at {
         let bounded = await_upload_write_watermark_first(
             crate::plugins::await_deadline_first(Some(deadline), send_fut),
@@ -60126,6 +60289,45 @@ fn build_http3_backend_headers(
     http3_headers
 }
 
+/// Bound retained H3 response collection by the admitted request lifetime.
+#[allow(clippy::too_many_arguments)]
+async fn drain_h3_response_under_authorization(
+    response: crate::http3::client::H3StreamingResponse,
+    state: &ProxyState,
+    proxy: &Proxy,
+    method: &str,
+    backend_url: &str,
+    resolved_ip: Option<String>,
+    max_response_body_size_bytes: usize,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&RequestAuthLifetimePlan>,
+    request_ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> retry::BackendResponse {
+    let collect = drain_h3_streaming_response_to_buffered(
+        response,
+        state,
+        proxy,
+        method,
+        backend_url,
+        resolved_ip.clone(),
+        max_response_body_size_bytes,
+    );
+    match collect_response_under_authorization(grpc_deadline_at, auth, collect).await {
+        Ok(response) => response,
+        Err(ResponseCollectBound::AuthorizationExpired) => {
+            authorization_expired_dispatch_placeholder(resolved_ip)
+        }
+        Err(ResponseCollectBound::RpcDeadline) => {
+            client_grpc_deadline_exceeded_response_for_optional_request(
+                Some(request_ctx),
+                headers,
+                resolved_ip,
+            )
+        }
+    }
+}
+
 /// Proxy the request to an HTTP/3 backend.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_http3(
@@ -60137,6 +60339,7 @@ async fn proxy_to_backend_http3(
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     mut ctx: Option<&mut RequestContext>,
+    request_ctx: &RequestContext,
     grpc_deadline_at: Option<tokio::time::Instant>,
     // Real, read-only request context for the response-side buffer->stream
     // downgrade (`refine_stream_response_for_content_type`). Distinct from
@@ -60177,6 +60380,10 @@ async fn proxy_to_backend_http3(
         route_response_body_limit,
     );
 
+    let buffered_upload_auth_deadline = request_upload_auth_deadline(
+        Some(request_ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
     // Resolve backend IP from DNS cache for the effective host
     let effective_host = upstream_target
         .map(|t| t.host.as_str())
@@ -60293,7 +60500,7 @@ async fn proxy_to_backend_http3(
                         .and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
                     state
                         .h3_pool
-                        .request_with_target_streaming_incoming_body(
+                        .request_with_target_streaming_incoming_body_under_authorization(
                             proxy,
                             &target_host,
                             target_port,
@@ -60305,6 +60512,10 @@ async fn proxy_to_backend_http3(
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
+                            crate::http3::client::H3Authorization::new(
+                                grpc_deadline_at,
+                                buffered_upload_auth_deadline.as_ref(),
+                            ),
                             move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                         )
                         .await
@@ -60315,7 +60526,7 @@ async fn proxy_to_backend_http3(
                         .and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
                     state
                         .h3_pool
-                        .request_streaming_incoming_body(
+                        .request_streaming_incoming_body_under_authorization(
                             proxy,
                             method,
                             backend_url,
@@ -60324,6 +60535,10 @@ async fn proxy_to_backend_http3(
                             effective_max_request_body_size_bytes,
                             Arc::clone(ctx_bytes_sent_observed),
                             grpc_messages,
+                            crate::http3::client::H3Authorization::new(
+                                grpc_deadline_at,
+                                buffered_upload_auth_deadline.as_ref(),
+                            ),
                             move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                         )
                         .await
@@ -60361,7 +60576,7 @@ async fn proxy_to_backend_http3(
                             )
                         } else {
                             (
-                                drain_h3_streaming_response_to_buffered(
+                                drain_h3_response_under_authorization(
                                     response,
                                     state,
                                     proxy,
@@ -60369,6 +60584,10 @@ async fn proxy_to_backend_http3(
                                     backend_url,
                                     resolved_ip,
                                     effective_max_response_body_size_bytes,
+                                    grpc_deadline_at,
+                                    buffered_upload_auth_deadline.as_ref(),
+                                    request_ctx,
+                                    headers,
                                 )
                                 .await,
                                 None,
@@ -60376,6 +60595,19 @@ async fn proxy_to_backend_http3(
                         }
                     }
                     Err(e) => {
+                        if e.client_deadline_expired() {
+                            return (
+                                client_grpc_deadline_exceeded_response_for_optional_request(
+                                    Some(request_ctx),
+                                    headers,
+                                    resolved_ip,
+                                ),
+                                None,
+                            );
+                        }
+                        if e.authorization_expiry().is_some() {
+                            return (authorization_expired_dispatch_placeholder(resolved_ip), None);
+                        }
                         let error_str = e.to_string();
                         if error_str.contains("exceeds maximum size") {
                             (
@@ -60490,14 +60722,6 @@ async fn proxy_to_backend_http3(
         client_request_body
     };
 
-    // Authorization lifetime for a BUFFERED upload on the H3-backend bridge
-    // (#3815). Same contract as the reqwest and direct-H2 buffered arms: a
-    // continuously active client upload that the gateway must collect before
-    // dispatch cannot outlive the credential that admitted the stream.
-    let buffered_upload_auth_deadline = request_upload_auth_deadline(
-        response_decision_ctx.or(ctx.as_deref()),
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
     // Permit from either origin (issue #4231): in-dispatch collect, or the
     // pre-auth permit carried on `BufferedClientRequestBody`. Must outlive
     // this match so it can be published onto the `Bytes` that stay resident
@@ -60720,7 +60944,7 @@ async fn proxy_to_backend_http3(
             let proxy_clone = proxy.clone();
             state
                 .h3_pool
-                .request_with_target_streaming(
+                .request_with_target_streaming_under_authorization(
                     proxy,
                     &target_host,
                     target_port,
@@ -60729,6 +60953,10 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
+                    crate::http3::client::H3Authorization::new(
+                        grpc_deadline_at,
+                        buffered_upload_auth_deadline.as_ref(),
+                    ),
                     move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
@@ -60737,12 +60965,16 @@ async fn proxy_to_backend_http3(
             let proxy_clone = proxy.clone();
             state
                 .h3_pool
-                .request_streaming(
+                .request_streaming_under_authorization(
                     proxy,
                     method,
                     backend_url,
                     &http3_headers,
                     body_bytes,
+                    crate::http3::client::H3Authorization::new(
+                        grpc_deadline_at,
+                        buffered_upload_auth_deadline.as_ref(),
+                    ),
                     move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
@@ -60760,6 +60992,22 @@ async fn proxy_to_backend_http3(
                 retained_body,
             ),
             Err(e) => {
+                if e.client_deadline_expired() {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_optional_request(
+                            Some(request_ctx),
+                            headers,
+                            resolved_ip,
+                        ),
+                        retained_body,
+                    );
+                }
+                if e.authorization_expiry().is_some() {
+                    return (
+                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        retained_body,
+                    );
+                }
                 if e.is_read_timeout() {
                     // `backend_read_timeout_ms` expired waiting for response
                     // headers — surface 504 Backend timeout like the
@@ -60831,7 +61079,7 @@ async fn proxy_to_backend_http3(
             let proxy_clone = proxy.clone();
             state
                 .h3_pool
-                .request_with_target_streaming(
+                .request_with_target_streaming_under_authorization(
                     proxy,
                     &target_host,
                     target_port,
@@ -60840,6 +61088,10 @@ async fn proxy_to_backend_http3(
                     backend_url,
                     &http3_headers,
                     body_bytes,
+                    crate::http3::client::H3Authorization::new(
+                        grpc_deadline_at,
+                        buffered_upload_auth_deadline.as_ref(),
+                    ),
                     move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
@@ -60848,12 +61100,16 @@ async fn proxy_to_backend_http3(
             let proxy_clone = proxy.clone();
             state
                 .h3_pool
-                .request_streaming(
+                .request_streaming_under_authorization(
                     proxy,
                     method,
                     backend_url,
                     &http3_headers,
                     body_bytes,
+                    crate::http3::client::H3Authorization::new(
+                        grpc_deadline_at,
+                        buffered_upload_auth_deadline.as_ref(),
+                    ),
                     move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
                 )
                 .await
@@ -60882,7 +61138,7 @@ async fn proxy_to_backend_http3(
                     )
                 } else {
                     (
-                        drain_h3_streaming_response_to_buffered(
+                        drain_h3_response_under_authorization(
                             response,
                             state,
                             proxy,
@@ -60890,6 +61146,10 @@ async fn proxy_to_backend_http3(
                             backend_url,
                             resolved_ip,
                             effective_max_response_body_size_bytes,
+                            grpc_deadline_at,
+                            buffered_upload_auth_deadline.as_ref(),
+                            request_ctx,
+                            headers,
                         )
                         .await,
                         retained_body,
@@ -60897,6 +61157,22 @@ async fn proxy_to_backend_http3(
                 }
             }
             Err(e) => {
+                if e.client_deadline_expired() {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_optional_request(
+                            Some(request_ctx),
+                            headers,
+                            resolved_ip,
+                        ),
+                        retained_body,
+                    );
+                }
+                if e.authorization_expiry().is_some() {
+                    return (
+                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        retained_body,
+                    );
+                }
                 if e.is_read_timeout() {
                     // `backend_read_timeout_ms` expired waiting for response
                     // headers (`recv_response`) — surface 504 Backend timeout

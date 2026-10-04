@@ -4664,10 +4664,15 @@ fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
             .split("stream.finish(),")
             .next()
             .unwrap_or_else(|| panic!("bounded {label} entry point"));
-        assert!(
+        let uses_chunked_sender = if label == "pooled streaming-response request" {
+            entry.contains("send_h3_buffered_body_under_authorization(")
+        } else {
             entry.contains(
-                "send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms)"
-            ),
+                "send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms)",
+            )
+        };
+        assert!(
+            uses_chunked_sender,
             "{label} must send its buffered body through the shared chunked sender"
         );
         assert!(
@@ -4688,6 +4693,19 @@ fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
             && sender.contains("await_h3_client_write_with_timeout(")
             && sender.contains("stream.send_data(chunk),"),
         "each bounded slice must get its own write-timeout wrapper call"
+    );
+    let authorized_sender = client
+        .split("async fn send_h3_buffered_body_under_authorization<S>(")
+        .nth(1)
+        .expect("authorized chunked sender")
+        .split("async fn recv_h3_response_under_authorization(")
+        .next()
+        .expect("bounded authorized sender");
+    assert!(
+        authorized_sender.contains("for chunk in H3BufferedBodyChunks::new(body)")
+            && authorized_sender.contains("await_h3_write_under_authorization(")
+            && authorized_sender.contains("stream.send_data(chunk),"),
+        "the authorized sender must preserve chunk boundaries and per-write idle watermarks"
     );
     assert!(
         client.contains("Some(self.remaining.split_to(take))"),

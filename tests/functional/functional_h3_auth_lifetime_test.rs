@@ -1643,3 +1643,53 @@ async fn h3_auth_lifetime_native_h3_grpc_withheld_head_is_a_precommit_unauthenti
 
     assert_credential_expired_exactly(&harness, "grpc", 1).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_auth_lifetime_buffered_grpc_bridge_collect_commits_only_the_expiry_terminal() {
+    let ca = TestCa::new("h3-buffered-grpc-lifetime").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("TLS backend")
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::Sleep(Duration::from_secs(45)))
+        .spawn()
+        .expect("stalling backend");
+    let mut config: Value =
+        serde_yaml::from_str(&protected_proxy_yaml(backend_port)).expect("base config");
+    config["proxies"][0]["response_body_mode"] = json!("buffer");
+    let (harness, https_port) =
+        spawn_h3_gateway(serde_yaml::to_string(&config).expect("config"), false).await;
+    let client = Http3Client::insecure().expect("H3 client");
+    let token = mint_short_lived_token();
+    let mut stream = client
+        .open_grpc_stream_with_headers(
+            &proxy_url(https_port, "/api/buffered.Response/Call"),
+            &[("authorization", &format!("Bearer {token}"))],
+        )
+        .await
+        .expect("request stream");
+    stream.send_message(b"hello").await.expect("message");
+    stream.finish().await.expect("half-close");
+    let (status, headers) = tokio::time::timeout(
+        Duration::from_secs(TOKEN_TTL_SECS as u64) + TERMINATION_GRACE,
+        stream.recv_response(),
+    )
+    .await
+    .expect("buffered bridge must stop collecting at expiry")
+    .expect("terminal head");
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(
+        headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("16")
+    );
+    let (body, _) = stream.recv_body_and_trailers().await.expect("terminal FIN");
+    assert!(body.is_empty(), "no protected backend bytes may commit");
+    assert_eq!(backend.received_stream_count(), 1, "expiry must not retry");
+    assert_credential_expired_exactly(&harness, "grpc", 1).await;
+}

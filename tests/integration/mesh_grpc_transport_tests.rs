@@ -1457,6 +1457,7 @@ async fn grpc_streams_request_data_incrementally_over_ambient_hbone() {
         None,
         &mut held_upload,
         None,
+        None,
     )
     .await
     .expect("bidirectional gRPC over the Ambient HBONE transport must succeed");

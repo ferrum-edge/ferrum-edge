@@ -7356,8 +7356,31 @@ where
         streaming.status,
     );
 
-    if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
+    if let Some(termination) = crate::proxy::request_authorization_termination(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    ) {
+        cb_probe.release_neutral();
+        drop(backend_admission_permits.take());
+        return write_grpc_authorization_expired_send_terminal(
+            stream,
+            ctx,
+            termination,
+            backend_start,
+            bytes_sent,
+            initial_response_header_policy_plugins,
+        )
+        .await;
+    }
+    let header_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
         streaming.grpc_deadline_at,
+        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+            ctx,
+            state.env_config.authenticated_stream_max_lifetime_seconds,
+        ),
+    );
+    if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
+        header_bound.deadline(),
         // Native gRPC / gRPC-Web streaming over the H3 bridge: gRPC has no HEAD
         // and never frames with Content-Length, so pass ordinary Streaming
         // framing explicitly rather than deriving a HEAD exemption from the
@@ -7372,6 +7395,24 @@ where
     )
     .await
     {
+        if let Some(termination) = header_bound.expired_authorization() {
+            ctx.record_authorization_termination_once(termination, grpc_auth_family(ctx));
+            cb_probe.release_neutral();
+            drop(backend_admission_permits.take());
+            crate::proxy::insert_grpc_error_metadata(
+                &mut ctx.metadata,
+                grpc_proxy::grpc_status::UNAUTHENTICATED,
+                termination.grpc_message(),
+            );
+            crate::http3::stream_util::abort_response_stream(stream);
+            return Ok(terminal_deadline_write_aborted_outcome(
+                200,
+                0,
+                backend_start,
+                bytes_sent,
+                false,
+            ));
+        }
         if matches!(
             error,
             crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
@@ -8005,6 +8046,14 @@ where
         }
     };
 
+    let grpc_auth = crate::proxy::request_upload_auth_deadline(
+        Some(ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
+    let upload_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        ctx.grpc_deadline_at(),
+        grpc_auth.as_ref().map(|(plan, _, _)| *plan),
+    );
     // This path is intentionally replayable: body-mutating plugins and retry
     // policy require a complete request before the first upstream attempt.
     // Streaming-safe calls are routed through `dispatch_grpc_streaming`, whose
@@ -8016,9 +8065,9 @@ where
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
-        match super::server::collect_h3_request_body_with_deadline(
+        match super::server::collect_h3_request_body_under_authorization(
             drain_h3_body(stream, effective_max_grpc_recv_size_bytes),
-            ctx.grpc_deadline_at(),
+            upload_bound,
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -8108,10 +8157,20 @@ where
                 crate::http3::stream_util::halt_request_body(stream);
                 return result;
             }
-            // This bridge drain supplies NO authorization plan, so the winner
-            // captured at composition is structurally the client's own RPC
-            // deadline: it can never carry an authorization termination.
-            Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {
+            Err(super::server::H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {
+                ctx.record_authorization_termination_once(termination, grpc_auth_family(ctx));
+                cb_probe.release_neutral();
+                return write_grpc_authorization_expired_terminal(
+                    stream,
+                    ctx,
+                    termination,
+                    backend_start,
+                    0,
+                    initial_response_header_policy_plugins,
+                )
+                .await;
+            }
+            Err(super::server::H3RequestBodyReadError::DeadlineExceeded(None)) => {
                 ctx.mark_gateway_deadline_response_selected();
                 cb_probe.release_neutral();
                 let mut outcome = write_final_body_reject(
@@ -8262,9 +8321,7 @@ where
             stream_grpc_response,
             effective_max_response_body_size_bytes,
             ctx.grpc_deadline_at(),
-            // No authorization plan on the H3 bridge's dispatch yet: its own
-            // bound is a separate follow-up to GHSA-xcg4-wj3x-gjj2.
-            None,
+            grpc_auth.as_ref(),
         );
         tokio::pin!(attempt);
         attempt_span.scope(attempt).await
@@ -8379,7 +8436,7 @@ where
             }
             ctx.record_backend_attempt(
                 retry_error_class,
-                retry_error_class.is_none_or(crate::retry::request_reached_wire),
+                grpc_proxy::grpc_dispatch_reached_wire(&result, retry_error_class),
                 None,
             );
             last_attempt_recorded = true;
@@ -8525,7 +8582,7 @@ where
                     stream_grpc_response,
                     effective_max_response_body_size_bytes,
                     ctx.grpc_deadline_at(),
-                    None,
+                    grpc_auth.as_ref(),
                 );
                 tokio::pin!(attempt);
                 attempt_span.scope(attempt).await
@@ -8546,7 +8603,7 @@ where
         }
         ctx.record_backend_attempt(
             dispatch_error,
-            dispatch_error.is_none_or(crate::retry::request_reached_wire),
+            grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error),
             None,
         );
     }
@@ -8568,6 +8625,28 @@ where
     )
     .is_some();
 
+    if (result.is_ok()
+        || matches!(
+            &result,
+            Err(grpc_proxy::GrpcProxyError::AuthorizationExpired { .. })
+        ))
+        && let Some(termination) = crate::proxy::request_authorization_termination(
+            ctx,
+            state.env_config.authenticated_stream_max_lifetime_seconds,
+        )
+    {
+        cb_probe.release_neutral();
+        drop(backend_admission_permits.take());
+        return write_grpc_authorization_expired_terminal(
+            stream,
+            ctx,
+            termination,
+            backend_start,
+            bytes_sent,
+            initial_response_header_policy_plugins,
+        )
+        .await;
+    }
     match result {
         Ok(GrpcResponseKind::Buffered(resp)) => {
             // Buffered variant: pool extracted trailers up front. Run the full
@@ -9137,7 +9216,26 @@ where
                 response_trailers.clear();
             }
 
-            let grpc_deadline_at = ctx.grpc_deadline_at();
+            if let Some(termination) = crate::proxy::request_authorization_termination(
+                ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            ) {
+                cb_probe.release_neutral();
+                drop(backend_admission_permits.take());
+                return write_grpc_authorization_expired_terminal(
+                    stream,
+                    ctx,
+                    termination,
+                    backend_start,
+                    bytes_sent,
+                    initial_response_header_policy_plugins,
+                )
+                .await;
+            }
+            let response_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+                ctx.grpc_deadline_at(),
+                grpc_auth.as_ref().map(|(plan, _, _)| *plan),
+            );
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
             // Buffered bridge response: `response_body` below IS the wire body,
             // so framing is derived from it rather than from which plugin phase
@@ -9162,7 +9260,7 @@ where
                 .retain(|name, _| !gateway_owned_headers.owns(&name.to_ascii_lowercase()));
             let header_write = if terminal_gateway_deadline {
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                    grpc_deadline_at,
+                    response_bound.deadline(),
                     send_response_headers_with_framing(
                         stream,
                         response_status,
@@ -9173,7 +9271,7 @@ where
                 .await
             } else {
                 crate::http3::stream_util::await_response_write_before_deadline(
-                    grpc_deadline_at,
+                    response_bound.deadline(),
                     send_response_headers_with_framing(
                         stream,
                         response_status,
@@ -9184,6 +9282,24 @@ where
                 .await
             };
             if let Err(error) = header_write {
+                if let Some(termination) = response_bound.expired_authorization() {
+                    ctx.record_authorization_termination_once(termination, grpc_auth_family(ctx));
+                    cb_probe.release_neutral();
+                    drop(backend_admission_permits.take());
+                    crate::proxy::insert_grpc_error_metadata(
+                        &mut ctx.metadata,
+                        grpc_proxy::grpc_status::UNAUTHENTICATED,
+                        termination.grpc_message(),
+                    );
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    return Ok(terminal_deadline_write_aborted_outcome(
+                        200,
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        false,
+                    ));
+                }
                 if matches!(
                     error,
                     crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
@@ -9223,17 +9339,18 @@ where
             let mut bytes_streamed = 0;
             let mut body_completed = true;
             let mut client_disconnected = false;
+            let mut authorization_terminated = false;
             if !response_body.is_empty() {
                 let body_len = response_body.len() as u64;
                 let body_write = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                        grpc_deadline_at,
+                        response_bound.deadline(),
                         stream.send_data(response_body),
                     )
                     .await
                 } else {
                     crate::http3::stream_util::await_response_write_before_deadline(
-                        grpc_deadline_at,
+                        response_bound.deadline(),
                         stream.send_data(response_body),
                     )
                     .await
@@ -9249,11 +9366,24 @@ where
                         }
                     }
                     Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                        crate::proxy::insert_grpc_error_metadata(
-                            &mut ctx.metadata,
-                            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                        );
+                        if let Some(termination) = response_bound.expired_authorization() {
+                            ctx.record_authorization_termination_once(
+                                termination,
+                                grpc_auth_family(ctx),
+                            );
+                            authorization_terminated = true;
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                termination.grpc_message(),
+                            );
+                        } else {
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                            );
+                        }
                         crate::http3::stream_util::abort_response_stream(stream);
                         body_completed = false;
                     }
@@ -9272,13 +9402,13 @@ where
                 );
                 let trailer_write = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                        grpc_deadline_at,
+                        response_bound.deadline(),
                         stream.send_trailers(trailer_map),
                     )
                     .await
                 } else {
                     crate::http3::stream_util::await_response_write_before_deadline(
-                        grpc_deadline_at,
+                        response_bound.deadline(),
                         stream.send_trailers(trailer_map),
                     )
                     .await
@@ -9286,14 +9416,14 @@ where
                 let trailer_and_finish = match trailer_write {
                     Ok(()) if terminal_gateway_deadline => {
                         crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                            grpc_deadline_at,
+                            response_bound.deadline(),
                             stream.finish(),
                         )
                         .await
                     }
                     Ok(()) => {
                         crate::http3::stream_util::await_response_write_before_deadline(
-                            grpc_deadline_at,
+                            response_bound.deadline(),
                             stream.finish(),
                         )
                         .await
@@ -9305,11 +9435,24 @@ where
                         error,
                         crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
                     ) {
-                        crate::proxy::insert_grpc_error_metadata(
-                            &mut ctx.metadata,
-                            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                        );
+                        if let Some(termination) = response_bound.expired_authorization() {
+                            ctx.record_authorization_termination_once(
+                                termination,
+                                grpc_auth_family(ctx),
+                            );
+                            authorization_terminated = true;
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                termination.grpc_message(),
+                            );
+                        } else {
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                            );
+                        }
                         crate::http3::stream_util::abort_response_stream(stream);
                     } else {
                         warn!("H3 gRPC trailer or FIN write failed");
@@ -9320,13 +9463,13 @@ where
             } else if body_completed {
                 let finish = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                        grpc_deadline_at,
+                        response_bound.deadline(),
                         stream.finish(),
                     )
                     .await
                 } else {
                     crate::http3::stream_util::await_response_write_before_deadline(
-                        grpc_deadline_at,
+                        response_bound.deadline(),
                         stream.finish(),
                     )
                     .await
@@ -9336,11 +9479,24 @@ where
                         error,
                         crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
                     ) {
-                        crate::proxy::insert_grpc_error_metadata(
-                            &mut ctx.metadata,
-                            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                        );
+                        if let Some(termination) = response_bound.expired_authorization() {
+                            ctx.record_authorization_termination_once(
+                                termination,
+                                grpc_auth_family(ctx),
+                            );
+                            authorization_terminated = true;
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                grpc_proxy::grpc_status::UNAUTHENTICATED,
+                                termination.grpc_message(),
+                            );
+                        } else {
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                            );
+                        }
                         crate::http3::stream_util::abort_response_stream(stream);
                     } else {
                         debug!("H3 stream finish failed");
@@ -9349,20 +9505,25 @@ where
                     body_completed = false;
                 }
             }
-            record_backend_outcome_no_conn_end(
-                state,
-                proxy,
-                &epoch.load_balancer,
-                upstream_balancer,
-                current_target.as_deref(),
-                current_cb_target_key.as_deref(),
-                response_status,
-                false,
-                None,
-                cb_probe.take_slot(),
-                false,
-                backend_start.elapsed(),
-            );
+            if authorization_terminated {
+                cb_probe.release_neutral();
+                drop(backend_admission_permits.take());
+            } else {
+                record_backend_outcome_no_conn_end(
+                    state,
+                    proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    response_status,
+                    false,
+                    None,
+                    cb_probe.take_slot(),
+                    false,
+                    backend_start.elapsed(),
+                );
+            }
             // A completed buffered gRPC response carries its backend outcome in the
             // grpc-status trailer (HTTP 200), captured pre-hook as
             // `grpc_backend_dispatch_status`, so an UNAVAILABLE/INTERNAL backend must
@@ -9394,7 +9555,7 @@ where
                 body_completed,
                 client_disconnected,
                 connection_error: false,
-                error_class: None,
+                error_class: authorization_terminated.then_some(ErrorClass::ClientDisconnect),
                 body_error_class: if body_completed {
                     None
                 } else {
@@ -9471,9 +9632,6 @@ where
                 grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
-                // Not raised here: this bridge passes no authorization plan to
-                // the shared dispatch. Mapped to its fixed terminal status for
-                // exhaustiveness.
                 grpc_proxy::GrpcProxyError::AuthorizationExpired { termination, .. } => (
                     grpc_proxy::grpc_status::UNAUTHENTICATED,
                     termination.grpc_message(),
@@ -9655,6 +9813,10 @@ pub(crate) async fn dispatch_grpc_streaming(
         state.max_grpc_recv_size_bytes,
         route_request_body_limit,
     );
+    let grpc_auth = crate::proxy::request_upload_auth_deadline(
+        Some(ctx),
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
     let mut stream = stream;
     let current_target = upstream_target.cloned().map(Arc::new);
     let current_cb_target_key = cb_target_key.map(str::to_owned);
@@ -9798,107 +9960,125 @@ pub(crate) async fn dispatch_grpc_streaming(
     // lingering parked on `recv_data()`.
     let pump_shutdown = Arc::new(tokio::sync::Notify::new());
     let pump_shutdown_signal = Arc::clone(&pump_shutdown);
+    let pump_bound = crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        ctx.grpc_deadline_at(),
+        grpc_auth.as_ref().map(|(plan, _, _)| *plan),
+    );
+    let pump_auth = grpc_auth.clone();
     let pump = tokio::spawn(async move {
         let mut cancelled_before_eof = false;
-        loop {
-            tokio::select! {
-                biased;
-                _ = pump_shutdown_signal.notified() => {
-                    cancelled_before_eof = true;
-                    break;
-                },
-                recv = recv_half.recv_data() => {
-                    match recv {
-                        Ok(Some(mut chunk)) => {
-                            let len = chunk.remaining();
-                            if len == 0 {
-                                continue;
-                            }
-                            // `Buf::copy_to_bytes` is zero-copy when the buffer is
-                            // already `bytes::Bytes` (always true with h3-quinn).
-                            let body_bytes = chunk.copy_to_bytes(len);
-                            // The send MUST stay cancellable (codex P1): on
-                            // bounded-channel backpressure, a bidi backend that
-                            // finished its response and stopped polling the request
-                            // body would otherwise park us forever inside
-                            // `tx.send(...).await`, and the post-response
-                            // `pump_shutdown.notify_one()` (observed only by this
-                            // select) could never unblock the awaited `pump`.
-                            let send_result = tokio::select! {
-                                biased;
-                                _ = pump_shutdown_signal.notified() => {
-                                    cancelled_before_eof = true;
+        let upload = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = pump_shutdown_signal.notified() => {
+                        cancelled_before_eof = true;
+                        break;
+                    },
+                    recv = recv_half.recv_data() => {
+                        match recv {
+                            Ok(Some(mut chunk)) => {
+                                let len = chunk.remaining();
+                                if len == 0 {
+                                    continue;
+                                }
+                                // `Buf::copy_to_bytes` is zero-copy when the buffer is
+                                // already `bytes::Bytes` (always true with h3-quinn).
+                                let body_bytes = chunk.copy_to_bytes(len);
+                                // The send MUST stay cancellable (codex P1): on
+                                // bounded-channel backpressure, a bidi backend that
+                                // finished its response and stopped polling the request
+                                // body would otherwise park us forever inside
+                                // `tx.send(...).await`, and the post-response
+                                // `pump_shutdown.notify_one()` (observed only by this
+                                // select) could never unblock the awaited `pump`.
+                                let send_result = tokio::select! {
+                                    biased;
+                                    _ = pump_shutdown_signal.notified() => {
+                                        cancelled_before_eof = true;
+                                        break;
+                                    },
+                                    res = tx.send(Ok(http_body::Frame::data(body_bytes))) => res,
+                                };
+                                if send_result.is_err() {
+                                    // Backend dropped the request body (RPC done / RST):
+                                    // nothing left to feed.
                                     break;
-                                },
-                                res = tx.send(Ok(http_body::Frame::data(body_bytes))) => res,
-                            };
-                            if send_result.is_err() {
-                                // Backend dropped the request body (RPC done / RST):
-                                // nothing left to feed.
-                                break;
+                                }
                             }
-                        }
-                        // DATA EOF may be followed by one trailers HEADERS block.
-                        // Preserve it as an H2 trailers frame so client-streaming
-                        // gRPC metadata is not silently dropped at the protocol
-                        // bridge. Malformed trailers fail the upload closed.
-                        Ok(None) => {
-                            let trailer_result = tokio::select! {
-                                biased;
-                                _ = pump_shutdown_signal.notified() => {
-                                    cancelled_before_eof = true;
-                                    break;
-                                },
-                                result = recv_half.recv_trailers() => result,
-                            };
-                            match trailer_result {
-                                Ok(Some(mut trailers)) if !trailers.is_empty() => {
-                                    sanitize_backend_request_trailers(&mut trailers);
-                                    if !trailers.is_empty() {
+                            // DATA EOF may be followed by one trailers HEADERS block.
+                            // Preserve it as an H2 trailers frame so client-streaming
+                            // gRPC metadata is not silently dropped at the protocol
+                            // bridge. Malformed trailers fail the upload closed.
+                            Ok(None) => {
+                                let trailer_result = tokio::select! {
+                                    biased;
+                                    _ = pump_shutdown_signal.notified() => {
+                                        cancelled_before_eof = true;
+                                        break;
+                                    },
+                                    result = recv_half.recv_trailers() => result,
+                                };
+                                match trailer_result {
+                                    Ok(Some(mut trailers)) if !trailers.is_empty() => {
+                                        sanitize_backend_request_trailers(&mut trailers);
+                                        if !trailers.is_empty() {
+                                            tokio::select! {
+                                                biased;
+                                                _ = pump_shutdown_signal.notified() => {
+                                                    cancelled_before_eof = true;
+                                                }
+                                                _ = tx.send(Ok(http_body::Frame::trailers(
+                                                    trailers,
+                                                ))) => {}
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(_e) => {
+                                        pump_frontend_malformed.store(true, Ordering::Release);
+                                        pump_frontend_failed.store(true, Ordering::Release);
                                         tokio::select! {
                                             biased;
                                             _ = pump_shutdown_signal.notified() => {
                                                 cancelled_before_eof = true;
                                             }
-                                            _ = tx.send(Ok(http_body::Frame::trailers(
-                                                trailers,
-                                            ))) => {}
+                                            _ = tx.send(Err(())) => {}
                                         }
                                     }
                                 }
-                                Ok(_) => {}
-                                Err(_e) => {
-                                    pump_frontend_malformed.store(true, Ordering::Release);
-                                    pump_frontend_failed.store(true, Ordering::Release);
-                                    tokio::select! {
-                                        biased;
-                                        _ = pump_shutdown_signal.notified() => {
-                                            cancelled_before_eof = true;
-                                        }
-                                        _ = tx.send(Err(())) => {}
+                                break;
+                            }
+                            Err(_e) => {
+                                // Frontend upload failure: flag it (so the dispatch Err
+                                // arm records a client abort, not a backend fault) and
+                                // best-effort signal the channel body to RST the backend
+                                // instead of sending a clean END_STREAM. The send stays
+                                // cancellable for the same reason as the data send above.
+                                pump_frontend_failed.store(true, Ordering::Release);
+                                tokio::select! {
+                                    biased;
+                                    _ = pump_shutdown_signal.notified() => {
+                                        cancelled_before_eof = true;
                                     }
+                                    _ = tx.send(Err(())) => {}
                                 }
+                                break;
                             }
-                            break;
-                        }
-                        Err(_e) => {
-                            // Frontend upload failure: flag it (so the dispatch Err
-                            // arm records a client abort, not a backend fault) and
-                            // best-effort signal the channel body to RST the backend
-                            // instead of sending a clean END_STREAM. The send stays
-                            // cancellable for the same reason as the data send above.
-                            pump_frontend_failed.store(true, Ordering::Release);
-                            tokio::select! {
-                                biased;
-                                _ = pump_shutdown_signal.notified() => {
-                                    cancelled_before_eof = true;
-                                }
-                                _ = tx.send(Err(())) => {}
-                            }
-                            break;
                         }
                     }
                 }
+            }
+        };
+        if crate::plugins::await_deadline_first(pump_bound.deadline(), upload)
+            .await
+            .is_err()
+        {
+            cancelled_before_eof = true;
+            if let Some(termination) = pump_bound.expired_authorization()
+                && let Some((_, family, latch)) = pump_auth.as_ref()
+            {
+                latch.record_once(termination, *family);
             }
         }
         if cancelled_before_eof {
@@ -9951,6 +10131,7 @@ pub(crate) async fn dispatch_grpc_streaming(
             ctx.grpc_deadline_at(),
             &mut held_frontend_grpc_upload,
             Some(Arc::clone(&ctx.grpc_request_messages_observed)),
+            grpc_auth.as_ref(),
         );
         tokio::pin!(attempt);
         attempt_span.scope(attempt).await
@@ -9958,6 +10139,25 @@ pub(crate) async fn dispatch_grpc_streaming(
     // A stall the matched rule's per-attempt budget (`backendRequest`) cut is
     // the backend's, exactly as on the H1/H2 gRPC path (#5646).
     crate::proxy::charge_grpc_route_attempt_budget_expiry(ctx, &mut result);
+    if (result.is_ok()
+        || matches!(
+            &result,
+            Err(grpc_proxy::GrpcProxyError::AuthorizationExpired { .. })
+        ))
+        && let Some(termination) = crate::proxy::request_authorization_termination(
+            ctx,
+            state.env_config.authenticated_stream_max_lifetime_seconds,
+        )
+    {
+        let handed_to_backend = grpc_proxy::grpc_dispatch_reached_wire(
+            &result,
+            result.as_ref().err().map(crate::retry::classify_grpc_proxy_error),
+        );
+        result = Err(grpc_proxy::GrpcProxyError::AuthorizationExpired {
+            termination,
+            handed_to_backend,
+        });
+    }
     let dispatch_error = result
         .as_ref()
         .err()
@@ -9970,7 +10170,7 @@ pub(crate) async fn dispatch_grpc_streaming(
     }
     ctx.record_backend_attempt(
         dispatch_error,
-        dispatch_error.is_none_or(crate::retry::request_reached_wire),
+        grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error),
         None,
     );
 
@@ -10085,8 +10285,6 @@ pub(crate) async fn dispatch_grpc_streaming(
                     grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                     }
-                    // Not raised here: the channel-backed dispatch carries no
-                    // authorization plan. Mapped for exhaustiveness.
                     grpc_proxy::GrpcProxyError::AuthorizationExpired { termination, .. } => (
                         grpc_proxy::grpc_status::UNAUTHENTICATED,
                         termination.grpc_message(),
@@ -10159,22 +10357,39 @@ pub(crate) async fn dispatch_grpc_streaming(
             );
             // Drop the held upload only after the Trailers-Only error is queued
             // on the H3 send half (#2057).
-            let grpc_error_write = write_grpc_error_send_with_policy(
-                &mut send_half,
-                grpc_status_code,
-                grpc_message,
-                backend_start,
-                bytes_sent,
-                initial_response_header_policy_plugins,
-            )
-            .await
-            .map(|mut outcome| {
-                outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
-                outcome.connection_error = connection_error;
-                outcome.error_class = Some(error_class);
-                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
-                outcome
-            });
+            let grpc_error_write = if let grpc_proxy::GrpcProxyError::AuthorizationExpired {
+                termination,
+                ..
+            } = &err
+            {
+                write_grpc_authorization_expired_send_terminal(
+                    &mut send_half,
+                    ctx,
+                    *termination,
+                    backend_start,
+                    bytes_sent,
+                    initial_response_header_policy_plugins,
+                )
+                .await
+            } else {
+                write_grpc_error_send_with_policy(
+                    &mut send_half,
+                    grpc_status_code,
+                    grpc_message,
+                    backend_start,
+                    bytes_sent,
+                    initial_response_header_policy_plugins,
+                )
+                .await
+                .map(|mut outcome| {
+                    outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
+                    outcome.connection_error = connection_error;
+                    outcome.error_class = Some(error_class);
+                    outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                    outcome
+                })
+            };
+
             drop(held_frontend_grpc_upload.take());
             grpc_error_write
         }
@@ -12843,6 +13058,115 @@ where
     // its spawned pump owns and halts the recv half.
     crate::http3::stream_util::halt_request_body(stream);
     Ok(outcome)
+}
+
+fn grpc_auth_family(ctx: &RequestContext) -> crate::proxy::auth_lifetime::StreamAuthProtocolFamily {
+    if crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::GrpcWeb
+    } else {
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Grpc
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_grpc_authorization_expired_terminal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    backend_start: Instant,
+    bytes_sent: u64,
+    policy: &[Arc<dyn Plugin>],
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let result = write_grpc_authorization_expired_send_terminal(
+        stream,
+        ctx,
+        termination,
+        backend_start,
+        bytes_sent,
+        policy,
+    )
+    .await;
+    crate::http3::stream_util::halt_request_body(stream);
+    result
+}
+
+async fn write_grpc_authorization_expired_send_terminal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+    backend_start: Instant,
+    bytes_sent: u64,
+    policy: &[Arc<dyn Plugin>],
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: SendStream<Bytes>,
+{
+    ctx.record_authorization_termination_once(termination, grpc_auth_family(ctx));
+    crate::proxy::insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        grpc_proxy::grpc_status::UNAUTHENTICATED,
+        termination.grpc_message(),
+    );
+    let write = async {
+        if let Some(mut translated) = crate::plugins::grpc_web::translated_error_response(
+            ctx,
+            grpc_proxy::grpc_status::UNAUTHENTICATED,
+            termination.grpc_message(),
+        ) {
+            crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, policy, None);
+            send_response_headers(stream, "POST", 200, &translated.headers).await?;
+            let body_len = translated.body.len() as u64;
+            stream.send_data(Bytes::from(translated.body)).await?;
+            stream.finish().await?;
+            Ok(CrossProtocolOutcome {
+                response_status: 200,
+                response_streamed: false,
+                bytes_streamed: body_len,
+                bytes_sent,
+                backend_target: None,
+                backend_resolved_ip: None,
+                body_completed: true,
+                client_disconnected: false,
+                connection_error: false,
+                error_class: Some(ErrorClass::ClientDisconnect),
+                body_error_class: None,
+                backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                rejection_logged: false,
+            })
+        } else {
+            write_grpc_error_send_with_policy(
+                stream,
+                grpc_proxy::grpc_status::UNAUTHENTICATED,
+                termination.grpc_message(),
+                backend_start,
+                bytes_sent,
+                policy,
+            )
+            .await
+        }
+    };
+    let result =
+        crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await;
+    match result {
+        Ok(mut outcome) => {
+            outcome.error_class = Some(ErrorClass::ClientDisconnect);
+            Ok(outcome)
+        }
+        Err(error) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            Ok(terminal_deadline_write_aborted_outcome(
+                StatusCode::OK.as_u16(),
+                0,
+                backend_start,
+                bytes_sent,
+                matches!(error, crate::http3::stream_util::H3ResponseWriteError::Write(_)),
+            ))
+        }
+    }
 }
 
 /// Write a pre-response gRPC failure using the original client representation.

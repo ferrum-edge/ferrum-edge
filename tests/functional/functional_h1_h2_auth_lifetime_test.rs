@@ -901,3 +901,73 @@ async fn h1_h2_auth_lifetime_buffered_grpc_stalled_acquisition_never_reaches_the
 async fn h1_h2_auth_lifetime_streamed_grpc_stalled_acquisition_never_reaches_the_backend() {
     assert_stalled_grpc_acquisition_never_reaches_the_backend(false).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h1_h2_auth_lifetime_buffered_grpc_response_collect_commits_only_the_expiry_terminal() {
+    use crate::scaffolding::backends::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::Sleep(Duration::from_secs(45)))
+        .spawn()
+        .expect("stalling buffered gRPC backend");
+    let mut config: Value =
+        serde_yaml::from_str(&stalled_grpc_proxy_yaml(backend_port, true)).expect("base config");
+    config["proxies"][0]["response_body_mode"] = json!("buffer");
+    let harness = GatewayHarness::builder()
+        .file_config(serde_yaml::to_string(&config).expect("config"))
+        .capture_output()
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("gateway");
+    let authority = proxy_authority(&harness);
+    let token = mint_short_lived_token(ExpShape::Integer);
+    let tcp = tokio::net::TcpStream::connect(authority.as_str())
+        .await
+        .expect("gateway TCP");
+    let (sender, connection) = h2::client::handshake(tcp).await.expect("h2 client");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut sender = sender.ready().await.expect("sender ready");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://{authority}/grpc/buffered.Response/Call"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .expect("request");
+    let (response, mut upload) = sender.send_request(request, false).expect("send");
+    upload
+        .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+        .expect("message");
+    let response = tokio::time::timeout(
+        Duration::from_secs(TOKEN_TTL_SECS as u64) + TERMINATION_GRACE,
+        response,
+    )
+    .await
+    .expect("collect must stop at expiry")
+    .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("16"),
+        "no backend head may commit while the buffered collect is still pending"
+    );
+    assert_eq!(grpc_status_of(response).await.as_deref(), Some("16"));
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "expiry must never retry the RPC"
+    );
+    assert_credential_expired_exactly(&harness, "grpc", 1).await;
+}

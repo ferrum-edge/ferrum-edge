@@ -11615,7 +11615,124 @@ pub mod _test_support {
     where
         F: std::future::Future,
     {
-        bounds.0.acquire(auth, acquisition).await
+        bounds
+            .0
+            .acquire(auth, async {
+                Ok::<_, std::convert::Infallible>(acquisition.await)
+            })
+            .await
+            .map(|result| match result {
+                Ok(value) => value,
+                Err(never) => match never {},
+            })
+    }
+
+    /// Result-bearing acquisition through the same production cold-error gate.
+    pub async fn await_native_grpc_acquisition_result_for_test<F, T>(
+        bounds: &NativeGrpcDispatchBoundsForTest,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        acquisition: F,
+    ) -> Result<T, crate::proxy::grpc_proxy::GrpcProxyError>
+    where
+        F: std::future::Future<Output = Result<T, crate::proxy::grpc_proxy::GrpcProxyError>>,
+    {
+        bounds.0.acquire(auth, acquisition).await?
+    }
+
+    /// The admitted plan used by dispatch and transport guards.
+    pub type RequestAuthLifetimePlanForTest = (
+        crate::proxy::auth_lifetime::StreamAuthDeadline,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    );
+
+    /// Compose before first poll and observe the adapter's actual handoff flag.
+    pub fn native_grpc_header_wait_with_handoff_for_test<F, T>(
+        protocol_at: Option<tokio::time::Instant>,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        handed_to_backend: &std::sync::atomic::AtomicBool,
+        wait: F,
+    ) -> impl std::future::Future<Output = Result<T, crate::proxy::grpc_proxy::GrpcProxyError>>
+    where
+        F: std::future::Future<Output = Result<T, crate::proxy::grpc_proxy::GrpcProxyError>>,
+    {
+        let bound =
+            crate::proxy::grpc_proxy::grpc_header_wait_authorization_bound(auth, protocol_at);
+        crate::proxy::grpc_proxy::grpc_header_wait_under_authorization(
+            bound,
+            auth,
+            handed_to_backend,
+            wait,
+        )
+    }
+
+    /// Drive the sidecar's result-bearing checkout/readiness combinator.
+    pub async fn await_backend_checkout_result_for_test<F, T, E>(
+        bound: &ComposedBackendHandoffBoundForTest,
+        checkout: F,
+    ) -> Result<Result<T, E>, BackendHandoffBoundSourceForTest>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::proxy::await_backend_handoff_result(bound.0, checkout)
+            .await
+            .map_err(backend_handoff_source_for_test)
+    }
+
+    /// A native H3 lifetime failure's termination, wire state, and client flag.
+    pub type H3LifetimeErrorForTest = (
+        Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+        bool,
+        bool,
+    );
+
+    /// Native H3 acquisition: termination, wire state, and client-deadline flag.
+    pub async fn await_native_h3_checkout_for_test<F, T>(
+        client_at: Option<tokio::time::Instant>,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        checkout: F,
+    ) -> Result<T, H3LifetimeErrorForTest>
+    where
+        F: std::future::Future<Output = Result<T, anyhow::Error>>,
+    {
+        crate::http3::client::await_h3_checkout(
+            crate::http3::client::H3Authorization::new(client_at, auth),
+            checkout,
+        )
+        .await
+        .map_err(|error| {
+            (
+                error.authorization_expiry(),
+                error.request_on_wire(),
+                error.client_deadline_expired(),
+            )
+        })
+    }
+
+    /// Native H3 stream-open/upload/header wait, including the per-poll gate.
+    pub async fn await_native_h3_dispatch_for_test<F, T>(
+        protocol_at: Option<tokio::time::Instant>,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        handed_to_backend: bool,
+        wait: F,
+    ) -> Result<T, H3LifetimeErrorForTest>
+    where
+        F: std::future::Future<Output = Result<T, crate::http3::client::H3PoolError>>,
+    {
+        crate::http3::client::await_h3_dispatch(
+            crate::http3::client::H3Authorization::new(None, auth),
+            handed_to_backend,
+            protocol_at,
+            wait,
+        )
+        .await
+        .map_err(|error| {
+            (
+                error.authorization_expiry(),
+                error.request_on_wire(),
+                error.client_deadline_expired(),
+            )
+        })
     }
 
     /// Run the production fail-closed native gRPC handoff gate in front of a
@@ -11655,7 +11772,14 @@ pub mod _test_support {
             tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(millis))
         });
         let bound = crate::proxy::grpc_proxy::grpc_header_wait_authorization_bound(auth, phase_at);
-        crate::proxy::grpc_proxy::grpc_header_wait_under_authorization(bound, auth, wait).await
+        let handed_to_backend = std::sync::atomic::AtomicBool::new(true);
+        crate::proxy::grpc_proxy::grpc_header_wait_under_authorization(
+            bound,
+            auth,
+            &handed_to_backend,
+            wait,
+        )
+        .await
     }
 
     /// Attribute an ALREADY-COMPOSED dispatch-phase bound whose winning source

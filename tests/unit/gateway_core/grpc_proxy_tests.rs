@@ -2036,6 +2036,8 @@ fn grpc_channel_body(max_bytes: usize) -> GrpcChannelBodyFixture {
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let forwarded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let body = grpc_proxy::GrpcBody::Channel {
+        auth_deadline: None,
+        grpc_deadline_at: None,
         receiver,
         bytes_seen: 0,
         max_bytes,
@@ -3778,4 +3780,90 @@ fn grpc_streaming_upload_publishes_forwarded_request_bytes() {
         h3_src[..h3_publish].contains("ctx.bytes_sent_observed"),
         "the H3 gRPC bridge must mirror its forwarded upload bytes into the shared counter"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_channel_authorization_gate_rejects_queued_data_before_the_pump_repolls() {
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let (tx, mut body, exceeded, cancelled, forwarded) = grpc_channel_body(64);
+    let latch = StreamAuthTerminationLatch::default();
+    let deadline = StreamAuthDeadline {
+        at: tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+        termination: StreamAuthTermination::CredentialExpired,
+    };
+    if let grpc_proxy::GrpcBody::Channel { auth_deadline, .. } = &mut body {
+        *auth_deadline = Some((deadline, StreamAuthProtocolFamily::Grpc, latch.clone()));
+    } else {
+        panic!("fixture must supply a channel body");
+    }
+    tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+        b"protected",
+    ))))
+    .await
+    .unwrap();
+    // The independently-owned pump timer has not been polled. Queued DATA must
+    // still be refused by the actual backend body boundary after expiry.
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    assert!(body.frame().await.unwrap().is_err());
+    assert!(body.frame().await.is_none());
+    assert_eq!(forwarded.load(Ordering::Relaxed), 0);
+    assert!(cancelled.load(Ordering::Acquire));
+    assert!(!exceeded.load(Ordering::Acquire));
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(!latch.record_once(
+        StreamAuthTermination::CredentialExpired,
+        StreamAuthProtocolFamily::Grpc,
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_channel_late_poll_preserves_an_earlier_client_deadline() {
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let (tx, mut body, _exceeded, cancelled, forwarded) = grpc_channel_body(64);
+    let latch = StreamAuthTerminationLatch::default();
+    let start = tokio::time::Instant::now();
+    if let grpc_proxy::GrpcBody::Channel {
+        auth_deadline,
+        grpc_deadline_at,
+        ..
+    } = &mut body
+    {
+        *auth_deadline = Some((
+            StreamAuthDeadline {
+                at: start + std::time::Duration::from_millis(200),
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Grpc,
+            latch.clone(),
+        ));
+        *grpc_deadline_at = Some(start + std::time::Duration::from_millis(50));
+    } else {
+        panic!("fixture must supply a channel body");
+    }
+    tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+        b"queued",
+    ))))
+    .await
+    .unwrap();
+    tokio::time::advance(std::time::Duration::from_millis(300)).await;
+    let error = body.frame().await.unwrap().unwrap_err();
+    assert_eq!(error.to_string(), "gRPC client deadline exceeded");
+    assert_eq!(forwarded.load(Ordering::Relaxed), 0);
+    assert!(cancelled.load(Ordering::Acquire));
+    assert_eq!(latch.observed(), None);
 }

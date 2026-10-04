@@ -545,7 +545,8 @@ fn both_native_grpc_dispatches_bound_acquisition_handoff_and_header_wait() {
             1,
             "{label}: the only request handoff must be the gated one"
         );
-        let wrapped = format!("under_authorization(header_auth_bound,auth,{wait})");
+        let wrapped =
+            format!("under_authorization(header_auth_bound,auth,&handed_to_backend,{wait})");
         assert!(
             code.contains(&wrapped),
             "{label}: the response-header wait must be held to the authorization bound"
@@ -562,7 +563,7 @@ fn native_grpc_reuses_the_shared_poll_before_timer_combinators() {
     // gate follows it, so an exact-deadline tie must go to the bound.
     let acquire = compact_code(source_region(
         GRPC_PROXY_SOURCE,
-        "pub(crate) fn acquire<F>(",
+        "pub(crate) fn acquire<F, T, E>(",
         "pub(crate) fn admit_handoff(",
     ));
     assert!(
@@ -639,4 +640,370 @@ fn a_native_grpc_authorization_expiry_gets_the_fixed_terminal() {
             && !code.contains("record_grpc_backend_dispatch_outcome("),
         "the gateway's own decision trains no backend admission or health outcome"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_completed_connect_error_after_expiry_cannot_bypass_the_acquisition_bound() {
+    use ferrum_edge::_test_support::await_native_grpc_acquisition_result_for_test;
+
+    let plan = plan_after(Duration::from_millis(50));
+    let bounds = compose_native_grpc_dispatch_bounds_for_test(Some(200), Some(&plan));
+    let connect_failed = AtomicBool::new(false);
+    let acquisition = std::future::poll_fn(|_| {
+        if connect_failed.load(Ordering::Relaxed) {
+            Poll::Ready(Err::<(), _>(GrpcProxyError::BackendTimeout {
+                kind: GrpcTimeoutKind::Connect,
+                message: "later connection failure".to_string(),
+            }))
+        } else {
+            Poll::Pending
+        }
+    });
+    let mut attempt = Box::pin(await_native_grpc_acquisition_result_for_test(
+        &bounds,
+        Some(&plan),
+        acquisition,
+    ));
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(attempt.as_mut().poll(&mut cx).is_pending());
+    // No repoll between expiry and the later connection error becoming ready.
+    tokio::time::advance(Duration::from_millis(300)).await;
+    connect_failed.store(true, Ordering::Relaxed);
+    let error = attempt.await.unwrap_err();
+    assert!(matches!(
+        error,
+        GrpcProxyError::AuthorizationExpired {
+            handed_to_backend: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        classify_grpc_proxy_error(&error),
+        ErrorClass::ClientDisconnect
+    );
+    assert!(
+        !plan
+            .2
+            .record_once(StreamAuthTermination::CredentialExpired, plan.1)
+    );
+    // A retry would compose the same elapsed instant and never poll a dial.
+    let retried = AtomicBool::new(false);
+    let result = await_native_grpc_acquisition_result_for_test(&bounds, Some(&plan), async {
+        retried.store(true, Ordering::Relaxed);
+        Ok::<_, GrpcProxyError>(())
+    })
+    .await;
+    assert!(result.is_err());
+    assert!(!retried.load(Ordering::Relaxed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unpolled_header_wrapper_refuses_before_the_actual_handoff() {
+    use ferrum_edge::_test_support::native_grpc_header_wait_with_handoff_for_test;
+
+    let plan = plan_after(Duration::from_millis(50));
+    let bounds = compose_native_grpc_dispatch_bounds_for_test(None, Some(&plan));
+    let handed = AtomicBool::new(false);
+    let backend_requests = AtomicUsize::new(0);
+    let headers = native_grpc_header_wait_with_handoff_for_test(
+        None,
+        Some(&plan),
+        &handed,
+        async {
+            native_grpc_handoff_gate_for_test(&bounds, Some(&plan), || {
+                backend_requests.fetch_add(1, Ordering::Relaxed);
+                handed.store(true, Ordering::Relaxed);
+            })?;
+            Ok::<_, GrpcProxyError>(())
+        },
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(matches!(
+        headers.await,
+        Err(GrpcProxyError::AuthorizationExpired {
+            handed_to_backend: false,
+            ..
+        })
+    ));
+    assert_eq!(backend_requests.load(Ordering::Relaxed), 0);
+    assert!(!handed.load(Ordering::Relaxed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiry_after_actual_handoff_retains_post_wire_attribution() {
+    use ferrum_edge::_test_support::native_grpc_header_wait_with_handoff_for_test;
+
+    let plan = plan_after(Duration::from_millis(50));
+    let bounds = compose_native_grpc_dispatch_bounds_for_test(None, Some(&plan));
+    let handed = AtomicBool::new(false);
+    let backend_requests = AtomicUsize::new(0);
+    let mut headers = Box::pin(native_grpc_header_wait_with_handoff_for_test(
+        None,
+        Some(&plan),
+        &handed,
+        async {
+            native_grpc_handoff_gate_for_test(&bounds, Some(&plan), || {
+                backend_requests.fetch_add(1, Ordering::Relaxed);
+                handed.store(true, Ordering::Relaxed);
+            })?;
+            std::future::pending::<Result<(), GrpcProxyError>>().await
+        },
+    ));
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(headers.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(backend_requests.load(Ordering::Relaxed), 1);
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert!(matches!(
+        headers.await,
+        Err(GrpcProxyError::AuthorizationExpired {
+            handed_to_backend: true,
+            ..
+        })
+    ));
+    assert_eq!(backend_requests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_grpc_collection_is_cancelled_at_the_dispatch_authorization_instant() {
+    // Body collection uses the same production wrapper as the header wait,
+    // after the actual handoff has been recorded, without rearming the plan.
+    let plan = plan_after(Duration::from_millis(100));
+    tokio::time::advance(Duration::from_millis(60)).await;
+    let (collect, polled, dropped) = stalled();
+    let result = await_native_grpc_header_wait_for_test(None, Some(&plan), async {
+        Ok(collect.await)
+    })
+    .await;
+    assert_eq!(
+        expired_after_handoff(result),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert!(polled.load(Ordering::SeqCst));
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(
+        !plan
+            .2
+            .record_once(StreamAuthTermination::CredentialExpired, plan.1)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sidecar_readiness_error_after_expiry_keeps_the_captured_source() {
+    use ferrum_edge::_test_support::{
+        BackendHandoffBoundSourceForTest, await_backend_checkout_result_for_test,
+        compose_backend_handoff_bound_for_test, compose_dispatch_phase_bound_for_test,
+    };
+
+    let plan = plan_after(Duration::from_millis(50));
+    let dispatch = compose_dispatch_phase_bound_for_test(None, Some(&plan));
+    let bound = compose_backend_handoff_bound_for_test(
+        Some(tokio::time::Instant::now() + Duration::from_millis(200)),
+        &dispatch,
+    );
+    let ready = AtomicBool::new(false);
+    let readiness = std::future::poll_fn(|_| {
+        if ready.load(Ordering::Relaxed) {
+            Poll::Ready(Err::<(), _>("connection failed"))
+        } else {
+            Poll::Pending
+        }
+    });
+    let mut wait = Box::pin(await_backend_checkout_result_for_test(&bound, readiness));
+    let waker = futures_util::task::noop_waker();
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    tokio::time::advance(Duration::from_millis(300)).await;
+    ready.store(true, Ordering::Relaxed);
+    assert_eq!(
+        wait.await,
+        Err(BackendHandoffBoundSourceForTest::Authorization)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_h3_acquisition_and_resumed_send_never_outlive_the_plan() {
+    use ferrum_edge::_test_support::{
+        await_native_h3_checkout_for_test, await_native_h3_dispatch_for_test,
+    };
+
+    let plan = plan_after(Duration::from_millis(50));
+    let start = tokio::time::Instant::now();
+    let result = await_native_h3_checkout_for_test(None, Some(&plan), async {
+        std::future::pending::<Result<(), anyhow::Error>>().await
+    })
+    .await;
+    assert_eq!(
+        result,
+        Err((Some(StreamAuthTermination::CredentialExpired), false, false))
+    );
+    assert_eq!(tokio::time::Instant::now(), start + Duration::from_millis(50));
+
+    let plan = plan_after(Duration::from_millis(50));
+    let stream_credit = AtomicBool::new(false);
+    let backend_requests = AtomicUsize::new(0);
+    let send = std::future::poll_fn(|_| {
+        if stream_credit.load(Ordering::Relaxed) {
+            backend_requests.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok::<_, ferrum_edge::http3::client::H3PoolError>(()))
+        } else {
+            Poll::Pending
+        }
+    });
+    let mut wait = Box::pin(await_native_h3_dispatch_for_test(
+        None,
+        Some(&plan),
+        false,
+        send,
+    ));
+    let waker = futures_util::task::noop_waker();
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    stream_credit.store(true, Ordering::Relaxed);
+    assert_eq!(
+        wait.await,
+        Err((Some(StreamAuthTermination::CredentialExpired), false, false))
+    );
+    assert_eq!(backend_requests.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_h3_header_expiry_is_post_wire_and_an_earlier_read_bound_stays_read() {
+    use ferrum_edge::_test_support::await_native_h3_dispatch_for_test;
+
+    let plan = plan_after(Duration::from_millis(50));
+    let result = await_native_h3_dispatch_for_test(None, Some(&plan), true, async {
+        std::future::pending::<Result<(), ferrum_edge::http3::client::H3PoolError>>().await
+    })
+    .await;
+    assert_eq!(
+        result,
+        Err((Some(StreamAuthTermination::CredentialExpired), true, false))
+    );
+
+    let plan = plan_after(Duration::from_millis(200));
+    let protocol_at = tokio::time::Instant::now() + Duration::from_millis(50);
+    let result = await_native_h3_dispatch_for_test(Some(protocol_at), Some(&plan), true, async {
+        std::future::pending::<Result<(), ferrum_edge::http3::client::H3PoolError>>().await
+    })
+    .await;
+    assert_eq!(result, Err((None, true, false)));
+    assert_eq!(plan.2.observed(), None);
+}
+
+#[test]
+fn all_grouped_paths_carry_the_authorization_plan_to_their_actual_boundaries() {
+    let buffered = source_region(
+        GRPC_PROXY_SOURCE,
+        "// Collection has its own operator phase budget",
+        "// Hand the charge to the retained allocation",
+    );
+    assert!(compact_code(buffered).contains("grpc_header_wait_under_authorization("));
+    let native = source_region(
+        PROXY_SOURCE,
+        "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
+        "Err(GrpcProxyError::AuthorizationExpired",
+    );
+    assert!(native.contains("authorization_expired_grpc_precommit"));
+    let sidecar = source_region(
+        PROXY_SOURCE,
+        "async fn proxy_to_backend_mesh_mtls(",
+        "/// Post-ready Sidecar dispatch",
+    );
+    assert_eq!(sidecar.matches("await_backend_handoff_result(").count(), 3);
+    let sidecar_send = source_region(
+        PROXY_SOURCE,
+        "async fn proxy_to_backend_mesh_mtls_after_ready(",
+        "let send_result =",
+    );
+    assert!(
+        offset_of(sidecar_send, "handoff_bound.elapsed()")
+            < offset_of(sidecar_send, "sender.send_request(backend_req)")
+    );
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let streamed_bridge = source_region(
+        bridge,
+        "pub(crate) async fn dispatch_grpc_streaming(",
+        "async fn apply_buffered_plain_plugin_reject(",
+    );
+    assert!(streamed_bridge.contains("pump_bound.deadline()"));
+    assert!(streamed_bridge.contains("grpc_auth.as_ref(),"));
+    let pool = include_str!("../../../src/http3/client.rs");
+    assert!(pool.contains("await_backend_dispatch_bound(bound, work)"));
+    assert!(pool.contains("await_backend_handoff_result(bound, checkout)"));
+}
+
+#[test]
+fn ready_sidecar_and_native_h3_phases_never_arm_timers() {
+    use ferrum_edge::_test_support::{
+        await_backend_checkout_result_for_test, await_native_h3_checkout_for_test,
+        await_native_h3_dispatch_for_test, compose_backend_handoff_bound_for_test,
+        compose_dispatch_phase_bound_for_test,
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime without a time driver");
+    runtime.block_on(async {
+        let plan = plan_after(Duration::from_secs(60));
+        let dispatch = compose_dispatch_phase_bound_for_test(None, Some(&plan));
+        let bound = compose_backend_handoff_bound_for_test(None, &dispatch);
+        let sidecar = await_backend_checkout_result_for_test(
+            &bound,
+            std::future::ready(Ok::<_, ()>("ready")),
+        )
+        .await;
+        assert_eq!(sidecar, Ok(Ok("ready")));
+        let h3 = await_native_h3_checkout_for_test(
+            None,
+            Some(&plan),
+            std::future::ready(Ok::<_, anyhow::Error>("pooled")),
+        )
+        .await;
+        assert_eq!(h3, Ok("pooled"));
+        let sent = await_native_h3_dispatch_for_test(
+            None,
+            Some(&plan),
+            false,
+            std::future::ready(Ok::<_, ferrum_edge::http3::client::H3PoolError>("sent")),
+        )
+        .await;
+        assert_eq!(sent, Ok("sent"));
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_h3_late_checkout_errors_preserve_the_captured_client_winner() {
+    use ferrum_edge::_test_support::await_native_h3_checkout_for_test;
+
+    let plan = plan_after(Duration::from_millis(200));
+    let client_at = tokio::time::Instant::now() + Duration::from_millis(50);
+    let failed = AtomicBool::new(false);
+    let checkout = std::future::poll_fn(|_| {
+        if failed.load(Ordering::Relaxed) {
+            Poll::Ready(Err::<(), _>(anyhow::anyhow!("later connect failure")))
+        } else {
+            Poll::Pending
+        }
+    });
+    let mut wait = Box::pin(await_native_h3_checkout_for_test(
+        Some(client_at),
+        Some(&plan),
+        checkout,
+    ));
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    tokio::time::advance(Duration::from_millis(300)).await;
+    failed.store(true, Ordering::Relaxed);
+    assert_eq!(wait.await, Err((None, false, true)));
+    assert_eq!(plan.2.observed(), None);
 }

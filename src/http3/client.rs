@@ -998,6 +998,8 @@ pub struct H3PoolError {
     graceful_close: bool,
     read_timeout: bool,
     route_deadline: Option<crate::proxy::RouteDeadlineExpiry>,
+    authorization_expiry: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+    client_deadline_expired: bool,
 }
 
 impl H3PoolError {
@@ -1012,6 +1014,8 @@ impl H3PoolError {
             graceful_close: false,
             read_timeout: false,
             route_deadline: None,
+            authorization_expiry: None,
+            client_deadline_expired: false,
         }
     }
 
@@ -1026,6 +1030,8 @@ impl H3PoolError {
             graceful_close: false,
             read_timeout: false,
             route_deadline: None,
+            authorization_expiry: None,
+            client_deadline_expired: false,
         }
     }
 
@@ -1047,6 +1053,8 @@ impl H3PoolError {
             graceful_close: true,
             read_timeout: false,
             route_deadline: None,
+            authorization_expiry: None,
+            client_deadline_expired: false,
         }
     }
 
@@ -1072,6 +1080,8 @@ impl H3PoolError {
             graceful_close: false,
             read_timeout: true,
             route_deadline: None,
+            authorization_expiry: None,
+            client_deadline_expired: false,
         }
     }
 
@@ -1109,6 +1119,8 @@ impl H3PoolError {
             graceful_close: false,
             read_timeout: true,
             route_deadline: Some(expiry),
+            authorization_expiry: None,
+            client_deadline_expired: false,
         }
     }
 
@@ -1116,6 +1128,20 @@ impl H3PoolError {
     /// [`Self::route_deadline`]).
     pub(crate) fn route_deadline_expiry(&self) -> Option<crate::proxy::RouteDeadlineExpiry> {
         self.route_deadline
+    }
+
+    pub(crate) fn lifetime_expired(&self) -> bool {
+        self.authorization_expiry.is_some() || self.client_deadline_expired
+    }
+
+    pub(crate) fn client_deadline_expired(&self) -> bool {
+        self.client_deadline_expired
+    }
+
+    pub(crate) fn authorization_expiry(
+        &self,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        self.authorization_expiry
     }
 
     /// Borrow the underlying error for downcast / display / `tracing` use.
@@ -1229,6 +1255,169 @@ pub type H3PoolResult<T> = std::result::Result<T, H3PoolError>;
 
 fn should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire: bool) -> bool {
     !fast_path_failed_pre_wire
+}
+
+/// One admitted request's absolute lifetime, shared by cached and fresh attempts.
+#[derive(Clone, Copy)]
+pub(crate) struct H3Authorization<'a> {
+    plan: Option<&'a crate::proxy::RequestAuthLifetimePlan>,
+    client_deadline_at: Option<tokio::time::Instant>,
+}
+
+impl<'a> H3Authorization<'a> {
+    pub(crate) fn new(
+        client_deadline_at: Option<tokio::time::Instant>,
+        plan: Option<&'a crate::proxy::RequestAuthLifetimePlan>,
+    ) -> Self {
+        Self {
+            plan,
+            client_deadline_at,
+        }
+    }
+
+    fn compose(self, protocol_at: Option<tokio::time::Instant>) -> crate::proxy::DispatchPhaseBound {
+        let phase_at = match (self.client_deadline_at, protocol_at) {
+            (Some(client), Some(protocol)) => Some(client.min(protocol)),
+            (client, protocol) => client.or(protocol),
+        };
+        crate::proxy::compose_dispatch_phase_auth_bound(phase_at, self.plan)
+    }
+}
+
+fn h3_authorization_error(
+    bound: crate::proxy::DispatchPhaseBound,
+    auth: H3Authorization<'_>,
+    handed_to_backend: bool,
+) -> H3PoolError {
+    let termination = crate::proxy::dispatch_phase_authorization_expiry(bound, auth.plan);
+    let mut error = if handed_to_backend {
+        H3PoolError::post_wire(anyhow::anyhow!("authorization lifetime expired"))
+    } else {
+        H3PoolError::pre_wire(anyhow::anyhow!("authorization lifetime expired"))
+    };
+    error.authorization_expiry = termination;
+    if !bound.authorization_wins && bound.at == auth.client_deadline_at && bound.at.is_some() {
+        error.client_deadline_expired = true;
+        error.inner = anyhow::anyhow!("client RPC deadline exceeded");
+    }
+    error
+}
+
+/// Pool hits finish before any timer is armed. Completed errors must still
+/// yield to the captured authorization bound before transport classification.
+pub(crate) async fn await_h3_checkout<F, T>(
+    auth: H3Authorization<'_>,
+    checkout: F,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = Result<T, anyhow::Error>>,
+{
+    let dispatch = auth.compose(None);
+    let bound = crate::proxy::compose_backend_handoff_bound(None, dispatch);
+    match crate::proxy::await_backend_handoff_result(bound, checkout).await {
+        Ok(result) => result.map_err(H3PoolError::pre_wire),
+        Err(_) => Err(h3_authorization_error(dispatch, auth, false)),
+    }
+}
+
+/// Check before EVERY poll, including the poll that opens a QUIC stream or
+/// writes HEADERS after stream-credit readiness. No await separates the check
+/// from that poll. An immediately-ready phase never arms a timer.
+pub(crate) async fn await_h3_dispatch<F, T>(
+    auth: H3Authorization<'_>,
+    handed_to_backend: bool,
+    protocol_at: Option<tokio::time::Instant>,
+    work: F,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = H3PoolResult<T>>,
+{
+    let dispatch = auth.compose(protocol_at);
+    let bound = crate::proxy::compose_backend_handoff_bound(None, dispatch);
+    match crate::proxy::await_backend_dispatch_bound(bound, work).await {
+        Ok(result) => result,
+        Err(_) if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at => {
+            Err(h3_authorization_error(dispatch, auth, handed_to_backend))
+        }
+        Err(_) => Err(H3PoolError::read_timeout(anyhow::anyhow!(
+            "recv_response read timeout"
+        ))),
+    }
+}
+
+/// A write keeps its own idle watermark and the request's absolute lifetime.
+/// Capturing their winner before polling preserves attribution on a late wake.
+async fn await_h3_write_under_authorization<F, T, E>(
+    auth: H3Authorization<'_>,
+    timeout_ms: u64,
+    write: F,
+    op: &'static str,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let protocol_at = if timeout_ms > 0 {
+        tokio::time::Instant::now().checked_add(Duration::from_millis(timeout_ms))
+    } else {
+        None
+    };
+    let dispatch = auth.compose(protocol_at);
+    let bound = crate::proxy::compose_backend_handoff_bound(None, dispatch);
+    let work = async {
+        write
+            .await
+            .map_err(|error| H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {error}")))
+    };
+    match crate::proxy::await_backend_dispatch_bound(bound, work).await {
+        Ok(result) => result,
+        Err(_) if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at => {
+            Err(h3_authorization_error(dispatch, auth, true))
+        }
+        Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
+            "backend request body write timeout after {timeout_ms}ms"
+        ))),
+    }
+}
+
+async fn send_h3_buffered_body_under_authorization<S>(
+    stream: &mut h3::client::RequestStream<S, bytes::Bytes>,
+    body: bytes::Bytes,
+    timeout_ms: u64,
+    auth: H3Authorization<'_>,
+) -> H3PoolResult<()>
+where
+    S: h3::quic::SendStream<bytes::Bytes>,
+{
+    for chunk in H3BufferedBodyChunks::new(body) {
+        await_h3_write_under_authorization(
+            auth,
+            timeout_ms,
+            stream.send_data(chunk),
+            "send_data",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn recv_h3_response_under_authorization(
+    stream: &mut H3RequestStream,
+    read_timeout_ms: u64,
+    auth: H3Authorization<'_>,
+) -> H3PoolResult<http::Response<()>> {
+    let protocol_at = if read_timeout_ms > 0 {
+        tokio::time::Instant::now().checked_add(Duration::from_millis(read_timeout_ms))
+    } else {
+        None
+    };
+    await_h3_dispatch(
+        auth,
+        true,
+        protocol_at,
+        recv_h3_response_with_timeout(stream, read_timeout_ms),
+    )
+    .await
 }
 
 /// A native-H3 streaming request may reconnect after a cached-connection
@@ -2687,6 +2876,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
+        auth: H3Authorization<'_>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
@@ -2711,21 +2901,34 @@ impl Http3ConnectionPool {
         }
 
         let req = req_builder.body(()).map_err(H3PoolError::pre_wire)?;
-        let mut stream = send_request
-            .send_request(req)
-            .await
-            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
-
-        send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms).await?;
-        await_h3_client_write_with_timeout(
+        let mut stream = await_h3_dispatch(auth, false, None, async {
+            send_request
+                .send_request(req)
+                .await
+                .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
+        })
+        .await?;
+        send_h3_buffered_body_under_authorization(
+            &mut stream,
+            body,
+            proxy.backend_write_timeout_ms,
+            auth,
+        )
+        .await?;
+        await_h3_write_under_authorization(
+            auth,
             proxy.backend_write_timeout_ms,
             stream.finish(),
             "finish",
         )
         .await?;
 
-        let response =
-            recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
+        let response = recv_h3_response_under_authorization(
+            &mut stream,
+            proxy.backend_read_timeout_ms,
+            auth,
+        )
+        .await?;
         let status = response.status().as_u16();
 
         let response_headers = collect_h3_response_headers(response.headers());
@@ -3173,6 +3376,7 @@ impl Http3ConnectionPool {
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
+        auth: H3Authorization<'_>,
     ) -> Result<H3StreamingResponse, (H3PoolError, Option<Incoming>)> {
         let backend_stream = match Self::open_streaming_incoming_backend_stream(
             send_request,
@@ -3180,6 +3384,7 @@ impl Http3ConnectionPool {
             method,
             backend_url,
             headers,
+            auth,
         )
         .await
         {
@@ -3196,6 +3401,7 @@ impl Http3ConnectionPool {
             max_request_body_size,
             bytes_seen,
             grpc_messages,
+            auth,
         )
         .await
         .map_err(|e| (e, None))
@@ -3211,6 +3417,7 @@ impl Http3ConnectionPool {
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        auth: H3Authorization<'_>,
     ) -> H3PoolResult<H3RequestStream> {
         let uri: http::Uri = backend_url
             .parse()
@@ -3235,10 +3442,13 @@ impl Http3ConnectionPool {
         }
 
         let req = req_builder.body(()).map_err(H3PoolError::pre_wire)?;
-        send_request
-            .send_request(req)
-            .await
-            .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
+        await_h3_dispatch(auth, false, None, async {
+            send_request
+                .send_request(req)
+                .await
+                .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))
+        })
+        .await
     }
 
     /// Post-wire phase of `do_request_streaming_incoming_body`: forward the
@@ -3251,10 +3461,15 @@ impl Http3ConnectionPool {
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
+        auth: H3Authorization<'_>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let mut total_sent: usize = 0;
         let mut grpc_tap = grpc_messages;
-        while let Some(frame_result) = frontend_body.frame().await {
+        while let Some(frame_result) = await_h3_dispatch(auth, true, None, async {
+            Ok(frontend_body.frame().await)
+        })
+        .await?
+        {
             let frame = frame_result.map_err(|e| {
                 H3PoolError::post_wire(anyhow::anyhow!(
                     "Client disconnected while sending request body: {}",
@@ -3278,7 +3493,8 @@ impl Http3ConnectionPool {
             }
             let data = chunk.copy_to_bytes(len);
             let metric_data = grpc_tap.as_ref().map(|_| data.clone());
-            await_h3_client_write_with_timeout(
+            await_h3_write_under_authorization(
+                auth,
                 proxy.backend_write_timeout_ms,
                 backend_stream.send_data(data),
                 "send_data",
@@ -3289,16 +3505,20 @@ impl Http3ConnectionPool {
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
-        await_h3_client_write_with_timeout(
+        await_h3_write_under_authorization(
+            auth,
             proxy.backend_write_timeout_ms,
             backend_stream.finish(),
             "finish",
         )
         .await?;
 
-        let response =
-            recv_h3_response_with_timeout(&mut backend_stream, proxy.backend_read_timeout_ms)
-                .await?;
+        let response = recv_h3_response_under_authorization(
+            &mut backend_stream,
+            proxy.backend_read_timeout_ms,
+            auth,
+        )
+        .await?;
         let status = response.status().as_u16();
 
         let response_headers = collect_h3_response_headers(response.headers());
@@ -3449,10 +3669,74 @@ impl Http3ConnectionPool {
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_body: Incoming,
+        max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
+        tls_config_fn: impl FnOnce() -> TlsFut,
+    ) -> H3PoolResult<H3StreamingResponse>
+    where
+        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        self.request_streaming_incoming_body_inner(
+            proxy,
+            method,
+            backend_url,
+            headers,
+            frontend_body,
+            max_request_body_size,
+            bytes_seen,
+            grpc_messages,
+            H3Authorization::new(None, None),
+            tls_config_fn,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_streaming_incoming_body_under_authorization<TlsFut>(
+        &self,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_body: Incoming,
+        max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
+        auth: H3Authorization<'_>,
+        tls_config_fn: impl FnOnce() -> TlsFut,
+    ) -> H3PoolResult<H3StreamingResponse>
+    where
+        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        self.request_streaming_incoming_body_inner(
+            proxy,
+            method,
+            backend_url,
+            headers,
+            frontend_body,
+            max_request_body_size,
+            bytes_seen,
+            grpc_messages,
+            auth,
+            tls_config_fn,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_streaming_incoming_body_inner<TlsFut>(
+        &self,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
+        auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
     where
@@ -3477,10 +3761,12 @@ impl Http3ConnectionPool {
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
                 grpc_messages.clone(),
+                auth,
             )
             .await
             {
                 Ok(result) => return Ok(result),
+                Err((e, _)) if e.lifetime_expired() => return Err(e),
                 Err((e, recovered_body)) => {
                     debug!(
                         "HTTP/3 streaming body from Incoming: cached connection failed, evicting: {}",
@@ -3504,25 +3790,24 @@ impl Http3ConnectionPool {
         // was pre-wire (the gate above recovered the un-polled body), so
         // replay safety is preserved and no sticky `request_on_wire` state
         // needs to be promoted into this attempt.
-        let tls_config = tls_config_fn().await.map_err(H3PoolError::pre_wire)?;
+        let tls_config = await_h3_checkout(auth, tls_config_fn()).await?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         // A create refused by the destination's `maxConnections` ceiling is not
         // a dead end: an already-established shard can serve this request by
         // multiplexing. Only a cap refusal takes that path — see
         // `reuse_shard_after_max_connections`.
-        let pooled = match self
-            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
-            .await
-        {
+        let create = self.create_or_get_proxy_sender(key, proxy, tls_config, h3_config);
+        let pooled = match await_h3_checkout(auth, create).await {
             Ok(pooled) => pooled,
+            Err(err) if err.lifetime_expired() => return Err(err),
             Err(err) => match self.reuse_shard_after_max_connections(
-                &err,
+                err.as_error(),
                 start,
                 conns_per_backend,
                 |index| self.pool_key_with_current_generation(proxy, index),
             ) {
                 Some(pooled) => pooled,
-                None => return Err(H3PoolError::pre_wire(err)),
+                None => return Err(err),
             },
         };
         let mut sr_for_request = pooled.send_request;
@@ -3537,6 +3822,7 @@ impl Http3ConnectionPool {
             max_request_body_size,
             bytes_seen,
             grpc_messages,
+            auth,
         )
         .await
         .map_err(|(e, _)| e)
@@ -3706,10 +3992,96 @@ impl Http3ConnectionPool {
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_body: Incoming,
+        max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
+        tls_config_fn: impl FnOnce() -> TlsFut,
+    ) -> H3PoolResult<H3StreamingResponse>
+    where
+        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        self.request_with_target_streaming_incoming_body_inner(
+            proxy,
+            target_host,
+            target_port,
+            target_policy_port,
+            method,
+            backend_url,
+            headers,
+            frontend_body,
+            max_request_body_size,
+            bytes_seen,
+            grpc_messages,
+            H3Authorization::new(None, None),
+            tls_config_fn,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_with_target_streaming_incoming_body_under_authorization<TlsFut>(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_body: Incoming,
+        max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
+        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
+        auth: H3Authorization<'_>,
+        tls_config_fn: impl FnOnce() -> TlsFut,
+    ) -> H3PoolResult<H3StreamingResponse>
+    where
+        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        self.request_with_target_streaming_incoming_body_inner(
+            proxy,
+            target_host,
+            target_port,
+            target_policy_port,
+            method,
+            backend_url,
+            headers,
+            frontend_body,
+            max_request_body_size,
+            bytes_seen,
+            grpc_messages,
+            auth,
+            tls_config_fn,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_with_target_streaming_incoming_body_inner<TlsFut>(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         mut frontend_body: Incoming,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
+        auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
     where
@@ -3739,10 +4111,12 @@ impl Http3ConnectionPool {
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
                 grpc_messages.clone(),
+                auth,
             )
             .await
             {
                 Ok(result) => return Ok(result),
+                Err((e, _)) if e.lifetime_expired() => return Err(e),
                 Err((e, recovered_body)) => {
                     debug!(
                         "HTTP/3 streaming body from Incoming: cached connection to {}:{} failed, evicting: {}",
@@ -3765,29 +4139,28 @@ impl Http3ConnectionPool {
         // was pre-wire (the gate above recovered the un-polled body), so
         // replay safety is preserved and no sticky `request_on_wire` state
         // needs to be promoted into this attempt.
-        let tls_config = tls_config_fn().await.map_err(H3PoolError::pre_wire)?;
+        let tls_config = await_h3_checkout(auth, tls_config_fn()).await?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         // A create refused by the destination's `maxConnections` ceiling is not
         // a dead end: an already-established shard can serve this request by
         // multiplexing. Only a cap refusal takes that path — see
         // `reuse_shard_after_max_connections`.
-        let pooled = match self
-            .create_or_get_target_sender(
-                key,
-                proxy,
-                H3ConnectionTarget {
-                    host: target_host,
-                    port: target_port,
-                    policy_port: target_policy_port,
-                },
-                tls_config,
-                h3_config,
-            )
-            .await
-        {
+        let create = self.create_or_get_target_sender(
+            key,
+            proxy,
+            H3ConnectionTarget {
+                host: target_host,
+                port: target_port,
+                policy_port: target_policy_port,
+            },
+            tls_config,
+            h3_config,
+        );
+        let pooled = match await_h3_checkout(auth, create).await {
             Ok(pooled) => pooled,
+            Err(err) if err.lifetime_expired() => return Err(err),
             Err(err) => match self.reuse_shard_after_max_connections(
-                &err,
+                err.as_error(),
                 start,
                 conns_per_backend,
                 |index| {
@@ -3800,7 +4173,7 @@ impl Http3ConnectionPool {
                 },
             ) {
                 Some(pooled) => pooled,
-                None => return Err(H3PoolError::pre_wire(err)),
+                None => return Err(err),
             },
         };
         let mut sr_for_request = pooled.send_request;
@@ -3815,6 +4188,7 @@ impl Http3ConnectionPool {
             max_request_body_size,
             bytes_seen,
             grpc_messages,
+            auth,
         )
         .await
         .map_err(|(e, _)| e)
@@ -3829,6 +4203,58 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
+        tls_config_fn: impl FnOnce() -> TlsFut,
+    ) -> H3PoolResult<H3StreamingResponse>
+    where
+        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        self.request_streaming_inner(
+            proxy,
+            method,
+            backend_url,
+            headers,
+            body,
+            H3Authorization::new(None, None),
+            tls_config_fn,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_streaming_under_authorization<TlsFut>(
+        &self,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        auth: H3Authorization<'_>,
+        tls_config_fn: impl FnOnce() -> TlsFut,
+    ) -> H3PoolResult<H3StreamingResponse>
+    where
+        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        self.request_streaming_inner(
+            proxy,
+            method,
+            backend_url,
+            headers,
+            body,
+            auth,
+            tls_config_fn,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_streaming_inner<TlsFut>(
+        &self,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
     where
@@ -3869,11 +4295,12 @@ impl Http3ConnectionPool {
                 backend_url,
                 headers,
                 body.clone(),
+                auth,
             )
             .await
             {
                 Ok(result) => return Ok(result),
-                Err(e) if e.request_on_wire() => return Err(e),
+                Err(e) if e.request_on_wire() || e.lifetime_expired() => return Err(e),
                 Err(_) => {
                     fast_path_failed_pre_wire = true;
                 }
@@ -3899,11 +4326,12 @@ impl Http3ConnectionPool {
                 backend_url,
                 headers,
                 body.clone(),
+                auth,
             )
             .await
             {
                 Ok(result) => return Ok(result),
-                Err(e) if e.request_on_wire() => return Err(e),
+                Err(e) if e.request_on_wire() || e.lifetime_expired() => return Err(e),
                 Err(e) => {
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
@@ -3926,11 +4354,12 @@ impl Http3ConnectionPool {
                         backend_url,
                         headers,
                         body.clone(),
+                        auth,
                     )
                     .await
                     {
                         Ok(result) => return Ok(result),
-                        Err(e) if e.request_on_wire() => return Err(e),
+                        Err(e) if e.request_on_wire() || e.lifetime_expired() => return Err(e),
                         Err(_) => {
                             self.pool.invalidate(&fallback_key);
                         }
@@ -3942,25 +4371,24 @@ impl Http3ConnectionPool {
         // Create a fresh connection. Post-wire failures on earlier cached
         // attempts have already returned above, so setup failures here are
         // genuinely pre-wire.
-        let tls_config = tls_config_fn().await.map_err(H3PoolError::pre_wire)?;
+        let tls_config = await_h3_checkout(auth, tls_config_fn()).await?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         // A create refused by the destination's `maxConnections` ceiling is not
         // a dead end: an already-established shard can serve this request by
         // multiplexing. Only a cap refusal takes that path — see
         // `reuse_shard_after_max_connections`.
-        let pooled = match self
-            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
-            .await
-        {
+        let create = self.create_or_get_proxy_sender(key, proxy, tls_config, h3_config);
+        let pooled = match await_h3_checkout(auth, create).await {
             Ok(pooled) => pooled,
+            Err(err) if err.lifetime_expired() => return Err(err),
             Err(err) => match self.reuse_shard_after_max_connections(
-                &err,
+                err.as_error(),
                 start,
                 conns_per_backend,
                 |index| self.pool_key_with_generation(proxy, index, svid_generation),
             ) {
                 Some(pooled) => pooled,
-                None => return Err(H3PoolError::pre_wire(err)),
+                None => return Err(err),
             },
         };
         let mut sr_for_request = pooled.send_request;
@@ -3972,6 +4400,7 @@ impl Http3ConnectionPool {
             backend_url,
             headers,
             body,
+            auth,
         )
         .await
     }
@@ -3994,6 +4423,80 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
+        tls_config_fn: impl FnOnce() -> TlsFut,
+    ) -> H3PoolResult<H3StreamingResponse>
+    where
+        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        self.request_with_target_streaming_inner(
+            proxy,
+            target_host,
+            target_port,
+            target_policy_port,
+            method,
+            backend_url,
+            headers,
+            body,
+            H3Authorization::new(None, None),
+            tls_config_fn,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_with_target_streaming_under_authorization<TlsFut>(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        auth: H3Authorization<'_>,
+        tls_config_fn: impl FnOnce() -> TlsFut,
+    ) -> H3PoolResult<H3StreamingResponse>
+    where
+        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        self.request_with_target_streaming_inner(
+            proxy,
+            target_host,
+            target_port,
+            target_policy_port,
+            method,
+            backend_url,
+            headers,
+            body,
+            auth,
+            tls_config_fn,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_with_target_streaming_inner<TlsFut>(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        // DestinationRule policy port for this dispatch — the selected target's
+        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
+        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
+        // for `connectionPool.tcp.maxConnections` admission; the dial address,
+        // TLS/SNI and the pool key all stay on `target_host:target_port`.
+        target_policy_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
     where
@@ -4028,11 +4531,12 @@ impl Http3ConnectionPool {
                 backend_url,
                 headers,
                 body.clone(),
+                auth,
             )
             .await
             {
                 Ok(result) => return Ok(result),
-                Err(e) if e.request_on_wire() => return Err(e),
+                Err(e) if e.request_on_wire() || e.lifetime_expired() => return Err(e),
                 Err(e) => {
                     debug!(
                         "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
@@ -4058,11 +4562,14 @@ impl Http3ConnectionPool {
                                 backend_url,
                                 headers,
                                 body.clone(),
+                                auth,
                             )
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(e) if e.request_on_wire() => return Err(e),
+                                Err(e) if e.request_on_wire() || e.lifetime_expired() => {
+                                    return Err(e);
+                                }
                                 Err(_) => {
                                     self.pool.invalidate(&fallback_key);
                                 }
@@ -4076,29 +4583,28 @@ impl Http3ConnectionPool {
         // Create a fresh connection to the explicit target. Post-wire failures
         // on earlier cached attempts have already returned above, so setup
         // failures here are genuinely pre-wire.
-        let tls_config = tls_config_fn().await.map_err(H3PoolError::pre_wire)?;
+        let tls_config = await_h3_checkout(auth, tls_config_fn()).await?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         // A create refused by the destination's `maxConnections` ceiling is not
         // a dead end: an already-established shard can serve this request by
         // multiplexing. Only a cap refusal takes that path — see
         // `reuse_shard_after_max_connections`.
-        let pooled = match self
-            .create_or_get_target_sender(
-                key,
-                proxy,
-                H3ConnectionTarget {
-                    host: target_host,
-                    port: target_port,
-                    policy_port: target_policy_port,
-                },
-                tls_config,
-                h3_config,
-            )
-            .await
-        {
+        let create = self.create_or_get_target_sender(
+            key,
+            proxy,
+            H3ConnectionTarget {
+                host: target_host,
+                port: target_port,
+                policy_port: target_policy_port,
+            },
+            tls_config,
+            h3_config,
+        );
+        let pooled = match await_h3_checkout(auth, create).await {
             Ok(pooled) => pooled,
+            Err(err) if err.lifetime_expired() => return Err(err),
             Err(err) => match self.reuse_shard_after_max_connections(
-                &err,
+                err.as_error(),
                 start,
                 conns_per_backend,
                 |index| {
@@ -4112,7 +4618,7 @@ impl Http3ConnectionPool {
                 },
             ) {
                 Some(pooled) => pooled,
-                None => return Err(H3PoolError::pre_wire(err)),
+                None => return Err(err),
             },
         };
         let mut sr_for_request = pooled.send_request;
@@ -4124,6 +4630,7 @@ impl Http3ConnectionPool {
             backend_url,
             headers,
             body,
+            auth,
         )
         .await
     }
