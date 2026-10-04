@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The base-image refresh inventory reports Cross tag drift for an independent
   trusted-policy rotation. The existing admission guard remains enforced;
   candidate CI cannot authorize a merge or release.
+- **Pin the iproute2 runtime base to the production distroless digest**
+  (GHSA-c3r8-6276-9678). `Dockerfile.iproute2-layer` now defaults
+  `BASE_IMAGE` to the verified OCI index digest used by the production runtime.
+  The existing base-image digest refresh workflow already includes this
+  Dockerfile, and callers that set an explicit `BASE_IMAGE` override keep that
+  behavior.
 - **OIDC session encryption secrets reject published and placeholder values**
   (#5987; cross-repo hardening from Ferrum Foundry GHSA-hjw6-685j-p5hw). The
   `oidc_relying_party` session config previously checked
@@ -74,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `1:6.0-1ubuntu2~16.04.1`. The LLVM major version and `LIBCLANG_PATH`
   (`/usr/lib/llvm-6.0/lib`) are unchanged. The trusted Cross build policy's
   frozen pre-build allowlist is updated to match.
+- **Redis semantic-cache quarantine now compares the observed value atomically** (#5986). Invalid
+  bounded values are deleted only if their raw bytes still match the value read, preserving a
+  concurrent replacement. The dedicated watched comparison transfers at most the observed
+  length plus one byte, even if a large value replaces a small invalid entry. Values larger than
+  the read bound remain in Redis until their TTL expires, while a bounded local quarantine
+  marker suppresses repeated processing without counting an unattempted delete as a failure.
+  The required Redis-backed CI gate exercises plugin admission, quarantine races, and bounded
+  transfer regressions.
+
 - The `ai_semantic_cache` entry-limit cleanup now conditionally evicts the exact cached
   entry generation it selected. A concurrent same-key refresh survives the cleanup
   pass instead of being removed as stale. The expired-entry lookup path also removes
