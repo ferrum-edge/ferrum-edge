@@ -96,6 +96,10 @@ def mysql_failure(stderr):
     ):
         return code, "secure-transport-required"
     if code == 2013 and sqlstate == "HY000":
+        # MySQL 8.0's published client catalog names CR_SERVER_LOST (2013) with
+        # this fixed template. Keep the catalog label diagnostic-only.
+        if message == "Lost connection to MySQL server during query":
+            return code, "client-server-lost-during-query"
         late_read = re.fullmatch(
             r"Lost connection to MySQL server at 'reading "
             r"(?:authorization packet|final connect information)', system error: ([0-9]+)",
@@ -142,6 +146,16 @@ def check_mysql_classifier():
         (late_read + "1", (2013, "late-auth-read-other-system-error"), False),
         (late_read + "0 trailing text", (2013, "unclassified"), False),
         (late_read.replace("HY000", "HY001") + "0", (2013, "unclassified"), False),
+        ("ERROR 2013 (HY000): Lost connection to MySQL server during query",
+         (2013, "client-server-lost-during-query"), False),
+        ("ERROR 2013 (HY000): Lost connection to MySQL server during query private-user",
+         (2013, "unclassified"), False),
+        ("ERROR 2013 (HY000): Lost connection to MySQL server during query /private/client.key",
+         (2013, "unclassified"), False),
+        ("ERROR 2013 (HY000): Lost connection to MySQL server during query random-secret",
+         (2013, "unclassified"), False),
+        ("ERROR 2013 (HY000): Lost connection to MySQL server during quer",
+         (2013, "unclassified"), False),
         ("ERROR 2013 (HY000): Lost connection to MySQL server at "
          "'reading initial communication packet', system error: 0",
          (2013, "initial-handshake-read-disconnect"), False),
