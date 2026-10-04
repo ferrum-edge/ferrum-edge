@@ -5012,7 +5012,10 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
                         .and_then(|value| value.to_str().ok())
                         .and_then(|value| value.parse::<usize>().ok());
                     if authenticated && upload_id.is_some() {
-                        assert_eq!(request.headers()["x-consumer-username"], "affinity-consumer");
+                        assert_eq!(
+                            request.headers()["x-consumer-username"],
+                            "affinity-consumer"
+                        );
                     }
                     let response = http::Response::builder()
                         .status(200)
@@ -5188,12 +5191,7 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
     }
     // H1 chunked EOF need not set Incoming::is_end_stream(). Exercise the
     // same bare/pumped native-gRPC source without applying the H2 reset rule.
-    exercise_grpc_chunked_upload(
-        &harness,
-        authorization.as_deref(),
-        &mut ended_rx,
-    )
-    .await;
+    exercise_grpc_chunked_upload(&harness, authorization.as_deref(), &mut ended_rx).await;
     if authenticated {
         let metrics = harness
             .get_admin_json("/metrics/runtime")
@@ -5703,9 +5701,7 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
                 connection_ids.next().is_none(),
                 "exactly one terminal connection ID"
             );
-            backend_ids.push(
-                http::HeaderValue::from_str(connection_id).expect("connection ID"),
-            );
+            backend_ids.push(http::HeaderValue::from_str(connection_id).expect("connection ID"));
         } else {
             assert!(response_bytes.is_empty());
         }

@@ -2653,12 +2653,8 @@ impl UploadSource {
         require_end_stream: bool,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
         let mut source = UploadSource::Direct(incoming);
-        let join = source.install_pump_with_write_start(
-            auth,
-            write_timeout_ms,
-            true,
-            require_end_stream,
-        );
+        let join =
+            source.install_pump_with_write_start(auth, write_timeout_ms, true, require_end_stream);
         (source, join)
     }
 
