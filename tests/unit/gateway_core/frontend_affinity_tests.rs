@@ -157,14 +157,14 @@ fn http1_requests_allocate_no_affinity_state() {
 
 #[tokio::test]
 async fn early_responses_keep_uploads_counted_until_both_halves_terminate() {
-    use ferrum_edge::proxy::frontend_affinity::retain_upload;
+    use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;
 
     let connection = FrontendConnectionAffinity::with_table(table());
     let mut uploads = Vec::new();
     for _ in 0..AFFINITY_MAX_OPEN_STREAMS {
         let (upload, response) = connection
             .open_stream()
-            .run_request(async { retain_upload(None, None).expect("upload observer") })
+            .run_request(async { retain_backend_stream().expect("backend owner") })
             .await;
         drop(response);
         uploads.push(upload);
@@ -175,53 +175,48 @@ async fn early_responses_keep_uploads_counted_until_both_halves_terminate() {
     drop(next);
 
     for upload in uploads {
-        upload.on_upload_terminated();
-        upload.on_upload_terminated();
+        let clone = upload.clone();
+        drop(upload);
+        drop(clone);
     }
     assert_eq!(connection.open_streams(), 0, "each join releases once");
 }
 
 #[tokio::test]
-async fn upload_completion_waits_for_the_response_and_preserves_the_previous_observer() {
-    use ferrum_edge::proxy::frontend_affinity::retain_upload;
-    use ferrum_edge::proxy::grpc_proxy::GrpcUploadTerminationObserver;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+async fn every_retry_attempt_and_the_response_retain_one_count() {
+    use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;
 
-    struct Observer(AtomicUsize);
-    impl GrpcUploadTerminationObserver for Observer {
-        fn on_upload_terminated(&self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    let observed = Arc::new(Observer(AtomicUsize::new(0)));
-    let observer: Arc<dyn GrpcUploadTerminationObserver> = observed.clone();
     let connection = FrontendConnectionAffinity::with_table(table());
-    let latch = Arc::new(ferrum_edge::proxy::body::DirectH2BytesLatch::new());
-    let (upload, response) = connection
+    let ((first, retry), response) = connection
         .open_stream()
         .run_request(async {
-            retain_upload(Some(observer), Some(&latch)).expect("joined observer")
+            (
+                retain_backend_stream().expect("first backend owner"),
+                retain_backend_stream().expect("retry backend owner"),
+            )
         })
         .await;
-    let reused: Arc<dyn GrpcUploadTerminationObserver> = latch.clone();
-    assert!(
-        Arc::ptr_eq(&upload, &reused),
-        "reuse the request-byte latch allocation"
-    );
-    upload.on_upload_terminated();
-    upload.on_upload_terminated();
-    assert_eq!(observed.0.load(Ordering::Relaxed), 1);
+    assert_eq!(connection.open_streams(), 1);
+    drop(first);
     assert_eq!(connection.open_streams(), 1);
     drop(response);
-    assert_eq!(connection.open_streams(), 0);
-    upload.on_upload_terminated();
+    assert_eq!(connection.open_streams(), 1, "retry still owns queued DATA");
+    drop(retry);
+    assert_eq!(connection.open_streams(), 0, "all owners release once");
+
+    let (upload, response) = connection
+        .open_stream()
+        .run_request(async { retain_backend_stream().expect("backend owner") })
+        .await;
+    drop(upload);
+    assert_eq!(connection.open_streams(), 1, "response still owns the call");
+    drop(response);
     assert_eq!(connection.open_streams(), 0);
 }
 
 #[tokio::test]
 async fn handler_cancellation_joins_the_still_owned_upload() {
-    use ferrum_edge::proxy::frontend_affinity::retain_upload;
+    use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;
 
     let connection = FrontendConnectionAffinity::with_table(table());
     let stream = connection.open_stream();
@@ -229,7 +224,7 @@ async fn handler_cancellation_joins_the_still_owned_upload() {
     let handler = tokio::spawn(async move {
         stream
             .run_request(async move {
-                let upload = retain_upload(None, None).expect("upload observer");
+                let upload = retain_backend_stream().expect("backend owner");
                 assert!(tx.send(upload).is_ok());
                 std::future::pending::<()>().await;
             })
@@ -239,13 +234,13 @@ async fn handler_cancellation_joins_the_still_owned_upload() {
     handler.abort();
     let _ = handler.await;
     assert_eq!(connection.open_streams(), 1);
-    upload.on_upload_terminated();
+    drop(upload);
     assert_eq!(connection.open_streams(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_upload_and_response_termination_releases_each_stream_once() {
-    use ferrum_edge::proxy::frontend_affinity::retain_upload;
+    use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;
     use std::sync::Arc;
 
     let connection = FrontendConnectionAffinity::with_table(table());
@@ -254,13 +249,14 @@ async fn concurrent_upload_and_response_termination_releases_each_stream_once() 
     for _ in 0..AFFINITY_MAX_OPEN_STREAMS {
         let (upload, response) = connection
             .open_stream()
-            .run_request(async { retain_upload(None, None).expect("upload observer") })
+            .run_request(async { retain_backend_stream().expect("backend owner") })
             .await;
         let upload_barrier = Arc::clone(&barrier);
         tasks.spawn(async move {
             upload_barrier.wait().await;
-            upload.on_upload_terminated();
-            upload.on_upload_terminated();
+            let clone = upload.clone();
+            drop(upload);
+            drop(clone);
         });
         let response_barrier = Arc::clone(&barrier);
         tasks.spawn(async move {

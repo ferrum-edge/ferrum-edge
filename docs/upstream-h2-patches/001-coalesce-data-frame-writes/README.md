@@ -109,7 +109,7 @@ CI also runs every Ferrum hyper regression (`ferrum_*`, including patch 002's DA
 
 ## Retirement
 
-Retire when an h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or when Ferrum stops using h2. To retire:
+Retire this patch when an h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or when Ferrum stops using h2. Patch [002-stream-lifetime](../002-stream-lifetime/README.md) must also retire before dropping the vendored crate. To retire the crate after both patches are superseded:
 
 1. Remove the `h2` line from `[patch.crates-io]` in `Cargo.toml`, `tests/performance/mesh/Cargo.toml` and `fuzz/Cargo.toml`.
 2. Drop `vendor/h2-0.4.19-ferrum-patched/` and update the three lockfiles.

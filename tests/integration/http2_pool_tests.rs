@@ -2786,3 +2786,181 @@ async fn test_direct_h1_handoff_gate_returns_the_untouched_connection_to_the_poo
     assert_eq!(accepts.load(Ordering::SeqCst), 1, "no redial");
     backend.abort();
 }
+
+// Hyper's source EOF is earlier than h2 transport completion: final DATA may
+// be queued behind the backend window even after an early terminal response.
+async fn hyper_h2_lifetime_outlives_final_source_data(termination: u8) {
+    use http_body::Body as _;
+    use http_body_util::{BodyExt, Full};
+    use hyper::client::conn::http2;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct Source {
+        body: Full<Bytes>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl http_body::Body for Source {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+            Pin::new(&mut self.body).poll_frame(cx)
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.body.is_end_stream()
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            self.body.size_hint()
+        }
+    }
+
+    impl Drop for Source {
+        fn drop(&mut self) {
+            if let Some(tx) = self.dropped.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    struct Owner(tokio::sync::mpsc::UnboundedSender<()>);
+
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+    let backend = tokio::spawn(async move {
+        let mut conn = h2::server::Builder::new()
+            .initial_window_size(1024)
+            .handshake::<_, Bytes>(server_io)
+            .await
+            .expect("h2 backend");
+        let (request, mut respond) = conn.accept().await.unwrap().unwrap();
+        let mut send = respond.send_response(http::Response::new(()), true).unwrap();
+        let upload = async move {
+            let mut body = request.into_body();
+            let first = body.data().await.unwrap().unwrap();
+            assert_eq!(first.len(), 1024);
+            assert!(!body.is_end_stream());
+            blocked_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            match termination {
+                0 => {
+                    body.flow_control().release_capacity(first.len()).unwrap();
+                    let mut received = first.len();
+                    while let Some(data) = body.data().await {
+                        let data = data.unwrap();
+                        body.flow_control().release_capacity(data.len()).unwrap();
+                        received += data.len();
+                    }
+                    assert_eq!(received, 16 * 1024);
+                }
+                1 => send.send_reset(h2::Reason::CANCEL),
+                2 => return,
+                _ => unreachable!(),
+            }
+            ended_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        };
+        let drive = async move {
+            while conn.accept().await.is_some() {}
+        };
+        tokio::select! {
+            _ = upload => {}
+            _ = drive => panic!("backend connection ended before test teardown"),
+        }
+    });
+    let (mut sender, conn) = http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(client_io))
+        .await
+        .expect("hyper h2 client");
+    let driver = tokio::spawn(conn);
+    let (source_tx, source_rx) = tokio::sync::oneshot::channel();
+    let (owner_tx, mut owner_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut request = http::Request::post("http://backend/upload")
+        .body(Source {
+            body: Full::new(Bytes::from(vec![b'x'; 16 * 1024])),
+            dropped: Some(source_tx),
+        })
+        .unwrap();
+    let lifetime = h2::ext::StreamLifetime::new(Arc::new(Owner(owner_tx)));
+    request.extensions_mut().insert(lifetime);
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        sender.send_request(request),
+    )
+    .await
+    .expect("early response timeout")
+    .expect("early response");
+    let response_body = response.into_body();
+    let body = tokio::time::timeout(Duration::from_secs(5), response_body.collect())
+        .await
+        .expect("terminal response body timeout")
+        .unwrap();
+    assert!(body.to_bytes().is_empty());
+    tokio::time::timeout(Duration::from_secs(5), blocked_rx)
+        .await
+        .expect("blocked upload timeout")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), source_rx)
+        .await
+        .expect("Hyper must drop the final DATA source before credit is released")
+        .unwrap();
+    assert!(
+        matches!(
+            owner_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "transport owner must survive source drop and the terminal response"
+    );
+    release_tx.send(()).unwrap();
+    if termination != 2 {
+        tokio::time::timeout(Duration::from_secs(5), ended_rx)
+            .await
+            .expect("backend drain/reset timeout")
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), owner_rx.recv())
+        .await
+        .expect("transport owner must release after drain/reset/connection close")
+        .expect("completion signal");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), owner_rx.recv())
+            .await
+            .expect("duplicate completion check timeout")
+            .is_none(),
+        "owner releases exactly once"
+    );
+    backend.abort();
+    let _ = backend.await;
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test]
+async fn test_hyper_h2_stream_lifetime_waits_for_queued_final_data_to_drain() {
+    hyper_h2_lifetime_outlives_final_source_data(0).await;
+}
+
+#[tokio::test]
+async fn test_hyper_h2_stream_lifetime_releases_on_backend_reset() {
+    hyper_h2_lifetime_outlives_final_source_data(1).await;
+}
+
+#[tokio::test]
+async fn test_hyper_h2_stream_lifetime_releases_on_connection_teardown() {
+    hyper_h2_lifetime_outlives_final_source_data(2).await;
+}

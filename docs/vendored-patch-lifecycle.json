@@ -867,7 +867,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2.",
+        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. Patch 002 must also retire before removing the vendored crate.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",
@@ -876,6 +876,38 @@
       },
       "regression_tests": [
         "vendor/h2-0.4.19-ferrum-patched (codec::framed_write::ferrum_coalesce_data_frame_writes_tests)"
+      ]
+    },
+    {
+      "id": "h2-002-stream-lifetime",
+      "label": "h2 retains an owned client-stream lifetime through queued DATA drain/reset",
+      "crate": "h2",
+      "vendored_version": "0.4.19",
+      "vendor_path": "vendor/h2-0.4.19-ferrum-patched",
+      "docs_path": "docs/upstream-h2-patches/002-stream-lifetime/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Hyper drops a final DATA source after acquiring only 1 KiB capacity while h2 still owns blocked bytes; source Drop and early terminal responses prematurely released frontend affinity. StreamLifetime retains one shared owner at the actual h2 concurrent-stream drain/reset boundary for all gRPC body representations and retry attempts (#5991, #5588).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h2",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "h2 offers an equivalent owned client-stream completion hook, or Ferrum stops using this backend transport.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/http2_pool_tests.rs (test_hyper_h2_stream_lifetime_*)",
+        "tests/functional/scripted_backend_h2_tests.rs (grpc_affinity_retains_* final DATA, native retry, translated gRPC-Web)",
+        "tests/unit/gateway_core/frontend_affinity_tests.rs"
       ]
     }
   ]

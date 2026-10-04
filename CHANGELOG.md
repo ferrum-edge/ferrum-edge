@@ -42,9 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uploads** (#5991). Failed or cancelled physical shard creates record one
   cooldown before waiting callers elect another creator; those callers borrow
   a ready sibling during cooldown, while a cold pool can still recover
-  immediately. Early terminal responses retain a streaming upload's affinity
-  count until both halves end, including EOF and reset, so more than 32 open
-  uploads spill across the shard ring. The join reuses the request-byte latch.
+  immediately. Early terminal responses retain every gRPC upload's affinity
+  count until its frontend response and all backend attempts end, including
+  final DATA still queued after source EOF, reset, and connection teardown.
+  Streaming, buffered native/retry, and translated/pumped gRPC-Web uploads
+  therefore spill beyond 32 open calls. One shared Arc joins transport owners
+  without extra tasks or locks; source observers and timers remain independent.
   Failure bookkeeping is capped at 4,096 keys and FIFO records with at most one
   eviction per physical failure, replacing full-map scans on failed requests.
 

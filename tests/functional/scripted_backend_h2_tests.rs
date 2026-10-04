@@ -5217,3 +5217,365 @@ async fn grpc_affinity_retains_early_response_uploads_on_plaintext_frontend() {
 async fn grpc_affinity_retains_early_response_uploads_on_tls_frontend() {
     grpc_early_response_upload_affinity(true).await;
 }
+
+// The backend grants only 1 KiB, answers before consuming the upload, and
+// withholds all further credit. Each final 16 KiB DATA must keep a backend
+// stream occupied even after Hyper drops its source and the response ends.
+#[derive(Clone, Copy)]
+enum QueuedGrpcUpload {
+    Streaming,
+    RetryBuffered,
+    WebTrailers,
+    WebPumped,
+}
+
+async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpStream;
+
+    const UPLOADS: usize = 40;
+    const DATA_LEN: usize = 16 * 1024;
+    const WINDOW: usize = 1024;
+    let web = matches!(
+        mode,
+        QueuedGrpcUpload::WebTrailers | QueuedGrpcUpload::WebPumped
+    );
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let listener = reservation.into_listener();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task_accepted = Arc::clone(&accepted);
+    let (blocked_tx, mut blocked_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let backend = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            let id = task_accepted.fetch_add(1, Ordering::Relaxed);
+            let blocked_tx = blocked_tx.clone();
+            let ended_tx = ended_tx.clone();
+            let release_rx = release_rx.clone();
+            connections.spawn(async move {
+                let mut connection = h2::server::Builder::new()
+                    .initial_window_size(WINDOW as u32)
+                    .initial_connection_window_size(2 * 1024 * 1024)
+                    .max_concurrent_streams(128)
+                    .handshake::<_, Bytes>(socket)
+                    .await
+                    .expect("backend h2");
+                let mut uploads = tokio::task::JoinSet::new();
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    assert_eq!(request.headers()["content-type"], "application/grpc");
+                    let index = request
+                        .headers()
+                        .get("x-upload-id")
+                        .map(|value| value.to_str().unwrap().parse::<usize>().unwrap());
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", "0")
+                        .header("x-backend-connection", id.to_string())
+                        .body(())
+                        .expect("early terminal response");
+                    let mut send = respond.send_response(response, true).expect("respond");
+                    let Some(index) = index else {
+                        assert!(
+                            request.into_body().is_end_stream(),
+                            "probe upload is empty"
+                        );
+                        continue;
+                    };
+                    let blocked_tx = blocked_tx.clone();
+                    let ended_tx = ended_tx.clone();
+                    let mut release_rx = release_rx.clone();
+                    uploads.spawn(async move {
+                        let mut body = request.into_body();
+                        let mut received = Vec::new();
+                        while received.len() < WINDOW {
+                            let data = tokio::time::timeout(Duration::from_secs(5), body.data())
+                                .await
+                                .expect("initial DATA timeout")
+                                .expect("initial DATA")
+                                .expect("initial DATA result");
+                            received.extend_from_slice(&data);
+                        }
+                        assert_eq!(received.len(), WINDOW);
+                        assert!(
+                            !body.is_end_stream(),
+                            "final DATA remains flow controlled"
+                        );
+                        blocked_tx.send(index).expect("report withheld credit");
+                        while !*release_rx.borrow_and_update() {
+                            release_rx.changed().await.expect("release signal");
+                        }
+                        if index % 2 != 0 {
+                            send.send_reset(h2::Reason::CANCEL);
+                            // Drop discards unread upload bytes after the reset.
+                            drop(body);
+                            ended_tx.send((index, true)).expect("report reset");
+                            return;
+                        }
+                        body.flow_control()
+                            .release_capacity(received.len())
+                            .expect("release withheld credit");
+                        while let Some(data) = body.data().await {
+                            let data = data.expect("drained DATA");
+                            body.flow_control()
+                                .release_capacity(data.len())
+                                .expect("release drain credit");
+                            received.extend_from_slice(&data);
+                        }
+                        assert_eq!(
+                            received.len(),
+                            DATA_LEN,
+                            "complete native DATA representation"
+                        );
+                        assert_eq!(&received[..5], &[0, 0, 0, 63, 251]);
+                        assert!(received[5..].iter().all(|byte| *byte == b'x'));
+                        let trailers = body.trailers().await.expect("request trailers");
+                        if web {
+                            assert_eq!(
+                                trailers.expect("translated trailers")["x-client-trailer"],
+                                "end"
+                            );
+                        } else {
+                            assert!(trailers.is_none());
+                        }
+                        ended_tx.send((index, false)).expect("report drained upload");
+                    });
+                }
+                while let Some(result) = uploads.join_next().await {
+                    result.expect("backend upload task");
+                }
+            });
+        }
+    });
+
+    // A held refused port forces a real buffered-native retry. The successful
+    // target retains the same 1 KiB window as the other representations.
+    let refused = reserve_refused_tcp_port().expect("refused retry target");
+    let write_timeout_ms = if matches!(mode, QueuedGrpcUpload::WebPumped) {
+        30_000
+    } else {
+        0
+    };
+    let mut proxy = json!({
+        "id": "queued-grpc",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "backend_write_timeout_ms": write_timeout_ms,
+        "backend_read_timeout_ms": 30_000,
+    });
+    let mut upstreams = json!([]);
+    if matches!(mode, QueuedGrpcUpload::RetryBuffered) {
+        proxy["backend_port"] = json!(refused.port);
+        proxy["upstream_id"] = json!("retry-targets");
+        proxy["retry"] = json!({
+            "max_retries": 1,
+            "retry_on_connect_failure": true,
+            "backoff": { "fixed": { "delay_ms": 1 } },
+        });
+        upstreams = json!([{
+            "id": "retry-targets",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": refused.port, "weight": 100 },
+                { "host": "127.0.0.1", "port": backend_port, "weight": 100 },
+            ],
+        }]);
+    }
+    let plugins = if web {
+        json!([{
+            "id": "web",
+            "plugin_name": "grpc_web",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }])
+    } else {
+        json!([])
+    };
+    let yaml = to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [proxy],
+        "upstreams": upstreams,
+        "consumers": [],
+        "plugin_configs": plugins,
+    }));
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "4")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("gateway");
+    let port = reqwest::Url::parse(&harness.proxy_base_url())
+        .expect("frontend URL")
+        .port()
+        .expect("frontend port");
+    let socket = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("frontend socket");
+    let (mut client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+    let driver = tokio::spawn(connection);
+    let mut data = vec![b'x'; DATA_LEN];
+    data[..5].copy_from_slice(&[0, 0, 0, 63, 251]);
+    if web {
+        let trailers = b"x-client-trailer: end\r\n";
+        data.push(0x80);
+        data.extend_from_slice(&(trailers.len() as u32).to_be_bytes());
+        data.extend_from_slice(trailers);
+    }
+    let data = Bytes::from(data);
+    let mut backend_ids = Vec::new();
+    for index in 0..UPLOADS {
+        client = client.ready().await.expect("frontend ready");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost:{port}/api/affinity"))
+            .header(
+                "content-type",
+                if web {
+                    "application/grpc-web+proto"
+                } else {
+                    "application/grpc"
+                },
+            )
+            .header("te", "trailers")
+            .header("x-upload-id", index.to_string())
+            .body(())
+            .expect("request");
+        let (response, mut upload) = client.send_request(request, false).expect("upload");
+        upload
+            .send_data(data.clone(), true)
+            .expect("final 16 KiB DATA");
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("early response timeout")
+            .expect("early response");
+        backend_ids.push(response.headers()["x-backend-connection"].clone());
+        if !web {
+            assert_eq!(response.headers()["grpc-status"], "0");
+        }
+        let mut body = response.into_body();
+        let mut response_bytes = Vec::new();
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(5), body.data())
+            .await
+            .expect("terminal response timeout")
+        {
+            let chunk = chunk.expect("terminal response DATA");
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .expect("response credit");
+            response_bytes.extend_from_slice(&chunk);
+        }
+        if web {
+            assert!(
+                response_bytes
+                    .windows(16)
+                    .any(|bytes| bytes == b"grpc-status: 0\r\n")
+            );
+        } else {
+            assert!(response_bytes.is_empty());
+        }
+        drop(body);
+        let blocked = tokio::time::timeout(Duration::from_secs(5), blocked_rx.recv())
+            .await
+            .expect("withheld-credit timeout")
+            .expect("withheld-credit report");
+        assert_eq!(blocked, index, "every response leaves its upload blocked");
+    }
+    assert!(backend_ids[..32].iter().all(|id| id == &backend_ids[0]));
+    assert!(
+        backend_ids[32..].iter().any(|id| id != &backend_ids[0]),
+        "final DATA still queued after terminal responses must force spill"
+    );
+    assert!(ended_rx.try_recv().is_err(), "no upload has drained or reset");
+    assert!(accepted.load(Ordering::Relaxed) >= 2, "spill widens the pool");
+    if matches!(mode, QueuedGrpcUpload::RetryBuffered) {
+        let logs = harness
+            .wait_for_log_contains(
+                &|logs: &str| logs.contains("Retrying gRPC backend request"),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            logs.contains("Retrying gRPC backend request"),
+            "real native retry required"
+        );
+    }
+
+    release_tx.send(true).expect("drain/reset all uploads");
+    let mut seen = [false; UPLOADS];
+    for _ in 0..UPLOADS {
+        let (index, reset) = tokio::time::timeout(Duration::from_secs(5), ended_rx.recv())
+            .await
+            .expect("upload termination timeout")
+            .expect("upload termination report");
+        assert!(!seen[index], "upload terminates exactly once");
+        seen[index] = true;
+        assert_eq!(reset, index % 2 != 0);
+    }
+    // Allow the backend driver to deliver its last RST/WINDOW_UPDATE. Every
+    // subsequent probe must regain the original preferred shard.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..16 {
+        client = client.ready().await.expect("probe ready");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost:{port}/api/affinity"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .expect("probe");
+        let (response, _) = client.send_request(request, true).expect("empty probe");
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("probe timeout")
+            .expect("probe response");
+        assert_eq!(response.headers()["x-backend-connection"], backend_ids[0]);
+        assert_eq!(response.headers()["grpc-status"], "0");
+        let mut body = response.into_body();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), body.data())
+                .await
+                .expect("probe body timeout")
+                .is_none()
+        );
+    }
+    assert!(ended_rx.try_recv().is_err(), "no duplicate termination report");
+    driver.abort();
+    let _ = driver.await;
+    drop(harness);
+    backend.abort();
+    let _ = backend.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_streaming_final_data_queued_after_source_eof() {
+    grpc_affinity_with_queued_final_data(QueuedGrpcUpload::Streaming).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_retry_buffered_native_final_data() {
+    grpc_affinity_with_queued_final_data(QueuedGrpcUpload::RetryBuffered).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_translated_web_data_and_trailers() {
+    grpc_affinity_with_queued_final_data(QueuedGrpcUpload::WebTrailers).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_pumped_translated_web_data_and_trailers() {
+    grpc_affinity_with_queued_final_data(QueuedGrpcUpload::WebPumped).await;
+}

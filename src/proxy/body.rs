@@ -14,7 +14,7 @@ use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -3163,9 +3163,6 @@ pub(crate) fn direct_h2_uses_limit_adapter(
 pub struct DirectH2BytesLatch {
     done: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
-    /// Streaming gRPC reuses this already allocated latch for the frontend
-    /// upload/response join instead of allocating another per-RPC Arc.
-    pub(crate) frontend_upload_join: OnceLock<super::frontend_affinity::StreamUploadJoin>,
 }
 
 impl Default for DirectH2BytesLatch {
@@ -3179,7 +3176,6 @@ impl DirectH2BytesLatch {
         Self {
             done: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
-            frontend_upload_join: OnceLock::new(),
         }
     }
 

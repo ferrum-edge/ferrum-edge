@@ -76,11 +76,11 @@ pub(crate) const GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER: &str =
 /// Canonical serialized `grpc-status` paired with the gateway message above.
 pub(crate) const GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER: &str = "4";
 
-/// Observer fired exactly when the streaming gRPC **request upload** reaches a
+/// Observer fired exactly when the streaming gRPC **request source** reaches a
 /// terminal state — clean EOF, overflow abort, or stream drop (client/backend
 /// reset). Attached to the `GrpcBody::Streaming` request-body wrapper and
-/// invoked from its `Drop`, which hyper runs once it is done sending the
-/// request body (END_STREAM) or abandons the stream.
+/// invoked from its `Drop`, when hyper finishes polling the source or abandons
+/// it. h2 may still own queued DATA then; this is not transport completion.
 ///
 /// The gRPC transport layer stays agnostic to what the observer does. The proxy
 /// layer wires it to circuit-breaker probe accounting (`GrpcStreamingProbeRecorder`
@@ -289,10 +289,9 @@ impl Drop for GrpcBody {
         {
             accounting.publish(*bytes_seen as u64);
         }
-        // Notify the upload-termination observer when the streaming request
-        // body is dropped. hyper drops it once the upload finishes (END_STREAM)
-        // or the stream is reset, so this is the canonical "request upload
-        // terminated" signal — independent of the response body's lifetime.
+        // Preserve the source observer for probe/accounting publication. Hyper
+        // can drop this body with final DATA still queued inside h2; backend
+        // stream affinity is owned separately by the request extension.
         let upload_observer = match self {
             GrpcBody::Streaming {
                 upload_observer, ..
@@ -404,7 +403,7 @@ impl http_body::Body for GrpcBody {
                         Poll::Ready(Some(Err(e)))
                     }
                     Poll::Ready(None) => {
-                        // Clean END_STREAM: the whole upload is on the wire.
+                        // Source EOF: h2 may still hold queued upload DATA.
                         if let Some(accounting) = request_bytes.as_mut() {
                             accounting.publish(*bytes_seen as u64);
                         }
@@ -4421,8 +4420,13 @@ impl GrpcDispatchSender {
     /// post-wire hyper error.
     async fn send_request(
         &mut self,
-        request: Request<GrpcBody>,
+        mut request: Request<GrpcBody>,
     ) -> Result<hyper::Response<Incoming>, GrpcDispatchSendError> {
+        // Cover every body representation and retry at the common transport
+        // seam. The source observer remains independent of h2 queued DATA.
+        if let Some(lifetime) = super::frontend_affinity::retain_backend_stream() {
+            request.extensions_mut().insert(lifetime);
+        }
         match self {
             Self::H2(sender) => sender
                 .send_request(request)
@@ -4847,10 +4851,6 @@ pub async fn proxy_grpc_request_streaming(
     let auth_deadline = auth.map(|(deadline, family, latch)| {
         crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
     });
-    let upload_observer = super::frontend_affinity::retain_upload(
-        upload_observer,
-        request_bytes.as_ref().map(|accounting| &accounting.latch),
-    );
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
         auth_deadline,
