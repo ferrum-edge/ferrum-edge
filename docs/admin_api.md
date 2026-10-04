@@ -1392,7 +1392,9 @@ reverts it. `GET /proxies/{id}`, `/upstreams/{id}`, `/consumers/{id}`, and
 `/plugins/config/{id}` return a strong `ETag`; send it back as `If-Match` on
 `PUT` or `DELETE` of the same resource and the write is refused with
 `412 Precondition Failed` — writing nothing — unless the stored resource still
-has that representation.
+has the state validated by that tag. The validator covers complete stored
+state, including credentials and associations, rather than the bytes of a
+redacted or role-specific response.
 
 ```bash
 ETAG=$(curl -si -H "Authorization: Bearer $TOKEN" \
@@ -1414,25 +1416,44 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
 - **What the tag covers.** A keyed MAC over the full stored resource, bound to
   its kind, namespace, and id. It changes when any stored field changes,
   including fields redacted from the caller's view and plugin associations
-  (which are compared order-independently). It is keyed by a subkey of
+  (which are compared order-independently). An ordinary consumer GET and the
+  admin-only `GET /consumers/{id}/verification` issue the same tag for the same
+  stored row; verification returns its complete stored credentials and tag
+  together. Conditional backup row tags likewise validate the complete rows
+  in that coherent snapshot. A tag from a redacted GET alone does not let the
+  caller inspect hidden credentials. It is keyed by a subkey of
   `FERRUM_ADMIN_JWT_SECRET` so it cannot be used to test guesses of a redacted
   value; replicas sharing that secret issue identical tags, and rotating it
   invalidates outstanding tags (writes then return `412` until re-read).
-- **Strict parsing.** `*` requires only that the resource exists. Comparison
-  is strong, so a weak `W/"…"` tag never matches. A comma-separated list
+- **Strict parsing for row writes.** `*` requires only that the resource exists.
+  Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
-  treated as absent, and `If-Match` on any other mutating route (including
+  treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the
+  four resource routes above. `POST /restore` supports the separate namespace
+  precondition described below. `If-Match` on any other mutating route (including
   `POST` creates, `/batch`, and `/gateway-trust-bundles/{id}`, which keeps its
   own body `revision` contract) is `400` rather than applied unconditionally.
   A request that would be `404` without the header is still `404`.
-- **After a `412`,** re-read the resource and reapply the intended edits to
-  the current representation. Resending the same body with the fresh tag
+- **Namespace restore precondition.** `GET /backup?conditional=true` returns
+  an `ETag` equal to `conditional.namespace_etag` for the complete coherent
+  namespace state. Send that tag as `If-Match` to `POST /restore?confirm=true`
+  on the same namespace. The store compares the expected snapshot and replaces
+  the namespace in one transaction, including the lease checks; a stale tag
+  returns `412` without replacement. Strong comparison and tag lists apply,
+  but `*`, malformed and empty headers return `400`. A row tag cannot authorize
+  this namespace replacement, and body `conditional` metadata alone does not
+  make restore conditional. An unsupported topology returns `501`; unavailable
+  authoritative state or admission lease returns `503`. See
+  [Conditional snapshots and restore](admin_backup_restore.md#conditional-snapshots-and-restore).
+- **After a `412`,** re-read the resource, or take another conditional namespace
+  backup for restore, and reapply the intended edits to the current state.
+  Resending the same body with the fresh tag
   would revert the change that caused the refusal.
 - **Write responses carry no tag.** Re-read to obtain the tag for the accepted
   state. The cached-config `GET` fallback (`X-Data-Source: cached`) also
   carries none, because it may lag the database.
 - **Unconditional writes are unchanged.** Omitting `If-Match` keeps today's
-  last-writer-wins behavior.
+  last-writer-wins behavior, including unconditional restore.
 
 ## Plugin Configs
 

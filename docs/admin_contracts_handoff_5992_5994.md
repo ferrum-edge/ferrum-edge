@@ -17,13 +17,23 @@ it is not evidence that a ferrum-contracts update has shipped.
 | Inherited backend egress discovery | `src/admin/backend_egress_policy.rs`, `src/admin/mod.rs`, `src/config/env_config.rs`, `docs/admin_api.md`, `openapi.yaml` | `GET /backend-egress-policy`, namespace-authorized JWT reads, `schema_version=1`, `ip_classification=ferrum-private-reserved-v1`, process scope, four enforcement scopes, three modes, evaluation order, dangerous-range and overlay-presence flags, conservative `public_only_guaranteed`. No raw CIDRs, credentials, DNS probe, or DP attestation by CP. |
 | Adoption and release notes | `CHANGELOG.md`, `docs/upgrade_guide.md`, `README.md` | Mark availability against the actual Edge release; update the published contracts tag only after the contract artifacts are released. |
 
-Before release, reconcile the older conditional-write paragraph in
-`docs/admin_api.md` under `Conditional writes (ETag / If-Match)`: it still says
-any other mutating route including `POST` is refused, without the new
-`POST /restore` exception. Cross-check it with
-`openapi.yaml#/components/parameters/IfMatch` and `NamespaceIfMatch`.
-Describe the tags as validators of complete stored state, since ordinary
-consumer responses are redacted; they are not hashes of those response bytes.
+`docs/admin_api.md` under `Conditional writes (ETag / If-Match)` now separates
+the four row `PUT`/`DELETE` routes from the `POST /restore` namespace exception.
+Carry those semantics into the published contract: `IfMatch` and
+`ResourceETag` validate complete stored row state, including privately verified
+credentials, rather than redacted wire bytes. Ordinary consumer reads and
+admin-only verification share the same row tag. `NamespaceIfMatch` instead
+validates the complete coherent namespace snapshot, including its durable
+change watermark; a row tag or body metadata cannot authorize that replacement.
+
+The new route contracts to publish are:
+
+| Route | Successful contract | Refusal semantics to preserve |
+| --- | --- | --- |
+| `GET /consumers/{id}/verification` | `200`, complete stored consumer and matching strong row `ETag`, `Cache-Control: no-store`, mandatory security audit admission before response. | `400` invalid input, `401` missing/invalid JWT, `403` role or namespace denial, `404` absent consumer, `503` unavailable authoritative state, tag key or security audit admission. |
+| `GET /backup?conditional=true` | `200`, unfiltered primary transaction snapshot, namespace `ETag` equal to `conditional.namespace_etag`, all four row-tag maps, `Cache-Control: no-store`. | `400` invalid opt-in/filter/namespace, `401` authentication, `403` authorization, `501` unsupported MongoDB topology, `503` unavailable authoritative snapshot, tag key or security audit admission. No cached fallback. |
+| `POST /restore?confirm=true` with namespace `If-Match` | Atomic compare and complete replacement under transaction lease fencing; response retains the existing restore/live-apply contract and carries no new `ETag`. | `412` stale or weak-only tag, `400` malformed/empty header or wildcard, `501` unsupported topology, `503` unavailable authoritative state/lease. Existing authentication, admission, body-size, confirmation, conflict and live-apply statuses still apply. Omission of the header preserves unconditional restore. |
+| `GET /backend-egress-policy` | `200`, JWT-authorized versioned metadata for the immutable process policy, `Cache-Control: no-store`; available on read-only listeners. | `400` invalid namespace, `401` missing/invalid JWT, `403` namespace claim/ceiling denial. Metrics credentials do not authorize this route. |
 
 The OpenAPI handoff must verify these exact locations in `openapi.yaml`:
 
@@ -38,10 +48,16 @@ The OpenAPI handoff must verify these exact locations in `openapi.yaml`:
 
 ## ferrum-contracts publication work
 
-The existing published contract set does not contain dedicated conditional
-snapshot or backend egress policy artifacts. Root must arrange the corresponding
-ferrum-contracts PR before the Edge release, with real release-tag and full-SHA
-provenance. Do not edit an already published `contracts-edge-*` tag.
+Publication remains outstanding before the next Edge release. On 2026-10-04,
+the inspected ferrum-contracts
+[main tree at `c35f4c9d254820ad96e7e308583135127c2003de`](https://github.com/ferrum-edge/ferrum-contracts/tree/c35f4c9d254820ad96e7e308583135127c2003de)
+and published
+[`contracts-edge-0.9.9-r2` at `591c73a3f965fdab440c3a76b2707accdf491ba5`](https://github.com/ferrum-edge/ferrum-contracts/tree/591c73a3f965fdab440c3a76b2707accdf491ba5)
+have no dedicated conditional snapshot or backend egress policy artifacts;
+their `vocabularies/gateway-headers.json` also has no `ETag`/`If-Match` entries.
+No corresponding open ferrum-contracts PR was present at inspection. Root must
+arrange that PR and publication with the actual Edge release tag and full-SHA
+provenance before release. Do not edit an already published `contracts-edge-*` tag.
 
 Existing exact paths requiring review/update in ferrum-contracts:
 
@@ -84,11 +100,22 @@ policy, default mode, and documented enforcement-path limitations are inherited.
 
 ## Hosted CI and root review
 
-Root must obtain a fresh independent review of the new CI policy logic and
-confirm that `conditional-live-stores` executes all three PostgreSQL, MySQL,
-and replica-set MongoDB tests with `--run-ignored=all -j 1` at the final SHA.
-Local execution was prohibited for this handoff. The new fixture pins were
-verified on 2026-10-04 against Docker Hub tag metadata and registry OCI index
+Review 11 accepted the live fixture behavior and identified a P2 gap in its
+substring guards: a skipped runner, nonfatal cleanup, or MySQL password argv
+could retain every required substring. The guards in
+`tests/unit/config/conditional_live_stores_ci_tests.rs` now parse the active
+YAML job/matrix/steps and pin the complete reviewed shell programs, conditions,
+timeouts and environment wiring. Their negative mutations cover those three
+findings plus exact filter selection, serial ignored tests, TCP authentication,
+query readiness, network bindings, credentials and bounded failure handling.
+The existing `Unit Tests (core)` target includes these unignored tests; hosted
+execution of them is required, not established by this source inspection.
+No global scanner or workflow condition was changed by the guard repair.
+
+Root must confirm hosted CI at the final SHA and actual execution of all three
+PostgreSQL, MySQL and replica-set MongoDB tests in `conditional-live-stores`
+with `--run-ignored=all -j 1`. Local execution was prohibited for this handoff.
+The new fixture pins were verified on 2026-10-04 against Docker Hub tag metadata and registry OCI index
 `Docker-Content-Digest` headers for `postgres:16-alpine`, `mysql:8`, and `mongo:7`.
 The corresponding Docker Hub tag metadata is available at
 [`postgres:16-alpine`](https://hub.docker.com/v2/repositories/library/postgres/tags/16-alpine),
@@ -98,8 +125,8 @@ the immutable index pins live in `.github/workflows/ci.yml`.
 
 At inspected head `302266a85a2b747669e2f29a2def128cdea0efa2`, CI run
 [37190337612](https://github.com/ferrum-edge/ferrum-edge/actions/runs/37190337612)
-passed CI Policy but did not reach the live shard. These deterministic Rust
-failures require the respective source owners; they are outside this CI/docs fix:
+passed CI Policy but did not reach the live shard. It reported these historical
+Rust failures:
 
 - Lint: unused `debug_persistence_failure_redacted` in `src/admin/mod.rs:12412`
   and `clippy::collapsible_if` in `src/admin/conditional_snapshots.rs:353`.
@@ -107,3 +134,10 @@ failures require the respective source owners; they are outside this CI/docs fix
   `tests/integration/admin_backend_egress_policy_tests.rs:126` and unavailable
   `pool()` on `Arc<dyn DatabaseBackend>` in
   `tests/integration/admin_conditional_write_tests.rs:1391`.
+
+The separate source/schema follow-up
+`4405f5e649c0267a5cfecb7e02cc44c7dd89f90e` contains fixes for those findings.
+Its source delta is outside this guard/docs repair; the earlier failed run is
+neither proof of a remaining failure nor evidence that the fixes pass. Hosted
+formatting, compilation, lint, guard mutations and live-store execution for the
+final pushed SHA remain unverified until their actual runs complete.
