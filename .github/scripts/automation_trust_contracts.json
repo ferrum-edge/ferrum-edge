@@ -1,0 +1,37 @@
+{
+  "reviewed_sha": "5d7c29f354c21dc1128f13ec36e7070ed3f5b368",
+  "workflows": {
+    "main-latest-image.yml": {
+      "job_sha256": {
+        "attest": "265f4ce0564843ef067af97d18bae0d29c285b1679ea5f241f9955ad8289631d",
+        "build": "44e04ee4c42037bdcde6310136988af134a755c6be919bdbc484908e9a64ccca",
+        "contract": "269bf144ba3dec5e6e00076ae58ee2d60c6f5bc9cf999adfe367e4a8eba0046a",
+        "manifest": "418bca07f4105834f2c028a0afbae4a34f536e4a247b2a6103b6bfc0d25f315e",
+        "promote": "be135c20f747e9fc398075f250f5ec0df84e16200a4a9ff0d136cec25f19b25c",
+        "resolve": "eeef3648c31050e97d49fd1d7fa80326de7793f5bf044b9344969a40736b798f",
+        "smoke": "403f78289d8ad90a2a3dac10c74af44d0014b23a40ac623f7def2b09cdaeb671"
+      },
+      "prefix_sha256": "1b36762748de2006f81b3a670630ddb729ddea0e6fcd2a103ba3c4238dbf340e"
+    },
+    "release.yml": {
+      "job_sha256": {
+        "anonymous-pull-smoke": "c4725d506554c29c2c24dda91a17f34a65a168356e2f324362b07516106bd143",
+        "attest-release-images": "f5ff858383b1582584574a60f6553140d6775a1c9d0b0fb3d8f2d909e21c045c",
+        "build-release-arm64-cross": "9621b03f5567665230d47ab4928eaa46faddedfdd3db45a0015437c73b239474",
+        "build-release-binaries": "23cc16ca6bf86118329fb5c82bcbfb8566d31b1983c4d955a826eb83db915c6f",
+        "create-release": "71d50d1bde25ee367236ae040b3c0c8856fc4674a447b39e2eb53814308c9cb3",
+        "docker": "b65fb16017cb78cd8ce968e9667190b1ad22ee606f85e42f777e09fe4adb1227",
+        "docker-ebpf": "2bfe5d820d2f1c1727db42f35d9400d3782e3fe4bdb26e9365d084310f963829",
+        "docker-ebpf-manifest": "a46e024aa199e178741332349b16c690b45b8cede4d82bf5b7b15f54ea23ee15",
+        "docker-ebpf-tools-manifest": "c5e311d46fd5daa188c3acb2066c26eff592a04eeb7bfa1590f4ae5f19a79b7d",
+        "docker-manifest": "72466d70d83c3dfb790501f749a7deae37cdd513d4855d9c02684430e090b068",
+        "linux-gnu-abi-release-gate": "5dfc96868b2c6cd1cf7e1e2296217de0dfd3cbef0449e2b0196db8aa01a043a0",
+        "release-attestation-gate": "e0bb15d288f45ada2ba9ccf5408aa22eea3f531134fd0f3faca9fe8a96c71366",
+        "validate-release-sha": "cf802c01870340a5bda8624a98dc2ae8753e00b3a0ed7ca8bf76781028c8a101",
+        "validate-release-version": "a1b12dc5f50a324f299f7c2a1ba2d0e07a9423530e9ac28360ad7d9f898cd68c",
+        "verify-linux-gnu-abi-aarch64": "7a777347173899127241db9ce360cbe69c58ade9b3b495d8f27dc5c31c4b4837"
+      },
+      "prefix_sha256": "f3f7316d720050b245009a6f8b3ff8016e9461b510a56745f707b375241204c0"
+    }
+  }
+}

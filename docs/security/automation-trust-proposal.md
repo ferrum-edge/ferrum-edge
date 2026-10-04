@@ -126,10 +126,33 @@ URLs. Sanitization is presentation control; human review remains mandatory.
 `llm-review-publish.yml` is a separate manual-only, main-only, default-off
 workflow. Its read-only inspect job verifies the source run's workflow path,
 repository, main branch, exact automation revision, successful first attempt,
-one unexpired artifact, reviewed PR/head/base and three human-supplied hashes.
+one unexpired artifact with matching workflow-run metadata, reviewed PR/head/base
+and three human-supplied hashes. Archive download accepts one GitHub-issued HTTPS
+redirect only to `productionresultssa<digits>.blob.core.windows.net`, without
+forwarding any credential. Other storage backends need a separately reviewed
+allowlist change. API and provider redirects and proxy discovery are disabled;
+the provider endpoint is fixed, regardless of input or provider-base environment
+variables.
 Archives are read as data without extraction, with exact filenames, bounded
-sizes, no symlinks, no extra/duplicate members and duplicate JSON-key rejection.
+compressed/member sizes, no symlinks, no extra/duplicate members and duplicate
+JSON-key rejection. JSON must be strictly decoded UTF-8, with finite numbers
+only. Both generator and publisher validate the same closed input/patch schema:
+1–299 unique relative paths, bounded UTF-8 text, a finite status set, and no
+unknown patch fields, invalid Unicode or unexpected controls. These are finite
+data contracts, not a guarantee of complete or truthful patch/model content.
 The publisher regenerates the comment and compares its exact bytes.
+
+Before the environment job can request approval, the read-only inspect job reads
+the actual environment and deployment branch policies. It requires a positive
+environment ID, exactly the named human required reviewer, prevent-self-review,
+explicitly disabled administrator bypass, and one custom deployment policy for
+the exact `main` branch, without tag/wildcard allowances. Missing fields, unknown
+protection rule types, extra reviewers, unavailable APIs or unavailable plan
+features fail closed. It rereads the environment around the branch-policy API
+read, then exports only its validated ID and SHA-256 of the relevant settings
+snapshot (including rule/policy IDs and settings revision) to the dependent job.
+No model text becomes an output. A historical approval alone cannot pass this
+preflight.
 
 The publish job depends on successful inspection, uses the
 `llm-review-publication` environment, and has only contents/actions/PR read plus
@@ -137,11 +160,17 @@ issues write. It runs the same trusted publisher script, without a provider
 secret or model. Before its sole POST, it repeats artifact/identity/head checks
 and requires a real approval in **this publisher run's**
 [`/actions/runs/<id>/approvals`](https://docs.github.com/en/rest/actions/workflow-runs#get-the-review-history-for-a-workflow-run).
-The approval must name the exact environment and user `jeremyjpj0916`
-(ID `31913027`, type `User`), independently of the publisher dispatch actor.
-Absent approval, an unprotected auto-created environment, administrator bypass
-without such a record, another environment, a bot, self-approval, rejection or
-ambiguous history refuses the write. Reruns are refused; create a new inspected
+The approval must name the **same environment ID** admitted before approval and
+user `jeremyjpj0916` (ID `31913027`, type `User`). The publisher also reads its own
+run metadata: its actor and triggering actor must identify the same distinct
+named human on the trusted manual first attempt. Immediately before its sole
+POST, after comment pagination and the live PR read, it revalidates the current
+environment settings/identity against the inspect snapshot and reads actual
+approval history again. Protection drift or a deleted/recreated environment
+refuses the write even when a historical record still says approved. Absent
+approval, an unprotected environment, administrator bypass, another environment,
+a bot, self-approval, rejection or ambiguous history refuses the write. Reruns
+are refused; create a new inspected
 dispatch. Approved repeats are serialized per PR and skip an identical existing
 GitHub Actions comment. Writes are not retried after uncertain HTTP failures.
 The model cannot choose an endpoint, PR number, file path, or command to run.
@@ -215,20 +244,39 @@ to disable the backend, revoke/rotate the Machine connection and investigate
 cached execution. No enrollment, cache deletion, setting or secret is changed
 by this worker. No cache-content signature/hash scheme is invented here.
 
+This candidate does not establish a direct BoringCache compiler-object path into
+signed main-latest **or release** images, and does not claim demonstrated exploit
+closure for that premise. Cold native GitHub compiler-cache hardening addresses
+a separate publication exposure. Nonpublication BuildKit validation images also
+retain registry cache imports, including `ambient-host-udp-live.yml` and
+`production-dockerfile-smoke.yml`; their cached validation evidence remains a
+residual risk alongside cached CI execution and historical signed-image reuse.
+
 ## Hosted evidence and admission
 
 `automation-trust-proposal-checks.yml` runs the new unittest suite on the
 proposal push and relevant PRs, with contents read and no secrets. Tests cover
-exact PR/head fetching, hostile output, artifact replacement, unsafe archives,
-source workflow identity, approval refusal, last-read head motion, exact comment
-destination and repeat-dispatch behavior. For cache/publication, the tests
-compare complete workflow producer/consumer bodies against the immutable b1
-baseline plus the explicitly reviewed cold-only changes, and mutate cache
-restores, wrappers, producer artifact names and build profiles. Cross/crypto
-and nonpublication CI stay byte-identical. This is deliberately stricter than
-checking for isolated strings such as "no-cache" in a comment.
+exact PR/head fetching, hostile output, actual `prepare()` selection/provenance
+checks, rerun/head/base motion during download, unsafe archives, UTF-8/finite
+JSON/schema/byte limits, provider response processing, and the real urllib
+redirect handlers with mocked HTTPS responses. Tests verify no credential
+forwarding, no internal/unknown artifact endpoint, no provider endpoint override,
+protection drift and environment identity, actual preflight outputs, distinct
+human dispatch/approval, exact comment destination, repeat-dispatch behavior and
+an ambiguous POST failure with **exactly one write attempt**, without a retry.
+No test uses live credentials or contacts a model or GitHub.
 
-The frozen baseline in these proposal tests is a regression fixture, **not**
+For publication, structural checks enforce cold BuildKit/native producers and
+same-run binary artifact dependencies, alongside the existing main-latest graph
+parser. `automation_trust_contracts.json` pins the active producer/consumer and
+release gate job bodies and entry conditions at the reviewed `5d7c29f…` candidate;
+only blank/comment-only lines are omitted. Mutations must be rejected by the
+actual contract validator, including structural refusal for cold-boundary changes.
+The fixture does not freeze unrelated `ci.yml` or `fips-build.yml`, so legitimate
+Admin/other main changes no longer break this proposal lane. There is no dynamic
+subprocess baseline helper, network fixture acquisition or opaque process command.
+
+The pinned candidate contract in these proposal tests is a regression fixture, **not**
 an admission mechanism. Future reviewed publication changes must update the
 test expectations deliberately. The trusted Cross checker, publication
 verifier/inventory, digest/admission machinery, settings and main source are
@@ -242,6 +290,10 @@ No local formatter, tests, builds, scripts or model/provider requests were run.
 Local verification is static source/diff inspection and `git diff --check`.
 Hosted checks for the pushed SHA are unverified at worker handoff; root owns
 collection and diagnosis. Do not treat pending/skipped checks as passing.
+The previous exact-head PR run failed the unrelated whole-CI fixture assertion;
+the policy log also identified two opaque fixture-helper commands. This repair
+removes those failure sources without weakening trusted policy. The three
+external frozen release producer/artifact-selection failures remain expected.
 
 ## Exact root and owner checklist
 
@@ -294,8 +346,16 @@ collection and diagnosis. Do not treat pending/skipped checks as passing.
    verify the returned protection rules/branch policies with an owner account.
    See [GitHub environment protection](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
    Put no model credential in this publisher environment. If the plan cannot
-   enforce required reviewers, leave publication off; an environment name or
-   manually created unprotected environment is not approval.
+   enforce required reviewers, leave publication off. GitHub availability differs
+   for public/private repositories and paid plans; verify the actual repository
+   with [the environment API](https://docs.github.com/en/rest/deployments/environments#get-an-environment)
+   and [branch-policy API](https://docs.github.com/en/rest/deployments/branch-policies#list-deployment-branch-policies).
+   Verify those exact read endpoints with the proposed job's existing read-only
+   token, including explicit `can_admins_bypass: false` and branch `type: branch`.
+   If fields or API permission are unavailable, **publication stays off**; do not
+   add a PAT, privileged App/human credential, self-review fallback or implicit
+   allow. An environment name or manual unprotected environment is not approval.
+   This branch does not approve or provision any of this human configuration.
 6. A separate designated maintainer must dispatch publication; the named owner
    cannot both dispatch and approve it. If no second maintainer is available,
    keep publication off and inspect review artifacts privately. Expanding the
@@ -314,7 +374,19 @@ collection and diagnosis. Do not treat pending/skipped checks as passing.
    revision changes, expired artifacts, or a source/publisher rerun. There is an
    unavoidable GitHub read/POST race: a push after the last head read can leave
    an explicitly old-head comment. It never targets a model-chosen PR or claims
-   a new head was reviewed. Inspect uncertain POST outcomes before any retry.
+   a new head was reviewed. The environment/history APIs also offer no atomic
+   settings precondition for a comment POST: changes after the final revalidation
+   remain a residual race. Revision/ID checks catch observed drift, not every
+   transient change between reads. Inspect uncertain POST outcomes before any
+   manually authorized new dispatch; the publisher itself never retries.
+
+The five findings in the independent whole-candidate review are addressed in
+this repair: current environment admission/binding (P1), relevant publication
+contracts instead of whole-CI equality (P2), removal of opaque fixture subprocesses
+(P2), behavioral trust-boundary coverage (P2), and strict JSON/shared patch schema
+(P3). This records implementation disposition only. Root must still perform a
+fresh whole-candidate review and focused review of this delta, collect exact-head
+hosted results, and arrange actual trusted-base admission before any adoption.
 
 Remaining costs/limitations: cold publication takes longer and both eBPF
 families compile independently; existing timeout budgets must be measured on

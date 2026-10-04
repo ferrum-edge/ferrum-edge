@@ -17,6 +17,7 @@ on:
       - .github/scripts/generate_llm_review.py
       - .github/scripts/publish_llm_review.py
       - .github/scripts/test_automation_trust.py
+      - .github/scripts/automation_trust_contracts.json
 
 permissions:
   contents: read
@@ -28,7 +29,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          fetch-depth: 0
           persist-credentials: false
       - name: Exercise artifact, approval, and publication producer/consumer contracts
         run: python3 -I .github/scripts/test_automation_trust.py

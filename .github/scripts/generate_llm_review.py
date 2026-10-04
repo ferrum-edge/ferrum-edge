@@ -24,12 +24,15 @@ def fetch_input(pr_number, head, api=io.github_api):
     pr = api(path)
     base = io.validate_pr(pr, pr_number, head)
     compare = api(f"repos/{io.REPOSITORY}/compare/{base}...{head}?per_page=1")
+    io.require(isinstance(compare, dict) and isinstance(compare.get("base_commit"), dict),
+               "malformed comparison identity")
     io.require(compare.get("base_commit", {}).get("sha") == base, "wrong comparison base")
     io.require(compare.get("status") in ("ahead", "diverged"), "no reviewable comparison")
     files = compare.get("files")
     # GitHub caps comparison files at 300; never quietly accept that cap.
     io.require(isinstance(files, list) and 0 < len(files) < 300, "missing or capped patch list")
-    io.require(pr.get("changed_files") == len(files), "incomplete patch list")
+    io.require(type(pr.get("changed_files")) is int and pr["changed_files"] == len(files),
+               "incomplete patch list")
     patches = []
     for item in files:
         io.require(isinstance(item, dict), "malformed comparison file")
@@ -37,9 +40,9 @@ def fetch_input(pr_number, head, api=io.github_api):
         io.require(isinstance(name, str) and isinstance(patch, str) and patch,
                    "binary, missing or empty patch requires manual review")
         patches.append({"path": name, "status": item.get("status"), "patch": patch})
-    data = io.json_bytes({"schema": 1, "repository": io.REPOSITORY, "pr": pr_number,
-                          "head": head, "base": base, "patches": patches})
-    io.require(len(data) <= io.INPUT_LIMIT, "patch input is too large; review manually")
+    value = {"schema": 1, "repository": io.REPOSITORY, "pr": pr_number,
+             "head": head, "base": base, "patches": patches}
+    data = io.json_bytes(io.validate_input(value, pr_number, head, base))
     io.validate_pr(api(path), pr_number, head, base)
     return data, base
 
@@ -53,27 +56,38 @@ def model_payload(model, data):
             "messages": [{"role": "user", "content": data.decode("utf-8")}], "tools": []}
 
 
+def provider_review(model, data, request=io.request_bytes):
+    key = os.environ.get("ANTHROPIC_REVIEW_API_KEY", "")
+    io.require(bool(key), "dedicated review API key is missing")
+    payload = model_payload(model, data)
+    response = io.load_json(request(
+        "https://api.anthropic.com/v1/messages",
+        {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+        payload=io.json_bytes(payload),
+    ))
+    io.require(isinstance(response, dict) and response.get("type") == "message"
+               and response.get("role") == "assistant"
+               and response.get("stop_reason") == "end_turn", "model output did not complete")
+    blocks = response.get("content")
+    io.require(isinstance(blocks, list) and 0 < len(blocks) <= 100 and all(
+        isinstance(block, dict) and {"type", "text"} <= set(block) <= {"type", "text", "citations"}
+        and block.get("citations") is None and block["type"] == "text"
+        and isinstance(block.get("text"), str) for block in blocks
+    ), "unexpected model response; tool calls are refused")
+    review = "\n".join(block["text"] for block in blocks)
+    output = review.encode("utf-8")
+    io.require(0 < len(output) <= io.OUTPUT_LIMIT and bool(review.strip()),
+               "model output is empty or oversized")
+    return review
+
+
 def main():
     trusted_sha = io.trusted_context()
     pr_number = io.number(os.environ.get("REVIEW_PR"))
     head = io.hex_value(os.environ.get("REVIEW_HEAD"), 40)
     run_id = io.number(os.environ.get("GITHUB_RUN_ID"))
     data, base = fetch_input(pr_number, head)
-    key = os.environ.get("ANTHROPIC_REVIEW_API_KEY", "")
-    io.require(bool(key), "dedicated review API key is missing")
-    payload = model_payload(os.environ.get("REVIEW_MODEL"), data)
-    response = io.load_json(io.request_bytes(
-        "https://api.anthropic.com/v1/messages",
-        {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-        payload=io.json_bytes(payload),
-    ))
-    io.require(response.get("stop_reason") == "end_turn", "model output did not complete")
-    blocks = response.get("content")
-    io.require(isinstance(blocks, list) and blocks and all(
-        isinstance(block, dict) and block.get("type") == "text"
-        and isinstance(block.get("text"), str) for block in blocks
-    ), "unexpected model response; tool calls are refused")
-    review = "\n".join(block["text"] for block in blocks)
+    review = provider_review(os.environ.get("REVIEW_MODEL"), data)
     output = review.encode("utf-8")
     comment = io.render_comment(review, pr_number, head, io.digest(data), run_id)
     io.validate_pr(io.github_api(f"repos/{io.REPOSITORY}/pulls/{pr_number}"), pr_number, head, base)
