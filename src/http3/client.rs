@@ -2095,11 +2095,7 @@ impl Http3ConnectionPool {
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         self.create_or_get_proxy_sender_with_connect_deadline(
-            key,
-            proxy,
-            tls_config,
-            h3_config,
-            None,
+            key, proxy, tls_config, h3_config, None,
         )
         .await
     }
@@ -2119,13 +2115,8 @@ impl Http3ConnectionPool {
                 let tls_config = tls_config.clone();
                 let h3_config = h3_config.clone();
                 async move {
-                    self.create_connection(
-                        proxy,
-                        &tls_config,
-                        Some(&h3_config),
-                        connect_at,
-                    )
-                    .await
+                    self.create_connection(proxy, &tls_config, Some(&h3_config), connect_at)
+                        .await
                 }
             })
             .await
@@ -2144,12 +2135,7 @@ impl Http3ConnectionPool {
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         self.create_or_get_target_sender_with_connect_deadline(
-            key,
-            proxy,
-            target,
-            tls_config,
-            h3_config,
-            None,
+            key, proxy, target, tls_config, h3_config, None,
         )
         .await
     }
@@ -3458,12 +3444,7 @@ impl Http3ConnectionPool {
             Some(&connect_at),
         );
         let pooled = match await_h3_connection_checkout(auth, &connect_at, create, || {
-            h3_backend_connect_timeout(
-                proxy,
-                &proxy.backend_host,
-                proxy.backend_port,
-                "HTTP/3",
-            )
+            h3_backend_connect_timeout(proxy, &proxy.backend_host, proxy.backend_port, "HTTP/3")
         })
         .await
         {
@@ -3902,12 +3883,7 @@ impl Http3ConnectionPool {
             Some(&connect_at),
         );
         let pooled = match await_h3_connection_checkout(auth, &connect_at, create, || {
-            h3_backend_connect_timeout(
-                proxy,
-                &proxy.backend_host,
-                proxy.backend_port,
-                "HTTP/3",
-            )
+            h3_backend_connect_timeout(proxy, &proxy.backend_host, proxy.backend_port, "HTTP/3")
         })
         .await
         {
@@ -4089,12 +4065,7 @@ impl Http3ConnectionPool {
             Some(&connect_at),
         );
         let pooled = match await_h3_connection_checkout(auth, &connect_at, create, || {
-            h3_backend_connect_timeout(
-                proxy,
-                &proxy.backend_host,
-                proxy.backend_port,
-                "HTTP/3",
-            )
+            h3_backend_connect_timeout(proxy, &proxy.backend_host, proxy.backend_port, "HTTP/3")
         })
         .await
         {
@@ -4703,12 +4674,7 @@ impl Http3ConnectionPool {
             Some(&connect_at),
         );
         let pooled = match await_h3_connection_checkout(auth, &connect_at, create, || {
-            h3_backend_connect_timeout(
-                proxy,
-                &proxy.backend_host,
-                proxy.backend_port,
-                "HTTP/3",
-            )
+            h3_backend_connect_timeout(proxy, &proxy.backend_host, proxy.backend_port, "HTTP/3")
         })
         .await
         {

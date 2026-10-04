@@ -1976,7 +1976,10 @@ async fn assert_h3_upload_expiry_summary(harness: &GatewayHarness, completed: bo
         .wait_for_stable_log_count(summary_count, 1, Duration::from_secs(12))
         .await;
     let logs = harness.captured_combined().unwrap_or_default();
-    assert_eq!(count, 1, "one actual terminal summary must be emitted: {logs}");
+    assert_eq!(
+        count, 1,
+        "one actual terminal summary must be emitted: {logs}"
+    );
     let summary = logs
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -1989,7 +1992,10 @@ async fn assert_h3_upload_expiry_summary(harness: &GatewayHarness, completed: bo
         summary["metadata"]["authorization.termination_reason"],
         "credential_expired"
     );
-    assert_eq!(summary["body_completed"].as_bool().unwrap_or(false), completed);
+    assert_eq!(
+        summary["body_completed"].as_bool().unwrap_or(false),
+        completed
+    );
     assert_eq!(
         summary["client_disconnected"].as_bool().unwrap_or(false),
         !completed
@@ -2011,7 +2017,10 @@ async fn assert_h3_expiry_lb_connections(harness: &GatewayHarness, expected: i64
                 .iter()
                 .filter(|entry| entry["upstream_id"] == "h3-expiry-lb")
                 .flat_map(|entry| {
-                    entry["targets"].as_object().expect("target counts").values()
+                    entry["targets"]
+                        .as_object()
+                        .expect("target counts")
+                        .values()
                 })
                 .filter_map(Value::as_i64)
                 .sum();

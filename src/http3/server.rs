@@ -7487,7 +7487,11 @@ async fn handle_h3_request(
                     error_class: Some(h3_error_class),
                     body_completed: reject_sent,
                     client_disconnected: !reject_sent,
-                    bytes_received: if reject_sent { reject_body.len() as u64 } else { 0 },
+                    bytes_received: if reject_sent {
+                        reject_body.len() as u64
+                    } else {
+                        0
+                    },
                     bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                     metadata: crate::proxy::clone_log_metadata(&ctx),
                     ai_usage_export: ctx.ai_usage_export.clone(),
@@ -13642,11 +13646,7 @@ async fn record_failed_h3_grpc_dispatch(
 
 fn record_h3_grpc_dispatch_attempt(ctx: &mut RequestContext, failure: &H3GrpcDispatchFailure) {
     ctx.record_backend_dispatch_outcome(Some(failure.h3_error_class), failure.request_on_wire);
-    ctx.record_backend_attempt(
-        Some(failure.h3_error_class),
-        failure.request_on_wire,
-        None,
-    );
+    ctx.record_backend_attempt(Some(failure.h3_error_class), failure.request_on_wire, None);
 }
 
 /// Drive the production failure carrier and attempt recorder without a socket.
@@ -13659,11 +13659,7 @@ pub fn h3_grpc_authorization_failure_provenance_for_test(
         request_on_wire,
         true,
     );
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/".to_string(),
-    );
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "POST".to_string(), "/".to_string());
     record_h3_grpc_dispatch_attempt(&mut ctx, &failure);
     let state = match ctx.backend_dispatch_state() {
         crate::plugins::BackendDispatchState::PreWireFailure => "pre_wire",
@@ -17548,9 +17544,9 @@ async fn send_h3_backend_failure_response(
                 crate::http3::stream_util::halt_request_body(stream);
                 match error {
                     crate::http3::stream_util::H3ResponseWriteError::Write(error) => Err(error),
-                    crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded => {
-                        Err(anyhow::anyhow!("authorization terminal write grace exceeded"))
-                    }
+                    crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded => Err(
+                        anyhow::anyhow!("authorization terminal write grace exceeded"),
+                    ),
                 }
             }
         }

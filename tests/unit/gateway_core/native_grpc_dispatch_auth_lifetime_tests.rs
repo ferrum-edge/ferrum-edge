@@ -1134,8 +1134,9 @@ async fn native_h3_cold_checkout_retains_earliest_connect_client_or_authorizatio
         assert_eq!(polls.load(Ordering::Relaxed), 1);
         tokio::time::advance(Duration::from_secs(1)).await;
         late_error_ready.store(true, Ordering::Relaxed);
-        let (termination, request_on_wire, client_expired, class) =
-            wait.await.expect_err("the captured earliest bound must win");
+        let (termination, request_on_wire, client_expired, class) = wait
+            .await
+            .expect_err("the captured earliest bound must win");
         assert_eq!(
             termination,
             expected_auth.then_some(StreamAuthTermination::CredentialExpired)
@@ -1174,10 +1175,8 @@ async fn generic_grpc_late_attempt_clock_cannot_replace_authorization_or_actual_
             "POST".to_string(),
             "/pkg.Svc/Call".to_string(),
         );
-        ctx.headers.insert(
-            "content-type".to_string(),
-            "application/grpc".to_string(),
-        );
+        ctx.headers
+            .insert("content-type".to_string(), "application/grpc".to_string());
         ctx.authenticated_identity = Some("accepted-principal".to_string());
         set_request_credential_deadline_for_test(
             &mut ctx,
@@ -1219,7 +1218,11 @@ async fn generic_grpc_late_attempt_clock_cannot_replace_authorization_or_actual_
                 .map(String::as_str),
             Some("credential_expired")
         );
-        assert!(!plan.2.record_once(StreamAuthTermination::CredentialExpired, plan.1));
+        assert!(
+            !plan
+                .2
+                .record_once(StreamAuthTermination::CredentialExpired, plan.1)
+        );
     }
 }
 
@@ -1255,14 +1258,22 @@ async fn generic_grpc_charges_only_its_deadline_terminal_after_observable_handof
         let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
         let mut response = client_deadline_response(&ctx, &headers, false);
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(plan.2.record_once(StreamAuthTermination::CredentialExpired, plan.1));
+        assert!(
+            plan.2
+                .record_once(StreamAuthTermination::CredentialExpired, plan.1)
+        );
         assert!(!charge_route_attempt(&ctx, &headers, true, &mut response));
         assert!(!response.request_on_wire);
         assert_eq!(response.error_class, Some(ErrorClass::ClientDisconnect));
 
         let mut cancellation = authorization_response(true);
         cancellation.status_code = 502;
-        assert!(!charge_route_attempt(&ctx, &headers, true, &mut cancellation));
+        assert!(!charge_route_attempt(
+            &ctx,
+            &headers,
+            true,
+            &mut cancellation
+        ));
         assert_eq!(cancellation.error_class, Some(ErrorClass::ClientDisconnect));
 
         let mut response = client_deadline_response(&ctx, &headers, true);
