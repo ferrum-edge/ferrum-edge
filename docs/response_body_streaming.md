@@ -64,6 +64,17 @@ When `response_body_mode: stream` is active and no plugin requires buffering, th
 
 This means the client sees the first byte of the response as soon as the backend sends it, rather than waiting for the entire response to be collected — unless adaptive buffering applies.
 
+The H1/H2 frontend and routing handler store boxed concrete futures. Routing
+also boxes each selected backend attempt; generic dispatch boxes its selected
+large transport child. These boxes keep child state out of enclosing coroutine
+poll frames and add heap allocations: one
+frontend box per request beyond the existing routing box, one per attempt,
+and one per selected generic transport. They run in the original request task,
+preserving task-local affinity, cancellation, and request/response/body/backend
+guards. Coroutine-size checks complement
+real default-stack listener tests; a boxed async trampoline alone would still
+embed its awaited child and would not establish a small poll frame.
+
 ### Small Response Buffering
 
 When a backend response has a known `Content-Length ≤ 64 KiB` (configurable), the gateway collects the entire body into a single bounded allocation instead of streaming it through the coalescing adapter. For typical JSON API payloads this is cheaper than driving the adapter's poll loop and frame accounting. Responses without `Content-Length` or with `Content-Length` above the cutoff always stream.

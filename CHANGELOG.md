@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **H1/H2 listener dispatch keeps large child futures out of enclosing poll
+  frames** (#5993). The frontend boxes its concrete handler rather than an
+  async trampoline, and routing/backend dispatch boxes its selected child
+  futures through synchronous out-of-line factories. This adds one frontend
+  allocation per request beyond the existing routing box and one box per
+  backend attempt. Generic HBONE, sidecar mTLS, H3, direct-H2, and direct-H1
+  dispatch also box the selected transport. Polling and cancellation stay in
+  the request's task, preserving affinity scopes and request/body/backend
+  ownership. Ordinary
+  hosted tests cover concrete future-size budgets and real H1/H2 listener
+  traffic on default worker stacks.
+
 - **Redis semantic-cache quarantine now compares the observed value atomically** (#5986). Invalid
   bounded values are deleted only if their raw bytes still match the value read, preserving a
   concurrent replacement. The dedicated watched comparison transfers at most the observed

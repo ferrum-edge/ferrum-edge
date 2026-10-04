@@ -477,13 +477,15 @@ fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 /// Code outside `//` comments with every whitespace character removed, so a
-/// structural scan depends neither on prose nor on how rustfmt wraps a call.
+/// structural scan depends neither on prose nor on how rustfmt wraps a call
+/// or inserts an optional trailing argument comma.
 fn compact_code(text: &str) -> String {
     text.lines()
         .filter(|line| !line.trim_start().starts_with("//"))
         .flat_map(str::chars)
         .filter(|c| !c.is_whitespace())
-        .collect()
+        .collect::<String>()
+        .replace(",)", ")")
 }
 
 /// Byte offset of `pattern` in `haystack`, or a failure naming it.
@@ -1066,7 +1068,7 @@ fn authorization_placeholders_keep_actual_handoff_separate_from_neutral_health()
             "record_backend_dispatch_outcome(result.error_class, !result.connection_error)"
         )
     );
-    let compact_proxy: String = proxy.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let compact_proxy = compact_code(proxy);
     assert!(
         compact_proxy.contains(
             "authorization_expired_dispatch_placeholder(resolved_ip,e.request_on_wire())"

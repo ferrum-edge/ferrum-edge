@@ -32082,14 +32082,23 @@ pub async fn handle_proxy_request(
     .await
 }
 
-/// Keep the frontend request future behind a pointer before the service moves
-/// it into the HTTP/2 affinity scope. That scope nests task-local futures and
-/// returns the response-side stream guard; embedding the request in each layer
-/// multiplies its construction temporaries on the connection driver's stack.
-///
-/// Box an async trampoline out of line, rather than constructing the handler
-/// as a `Box::pin` argument. Polling stays in the caller's task and affinity
-/// scope, and dropping the box still cancels the request and its guards.
+/// Construct and box a concrete child future in a separate synchronous frame.
+/// The closure captures arguments, but does not await or store the child. In
+/// particular, an async trampoline would still include its awaited child in
+/// its state and add another large poll frame. Callers store only the returned
+/// pointer; construction and polling remain in the same task and task locals.
+/// Dropping the pointer cancels the child and releases its existing guards.
+#[inline(never)]
+fn boxed_proxy_future<F>(construct: impl FnOnce() -> F) -> std::pin::Pin<Box<F>>
+where
+    F: std::future::Future,
+{
+    Box::pin(construct())
+}
+
+/// Box the concrete frontend future before the affinity task-local scopes.
+/// The factory constructs it out of line, and the routing handler separately
+/// boxes its dispatch children so they do not enlarge its own poll frame.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_handle_proxy_request_on_frontend_port(
@@ -32102,19 +32111,116 @@ fn boxed_handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
-    Box::pin(async move {
-        handle_proxy_request_on_frontend_port(
-            req,
-            state,
-            remote_addr,
-            is_tls,
-            tls_client_cert_der,
-            tls_client_cert_chain_der,
-            mtls_auth_connection_cache,
-            connection_metadata,
-        )
-        .await
-    })
+    Box::pin(handle_proxy_request_on_frontend_port(
+        req,
+        state,
+        remote_addr,
+        is_tls,
+        tls_client_cert_der,
+        tls_client_cert_chain_der,
+        mtls_auth_connection_cache,
+        connection_metadata,
+    ))
+}
+
+/// Compiled coroutine sizes for external stack regressions. The type probes
+/// never invoke their constructors, allocate a request, or start a dispatch.
+#[doc(hidden)]
+pub mod request_stack_test_support {
+    use super::*;
+
+    fn request_size<F: std::future::Future>(
+        _construct: impl FnOnce(Request<Incoming>, Arc<ProxyState>) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    fn dispatch_size<'a, F: std::future::Future>(
+        _construct: impl FnOnce(
+            Request<Incoming>,
+            &'a ProxyState,
+            &'a Proxy,
+            &'a RequestContext,
+            &'a mut Instant,
+            &'a BackendAttemptHandoff,
+        ) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    /// Boxed frontend, concrete frontend, concrete routing handler, and
+    /// concrete backend attempt sizes, including their awaited child state.
+    pub fn future_sizes() -> [usize; 4] {
+        [
+            request_size(|req, state| {
+                boxed_handle_proxy_request_on_frontend_port(
+                    req,
+                    state,
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    false,
+                    None,
+                    None,
+                    None,
+                    RequestConnectionMetadata::default(),
+                )
+            }),
+            request_size(|req, state| {
+                handle_proxy_request_on_frontend_port(
+                    req,
+                    state,
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    false,
+                    None,
+                    None,
+                    None,
+                    RequestConnectionMetadata::default(),
+                )
+            }),
+            request_size(|req, state| {
+                handle_proxy_request_inner(
+                    req,
+                    state,
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    false,
+                    None,
+                    None,
+                    None,
+                    RequestConnectionMetadata::default(),
+                )
+            }),
+            dispatch_size(|req, state, proxy, ctx, started, handoff| {
+                proxy_to_backend(
+                    state,
+                    proxy,
+                    "http://127.0.0.1/",
+                    "GET",
+                    &ctx.headers,
+                    ClientRequestBody::Streaming(Box::new(req)),
+                    None,
+                    &[],
+                    &[],
+                    PreacquiredBackendAdmission::default(),
+                    None,
+                    ctx,
+                    true,
+                    false,
+                    true,
+                    false,
+                    false,
+                    "127.0.0.1",
+                    "127.0.0.1",
+                    false,
+                    false,
+                    false,
+                    false,
+                    &ctx.bytes_sent_observed,
+                    hyper::Version::HTTP_11,
+                    started,
+                    handoff,
+                )
+            }),
+        ]
+    }
 }
 
 /// HTTP/1.1 and HTTP/2 frontend service boundary: every response the gateway
@@ -32411,17 +32517,10 @@ async fn admit_proxy_request_on_frontend_port(
     })
 }
 
-/// Keep the full routing/dispatch future out of the admission wrapper and
-/// Hyper's per-stream service future. In particular, H2 constructs and moves
-/// that service future before spawning it; boxing a task at spawn time does
-/// not bound those earlier stack temporaries. Rejection-only boxes also leave
-/// the successful direct-H2 dispatch pipeline embedded in every service call.
-///
-/// Box an async trampoline out of line so construction captures only the
-/// arguments, rather than first materializing the full routing future as a
-/// `Box::pin` argument on the admission poll stack. The caller retains the
-/// request guard and attaches it to the body exactly as before; dropping this
-/// future still cancels the same request.
+/// Construct the routing future out of line and return only its pointer to
+/// admission and Hyper. The caller retains the request guard and transfers it
+/// to the response body. Backend and native gRPC dispatch futures are boxed
+/// separately: boxing this handler alone does not reduce its poll temporaries.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_handle_proxy_request_inner(
@@ -32434,19 +32533,16 @@ fn boxed_handle_proxy_request_inner(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
-    Box::pin(async move {
-        handle_proxy_request_inner(
-            req,
-            state,
-            remote_addr,
-            is_tls,
-            tls_client_cert_der,
-            tls_client_cert_chain_der,
-            mtls_auth_connection_cache,
-            connection_metadata,
-        )
-        .await
-    })
+    Box::pin(handle_proxy_request_inner(
+        req,
+        state,
+        remote_addr,
+        is_tls,
+        tls_client_cert_der,
+        tls_client_cert_chain_der,
+        mtls_auth_connection_cache,
+        connection_metadata,
+    ))
 }
 
 /// Inner implementation of [`handle_proxy_request`] — separated so the outer
@@ -36880,30 +36976,32 @@ async fn handle_proxy_request_inner(
             // The attempt's `otel_tracing` CLIENT span (issue #5864).
             let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
             let result = {
-                let attempt = grpc_proxy::proxy_grpc_request_core(
-                    grpc_method,
-                    grpc_headers,
-                    grpc_req_body.clone(),
-                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                    grpc_dispatch_proxy,
-                    &grpc_backend_url,
-                    // The transport materialized for THIS target before any dial:
-                    // the direct pool for an untagged target, the nested-HTTP/2
-                    // HBONE transport for an Ambient `mesh.hbone` one. A
-                    // `mesh.mtls` target never reaches here — it is routed onto the
-                    // generic mesh-mTLS path by `grpc_mesh_dispatch_falls_through`
-                    // and defensively refused by the screen above (issues #2003,
-                    // #3284, #3728).
-                    &grpc_transport,
-                    &state.dns_cache,
-                    attempt_span.headers(headers_view),
-                    grpc_should_stream,
-                    effective_max_response_body_size_bytes,
-                    ctx.grpc_deadline_at(),
-                    // Bounds the sender acquisition, the handoff, and the
-                    // response-header wait (GHSA-xcg4-wj3x-gjj2).
-                    grpc_buffered_upload_auth_deadline.as_ref(),
-                );
+                let attempt = boxed_proxy_future(|| {
+                    grpc_proxy::proxy_grpc_request_core(
+                        grpc_method,
+                        grpc_headers,
+                        grpc_req_body.clone(),
+                        crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                        grpc_dispatch_proxy,
+                        &grpc_backend_url,
+                        // The transport materialized for THIS target before any dial:
+                        // the direct pool for an untagged target, the nested-HTTP/2
+                        // HBONE transport for an Ambient `mesh.hbone` one. A
+                        // `mesh.mtls` target never reaches here — it is routed onto the
+                        // generic mesh-mTLS path by `grpc_mesh_dispatch_falls_through`
+                        // and defensively refused by the screen above (issues #2003,
+                        // #3284, #3728).
+                        &grpc_transport,
+                        &state.dns_cache,
+                        attempt_span.headers(headers_view),
+                        grpc_should_stream,
+                        effective_max_response_body_size_bytes,
+                        ctx.grpc_deadline_at(),
+                        // Bounds the sender acquisition, the handoff, and the
+                        // response-header wait (GHSA-xcg4-wj3x-gjj2).
+                        grpc_buffered_upload_auth_deadline.as_ref(),
+                    )
+                });
                 tokio::pin!(attempt);
                 attempt_span.scope(attempt).await
             };
@@ -37053,40 +37151,44 @@ async fn handle_proxy_request_inner(
                 // The attempt's `otel_tracing` CLIENT span (issue #5864).
                 let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
                 let result = {
-                    let attempt = grpc_proxy::proxy_grpc_request_streaming(
-                        request,
-                        grpc_dispatch_proxy,
-                        &grpc_backend_url,
-                        // Same materialized transport as the buffered arms. A
-                        // fully-streamed (non-replayable) upload can therefore ride
-                        // the Ambient HBONE tunnel's nested HTTP/2 connection with
-                        // frames committed incrementally and no retry (issue #3728).
-                        &grpc_transport,
-                        &state.dns_cache,
-                        attempt_span.headers(headers_view),
-                        effective_max_grpc_recv_size_bytes,
-                        body_size_exceeded,
-                        upload_observer,
-                        ctx.grpc_deadline_at(),
-                        &mut held_frontend_grpc_upload,
-                        // Scans the upload's own framing: a pass-through
-                        // gRPC-Web upload counts decoded message frames only.
-                        Some(
-                            crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
-                                Arc::clone(&ctx.grpc_request_messages_observed),
-                                crate::plugins::grpc_web::request_upload_grpc_message_framing(&ctx),
+                    let attempt = boxed_proxy_future(|| {
+                        grpc_proxy::proxy_grpc_request_streaming(
+                            request,
+                            grpc_dispatch_proxy,
+                            &grpc_backend_url,
+                            // Same materialized transport as the buffered arms. A
+                            // fully-streamed (non-replayable) upload can therefore ride
+                            // the Ambient HBONE tunnel's nested HTTP/2 connection with
+                            // frames committed incrementally and no retry (issue #3728).
+                            &grpc_transport,
+                            &state.dns_cache,
+                            attempt_span.headers(headers_view),
+                            effective_max_grpc_recv_size_bytes,
+                            body_size_exceeded,
+                            upload_observer,
+                            ctx.grpc_deadline_at(),
+                            &mut held_frontend_grpc_upload,
+                            // Scans the upload's own framing: a pass-through
+                            // gRPC-Web upload counts decoded message frames only.
+                            Some(
+                                crate::plugins::mesh::prometheus_helpers::GrpcMessageTap::new(
+                                    Arc::clone(&ctx.grpc_request_messages_observed),
+                                    crate::plugins::grpc_web::request_upload_grpc_message_framing(
+                                        &ctx,
+                                    ),
+                                ),
                             ),
-                        ),
-                        // The buffered arms `fetch_max` the collected length into
-                        // this counter; the streamed arm has no collected length,
-                        // so the body publishes its forwarded DATA tally at upload
-                        // termination instead (GHSA-8x5h-g4xh-hgc9).
-                        Some(request_bytes_accounting),
-                        // Same absolute plan the buffered gRPC arms use (#3815);
-                        // the fully-streamed upload gets the gateway-owned pump
-                        // instead of a bounded collect.
-                        grpc_buffered_upload_auth_deadline.as_ref(),
-                    );
+                            // The buffered arms `fetch_max` the collected length into
+                            // this counter; the streamed arm has no collected length,
+                            // so the body publishes its forwarded DATA tally at upload
+                            // termination instead (GHSA-8x5h-g4xh-hgc9).
+                            Some(request_bytes_accounting),
+                            // Same absolute plan the buffered gRPC arms use (#3815);
+                            // the fully-streamed upload gets the gateway-owned pump
+                            // instead of a bounded collect.
+                            grpc_buffered_upload_auth_deadline.as_ref(),
+                        )
+                    });
                     tokio::pin!(attempt);
                     attempt_span.scope(attempt).await
                 };
@@ -37193,24 +37295,28 @@ async fn handle_proxy_request_inner(
                         let attempt_span =
                             ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
                         let result = {
-                            let attempt = grpc_proxy::proxy_grpc_request_core(
-                                grpc_method,
-                                grpc_headers,
-                                grpc_req_body.clone(),
-                                crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                                grpc_dispatch_proxy,
-                                &grpc_backend_url,
-                                // The same materialized transport as the split-path
-                                // call above (issues #2003, #3284, #3728).
-                                &grpc_transport,
-                                &state.dns_cache,
-                                attempt_span.headers(headers_view),
-                                grpc_should_stream,
-                                effective_max_response_body_size_bytes,
-                                ctx.grpc_deadline_at(),
-                                // GHSA-xcg4-wj3x-gjj2, as in the split path.
-                                grpc_buffered_upload_auth_deadline.as_ref(),
-                            );
+                            let attempt = boxed_proxy_future(|| {
+                                grpc_proxy::proxy_grpc_request_core(
+                                    grpc_method,
+                                    grpc_headers,
+                                    grpc_req_body.clone(),
+                                    crate::plugins::grpc_web::staged_request_trailers(
+                                        &ctx.metadata,
+                                    ),
+                                    grpc_dispatch_proxy,
+                                    &grpc_backend_url,
+                                    // The same materialized transport as the split-path
+                                    // call above (issues #2003, #3284, #3728).
+                                    &grpc_transport,
+                                    &state.dns_cache,
+                                    attempt_span.headers(headers_view),
+                                    grpc_should_stream,
+                                    effective_max_response_body_size_bytes,
+                                    ctx.grpc_deadline_at(),
+                                    // GHSA-xcg4-wj3x-gjj2, as in the split path.
+                                    grpc_buffered_upload_auth_deadline.as_ref(),
+                                )
+                            });
                             tokio::pin!(attempt);
                             attempt_span.scope(attempt).await
                         };
@@ -37792,29 +37898,31 @@ async fn handle_proxy_request_inner(
                 // The attempt's `otel_tracing` CLIENT span (issue #5864).
                 let attempt_span = ctx.begin_backend_attempt_span(&grpc_backend_url, headers_view);
                 grpc_result = {
-                    let attempt = grpc_proxy::proxy_grpc_request_from_bytes(
-                        grpc_method.clone(),
-                        grpc_req_headers.clone(),
-                        grpc_body_bytes.clone(),
-                        // A retry replays the complete request, trailers included.
-                        crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
-                        grpc_retry_effective_proxy.as_ref(),
-                        &grpc_backend_url,
-                        // The transport re-materialized for THIS attempt's target:
-                        // the loop re-screens every rotated target above and refuses
-                        // any class this pipeline cannot carry before reaching here
-                        // (issues #2003, #3728).
-                        &grpc_retry_transport,
-                        &state.dns_cache,
-                        attempt_span.headers(headers_view),
-                        grpc_should_stream,
-                        effective_max_response_body_size_bytes,
-                        ctx.grpc_deadline_at(),
-                        // The SAME absolute plan as the first attempt: a retry
-                        // never re-arms the authorization lifetime
-                        // (GHSA-xcg4-wj3x-gjj2).
-                        grpc_buffered_upload_auth_deadline.as_ref(),
-                    );
+                    let attempt = boxed_proxy_future(|| {
+                        grpc_proxy::proxy_grpc_request_from_bytes(
+                            grpc_method.clone(),
+                            grpc_req_headers.clone(),
+                            grpc_body_bytes.clone(),
+                            // A retry replays the complete request, trailers included.
+                            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                            grpc_retry_effective_proxy.as_ref(),
+                            &grpc_backend_url,
+                            // The transport re-materialized for THIS attempt's target:
+                            // the loop re-screens every rotated target above and refuses
+                            // any class this pipeline cannot carry before reaching here
+                            // (issues #2003, #3728).
+                            &grpc_retry_transport,
+                            &state.dns_cache,
+                            attempt_span.headers(headers_view),
+                            grpc_should_stream,
+                            effective_max_response_body_size_bytes,
+                            ctx.grpc_deadline_at(),
+                            // The SAME absolute plan as the first attempt: a retry
+                            // never re-arms the authorization lifetime
+                            // (GHSA-xcg4-wj3x-gjj2).
+                            grpc_buffered_upload_auth_deadline.as_ref(),
+                        )
+                    });
                     tokio::pin!(attempt);
                     attempt_span.scope(attempt).await
                 };
@@ -40358,35 +40466,38 @@ async fn handle_proxy_request_inner(
                 &mut route_attempt_deadline,
             ),
             initial_attempt_span.trace(),
-            proxy_to_backend(
-                &state,
-                &proxy,
-                &current_url,
-                &method,
-                initial_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
-                client_request_body,
-                upstream_target.as_deref(),
-                &plugins,
-                backend_admission_plugins.as_ref(),
-                std::mem::take(&mut preacquired_backend_admission),
-                body_hook_ctx.as_mut(),
-                &ctx,
-                should_stream,
-                requires_request_body_buffering,
-                stream_request_body,
-                has_retry,
-                request_body_prepared,
-                &request_client_ip,
-                &request_xff_append_ip,
-                ctx.request_is_secure,
-                current_dispatch_hbone,
-                current_dispatch_mesh_mtls,
-                current_dispatch_h3,
-                &bytes_sent_observed,
-                inbound_version,
-                &mut backend_admission_started_at,
-                &initial_attempt_handoff,
-            ),
+            boxed_proxy_future(|| {
+                proxy_to_backend(
+                    &state,
+                    &proxy,
+                    &current_url,
+                    &method,
+                    initial_attempt_span
+                        .headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
+                    client_request_body,
+                    upstream_target.as_deref(),
+                    &plugins,
+                    backend_admission_plugins.as_ref(),
+                    std::mem::take(&mut preacquired_backend_admission),
+                    body_hook_ctx.as_mut(),
+                    &ctx,
+                    should_stream,
+                    requires_request_body_buffering,
+                    stream_request_body,
+                    has_retry,
+                    request_body_prepared,
+                    &request_client_ip,
+                    &request_xff_append_ip,
+                    ctx.request_is_secure,
+                    current_dispatch_hbone,
+                    current_dispatch_mesh_mtls,
+                    current_dispatch_h3,
+                    &bytes_sent_observed,
+                    inbound_version,
+                    &mut backend_admission_started_at,
+                    &initial_attempt_handoff,
+                )
+            }),
         )
         .await;
         let initial_handed_to_backend = initial_attempt_handoff.handed_to_backend();
@@ -41049,24 +41160,26 @@ async fn handle_proxy_request_inner(
                     route_request_deadline,
                     retry_attempt_budget,
                     retry_attempt_span.trace(),
-                    proxy_to_backend_mesh_retry(
-                        &state,
-                        &proxy,
-                        &current_url,
-                        &method,
-                        retry_attempt_headers,
-                        current_target.as_deref(),
-                        retained_body.as_ref(),
-                        mesh_retry_headers.as_deref(),
-                        retry_dispatch_hbone,
-                        &plugins,
-                        &ctx,
-                        should_stream,
-                        &ctx.client_ip,
-                        &request_xff_append_ip,
-                        ctx.request_is_secure,
-                        &bytes_sent_observed,
-                    ),
+                    boxed_proxy_future(|| {
+                        proxy_to_backend_mesh_retry(
+                            &state,
+                            &proxy,
+                            &current_url,
+                            &method,
+                            retry_attempt_headers,
+                            current_target.as_deref(),
+                            retained_body.as_ref(),
+                            mesh_retry_headers.as_deref(),
+                            retry_dispatch_hbone,
+                            &plugins,
+                            &ctx,
+                            should_stream,
+                            &ctx.client_ip,
+                            &request_xff_append_ip,
+                            ctx.request_is_secure,
+                            &bytes_sent_observed,
+                        )
+                    }),
                 )
                 .await
                 {
@@ -41085,22 +41198,24 @@ async fn handle_proxy_request_inner(
                     route_request_deadline,
                     retry_attempt_budget,
                     retry_attempt_span.trace(),
-                    proxy_to_backend_http3_retry(
-                        &state,
-                        &proxy,
-                        &current_url,
-                        &method,
-                        retry_attempt_headers,
-                        current_target.as_deref(),
-                        retained_body.as_deref(),
-                        should_stream,
-                        &plugins,
-                        &ctx,
-                        &ctx.client_ip,
-                        &request_xff_append_ip,
-                        ctx.request_is_secure,
-                        inbound_version,
-                    ),
+                    boxed_proxy_future(|| {
+                        proxy_to_backend_http3_retry(
+                            &state,
+                            &proxy,
+                            &current_url,
+                            &method,
+                            retry_attempt_headers,
+                            current_target.as_deref(),
+                            retained_body.as_deref(),
+                            should_stream,
+                            &plugins,
+                            &ctx,
+                            &ctx.client_ip,
+                            &request_xff_append_ip,
+                            ctx.request_is_secure,
+                            inbound_version,
+                        )
+                    }),
                 )
                 .await
             } else {
@@ -41108,22 +41223,24 @@ async fn handle_proxy_request_inner(
                     route_request_deadline,
                     retry_attempt_budget,
                     retry_attempt_span.trace(),
-                    proxy_to_backend_retry(
-                        &state,
-                        &proxy,
-                        &current_url,
-                        &method,
-                        retry_attempt_headers,
-                        current_target.as_deref(),
-                        retained_body.as_deref(),
-                        should_stream,
-                        &plugins,
-                        &ctx,
-                        &ctx.client_ip,
-                        &request_xff_append_ip,
-                        ctx.request_is_secure,
-                        inbound_version,
-                    ),
+                    boxed_proxy_future(|| {
+                        proxy_to_backend_retry(
+                            &state,
+                            &proxy,
+                            &current_url,
+                            &method,
+                            retry_attempt_headers,
+                            current_target.as_deref(),
+                            retained_body.as_deref(),
+                            should_stream,
+                            &plugins,
+                            &ctx,
+                            &ctx.client_ip,
+                            &request_xff_append_ip,
+                            ctx.request_is_secure,
+                            inbound_version,
+                        )
+                    }),
                 )
                 .await
             };
@@ -41192,6 +41309,9 @@ async fn handle_proxy_request_inner(
             owned_proxy_headers_ref.unwrap_or(&ctx.headers),
         );
         dispatch_attempt_span.handoff_reported_by_dispatch();
+        // Construct the attempt behind a pointer before the deadline wrapper.
+        // Its transport variants also box their large child futures, bounding
+        // both this handler's state and the backend attempt's poll temporaries.
         let dispatch_attempt = await_backend_attempt_route_deadline(
             route_request_deadline,
             RouteAttemptBudget::from_handoff(
@@ -41200,35 +41320,37 @@ async fn handle_proxy_request_inner(
                 &mut route_attempt_deadline,
             ),
             dispatch_attempt_span.trace(),
-            proxy_to_backend(
-                &state,
-                &proxy,
-                &backend_url,
-                &method,
-                dispatch_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
-                client_request_body,
-                upstream_target.as_deref(),
-                &plugins,
-                backend_admission_plugins.as_ref(),
-                std::mem::take(&mut preacquired_backend_admission),
-                body_hook_ctx.as_mut(),
-                &ctx,
-                should_stream,
-                requires_request_body_buffering,
-                stream_request_body,
-                false, // no retry — don't retain body
-                request_body_prepared,
-                &request_client_ip,
-                &request_xff_append_ip,
-                ctx.request_is_secure,
-                current_dispatch_hbone,
-                current_dispatch_mesh_mtls,
-                current_dispatch_h3,
-                &bytes_sent_observed,
-                inbound_version,
-                &mut backend_admission_started_at,
-                &dispatch_attempt_handoff,
-            ),
+            boxed_proxy_future(|| {
+                proxy_to_backend(
+                    &state,
+                    &proxy,
+                    &backend_url,
+                    &method,
+                    dispatch_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
+                    client_request_body,
+                    upstream_target.as_deref(),
+                    &plugins,
+                    backend_admission_plugins.as_ref(),
+                    std::mem::take(&mut preacquired_backend_admission),
+                    body_hook_ctx.as_mut(),
+                    &ctx,
+                    should_stream,
+                    requires_request_body_buffering,
+                    stream_request_body,
+                    false, // no retry — don't retain body
+                    request_body_prepared,
+                    &request_client_ip,
+                    &request_xff_append_ip,
+                    ctx.request_is_secure,
+                    current_dispatch_hbone,
+                    current_dispatch_mesh_mtls,
+                    current_dispatch_h3,
+                    &bytes_sent_observed,
+                    inbound_version,
+                    &mut backend_admission_started_at,
+                    &dispatch_attempt_handoff,
+                )
+            }),
         )
         .await;
         let dispatch_handed_to_backend = dispatch_attempt_handoff.handed_to_backend();
@@ -46840,7 +46962,7 @@ fn boxed_proxy_to_backend_unix<'a>(
 /// frame slot. This one — the `mesh.unix_socket_h2c` sidecar-ingress branch —
 /// is the cold, Unix-selected one, so it pays a heap allocation instead of a
 /// permanent slot in the frame every ordinary request walks over. The two
-/// non-Unix call sites are untouched.
+/// non-Unix call sites also box their selected transport child.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_proxy_to_backend_unix_h2c<'a>(
@@ -47348,26 +47470,28 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         backend_attempt_handoff.mark_handed_to_backend(mesh_retained_body.as_ref());
-        let (backend_resp, body_bytes, request_body_exceeded) = proxy_to_backend_hbone(
-            state,
-            proxy,
-            backend_url,
-            method,
-            headers,
-            mesh_request_body,
-            upstream_target,
-            plugins,
-            Some(request_ctx),
-            response_decision_ctx,
-            stream_response,
-            client_ip,
-            xff_append_ip,
-            request_is_secure,
-            resolved_ip.clone(),
-            ctx_bytes_sent_observed,
-            route_request_body_limit,
-            route_response_body_limit,
-        )
+        let (backend_resp, body_bytes, request_body_exceeded) = boxed_proxy_future(|| {
+            proxy_to_backend_hbone(
+                state,
+                proxy,
+                backend_url,
+                method,
+                headers,
+                mesh_request_body,
+                upstream_target,
+                plugins,
+                Some(request_ctx),
+                response_decision_ctx,
+                stream_response,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                resolved_ip.clone(),
+                ctx_bytes_sent_observed,
+                route_request_body_limit,
+                route_response_body_limit,
+            )
+        })
         .await;
         return BackendDispatchResult::Response {
             response: Box::new(backend_resp),
@@ -47480,28 +47604,30 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         backend_attempt_handoff.mark_handed_to_backend(mesh_retained_body.as_ref());
-        let (backend_resp, body_bytes, request_body_exceeded) = proxy_to_backend_mesh_mtls(
-            state,
-            proxy,
-            backend_url,
-            method,
-            headers,
-            mesh_request_body,
-            upstream_target,
-            plugins,
-            request_ctx,
-            response_decision_ctx,
-            stream_response,
-            client_ip,
-            xff_append_ip,
-            request_is_secure,
-            resolved_ip.clone(),
-            ctx_bytes_sent_observed,
-            route_request_body_limit,
-            route_response_body_limit,
-            // SVID-mTLS transport, not a unix socket.
-            None,
-        )
+        let (backend_resp, body_bytes, request_body_exceeded) = boxed_proxy_future(|| {
+            proxy_to_backend_mesh_mtls(
+                state,
+                proxy,
+                backend_url,
+                method,
+                headers,
+                mesh_request_body,
+                upstream_target,
+                plugins,
+                request_ctx,
+                response_decision_ctx,
+                stream_response,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                resolved_ip.clone(),
+                ctx_bytes_sent_observed,
+                route_request_body_limit,
+                route_response_body_limit,
+                // SVID-mTLS transport, not a unix socket.
+                None,
+            )
+        })
         .await;
         return BackendDispatchResult::Response {
             response: Box::new(backend_resp),
@@ -47559,34 +47685,36 @@ async fn proxy_to_backend(
             Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
         };
         *backend_admission_started_at = Instant::now();
-        let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
-            state,
-            proxy,
-            backend_url,
-            method,
-            headers,
-            client_request_body,
-            plugins,
-            ctx,
-            request_ctx,
-            request_ctx.grpc_deadline_at(),
-            response_decision_ctx,
-            upstream_target,
-            client_ip,
-            xff_append_ip,
-            request_is_secure,
-            inbound_version,
-            stream_request_body,
-            retain_request_body,
-            request_body_prepared,
-            stream_response,
-            ctx_bytes_sent_observed,
-            route_request_body_limit,
-            route_response_body_limit,
-            // The H3 bridge collects a buffered client body and runs the
-            // request-body hooks itself, so it marks the handoff itself.
-            backend_attempt_handoff,
-        )
+        let (mut backend_resp, body_bytes) = boxed_proxy_future(|| {
+            proxy_to_backend_http3(
+                state,
+                proxy,
+                backend_url,
+                method,
+                headers,
+                client_request_body,
+                plugins,
+                ctx,
+                request_ctx,
+                request_ctx.grpc_deadline_at(),
+                response_decision_ctx,
+                upstream_target,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                inbound_version,
+                stream_request_body,
+                retain_request_body,
+                request_body_prepared,
+                stream_response,
+                ctx_bytes_sent_observed,
+                route_request_body_limit,
+                route_response_body_limit,
+                // The H3 bridge collects a buffered client body and runs the
+                // request-body hooks itself, so it marks the handoff itself.
+                backend_attempt_handoff,
+            )
+        })
         .await;
         // For streaming H3 responses, move headers from the H3StreamingResponse
         // into the BackendResponse headers map (avoids cloning all key/value strings).
@@ -47886,27 +48014,29 @@ async fn proxy_to_backend(
                     }
                 };
                 let mut passthrough_request_bytes = None;
-                let (backend_resp, request_body_exceeded) = proxy_to_backend_http2(
-                    state,
-                    direct_h2_proxy,
-                    sender,
-                    backend_url,
-                    method,
-                    headers,
-                    request,
-                    plugins,
-                    response_decision_ctx,
-                    request_ctx.grpc_deadline_at(),
-                    stream_response,
-                    client_ip,
-                    xff_append_ip,
-                    request_is_secure,
-                    resolved_ip,
-                    ctx_bytes_sent_observed,
-                    route_request_body_limit,
-                    route_response_body_limit,
-                    &mut passthrough_request_bytes,
-                )
+                let (backend_resp, request_body_exceeded) = boxed_proxy_future(|| {
+                    proxy_to_backend_http2(
+                        state,
+                        direct_h2_proxy,
+                        sender,
+                        backend_url,
+                        method,
+                        headers,
+                        request,
+                        plugins,
+                        response_decision_ctx,
+                        request_ctx.grpc_deadline_at(),
+                        stream_response,
+                        client_ip,
+                        xff_append_ip,
+                        request_is_secure,
+                        resolved_ip,
+                        ctx_bytes_sent_observed,
+                        route_request_body_limit,
+                        route_response_body_limit,
+                        &mut passthrough_request_bytes,
+                    )
+                })
                 .await;
                 return BackendDispatchResult::Response {
                     response: Box::new(backend_resp),
@@ -48021,35 +48151,37 @@ async fn proxy_to_backend(
             request_body_prepared,
         )
     {
-        return proxy_to_backend_direct_h1(
-            state,
-            proxy,
-            upstream_target,
-            backend_url,
-            method,
-            headers,
-            client_request_body,
-            plugins,
-            backend_admission_plugins,
-            preacquired_backend_admission,
-            request_ctx,
-            response_decision_ctx,
-            stream_response,
-            retain_request_body,
-            direct_h1_has_body,
-            client_ip,
-            xff_append_ip,
-            request_is_secure,
-            inbound_version,
-            resolved_ip,
-            ctx_bytes_sent_observed,
-            effective_host,
-            effective_port,
-            effective_max_request_body_size_bytes,
-            effective_max_response_body_size_bytes,
-            backend_admission_started_at,
-            backend_attempt_handoff,
-        )
+        return boxed_proxy_future(|| {
+            proxy_to_backend_direct_h1(
+                state,
+                proxy,
+                upstream_target,
+                backend_url,
+                method,
+                headers,
+                client_request_body,
+                plugins,
+                backend_admission_plugins,
+                preacquired_backend_admission,
+                request_ctx,
+                response_decision_ctx,
+                stream_response,
+                retain_request_body,
+                direct_h1_has_body,
+                client_ip,
+                xff_append_ip,
+                request_is_secure,
+                inbound_version,
+                resolved_ip,
+                ctx_bytes_sent_observed,
+                effective_host,
+                effective_port,
+                effective_max_request_body_size_bytes,
+                effective_max_response_body_size_bytes,
+                backend_admission_started_at,
+                backend_attempt_handoff,
+            )
+        })
         .await;
     }
     let (dial_proxy, dial_url): (&Proxy, &str) = match sni_reqwest_dial.as_ref() {
@@ -53303,10 +53435,10 @@ pin_project_lite::pin_project! {
     /// Future returned by [`await_route_request_deadline`].
     ///
     /// Hand-written rather than an `async fn` so the (large) backend attempt
-    /// future is stored inline exactly once and the request handler's frame
-    /// does not grow on every request: the deadline-free path adds two
-    /// `Option` checks per poll, and the timer is armed only when a deadline
-    /// or a started attempt budget exists and the attempt returns `Pending`.
+    /// future is stored exactly once (production dispatch passes a boxed child).
+    /// The deadline-free path adds two `Option` checks per poll. The timer is
+    /// armed only when a deadline or a started attempt budget exists and the
+    /// attempt returns `Pending`.
     pub(crate) struct RouteDeadlineAttempt<'a, F> {
         #[pin]
         attempt: F,

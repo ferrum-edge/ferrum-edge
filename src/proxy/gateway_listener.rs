@@ -3881,9 +3881,13 @@ mod tests {
 
     /// The dedicated HTTP bind is an inbound mesh listener, not merely a
     /// loopback socket. A live request must survive direction-scoped routing
-    /// and reach the configured local application backend.
+    /// and reach the configured local application backend. Exercise both H1
+    /// and H2 on ordinary worker stacks: the shared routing/backend futures
+    /// must also fit when H2 adds its affinity task-local scopes (#5993).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dedicated_sidecar_http_bind_serves_live_inbound_route() {
+        use http_body_util::BodyExt;
+        use std::sync::atomic::Ordering;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let backend = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3891,27 +3895,31 @@ mod tests {
             .expect("bind backend");
         let backend_port = backend.local_addr().expect("backend addr").port();
         let backend_task = tokio::spawn(async move {
-            let (mut stream, _) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), backend.accept())
-                    .await
-                    .expect("backend accept timeout")
-                    .expect("backend accept");
-            let mut request = [0u8; 4096];
-            let read =
-                tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut request))
-                    .await
-                    .expect("backend read timeout")
-                    .expect("backend read");
-            assert!(
-                String::from_utf8_lossy(&request[..read]).contains("GET / HTTP/1.1"),
-                "dedicated bind must forward the HTTP request"
-            );
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ndedicated-ok",
+            for _ in 0..2 {
+                let (mut stream, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), backend.accept())
+                        .await
+                        .expect("backend accept timeout")
+                        .expect("backend accept");
+                let mut request = [0u8; 4096];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    stream.read(&mut request),
                 )
                 .await
-                .expect("backend response");
+                .expect("backend read timeout")
+                .expect("backend read");
+                assert!(
+                    String::from_utf8_lossy(&request[..read]).contains("GET / HTTP/1.1"),
+                    "dedicated bind must forward the HTTP request"
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ndedicated-ok",
+                    )
+                    .await
+                    .expect("backend response");
+            }
         });
 
         let bind = IpAddr::from([127, 0, 0, 1]);
@@ -3951,7 +3959,53 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("dedicated-ok"), "{response}");
 
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect((bind, frontend_port)),
+        )
+        .await
+        .expect("H2 dedicated bind connect timeout")
+        .expect("connect H2 dedicated bind");
+        let (mut sender, connection) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(stream),
+        )
+        .await
+        .expect("H2 frontend handshake");
+        let driver = tokio::spawn(connection);
+        let request = hyper::Request::builder()
+            .uri(format!("http://app.example.com:{frontend_port}/"))
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .expect("H2 request");
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sender.send_request(request),
+        )
+        .await
+        .expect("H2 response timeout")
+        .expect("H2 response");
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            response.into_body().collect(),
+        )
+        .await
+        .expect("H2 body timeout")
+        .expect("H2 body")
+        .to_bytes();
+        assert_eq!(body.as_ref(), b"dedicated-ok");
+        drop(sender);
+        driver.abort();
+        let _ = driver.await;
+
         backend_task.await.expect("backend task");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while manager.state.overload.active_requests.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed H1/H2 responses release their request guards");
         manager.shutdown_all().await;
     }
 
