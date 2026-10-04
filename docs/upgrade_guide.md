@@ -28,6 +28,14 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Unreleased
 
+**gRPC qualification fixtures (#6006).** No configuration or runtime change is
+required. Acquisition-expiry coverage now owns a cold pool without a shorter
+startup probe, observes cancellation before any RPC frames, and proves healthy
+recovery. Attempt-span coverage holds one frontend H2 connection and independently
+checks physical backend reuse. The strict authorization and telemetry assertions
+remain required. Fresh hosted gates and root integration into release PR #6005
+are pending; see [the failure analysis](grpc_qualification_6006.md).
+
 **Dependency security chain candidate (#5912).** The proposed Hyper 1.10.0
 and reqwest 0.13.4 vendor refresh retains every local patch and preserves the
 selected ordinary/FIPS crypto profiles. GCP uses the compatible GAX 0.7.14 /
