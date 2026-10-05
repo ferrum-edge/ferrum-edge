@@ -3125,6 +3125,11 @@ pub async fn handle_put_api_spec(
             upstream: existing_spec_upstream.clone(),
             plugins: existing_spec_plugins,
         },
+        None if deployment_expected.is_some() => {
+            return Ok(crate::admin::deployment_mutations::store_error(
+                &crate::config::deployment_mutation::DeploymentGraphInvalid.into(),
+            ));
+        }
         None => {
             return Ok(error_response(ApiSpecError::Internal(format!(
                 "API spec '{}' references missing proxy '{}'",

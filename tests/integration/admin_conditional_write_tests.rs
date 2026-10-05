@@ -2415,6 +2415,7 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
         .await
         .unwrap()
         .database(&database);
+    assert_mongo_orphaned_spec_refused(db.clone(), &raw).await;
     assert_mongo_deployment_raw_preservation(db.clone(), &raw).await;
     let locks = raw.collection::<mongodb::bson::Document>("config_admission_locks");
     assert_restore_renewal_and_fencing(db.clone(), move |namespace, ttl| {
@@ -2692,6 +2693,7 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         400
     );
 
+    let missing_sequence = db.latest_change_sequence(&namespace).await.unwrap();
     for (method, path, body) in [
         (
             Method::DELETE,
@@ -2715,7 +2717,20 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         )
         .await;
         assert_eq!(missing.status, 409, "{}", missing.body);
+        assert_eq!(missing.body["durable"], "not_committed");
+        assert_eq!(missing.body["live"], "unconfirmed");
         assert_eq!(missing.body["recovery_cleanup_authorized"], false);
+        let unchanged = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        assert_eq!(unchanged.status, 200);
+        assert!(unchanged.etag == opened.etag, "original authority changed");
+        assert!(
+            unchanged.body == opened.body,
+            "missing-target refusal changed persisted deployment evidence"
+        );
+        assert_eq!(
+            db.latest_change_sequence(&namespace).await.unwrap(),
+            missing_sequence
+        );
     }
 
     // Writes after the original evidence must invalidate both owner operations,
@@ -3548,6 +3563,178 @@ async fn add_hand_added_deployment_association(base: &str, namespace: &str, prox
     )
     .await;
     assert_eq!(updated.status, 200, "{}", updated.body);
+}
+
+/// MongoDB can retain a spec after a partial/out-of-band proxy deletion. SQL's
+/// baseline foreign keys cascade that spec, so exercise the actual orphan here.
+async fn assert_mongo_orphaned_spec_refused(db: Arc<dyn DatabaseBackend>, raw: &mongodb::Database) {
+    use ferrum_edge::config::types::Consumer;
+    use mongodb::bson::{Document, doc};
+
+    let namespace = format!("deployment-orphan-{}", uuid::Uuid::new_v4());
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    let mut document = json!({
+        "openapi": "3.0.3", "info": {"title": "Orphan", "version": "1"},
+        "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": "orphan", "listen_path": "/orphan",
+            "backend_host": "backend.example.com", "backend_port": 8080},
+        "x-ferrum-upstream": {"id": "orphan-upstream", "name": "orphan-upstream",
+            "targets": [{"host": "backend.example.com", "port": 8080}]},
+        "x-ferrum-plugins": [{"id": "orphan-plugin", "plugin_name": "cors",
+            "config": {"allowed_origins": ["https://original.example"]}}]
+    });
+    let imported = send_ns(
+        Method::POST,
+        &base,
+        "/api-specs",
+        &admin_token(),
+        None,
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(imported.status, 201, "{}", imported.body);
+    let spec_id = imported.body["id"].as_str().unwrap();
+    let unrelated = send_ns(
+        Method::POST,
+        &base,
+        "/proxies",
+        &admin_token(),
+        None,
+        Some(&json!({"id": "unrelated", "listen_path": "/unrelated",
+            "backend_host": "unrelated.example.com", "backend_port": 8080,
+            "labels": {"future-owner-metadata": "retained"}})),
+        &namespace,
+    )
+    .await;
+    assert_eq!(unrelated.status, 201, "{}", unrelated.body);
+    let consumer: Consumer = serde_json::from_value(json!({
+        "namespace": namespace, "id": "historical", "username": "historical",
+        "credentials": {"custom": [{"legacy": "  orphan-canary  ",
+            "future": {"preserve": true}}]},
+        "created_at": "2000-01-01T00:00:00Z", "updated_at": "2001-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    db.create_consumer(&consumer).await.unwrap();
+    let trust = deployment_trust_record(&namespace);
+    db.create_gateway_trust_bundle(&trust).await.unwrap();
+
+    // Delete only the raw proxy document, leaving its persisted spec, generated
+    // plugin and upstream intact. Do not use CRUD's complete deployment cascade.
+    let deleted = raw
+        .collection::<Document>("proxies")
+        .delete_one(doc! { "_id": format!("{namespace}:orphan") })
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted_count, 1);
+    assert!(
+        db.get_proxy_for_write(&namespace, "orphan")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stored_before = db.load_deployment_snapshot(&namespace).await.unwrap();
+    assert_eq!(stored_before.snapshot.api_specs.len(), 1);
+    assert_eq!(stored_before.snapshot.api_specs[0].id, spec_id);
+    assert_eq!(stored_before.snapshot.api_specs[0].proxy_id, "orphan");
+    assert_eq!(stored_before.snapshot.config.proxies.len(), 1);
+    assert_eq!(stored_before.snapshot.config.proxies[0].id, "unrelated");
+    assert_eq!(stored_before.snapshot.config.plugin_configs.len(), 1);
+    assert_eq!(stored_before.snapshot.config.upstreams.len(), 1);
+    let evidence_before = stored_before.representation().unwrap();
+
+    // Coherent, decodable original authority may describe an invalid graph.
+    // It authorizes comparison, not recreation of the missing dependency.
+    let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    assert_eq!(original.status, 200);
+    assert!(original.etag.is_some());
+    assert!(original.body["evidence"] == evidence_before);
+    assert!(
+        original.body["namespace_etag"].as_str() == original.etag.as_deref(),
+        "snapshot must return the original authority in both places"
+    );
+    let sequence_before = db.latest_change_sequence(&namespace).await.unwrap();
+    let read_changes = || async {
+        let mut rows = Vec::new();
+        for name in ["config_changes", "config_change_counters"] {
+            let filter = if name == "config_changes" {
+                doc! { "namespace": &namespace }
+            } else {
+                doc! {}
+            };
+            let mut cursor = raw
+                .collection::<Document>(name)
+                .find(filter)
+                .sort(doc! { "_id": 1 })
+                .await
+                .unwrap();
+            while cursor.advance().await.unwrap() {
+                let row = cursor.deserialize_current().unwrap();
+                let bytes = mongodb::bson::to_vec(&row).unwrap();
+                rows.push((name, bytes));
+            }
+        }
+        rows
+    };
+    let changes_before = read_changes().await;
+    document["info"]["description"] = json!("replacement must not persist");
+    document["x-ferrum-upstream"]["targets"][0]["host"] = json!("replacement.example.com");
+    document["x-ferrum-plugins"][0]["config"]["allowed_origins"] =
+        json!(["https://replacement.example"]);
+
+    // Repeated conditional attempts retain the exact original token. The
+    // ordinary PUT retains its existing redacted 500 contract for this state.
+    for conditional in [true, false, true] {
+        let path = if conditional {
+            format!("/api-specs/{spec_id}?conditional=true")
+        } else {
+            format!("/api-specs/{spec_id}")
+        };
+        let result = send_ns(
+            Method::PUT,
+            &base,
+            &path,
+            &admin_token(),
+            if conditional {
+                original.etag.as_deref()
+            } else {
+                None
+            },
+            Some(&document),
+            &namespace,
+        )
+        .await;
+        if conditional {
+            assert_eq!(result.status, 409, "{}", result.body);
+            assert_eq!(result.body["durable"], "not_committed");
+            assert_eq!(result.body["live"], "unconfirmed");
+            assert_eq!(result.body["recovery_cleanup_authorized"], false);
+        } else {
+            assert_eq!(result.status, 500);
+            assert_eq!(result.body, json!({"error": "Internal server error"}));
+        }
+        assert!(!result.body.to_string().contains("orphan-canary"));
+        let unchanged = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        assert_eq!(unchanged.status, 200);
+        assert!(unchanged.etag == original.etag, "original authority changed");
+        assert!(
+            unchanged.body == original.body,
+            "orphan refusal changed complete typed/raw deployment evidence"
+        );
+        let stored_after = db.load_deployment_snapshot(&namespace).await.unwrap();
+        assert!(
+            stored_after.representation().unwrap() == evidence_before,
+            "orphan refusal changed persisted resources or identity indexes"
+        );
+        assert_eq!(
+            db.latest_change_sequence(&namespace).await.unwrap(),
+            sequence_before
+        );
+        assert!(
+            read_changes().await == changes_before,
+            "orphan refusal changed durable change rows or counters"
+        );
+    }
 }
 
 async fn assert_mongo_deployment_raw_preservation(
