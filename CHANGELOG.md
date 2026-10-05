@@ -31,11 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collected/transformed native-gRPC bodies and H3 bridge retries. Completed
   generic attempts also retire redundant replay handoff witnesses. When the
   ordered capture hooks complete, context-owned uploads retire before committed
-  observers, logging or terminal transport waits. A pending reject-path hook
-  detached on deadline expiry can still retain a raw context clone through the
-  existing bounded cleanup period; review5 P2 remains unresolved. This boundary
-  concerns those upload owners, not whole-process RSS or independently live
-  clones. No complete-remediation claim is made.
+  observers, logging or terminal transport waits. The approved rejection contract
+  has an immediate-only typed preparation/admission subset: the opaque rejection
+  future is removed, and unsupported terminal chains or mixed provenance refuse
+  without an old-hook adapter. H3 committed entry checks actual header capacity
+  and typed lineage before observers; later credential expiry preserves the
+  captured upload terminal while retiring raw views and closing final headers.
+  Audit/limiter migration, bounded parsers/RESP, async operations, provenance,
+  carrier storage, remaining active hooks and complete hosted qualification remain
+  open. See [implementation status](docs/rejection_preparation_implementation.md).
+  P2 remains unresolved; no whole-process memory proof, independently live clone
+  bound or complete-remediation claim is made.
   ferrum-contracts parity is required for the next qualified release.
 
 ## [0.9.12] - Unreleased

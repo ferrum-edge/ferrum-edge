@@ -718,11 +718,14 @@ impl Plugin for CommittedCapturePlugin {
 
     async fn on_response_committed(
         &self,
-        _ctx: &mut RequestContext,
+        ctx: &mut RequestContext,
         response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) {
+        assert!(ctx.request_body_bytes.is_none());
+        assert!(!ctx.metadata.contains_key("request_body"));
+        assert!(!ctx.final_request_body_was_decoded());
         self.committed_calls.fetch_add(1, Ordering::SeqCst);
         *self.observation.lock().expect("observation lock") = Some(CommittedObservation {
             status: response_status,
@@ -738,6 +741,171 @@ impl Plugin for CommittedCapturePlugin {
             Ordering::SeqCst,
         );
     }
+}
+
+struct RetainedH3RawView(Arc<AtomicUsize>);
+
+impl AsRef<[u8]> for RetainedH3RawView {
+    fn as_ref(&self) -> &[u8] {
+        b"raw upload"
+    }
+}
+
+impl Drop for RetainedH3RawView {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn stage_h3_terminal_request_views(
+    ctx: &mut RequestContext,
+    dropped: &Arc<AtomicUsize>,
+    budget: &ferrum_edge::_test_support::RequestBufferBudgetProbe,
+) {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_RESERVATION_UNIT_BYTES, retain_native_grpc_rejection_metadata_for_test,
+        stage_final_request_body_plaintext,
+    };
+
+    let raw = RetainedH3RawView(Arc::clone(dropped));
+    ctx.request_body_bytes = Some(bytes::Bytes::from_owner(raw));
+    ctx.metadata.insert("request_body".into(), "raw upload".into());
+    let retained = budget
+        .try_reserve(RESPONSE_BUFFER_RESERVATION_UNIT_BYTES)
+        .unwrap()
+        .into_charged_bytes(b"raw upload".to_vec());
+    retain_native_grpc_rejection_metadata_for_test(ctx, retained);
+    stage_final_request_body_plaintext(ctx, b"decoded upload".to_vec());
+    assert!(ctx.final_request_body_was_decoded());
+    assert_eq!(budget.available_bytes(), 0);
+}
+
+#[tokio::test]
+async fn h3_reject_refuses_carrier_or_mixed_lineage_before_any_committed_observer() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
+        gateway_deadline_response_selected_for_test,
+        stage_buffered_replacement_header_provenance_for_test,
+    };
+    use ferrum_edge::plugins::terminal_preparation::{CARRIER_OWNED_BYTES, validate_terminal_headers};
+
+    for (mixed_lineage, normalized_overflow) in [(false, false), (true, false), (false, true)] {
+        let capture = Arc::new(CommittedCapturePlugin::default());
+        let plugins: Vec<Arc<dyn Plugin>> = vec![capture.clone()];
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/upload".into());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let budget = RequestBufferBudgetProbe::new(UNIT, UNIT);
+        stage_h3_terminal_request_views(&mut ctx, &dropped, &budget);
+        ctx.metadata.insert(
+            "ferrum:finalized_synthetic_response".to_string(),
+            "true".to_string(),
+        );
+        let mut headers = HashMap::from([("x-correlation-id".into(), "request-123".into())]);
+        if mixed_lineage {
+            stage_buffered_replacement_header_provenance_for_test(&mut ctx, &headers);
+            headers.insert("x-gateway-decoration".into(), "completed".into());
+            assert!(validate_terminal_headers(&headers).is_ok());
+        } else if normalized_overflow {
+            for index in 0..255 {
+                headers.insert(format!("x-field-{index}"), "value".into());
+            }
+            assert_eq!(headers.len(), 256);
+            assert!(validate_terminal_headers(&headers).is_ok());
+        } else {
+            let mut value = String::with_capacity(CARRIER_OWNED_BYTES + 1);
+            value.push_str("tiny");
+            headers.insert("x-large-capacity".into(), value);
+            assert!(validate_terminal_headers(&headers).is_err());
+        }
+        let before = headers.clone();
+        let capacity = headers.capacity();
+        let body = bytes::Bytes::from_static(br#"{"error":"selected rejection"}"#);
+        let replaced = ferrum_edge::_test_support::run_h3_reject_response_committed_hooks(
+            &plugins,
+            &mut ctx,
+            HttpFlavor::Plain,
+            None,
+            StatusCode::BAD_GATEWAY,
+            body.clone(),
+            &headers,
+        )
+        .await;
+
+        assert!(!replaced);
+        assert!(!gateway_deadline_response_selected_for_test(&ctx));
+        assert_eq!(headers, before);
+        assert_eq!(headers.capacity(), capacity);
+        assert_eq!(body.as_ref(), br#"{"error":"selected rejection"}"#);
+        assert!(ctx.request_body_bytes.is_none());
+        assert!(!ctx.metadata.contains_key("request_body"));
+        assert!(!ctx.final_request_body_was_decoded());
+        assert!(!ctx.metadata.contains_key("ferrum:finalized_synthetic_response"));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.available_bytes(), UNIT);
+        assert_eq!(capture.committed_calls.load(Ordering::SeqCst), 0);
+        assert!(capture.observation.lock().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn direct_h3_typed_gateway_terminal_preserves_correlated_native_grpc_wire() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
+        mark_gateway_deadline_response_selected_for_test,
+    };
+
+    let capture = Arc::new(CommittedCapturePlugin::default());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![capture.clone()];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".into(),
+        "POST".into(),
+        "/test.Service/Call".into(),
+    );
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let budget = RequestBufferBudgetProbe::new(UNIT, UNIT);
+    stage_h3_terminal_request_views(&mut ctx, &dropped, &budget);
+    mark_gateway_deadline_response_selected_for_test(&mut ctx);
+    ctx.metadata.insert(
+        "ferrum:finalized_synthetic_response".to_string(),
+        "true".to_string(),
+    );
+    let headers = HashMap::from([
+        ("x-correlation-id".into(), "request-123".into()),
+        ("content-type".into(), "application/grpc".into()),
+        ("grpc-status".into(), "4".into()),
+        ("grpc-message".into(), "Deadline exceeded at gateway".into()),
+    ]);
+    let replaced = ferrum_edge::_test_support::run_h3_reject_response_committed_hooks(
+        &plugins,
+        &mut ctx,
+        HttpFlavor::Grpc,
+        None,
+        StatusCode::OK,
+        bytes::Bytes::new(),
+        &headers,
+    )
+    .await;
+
+    assert!(!replaced);
+    assert_eq!(capture.committed_calls.load(Ordering::SeqCst), 1);
+    let observed = capture.observation.lock().unwrap().clone().unwrap();
+    assert_eq!(observed.status, 200);
+    assert_eq!(observed.headers.len(), 4);
+    assert_eq!(observed.headers, headers);
+    assert_eq!(observed.headers["x-correlation-id"], "request-123");
+    assert_eq!(observed.headers["content-type"], "application/grpc");
+    assert_eq!(observed.headers["grpc-status"], "4");
+    assert_eq!(
+        observed.headers["grpc-message"],
+        "Deadline exceeded at gateway"
+    );
+    assert!(observed.body.is_empty());
+    assert!(ctx.request_body_bytes.is_none());
+    assert!(!ctx.metadata.contains_key("request_body"));
+    assert!(!ctx.final_request_body_was_decoded());
+    assert!(!ctx.metadata.contains_key("ferrum:finalized_synthetic_response"));
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(budget.available_bytes(), UNIT);
 }
 
 #[tokio::test]

@@ -18265,7 +18265,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
 ) -> bool {
     // Capture/shaping has completed (or this is a direct gateway terminal).
     // Never clone a raw upload into a deferred observer or retain it on QUIC.
-    ctx.discard_retained_request_metadata();
+    ctx.retire_terminal_request_views();
     if !plugins
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())
@@ -18275,21 +18275,19 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
         return false;
     }
 
-    // Seed gateway-rejection provenance for every H3 reject path that can reach
-    // a committed hook, not just the ones routed through
-    // `apply_reject_after_proxy_and_synthetic_body_hooks`. Direct gateway-error
-    // callers (notably the mesh dispatch-required 502 emitted straight after
-    // `finalize_h3_gateway_error_headers`) otherwise hand gateway-authored
-    // headers to a committed hook with no provenance at all; if that hook
-    // exhausts the RPC deadline, `replace_buffered_h3_response_with_grpc_deadline`
-    // below rebuilds from an empty gateway map and strips them. These headers are
-    // the rejection the gateway itself synthesized, so declaring them
-    // gateway-owned adds no backend surface. Seeding here (after the
-    // no-committed-hook early return, and on the same `headers` the deadline
-    // rebuild clones) covers the shared wrapper and the direct delegate callers
-    // in one place; on paths that already seeded, this folds through
-    // `adopt_gateway_rejection` rather than restarting provenance.
-    ctx.begin_rejection_deadline_response_header_provenance(headers);
+    // These callers supply finalized rejections or direct gateway errors,
+    // including mesh dispatch-required 502s. Check the actual carrier and enter
+    // the typed gateway boundary without cloning a provenance snapshot. Existing
+    // mixed backend/gateway lineage remains unsupported and must refuse before
+    // any observer. The immutable response already selected by the caller stays
+    // intact: false reports that no deadline replacement was selected.
+    if crate::plugins::terminal_preparation::validate_terminal_headers(headers).is_err()
+        || ctx.enter_typed_terminal_response(true).is_err()
+    {
+        ctx.metadata
+            .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
+        return false;
+    }
 
     let (committed_status, committed_headers, committed_body) = if let Some(content_type) =
         grpc_web_response_content_type
@@ -18331,6 +18329,14 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
         );
         (normalized.http_status, normalized.headers, normalized.body)
     };
+
+    // Wire normalization can add fields to a carrier already at its limit.
+    // Refuse that observer view too, without changing the caller's response.
+    if crate::plugins::terminal_preparation::validate_terminal_headers(&committed_headers).is_err() {
+        ctx.metadata
+            .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
+        return false;
+    }
 
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
@@ -20143,7 +20149,8 @@ mod h3_request_body_timeout_tests {
         ]);
         let mut body = Bytes::from_static(b"backend response");
         ctx.mark_gateway_deadline_response_selected();
-        ctx.begin_rejection_deadline_response_header_provenance(&headers);
+        crate::plugins::terminal_preparation::validate_terminal_headers(&headers).unwrap();
+        ctx.enter_typed_terminal_response(true).unwrap();
 
         let status = super::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,

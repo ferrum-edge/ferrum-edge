@@ -24647,6 +24647,13 @@ async fn run_after_proxy_hooks_on_rejection(
         .or_else(|| ctx.precommit_response_phase_bound().elapsed_authorization())
     {
         ctx.retire_terminal_request_views();
+        if ctx.early_upload_terminal_selected() {
+            // The collector captured an earlier owner before this late wake.
+            // Expired credentials forbid further preparation or cursor work,
+            // but cannot replace that terminal. Outer header closure still runs.
+            restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
+            return;
+        }
         if validate_terminal_headers(response_headers).is_err()
             || ctx.enter_typed_terminal_response(true).is_err()
         {

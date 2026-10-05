@@ -21,6 +21,9 @@ use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginScope};
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
+use ferrum_edge::plugins::terminal_preparation::{
+    PreparedTerminalOp, ReachedRequestView, TerminalAdmissionError, TerminalDeclaration,
+};
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::auth_lifetime::{StreamAuthDeadline, StreamAuthTermination};
 use futures_util::StreamExt;
@@ -641,6 +644,210 @@ async fn actual_rejection_seam_closes_headers_and_keeps_the_earlier_owner_on_lat
             observed.load(Ordering::SeqCst),
             usize::from(!later_authorization)
         );
+    }
+}
+
+struct TypedTerminalProbe {
+    prepared: Arc<AtomicUsize>,
+    header_polls: Arc<AtomicUsize>,
+    observed: Arc<AtomicUsize>,
+    replacement: bool,
+}
+
+#[async_trait::async_trait]
+impl Plugin for TypedTerminalProbe {
+    fn name(&self) -> &str {
+        "typed_early_upload_probe"
+    }
+
+    fn terminal_declaration(&self) -> TerminalDeclaration {
+        ferrum_edge::plugins::terminal_preparation::field_declaration(1024, 1024)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        self.replacement
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut ReachedRequestView<'_>,
+    ) -> Result<PreparedTerminalOp, TerminalAdmissionError> {
+        assert_eq!(
+            self.prepared.fetch_add(1, Ordering::SeqCst),
+            usize::from(self.replacement),
+            "whole preparation follows the pinned chain order"
+        );
+        assert_eq!(
+            view.context.request_body_bytes.as_deref(),
+            Some(&b"raw upload"[..])
+        );
+        assert!(view.context.final_request_body_was_decoded());
+        assert_eq!(view.action_allowed(), !self.replacement);
+        let mut patch = view.patch(1)?;
+        patch.set(
+            "x-typed-executed",
+            if self.replacement {
+                "replacement"
+            } else {
+                "decorator"
+            },
+            true,
+        )?;
+        Ok(PreparedTerminalOp::Fields(patch))
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _status: u16,
+        _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        panic!("the rejection seam must never invoke the old raw-capable hook")
+    }
+
+    fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        status: u16,
+        headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        self.header_polls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(self.prepared.load(Ordering::SeqCst), 2);
+        assert!(ctx.request_body_bytes.is_none());
+        assert!(!ctx.metadata.contains_key("request_body"));
+        assert!(!ctx.final_request_body_was_decoded());
+        assert_eq!(status, 504);
+        assert_eq!(headers["x-typed-executed"], "decorator");
+        PluginResult::Continue
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        status: u16,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) {
+        self.observed.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(self.prepared.load(Ordering::SeqCst), 2);
+        assert_eq!(self.header_polls.load(Ordering::SeqCst), 2);
+        assert!(ctx.request_body_bytes.is_none());
+        assert!(!ctx.metadata.contains_key("request_body"));
+        assert!(!ctx.final_request_body_was_decoded());
+        assert_eq!(status, 504);
+        assert_eq!(headers["x-typed-executed"], "decorator");
+        assert_eq!(body, br#"{"error":"Request timeout"}"#);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admitted_typed_rejection_chain_retires_views_and_skips_work_after_later_auth_expiry() {
+    use ferrum_edge::_test_support::stage_final_request_body_plaintext;
+    use ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest;
+
+    for late_wake in [false, true] {
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let header_polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let plugins: Vec<Arc<dyn Plugin>> = [false, true]
+            .into_iter()
+            .map(|replacement| {
+                Arc::new(TypedTerminalProbe {
+                    prepared: Arc::clone(&prepared),
+                    header_polls: Arc::clone(&header_polls),
+                    observed: Arc::clone(&observed),
+                    replacement,
+                }) as Arc<dyn Plugin>
+            })
+            .collect();
+        let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+        assert_eq!(manifest.participant_count(), 2);
+        assert!(manifest.control_bytes() > 0);
+        let mut ctx = request();
+        manifest.pin(&mut ctx).unwrap();
+        assert_eq!(
+            prepared.load(Ordering::SeqCst),
+            0,
+            "pinning only admits credit"
+        );
+        ctx.authenticated_identity = Some("test-admitted-principal".into());
+        let now = tokio::time::Instant::now();
+        set_request_credential_deadline_for_test(
+            &mut ctx,
+            Some(now + Duration::from_millis(10)),
+        );
+        let bound = capture_route_upload_bound_for_test(&ctx, Some(5), 0, None);
+        let budget = RequestBufferBudgetProbe::new(UNIT, UNIT);
+        ctx.request_body_bytes = Some(
+            budget
+                .try_reserve(UNIT)
+                .unwrap()
+                .into_charged_bytes(b"raw upload".to_vec()),
+        );
+        ctx.metadata.insert("request_body".into(), "raw upload".into());
+        stage_final_request_body_plaintext(&mut ctx, b"decoded upload".to_vec());
+        assert_eq!(budget.available_bytes(), 0);
+        tokio::time::advance(Duration::from_millis(if late_wake { 100 } else { 5 })).await;
+        assert_eq!(bound.collect(async {}).await, Err("route"));
+        mark_early_upload_terminal_for_test(&mut ctx);
+        let result = finalize_plugin_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            PluginResult::Reject {
+                status_code: 504,
+                body: r#"{"error":"Request timeout"}"#.into(),
+                headers: HashMap::from([("x-test-refused".into(), "private".into())]),
+            },
+        )
+        .await;
+        let PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } = result
+        else {
+            panic!("fixed route terminal");
+        };
+        assert_eq!(status_code, 504);
+        assert_eq!(body, Bytes::from_static(br#"{"error":"Request timeout"}"#));
+        assert!(!headers.contains_key("grpc-status"));
+        assert!(!gateway_deadline_response_selected_for_test(&ctx));
+        assert!(ctx.request_body_bytes.is_none());
+        assert!(!ctx.metadata.contains_key("request_body"));
+        assert!(!ctx.final_request_body_was_decoded());
+        assert!(!ctx.metadata.contains_key("ferrum:rejection_response"));
+        assert!(!ctx.metadata.contains_key("ferrum:replaceable_rejection_response"));
+        assert_eq!(budget.available_bytes(), UNIT);
+        let expected = if late_wake { 0 } else { 2 };
+        assert_eq!(prepared.load(Ordering::SeqCst), expected);
+        assert_eq!(header_polls.load(Ordering::SeqCst), expected);
+        assert_eq!(observed.load(Ordering::SeqCst), expected);
+        if late_wake {
+            assert_eq!(headers.len(), 3);
+            assert_eq!(headers["content-type"], "application/json");
+            assert_eq!(headers["content-length"], body.len().to_string());
+            assert_eq!(headers["x-gateway-error"], "request_timeout");
+            assert!(!headers.contains_key("x-test-refused"));
+            assert!(!headers.contains_key("x-typed-executed"));
+        } else {
+            assert_eq!(headers["x-typed-executed"], "decorator");
+        }
     }
 }
 

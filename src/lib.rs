@@ -7861,9 +7861,8 @@ pub mod _test_support {
         body: bytes::Bytes,
         headers: &HashMap<String, String>,
     ) -> bool {
-        // No provenance seeding here: the production delegate seeds it, so this
-        // shim stays a pure pass-through and tests observe the real behavior of
-        // direct H3 reject callers rather than a test-only head start.
+        // The production delegate checks carrier capacity and typed lineage.
+        // Keep this shim a pass-through so tests exercise direct reject entry.
         crate::http3::server::run_h3_reject_response_committed_hooks(
             plugins,
             ctx,
@@ -7874,6 +7873,15 @@ pub mod _test_support {
             headers,
         )
         .await
+    }
+
+    /// Seed the existing backend snapshot to exercise refusal of unmigrated
+    /// lineage at the real H3 typed terminal boundary.
+    pub fn stage_buffered_replacement_header_provenance_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+    ) {
+        ctx.begin_buffered_replacement_response_header_provenance(headers);
     }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────

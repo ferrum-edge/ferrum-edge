@@ -1,7 +1,7 @@
 # Rejection preparation implementation status
 
-PR #6011, issues #6008/#6009; implementation round 20. **Draft subset only.
-P2 remains open; the whole approved contract is not implemented or qualified.**
+PR #6011, issues #6008/#6009; implementation round 20 with round-22 repairs.
+**Draft subset only. P2 remains open; the whole approved contract is not implemented or qualified.**
 The owner approved the complete 883-line round-17 contract identified by SHA-256
 `641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
 No further policy approval is requested. The separate unresolved-route HTTP 503 /
@@ -160,6 +160,28 @@ declaration will refuse it. Enabled inactive audits still conservatively refuse
 until their config-derived no-op declaration is implemented.
 
 ## Tests and qualification
+
+Round 22 repairs the two retired H3 rejection-provenance calls using checked
+typed terminal entry rather than the buffered snapshot recorder. The shared H3
+reject delegate retires context raw/decode views, refuses unsupported carrier or
+mixed lineage before any committed observer, clears its temporary synthetic
+marker and leaves the selected immutable response intact on refusal. Direct
+gateway terminals preserve admitted native-gRPC correlation and wire fields.
+The rejection runner also preserves a captured early-upload terminal when later
+authorization expires at entry; it retires raw views and skips preparation and
+cursor work while the outer final-header closure still runs. Ordinary
+authorization-terminal selection remains unchanged.
+
+External regressions exercise both actual delegates, including over-capacity
+backing with tiny header values, normalization crossing 256 field occurrences,
+mixed lineage, zero refused committed observers,
+raw-owner/request-budget release and decode retirement, and an admitted pinned
+typed chain with ordered preparation, suppressed replacement actions and no
+typed execution or protected observer after later credential expiry. The existing
+late-wake refusal fixture retains both RPC/authorization arms and all assertions;
+the existing canonical H3 deadline fixture retains all wire/context assertions.
+These repairs do not complete any of the open migrations above. Hosted
+formatting, compilation and execution for the repaired head are pending.
 
 External `unit_gateway_core_tests` retain the strict round-19 ledger assertions:
 64/65 participants, 1,024/1,025 tickets, process/control/workspace exhaustion,
