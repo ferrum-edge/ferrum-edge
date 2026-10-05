@@ -26,36 +26,94 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased
+## Upgrading to 0.9.12 (candidate)
 
-**Dependency-fenced partial deployment mutations (#6010).** Automation must use
-`GET /deployment-snapshot` and its original deployment token for opt-in
-`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` and
-`PUT /api-specs/{id}?conditional=true`. Backup namespace tokens and row ETags
-cannot authorize these operations. No local schema migration or configuration
-change enables this additive profile; MongoDB needs replica-set transactions
-and MySQL needs REPEATABLE READ. The legacy missing-If-Match profiles remain
-supported outside conditional mode.
+Prepared on **2026-10-05 UTC** from merged #6012 main
+`a9c758c6352765d13a7f61c4d7e3571c82a2d307`. Final candidate/main-push
+qualification and publication are pending; keep the verified published v0.9.11
+pin until actual release, canonical contracts and consumer qualification complete.
+Read the [candidate record](releases/v0.9.12.md) for source evidence and the
+future cut procedure. All previously released breaking identifiers and guidance
+below remain applicable. CP/DP must run the same build. A changed core baseline
+still requires a fresh database and the intact old database for rollback; this
+candidate provides no online schema migration or binary-only rollback promise.
 
-Keep the original encrypted snapshot/journal on stale/refused/uncertain outcomes.
-Never retry recovery with a fresh token or restore an entire namespace minus one
-graph. Require `durable: "committed"`, `live: "applied"` and
-`recovery_cleanup_authorized: true` before automatic journal removal. CP and
-unserved-namespace durable-only acknowledgements do not authorize cleanup. See
-[consumer adoption and limitations](deployment_mutations.md). This source change
-does not establish downstream adoption or packaged qualification.
+**Dependency-fenced partial deployment mutations (#6010 / #6012).** Capture
+`GET /deployment-snapshot` with an admin-role JWT and the intended namespace;
+keep the complete credential-bearing evidence and original quoted
+`namespace_etag`/HTTP `ETag` encrypted. Compare the full original proxy/spec,
+generated plugins, associations and external-reference evidence before sending
+that original `deployment-v1` token in exactly one `If-Match` to:
 
-## Upgrading to 0.9.11 (release draft)
+```text
+DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false
+PUT /api-specs/{id}?conditional=true
+```
 
-0.9.11 is not published or qualified yet. This candidate was prepared on
-2026-10-04 UTC, the planned cut date rather than a publication timestamp; root
-must adjust the date before the actual cut if it changes. The guidance below
-covers main through `3ce21ad101f164f70cb7f7f77fb033db828b9518`, including
-the merged dependency security fix
-[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) and qualified gRPC
-fixture repair [#6007](https://github.com/ferrum-edge/ferrum-edge/pull/6007).
-Use the [release draft](releases/v0.9.11.md) for outstanding evidence and publication
-requirements. Version pins in this draft become usable only after publication.
+Backup namespace tokens and row ETags cannot authorize these operations.
+The discriminator and removal cleanup value must each occur exactly once;
+only one optional `apply=sync` is allowed. Missing/duplicate/invalid authority,
+wrong-profile/weak/wildcard/list tokens, unknown modes and `apply=async` refuse.
+Ordinary profiles outside conditional mode retain their supported behavior.
+Target or unrelated namespace changes invalidate the original token (`412`).
+
+SQLite uses a writer lock; PostgreSQL refreshes READ COMMITTED evidence after
+namespace writer fences; MySQL requires REPEATABLE READ after those fences;
+MongoDB requires replica-set snapshot/majority transactions with a lease-document
+write pin (standalone is `501`). All four compare original raw evidence inside
+entry/commit fences. Missing/unavailable/undecodable state fails closed without
+cached authority. Unsupported SQL types, unsafe selected-row reinsertion and
+MongoDB top-level fields rejected by the typed schema refuse rather than
+silently dropping state. Supported unknown columns/association metadata and
+credential/config maps survive; unknown collections are not deployable resources.
+Partial writes preserve unrelated timestamps, historical credentials, trust,
+retained upstreams and surviving owners; unchanged proxy fields/row ETags survive
+plugin-only replacement.
+
+Require the expected profile/id plus `durable: "committed"`, `live: "applied"`
+and `recovery_cleanup_authorized: true` before automatic journal removal.
+This `200` acknowledgement includes applicable covering local apply, final
+security audit admission and owner-qualified lease release. Its cursor proves
+this process only. CP/unserved-namespace `200/committed/not_applicable/false`
+cannot authorize cleanup. A confirmed commit with unconfirmed apply/audit/lease
+is `503/committed/unconfirmed/false`; database/commit/transport unknown is
+`503/unknown/unconfirmed/false` when a response exists. Initial failures may be
+`not_started`; stale/typed graph refusals are `not_committed`. Missing fields,
+cancellation or no response grant no authority. Keep the original encrypted
+snapshot/token/journal; never retry recovery with a fresh token, infer rollback
+from an untyped error, or restore an entire namespace minus one graph.
+
+**Precise dependency refusal (#6010 / #6012).** Proven external references to
+spec-owned upstreams refuse resource-changing conditional PUT/DELETE with
+`409/not_committed/unconfirmed/recovery_cleanup_authorized=false`. Metadata-only
+replacement retains its shortcut before the guard. Ordinary invalid external
+owner admission remains `400` without a durable proxy row or covering change.
+Driver, commit, auxiliary lease-release and untyped failures remain uncertain;
+no conflict identifiers or driver details are returned.
+
+**SQLx Any typed NULL preservation (#6010 / #6012).** REAL NULL now binds via
+`Option<f32>` and DOUBLE NULL via `Option<f64>`. Native PostgreSQL type witnesses
+use uncast parameters and check explicit NULLs. The extended fixture finishes
+all ALTERs and reconnects once to its original durable database before authority
+capture. This does not identify the earlier PostgreSQL initial-import 500's
+cause or establish online DDL safety. Retire the float correction only after a
+compatible upstream release passes the same hosted regression; keep SQLx's vendor
+copy while the separate TLS patch needs it, and retain behavioral tests after
+both patches retire. No dependency graph/schema changes accompany preparation.
+See [consumer adoption and limitations](deployment_mutations.md) and the
+[patch retirement record](upstream-sqlx-patches/002-typed-float-null-bindings/README.md).
+No downstream adoption, packaged acceptance or advisory closure is asserted.
+
+## Upgrading to 0.9.11
+
+0.9.11 was published at **2026-10-04T21:26:11Z** at
+`c764084b3b51c3f7ffde268c039688d35e49c553`. All 14 pre-tag main-push
+workflows and all 20 release jobs succeeded; assets/checksums and all three
+image families were verified. See the [verified release](releases/v0.9.11.md)
+for exact identities and GHCR/revision-label limits. The guidance below includes
+merged dependency fix [#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004)
+and qualified gRPC fixtures [#6007](https://github.com/ferrum-edge/ferrum-edge/pull/6007).
+The historical source evidence is distinct from final release qualification.
 
 **TLS source selectors must match their field (issue #5959; breaking).**
 Correct references whose explicit fragment, Kubernetes data key, `?kind=` hint,
@@ -126,12 +184,12 @@ with no findings after the accepted completion finding was fixed. All 12
 hosted workflows succeeded; all 80 checks completed (49 successful and 31
 nonapplicable PR skips), all nine protected Actions contexts passed, and there
 were zero review threads. PR #6007 merged and issue #6006 closed on
-2026-10-04; this release branch now normally integrates the fix. The failed
+2026-10-04; the published 0.9.11 release includes the fix. The failed
 historical `5bab92a367c69ececaaa81e535fca45ba4436f38` release run and
 `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017` main run remain failure evidence,
-not candidates for blind reruns. Fresh exact-release-head review and hosted
-gates, the eventual main merge/push gates, tag, and artifact verification are
-still pending. See [the failure analysis](grpc_qualification_6006.md) and
+not candidates for blind reruns. The final #6005 reviewed head, actual
+merge/push gates and published distribution subsequently qualified separately.
+See [the failure analysis](grpc_qualification_6006.md) and
 [fixture source qualification](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
 
 **Dependency security chain (#5912 / #6004).** The integrated Hyper 1.10.0
@@ -140,18 +198,18 @@ selected ordinary/FIPS crypto profiles. GCP uses the compatible GAX-internal
 0.7.14 / GAX 1.11.0 / OpenTelemetry 0.32 generation with SDK 0.32.1; root
 locks Smithy JSON 0.62.7, root/mesh lock xxhash 0.8.16, and fuzz retains xxhash
 0.8.18. The root, mesh and fuzz lockfiles came from the verified hosted Cargo
-producer; this release
-changes only their own `ferrum-edge` package version to 0.9.11. Dependency
+producer; 0.9.11 preparation
+changed only their own `ferrum-edge` package version to 0.9.11. Dependency
 versions, checksums, graph inputs and producer provenance are unchanged from
 main's security fix. Hosted source qualification passed at the reviewed
-#6004 head and issue #5912 is closed; fresh integrated-release qualification
-and published artifacts are still pending. Cloud secrets remain unsupported
-in enforcing FIPS mode. See
+#6004 head and issue #5912 is closed; the subsequent 0.9.11 release
+qualification and distribution verification completed separately. Cloud secrets
+remain unsupported in enforcing FIPS mode. See
 [the security upgrade record](dependency-security-upgrade-5912.md) for exact
 producer provenance and patch-port risks, and the
 [completed source integration evidence](releases/v0.9.11.md#dependency-source-integration-evidence)
-for the merge and exact-head hosted proof. Upgrade deployed binaries only after
-the release is qualified and its artifacts are verified.
+for the merge and exact-head hosted proof. Those historical results do not
+qualify future release candidates or close product advisories.
 
 **Conditional admin snapshots and restore (#5992).** Use an admin-role JWT
 for `GET /consumers/{id}/verification` when checking the complete stored
@@ -192,7 +250,7 @@ production default remains `both`; adopting public-only backends still
 requires explicitly configuring each serving process and restarting it.
 This discovery endpoint does not expand the existing enforcement coverage.
 See [backend egress policy](admin_api.md#backend-egress-policy) and the
-[pre-release contracts handoff](admin_contracts_handoff_5992_5994.md).
+[published baseline and next contracts handoff](admin_contracts_handoff_5992_5994.md).
 
 **Dependencies**
 
