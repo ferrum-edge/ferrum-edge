@@ -19,7 +19,7 @@
 # all three contracts.
 ARG FEATURES=cloud-secrets
 # Digest resolved 2026-09-14; the tag is kept for readability, the digest is authoritative.
-ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
 ARG IPROUTE2_BASE=debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 ARG IPROUTE2_VERSION=6.15.0-1
 ARG BPF_LINKER_VERSION=0.11.0
@@ -41,7 +41,7 @@ ARG BPF_LINKER_ARM64_SHA256=d09ddd83303e9ab1443f51e0e284680154009646a3ce141c63d8
 # is honored (and install rust-src on that pinned toolchain). core-only
 # build-std matches the crate's `#![no_std]` + `panic = "abort"`.
 # Digest resolved 2026-09-14; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS ebpf-builder
+FROM rust:latest@sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49 AS ebpf-builder
 ARG TARGETARCH
 ARG BPF_LINKER_VERSION
 ARG BPF_LINKER_AMD64_SHA256
@@ -91,7 +91,7 @@ RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 # Digest resolved 2026-09-14; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS builder
+FROM rust:latest@sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49 AS builder
 
 # Install build dependencies
 # clang/libclang-dev: required by bindgen (used by zstd-sys)
