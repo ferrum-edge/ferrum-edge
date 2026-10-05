@@ -3753,7 +3753,8 @@ async fn assert_mongo_deployment_raw_preservation(
         "paths": {"/raw": {"get": {"responses": {"200": {"description": "OK"}}}}},
         "x-ferrum-proxy": {"id": "raw", "listen_path": "/raw",
             "backend_host": "backend.example.com", "backend_port": 8080},
-        "x-ferrum-plugins": [{"id": "raw-generated", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "raw-generated", "plugin_name": "cors",
+            "config": {"allowed_origins": ["https://original.example"]}}]
     });
     let imported = send_ns(
         Method::POST,
@@ -4114,7 +4115,8 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
         "paths": {"/sql": {"get": {"responses": {"200": {"description": "OK"}}}}},
         "x-ferrum-proxy": {"id": "sql", "listen_path": "/sql",
             "backend_host": "backend.example.com", "backend_port": 8080},
-        "x-ferrum-plugins": [{"id": "sql-generated", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "sql-generated", "plugin_name": "cors",
+            "config": {"allowed_origins": ["https://original.example"]}}]
     });
     let imported = send_ns(
         Method::POST,
