@@ -439,7 +439,12 @@ cursor decision consumes current status and the ticket-bound selected carrier,
 preserving pristine SSE evidence and allocating no response state. The complete
 SSE refusal is evaluated in C and cannot replace its charged terminal; it does
 not grant R participation or trust a custom reported `body_validator` name.
-The ordinary successful-response `after_proxy` lifecycle is unchanged.
+AiStreamRouter likewise owns a sealed bounded provider decision and canonical
+coding result. Its cursor reads only the ticket-bound selected carrier, and
+core projects the fixed coding metadata after private provider-owner/custody
+checks. Its C-only non-replacer declaration does not grant R eligibility or
+trust a custom reported name. The ordinary successful-response `after_proxy`
+lifecycle is unchanged.
 
 Arbitrary futures, closures, plugin/context handles and raw bodies cannot be
 stored in an operation. External terminal I/O needs a reviewed bounded core

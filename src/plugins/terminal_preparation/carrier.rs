@@ -235,7 +235,7 @@ impl SelectedTerminalCarrier {
         Ok(())
     }
 
-    pub fn occurrences(&self) -> impl Iterator<Item = (&[u8], &[u8], TerminalFieldLineage)> {
+    pub fn occurrences(&self) -> impl Iterator<Item = (&[u8], &[u8], TerminalFieldLineage)> + Clone {
         self.fields.as_slice().iter().map(|field| {
             (
                 &self.bytes.bytes()[field.name.range()],

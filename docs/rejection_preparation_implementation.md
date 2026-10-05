@@ -1,6 +1,7 @@
 # Rejection preparation implementation status
 
-PR #6011, issues #6008/#6009; implementation round 34, preserving rounds 20–33.
+PR #6011, issues #6008/#6009; continuation round 36 completes interrupted round 35,
+preserving rounds 20–34.
 **Draft subset only. P2 remains open; the whole approved contract is not implemented or qualified.**
 The owner approved the complete 883-line round-17 contract identified by SHA-256
 `641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
@@ -36,8 +37,9 @@ profile is approved; interim refusals below are not final qualification of it.
   the stack context owner. No eager 2/32 MiB buffer is allocated.
 - `ReachedRequestView` provides only a synchronous borrow. `view.patch()` uses
   private admitted output credit. The closed `PreparedTerminalOp` /
-  `TerminalResult` variants are Noop, Fields, EmptyBody, moved Cookie and a sealed
-  BodyValidator response decision. Their owner contains no plugin/context/raw body/collector/closure/future. The whole
+  `TerminalResult` variants are Noop, Fields, EmptyBody, moved Cookie and sealed
+  BodyValidator and AiStreamRouter response decisions. Their owner contains no
+  plugin/context/raw body/collector/closure/future. The whole
   chain prepares before any operation is consumed; every operation is taken
   once in order. The public preparation boundary retires context body/text,
   collector and governed/decode plaintext on success and partial refusal.
@@ -95,6 +97,7 @@ profile is approved; interim refusals below are not final qualification of it.
 | `ai_semantic_cache` | Closed cache-status field; C/O 1,024 each. |
 | `ExamplePlugin` | Custom two-field patch built with admitted credit; C 1,024 / O 16,384. |
 | `cors` / `__cors_finalizer` | Borrow reached aggregate policy facts into a closed field patch; C/O 16,384 each, W 0. Direct instances and cache finalizers declare real configured output sizes; deferred wrappers retain inner declarations and wrapper credit. No raw context, policy-list clone or old-hook adapter escapes preparation. |
+| `ai_stream_router` | Complete claim-owned terminal media/coding decision and representation repair; C 4,096 / O 8,192 / W 0 for all configurations. Private owner/provider facts prepare synchronously; current selected response fields decide at the cursor. HTTP-only C non-replacer; no new rejection eligibility. |
 | `body_validator` | Complete terminal SSE refusal as a sealed response decision; C 1,024 / O 4,096 / W 0 for every configuration, including request-only protobuf. Current selected status/media and pristine origin evidence are cursor inputs; full-body validation is separate. |
 | `mesh/workload_metrics` | Actual synchronous reject restamp and traceparent operation; C 16,384 / O 4,096 / W 0. Borrowed authenticated peer/header/config facts, composed CEL label requirements, sampling/B3/W3C state and capture-marker retirement; no cloned raw header map in the operation. |
 
@@ -225,6 +228,115 @@ profile is distinct from the separately pending unresolved-route 503/14 profile.
 ROOT owns independent review, all current hosted failures and exact-head gates,
 landing and the ferrum-contracts plugin-catalog handoff for the Prepared
 BodyValidator row and sealed response-decision capability.
+
+## Rounds 35–36 complete AiStreamRouter terminal hook subset
+
+The actual AiStreamRouter owns its Prepared declaration, including disabled,
+normalization-disabled and OpenAI pass-through configurations. The sealed
+candidate registry delegates to that function; security candidate construction
+still uses the real instance. HTTP-only protocol membership, configured resource
+identity, cache generation, wrapper credit, priorities and PostAuth triggers
+retain their actual checks. Default-false R and non-replacer capabilities remain:
+C evaluates the hook and discards its closed 502 refusals, preserving the selected
+charged terminal; R suppresses the action. Names cannot grant this declaration.
+
+Preparation borrows the private claim only to establish owning instance,
+normalization eligibility and closed provider kind. The operation owns that
+bounded scalar witness, configured nonce, output allowance and shared ticket.
+It carries no provider request, credential, model, claim, context, map, raw body,
+plugin, closure or future. It does not freeze selected status or headers.
+The ordered cursor reads the actual ticket-bound carrier after prior effects.
+It preserves canonical lowercase Content-Type lookup, provider-specific
+Normalize/PassThrough/refusal rules, successful 200..299 status gate, duplicate
+case-insensitive encoding refusal, empty/identity behavior, parsing-error
+precedence, four-layer coding cap and exact gzip/x-gzip/br canonical metadata.
+The complete fixed OpenAI 502 bodies are static bytes, with no JSON allocation.
+
+The repair uses the shared validator/digest/signature/range inventory and both
+open-ended checksum families, removes encoding/length, scrubs Accept-Encoding
+from all Vary case variants with the existing wildcard/dedup/order rules, and
+stamps SSE only when no existing case variant already carries SSE. All patch
+layouts, full dynamic Vary backing, canonical metadata copies and metadata
+custody backing are planned together before allocation/copy; the
+approved O=8,192 is not raised. Exact values that exceed it refuse without
+truncation. Existing carrier occurrence/arena/provenance checks remain.
+Pristine media facts are unaffected by these header-only repairs; normal body
+producers, buffering, replay, caching/security policy and stream transforms
+retain their separate lifecycle and lease domains.
+
+Supported coding leaves the cursor only as a closed inline canonical projection.
+Core checks the originating request ticket and private provider owner before
+applying either identity or encoded repairs and copying the one fixed metadata
+key/value under remaining O credit and existing metadata custody. It refuses foreign table growth; no public mutable context/map
+adapter or raw access under suspension is introduced. The legacy response map
+import/export is still private and **UNQUALIFIED** for complete wire backing and
+mixed provenance, exactly as before. This participant does not qualify that
+common foundation or implement a new stream producer.
+
+Four native jemalloc fixtures compare the complete ordinary hook with real
+PluginCache/candidate instances, all four providers and configuration modes,
+media/coding/status/casing/duplicate/Vary/invalidation branches and exact refusal
+bytes. They exercise genuine private claims, foreign owners/generations,
+reordered instances, trigger outcomes, prior selected effects, C metadata/header
+application and refusal discard, R suppression, custody before allocation,
+dynamic O refusal before allocation, once consumption, cancellation and last
+native ticket backing. External unit controls pin actual declarations and
+refuse an opaque active implementation reporting the same name. Existing raw
+custody, cookie, CORS, BodyValidator, capacity and lifetime controls are unchanged.
+
+This removes AiStreamRouter's specific Undeclared source cause in the old
+adaptive route-override workload without changing that workload. Native fixtures
+are authored, **HOSTED UNVERIFIED**. No local project execution or formatter ran.
+All ten acceptance areas **1–10 remain OPEN/UNQUALIFIED**, **P2 remains OPEN**,
+and the separate unresolved-route HTTP 503/native-gRPC 14 decision remains
+**PENDING**. ROOT owns independent review and all exact-head hosted gates. The
+ferrum-contracts plugin-catalog handoff must include this source-owned Prepared
+row, actual C-only/HTTP-only capabilities, ENROLLMENT preparation, response and
+telemetry cursor effects, exact bounds, configured generation/wrapper/trigger
+identity and closed cursor/output projection. No cross-repository publication
+is performed in this round.
+
+## Round-36 source parity repair and hosted formatting evidence
+
+The independent review16 finding is accepted: BodyValidator's static refusal
+used `details` before `error`, while the unchanged ordinary hook constructs
+`error` before `details`. The normal MongoDB dependency graph includes BSON
+2.15.0, whose published manifest enables `serde_json/preserve_order`. The static
+constant now preserves that exact insertion order. The strict actual-cache
+assertion still compares `outcome.body()` with `ordinary_body.as_bytes()`;
+neither JSON parsing nor semantic comparison substitutes for bytes. This is a
+source-established correction, not an executed parity result. C still discards
+the non-replacer refusal and R remains ineligible.
+
+The same source inspection completed all seven AiStreamRouter fixed envelopes
+in ordinary `message`, `type`, `param`, `code` order. The closed outcome exposes
+the ordinary fixed rejection media type as well as status/body. Native parity
+retains complete header checks and counts every refusal branch, four canonical
+coding layers and genuine Gemini JSON normalization. Additional controls retain
+the actual active type for absent private claims despite forged public metadata,
+exercise simultaneous coding/repair output refusal before allocation, and drive
+the real R runner with a response that would normalize in C. No ordinary runtime
+error content or JSON construction changed.
+
+Native CI Plan job `111972339866` in run `37370810904` failed formatting for
+`a352db8bf3b567c751a3f042dcefdb94565a0d87` (its GitHub merge ref included base
+`8f63dfdd58f904644f43f1eeffb114d7d7ad38a4`). All six printed formatter regions
+were applied manually: the allocator imports, BodyValidator candidate arguments,
+Prepared destructure, no-op chain wrap, two configured cache calls, and the
+gateway-core Undeclared assertion. New additions were formatted by hand.
+Dependent compilation/lint/tests were skipped after planning failed. Cancelled
+or runner-absent workflows and failed dependency aggregates provide no runtime
+qualification; no historical green or rerun is borrowed.
+
+The combined continuation preserves the interrupted source/tests/docs and the
+round-32 public custody, round-33 authentication declarations, round-34 bounded
+BodyValidator/pristine SSE facts and strict controls. No local project execution,
+formatter, workflow edit, manual CI trigger or rerun occurred. The new pushed
+head remains **HOSTED UNVERIFIED**, all ten acceptance areas remain
+**OPEN/UNQUALIFIED**, and **P2 remains OPEN**. ROOT owns the complete final diff,
+fresh independent review, exact-head hosted gates, protected landing and the
+ferrum-contracts plugin-catalog handoff. The separate unresolved-route 503/14
+decision remains **PENDING**, distinct from approved capacity 503/8.
 
 ## Round-24 storage boundary and exact gaps
 
@@ -470,7 +582,7 @@ boundary before declaring the limiter migration conforming.
 | Audit (section 6) | All `ai_transcript_audit` and `transaction_debugger` active terminal capture remains Undeclared/refused. No private per-instance Complete/Refuted/Unfinished reached-body/method/header authority, staging guard transfer, immediate audit abort, or record-lease move has been implemented. Shared `MD_FINAL_REQ_SEEN` is not replaced. |
 | Bounded audit parser | No bounded JSON/protobuf/redaction arena or reserve-before-node/encoder growth migration. Ordinary `serde_json::Value` paths are not claimed conforming. |
 | Limiter / paid provider | `ai_rate_limiter`, including local/federation accounting and Redis reconciliation, remains Undeclared/refused before request provider work in configured terminal chains. No paid-operation cancellation/once/uncertainty semantics are invented. Root must implement the bounded RESP path described above with existing pool/TLS/config/deadline semantics. |
-| Other active hooks | `response_transformer`/core route-header finalizer, `compression`, `sse`, `a2a_gateway`, `ai_federation`, `ai_stream_router`, `openapi_validator`, `waf`, `ai_response_guard`, `response_size_limiting`, `response_caching`, `grpc_web`, `transaction_debugger`, and the audit/limiter rows above remain Undeclared/refused in their effective HTTP R/C union. There is no opaque fallback. Configuring a currently unmigrated participant can reject an otherwise valid proxy config. |
+| Other active hooks | `response_transformer`/core route-header finalizer, `compression`, `sse`, `a2a_gateway`, `ai_federation`, `openapi_validator`, `waf`, `ai_response_guard`, `response_size_limiting`, `response_caching`, `grpc_web`, `transaction_debugger`, and the audit/limiter rows above remain Undeclared/refused in their effective HTTP R/C union. There is no opaque fallback. Configuring a currently unmigrated participant can reject an otherwise valid proxy config. |
 | External operations / cursor | Add reviewed typed I/O/result/cleanup variants, selected-response scope and replacement/result replay, authorization/deadline rechecks before every external poll, independent finite detach summary, held-operation cancellation and once/paid-state semantics. The immediate driver is not an implementation of these requirements. |
 | Provenance / final policies | Migrate mixed backend/gateway provenance, exact authored-field/cookie occurrence ownership and route finalizers under finite cursor credit; preserve every admitted terminal's final header/body policy and HEAD/CORS/compression semantics. Current legacy-lineage refusal must be retired by the full migration. |
 | Complete teardown proof | Context retirement and existing retained-upload handoffs are connected, but every raw caller/replay/decode/collector/request-view sibling and cancellation site still needs exact-head real ownership proof. Committed-response/logging observers keep their existing separate lifecycle; no claim is made that their opaque state is a conforming typed terminal operation. |

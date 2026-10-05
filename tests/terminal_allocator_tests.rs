@@ -20,11 +20,11 @@ mod qualified {
     use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
     use ferrum_edge::plugins::rate_limiting::RateLimiting;
     use ferrum_edge::plugins::terminal_preparation::{
-        CARRIER_BYTES, CONTROL_BYTES, MAX_FIELD_OCCURRENCES, PROCESS_BYTES, PROCESS_PREPARATION_LEDGER,
-        PreparationLedger, PreparedTerminalChain, PreparedTerminalOp, REQUEST_TICKETS, ROOT_BYTES,
-        SLOT_BYTES, SelectedTerminalCarrier, TerminalAdmissionError, TerminalBounds,
-        TerminalDeclaration, TerminalFacts, TerminalFieldLineage, TerminalFieldOrigin,
-        TerminalFieldSection, TerminalRefusal, TerminalResult, WRAPPER_BYTES,
+        CARRIER_BYTES, CONTROL_BYTES, MAX_FIELD_OCCURRENCES, PROCESS_BYTES,
+        PROCESS_PREPARATION_LEDGER, PreparationLedger, PreparedTerminalChain, PreparedTerminalOp,
+        REQUEST_TICKETS, ROOT_BYTES, SLOT_BYTES, SelectedTerminalCarrier, TerminalAdmissionError,
+        TerminalBounds, TerminalDeclaration, TerminalFacts, TerminalFieldLineage,
+        TerminalFieldOrigin, TerminalFieldSection, TerminalRefusal, TerminalResult, WRAPPER_BYTES,
         compile_terminal_manifest, field_declaration, validate_terminal_headers,
     };
     use ferrum_edge::plugins::terminal_storage::{AllocationPlan, TerminalTicket};
@@ -1441,6 +1441,729 @@ mod qualified {
         config
     }
 
+    fn stream_router_policy(provider: &str, enabled: bool, normalize: bool) -> serde_json::Value {
+        json!({
+            "enabled": enabled,
+            "normalize_response_stream": normalize,
+            "providers": [{
+                "name": "same-provider-name",
+                "provider_type": provider,
+                "endpoint": "https://provider.example.com/v1/messages",
+                "api_key": "fixture-provider-key",
+                "model_patterns": ["*"]
+            }]
+        })
+    }
+
+    async fn claim_stream_router(plugin: &Arc<dyn Plugin>, ctx: &mut RequestContext) {
+        ctx.method = "POST".into();
+        ctx.path = "/v1/chat/completions".into();
+        ctx.headers
+            .insert("content-type".into(), "application/json".into());
+        ctx.metadata.insert(
+            "request_body".into(),
+            json!({"model": "fixture-model", "stream": true, "messages": []}).to_string(),
+        );
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            plugin.before_proxy(ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_router_complete_hook_matches_real_cache_and_all_representation_branches() {
+        use ferrum_edge::_test_support as support;
+        use ferrum_edge::plugins::ProxyProtocol;
+        use ferrum_edge::plugins::terminal_preparation::TerminalResponseOutcome;
+        allocator_profile();
+        let _guard = crate::env_lock::EnvGuard::new(&[]);
+        let baseline = PROCESS_PREPARATION_LEDGER.usage();
+        let mut refusal_branches = [0usize; 7];
+        let mut canonical_four_layers = 0usize;
+        let mut normalized_gemini = 0usize;
+        let media = [
+            None,
+            Some(("content-type", "text/event-stream")),
+            Some(("content-type", " Text/Event-Stream ; charset=UTF-8 ")),
+            Some(("content-type", "application/json; charset=utf-8")),
+            Some(("content-type", "APPLICATION/JSON")),
+            Some(("content-type", "application/problem+json")),
+            Some(("content-type", "application/event-stream+json")),
+            Some(("content-type", "")),
+            Some(("Content-Type", "text/event-stream")),
+        ];
+        let codings = [
+            None,
+            Some(""),
+            Some(" "),
+            Some("identity"),
+            Some("IDENTITY, identity"),
+            Some("gzip"),
+            Some("X-GZIP, Br, gzip, br"),
+            Some("br, gzip"),
+            Some("gzip, identity"),
+            Some("gzip, br, gzip, br, gzip"),
+            Some("identity, identity, identity, identity, identity"),
+            Some("gzip, br, gzip, br, unknown"),
+            Some("gzip, br, gzip, br,"),
+            Some(",gzip"),
+            Some("gzip,,br"),
+            Some("gzip; level=1"),
+            Some("g zip"),
+            Some("未知"),
+            Some("zstd"),
+            Some("gzip"),
+        ];
+        let vary = [
+            None,
+            Some("Accept-Encoding"),
+            Some("Origin, accept-encoding, ORIGIN, X-Test"),
+            Some("*"),
+            Some("*, Accept-Encoding"),
+            Some(" , accept-encoding, "),
+        ];
+        for provider in ["openai", "openai_compatible", "anthropic", "google_gemini"] {
+            for (enabled, normalize) in [(true, true), (true, false), (false, true)] {
+                let config = participant_config(
+                    "ai_stream_router",
+                    stream_router_policy(provider, enabled, normalize),
+                    1,
+                    false,
+                );
+                support::validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                    &config, None,
+                )
+                .unwrap();
+                let cache = ferrum_edge::PluginCache::new(&config).unwrap();
+                let view = cache.request_view("default", "participant-route", ProxyProtocol::Http);
+                let plugins = view.plugins();
+                let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+                let entry = manifest.entries().next().unwrap();
+                assert!(entry.wrapped && entry.eligibility.charged && !entry.eligibility.rejection);
+                let TerminalDeclaration::Prepared { bounds, .. } = entry.declaration else {
+                    panic!("actual router stays Prepared for every configuration")
+                };
+                assert_eq!(
+                    bounds,
+                    TerminalBounds {
+                        control: 4096,
+                        output: 8192,
+                        workspace: 0,
+                    }
+                );
+                assert_eq!(manifest.workspace_bytes(), 0);
+                let control = ROOT_BYTES + CARRIER_BYTES + SLOT_BYTES + 4096 + 8192 + WRAPPER_BYTES;
+                assert_eq!(manifest.control_bytes(), control.div_ceil(4096) * 4096);
+                let grpc = cache.request_view("default", "participant-route", ProxyProtocol::Grpc);
+                assert!(grpc.plugins().is_empty(), "router is actually HTTP-only");
+                for (index, media) in media.into_iter().enumerate() {
+                    for (coding_index, coding) in codings.into_iter().enumerate() {
+                        for status in [199, 200, 204, 206, 226, 299, 300, 502, 504] {
+                            let mut ctx = context();
+                            claim_stream_router(&plugins[0], &mut ctx).await;
+                            ctx.metadata.insert(
+                                "ai_stream_router.provider_content_encoding".into(),
+                                "old".into(),
+                            );
+                            let mut original = HashMap::new();
+                            if let Some((name, value)) = media {
+                                original.insert(name.into(), value.into());
+                            }
+                            if let Some(coding) = coding {
+                                original.insert("content-encoding".into(), coding.into());
+                            }
+                            if coding_index == codings.len() - 1 {
+                                original.insert("Content-Encoding".into(), "br".into());
+                            }
+                            if let Some(vary) = vary[(index + coding_index) % vary.len()] {
+                                original.insert("Vary".into(), vary.into());
+                                original.insert("vary".into(), "X-Other, x-test".into());
+                            }
+                            original.insert("content-length".into(), "123".into());
+                            if original.contains_key("content-type") {
+                                original.insert("Content-Type".into(), "application/json".into());
+                            }
+                            for name in [
+                                "accept-ranges",
+                                "content-range",
+                                "content-md5",
+                                "digest",
+                                "content-digest",
+                                "repr-digest",
+                                "etag",
+                                "last-modified",
+                                "delta-base",
+                                "im",
+                                "variant-key",
+                                "signature",
+                                "signature-input",
+                                "content-signature",
+                                "content-signature-input",
+                                "content-checksum",
+                                "x-goog-hash",
+                                "x-ms-content-crc64",
+                                "X-Amz-Checksum-Crc32",
+                                "X-CHECKSUM-Custom",
+                            ] {
+                                original.insert(name.into(), "invalidated".into());
+                            }
+                            original.insert("x-application".into(), "keep".into());
+                            original.insert("set-cookie".into(), "a=1\nb=2".into());
+                            let mut ordinary_ctx = ctx.clone();
+                            let mut expected_headers = original.clone();
+                            let expected = plugins[0]
+                                .after_proxy(&mut ordinary_ctx, status, &mut expected_headers)
+                                .await;
+                            manifest.pin(&mut ctx).unwrap();
+                            let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+                            let before = allocated.get();
+                            let mut chain =
+                                PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false)
+                                    .unwrap();
+                            let slots =
+                                AllocationPlan::array::<Option<PreparedTerminalOp>>(1).unwrap();
+                            assert_eq!(allocated.get() - before, slots.backing_bytes() as u64);
+                            assert!(!ctx.metadata.contains_key("request_body"));
+                            let mut carrier = chain.new_selected_carrier().unwrap();
+                            push_headers(&mut carrier, &original);
+                            let TerminalResult::StreamRouter(decision) =
+                                chain.next_operation().unwrap().execute()
+                            else {
+                                panic!("real Prepared router")
+                            };
+                            let output = decision.decide(status, &carrier).unwrap();
+                            if let Some(canonical) = output.provider_encoding() {
+                                canonical_four_layers +=
+                                    usize::from(canonical == "gzip, br, gzip, br");
+                                assert_eq!(
+                                    Some(canonical),
+                                    ordinary_ctx
+                                        .metadata
+                                        .get("ai_stream_router.provider_content_encoding")
+                                        .map(String::as_str)
+                                );
+                                assert_ne!(canonical, "old");
+                            }
+                            if let TerminalResponseOutcome::StreamRouterRefusal(reason) =
+                                output.outcome()
+                            {
+                                use ferrum_edge::plugins::terminal_preparation::StreamRouterRefusal;
+                                let index = match reason {
+                                    StreamRouterRefusal::MissingMedia => 0,
+                                    StreamRouterRefusal::UnexpectedMedia => 1,
+                                    StreamRouterRefusal::DuplicateEncoding => 2,
+                                    StreamRouterRefusal::MalformedEncoding => 3,
+                                    StreamRouterRefusal::UnsupportedEncoding => 4,
+                                    StreamRouterRefusal::MixedIdentity => 5,
+                                    StreamRouterRefusal::TooManyLayers => 6,
+                                };
+                                refusal_branches[index] += 1;
+                            }
+                            if provider == "google_gemini"
+                                && original
+                                    .get("content-type")
+                                    .is_some_and(|media| media == "APPLICATION/JSON")
+                                && expected_headers
+                                    .get("content-type")
+                                    .is_some_and(|media| media == "text/event-stream")
+                            {
+                                normalized_gemini += 1;
+                            }
+                            match expected {
+                                PluginResult::Continue => {
+                                    assert_eq!(
+                                        output.outcome(),
+                                        &TerminalResponseOutcome::Continue
+                                    );
+                                }
+                                PluginResult::Reject {
+                                    status_code,
+                                    body,
+                                    headers,
+                                } => {
+                                    assert_eq!(output.outcome().status_code(), Some(status_code));
+                                    assert_eq!(output.outcome().body(), body.as_bytes());
+                                    assert_eq!(
+                                        output.outcome().content_type(),
+                                        headers.get("content-type").map(String::as_str)
+                                    );
+                                    assert_eq!(
+                                        headers,
+                                        HashMap::from([(
+                                            "content-type".into(),
+                                            "application/json".into(),
+                                        )])
+                                    );
+                                }
+                                PluginResult::RejectBinary { .. } => panic!("fixed JSON refusal"),
+                            }
+                            output.apply(&mut carrier).unwrap();
+                            assert_carrier_headers(&carrier, &expected_headers);
+                            assert!(chain.allocated_backing_bytes() <= manifest.control_bytes());
+                            assert!(chain.next_operation().is_none());
+                            assert_eq!(
+                                PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false)
+                                    .unwrap_err()
+                                    .reason,
+                                TerminalRefusal::AlreadyPrepared
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(refusal_branches.into_iter().all(|count| count > 0));
+        assert!(canonical_four_layers > 0);
+        assert!(normalized_gemini > 0);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), baseline);
+    }
+
+    #[tokio::test]
+    async fn stream_router_cursor_order_custody_bounds_and_last_owner_are_native() {
+        use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
+        use ferrum_edge::plugins::terminal_preparation::TerminalResponseOutcome;
+        allocator_profile();
+        let baseline = PROCESS_PREPARATION_LEDGER.usage();
+        let router: Arc<dyn Plugin> = Arc::new(
+            AiStreamRouter::new(
+                &stream_router_policy("google_gemini", true, true),
+                PluginHttpClient::default(),
+            )
+            .unwrap(),
+        );
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(Fields {
+                values: vec![
+                    ("content-type", "application/json".into()),
+                    ("content-encoding", "X-GZIP, br".into()),
+                ],
+                override_existing: true,
+            }),
+            router.clone(),
+        ];
+        let mut ctx = context();
+        claim_stream_router(&router, &mut ctx).await;
+        pin(&plugins, &mut ctx);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let mut selected = chain.new_selected_carrier().unwrap();
+        selected
+            .push("content-type", b"text/plain", backend())
+            .unwrap();
+        selected.push("etag", b"invalid", backend()).unwrap();
+        let TerminalResult::Fields(fields) = chain.next_operation().unwrap().execute() else {
+            panic!("first fields")
+        };
+        selected.apply(&fields).unwrap();
+        drop(fields);
+        let TerminalResult::StreamRouter(decision) = chain.next_operation().unwrap().execute()
+        else {
+            panic!("router cursor")
+        };
+        let output = decision.decide(200, &selected).unwrap();
+        assert_eq!(output.provider_encoding(), Some("gzip, br"));
+        assert_eq!(output.outcome(), &TerminalResponseOutcome::Continue);
+        output.apply(&mut selected).unwrap();
+        assert_carrier_headers(
+            &selected,
+            &HashMap::from([("content-type".into(), "text/event-stream".into())]),
+        );
+        assert!(chain.next_operation().is_none());
+        drop(ctx);
+        drop(chain);
+
+        let mut ctx = context();
+        claim_stream_router(&router, &mut ctx).await;
+        pin(&plugins, &mut ctx);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        drop(chain.next_operation());
+        let TerminalResult::StreamRouter(decision) = chain.next_operation().unwrap().execute()
+        else {
+            panic!("router cursor")
+        };
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        let before = allocated.get();
+        assert_eq!(
+            decision.decide(200, &selected).unwrap_err().reason,
+            TerminalRefusal::PinnedGeneration
+        );
+        assert_eq!(allocated.get(), before);
+        drop(ctx);
+        drop(chain);
+
+        let mut ctx = context();
+        claim_stream_router(&router, &mut ctx).await;
+        pin(&plugins, &mut ctx);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        drop(chain.next_operation());
+        let TerminalResult::StreamRouter(decision) = chain.next_operation().unwrap().execute()
+        else {
+            panic!("router cursor")
+        };
+        let mut destination = chain.new_selected_carrier().unwrap();
+        destination
+            .push("content-type", b"application/json", backend())
+            .unwrap();
+        let output = decision.decide(200, &destination).unwrap();
+        let backing = chain.allocated_backing_bytes();
+        drop(ctx);
+        drop(chain);
+        drop(plugins);
+        drop(router);
+        let before = allocated.get();
+        assert_eq!(
+            output.apply(&mut selected).unwrap_err().reason,
+            TerminalRefusal::PinnedGeneration
+        );
+        assert_eq!(allocated.get(), before);
+        drop(selected);
+        assert_eq!(
+            PROCESS_PREPARATION_LEDGER.usage().tickets,
+            baseline.tickets + 1
+        );
+        let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+        let before = deallocated.get();
+        drop(destination);
+        assert!(deallocated.get() - before > 0);
+        assert!(deallocated.get() - before <= backing as u64);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), baseline);
+    }
+
+    #[tokio::test]
+    async fn stream_router_real_owner_generation_triggers_and_terminal_runners_remain_strict() {
+        use ferrum_edge::_test_support as support;
+        use ferrum_edge::plugins::ProxyProtocol;
+        use ferrum_edge::plugins::terminal_preparation::TerminalResponseOutcome;
+        allocator_profile();
+        let _guard = crate::env_lock::EnvGuard::new(&[]);
+        let baseline = PROCESS_PREPARATION_LEDGER.usage();
+        let config = participant_config(
+            "ai_stream_router",
+            stream_router_policy("google_gemini", true, true),
+            2,
+            false,
+        );
+        let cache = ferrum_edge::PluginCache::new(&config).unwrap();
+        let foreign_cache = ferrum_edge::PluginCache::new(&config).unwrap();
+        let view = cache.request_view("default", "participant-route", ProxyProtocol::Http);
+        let plugins = view.plugins();
+        let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+        let mut ctx = context();
+        claim_stream_router(&plugins[0], &mut ctx).await;
+        manifest.pin(&mut ctx).unwrap();
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        let foreign = foreign_cache.get_plugins_for_protocol(
+            "default",
+            "participant-route",
+            ProxyProtocol::Http,
+        );
+        let reordered: Vec<_> = plugins.iter().rev().cloned().collect();
+        for mismatch in [foreign.as_slice(), reordered.as_slice()] {
+            let before = allocated.get();
+            assert_eq!(
+                PreparedTerminalChain::prepare(mismatch, &mut ctx, true, false)
+                    .unwrap_err()
+                    .reason,
+                TerminalRefusal::PinnedGeneration
+            );
+            assert_eq!(allocated.get(), before);
+        }
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let mut selected = chain.new_selected_carrier().unwrap();
+        selected
+            .push("content-type", b"text/plain", backend())
+            .unwrap();
+        let instances: Vec<_> = manifest.entries().map(|entry| entry.instance).collect();
+        assert_ne!(instances[0], instances[1]);
+        for expected in [true, false] {
+            let TerminalResult::StreamRouter(decision) = chain.next_operation().unwrap().execute()
+            else {
+                panic!("each actual configured type stays Prepared")
+            };
+            let output = decision.decide(200, &selected).unwrap();
+            assert_eq!(output.outcome().status_code().is_some(), expected);
+            assert!(output.provider_encoding().is_none());
+        }
+        drop(selected);
+        drop(chain);
+        drop(ctx);
+
+        // The active configured implementation cannot normalize an unclaimed
+        // response or enroll itself from public coordination metadata.
+        let mut ctx = context();
+        ctx.metadata
+            .insert("ai_stream_router_claimed".into(), "true".into());
+        ctx.metadata
+            .insert("ai_stream_router.provider".into(), "same-provider-name".into());
+        manifest.pin(&mut ctx).unwrap();
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let mut selected = chain.new_selected_carrier().unwrap();
+        selected
+            .push("content-type", b"application/json", backend())
+            .unwrap();
+        for _ in 0..2 {
+            let TerminalResult::StreamRouter(decision) = chain.next_operation().unwrap().execute()
+            else {
+                panic!("active unclaimed type remains Prepared")
+            };
+            let before = allocated.get();
+            let output = decision.decide(200, &selected).unwrap();
+            assert_eq!(output.outcome(), &TerminalResponseOutcome::Continue);
+            assert!(output.provider_encoding().is_none());
+            output.apply(&mut selected).unwrap();
+            assert_eq!(allocated.get(), before);
+        }
+        assert_carrier_headers(
+            &selected,
+            &HashMap::from([("content-type".into(), "application/json".into())]),
+        );
+        drop(selected);
+        drop(chain);
+        drop(ctx);
+
+        // A claim from a retired/different cache cannot enroll the new owner.
+        let mut ctx = context();
+        claim_stream_router(&foreign[0], &mut ctx).await;
+        manifest.pin(&mut ctx).unwrap();
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let selected = chain.new_selected_carrier().unwrap();
+        for _ in 0..2 {
+            let TerminalResult::StreamRouter(decision) = chain.next_operation().unwrap().execute()
+            else {
+                panic!("closed foreign-owner no-action decision")
+            };
+            assert_eq!(
+                decision.decide(200, &selected).unwrap().outcome(),
+                &TerminalResponseOutcome::Continue
+            );
+        }
+        drop(selected);
+        drop(chain);
+        drop(ctx);
+        for coding in [None, Some("X-GZIP, br"), Some("zstd")] {
+            let mut ctx = context();
+            claim_stream_router(&plugins[0], &mut ctx).await;
+            ctx.metadata.insert(
+                "ai_stream_router.provider_content_encoding".into(),
+                "old".into(),
+            );
+            manifest.pin(&mut ctx).unwrap();
+            support::end_charged_grpc_route_attempt_for_test(&mut ctx);
+            let mut headers = HashMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("etag".into(), "invalid".into()),
+            ]);
+            if let Some(coding) = coding {
+                headers.insert("content-encoding".into(), coding.into());
+            }
+            assert!(
+                !support::run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut headers)
+                    .await
+            );
+            if coding == Some("zstd") {
+                assert_eq!(headers.get("etag").unwrap(), "invalid");
+            } else {
+                assert_eq!(headers.get("content-type").unwrap(), "text/event-stream");
+                assert!(!headers.contains_key("etag"));
+            }
+            assert_eq!(
+                ctx.metadata
+                    .get("ai_stream_router.provider_content_encoding")
+                    .unwrap(),
+                if coding == Some("X-GZIP, br") {
+                    "gzip, br"
+                } else {
+                    "old"
+                }
+            );
+        }
+        let triggered = participant_config(
+            "ai_stream_router",
+            stream_router_policy("google_gemini", true, true),
+            1,
+            true,
+        );
+        let triggered_cache = ferrum_edge::PluginCache::new(&triggered).unwrap();
+        let triggered_view =
+            triggered_cache.request_view("default", "participant-route", ProxyProtocol::Http);
+        for matched in [false, true] {
+            let mut ctx = context();
+            ctx.method = if matched { "GET" } else { "POST" }.into();
+            pin(&triggered_view.plugins(), &mut ctx);
+            let mut chain = PreparedTerminalChain::prepare(
+                &triggered_view.plugins(),
+                &mut ctx,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(
+                    chain.next_operation().unwrap().execute(),
+                    TerminalResult::StreamRouter(_)
+                ),
+                matched
+            );
+        }
+        let mut ctx = context();
+        claim_stream_router(&plugins[0], &mut ctx).await;
+        manifest.pin(&mut ctx).unwrap();
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                chain.next_operation().unwrap().execute(),
+                TerminalResult::Noop
+            ));
+        }
+        drop(chain);
+        drop(ctx);
+
+        let mut ctx = context();
+        claim_stream_router(&plugins[0], &mut ctx).await;
+        manifest.pin(&mut ctx).unwrap();
+        // A 2xx selected response would normalize in C. The real R runner must
+        // still suppress this HTTP-only type's default-false rejection action.
+        let mut status = 200;
+        let mut body = bytes::Bytes::from_static(b"selected terminal");
+        let mut headers = HashMap::from([
+            ("content-type".into(), "application/json".into()),
+            ("content-encoding".into(), "gzip".into()),
+            ("etag".into(), "keep".into()),
+        ]);
+        let original = headers.clone();
+        support::apply_replaceable_after_proxy_hooks_to_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut body,
+            &mut headers,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_ref(), b"selected terminal");
+        assert_eq!(headers, original);
+        assert!(!ctx.metadata.contains_key("ai_stream_router.provider_content_encoding"));
+        assert_eq!(
+            PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false)
+                .unwrap_err()
+                .reason,
+            TerminalRefusal::AlreadyPrepared
+        );
+        drop(ctx);
+        drop(plugins);
+        drop(view);
+        drop(manifest);
+        drop(cache);
+        drop(foreign);
+        drop(foreign_cache);
+        drop(triggered_view);
+        drop(triggered_cache);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), baseline);
+    }
+
+    #[tokio::test]
+    async fn stream_router_output_refuses_before_allocation_and_cancel_returns_root() {
+        use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
+        allocator_profile();
+        let baseline = PROCESS_PREPARATION_LEDGER.usage();
+        let router: Arc<dyn Plugin> = Arc::new(
+            AiStreamRouter::new(
+                &stream_router_policy("google_gemini", true, true),
+                PluginHttpClient::default(),
+            )
+            .unwrap(),
+        );
+        let plugins = [router.clone()];
+        for length in [4096, 8192, 16_384] {
+            let mut ctx = context();
+            claim_stream_router(&router, &mut ctx).await;
+            pin(&plugins, &mut ctx);
+            let mut chain =
+                PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+            let mut selected = chain.new_selected_carrier().unwrap();
+            selected
+                .push("content-type", b"application/json", backend())
+                .unwrap();
+            let vary = "v".repeat(length);
+            selected.push("vary", vary.as_bytes(), backend()).unwrap();
+            let original_backing = chain.allocated_backing_bytes();
+            let TerminalResult::StreamRouter(decision) = chain.next_operation().unwrap().execute()
+            else {
+                panic!("closed decision")
+            };
+            let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+            let before = allocated.get();
+            let result = decision.decide(200, &selected);
+            if length == 4096 {
+                result.unwrap().apply(&mut selected).unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().reason, TerminalRefusal::PatchCapacity);
+                assert_eq!(allocated.get(), before);
+                assert_eq!(chain.allocated_backing_bytes(), original_backing);
+                assert_eq!(selected.field_count(), 2);
+                assert!(
+                    selected
+                        .occurrences()
+                        .any(|(name, value, _)| name == b"vary" && value == vary.as_bytes())
+                );
+            }
+        }
+        // Supported coding needs metadata copies/custody while the repair is
+        // still live. Its full dynamic output must refuse before either grows.
+        let mut ctx = context();
+        claim_stream_router(&router, &mut ctx).await;
+        pin(&plugins, &mut ctx);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let mut selected = chain.new_selected_carrier().unwrap();
+        selected
+            .push("content-type", b"application/json", backend())
+            .unwrap();
+        selected
+            .push("content-encoding", b"X-GZIP, br", backend())
+            .unwrap();
+        let vary = "v".repeat(8192);
+        selected.push("vary", vary.as_bytes(), backend()).unwrap();
+        let backing = chain.allocated_backing_bytes();
+        let TerminalResult::StreamRouter(decision) = chain.next_operation().unwrap().execute()
+        else {
+            panic!("supported coding decision")
+        };
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        let before = allocated.get();
+        assert_eq!(
+            decision.decide(200, &selected).unwrap_err().reason,
+            TerminalRefusal::PatchCapacity
+        );
+        assert_eq!(allocated.get(), before);
+        assert_eq!(chain.allocated_backing_bytes(), backing);
+        assert_eq!(selected.field_count(), 3);
+        assert!(!ctx.metadata.contains_key("ai_stream_router.provider_content_encoding"));
+        drop(selected);
+        drop(chain);
+        drop(ctx);
+
+        let mut ctx = context();
+        claim_stream_router(&router, &mut ctx).await;
+        pin(&plugins, &mut ctx);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let operation = chain.next_operation().unwrap();
+        let slots = AllocationPlan::array::<Option<PreparedTerminalOp>>(1).unwrap();
+        let root_backing = chain.allocated_backing_bytes() - slots.backing_bytes();
+        drop(chain);
+        drop(ctx);
+        drop(plugins);
+        drop(router);
+        assert_eq!(
+            PROCESS_PREPARATION_LEDGER.usage().tickets,
+            baseline.tickets + 1
+        );
+        let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+        let before = deallocated.get();
+        drop(operation);
+        assert_eq!(deallocated.get() - before, root_backing as u64);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), baseline);
+    }
+
     #[tokio::test]
     async fn body_validator_complete_hook_matches_ordinary_results_without_cursor_allocation() {
         use ferrum_edge::_test_support as support;
@@ -1489,8 +2212,7 @@ mod qualified {
         for (policy_index, policy) in policies.into_iter().enumerate() {
             let config = participant_config("body_validator", policy, 1, false);
             support::validate_plugin_composition_candidate_with_real_ip_header_for_test(
-                &config,
-                None,
+                &config, None,
             )
             .unwrap();
             let cache = ferrum_edge::PluginCache::new(&config).unwrap();
@@ -1504,9 +2226,7 @@ mod qualified {
                 assert!(entry.eligibility.charged);
                 assert_eq!(manifest.workspace_bytes(), 0);
                 let TerminalDeclaration::Prepared {
-                    bounds,
-                    prep_reads,
-                    ..
+                    bounds, prep_reads, ..
                 } = entry.declaration
                 else {
                     panic!("actual BodyValidator must remain Prepared for every configuration")
@@ -1900,7 +2620,8 @@ mod qualified {
             let slots = AllocationPlan::array::<Option<PreparedTerminalOp>>(1).unwrap();
             let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
             let before = allocated.get();
-            let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+            let mut chain =
+                PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
             let backing = chain.allocated_backing_bytes();
             assert!(backing > 0);
             // Pinning already admitted the root; preparation allocates only
@@ -1929,16 +2650,10 @@ mod qualified {
         let config = participant_config("key_auth", json!({}), 2, true);
         let cache = ferrum_edge::PluginCache::new(&config).unwrap();
         let foreign = ferrum_edge::PluginCache::new(&config).unwrap();
-        let plugins = cache.get_plugins_for_protocol(
-            "default",
-            "participant-route",
-            ProxyProtocol::Http,
-        );
-        let foreign_plugins = foreign.get_plugins_for_protocol(
-            "default",
-            "participant-route",
-            ProxyProtocol::Http,
-        );
+        let plugins =
+            cache.get_plugins_for_protocol("default", "participant-route", ProxyProtocol::Http);
+        let foreign_plugins =
+            foreign.get_plugins_for_protocol("default", "participant-route", ProxyProtocol::Http);
         assert_eq!(plugins.len(), 2);
         assert!(!Arc::ptr_eq(&plugins[0], &plugins[1]));
         let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());

@@ -96,8 +96,8 @@ pub(crate) const fn terminal_composition_declaration() -> crate::plugins::Termin
 }
 
 pub(crate) const TERMINAL_EVENT_STREAM_BODY: &str = concat!(
-    "{\"details\":\"event-stream responses require a bounded streaming validator\",",
-    "\"error\":\"Response body validation failed\"}"
+    "{\"error\":\"Response body validation failed\",",
+    "\"details\":\"event-stream responses require a bounded streaming validator\"}"
 );
 
 pub(crate) fn terminal_refuses_event_stream(

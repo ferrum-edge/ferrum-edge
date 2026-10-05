@@ -15,7 +15,11 @@ use super::terminal_storage::{
 };
 
 mod carrier;
+mod stream_router;
 pub use carrier::SelectedTerminalCarrier;
+pub use stream_router::{
+    StreamRouterRefusal, StreamRouterTerminalDecision, StreamRouterTerminalOutput,
+};
 
 #[derive(Clone, Debug)]
 pub struct TerminalGeneration(Option<SharedTerminal<TerminalManifest>>);
@@ -1001,6 +1005,7 @@ pub enum PreparedTerminalOp {
     EmptyBody,
     Cookie(TerminalCookie),
     BodyValidator(BodyValidatorTerminalDecision),
+    StreamRouter(StreamRouterTerminalDecision),
 }
 
 /// Closed, raw-free response decision. Only the actual BodyValidator preparer
@@ -1020,19 +1025,28 @@ pub struct BodyValidatorTerminalDecision {
 pub enum TerminalResponseOutcome {
     Continue,
     BodyValidatorEventStreamRefusal,
+    StreamRouterRefusal(stream_router::StreamRouterRefusal),
 }
 
 impl TerminalResponseOutcome {
+    pub const fn content_type(&self) -> Option<&'static str> {
+        match self {
+            Self::StreamRouterRefusal(_) => Some("application/json"),
+            Self::Continue | Self::BodyValidatorEventStreamRefusal => None,
+        }
+    }
+
     pub const fn status_code(&self) -> Option<u16> {
         match self {
             Self::Continue => None,
-            Self::BodyValidatorEventStreamRefusal => Some(502),
+            Self::BodyValidatorEventStreamRefusal | Self::StreamRouterRefusal(_) => Some(502),
         }
     }
 
     pub const fn body(&self) -> &'static [u8] {
         match self {
             Self::Continue => &[],
+            Self::StreamRouterRefusal(reason) => reason.body(),
             Self::BodyValidatorEventStreamRefusal => {
                 super::body_validator::TERMINAL_EVENT_STREAM_BODY.as_bytes()
             }
@@ -1110,6 +1124,7 @@ pub enum TerminalResult {
     EmptyBody,
     Cookie(TerminalCookie),
     BodyValidator(BodyValidatorTerminalDecision),
+    StreamRouter(StreamRouterTerminalDecision),
 }
 
 impl PreparedTerminalOp {
@@ -1120,6 +1135,7 @@ impl PreparedTerminalOp {
         instance: TerminalInstanceToken,
     ) -> Result<(), TerminalAdmissionError> {
         match self {
+            Self::StreamRouter(decision) => decision.validate(ticket, instance)?,
             Self::BodyValidator(decision)
                 if decision.instance != instance
                     || ticket.is_none_or(|ticket| !ticket.ptr_eq(&decision.ticket)) =>
@@ -1154,6 +1170,7 @@ impl PreparedTerminalOp {
         let required = match self {
             Self::Noop | Self::EmptyBody => 0,
             Self::BodyValidator(_) => std::mem::size_of::<TerminalResponseOutcome>(),
+            Self::StreamRouter(_) => std::mem::size_of::<StreamRouterTerminalOutput>(),
             Self::Fields(patch) => patch.owned_bytes,
             Self::Cookie(cookie) => {
                 if cookie.value.as_str().len() > MAX_COOKIE_BYTES
@@ -1185,6 +1202,7 @@ impl PreparedTerminalOp {
             Self::EmptyBody => TerminalResult::EmptyBody,
             Self::Cookie(cookie) => TerminalResult::Cookie(cookie),
             Self::BodyValidator(decision) => TerminalResult::BodyValidator(decision),
+            Self::StreamRouter(decision) => TerminalResult::StreamRouter(decision),
         }
     }
 }
@@ -1417,7 +1435,10 @@ impl TerminalPatch {
 
     /// Closed CORS family removal, preflighted with every other field action.
     pub(crate) fn remove_cors_prefix(&mut self) -> Result<(), TerminalAdmissionError> {
-        let prefix = "access-control-";
+        self.remove_prefix("access-control-")
+    }
+
+    fn remove_prefix(&mut self, prefix: &str) -> Result<(), TerminalAdmissionError> {
         let (plan, _) = self.field_plans(prefix, "")?;
         let prefix = TerminalString::copy(prefix, plan, &self.ticket)?;
         self.actions
@@ -2513,6 +2534,7 @@ pub(crate) fn builtin_composition_declaration(name: &str) -> TerminalDeclaration
         "ai_prompt_shield" => super::ai_prompt_shield::terminal_composition_declaration(),
         "ai_request_guard" => super::ai_request_guard::terminal_composition_declaration(),
         "ai_semantic_firewall" => super::ai_semantic_firewall::terminal_composition_declaration(),
+        "ai_stream_router" => super::ai_stream_router::terminal_composition_declaration(),
         "ai_token_metrics" => super::ai_token_metrics::terminal_composition_declaration(),
         "ai_tool_governor" => super::ai_tool_governor::terminal_composition_declaration(),
         "api_chargeback" => super::api_chargeback::terminal_composition_declaration(),

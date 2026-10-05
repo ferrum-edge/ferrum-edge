@@ -267,6 +267,31 @@ static AI_STREAM_ROUTER_RESPONSE_POLICY_PREFIXES: std::sync::LazyLock<Vec<String
             .collect()
     });
 
+/// The actual type stays Prepared even for disabled/pass-through configurations.
+/// Only private claim ownership is read before the ordered response cursor.
+pub(crate) const fn terminal_composition_declaration() -> super::TerminalDeclaration {
+    use super::terminal_preparation::{TerminalBounds, TerminalDeclaration, TerminalFacts};
+    TerminalDeclaration::Prepared {
+        bounds: TerminalBounds {
+            control: 4096,
+            output: 8192,
+            workspace: 0,
+        },
+        prep_reads: TerminalFacts::ENROLLMENT,
+        prep_writes: TerminalFacts::NONE,
+        trigger_reads: TerminalFacts::NONE,
+        cursor_writes: TerminalFacts::RESPONSE_STATUS
+            .union(TerminalFacts::RESPONSE_HEADERS)
+            .union(TerminalFacts::TELEMETRY),
+    }
+}
+
+pub(crate) fn terminal_claim_owner_matches(ctx: &RequestContext, owner: u64) -> bool {
+    ctx.ai_stream_router_claim
+        .as_deref()
+        .is_some_and(|claim| claim.owner == owner)
+}
+
 // ---------------------------------------------------------------------------
 // Strict config key sets (fixed-shape objects; no free-form maps)
 // ---------------------------------------------------------------------------
@@ -365,7 +390,7 @@ const META_TOOL_CHOICE_NONE: &str = "ai_stream_router.tool_choice_none";
 /// can only make the claim owner's normalization fail (a fixed-cardinality
 /// upstream error body); it cannot move a credential, a destination, or a
 /// generation.
-const META_PROVIDER_ENCODING: &str = "ai_stream_router.provider_content_encoding";
+pub(crate) const META_PROVIDER_ENCODING: &str = "ai_stream_router.provider_content_encoding";
 /// Shared marker (same contract as `ai_prompt_shield` / `ai_semantic_firewall`)
 /// telling response plugins the request asked for a streaming response.
 const META_STREAMING_SHARED: &str = "ai_request_streaming";
@@ -374,7 +399,7 @@ const META_STREAMING_SHARED: &str = "ai_request_streaming";
 /// normalization. Absolute per-layer / aggregate ceilings match the streaming
 /// buffer caps; the 1024:1 ratio matches the shared compression pipeline so a
 /// tiny gzip/br bomb cannot spend the full absolute budget.
-const NORMALIZE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
+pub(crate) const NORMALIZE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
     max_decoded_bytes: 8 * 1024 * 1024,
     max_cumulative_bytes: 16 * 1024 * 1024,
     max_codings: 4,
@@ -398,7 +423,7 @@ const _: () = {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderType {
+pub(crate) enum ProviderType {
     OpenAi,
     OpenAiCompatible,
     Anthropic,
@@ -2827,6 +2852,29 @@ fn model_policy_violation(message: &str) -> PluginResult {
 
 #[async_trait]
 impl Plugin for AiStreamRouter {
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        terminal_composition_declaration()
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        let provider = self.owned_claim(view.context).and_then(|(_, provider)| {
+            provider
+                .normalizes_response(self.normalize_response_stream)
+                .then_some(provider.provider_type)
+        });
+        view.stream_router_decision(provider, self.owner_id)
+    }
+
     fn name(&self) -> &str {
         "ai_stream_router"
     }
@@ -3864,7 +3912,7 @@ fn content_encoding_value(headers: &HashMap<String, String>) -> Result<Option<&s
 /// normalization must never interpolate raw header/metadata members (including
 /// credential-like or unbounded attacker tokens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderEncodingRejectReason {
+pub(crate) enum ProviderEncodingRejectReason {
     AmbiguousDuplicateFieldLines,
     MalformedList,
     UnsupportedCoding,
@@ -4163,14 +4211,14 @@ fn wrap_provider_normalizer(
 /// adapter when the media type is missing or unexpected: those cases fail
 /// closed through after_proxy / inspector / buffered normalization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProviderStreamMediaDecision {
+pub(crate) enum ProviderStreamMediaDecision {
     Normalize,
     PassThrough,
     FailClosedMissingContentType,
     FailClosedUnexpectedContentType,
 }
 
-fn classify_provider_stream_media(
+pub(crate) fn classify_provider_stream_media(
     provider_type: ProviderType,
     content_type: Option<&str>,
 ) -> ProviderStreamMediaDecision {
@@ -4196,7 +4244,7 @@ fn classify_provider_stream_media(
 }
 
 /// Fixed-cardinality Content-Type diagnostics. Never echoes the provider header.
-fn provider_stream_media_fail_closed_message(
+pub(crate) fn provider_stream_media_fail_closed_message(
     decision: ProviderStreamMediaDecision,
 ) -> Option<&'static str> {
     match decision {

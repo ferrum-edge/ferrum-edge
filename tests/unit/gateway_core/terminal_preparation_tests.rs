@@ -36,6 +36,85 @@ fn prepared(bounds: TerminalBounds) -> TerminalDeclaration {
 }
 
 #[test]
+fn actual_stream_router_owns_a_prepared_http_only_nonreplacer_declaration() {
+    use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
+    use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, PluginHttpClient};
+    for policy in [
+        serde_json::json!({"enabled": false}),
+        serde_json::json!({
+            "normalize_response_stream": false,
+            "providers": [{
+                "name": "provider",
+                "provider_type": "openai",
+                "endpoint": "https://provider.example.com/v1/chat/completions",
+                "api_key": "fixture-key",
+                "model_patterns": ["*"]
+            }]
+        }),
+    ] {
+        let plugin = AiStreamRouter::new(&policy, PluginHttpClient::default()).unwrap();
+        assert_eq!(
+            plugin.terminal_declaration(),
+            TerminalDeclaration::Prepared {
+                bounds: TerminalBounds {
+                    control: 4096,
+                    output: 8192,
+                    workspace: 0,
+                },
+                prep_reads: TerminalFacts::ENROLLMENT,
+                prep_writes: TerminalFacts::NONE,
+                trigger_reads: TerminalFacts::NONE,
+                cursor_writes: TerminalFacts::RESPONSE_STATUS
+                    .union(TerminalFacts::RESPONSE_HEADERS)
+                    .union(TerminalFacts::TELEMETRY),
+            }
+        );
+        assert!(plugin.terminal_preparation_available());
+        assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+        assert!(!plugin.applies_after_proxy_on_reject());
+        assert!(!plugin.may_replace_rejection_response());
+    }
+}
+
+struct OpaqueReportedStreamRouter;
+
+#[async_trait::async_trait]
+impl Plugin for OpaqueReportedStreamRouter {
+    fn name(&self) -> &str {
+        "ai_stream_router"
+    }
+
+    fn priority(&self) -> u16 {
+        2984
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _status: u16,
+        _headers: &mut HashMap<String, String>,
+    ) -> ferrum_edge::plugins::PluginResult {
+        ctx.metadata.insert("opaque-effect".into(), "active".into());
+        ferrum_edge::plugins::PluginResult::Continue
+    }
+}
+
+#[test]
+fn opaque_stream_router_name_cannot_obtain_the_actual_source_declaration() {
+    let plugin: Arc<dyn Plugin> = Arc::new(OpaqueReportedStreamRouter);
+    assert_eq!(
+        plugin.terminal_declaration(),
+        TerminalDeclaration::Undeclared
+    );
+    assert_eq!(
+        ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest(&[plugin])
+            .unwrap_err()
+            .reason,
+        TerminalRefusal::Undeclared
+    );
+}
+
+#[test]
 fn actual_body_validator_declares_only_bounded_method_preparation_and_cursor_response_effects() {
     use ferrum_edge::plugins::body_validator::BodyValidator;
     let plugin = BodyValidator::new(&serde_json::json!({
@@ -103,7 +182,10 @@ impl Plugin for OpaqueReportedBodyValidator {
 #[test]
 fn body_validator_reported_name_does_not_grant_the_sealed_prepared_variant() {
     let plugin: Arc<dyn Plugin> = Arc::new(OpaqueReportedBodyValidator);
-    assert_eq!(plugin.terminal_declaration(), TerminalDeclaration::Undeclared);
+    assert_eq!(
+        plugin.terminal_declaration(),
+        TerminalDeclaration::Undeclared
+    );
     assert_eq!(
         ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest(&[plugin])
             .unwrap_err()

@@ -16,6 +16,11 @@ operations never adapt the ordinary async `after_proxy`. BodyValidator now
 prepares a bounded method/policy decision and evaluates SSE refusal from current
 selected response facts at its cursor. Its C-only capability and charged-terminal
 precedence are retained; ordinary body validation stays in its existing phases.
+AiStreamRouter now prepares only private owner/provider facts and evaluates the
+complete media/coding decision and bounded representation repair at its ordered
+cursor. It stays HTTP-only, C-only and non-replacing; supported canonical coding
+metadata is a closed custody-checked core projection. Ordinary provider/body
+normalization retains its existing separate lifecycle.
 Audit, limiter/Redis, transformers, compression, mixed response
 provenance and external terminal operations remain refused or unimplemented;
 P2 and hosted runtime qualification remain open. See the

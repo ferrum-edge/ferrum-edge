@@ -32,7 +32,7 @@ pub struct DecodeLimits {
 }
 
 /// True when `value` is an HTTP `token` (RFC 9110 §5.6.2).
-fn is_http_token(value: &str) -> bool {
+pub(crate) fn is_http_token(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()

@@ -24762,6 +24762,10 @@ async fn run_after_proxy_hooks_on_rejection(
             TerminalResult::Noop => Ok(()),
             TerminalResult::Fields(patch) => chain.apply_fields(patch, response_headers),
             TerminalResult::Cookie(cookie) => chain.apply_cookie(cookie, response_headers),
+            TerminalResult::StreamRouter(decision) => chain
+                .selected(response_headers)
+                .and_then(|selected| decision.decide(*status_code, selected))
+                .and_then(|output| chain.apply_stream_router(output, ctx, response_headers)),
             TerminalResult::BodyValidator(decision) => chain
                 .selected(response_headers)
                 .and_then(|selected| decision.decide(*status_code, selected))
@@ -26396,6 +26400,10 @@ fn run_prepared_charged_terminal_hooks(
             TerminalResult::Noop | TerminalResult::EmptyBody => Ok(()),
             TerminalResult::Fields(patch) => chain.apply_fields(patch, headers),
             TerminalResult::Cookie(cookie) => chain.apply_cookie(cookie, headers),
+            TerminalResult::StreamRouter(decision) => chain
+                .selected(headers)
+                .and_then(|selected| decision.decide(*status, selected))
+                .and_then(|output| chain.apply_stream_router(output, ctx, headers)),
             TerminalResult::BodyValidator(decision) => chain
                 .selected(headers)
                 .and_then(|selected| decision.decide(*status, selected))
