@@ -64,12 +64,46 @@ docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 ### Base Image Pinning
 
 Every image reference in `Dockerfile`, `Dockerfile.release`, `Dockerfile.test`,
-and `Dockerfile.ebpf-tools-layer` — `FROM` lines and the `ARG <NAME>=<image>`
-defaults their `FROM ${VAR}` stages expand — is pinned by `@sha256:` digest, so
-a local `docker build` pulls exactly the bytes CI and the published images were
-built from. Two CI gates enforce it and two automations refresh it; see
+`Dockerfile.ebpf-tools-layer`, and `Dockerfile.iproute2-layer` — `FROM` lines and
+the `ARG <NAME>=<image>` defaults their `FROM ${VAR}` stages expand — is pinned
+by `@sha256:` digest, fixing the base image bytes independently of the tag.
+Two CI gates enforce it and two automations refresh it; see
 [dependency-policy.md → Container build inputs](dependency-policy.md#container-build-inputs-enforcement-and-refresh).
 Never drop a digest to pick up a base-image fix by tag — bump the digest instead.
+
+The reviewed refresh in [PR #6014](https://github.com/ferrum-edge/ferrum-edge/pull/6014)
+(2026-10-05 UTC) changes these two image indexes. Both include `linux/amd64`
+and `linux/arm64` (v8):
+
+| Input | Previous index digest | Reviewed index digest |
+| --- | --- | --- |
+| `rust:latest` | `sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546` | `sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49` |
+| `gcr.io/distroless/cc-debian13:nonroot` | `sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97` | `sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2` |
+
+Both Rust platform configurations declare `RUST_VERSION=1.99.0`, replacing
+1.98.1; the [immutable upstream Dockerfile](https://github.com/rust-lang/docker-rust/blob/079baa4c2b11008b41b8d13329e7548a6e3dc59a/stable/trixie/Dockerfile)
+records Debian 13/trixie and the unchanged rustup 1.29.1 installer. This pin
+feeds `Dockerfile`'s `builder` and `ebpf-builder` bases and `Dockerfile.test`'s
+`base`. The eBPF stage subsequently installs nightly as a separate input.
+`Dockerfile.release` packages prebuilt GNU binaries whose compiler provenance
+belongs to the separate AlmaLinux sysroot / ARM64 Cross producers.
+
+The distroless pin feeds `Dockerfile`'s `RUNTIME_BASE`, `Dockerfile.release`,
+and both helper Dockerfiles' `BASE_IMAGE` defaults. Both platform configs retain
+`User=65532`. Comparing the old and new platform manifests shows only the
+`libssl3t64` package layer changed; libc, CA certificates, libgcc, and libstdc++
+layer identities remain unchanged. The Debian status entry
+`var/lib/dpkg/status.d/libssl3t64` in the digest-addressed
+[amd64 layer](https://gcr.io/v2/distroless/cc-debian13/blobs/sha256:810e2b405a0884835290e120ef380aa14dd1f53198a0cfa2260147e736d82cd5)
+and [arm64 layer](https://gcr.io/v2/distroless/cc-debian13/blobs/sha256:9e203bbce34864e6f234afe8db66b12f1b8e83f6c6348006363c695ff3e31365)
+records source package `openssl`, with `libssl3t64` moving from
+`3.5.7-1~deb13u2` to `3.5.7-1~deb13u3` on both architectures.
+
+This refresh describes unreleased source inputs. Published release assets and
+image digests, including v0.9.12, retain their own immutable release-head
+evidence. Required hosted checks and trusted-base policy must qualify the new
+PR head before merge; input hashes alone establish neither GNU ABI
+compatibility, FIPS qualification, nor datapath correctness.
 
 ### Image Details
 

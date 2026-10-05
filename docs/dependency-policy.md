@@ -582,10 +582,11 @@ Every registry image reference in `Dockerfile`, `Dockerfile.release`,
 `Dockerfile.test`, `Dockerfile.ebpf-tools-layer`, and
 `Dockerfile.iproute2-layer` — both `FROM <ref>` and the `ARG <NAME>=<ref>`
 defaults those `FROM ${VAR}` lines expand — carries an `@sha256:` digest.
-`Dockerfile.iproute2-layer`'s default `BASE_IMAGE` matches the verified
-production runtime reference
-`gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97`;
-an explicit caller override remains supported. `scratch` is the only
+`Dockerfile.iproute2-layer`'s default `BASE_IMAGE` matches the source runtime
+pin in `Dockerfile` and `Dockerfile.release`; the
+[reviewed input record](docker.md#base-image-pinning) distinguishes its
+provenance from published-release qualification. An explicit caller override
+remains supported. `scratch` is the only
 admissible digest-less base, and a `FROM` naming an earlier `AS` alias is an
 internal stage edge, not an input.
 
@@ -615,14 +616,31 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   rewrites the digest in place, re-runs the pin verifier, and opens or updates a
   single pull request on the fixed branch `deps/base-image-digests`. It is
   digest-preserving by construction: it substitutes a digest and never removes
-  one, never changes an image or tag. The PR carries no gates of its own — normal
-  required CI (multi-arch build, FIPS, eBPF, GNU ABI scan, chart smoke) is what
-  proves a new base before merge.
+  one, never changes an image or tag. Required CI (multi-arch build, FIPS, eBPF,
+  GNU ABI scan, chart smoke) and `Trusted Cross Build Policy` must qualify the
+  latest reviewed PR head before merge.
   The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
   so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
-  default `BASE_IMAGE` matches the verified production runtime digest; an
+  default `BASE_IMAGE` matches the same source runtime pin; an
   explicit caller override remains supported. The refresh workflow already
   included this Dockerfile and updates its digest-pinned image references.
+
+The refresh workflow uses `GH_TOKEN: ${{ github.token }}` to create or update
+the PR. [GitHub's event rules](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs)
+allow token-created `pull_request` events (`opened`, `synchronize`, `reopened`)
+to create approval-required runs; other events, including `pull_request_target`,
+remain suppressed. Approving those PR runs does not create the missing
+`Trusted Cross Build Policy` check: `cross-build-policy.yml` uses
+`pull_request_target` for PRs and has no `workflow_dispatch` trigger.
+
+After reviewing the proposed inputs and completing meaningful necessary source
+or provenance changes, a maintainer must make an ordinary human-authenticated,
+fast-forward push to the existing PR branch. That fresh `synchronize` event
+allows both the trusted-base policy and fresh-head PR workflows to run. Verify
+both against the actual new head; earlier-head successes cannot qualify it.
+Re-running an existing PR workflow cannot create the absent trusted workflow.
+Do not substitute an admin bypass, fabricated check/status, protected-policy
+change, or empty/dummy commit for this reviewed update and its required checks.
 
 Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
 fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the
