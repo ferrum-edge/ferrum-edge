@@ -359,6 +359,24 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 | `cp` (Control Plane) | Supported — proxy/upstream/plugins are distributed to DPs via gRPC; the spec row itself stays on the CP and is not distributed | Supported |
 | `dp` (Data Plane), `file`, `mesh` | 403 Forbidden (read-only mode) | 503 Service Unavailable (no database) |
 
+## Dependency-fenced deployment recovery (#6010)
+
+Use admin-only `GET /deployment-snapshot` for complete original spec/plugin and
+raw dependency evidence. Send its original deployment token to
+`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
+`PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
+partially mutate inside one owner-fenced transaction on all four supported
+stores (MongoDB requires a replica set). Stale evidence is `412`; invalid modes
+or headers refuse without fallback. Ordinary row deletion, spec replacement,
+backup and restore profiles retain their supported behavior.
+
+Only an acknowledgement with `durable: "committed"`, `live: "applied"` and
+`recovery_cleanup_authorized: true` authorizes automatic journal removal.
+Durable-only CP/unserved results explicitly return `false`. Preserve the original
+encrypted journal after every refusal or uncertain outcome. See the
+[consumer adoption guide](deployment_mutations.md) for exact evidence, query,
+ownership, preservation and acknowledgement rules.
+
 ## Atomicity and retries
 
 **SQL backends (PostgreSQL, MySQL, SQLite)**: `POST /api-specs` and `PUT /api-specs/{id}` execute within a single database transaction. Either all resources are created/replaced or none are (full rollback on error). Normal submissions retain the shared namespace admission contract used by ordinary resource writes, so unrelated invalid-but-present plugin associations do not block an otherwise valid spec submission needed for in-band repair. Late `DELETE` compensation uses the same transaction boundary for every upstream removed by the originating cascade (spec-owned upstreams and, for direct proxy deletion, an orphaned hand-owned upstream), the proxy, spec-owned plugins, hand-owned plugins removed by the proxy cascade, proxy/plugin junction rows, API-spec row, and every runtime config-change record. A hand-owned upstream retained because another proxy or mesh dispatch still references it is reused in place rather than inserted again, but only when its stable creation identity and ownership match the pre-delete snapshot. A same-ID replacement rejects and rolls back recovery. It additionally validates the recovered proxy/plugin graph before commit. This recovered-graph check includes raw associations, upstream/subset references, plugin composition, and named transaction-log schema dependencies for the restored proxy, its proxy-targeted rows, and effective global rows, while excluding unrelated proxy graphs so pre-existing repairable state elsewhere in the namespace cannot strand a valid recovery. Namespace-wide guarded TCP-throttle and mTLS identity checks still apply.
