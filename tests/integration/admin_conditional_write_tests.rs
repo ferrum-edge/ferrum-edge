@@ -3091,10 +3091,10 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     );
 }
 
-/// Each dependency shape retains one original authority through repeated
-/// conditional refusals and the ordinary endpoints' existing error contracts.
+/// Each dependency shape allows metadata-only replacement, then retains one
+/// original authority through conditional refusals and ordinary error contracts.
 async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBackend>) {
-    use ferrum_edge::config::types::Consumer;
+    use ferrum_edge::config::types::{Consumer, Proxy};
 
     let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
     for external_mesh in [false, true] {
@@ -3129,6 +3129,7 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         if !external_mesh {
             external_proxy["upstream_id"] = json!("owned-upstream");
         }
+        let sequence_before_admission = db.latest_change_sequence(&namespace).await.unwrap();
         let created = send_ns(
             Method::POST,
             &base,
@@ -3139,7 +3140,28 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
             &namespace,
         )
         .await;
-        assert_eq!(created.status, 201, "{}", created.body);
+        if external_mesh {
+            assert_eq!(created.status, 201, "{}", created.body);
+        } else {
+            // Ordinary admission must still reject a hand-managed proxy that
+            // attaches a spec-owned upstream. Seed the historical relationship
+            // through persistence so the removal guard can be exercised.
+            assert_eq!(created.status, 400, "{}", created.body);
+            assert!(created.body.to_string().contains("is owned by api_spec"));
+            assert!(
+                db.get_proxy_for_write(&namespace, "external")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                db.latest_change_sequence(&namespace).await.unwrap(),
+                sequence_before_admission
+            );
+            external_proxy["namespace"] = json!(namespace);
+            let historical: Proxy = serde_json::from_value(external_proxy).unwrap();
+            db.create_proxy(&historical).await.unwrap();
+        }
         if external_mesh {
             let plugin = send_ns(
                 Method::POST,
@@ -3174,6 +3196,8 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         // Ordinary metadata-only PUT still takes the matching-resource shortcut
         // while an external owner references the generated upstream.
         let proxy_before = get_ns(&base, "/proxies/dependency", &namespace).await;
+        assert_eq!(proxy_before.status, 200);
+        assert!(proxy_before.etag.is_some());
         let ordinary_replace = format!("/api-specs/{spec_id}");
         document["info"]["description"] = json!("metadata-only update");
         let metadata = send_ns(
@@ -3188,10 +3212,106 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         .await;
         assert_eq!(metadata.status, 200, "{}", metadata.body);
         let proxy_after = get_ns(&base, "/proxies/dependency", &namespace).await;
+        assert_eq!(proxy_after.status, 200);
         assert!(proxy_after.etag == proxy_before.etag);
         assert!(proxy_after.body == proxy_before.body);
 
+        // Conditional metadata-only PUT also preserves the complete resource
+        // graph while committing a covering proxy change for acknowledgement.
+        let metadata_before = db.load_deployment_snapshot(&namespace).await.unwrap();
+        let metadata_authority = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        assert_eq!(metadata_authority.status, 200);
+        assert!(metadata_authority.etag.is_some());
+        assert!(metadata_authority.body["evidence"] == metadata_before.representation().unwrap());
+        let sequence_before_metadata = db.latest_change_sequence(&namespace).await.unwrap();
+        assert_eq!(
+            metadata_before.snapshot.change_sequence,
+            sequence_before_metadata
+        );
+        let conditional_replace = format!("{ordinary_replace}?conditional=true");
+        document["info"]["description"] = json!("conditional metadata-only update");
+        let metadata = send_ns(
+            Method::PUT,
+            &base,
+            &conditional_replace,
+            &admin_token(),
+            metadata_authority.etag.as_deref(),
+            Some(&document),
+            &namespace,
+        )
+        .await;
+        assert_eq!(metadata.status, 200, "{}", metadata.body);
+        assert_eq!(metadata.body["profile"], "deployment-v1");
+        assert_eq!(metadata.body["id"], spec_id);
+        assert_eq!(metadata.body["durable"], "committed");
+        assert_eq!(metadata.body["live"], "not_applicable");
+        assert_eq!(metadata.body["recovery_cleanup_authorized"], false);
+        assert!(!metadata.body.to_string().contains("dependency-canary"));
+        let proxy_after = get_ns(&base, "/proxies/dependency", &namespace).await;
+        assert_eq!(proxy_after.status, 200);
+        assert!(proxy_after.etag == proxy_before.etag);
+        assert!(proxy_after.body == proxy_before.body);
         let stored_before = db.load_deployment_snapshot(&namespace).await.unwrap();
+        let resources_before = metadata_before.snapshot.representation().unwrap();
+        let resources_after = stored_before.snapshot.representation().unwrap();
+        // These members cover proxies, consumers, upstreams, plugins, trust and
+        // namespace metadata; only the spec and covering sequence may change.
+        for index in [0, 1, 2, 3, 4, 6] {
+            assert!(
+                resources_after[index] == resources_before[index],
+                "metadata-only replacement changed typed resource evidence at {index}"
+            );
+        }
+        assert_eq!(
+            stored_before.stored.as_object().unwrap().len(),
+            metadata_before.stored.as_object().unwrap().len()
+        );
+        // Compare every non-spec raw table/document, including unknown columns,
+        // association metadata, credential maps and identity reservation rows.
+        for (name, rows) in metadata_before.stored.as_object().unwrap() {
+            if name != "api_specs" {
+                assert!(
+                    stored_before.stored.get(name) == Some(rows),
+                    "metadata-only replacement changed raw {name} evidence"
+                );
+            }
+        }
+        assert_eq!(metadata_before.snapshot.api_specs.len(), 1);
+        assert_eq!(stored_before.snapshot.api_specs.len(), 1);
+        let spec_before = &metadata_before.snapshot.api_specs[0];
+        let spec_after = &stored_before.snapshot.api_specs[0];
+        assert_eq!(spec_after.id, spec_before.id);
+        assert_eq!(spec_after.proxy_id, spec_before.proxy_id);
+        assert_eq!(spec_after.namespace, spec_before.namespace);
+        assert_eq!(spec_after.created_at, spec_before.created_at);
+        assert_eq!(spec_after.resource_hash, spec_before.resource_hash);
+        assert_eq!(
+            spec_after.description.as_deref(),
+            Some("conditional metadata-only update")
+        );
+        assert_ne!(spec_after.content_hash, spec_before.content_hash);
+        assert!(spec_after.spec_content != spec_before.spec_content);
+        let sequence_after_metadata = db.latest_change_sequence(&namespace).await.unwrap();
+        assert!(sequence_after_metadata > sequence_before_metadata);
+        assert_eq!(
+            stored_before.snapshot.change_sequence,
+            sequence_after_metadata
+        );
+        let covering = db
+            .load_incremental_config(&namespace, sequence_before_metadata)
+            .await
+            .unwrap();
+        assert_eq!(covering.sequence_cursor, sequence_after_metadata);
+        assert_eq!(covering.added_or_modified_proxies.len(), 1);
+        assert_eq!(covering.added_or_modified_proxies[0].id, "dependency");
+        assert!(covering.removed_proxy_ids.is_empty());
+        assert!(covering.added_or_modified_consumers.is_empty());
+        assert!(covering.removed_consumer_ids.is_empty());
+        assert!(covering.added_or_modified_plugin_configs.is_empty());
+        assert!(covering.removed_plugin_config_ids.is_empty());
+        assert!(covering.added_or_modified_upstreams.is_empty());
+        assert!(covering.removed_upstream_ids.is_empty());
+
         let config = &stored_before.snapshot.config;
         assert_eq!(stored_before.snapshot.api_specs.len(), 1);
         assert_eq!(stored_before.snapshot.api_specs[0].id, spec_id);
@@ -3232,12 +3352,16 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
             "historical credential evidence changed during setup"
         );
         let evidence_before = stored_before.representation().unwrap();
+        // Successful metadata replacement advances authority legitimately.
+        // Capture refusal authority once here and retain it for every refusal.
         let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
         assert_eq!(original.status, 200);
         assert!(original.etag.is_some());
+        assert!(original.etag != metadata_authority.etag);
         assert!(original.body["evidence"] == evidence_before);
         assert!(original.body["namespace_etag"].as_str() == original.etag.as_deref());
         let sequence_before = db.latest_change_sequence(&namespace).await.unwrap();
+        assert_eq!(sequence_before, sequence_after_metadata);
 
         // The shared helper's Display remains useful to ordinary store callers.
         // Mongo's ordinary PUT exercises its non-session guard here as well.
@@ -3270,7 +3394,6 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         document["x-ferrum-upstream"]["targets"][0]["host"] = json!("replacement.example.com");
         document["x-ferrum-plugins"][0]["config"]["allowed_origins"] =
             json!(["https://replacement.example"]);
-        let conditional_replace = format!("{ordinary_replace}?conditional=true");
         let ordinary_remove = "/proxies/dependency?cleanup_orphaned_upstream=false";
         let conditional_remove =
             "/proxies/dependency?conditional=true&cleanup_orphaned_upstream=false";

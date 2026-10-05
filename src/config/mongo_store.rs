@@ -5620,21 +5620,21 @@ mod inner {
                 return Err(NamespacePreconditionFailed.into());
             }
             let plan = snapshot.removal_plan(id)?;
-            if let Some(spec_id) = &plan.spec_id {
-                self.ensure_no_external_spec_upstream_refs_opt_session(
-                    Some(&mut *session),
-                    namespace,
-                    spec_id,
-                    id,
-                )
-                .await?;
-            }
             crate::config::batch_atomicity::pause_conditional_restore_for_test(namespace).await;
             let mut candidate = snapshot.snapshot.config.clone();
             let prior_conflicts = candidate.mtls_dns_identity_conflicts();
             let mut changes: Vec<(&str, String, &str)> = Vec::new();
             match replacement {
                 None => {
+                    if let Some(spec_id) = &plan.spec_id {
+                        self.ensure_no_external_spec_upstream_refs_opt_session(
+                            Some(&mut *session),
+                            namespace,
+                            spec_id,
+                            id,
+                        )
+                        .await?;
+                    }
                     candidate.proxies.retain(|p| p.id != id);
                     candidate
                         .plugin_configs
@@ -5774,6 +5774,13 @@ mod inner {
                         )?;
                         return Ok(());
                     }
+                    self.ensure_no_external_spec_upstream_refs_opt_session(
+                        Some(&mut *session),
+                        namespace,
+                        &spec.id,
+                        id,
+                    )
+                    .await?;
                     let previous_proxy = candidate
                         .proxies
                         .iter()
