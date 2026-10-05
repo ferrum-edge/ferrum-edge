@@ -7,24 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- **Correct SQLx Any floating-point NULL parameter types** (#6010).
-  REAL NULL now binds through `Option<f32>` and DOUBLE NULL through
-  `Option<f64>`. The hosted PostgreSQL regression checks native parameter
-  types and explicit NULL results without casting the parameters.
-
-- **Dependency-fenced partial deployment mutations** (#6010). Admin-only
-  `GET /deployment-snapshot` binds complete spec/plugin/association and raw
-  namespace evidence. Opt-in proxy cascade removal and API-spec replacement
-  compare the original deployment token within entry/commit admission fences
-  on SQLite, PostgreSQL, MySQL and replica-set MongoDB. Partial writes preserve
-  unrelated rows, historical credentials, timestamps, trust and shared owners.
-  Plugin-only replacement also retains an unchanged proxy's raw fields,
-  timestamps and row ETag after merging hand-added associations;
-  ordinary endpoint profiles remain supported. Strict durable/live/audit/lease
-  acknowledgements refuse automatic journal cleanup after uncertain outcomes.
-  See the consumer adoption guide; downstream adoption and packaged qualification
-  are not asserted.
-
 ### Draft security remediation
 
 - Draft #6008/#6009 restores receipt-anchored route totals for deterministically
@@ -56,14 +38,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clones. No complete-remediation claim is made.
   ferrum-contracts parity is required for the next qualified release.
 
+## [0.9.12] - Unreleased
+
+Candidate prepared on **2026-10-05 UTC** from post-#6012 main
+`a9c758c6352765d13a7f61c4d7e3571c82a2d307`. This is preparation, not a cut
+or publication date. Main-push qualification, final release-head review/CI,
+tag and distribution remain pending. See the [candidate record](docs/releases/v0.9.12.md).
+
+### Added
+
+- **Dependency-fenced partial deployment mutations** (#6010 / #6012).
+  Admin-only `GET /deployment-snapshot` supplies `deployment-v1` evidence and
+  an original quoted namespace token for opt-in proxy cascade DELETE with
+  `conditional=true&cleanup_orphaned_upstream=false` and API-spec PUT with
+  `conditional=true`. Backup namespace tags and row ETags are not authority.
+  Compare full raw namespace/dependency evidence inside entry/commit fences
+  on SQLite, PostgreSQL, MySQL (REPEATABLE READ) and replica-set MongoDB;
+  unsupported topology and unavailable/undecodable state fail closed.
+  Partial writes retain unrelated/unknown supported fields, historical
+  credentials, timestamps, trust revisions and surviving association owners.
+  An unchanged proxy in a plugin-only replacement retains its complete raw
+  fields and row ETag. Ordinary endpoint profiles remain supported.
+  Cleanup requires confirmed `durable: committed`, applicable local
+  `live: applied`, final security audit, owner-qualified lease release and
+  `recovery_cleanup_authorized: true`. CP durable-only and committed-but-not-live
+  responses do not authorize cleanup; driver/commit unknown stays uncertain.
+  Retain the original encrypted journal after refusal, cancellation or ambiguity;
+  no retry or refreshed token supplies cleanup authority. See
+  [consumer adoption](docs/deployment_mutations.md). Canonical publication,
+  downstream adoption and packaged/advisory qualification are not asserted.
+
+### Fixed
+
+- **Preserve typed external-dependency refusals** (#6010 / #6012).
+  Proven references to spec-owned upstreams return
+  `409/not_committed/unconfirmed/recovery_cleanup_authorized=false` before
+  resource-changing conditional PUT/DELETE writes. Metadata-only replacement
+  keeps its shortcut; untyped database/commit/lease failures remain uncertain.
+  Ordinary invalid external-owner proxy admission still returns `400` without
+  a durable row or covering change. No driver details or conflict IDs are exposed.
+- **Correct SQLx Any floating-point NULL parameter types** (#6010 / #6012).
+  REAL NULL binds through `Option<f32>` and DOUBLE NULL through `Option<f64>`.
+  Hosted PostgreSQL checks native uncast parameter types and explicit NULLs.
+  The stable extended-schema fixture reconnects once after all ALTERs; it proves
+  neither the original PostgreSQL initial-import 500's cause nor online DDL safety.
+  No dependency graph/version changes are made. Preserve the hosted regression
+  after patch retirement and retain the vendor copy while the separate TLS patch
+  still requires it; see [retirement rules](docs/upstream-sqlx-patches/002-typed-float-null-bindings/README.md).
+
 ## [0.9.11] - 2026-10-04
 
-[v0.9.11](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.11)
-was published on 2026-10-04 at 21:26:11 UTC from immutable commit
-`c764084b3b51c3f7ffde268c039688d35e49c553`. The
-[release preparation record](docs/releases/v0.9.11.md) preserves historical
-pre-publication evidence. The early-upload candidate above is unreleased;
-v0.9.11 is not patched for GHSA-gxfv-924p-wvx4.
+Published at **2026-10-04T21:26:11Z** at immutable release merge
+`c764084b3b51c3f7ffde268c039688d35e49c553`, with reviewed #6005 head
+`ff0a9d5152dc3cf2fd240158cbdf5551f511212e` as second parent. All 14 pre-tag
+main-push workflows and all 20 release jobs succeeded; root verified all 14
+assets/checksums, three Docker Hub indexes and six platform/config pairs.
+See the [verified 0.9.11 record](docs/releases/v0.9.11.md) for exact identities,
+authenticated GHCR proof and revision-label limits. This does not qualify 0.9.12.
+The unreleased #6011 candidate does not patch v0.9.11 for GHSA-gxfv-924p-wvx4.
 
 ### Security
 
@@ -77,8 +109,9 @@ v0.9.11 is not patched for GHSA-gxfv-924p-wvx4.
   Hyper/reqwest pair per production graph. The source fix was merged through
   [PR #6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) at
   `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; issue #5912 is closed. Its
-  exact-head hosted checks passed; the changes are included in published
-  v0.9.11. See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
+  exact-head hosted checks passed, followed by the separately verified 0.9.11
+  release qualification and publication. Advisory disposition remains separate.
+  See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
   and [completed source integration evidence](docs/releases/v0.9.11.md#dependency-source-integration-evidence).
 
 - **Conditional admin reads and restores use authoritative strong state tags**
@@ -184,8 +217,8 @@ v0.9.11 is not patched for GHSA-gxfv-924p-wvx4.
   all 80 checks completed (49 successful, 31 nonapplicable PR skips), all nine
   protected Actions contexts passed, and there were zero review threads.
   PR #6007 merged at `3ce21ad101f164f70cb7f7f77fb033db828b9518` and
-  issue #6006 closed on 2026-10-04. Published v0.9.11 includes that fix;
-  qualification of the future early-upload candidate remains separate.
+  issue #6006 closed on 2026-10-04. The verified 0.9.11 release includes
+  that fix; historical failing runs remain distinct from final qualification.
   See [the root-cause record](docs/grpc_qualification_6006.md) and
   [completed fixture source evidence](docs/releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
 
@@ -6622,6 +6655,7 @@ published release notes.
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
 [Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.11...HEAD
+[0.9.12]: docs/releases/v0.9.12.md
 [0.9.11]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.8...v0.9.9
