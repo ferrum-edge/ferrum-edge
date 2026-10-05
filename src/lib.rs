@@ -14660,6 +14660,16 @@ pub mod _test_support {
         )
     }
 
+    /// The protocol/route ceiling used by actual H3 retained replacements.
+    pub fn retained_h3_request_body_limit_for_test(
+        flavor: crate::config::types::HttpFlavor,
+        ctx: &crate::plugins::RequestContext,
+        http_limit: usize,
+        grpc_limit: usize,
+    ) -> usize {
+        crate::http3::server::retained_h3_request_body_limit(flavor, ctx, http_limit, grpc_limit)
+    }
+
     /// Fold a global body ceiling with a route/plugin ceiling exactly as every
     /// request path does (`GHSA-xrfj-852f-645j`).
     pub fn effective_request_body_limit_for_test(
@@ -14815,7 +14825,7 @@ pub mod _test_support {
     }
 
     impl RequestBufferBudgetProbe {
-        /// The actual native-H3/bridge body-hook handoff under this budget.
+        /// The actual retained body hooks and finalized egress under this budget.
         pub async fn prepare_retained_body(
             &self,
             plugins: &[Arc<dyn crate::plugins::Plugin>],
@@ -14824,6 +14834,8 @@ pub mod _test_support {
             body: bytes::Bytes,
             effective_limit: usize,
         ) -> Result<bytes::Bytes, crate::plugins::PluginResult> {
+            use crate::proxy::run_finalized_request_egress_hooks;
+
             let deadline = ctx.grpc_deadline_at();
             let body = crate::proxy::apply_retained_request_body_plugins_in(
                 plugins,
@@ -14835,15 +14847,20 @@ pub mod _test_support {
                 self.0.handle(),
             )
             .await?;
-            match crate::proxy::run_final_request_body_hooks(
+            let result = crate::proxy::run_final_request_body_hooks(
                 plugins,
-                Some(ctx),
+                Some(&mut *ctx),
                 deadline,
                 headers,
                 &body,
             )
-            .await
-            {
+            .await;
+            if !matches!(result, crate::plugins::PluginResult::Continue) {
+                return Err(result);
+            }
+            let path = ctx.path.clone();
+            let egress = run_finalized_request_egress_hooks(plugins, ctx, &path, headers, &body).await;
+            match egress.result {
                 crate::plugins::PluginResult::Continue => Ok(body),
                 reject => Err(reject),
             }
@@ -14861,6 +14878,31 @@ pub mod _test_support {
                 self.0.handle(),
             )?;
             permit.into_covered_bytes(data)
+        }
+
+        /// The complete production normalization path under this budget.
+        #[allow(clippy::too_many_arguments)]
+        pub async fn normalize_retained_body(
+            &self,
+            plugins: &[Arc<dyn crate::plugins::Plugin>],
+            ctx: &mut crate::plugins::RequestContext,
+            headers: &mut HashMap<String, String>,
+            body: bytes::Bytes,
+            effective_limit: usize,
+            needs_body_text: bool,
+            needs_body_bytes: bool,
+        ) -> Result<bytes::Bytes, crate::plugins::PluginResult> {
+            crate::proxy::normalize_retained_request_body_in(
+                plugins,
+                ctx,
+                headers,
+                body,
+                effective_limit,
+                needs_body_text,
+                needs_body_bytes,
+                self.0.handle(),
+            )
+            .await
         }
 
         pub async fn collect_retained_chunks<S>(

@@ -1012,9 +1012,11 @@ where
             // they do on the H1/H2 dispatch path. This bridge path has no
             // `:method` pseudo-header for the no-context hook to consult.
             let grpc_deadline_at = ctx.grpc_deadline_at();
-            let retained_limit = crate::proxy::effective_request_body_limit(
+            let retained_limit = super::server::retained_h3_request_body_limit(
+                flavor,
+                ctx,
                 state.max_request_body_size_bytes,
-                ctx.route_request_body_limit(),
+                state.max_grpc_recv_size_bytes,
             );
             let transformed = crate::proxy::apply_retained_request_body_plugins_with_context(
                 plugins,

@@ -136,9 +136,13 @@ and publication refuses an allocation whose capacity exceeds that window.
 Original metadata and replay owners keep their original charge; output/retry
 owners keep the replacement's independent charge. Windows are released on a
 no-op, rejection or cancellation. The finite window uses the effective request
-ceiling, with the existing retained fallback at zero; memory pressure or an
-uncovered output yields the existing capacity terminal. Plugin-internal
-transform/decode working sets and text views keep their separate contracts;
+ceiling: `max_grpc_recv_size_bytes` for native gRPC and gRPC-Web, or
+`max_request_body_size_bytes` for HTTP, composed with the route ceiling and the
+existing retained fallback at zero. A producer with a memoized-false execution
+trigger is skipped before output admission; undecided or eligible producers
+retain admission and their normal context-aware trigger/security hooks. Memory
+pressure or an uncovered output yields the existing capacity terminal.
+Plugin-internal transform/decode working sets and text views keep their separate contracts;
 this change does not claim that the upload budget covers every plugin allocation.
 Streaming zero remains unlimited; QUIC flow control is not an aggregate retained-body cap. Trailers and
 H2 open-DATA GET/HEAD/OPTIONS without Content-Length retain their transport
@@ -159,8 +163,13 @@ before source polling and successful final-clone ownership. Actual bridge hook
 and cross-protocol retry handoffs prove allocation identity under an exhausted
 budget; independently admitted copies/transform outputs prove simultaneous
 original/output ownership, refusal before producer invocation and cancellation
-release. These tests use the same isolated-budget implementation as production,
-without assuming Vec capacity equals length. Real ingress tests
+release. Regression cases cover a small output with uncovered allocation
+capacity, refusal before final policy and finalized egress, complete
+normalization success/rejection/cancellation and memoized-false no-op behavior
+under pressure. A real gRPC-Web text decode and native gRPC replacements exercise
+differing HTTP/gRPC ceilings and narrower route caps. These tests use the same
+isolated-budget implementation as production, without assuming Vec capacity
+equals length. Real ingress tests
 exercise UsernameToken/X.509/SAML and timestamp-only SOAP stalls through H1
 chunked/Content-Length, H2 open DATA without Content-Length (POST/GET/HEAD/OPTIONS)
 and native H3 terminal HEADERS, with backend, circuit-breaker and health

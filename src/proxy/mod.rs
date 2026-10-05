@@ -6365,11 +6365,34 @@ pub(crate) async fn normalize_retained_request_body_before_before_proxy(
     needs_body_text: bool,
     needs_body_bytes: bool,
 ) -> Result<Bytes, PluginResult> {
-    let Some((mut normalized, permit)) = copy_retained_request_body_in(
-        &body,
+    normalize_retained_request_body_in(
+        plugins,
+        ctx,
+        headers,
+        body,
         effective_limit,
+        needs_body_text,
+        needs_body_bytes,
         response_buffer_budget::BudgetRef::request_buffer(),
-    ) else {
+    )
+    .await
+}
+
+/// The complete normalization path, with an isolated budget seam for tests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn normalize_retained_request_body_in(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: Bytes,
+    effective_limit: usize,
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+    budget: response_buffer_budget::BudgetRef<'_>,
+) -> Result<Bytes, PluginResult> {
+    let Some((mut normalized, permit)) =
+        copy_retained_request_body_in(&body, effective_limit, budget)
+    else {
         return Err(retained_request_capacity_result(ctx));
     };
     let was_decoded = ctx
@@ -6451,7 +6474,13 @@ pub(crate) async fn apply_retained_request_body_plugins_in(
     }
     let content_type = headers.get("content-type").map(String::as_str);
     let ceiling = budget.request_ceiling(effective_limit);
-    for plugin in plugins.iter().filter(|plugin| plugin.modifies_request_body()) {
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.modifies_request_body())
+    {
+        if !plugin.may_transform_request_body(ctx) {
+            continue;
+        }
         let Some(permit) = response_buffer_budget::RequestBufferPermit::reserve_in(budget, ceiling)
         else {
             return Err(retained_request_capacity_result(ctx));

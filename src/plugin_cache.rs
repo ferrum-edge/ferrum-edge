@@ -1241,6 +1241,9 @@ impl Plugin for PluginInstanceWrapper {
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
     }
+    fn may_transform_request_body(&self, ctx: &RequestContext) -> bool {
+        self.runs_cached(ctx) && self.inner.may_transform_request_body(ctx)
+    }
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.inner.egresses_request_body_before_finalization()
     }

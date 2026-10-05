@@ -10467,6 +10467,15 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Whether the retained request-body producer may run for this request.
+    /// Only a provably disabled producer may decline its output admission.
+    /// Trigger wrappers consult the memoized decision without evaluating a
+    /// trigger early; missing or undecided state must retain the output window
+    /// and invoke the ordinary context-aware hook.
+    fn may_transform_request_body(&self, _ctx: &RequestContext) -> bool {
+        self.modifies_request_body()
+    }
+
     /// Returns `true` when this plugin sends the buffered request body to an
     /// external service during `before_proxy`, before request-body transforms
     /// and final-body policy hooks run. Cache validation rejects a same-protocol

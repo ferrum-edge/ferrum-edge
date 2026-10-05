@@ -752,6 +752,7 @@ struct RetainedProducer {
     budget: Arc<RequestBufferBudgetProbe>,
     calls: Arc<AtomicUsize>,
     stall: bool,
+    output_capacity: Option<usize>,
 }
 
 #[async_trait::async_trait]
@@ -779,7 +780,9 @@ impl Plugin for RetainedProducer {
         if self.stall {
             pending::<()>().await;
         }
-        Some(body.to_vec())
+        let mut output = Vec::with_capacity(self.output_capacity.unwrap_or(body.len()));
+        output.extend_from_slice(body);
+        Some(output)
     }
 }
 
@@ -797,6 +800,7 @@ async fn actual_transform_output_has_its_own_retained_allocation_lifetime() {
         budget: budget.clone(),
         calls: calls.clone(),
         stall: false,
+        output_capacity: None,
     })];
     let headers = ctx.headers.clone();
     let output = budget
@@ -809,11 +813,7 @@ async fn actual_transform_output_has_its_own_retained_allocation_lifetime() {
     let retry = replay_retained_request_body_for_test(&output);
     drop(output);
     drop(original);
-    assert_eq!(
-        budget.available_bytes(),
-        0,
-        "metadata retains the original"
-    );
+    assert_eq!(budget.available_bytes(), 0, "metadata retains the original");
     drop(ctx);
     assert_eq!(budget.available_bytes(), UNIT);
     drop(retry);
@@ -833,6 +833,7 @@ async fn actual_transform_refusal_and_cancellation_release_only_their_own_admiss
             budget: budget.clone(),
             calls: calls.clone(),
             stall,
+            output_capacity: None,
         })];
         let headers = ctx.headers.clone();
         let mut prepare =
@@ -857,7 +858,10 @@ async fn actual_transform_refusal_and_cancellation_release_only_their_own_admiss
                 panic!("capacity refusal");
             };
             assert_eq!(status_code, 503);
-            assert_eq!(body, ferrum_edge::_test_support::REQUEST_BUFFER_OVERLOAD_BODY);
+            assert_eq!(
+                body,
+                ferrum_edge::_test_support::REQUEST_BUFFER_OVERLOAD_BODY
+            );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert_eq!(budget.available_bytes(), 0);
         }
@@ -878,4 +882,486 @@ async fn actual_normalization_copy_admission_preserves_both_allocation_owners() 
     assert_eq!(budget.available_bytes(), UNIT);
     drop(copy);
     assert_eq!(budget.available_bytes(), 2 * UNIT);
+}
+
+struct FinalizedEgressProbe {
+    final_calls: Arc<AtomicUsize>,
+    egress_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for FinalizedEgressProbe {
+    fn name(&self) -> &str {
+        "test_finalized_egress"
+    }
+
+    async fn on_final_request_body(
+        &self,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        self.final_calls.fetch_add(1, Ordering::SeqCst);
+        PluginResult::Continue
+    }
+
+    fn dispatches_finalized_request_egress(&self) -> bool {
+        true
+    }
+
+    async fn dispatch_finalized_request_egress(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+        _backend_header_overlay: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        self.egress_calls.fetch_add(1, Ordering::SeqCst);
+        PluginResult::Continue
+    }
+}
+
+#[tokio::test]
+async fn small_transform_with_uncovered_capacity_is_refused_before_final_egress() {
+    let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, 2 * UNIT));
+    let body = retained_body(&budget).await;
+    assert!(body.len() < UNIT);
+    let original = body.clone();
+    let mut ctx = request();
+    ctx.request_body_bytes = Some(body.clone());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let final_calls = Arc::new(AtomicUsize::new(0));
+    let egress_calls = Arc::new(AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(RetainedProducer {
+            budget: budget.clone(),
+            calls: calls.clone(),
+            stall: false,
+            output_capacity: Some(UNIT + 1),
+        }),
+        Arc::new(FinalizedEgressProbe {
+            final_calls: final_calls.clone(),
+            egress_calls: egress_calls.clone(),
+        }),
+    ];
+    let headers = ctx.headers.clone();
+    let result = budget
+        .prepare_retained_body(&plugins, &mut ctx, &headers, body, UNIT)
+        .await;
+    assert!(matches!(
+        result,
+        Err(PluginResult::Reject {
+            status_code: 503,
+            ..
+        })
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(egress_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(budget.available_bytes(), UNIT);
+    assert_eq!(
+        ctx.request_body_bytes.as_ref().unwrap().as_ptr(),
+        original.as_ptr()
+    );
+    drop(ctx);
+    assert_eq!(budget.available_bytes(), UNIT);
+    drop(original);
+    assert_eq!(budget.available_bytes(), 2 * UNIT);
+}
+
+#[tokio::test]
+async fn memoized_false_producer_needs_no_window_but_eligible_and_undecided_do() {
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let mut config = cache_config(50, None);
+    let producer = &mut config.plugin_configs[0];
+    producer.plugin_name = "request_transformer".into();
+    producer.config = json!({"rules": [{
+        "operation": "add", "target": "body", "key": "gated", "value": "yes"
+    }]});
+    producer.trigger = Some(
+        serde_json::from_value(json!({
+            "when": {"match": {"path": {"prefix": ["/eligible"]}}}
+        }))
+        .unwrap(),
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("ferrum", "upload", ProxyProtocol::Http);
+    assert!(plugins[0].modifies_request_body());
+    for decision in [Some(false), Some(true), None] {
+        for total in [UNIT, 2 * UNIT] {
+            let budget = RequestBufferBudgetProbe::new(UNIT, total);
+            let chunks = futures_util::stream::iter([Ok(Bytes::from_static(b"{}"))]);
+            let collected = budget.collect_retained_chunks(chunks, UNIT).await.unwrap();
+            let RetainedRequestOutcomeForTest::Collected(body) = collected else {
+                panic!("admitted JSON body");
+            };
+            let original = body.clone();
+            let mut ctx = request();
+            ctx.headers
+                .insert("content-type".into(), "application/json".into());
+            if decision != Some(false) {
+                ctx.path = "/eligible".into();
+            }
+            if decision.is_some() {
+                assert!(matches!(
+                    plugins[0].on_request_received(&mut ctx).await,
+                    PluginResult::Continue
+                ));
+            }
+            ctx.request_body_bytes = Some(body.clone());
+            let headers = ctx.headers.clone();
+            let result = budget
+                .prepare_retained_body(&plugins, &mut ctx, &headers, body, UNIT)
+                .await;
+            if decision == Some(false) || total == 2 * UNIT {
+                let output = result.unwrap_or_else(|_| panic!("admitted or skipped producer"));
+                if decision == Some(false) {
+                    assert_eq!(output.as_ptr(), original.as_ptr());
+                    assert_eq!(output.as_ref(), b"{}");
+                    assert_eq!(budget.available_bytes(), total - UNIT);
+                } else {
+                    assert_ne!(output.as_ptr(), original.as_ptr());
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+                        json!({"gated": "yes"})
+                    );
+                    assert_eq!(budget.available_bytes(), 0);
+                }
+                drop(output);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(PluginResult::Reject {
+                        status_code: 503,
+                        ..
+                    })
+                ));
+            }
+            assert_eq!(budget.available_bytes(), total - UNIT);
+            drop(ctx);
+            assert_eq!(budget.available_bytes(), total - UNIT);
+            drop(original);
+            assert_eq!(budget.available_bytes(), total);
+        }
+    }
+}
+
+enum NormalizerOutcome {
+    Rewrite,
+    Reject,
+    Stall,
+    Uncovered,
+}
+
+struct RetainedNormalizer {
+    budget: Arc<RequestBufferBudgetProbe>,
+    calls: Arc<AtomicUsize>,
+    outcome: NormalizerOutcome,
+}
+
+#[async_trait::async_trait]
+impl Plugin for RetainedNormalizer {
+    fn name(&self) -> &str {
+        "test_retained_normalizer"
+    }
+
+    fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        true
+    }
+
+    async fn normalize_buffered_request_body_before_before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: &mut Vec<u8>,
+    ) -> PluginResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(self.budget.available_bytes(), 0);
+        match self.outcome {
+            NormalizerOutcome::Reject => {
+                return PluginResult::Reject {
+                    status_code: 400,
+                    headers: HashMap::new(),
+                    body: "normalization refused".into(),
+                };
+            }
+            NormalizerOutcome::Stall => pending::<()>().await,
+            NormalizerOutcome::Uncovered => *body = Vec::with_capacity(UNIT + 1),
+            NormalizerOutcome::Rewrite => body.clear(),
+        }
+        body.extend_from_slice(b"normalized body");
+        ctx.metadata
+            .insert("compression:request_decoded".into(), "true".into());
+        headers.remove("content-encoding");
+        PluginResult::Continue
+    }
+}
+
+#[tokio::test]
+async fn complete_normalization_refreshes_views_and_preserves_independent_owners() {
+    let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, 2 * UNIT));
+    let body = retained_body(&budget).await;
+    let original = body.clone();
+    let mut ctx = request();
+    ctx.request_body_bytes = Some(body.clone());
+    ctx.metadata
+        .insert("request_body".into(), "original body".into());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetainedNormalizer {
+        budget: budget.clone(),
+        calls: calls.clone(),
+        outcome: NormalizerOutcome::Rewrite,
+    })];
+    let mut headers = ctx.headers.clone();
+    headers.insert("content-encoding".into(), "gzip".into());
+    let output = budget
+        .normalize_retained_body(&plugins, &mut ctx, &mut headers, body, UNIT, true, true)
+        .await
+        .unwrap_or_else(|_| panic!("admitted normalization"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(output.as_ref(), b"normalized body");
+    assert_ne!(output.as_ptr(), original.as_ptr());
+    assert_eq!(
+        ctx.request_body_bytes.as_ref().unwrap().as_ptr(),
+        output.as_ptr()
+    );
+    assert_eq!(ctx.metadata["request_body"], "normalized body");
+    assert_eq!(
+        ctx.metadata["request_body_size_bytes"],
+        output.len().to_string()
+    );
+    assert!(!headers.contains_key("content-encoding"));
+    assert_eq!(budget.available_bytes(), 0);
+    let retry = output.clone();
+    drop(output);
+    drop(ctx);
+    assert_eq!(budget.available_bytes(), 0);
+    drop(retry);
+    assert_eq!(budget.available_bytes(), UNIT);
+    drop(original);
+    assert_eq!(budget.available_bytes(), 2 * UNIT);
+}
+
+#[tokio::test]
+async fn complete_normalization_rejection_and_cancellation_keep_original_owners_charged() {
+    for outcome in [
+        NormalizerOutcome::Reject,
+        NormalizerOutcome::Stall,
+        NormalizerOutcome::Uncovered,
+    ] {
+        let stall = matches!(outcome, NormalizerOutcome::Stall);
+        let expected_status = if matches!(outcome, NormalizerOutcome::Reject) {
+            400
+        } else {
+            503
+        };
+        let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, 2 * UNIT));
+        let body = retained_body(&budget).await;
+        let original = body.clone();
+        let mut ctx = request();
+        ctx.request_body_bytes = Some(body.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetainedNormalizer {
+            budget: budget.clone(),
+            calls: calls.clone(),
+            outcome,
+        })];
+        let mut headers = ctx.headers.clone();
+        let mut normalize = Box::pin(budget.normalize_retained_body(
+            &plugins,
+            &mut ctx,
+            &mut headers,
+            body,
+            UNIT,
+            true,
+            true,
+        ));
+        if stall {
+            let waker = futures_util::task::noop_waker();
+            assert!(
+                normalize
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert_eq!(budget.available_bytes(), 0);
+            drop(normalize);
+        } else {
+            let PluginResult::Reject { status_code, .. } = normalize.await.unwrap_err() else {
+                panic!("normalization rejection");
+            };
+            assert_eq!(status_code, expected_status);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.available_bytes(), UNIT);
+        assert_eq!(
+            ctx.request_body_bytes.as_ref().unwrap().as_ptr(),
+            original.as_ptr()
+        );
+        drop(ctx);
+        assert_eq!(budget.available_bytes(), UNIT);
+        drop(original);
+        assert_eq!(budget.available_bytes(), 2 * UNIT);
+    }
+}
+
+#[tokio::test]
+async fn complete_normalization_admission_refusal_precedes_the_hook() {
+    let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, UNIT));
+    let body = retained_body(&budget).await;
+    let original = body.clone();
+    let mut ctx = request();
+    ctx.request_body_bytes = Some(body.clone());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetainedNormalizer {
+        budget: budget.clone(),
+        calls: calls.clone(),
+        outcome: NormalizerOutcome::Rewrite,
+    })];
+    let mut headers = ctx.headers.clone();
+    let result = budget
+        .normalize_retained_body(&plugins, &mut ctx, &mut headers, body, UNIT, true, true)
+        .await;
+    assert!(matches!(
+        result,
+        Err(PluginResult::Reject {
+            status_code: 503,
+            ..
+        })
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(budget.available_bytes(), 0);
+    drop(ctx);
+    assert_eq!(budget.available_bytes(), 0);
+    drop(original);
+    assert_eq!(budget.available_bytes(), UNIT);
+}
+
+#[tokio::test]
+async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
+    use base64::Engine;
+    use ferrum_edge::_test_support::retained_h3_request_body_limit_for_test;
+    use ferrum_edge::config::types::HttpFlavor;
+    use ferrum_edge::plugins::grpc_web::GrpcWebPlugin;
+
+    const MIB: usize = 1024 * 1024;
+    let mut frames = vec![0; 2 * MIB];
+    let message_len = (frames.len() - 5) as u32;
+    frames[1..5].copy_from_slice(&message_len.to_be_bytes());
+    for (flavor, grpc_web) in [
+        (HttpFlavor::Grpc, false),
+        (HttpFlavor::Plain, true),
+        (HttpFlavor::Plain, false),
+    ] {
+        for route_limit in [None, Some(3 * MIB), Some(MIB)] {
+            let mut ctx = request();
+            ctx.route_request_body_limit_bytes = route_limit.map(|limit| limit as u64);
+            let content_type = if grpc_web {
+                "application/grpc-web-text"
+            } else {
+                "application/grpc"
+            };
+            ctx.headers
+                .insert("content-type".into(), content_type.into());
+            let translator: Arc<dyn Plugin> = Arc::new(GrpcWebPlugin::new(&json!({})).unwrap());
+            if grpc_web {
+                assert!(matches!(
+                    translator.on_request_received(&mut ctx).await,
+                    PluginResult::Continue
+                ));
+            }
+            let limit = retained_h3_request_body_limit_for_test(flavor, &ctx, MIB, 4 * MIB);
+            let expected = if matches!(flavor, HttpFlavor::Grpc) || grpc_web {
+                route_limit.unwrap_or(4 * MIB)
+            } else {
+                MIB
+            };
+            assert_eq!(limit, expected);
+            let total = if grpc_web { 8 * MIB } else { limit + 2 * MIB };
+            let budget = Arc::new(RequestBufferBudgetProbe::new(4 * MIB, total));
+            let wire = if grpc_web {
+                base64::engine::general_purpose::STANDARD
+                    .encode(&frames)
+                    .into_bytes()
+            } else {
+                frames.clone()
+            };
+            let chunks = futures_util::stream::iter([Ok(Bytes::from(wire))]);
+            let collect_limit = if grpc_web { 4 * MIB } else { 2 * MIB };
+            let collected = budget
+                .collect_retained_chunks(chunks, collect_limit)
+                .await
+                .unwrap();
+            let RetainedRequestOutcomeForTest::Collected(body) = collected else {
+                panic!("admitted wire body");
+            };
+            ctx.request_body_bytes = Some(body.clone());
+            let mut headers = ctx.headers.clone();
+            if grpc_web {
+                assert!(matches!(
+                    translator.before_proxy(&mut ctx, &mut headers).await,
+                    PluginResult::Continue
+                ));
+            } else {
+                // Exercise the full normalization path with the same selected
+                // ceiling before testing a distinct post-before_proxy output.
+                let normalized = budget
+                    .normalize_retained_body(
+                        &[],
+                        &mut ctx,
+                        &mut headers,
+                        body.clone(),
+                        limit,
+                        false,
+                        false,
+                    )
+                    .await;
+                assert_eq!(normalized.is_ok(), limit >= frames.len());
+                drop(normalized);
+            }
+            let final_calls = Arc::new(AtomicUsize::new(0));
+            let egress_calls = Arc::new(AtomicUsize::new(0));
+            let producer: Arc<dyn Plugin> = if grpc_web {
+                translator
+            } else {
+                Arc::new(RetainedProducer {
+                    budget: budget.clone(),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    stall: false,
+                    output_capacity: None,
+                })
+            };
+            let plugins: Vec<Arc<dyn Plugin>> = vec![
+                producer,
+                Arc::new(FinalizedEgressProbe {
+                    final_calls: final_calls.clone(),
+                    egress_calls: egress_calls.clone(),
+                }),
+            ];
+            let result = budget
+                .prepare_retained_body(&plugins, &mut ctx, &headers, body, limit)
+                .await;
+            if limit >= frames.len() {
+                let output = result.unwrap_or_else(|_| panic!("valid 2 MiB replacement"));
+                assert_eq!(output.as_ref(), frames.as_slice());
+                assert_ne!(
+                    output.as_ptr(),
+                    ctx.request_body_bytes.as_ref().unwrap().as_ptr()
+                );
+                assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(egress_calls.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(PluginResult::Reject {
+                        status_code: 503,
+                        ..
+                    })
+                ));
+                assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(egress_calls.load(Ordering::SeqCst), 0);
+            }
+            drop(ctx);
+            assert_eq!(budget.available_bytes(), total);
+        }
+    }
 }

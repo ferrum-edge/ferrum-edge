@@ -4428,11 +4428,12 @@ async fn handle_h3_request(
     } else {
         crate::proxy::RequestBodyPhaseRequirements::default()
     };
-    let protocol_body_limit = if matches!(http_flavor, HttpFlavor::Grpc) {
-        effective_max_grpc_recv_size_bytes
-    } else {
-        effective_max_request_body_size_bytes
-    };
+    let protocol_body_limit = retained_h3_request_body_limit(
+        http_flavor,
+        &ctx,
+        state.max_request_body_size_bytes,
+        state.max_grpc_recv_size_bytes,
+    );
     let before_proxy_body_limit = crate::proxy::effective_request_body_limit(
         protocol_body_limit,
         before_proxy_body_requirements.plugin_limit,
@@ -4611,7 +4612,7 @@ async fn handle_h3_request(
                 &mut ctx,
                 &mut tmp_headers,
                 body_data.clone(),
-                effective_max_request_body_size_bytes,
+                protocol_body_limit,
                 before_proxy_body_requirements.needs_text,
                 before_proxy_body_requirements.needs_bytes,
             )
@@ -5859,7 +5860,7 @@ async fn handle_h3_request(
             grpc_deadline_at,
             &hook_headers,
             body_data,
-            effective_max_request_body_size_bytes,
+            protocol_body_limit,
         )
         .await;
         let (transformed, transform_rejection) = match transformed {
@@ -6451,7 +6452,7 @@ async fn handle_h3_request(
             grpc_deadline_at,
             &hook_headers,
             body_data,
-            effective_max_request_body_size_bytes,
+            protocol_body_limit,
         )
         .await;
         let (transformed, transform_rejection) = match transformed {
@@ -9031,7 +9032,7 @@ async fn handle_h3_request(
             grpc_deadline_at,
             &hook_headers,
             body_data,
-            effective_max_request_body_size_bytes,
+            protocol_body_limit,
         )
         .await
         {
@@ -10848,6 +10849,22 @@ async fn handle_h3_request(
     }
 
     Ok(())
+}
+
+/// Retained H3 collection and replacements share the client protocol ceiling,
+/// including gRPC-Web dispatched to an ordinary HTTP backend and route limits.
+pub(crate) fn retained_h3_request_body_limit(
+    flavor: HttpFlavor,
+    ctx: &RequestContext,
+    http_limit: usize,
+    grpc_limit: usize,
+) -> usize {
+    crate::proxy::effective_request_body_limit_for_protocol(
+        matches!(flavor, HttpFlavor::Grpc) || crate::plugins::grpc_web::client_uses_grpc_web(ctx),
+        http_limit,
+        grpc_limit,
+        ctx.route_request_body_limit(),
+    )
 }
 
 pub(crate) fn h3_plugin_protocol_for_request(
