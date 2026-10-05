@@ -2742,12 +2742,9 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             _ => {
                 let mut changed = consumer.clone();
                 changed.acl_groups = vec!["operator".to_string()];
-                db.update_consumer(
-                    &changed,
-                    &BatchConfigWriteMode::Admission,
-                )
-                .await
-                .unwrap();
+                db.update_consumer(&changed, &BatchConfigWriteMode::Admission)
+                    .await
+                    .unwrap();
                 (String::new(), None)
             }
         };

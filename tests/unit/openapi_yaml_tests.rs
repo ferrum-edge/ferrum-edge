@@ -13262,8 +13262,7 @@ fn plugin_graph_delete_rejections_have_openapi_parity() {
             .pointer(pointer)
             .unwrap_or_else(|| panic!("plugin-graph DELETE is missing 400 response: {pointer}"));
         assert_eq!(
-            response["content"]["application/json"]["schema"],
-            expected_schema,
+            response["content"]["application/json"]["schema"], expected_schema,
             "plugin-composition Error must remain an exact response member: {pointer}"
         );
         assert!(
