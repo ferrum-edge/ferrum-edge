@@ -3716,7 +3716,10 @@ async fn assert_mongo_orphaned_spec_refused(db: Arc<dyn DatabaseBackend>, raw: &
         assert!(!result.body.to_string().contains("orphan-canary"));
         let unchanged = get_ns(&base, "/deployment-snapshot", &namespace).await;
         assert_eq!(unchanged.status, 200);
-        assert!(unchanged.etag == original.etag, "original authority changed");
+        assert!(
+            unchanged.etag == original.etag,
+            "original authority changed"
+        );
         assert!(
             unchanged.body == original.body,
             "orphan refusal changed complete typed/raw deployment evidence"
