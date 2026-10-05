@@ -977,8 +977,8 @@ pub enum PreparedTerminalOp {
 /// Capacity-checked, moved cookie owner; construction is confined to the
 /// synchronous admitted view, before any cursor or external poll. Its immutable
 /// ticket binds the value to the originating request throughout its lifetime.
-/// Legacy application requires the destination's prepared chain; the raw copier
-/// is private.
+/// Public application uses the destination's immutable ticket-bound selected
+/// carrier. The legacy map adapter and raw copier are not public APIs.
 ///
 /// ```compile_fail,E0603
 /// use ferrum_edge::plugins::terminal_preparation::apply_terminal_cookie;
@@ -2026,11 +2026,61 @@ pub fn compile_terminal_manifest(
 /// All preparations finish before the caller executes any cursor action.
 /// This fixed slot owner contains no plugin/context/raw view and invokes no
 /// old-hook fallback. Unsupported operations fail before terminal execution.
-/// Public legacy application requires this destination request's custody; there
-/// is no free patch application that accepts an arbitrary destination map.
+/// Public application uses a selected carrier whose immutable admitted ticket
+/// belongs to the destination request. Legacy map adapters are crate-private
+/// and UNQUALIFIED: a raw map carries no destination-ticket proof.
 ///
 /// ```compile_fail,E0432
 /// use ferrum_edge::plugins::terminal_preparation::apply_terminal_patch;
+/// ```
+///
+/// A source chain cannot apply its payload to an arbitrary foreign map:
+///
+/// ```compile_fail,E0624
+/// use std::collections::HashMap;
+/// use ferrum_edge::plugins::terminal_preparation::{PreparedTerminalChain, TerminalPatch};
+///
+/// fn apply_source_fields_to_foreign_map(
+///     source: &mut PreparedTerminalChain,
+///     source_payload: TerminalPatch,
+///     foreign_headers: &mut HashMap<String, String>,
+/// ) {
+///     source.apply_fields(source_payload, foreign_headers).unwrap();
+/// }
+/// ```
+///
+/// The same restriction applies to cookies:
+///
+/// ```compile_fail,E0624
+/// use std::collections::HashMap;
+/// use ferrum_edge::plugins::terminal_preparation::{PreparedTerminalChain, TerminalCookie};
+///
+/// fn apply_source_cookie_to_foreign_map(
+///     source: &mut PreparedTerminalChain,
+///     source_payload: TerminalCookie,
+///     foreign_headers: &mut HashMap<String, String>,
+/// ) {
+///     source.apply_cookie(source_payload, foreign_headers).unwrap();
+/// }
+/// ```
+///
+/// Application through the originating request's typed destination remains public:
+///
+/// ```no_run
+/// use ferrum_edge::plugins::terminal_preparation::{
+///     PreparedTerminalChain, TerminalAdmissionError, TerminalCookie, TerminalPatch,
+/// };
+///
+/// fn apply_to_originating_request(
+///     source: &PreparedTerminalChain,
+///     patch: &TerminalPatch,
+///     cookie: &TerminalCookie,
+/// ) -> Result<(), TerminalAdmissionError> {
+///     let mut destination = source.new_selected_carrier()?;
+///     destination.apply(patch)?;
+///     destination.append_cookie(cookie)?;
+///     Ok(())
+/// }
 /// ```
 pub struct PreparedTerminalChain {
     slots: Option<FixedSlots<Option<PreparedTerminalOp>>>,
@@ -2199,9 +2249,10 @@ impl PreparedTerminalChain {
         Ok(())
     }
 
-    /// Apply only this request's patch, checking custody before legacy input
-    /// preflight or selected-carrier allocation. Legacy export is unqualified.
-    pub fn apply_fields(
+    /// UNQUALIFIED internal legacy adapter: checks source-payload custody before
+    /// preflight/allocation, but the raw map has no immutable destination ticket.
+    /// Public callers must use `SelectedTerminalCarrier::apply` instead.
+    pub(crate) fn apply_fields(
         &mut self,
         patch: TerminalPatch,
         headers: &mut std::collections::HashMap<String, String>,
@@ -2213,9 +2264,10 @@ impl PreparedTerminalChain {
         apply_legacy_patch(&patch, headers, selected)
     }
 
-    /// Apply only this request's cookie through the checked selected carrier.
-    /// Custody is checked before legacy preflight or allocation.
-    pub fn apply_cookie(
+    /// UNQUALIFIED internal legacy adapter: checks source-payload custody before
+    /// preflight/allocation, but the raw map has no immutable destination ticket.
+    /// Public callers must use `SelectedTerminalCarrier::append_cookie` instead.
+    pub(crate) fn apply_cookie(
         &mut self,
         cookie: TerminalCookie,
         headers: &mut std::collections::HashMap<String, String>,
@@ -2421,8 +2473,9 @@ fn preflight_legacy_cookie(
     Ok(Some(length))
 }
 
-// Private legacy export, reached only after the native chain checks custody
-// and appends every occurrence to its checked selected carrier.
+// UNQUALIFIED private legacy export. The native chain checks source-payload
+// custody and appends every occurrence to its selected carrier, but the raw
+// destination map carries no immutable ticket or allocation-backing proof.
 fn apply_terminal_cookie(
     cookie: TerminalCookie,
     headers: &mut std::collections::HashMap<String, String>,

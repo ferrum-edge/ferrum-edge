@@ -736,6 +736,10 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Check terminal preparation public API doctests
+        if: matrix.shard == 'gateway-core'
+        run: cargo test --doc --lib plugins::terminal_preparation::PreparedTerminalChain
+
       - name: Check the test run left the checkout clean
         # Tests keep runtime state in temporary directories (issue #5706).
         # Fail if this shard's tests modified a tracked file, left an

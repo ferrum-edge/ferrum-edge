@@ -1,6 +1,6 @@
 # Rejection preparation implementation status
 
-PR #6011, issues #6008/#6009; implementation round 30, preserving rounds 20–29.
+PR #6011, issues #6008/#6009; implementation round 32, preserving rounds 20–31.
 **Draft subset only. P2 remains open; the whole approved contract is not implemented or qualified.**
 The owner approved the complete 883-line round-17 contract identified by SHA-256
 `641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
@@ -131,9 +131,11 @@ The selected carrier checks the actual field table, simultaneous projection
 table and root against 32,768 bytes, and the single byte arena against 98,304.
 It holds 256 real occurrences and compacts in place after complete preflight.
 It is retained by the immediate chain rather than reconstructed for each patch.
-The checked prepared-chain legacy adapter validates the destination request's
-ticket before preflight, then exports through existing maps; that export is still
-outside the allocation proof. No second arena is allocated.
+The crate-private prepared-chain legacy adapter validates the source payload's
+ticket before preflight, then exports through existing maps. A raw map carries
+no immutable destination ticket: this adapter is **UNQUALIFIED** for destination
+custody and allocation backing. Public application uses only the typed selected
+carrier, which validates against its own immutable ticket. No second arena is allocated.
 
 Workload metrics stages its real UDP source-scope restamp through C credit, then
 checks authorization and completes all String adoption before changing metadata.
@@ -218,20 +220,23 @@ foundation and P2 remain OPEN. ROOT owns exact-head hosted execution, independen
 review and the ferrum-contracts plugin-catalog handoff for the new trait fact.
 The separate unresolved-route HTTP 503/native-gRPC 14 profile stays PENDING.
 
-## Round-30 request custody repair
+## Round-30 request custody repair and its destination gap
 
 Every direct selected-carrier field patch now validates its exact request ticket
 before allocating a projection table or changing carrier state. This applies to
 ordinary Set/Remove/Prefix actions as well as CORS Vary actions. The prepared
-chain checks the same ticket before legacy input preflight or first selected
-carrier construction. Existing configured-instance and generation validation at
-preparation remains strict.
+chain checks the source payload against its own ticket before legacy input
+preflight or first selected carrier construction. This does not bind an arbitrary
+raw destination map to that ticket. Existing configured-instance and generation
+validation at preparation remains strict.
 
 The unchecked public cookie copier is private to the checked native chain.
 The free public field adapter that constructed a destination carrier using the
-source patch's ticket is removed. Public legacy application now requires the
-destination's prepared chain and its private admitted custody. Tests use those
-checked routes; no public unchecked map fallback remains. Direct cookie append
+source patch's ticket is removed. The remaining chain methods were still public
+and accepted an arbitrary raw map: source chain A plus payload A could mutate
+foreign map B. The round-30 legacy negative fixtures only supplied A's payload
+through B's chain, so they did not exclude this public destination-custody escape.
+Round 32 restricts those adapters. Direct cookie append
 continues to validate custody and retain each opaque occurrence and its lineage.
 This is terminal cookie custody only, not an ordinary OIDC replay claim.
 
@@ -254,6 +259,46 @@ along with whole-diff inspection and fresh independent review. All ten original
 acceptance areas, complete wire/export allocation proof and P2 remain
 OPEN/UNQUALIFIED. The separate unresolved-route HTTP 503/native-gRPC 14 profile
 remains PENDING; this bounded repair does not qualify the whole contract.
+
+## Round-32 public destination-custody boundary
+
+`PreparedTerminalChain::apply_fields` and `apply_cookie` are now crate-private.
+There is no public wrapper that accepts a raw destination map. Public field and
+cookie application uses `SelectedTerminalCarrier::apply` / `append_cookie`;
+the destination owns an immutable admitted ticket and checks the payload against
+it before projection allocation or mutation. `new_selected_carrier` retains the
+prepared request's original ticket. Existing generation/configured-instance
+checks, cookie copier privacy, native backing/refcounts, caps, retirement,
+source ordering, CORS and suppression behavior are preserved.
+
+Public compile-fail examples use valid source-chain/payload/raw-map types and
+attempt the actual forbidden A-source/A-payload/B-map calls for fields and
+cookies. A positive typed API example accompanies them. The existing
+hosted gateway-core CI lane now runs these doctests; no local execution occurred.
+
+All external application fixtures now use the valid public typed destination API.
+The combined negative control constructs independently admitted A/B requests
+from one manifest and tests both fields and cookies against empty and full B
+carriers. Full B first rejects its own payload with ControlCapacity (field table)
+or FieldCapacity (cookies), then rejects A's payload with PinnedGeneration before
+any native allocation. B's occurrences, lineage, token contributions, context
+maps and backing, plus the logical ledger, are checked unchanged; consumed A
+payload backing is checked against its exact native release. A's next same-ticket
+payload succeeds, and last-owner release
+returns the exact logical ticket sum. Existing direct A/B native-allocation and
+extracted-owner lifetime controls remain. The legacy oversize-input fixture now
+exercises the actual rejection runner, asserting the capacity terminal and no
+partial field application; no raw adapter is exposed merely for tests. CORS and
+metrics parity compare every typed occurrence, including duplicate cookies.
+
+The crate-private legacy raw-map adapters/exports remain **UNQUALIFIED** for
+destination-map custody and complete allocation/wire backing. This bounded
+restriction does not complete participant migration, audit, Redis, raw-owner P2
+or any of the ten original acceptance areas: all ten remain OPEN/UNQUALIFIED.
+Exact-head hosted formatting, compilation, lint, doctest and runtime results
+remain UNVERIFIED. ROOT owns hosted validation and any required follow-up. No
+ordinary OIDC replay, complete export/wire qualification, new owner decision or
+separate unresolved-route HTTP 503/native-gRPC 14 approval is claimed.
 
 ## Concrete dependency boundary
 

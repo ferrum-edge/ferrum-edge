@@ -56,6 +56,51 @@ mod qualified {
         }
     }
 
+    // Test-only ingress uses the public typed destination and marks borrowed
+    // legacy values Unknown. It does not export or qualify a raw destination.
+    fn push_headers(carrier: &mut SelectedTerminalCarrier, headers: &HashMap<String, String>) {
+        let unknown = TerminalFieldLineage {
+            origin: TerminalFieldOrigin::Unknown,
+            policy_contribution: false,
+            section: TerminalFieldSection::Initial,
+            epoch: 0,
+        };
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("set-cookie") {
+                for value in value.split('\n') {
+                    carrier.push(name, value.as_bytes(), unknown).unwrap();
+                }
+            } else {
+                carrier.push(name, value.as_bytes(), unknown).unwrap();
+            }
+        }
+    }
+
+    // Compare every occurrence, including opaque duplicate cookies, without
+    // applying a prepared payload through a raw map or exporting a carrier.
+    fn assert_carrier_headers(
+        carrier: &SelectedTerminalCarrier,
+        expected: &HashMap<String, String>,
+    ) {
+        let mut actual: Vec<_> = carrier
+            .occurrences()
+            .map(|(name, value, _)| (name, value))
+            .collect();
+        let mut expected_fields = Vec::new();
+        for (name, value) in expected {
+            if name.eq_ignore_ascii_case("set-cookie") {
+                for value in value.split('\n') {
+                    expected_fields.push((name.as_bytes(), value.as_bytes()));
+                }
+            } else {
+                expected_fields.push((name.as_bytes(), value.as_bytes()));
+            }
+        }
+        actual.sort();
+        expected_fields.sort();
+        assert_eq!(actual, expected_fields);
+    }
+
     struct Fields {
         values: Vec<(&'static str, String)>,
         override_existing: bool,
@@ -708,9 +753,9 @@ mod qualified {
     }
 
     #[test]
-    fn checked_legacy_routes_refuse_foreign_custody_before_preflight_or_selected_allocation() {
+    fn typed_destinations_refuse_foreign_fields_and_cookies_before_allocation_or_mutation() {
         for cookie in [false, true] {
-            for selected_exists in [false, true] {
+            for full_destination in [false, true] {
                 let before = PROCESS_PREPARATION_LEDGER.usage();
                 let plugins: Vec<Arc<dyn Plugin>> = if cookie {
                     vec![
@@ -736,27 +781,42 @@ mod qualified {
                 let mut destination_chain =
                     PreparedTerminalChain::prepare(&plugins, &mut destination, false, false)
                         .unwrap();
-                let mut headers = HashMap::from([
-                    ("set-cookie".into(), "opaque=b\nopaque=b".into()),
-                    ("x-method".into(), "DELETE".into()),
-                    ("x-remove".into(), "b".into()),
-                ]);
-                if selected_exists {
+                let mut carrier = destination_chain.new_selected_carrier().unwrap();
+                if full_destination {
                     match destination_chain.next_operation().unwrap().execute() {
-                        TerminalResult::Fields(patch) => {
-                            destination_chain.apply_fields(patch, &mut headers).unwrap();
-                        }
-                        TerminalResult::Cookie(value) => {
-                            destination_chain.apply_cookie(value, &mut headers).unwrap();
-                        }
+                        TerminalResult::Fields(patch) => carrier.apply(&patch).unwrap(),
+                        TerminalResult::Cookie(value) => carrier.append_cookie(&value).unwrap(),
                         _ => panic!("expected fields or cookie"),
                     }
+                    if !cookie {
+                        carrier.rename("x-method", "x-destination-method").unwrap();
+                    }
+                    while carrier.field_count() < MAX_FIELD_OCCURRENCES {
+                        carrier.push("set-cookie", b"opaque=b", backend()).unwrap();
+                    }
                 }
-                // Invalid legacy input proves custody refusal precedes even
-                // legacy preflight, for fresh and already selected carriers.
-                headers.insert("invalid\nname".into(), "untouched".into());
-                let original = headers.clone();
-                let header_capacity = headers.capacity();
+                // B owns the immutable destination ticket even when it is
+                // empty. A full B also proves custody refusal precedes field
+                // capacity/projection work for both payload kinds.
+                let original: Vec<_> = carrier
+                    .occurrences()
+                    .map(|(name, value, lineage)| (name.to_vec(), value.to_vec(), lineage))
+                    .collect();
+                if full_destination {
+                    let refusal = match destination_chain.next_operation().unwrap().execute() {
+                        TerminalResult::Fields(patch) => carrier.apply(&patch).unwrap_err(),
+                        TerminalResult::Cookie(value) => carrier.append_cookie(&value).unwrap_err(),
+                        _ => panic!("expected fields or cookie"),
+                    };
+                    assert_eq!(
+                        refusal.reason,
+                        if cookie {
+                            TerminalRefusal::FieldCapacity
+                        } else {
+                            TerminalRefusal::ControlCapacity
+                        },
+                    );
+                }
                 let metadata = destination.metadata.clone();
                 let request_headers = destination.headers.clone();
                 let source_backing = source_chain.allocated_backing_bytes();
@@ -769,12 +829,8 @@ mod qualified {
                 let before_allocation = allocated.get();
                 let before_deallocation = deallocated.get();
                 let refusal = match operation {
-                    TerminalResult::Fields(patch) => destination_chain
-                        .apply_fields(patch, &mut headers)
-                        .unwrap_err(),
-                    TerminalResult::Cookie(value) => destination_chain
-                        .apply_cookie(value, &mut headers)
-                        .unwrap_err(),
+                    TerminalResult::Fields(patch) => carrier.apply(&patch).unwrap_err(),
+                    TerminalResult::Cookie(value) => carrier.append_cookie(&value).unwrap_err(),
                     _ => panic!("expected fields or cookie"),
                 };
                 assert_eq!(refusal.reason, TerminalRefusal::PinnedGeneration);
@@ -789,39 +845,56 @@ mod qualified {
                     destination_chain.allocated_backing_bytes(),
                     destination_backing
                 );
-                assert_eq!(headers, original);
-                assert_eq!(headers.capacity(), header_capacity);
+                let unchanged: Vec<_> = carrier
+                    .occurrences()
+                    .map(|(name, value, lineage)| (name.to_vec(), value.to_vec(), lineage))
+                    .collect();
+                assert_eq!(unchanged, original);
+                assert_eq!(carrier.token_contributions().count(), 0);
                 assert_eq!(destination.metadata, metadata);
                 assert_eq!(destination.headers, request_headers);
                 assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), admitted);
 
-                // A's remaining same-ticket operation is still accepted by
-                // the checked native route, with ordered opaque cookie values.
-                let mut source_headers = HashMap::from([
-                    ("set-cookie".into(), "opaque=a\nopaque=a".into()),
-                    ("x-remove".into(), "a".into()),
-                ]);
+                // A's remaining operation uses A's typed destination and
+                // retains exact opaque cookie order or applies Set/Remove.
+                let mut source_carrier = source_chain.new_selected_carrier().unwrap();
+                source_carrier.push("x-remove", b"a", backend()).unwrap();
+                for _ in 0..2 {
+                    source_carrier
+                        .push("set-cookie", b"opaque=a", backend())
+                        .unwrap();
+                }
                 match source_chain.next_operation().unwrap().execute() {
                     TerminalResult::Fields(patch) => {
-                        source_chain
-                            .apply_fields(patch, &mut source_headers)
-                            .unwrap();
-                        assert_eq!(source_headers.get("x-method").unwrap(), "POST");
-                        assert!(!source_headers.contains_key("x-remove"));
+                        source_carrier.apply(&patch).unwrap();
+                        assert_carrier_headers(
+                            &source_carrier,
+                            &HashMap::from([
+                                ("x-method".into(), "POST".into()),
+                                ("set-cookie".into(), "opaque=a\nopaque=a".into()),
+                            ]),
+                        );
                     }
                     TerminalResult::Cookie(value) => {
-                        source_chain
-                            .apply_cookie(value, &mut source_headers)
-                            .unwrap();
+                        source_carrier.append_cookie(&value).unwrap();
+                        let cookies: Vec<_> = source_carrier
+                            .occurrences()
+                            .filter(|(name, _, _)| *name == b"set-cookie")
+                            .map(|(_, value, _)| value)
+                            .collect();
                         assert_eq!(
-                            source_headers.get("set-cookie").unwrap(),
-                            "opaque=a\nopaque=a\na=3\na=4",
+                            cookies,
+                            [
+                                b"opaque=a".as_slice(),
+                                b"opaque=a".as_slice(),
+                                b"a=3".as_slice(),
+                                b"a=4".as_slice(),
+                            ],
                         );
                     }
                     _ => panic!("expected fields or cookie"),
                 }
-                // Retire the convenience pin's generation backing first,
-                // then observe the chain returning exactly A's request sum.
+                drop(source_carrier);
                 drop(source);
                 let retained = PROCESS_PREPARATION_LEDGER.usage();
                 assert_eq!(retained.tickets, before.tickets + 2);
@@ -829,6 +902,7 @@ mod qualified {
                 let retired = PROCESS_PREPARATION_LEDGER.usage();
                 assert_eq!(retired.tickets, before.tickets + 1);
                 assert_eq!(retired.bytes, retained.bytes - manifest.control_bytes());
+                drop(carrier);
                 drop(destination_chain);
                 drop(destination);
                 drop(manifest);
@@ -982,24 +1056,46 @@ mod qualified {
         assert_eq!(lineage, backend());
     }
 
-    #[test]
-    fn legacy_capacity_refusal_does_not_apply_a_prefix_of_the_patch() {
+    #[tokio::test]
+    async fn legacy_capacity_refusal_does_not_apply_a_prefix_of_the_patch() {
+        use ferrum_edge::_test_support::apply_replaceable_after_proxy_hooks_to_rejection_for_test;
+        use ferrum_edge::plugins::terminal_preparation::CAPACITY_HTTP_BODY;
+
         let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(Fields {
             values: vec![("x-first", "visible".into()), ("x-last", "z".repeat(1024))],
             override_existing: true,
         })];
         let mut ctx = context();
         pin(&plugins, &mut ctx);
-        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
-        let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
-            panic!("field operation")
-        };
         let mut retained = String::with_capacity(98_000);
         retained.push('x');
         let mut headers = HashMap::from([("x-retained".to_string(), retained)]);
-        assert!(chain.apply_fields(patch, &mut headers).is_err());
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers.get("x-retained").unwrap(), "x");
+        // Input alone fits; the complete prospective legacy patch does not.
+        assert!(validate_terminal_headers(&headers).is_ok());
+        let mut status = 403;
+        let mut body = bytes::Bytes::from_static(b"original rejection");
+        apply_replaceable_after_proxy_hooks_to_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut body,
+            &mut headers,
+        )
+        .await;
+        assert_eq!(status, 503);
+        assert_eq!(body.as_ref(), CAPACITY_HTTP_BODY);
+        assert!(!headers.contains_key("x-first"));
+        assert!(!headers.contains_key("x-last"));
+        assert_eq!(
+            headers,
+            HashMap::from([("content-type".into(), "application/json".into())]),
+        );
+        // The actual runner reached preparation rather than refusing input
+        // before the field operation existed. Its one-shot ticket is consumed.
+        assert!(matches!(
+            PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false),
+            Err(error) if error.reason == TerminalRefusal::AlreadyPrepared,
+        ));
     }
 
     #[test]
@@ -1017,15 +1113,21 @@ mod qualified {
         let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
         assert!(!ctx.metadata.contains_key("first"));
         assert!(!ctx.metadata.contains_key("second"));
-        let mut headers = HashMap::new();
+        let mut carrier = chain.new_selected_carrier().unwrap();
         while let Some(operation) = chain.next_operation() {
             let TerminalResult::Cookie(cookie) = operation.execute() else {
                 panic!("cookie operation")
             };
-            chain.apply_cookie(cookie, &mut headers).unwrap();
+            carrier.append_cookie(&cookie).unwrap();
         }
-        let values: Vec<_> = headers.get("set-cookie").unwrap().split('\n').collect();
-        assert_eq!(values, [value.as_str(), value.as_str()]);
+        let values: Vec<_> = carrier
+            .occurrences()
+            .map(|(name, value, _)| {
+                assert_eq!(name, b"set-cookie");
+                value
+            })
+            .collect();
+        assert_eq!(values, [value.as_bytes(), value.as_bytes()]);
     }
 
     #[tokio::test]
@@ -1083,10 +1185,10 @@ mod qualified {
         let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
             panic!("metrics operation")
         };
-        let mut headers = HashMap::new();
-        chain.apply_fields(patch, &mut headers).unwrap();
+        let mut carrier = chain.new_selected_carrier().unwrap();
+        carrier.apply(&patch).unwrap();
         assert_eq!(ctx.metadata, ordinary.metadata);
-        assert_eq!(headers, ordinary_headers);
+        assert_carrier_headers(&carrier, &ordinary_headers);
         assert_eq!(
             ctx.metadata.get("mesh.source.principal").unwrap(),
             "spiffe://mesh.local/peer",
@@ -1135,15 +1237,19 @@ mod qualified {
             let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
                 panic!("metrics trace operation")
             };
-            let mut headers = HashMap::new();
-            chain.apply_fields(patch, &mut headers).unwrap();
+            let mut carrier = chain.new_selected_carrier().unwrap();
+            carrier.apply(&patch).unwrap();
             if mode == 2 {
-                assert!(headers.is_empty());
+                assert_eq!(carrier.field_count(), 0);
                 assert!(!ctx.metadata.contains_key("trace_id"));
                 assert_eq!(ctx.metadata, ordinary.metadata);
                 continue;
             }
-            let traceparent = headers.get("traceparent").unwrap();
+            let traceparent = carrier
+                .occurrences()
+                .find(|(name, _, _)| *name == b"traceparent")
+                .map(|(_, value, _)| std::str::from_utf8(value).unwrap())
+                .unwrap();
             assert!(traceparent.starts_with("00-00000000000000000123456789abcdef-"));
             assert_eq!(traceparent.len(), 55);
             assert!(traceparent.ends_with("-00"));
@@ -1187,12 +1293,20 @@ mod qualified {
         let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
             panic!("rate-limit operation")
         };
-        let mut headers = HashMap::new();
-        headers.insert("x-ratelimit-identity".into(), "private".into());
-        chain.apply_fields(patch, &mut headers).unwrap();
-        assert_eq!(headers, ordinary_headers);
-        assert_eq!(headers.get("x-ratelimit-limit"), Some(&value));
-        assert!(!headers.contains_key("x-ratelimit-identity"));
+        let mut carrier = chain.new_selected_carrier().unwrap();
+        carrier
+            .push("x-ratelimit-identity", b"private", backend())
+            .unwrap();
+        carrier.apply(&patch).unwrap();
+        assert_carrier_headers(&carrier, &ordinary_headers);
+        assert!(carrier.occurrences().any(|(name, actual, _)| {
+            name == b"x-ratelimit-limit" && actual == value.as_bytes()
+        }));
+        assert!(
+            !carrier
+                .occurrences()
+                .any(|(name, _, _)| name == b"x-ratelimit-identity")
+        );
     }
 
     fn cors_policy() -> serde_json::Value {
@@ -1347,7 +1461,7 @@ mod qualified {
                     let mut chain =
                         PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
                     assert!(!ctx.metadata.contains_key("request_body"));
-                    let mut actual = HashMap::from([
+                    let initial = HashMap::from([
                         ("access-control-allow-origin".into(), "*".into()),
                         ("Access-Control-Allow-Private-Network".into(), "true".into()),
                         ("vary".into(), "Accept-Encoding, oRiGiN".into()),
@@ -1356,6 +1470,8 @@ mod qualified {
                             "opaque=1; HttpOnly\nopaque=1; HttpOnly".into(),
                         ),
                     ]);
+                    let mut carrier = chain.new_selected_carrier().unwrap();
+                    push_headers(&mut carrier, &initial);
                     drop(ctx);
                     drop(plugins);
                     drop(cache);
@@ -1363,12 +1479,12 @@ mod qualified {
                         match operation.execute() {
                             TerminalResult::Noop => {}
                             TerminalResult::Fields(patch) => {
-                                chain.apply_fields(patch, &mut actual).unwrap();
+                                carrier.apply(&patch).unwrap();
                             }
                             _ => panic!("CORS must only decorate fields"),
                         }
                     }
-                    assert_eq!(actual, expected);
+                    assert_carrier_headers(&carrier, &expected);
                 }
             }
         }
@@ -1865,13 +1981,14 @@ mod qualified {
                     .await;
                 let mut chain =
                     PreparedTerminalChain::prepare(&plugins, &mut ctx, true, true).unwrap();
-                let mut actual = initial;
+                let mut carrier = chain.new_selected_carrier().unwrap();
+                push_headers(&mut carrier, &initial);
                 while let Some(operation) = chain.next_operation() {
                     if let TerminalResult::Fields(patch) = operation.execute() {
-                        chain.apply_fields(patch, &mut actual).unwrap();
+                        carrier.apply(&patch).unwrap();
                     }
                 }
-                assert_eq!(actual, expected);
+                assert_carrier_headers(&carrier, &expected);
             }
         }
     }

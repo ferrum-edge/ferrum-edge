@@ -980,13 +980,16 @@ fn complete_preparation_precedes_ordered_once_only_actions_and_retires_raw_conte
     // No context or plugin handle is needed by any operation after preparation.
     drop(ctx);
     drop(plugins);
-    let mut headers = HashMap::new();
+    let mut carrier = chain.new_selected_carrier().unwrap();
     for expected in ["first", "second"] {
         let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
             panic!("expected the next ordered field patch");
         };
-        chain.apply_fields(patch, &mut headers).unwrap();
-        assert_eq!(headers.get("x-ordered").map(String::as_str), Some(expected));
+        carrier.apply(&patch).unwrap();
+        let fields: Vec<_> = carrier.occurrences().collect();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, b"x-ordered");
+        assert_eq!(fields[0].1, expected.as_bytes());
     }
     assert!(chain.next_operation().is_none());
     assert!(chain.next_operation().is_none());
