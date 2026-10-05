@@ -3005,15 +3005,16 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             .unwrap()
             .is_none()
     );
-    assert_eq!(
+    assert!(
         serde_json::to_value(
             db.get_consumer(&namespace, "historical")
                 .await
                 .unwrap()
                 .unwrap()
         )
-        .unwrap(),
-        serde_json::to_value(consumer_before).unwrap()
+        .unwrap()
+            == serde_json::to_value(consumer_before).unwrap(),
+        "stored credential preservation mismatch"
     );
     assert_eq!(
         serde_json::to_value(
@@ -3696,13 +3697,14 @@ async fn assert_mongo_deployment_raw_preservation(
             .unwrap(),
         &association_before
     );
-    assert_eq!(
+    assert!(
         consumers
             .find_one(doc! { "_id": format!("{namespace}:historical") })
             .await
             .unwrap()
-            .unwrap(),
-        historical
+            .unwrap()
+            == historical,
+        "stored credential preservation mismatch"
     );
 
     // A schema-rejected resource field refuses authority rather than being
@@ -3841,13 +3843,14 @@ async fn assert_mongo_deployment_raw_preservation(
             .unwrap()
             .is_none()
     );
-    assert_eq!(
+    assert!(
         consumers
             .find_one(doc! { "_id": format!("{namespace}:historical") })
             .await
             .unwrap()
-            .unwrap(),
-        historical
+            .unwrap()
+            == historical,
+        "stored credential preservation mismatch"
     );
 }
 
