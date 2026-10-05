@@ -10,8 +10,14 @@ qualification. The repairs qualified at final fixture head
 as `3ce21ad101f164f70cb7f7f77fb033db828b9518`; issue #6006 is closed.
 The failed release and main runs remain causal evidence, not rerunnable green
 qualification for a new candidate. No production behavior changes were made
-by this repair. The newly integrated release head still requires fresh review
-and hosted qualification.
+by this repair. The final v0.9.11 head
+`ff0a9d5152dc3cf2fd240158cbdf5551f511212e` subsequently qualified through review
+and hosted CI. Release merge `c764084b3b51c3f7ffde268c039688d35e49c553`
+published as v0.9.11 at 2026-10-04T21:26:11Z; see the
+[completed release record](releases/v0.9.11.md). The new
+[v0.9.12 candidate](releases/v0.9.12.md) requires fresh independent review and
+fresh exact-head, main-push and release evidence; these gates remain root-owned
+and pending.
 
 ## Authorization expiry during sender acquisition
 
