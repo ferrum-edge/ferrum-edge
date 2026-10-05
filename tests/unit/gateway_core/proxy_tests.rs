@@ -2124,6 +2124,9 @@ async fn pending_committed_observer_does_not_retain_terminal_deadline_response()
 
 #[test]
 fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
+    use super::http3_server_dispatch_tests::compact_code;
+    use super::native_grpc_dispatch_auth_lifetime_tests::source_group;
+
     let source = include_str!("../../../src/proxy/mod.rs");
     let finalization = source
         .split("async fn build_finalized_upload_deadline_response(")
@@ -2178,43 +2181,115 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         .expect("upload deadline metric");
     assert!(finalize < log && log < metric);
 
-    for phase in [
+    let handler = compact_code(
+        source
+            .split("async fn handle_proxy_request_inner(")
+            .nth(1)
+            .expect("H1/H2 request handler")
+            .split("pub fn build_backend_url(")
+            .next()
+            .expect("bounded H1/H2 handler"),
+    );
+    let mut exits = Vec::new();
+    for marker in [
+        "Err(RequestBodyBufferError::DeadlineExceeded)=>{",
+        "Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded)=>{",
+    ] {
+        for (index, _) in handler.match_indices(marker) {
+            let (branch, _) = source_group(&handler, index + marker.len() - 1)
+                .expect("complete buffered-upload deadline branch");
+            exits.push((index, branch));
+        }
+    }
+    exits.sort_by_key(|(index, _)| *index);
+    let phases = [
         "grpc_deadline_upload_before_authenticate",
         "grpc_deadline_upload_before_authorize",
         "grpc_deadline_upload_before_before_proxy",
         "grpc_deadline_terminal_request_body",
         "grpc_deadline_upload_before_dispatch",
         "grpc_deadline_buffered_grpc_upload",
-    ] {
-        assert!(
-            source.contains(phase),
-            "missing finalized upload deadline phase {phase}"
+        "grpc_deadline_buffered_grpc_upload",
+    ];
+    assert_eq!(exits.len(), phases.len());
+    for ((_, branch), (index, phase)) in exits.iter().zip(phases.iter().enumerate()) {
+        let call = format!(
+            "boxed_finalize_upload_deadline_rejection(&plugins,&mutctx,&state,start_time,\
+             \"{phase}\",plugin_execution_ns,Some(&original_request_path),\
+             grpc_web_response_content_type).await"
+        );
+        let prefix = match index {
+            3 => {
+                "ctx.metadata.insert(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),\
+                 \"true\".to_string());"
+            }
+            4..=6 => {
+                "cb_probe.release_neutral();\
+                 drop(preacquired_backend_admission.take_if_acquired());"
+            }
+            _ => "",
+        };
+        let expected = if matches!(index, 3 | 5 | 6) {
+            format!("{prefix}returnOk({call});")
+        } else {
+            format!("{prefix}letresponse={call};returnOk(response);")
+        };
+        assert_eq!(
+            *branch,
+            expected,
+            "complete cleanup/return sequence for {phase}"
         );
     }
     assert_eq!(
-        source
-            .matches("finalize_upload_deadline_rejection(")
+        handler
+            .matches("boxed_finalize_upload_deadline_rejection(")
             .count(),
-        9,
-        "the helper definition, the out-of-line boxed factory, and all seven H1/H2 buffered \
-         upload exits must stay routed through cleanup"
+        phases.len(),
+        "every handler call must be one of the individually proven exits"
     );
 
-    let grpc_collect_deadline_branches: Vec<&str> = source
-        .split("Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {")
-        .skip(1)
-        .map(|branch| {
-            branch
-                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy")
-                .next()
-                .expect("bounded buffered gRPC deadline branch")
-        })
-        .collect();
-    assert_eq!(grpc_collect_deadline_branches.len(), 2);
-    for branch in grpc_collect_deadline_branches {
-        assert!(branch.contains("cb_probe.release_neutral()"));
-        assert!(branch.contains("preacquired_backend_admission.take_if_acquired()"));
-    }
+    let factory = compact_code(
+        source
+            .split("fn boxed_finalize_upload_deadline_rejection<'a>(")
+            .nth(1)
+            .expect("out-of-line rejection factory"),
+    );
+    let (factory, _) = source_group(&factory, factory.find('{').unwrap()).unwrap();
+    assert_eq!(
+        factory,
+        "Box::pin(finalize_upload_deadline_rejection(plugins,ctx,state,start_time,\
+         rejection_phase,plugin_execution_ns,original_request_path,\
+         grpc_web_response_content_type))"
+    );
+
+    // The extra caller is an early-policy RPC delegation, not an eighth
+    // handler exit. Prove its arguments and awaited return independently.
+    let early = compact_code(
+        source
+            .split("async fn finalize_early_upload_policy_rejection(")
+            .nth(1)
+            .expect("early policy finalizer")
+            .split("pub(crate) async fn build_finalized_upload_deadline_response(")
+            .next()
+            .unwrap(),
+    );
+    let marker = "UploadExpiry::Rpc=>{";
+    let start = early.find(marker).expect("early RPC expiry delegation");
+    let (rpc, _) = source_group(&early, start + marker.len() - 1).unwrap();
+    assert_eq!(
+        rpc,
+        "returnboxed_finalize_upload_deadline_rejection(plugins,ctx,state,start_time,\
+         \"grpc_deadline_early_upload\",plugin_execution_ns,None,grpc_web).await;"
+    );
+    let helper = compact_code(helper);
+    let (helper, _) = source_group(&helper, helper.find('{').unwrap()).unwrap();
+    assert_eq!(
+        helper,
+        "let(response,log_status)=build_finalized_upload_deadline_response(plugins,ctx,\
+         grpc_web_response_content_type).await;log_rejected_request_with_path(plugins,ctx,\
+         log_status,start_time,rejection_phase,plugin_execution_ns,original_request_path).await;\
+         record_request(state,log_status);response"
+    );
 }
 
 #[test]
@@ -4271,6 +4346,9 @@ fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
 /// ahead of a finalization that is still to come.
 #[test]
 fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch() {
+    use super::http3_server_dispatch_tests::compact_code;
+    use super::native_grpc_dispatch_auth_lifetime_tests::{direct_source_statement, source_group};
+
     let src = include_str!("../../../src/proxy/mod.rs");
 
     // The dispatcher is exactly-once and refuses to run without a declared
@@ -4375,17 +4453,80 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
     );
 
     // HTTP/3 reaches the same boundary after its own terminal finalization.
-    let h3 = include_str!("../../../src/http3/server.rs");
-    let h3_final_hook = h3
-        .find("let final_body_result = crate::proxy::run_final_request_body_hooks(")
-        .expect("H3 terminal final-body hooks must remain present");
-    let h3_egress = h3
-        .find("crate::proxy::run_finalized_request_egress_hooks(")
-        .expect("H3 must reach the finalized-request-egress boundary");
+    let h3 = compact_code(include_str!("../../../src/http3/server.rs"));
+    let terminal_marker = "iffinal_body_before_backend_dispatch{";
+    let terminal_at = h3
+        .find(
+            "iffinal_body_before_backend_dispatch{\
+             letbody_was_prebuffered=prebuffered_body_data.is_some();",
+        )
+        .expect("H3 terminal retained-body preparation");
+    let (terminal, terminal_end) =
+        source_group(&h3, terminal_at + terminal_marker.len() - 1).unwrap();
+    assert!(direct_source_statement(
+        terminal,
+        "lettransformed=crate::proxy::apply_retained_request_body_plugins_with_context(\
+         &plugins,&mutctx,grpc_deadline_at,&hook_headers,body_data,protocol_body_limit).await;"
+    ));
+    let final_marker = "letfinal_body_result=matchtransform_rejection{";
+    let h3_final_hook = terminal
+        .find(final_marker)
+        .expect("H3 final policy must follow the retained transform result");
+    let transform_at = terminal
+        .find("lettransformed=crate::proxy::apply_retained_request_body_plugins_with_context(")
+        .unwrap();
+    assert!(transform_at < h3_final_hook);
+    let (final_result, _) =
+        source_group(terminal, h3_final_hook + final_marker.len() - 1).unwrap();
+    assert_eq!(
+        final_result,
+        "Some(reject)=>reject,None=>{crate::proxy::run_final_request_body_hooks(\
+         &plugins,Some(&mutctx),grpc_deadline_at,&hook_headers,&transformed).await}"
+    );
+    let continue_marker = "PluginResult::Continue=>{";
+    let result_marker = "matchfinal_body_result{";
+    let result_at = terminal.find(result_marker).expect("H3 final policy outcome");
+    let (outcome, _) = source_group(terminal, result_at + result_marker.len() - 1).unwrap();
+    let start = outcome.find(continue_marker).expect("H3 accepted final body");
+    let (accepted, _) = source_group(outcome, start + continue_marker.len() - 1).unwrap();
+    assert_eq!(
+        accepted,
+        "prebuffered_body_data=Some(transformed);request_body_prepared=true;"
+    );
+    let reject_marker = "reject@PluginResult::Reject{..}|reject@PluginResult::RejectBinary{..}=>{";
+    let start = outcome.find(reject_marker).expect("H3 refused final body");
+    let (rejected, _) = source_group(outcome, start + reject_marker.len() - 1).unwrap();
+    assert!(direct_source_statement(rejected, "drop(transformed);"));
+    assert!(direct_source_statement(
+        rejected,
+        "ctx.discard_retained_request_metadata();"
+    ));
+    assert!(direct_source_statement(rejected, "returnOk(());"));
+    assert!(rejected.ends_with(".await?;returnOk(());"));
+
+    let egress_marker = "ifcapabilities.has(crate::plugin_cache::PluginCapabilities::\
+                         DISPATCHES_FINALIZED_REQUEST_EGRESS){";
+    let h3_egress = h3[terminal_end..]
+        .find(egress_marker)
+        .map(|offset| terminal_end + offset)
+        .expect("H3 capability-gated finalized-request-egress boundary");
     assert!(
-        h3_final_hook < h3_egress,
+        terminal_end < h3_egress,
         "H3 egress must run after the terminal final request-body hooks"
     );
+    let call = "crate::proxy::run_finalized_request_egress_hooks(";
+    assert_eq!(h3.matches(call).count(), 1);
+    assert!(h3.find(call).unwrap() > h3_egress);
+    let (egress, _) = source_group(&h3, h3_egress + egress_marker.len() - 1).unwrap();
+    assert!(direct_source_statement(
+        egress,
+        "letegress_body:&[u8]=prebuffered_body_data.as_deref().unwrap_or(&[]);"
+    ));
+    assert!(direct_source_statement(
+        egress,
+        "letegress=crate::proxy::run_finalized_request_egress_hooks(&plugins,&mutctx,\
+         &original_request_path,&egress_headers,egress_body).await;"
+    ));
 
     // Composition admission still fails closed for anything egressing earlier.
     let cache = include_str!("../../../src/plugin_cache.rs");

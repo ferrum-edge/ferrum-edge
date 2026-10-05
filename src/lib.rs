@@ -14789,6 +14789,13 @@ pub mod _test_support {
         CapacityExceeded,
     }
 
+    /// A chunk source failed while the retained collector owned the partial body.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+    pub enum RetainedRequestCollectErrorForTest {
+        #[error("retained request chunk source failed")]
+        ChunkReadFailed,
+    }
+
     /// An isolated aggregate buffered-REQUEST budget built from the SAME
     /// [`crate::proxy::response_buffer_budget`] code the process-global one
     /// uses — same clamping, same non-blocking admission, same release-on-drop
@@ -14910,7 +14917,7 @@ pub mod _test_support {
             &self,
             chunks: S,
             effective_limit: usize,
-        ) -> Result<RetainedRequestOutcomeForTest, ()>
+        ) -> Result<RetainedRequestOutcomeForTest, RetainedRequestCollectErrorForTest>
         where
             S: futures_util::Stream<Item = Result<bytes::Bytes, ()>>,
         {
@@ -14922,7 +14929,8 @@ pub mod _test_support {
                 let permit = self.0.try_reserve_request_permit(ceiling)?;
                 RetainedRequestCollector::with_permit(ceiling, permit)
             })
-            .await?;
+            .await
+            .map_err(|()| RetainedRequestCollectErrorForTest::ChunkReadFailed)?;
             Ok(match result {
                 RetainedRequestOutcome::Collected(data, charge) => {
                     let mut ctx = crate::plugins::RequestContext::new(

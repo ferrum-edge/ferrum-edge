@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     EarlyRouteTotalPlanForTest, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
-    RequestBufferBudgetProbe, RetainedRequestOutcomeForTest,
+    RequestBufferBudgetProbe, RetainedRequestCollectErrorForTest, RetainedRequestOutcomeForTest,
     capture_early_route_upload_bound_for_test, capture_route_upload_bound_for_test,
     collect_h3_early_route_upload_for_test, early_upload_unresolved_result_for_test,
     finalize_plugin_rejection_for_test, gateway_deadline_response_selected_for_test,
@@ -339,8 +339,8 @@ fn cache_config(timeout: u64, trigger: Option<serde_json::Value>) -> GatewayConf
     .unwrap()
 }
 
-#[test]
-fn effective_cache_scope_protocol_and_priority_match_the_normal_hook_chain() {
+#[tokio::test]
+async fn effective_cache_scope_protocol_and_priority_match_the_normal_hook_chain() {
     let _env = crate::unit::env_lock::EnvGuard::new(&[]);
     let mut config = cache_config(50, None);
     let mut earlier = config.plugin_configs[0].clone();
@@ -358,25 +358,81 @@ fn effective_cache_scope_protocol_and_priority_match_the_normal_hook_chain() {
     config.proxies[0].plugins.push(reference);
     config.plugin_configs.extend([global, earlier]);
     let cache = PluginCache::new(&config).unwrap();
-    let ctx = request();
+    let plugins = cache.get_plugins("ferrum", "upload");
+    let expected_chain = [
+        ("mesh_route_dispatch", 2994),
+        ("mesh_route_dispatch", 2995),
+        ("__mesh_route_dispatch_finalizer", 2995),
+    ];
+    assert_eq!(
+        plugins
+            .iter()
+            .map(|plugin| (plugin.name(), plugin.priority()))
+            .collect::<Vec<_>>(),
+        expected_chain,
+        "scoped instances replace the global and retain the aggregate finalizer"
+    );
     for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
         let view = cache.request_view("ferrum", "upload", protocol);
+        let plugins = view.plugins();
+        assert_eq!(
+            plugins
+                .iter()
+                .map(|plugin| (plugin.name(), plugin.priority()))
+                .collect::<Vec<_>>(),
+            expected_chain
+        );
+        let mut ctx = request();
+        let mut headers = ctx.headers.clone();
+        let selection = EarlyRouteTotalPlanForTest::new(&plugins).selection(&ctx, &headers, false);
+        assert_eq!(selection, ("timed", Some(50)));
         let bound =
-            capture_early_route_upload_bound_for_test(&view, &ctx, &ctx.headers, false, 0).unwrap();
+            capture_early_route_upload_bound_for_test(&view, &ctx, &headers, false, 0).unwrap();
         assert_eq!(bound.owner(), Some("route"));
+        assert_eq!(ctx.route_override_request_timeout_ms, None);
+        for plugin in plugins.iter() {
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+        }
+        assert_eq!(ctx.route_override_request_timeout_ms, selection.1);
     }
-    let plugins = cache.get_plugins("ferrum", "upload");
+    let fallback = cache.request_view("ferrum", "unconfigured", ProxyProtocol::Http);
+    let fallback_plugins = fallback.plugins();
     assert_eq!(
-        plugins.len(),
-        2,
-        "proxy-scoped same-name instances replace the global"
+        fallback_plugins
+            .iter()
+            .map(|plugin| (plugin.name(), plugin.priority()))
+            .collect::<Vec<_>>(),
+        [
+            ("mesh_route_dispatch", 2993),
+            ("__mesh_route_dispatch_finalizer", 2993),
+        ]
     );
-    let plan = EarlyRouteTotalPlanForTest::new(&plugins);
+    let mut ctx = request();
+    let mut headers = ctx.headers.clone();
+    let selection =
+        EarlyRouteTotalPlanForTest::new(&fallback_plugins).selection(&ctx, &headers, false);
+    assert_eq!(selection, ("timed", Some(1)));
+    let bound =
+        capture_early_route_upload_bound_for_test(&fallback, &ctx, &headers, false, 0).unwrap();
+    assert_eq!(bound.owner(), Some("route"));
+    for plugin in fallback_plugins.iter() {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    assert_eq!(ctx.route_override_request_timeout_ms, selection.1);
+    let tcp = cache.request_view("ferrum", "upload", ProxyProtocol::Tcp);
+    assert!(tcp.plugins().is_empty());
+    let ctx = request();
+    let plan = EarlyRouteTotalPlanForTest::new(&tcp.plugins());
     assert_eq!(
         plan.selection(&ctx, &ctx.headers, false),
-        ("timed", Some(50))
+        ("no_match", None)
     );
-    let tcp = cache.request_view("ferrum", "upload", ProxyProtocol::Tcp);
     let bound =
         capture_early_route_upload_bound_for_test(&tcp, &ctx, &ctx.headers, false, 0).unwrap();
     assert_eq!(bound.owner(), None);
@@ -607,7 +663,10 @@ async fn actual_retained_collector_failure_cancellation_and_last_clone_lifetime(
     ));
     assert_eq!(budget.available_bytes(), 2 * UNIT);
     let disconnect = futures_util::stream::iter([Ok(Bytes::from_static(b"partial")), Err(())]);
-    assert!(budget.collect_retained_chunks(disconnect, 0).await.is_err());
+    assert!(matches!(
+        budget.collect_retained_chunks(disconnect, 0).await,
+        Err(RetainedRequestCollectErrorForTest::ChunkReadFailed)
+    ));
     assert_eq!(budget.available_bytes(), 2 * UNIT);
     let source = futures_util::stream::iter([Ok(Bytes::from_static(b"success"))]);
     let Ok(RetainedRequestOutcomeForTest::Collected(body)) =
@@ -753,32 +812,76 @@ struct RetainedProducer {
     calls: Arc<AtomicUsize>,
     stall: bool,
     output_capacity: Option<usize>,
+    expected_available_before_hook: usize,
+    inner: Option<Arc<dyn Plugin>>,
 }
 
 #[async_trait::async_trait]
 impl Plugin for RetainedProducer {
     fn name(&self) -> &str {
-        "test_retained_producer"
+        self.inner
+            .as_ref()
+            .map_or("test_retained_producer", |inner| inner.name())
     }
 
     fn modifies_request_body(&self) -> bool {
         true
     }
 
-    async fn transform_request_body(
+    fn enforces_finalized_request_policy(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.enforces_finalized_request_policy())
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.needs_final_request_body_context())
+    }
+
+    fn may_transform_request_body(&self, ctx: &RequestContext, content_type: Option<&str>) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(|inner| inner.may_transform_request_body(ctx, content_type))
+    }
+
+    async fn on_final_request_body_with_context(
         &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
         body: &[u8],
-        _content_type: Option<&str>,
-        _headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        match &self.inner {
+            Some(inner) => {
+                inner
+                    .on_final_request_body_with_context(ctx, headers, body)
+                    .await
+            }
+            None => PluginResult::Continue,
+        }
+    }
+
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
             self.budget.available_bytes(),
-            0,
+            self.expected_available_before_hook,
             "output admitted before the hook"
         );
         if self.stall {
             pending::<()>().await;
+        }
+        if let Some(inner) = &self.inner {
+            return inner
+                .transform_request_body_with_context(ctx, body, content_type, headers)
+                .await;
         }
         let mut output = Vec::with_capacity(self.output_capacity.unwrap_or(body.len()));
         output.extend_from_slice(body);
@@ -801,6 +904,8 @@ async fn actual_transform_output_has_its_own_retained_allocation_lifetime() {
         calls: calls.clone(),
         stall: false,
         output_capacity: None,
+        expected_available_before_hook: 0,
+        inner: None,
     })];
     let headers = ctx.headers.clone();
     let output = budget
@@ -834,6 +939,8 @@ async fn actual_transform_refusal_and_cancellation_release_only_their_own_admiss
             calls: calls.clone(),
             stall,
             output_capacity: None,
+            expected_available_before_hook: 0,
+            inner: None,
         })];
         let headers = ctx.headers.clone();
         let mut prepare =
@@ -937,6 +1044,8 @@ async fn small_transform_with_uncovered_capacity_is_refused_before_final_egress(
             calls: calls.clone(),
             stall: false,
             output_capacity: Some(UNIT + 1),
+            expected_available_before_hook: 0,
+            inner: None,
         }),
         Arc::new(FinalizedEgressProbe {
             final_calls: final_calls.clone(),
@@ -1118,6 +1227,8 @@ async fn exhausted_retained_xml_skips_only_the_proven_outbound_noop_transformer(
                 calls: producer_calls.clone(),
                 stall: false,
                 output_capacity: None,
+                expected_available_before_hook: 0,
+                inner: None,
             }),
         );
         let result = budget
@@ -1416,7 +1527,9 @@ async fn complete_normalization_admission_refusal_precedes_the_hook() {
 #[tokio::test]
 async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
     use base64::Engine;
-    use ferrum_edge::_test_support::retained_h3_request_body_limit_for_test;
+    use ferrum_edge::_test_support::{
+        replay_retained_request_body_for_test, retained_h3_request_body_limit_for_test,
+    };
     use ferrum_edge::config::types::HttpFlavor;
     use ferrum_edge::plugins::grpc_web::GrpcWebPlugin;
 
@@ -1453,8 +1566,13 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
                 MIB
             };
             assert_eq!(limit, expected);
-            let total = if grpc_web { 8 * MIB } else { limit + 2 * MIB };
-            let budget = Arc::new(RequestBufferBudgetProbe::new(4 * MIB, total));
+            let requested_total = if grpc_web { 8 * MIB } else { limit + 2 * MIB };
+            let budget = Arc::new(RequestBufferBudgetProbe::new(4 * MIB, requested_total));
+            // The shared budget floors its total at the fallback. A 1 MiB
+            // route cap therefore leaves 1 MiB free even while input and output
+            // are both fully admitted; exhaustion is not the admission proof.
+            let total = requested_total.max(4 * MIB);
+            assert_eq!(budget.available_bytes(), total);
             let wire = if grpc_web {
                 base64::engine::general_purpose::STANDARD
                     .encode(&frames)
@@ -1462,6 +1580,7 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
             } else {
                 frames.clone()
             };
+            let input_charge = wire.len().div_ceil(UNIT) * UNIT;
             let chunks = futures_util::stream::iter([Ok(Bytes::from(wire))]);
             let collect_limit = if grpc_web { 4 * MIB } else { 2 * MIB };
             let collected = budget
@@ -1471,6 +1590,8 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
             let RetainedRequestOutcomeForTest::Collected(body) = collected else {
                 panic!("admitted wire body");
             };
+            assert_eq!(budget.available_bytes(), total - input_charge);
+            let original = body.clone();
             ctx.request_body_bytes = Some(body.clone());
             let mut headers = ctx.headers.clone();
             if grpc_web {
@@ -1493,20 +1614,26 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
                     )
                     .await;
                 assert_eq!(normalized.is_ok(), limit >= frames.len());
+                if let Ok(normalized) = &normalized {
+                    assert_eq!(normalized.as_ref(), frames.as_slice());
+                    assert_ne!(normalized.as_ptr(), original.as_ptr());
+                    assert_eq!(budget.available_bytes(), total - input_charge - 2 * MIB);
+                }
                 drop(normalized);
+                assert_eq!(budget.available_bytes(), total - input_charge);
             }
             let final_calls = Arc::new(AtomicUsize::new(0));
             let egress_calls = Arc::new(AtomicUsize::new(0));
-            let producer: Arc<dyn Plugin> = if grpc_web {
-                translator
-            } else {
-                Arc::new(RetainedProducer {
-                    budget: budget.clone(),
-                    calls: Arc::new(AtomicUsize::new(0)),
-                    stall: false,
-                    output_capacity: None,
-                })
-            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let output_window = budget.buffered_request_body_ceiling(limit);
+            let producer: Arc<dyn Plugin> = Arc::new(RetainedProducer {
+                budget: budget.clone(),
+                calls: calls.clone(),
+                stall: false,
+                output_capacity: None,
+                expected_available_before_hook: total - input_charge - output_window,
+                inner: grpc_web.then_some(translator),
+            });
             let plugins: Vec<Arc<dyn Plugin>> = vec![
                 producer,
                 Arc::new(FinalizedEgressProbe {
@@ -1517,6 +1644,7 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
             let result = budget
                 .prepare_retained_body(&plugins, &mut ctx, &headers, body, limit)
                 .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
             if limit >= frames.len() {
                 let output = result.unwrap_or_else(|_| panic!("valid 2 MiB replacement"));
                 assert_eq!(output.as_ref(), frames.as_slice());
@@ -1526,6 +1654,16 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
                 );
                 assert_eq!(final_calls.load(Ordering::SeqCst), 1);
                 assert_eq!(egress_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(budget.available_bytes(), total - input_charge - 2 * MIB);
+                let retry = replay_retained_request_body_for_test(&output);
+                assert_eq!(retry.as_ptr(), output.as_ptr());
+                drop(output);
+                assert_eq!(budget.available_bytes(), total - input_charge - 2 * MIB);
+                drop(ctx);
+                assert_eq!(budget.available_bytes(), total - input_charge - 2 * MIB);
+                drop(original);
+                assert_eq!(budget.available_bytes(), total - 2 * MIB);
+                drop(retry);
             } else {
                 assert!(matches!(
                     result,
@@ -1536,8 +1674,11 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
                 ));
                 assert_eq!(final_calls.load(Ordering::SeqCst), 0);
                 assert_eq!(egress_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(budget.available_bytes(), total - input_charge);
+                drop(ctx);
+                assert_eq!(budget.available_bytes(), total - input_charge);
+                drop(original);
             }
-            drop(ctx);
             assert_eq!(budget.available_bytes(), total);
         }
     }

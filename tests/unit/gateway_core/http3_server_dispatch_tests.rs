@@ -13,7 +13,7 @@ fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 /// Strip line comments and whitespace from structural source assertions.
-fn compact_code(text: &str) -> String {
+pub(super) fn compact_code(text: &str) -> String {
     text.lines()
         .filter(|line| !line.trim_start().starts_with("//"))
         .flat_map(str::chars)
@@ -2193,7 +2193,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .expect("bounded H3 upload-deadline finalizer");
     assert!(helper.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
     assert!(helper.contains("run_h3_reject_response_committed_hooks("));
-    assert!(helper.contains("log_rejected_request("));
+    assert!(helper.contains("crate::proxy::log_pre_backend_rejected_request("));
     assert!(helper.contains("send_h3_plugin_reject_flavor_aware_with_recv_halt("));
     // Upload-deadline rejection is already selected; the terminal write must use
     // the shared post-deadline grace (via the plugin reject writer) rather than
@@ -2212,7 +2212,12 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
             .count(),
         1
     );
-    assert_eq!(helper.matches("log_rejected_request(").count(), 1);
+    assert_eq!(
+        helper
+            .matches("crate::proxy::log_pre_backend_rejected_request(")
+            .count(),
+        1
+    );
     assert_eq!(helper.matches("record_request(state,").count(), 1);
     assert_eq!(
         helper
@@ -2227,7 +2232,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .find("run_h3_reject_response_committed_hooks(")
         .expect("upload deadline commit");
     let log = helper
-        .find("log_rejected_request(")
+        .find("crate::proxy::log_pre_backend_rejected_request(")
         .expect("upload deadline log");
     let metric = helper
         .find("record_request(state,")
@@ -2236,7 +2241,55 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .find("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
         .expect("upload deadline send");
     assert!(decorate < commit && commit < log && log < metric && metric < send);
-    for phase in [
+    let helper_code = compact_code(helper);
+    let (helper_body, _) = source_group(&helper_code, helper_code.find('{').unwrap()).unwrap();
+    for statement in [
+        "apply_reject_after_proxy_and_synthetic_body_hooks(plugins,ctx,\
+         &mutreject.status_code,&mutreject.headers,&mutreject.body,!route_timeout,false).await;",
+        "run_h3_reject_response_committed_hooks(plugins,ctx,flavor,\
+         grpc_web_response_content_type,http_status,reject.body.clone(),&reject.headers).await;",
+        "crate::proxy::log_pre_backend_rejected_request(plugins,ctx,log_status,start_time,\
+         rejection_phase,plugin_execution_ns).await;",
+        "record_request(state,log_status);",
+        "send_h3_plugin_reject_flavor_aware_with_recv_halt(stream,plugins,ctx,flavor,\
+         grpc_web_response_content_type,http_status,reject.body.clone(),&reject.headers,false).await",
+    ] {
+        assert!(
+            direct_source_statement(helper_body, statement),
+            "the finalizer must execute this complete statement at its own scope: {statement}"
+        );
+    }
+
+    // Follow the delegated logger into the same rejection funnel, explicitly
+    // retaining its no-backend-contact attribution.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let logger = compact_code(source_region(
+        proxy,
+        "pub async fn log_pre_backend_rejected_request(",
+        "pub(crate) async fn log_rejected_request_with_path(",
+    ));
+    let (logger, _) = source_group(&logger, logger.find('{').unwrap()).unwrap();
+    assert_eq!(
+        logger,
+        "log_rejected_request_with_path_and_backend_state(plugins,ctx,status_code,start_time,\
+         rejection_phase,plugin_execution_ns,None,false).await;"
+    );
+
+    let handler = compact_code(source_region(
+        source,
+        "async fn handle_h3_request(",
+        "pub(crate) fn retained_h3_request_body_limit(",
+    ));
+    let marker = "Err(H3RequestBodyReadError::DeadlineExceeded(authorization_expiry))=>{";
+    let exits: Vec<&str> = handler
+        .match_indices(marker)
+        .map(|(index, _)| {
+            source_group(&handler, index + marker.len() - 1)
+                .expect("complete H3 buffered-upload deadline branch")
+                .0
+        })
+        .collect();
+    let phases = [
         "grpc_deadline_upload_before_authenticate",
         "grpc_deadline_upload_before_authorize",
         "grpc_deadline_upload_before_before_proxy",
@@ -2244,19 +2297,87 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         "grpc_deadline_upload_before_dispatch",
         "grpc_deadline_upload_before_cross_protocol_dispatch",
         "grpc_deadline_buffered_h3_upload",
-    ] {
-        assert!(
-            source.contains(phase),
-            "missing finalized H3 upload deadline phase {phase}"
+    ];
+    assert_eq!(exits.len(), phases.len());
+    for (index, (branch, phase)) in exits.iter().zip(phases.iter()).enumerate() {
+        let prefix = match index {
+            3 => {
+                "ctx.metadata.insert(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),\
+                 \"true\".to_string());"
+            }
+            4 => {
+                "cb_probe.release_neutral();\
+                 drop(preacquired_backend_admission.take_if_acquired());"
+            }
+            5 => {
+                "crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(\
+                 &state,&proxy,&epoch.load_balancer,upstream_balancer.as_ref(),\
+                 upstream_target.as_deref(),cb_target_key.as_deref(),\
+                 StatusCode::REQUEST_TIMEOUT.as_u16(),false,\
+                 Some(crate::retry::ErrorClass::ClientDisconnect),cb_probe.take_slot(),false,\
+                 backend_start.elapsed());"
+            }
+            6 => "cb_probe.release_neutral();",
+            _ => "",
+        };
+        let expected = format!(
+            "{prefix}finalize_h3_upload_deadline_rejection(&mutstream,&state,&plugins,\
+             &mutctx,http_flavor,grpc_web_response_content_type,start_time,\"{phase}\",\
+             plugin_execution_ns,authorization_expiry,false).await?;returnOk(());"
+        );
+        assert_eq!(
+            *branch,
+            expected,
+            "complete cleanup/return sequence for {phase}"
         );
     }
     assert_eq!(
-        source
+        handler
             .matches("finalize_h3_upload_deadline_rejection(")
             .count(),
-        8,
-        "the helper definition plus all seven native H3 buffered upload exits must remain finalized"
+        phases.len(),
+        "every handler call must be one of the individually proven exits"
     );
+
+    let early = compact_code(source_region(
+        source,
+        "async fn finalize_h3_early_policy_rejection(",
+        "async fn finalize_h3_upload_deadline_rejection(",
+    ));
+    let marker = "ifexpiry==crate::proxy::early_upload::UploadExpiry::Route{";
+    let start = early.find(marker).expect("early route expiry delegation");
+    let (route, _) = source_group(&early, start + marker.len() - 1).unwrap();
+    assert_eq!(
+        route,
+        "returnfinalize_h3_upload_deadline_rejection(stream,state,plugins,ctx,flavor,\
+         grpc_web,start_time,H3_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE,plugin_execution_ns,\
+         None,true).await;"
+    );
+
+    let writer = compact_code(source_region(
+        source,
+        "async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(",
+        "async fn send_h3_aggregate_sse_response(",
+    ));
+    for marker in ["ifterminal_gateway_deadline{", "if!halt_recv{"] {
+        let start = writer.find(marker).expect("post-deadline writer branch");
+        let (branch, _) = source_group(&writer, start + marker.len() - 1).unwrap();
+        let wait = "letresult=matchcrate::http3::stream_util::\
+                    await_post_deadline_terminal_response_write(write).await{";
+        let halt = "crate::http3::stream_util::halt_request_body(stream);";
+        assert!(direct_source_statement(branch, wait));
+        assert!(direct_source_statement(branch, halt));
+        assert!(direct_source_statement(branch, "returnresult;"));
+        assert!(branch.find(wait).unwrap() < branch.find(halt).unwrap());
+        let expiry = "Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)=>{";
+        let start = branch.find(expiry).expect("bounded stalled response write");
+        let (abort, _) = source_group(branch, start + expiry.len() - 1).unwrap();
+        assert_eq!(
+            abort,
+            "crate::http3::stream_util::abort_response_stream(stream);Ok(())"
+        );
+        assert!(!branch.contains("await_terminal_response_write_before_deadline("));
+    }
 }
 
 #[test]
