@@ -5693,7 +5693,13 @@ paths:
             X-Ferrum-Namespace-Unserved:
               $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
+          description: |
+            Deletion would leave an invalid plugin-composition graph, or an
+            API-spec-owned proxy has foreign/missing ownership metadata or a
+            restore-snapshot shape that atomic compensation cannot reproduce
+            safely, or `cleanup_orphaned_upstream` was duplicated or was not
+            exactly `true` or `false`. Conditional mode also refuses invalid
+            query parameters or original deployment authority without mutation.
           content:
             application/json:
               schema:
@@ -5735,13 +5741,7 @@ paths:
                   - $ref: "#/components/schemas/ProxyDeleteAtomicityFailureResponse"
                   - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "503":
-          description: Admission unavailable, committed but not live, or outcome uncertain; never replay or remove a journal
-          content:
-            application/json:
-              schema:
-                anyOf:
-                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
-                  - $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/DeploymentMutationUnavailable"
 
   /proxies/{id}/mcp/tools:
     parameters:
@@ -8138,7 +8138,8 @@ paths:
             New spec is structurally invalid (bad JSON/YAML, unrecognised
             OpenAPI/Swagger version, or missing/malformed `x-ferrum-*`
             extension). See `ApiSpecParseError.code` for which structural
-            problem fired.
+            problem fired. Conditional mode also refuses invalid query
+            parameters or original deployment authority without mutation.
           content:
             application/json:
               schema:
@@ -8154,11 +8155,18 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle, or the replacement would make mTLS DNS identities ambiguous
+          description: |
+            A resource name / listen_path in the new spec conflicts with an
+            existing resource outside this bundle, or the replacement would
+            make mTLS DNS identities ambiguous. Conditional mode also refuses
+            missing or inconsistent deployment dependencies or ownership
+            before mutation.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "412":
           description: Original deployment snapshot is stale; nothing was modified
           content:
@@ -8197,13 +8205,7 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
-          description: Admission unavailable, committed but not live, or outcome uncertain; never replay or remove a journal
-          content:
-            application/json:
-              schema:
-                anyOf:
-                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
-                  - $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/DeploymentMutationUnavailable"
 
     delete:
       operationId: deleteApiSpec
@@ -8964,6 +8966,50 @@ components:
             $ref: "#/components/schemas/Error"
           example:
             error: Namespace mutation is temporarily unavailable; retry later
+    DeploymentMutationUnavailable:
+      description: |
+        Ordinary mutations retain the NamespaceAdmissionUnavailable contract:
+        namespace contention or a definitively aborted admission/serialization
+        transaction applies nothing, uses a redacted Error body without an
+        `applied` field, and may carry `Retry-After: 1`. A retained uncertain
+        namespace fence requires operator recovery before retries can succeed.
+        Admission/transaction aborts carry `rollback: not_needed`; driver
+        messages are withheld. Uniqueness and name conflicts use 409 instead.
+        A committed ordinary mutation that is not live has `applied: false`
+        and a closed `reason` (`config_rejected`, `reload_timeout`, or
+        `sequence_unavailable`), without Retry-After. Only that committed
+        family may carry the optional X-Ferrum-Config-Cursor; pre-commit
+        failures never carry it. The covering sequence is bound to the pinned
+        topology epoch; reconnect/failover invalidates the old cursor rather
+        than comparing it with a replacement database's watermark.
+
+        Conditional deployment mutations instead use
+        DeploymentMutationAcknowledgement. Admission/evidence failures report
+        `durable: not_started`; a transaction acknowledgement that cannot be
+        confirmed reports `durable: unknown`; a confirmed commit whose live,
+        audit or namespace-lease acknowledgement fails reports
+        `durable: committed`. All have `live: unconfirmed` and
+        `recovery_cleanup_authorized: false`. This family does not promise a
+        cursor or Retry-After. Retain the original encrypted journal; no 503
+        authorizes automatic replay or journal removal.
+      headers:
+        Retry-After:
+          required: false
+          description: >-
+            Minimum delay in seconds before retrying; present for
+            namespace-admission contention.
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+        X-Ferrum-Config-Cursor:
+          $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
     NamespaceRegistryAtomicityUnsupported:
       description: >-
         The configured database deployment cannot commit a namespace registry

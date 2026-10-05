@@ -23,7 +23,11 @@ Read `GET /deployment-snapshot` with an admin-role JWT and the intended
   the resource and association tables, including credential indexes, with each
   column's SQLx type, runtime value type and lossless scalar evidence (float bits
   and blob bytes). Typed nulls retain their column type. MongoDB includes raw
-  documents and their BSON bytes, including embedded association metadata. Lease maintenance and audit records do not invalidate authority.
+  documents and their BSON bytes, including embedded association metadata.
+  MongoDB credential representations and uniqueness hashes are stored on
+  `consumers` and covered by those raw documents; `consumer_identity_index`
+  is the separate identity reservation collection. Lease maintenance and audit
+  records do not invalidate authority.
 
 The read is admin-only because evidence contains unredacted credentials and
 spec/plugin material. Security-audit admission is mandatory before disclosure,
@@ -116,9 +120,9 @@ body echoes. A confirmed response has `profile: "deployment-v1"`, `id`,
 
 | Result | HTTP | Live status | Cleanup authorization |
 | --- | --- | --- | --- |
-| Commit and covering local generation applied; final audit and lease release acknowledged | 200 | `applied` | `true` |
+| Commit and covering local generation applied; final audit and namespace admission lease release acknowledged | 200 | `applied` | `true` |
 | Commit in CP mode, an unserved namespace, or a process without a serving coordinator | 200 | `not_applicable` | `false` |
-| Commit confirmed but local apply, final audit, cursor capture or lease release cannot be confirmed | 503 | `unconfirmed` | `false` |
+| Commit confirmed but local apply, final audit, cursor capture or namespace admission lease release cannot be confirmed | 503 | `unconfirmed` | `false` |
 | Transport/store acknowledgement uncertain | 503 if a response is available | `unconfirmed` | `false`; durable state `unknown` |
 | Precondition/graph refusal | 412/409 | `unconfirmed` | `false`; durable state `not_committed` |
 
@@ -128,6 +132,22 @@ members and cannot authorize cleanup. A covering local live result carries
 `X-Ferrum-Config-Cursor`. This proves only this process's application; it does
 not assert every remote DP has applied the change. CP consumers must separately
 qualify downstream live application and retain recovery state in the meantime.
+
+After a MongoDB transaction is confirmed committed, internal mTLS admission
+mutex cleanup drains every guard and logs redacted cleanup failures for operator
+recovery. Cleanup cannot turn that confirmed durable result into a failed or
+unknown mutation. Transaction commit uncertainty still retains the mTLS fence;
+the final audit, namespace admission lease release and live checks above still
+control cleanup authorization.
+
+Ordinary mutations on these routes retain their error contracts: proxy deletion
+uses `Error` for plugin-composition rejection (`400`) and the typed `error` /
+`detail` atomicity refusal (`501`). Namespace contention (`503`) may carry
+`Retry-After: 1`; ordinary committed-not-live responses have `applied: false`
+and may carry `X-Ferrum-Config-Cursor`. Pre-commit responses never carry that
+cursor. Conditional dependency or ownership refusals use the deployment
+acknowledgement at `409` for both removal and spec replacement. A `503` from
+either mode never authorizes automatic recovery replay or journal removal.
 
 A consumer adopting this capability must:
 

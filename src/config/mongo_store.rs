@@ -5541,6 +5541,8 @@ mod inner {
                 .conditional_namespace_snapshot_in_session(session, connection.as_ref(), namespace)
                 .await?;
             let mut stored = serde_json::Map::new();
+            // Credential representations and uniqueness hashes live on consumers;
+            // their partial unique indexes do not own separate documents.
             for name in [
                 "proxies",
                 "consumers",
@@ -5549,7 +5551,6 @@ mod inner {
                 "api_specs",
                 "gateway_trust_bundles",
                 "consumer_identity_index",
-                "consumer_credential_index",
                 "namespaces",
             ] {
                 let collection: Collection<Document> = connection.db.collection(name);
@@ -6102,8 +6103,9 @@ mod inner {
                 Ok::<_, anyhow::Error>(())
             })
             .await?;
-            // A release error is an uncertain acknowledgement, never success.
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            // The transaction is confirmed committed. Cleanup cannot reclassify
+            // that durable result as a failed or uncertain mutation.
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(())
         }
 
