@@ -25484,7 +25484,13 @@ components:
                   including SOAP UsernameToken, X.509 and SAML on H1/H2 and
                   native H3. The proposed fixed 503 for unresolved identity/body/
                   intervening-mutation selection is NOT owner-approved; see
-                  docs/early_upload_policy.md. This draft does not declare
+                  docs/early_upload_policy.md. Established correlation headers
+                  preserve deterministic timed/untimed selection when the outgoing
+                  value agrees with private request provenance. Retained Bytes are
+                  reused through no-op body hooks and cross-protocol retries;
+                  distinct retained replacements require independent finite admission
+                  and keep their own allocation charge until the final owner drops.
+                  This draft does not declare
                   v0.9.11 patched or close GHSA-gxfv-924p-wvx4.
                   Expiry is charged to a backend's health
                   only when that backend held the cancelled attempt; expiry

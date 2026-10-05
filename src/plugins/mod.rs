@@ -3194,7 +3194,8 @@ pub struct RequestContext {
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
-    /// Native-H3 retained upload admission. Private, unlogged and clone-owned.
+    /// Native-H3 collector admission, transferred once onto its Bytes owner.
+    /// Private and unlogged; retained replacements acquire independent admission.
     pub(crate) request_buffer_charge:
         Option<crate::proxy::response_buffer_budget::SharedRequestBufferCharge>,
     /// Precomputed body hashes for integrity-verifying authentication plugins.
@@ -4633,17 +4634,12 @@ impl RequestContext {
         self.route_request_deadline_at = self.receipt_anchored_route_total(request_timeout_ms);
     }
 
-    pub(crate) fn charged_retained_request_bytes(&self, data: Vec<u8>) -> bytes::Bytes {
-        match &self.request_buffer_charge {
+    pub(crate) fn charged_retained_request_bytes(&mut self, data: Vec<u8>) -> bytes::Bytes {
+        // A collector charge belongs to exactly one allocation. Subsequent
+        // replacements must acquire their own admission before construction.
+        match self.request_buffer_charge.take() {
             Some(charge) => charge.bytes(data),
             None => bytes::Bytes::from(data),
-        }
-    }
-
-    pub(crate) fn charged_retained_request_copy(&self, data: &[u8]) -> bytes::Bytes {
-        match &self.request_buffer_charge {
-            Some(charge) => charge.bytes(data.to_vec()),
-            None => bytes::Bytes::copy_from_slice(data),
         }
     }
 

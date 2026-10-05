@@ -5269,13 +5269,13 @@ fn test_h1_h2_h3_paths_share_multi_instance_body_transform_loops() {
         "H1/H2 must use the shared request/response body transform loops and pre-before_proxy normalization"
     );
     assert!(
-        h3.contains("apply_request_body_plugins_with_context(")
+        h3.contains("apply_retained_request_body_plugins_with_context(")
             && h3.contains("transform_buffered_response_body_with_deadline(")
-            && h3.contains("apply_buffered_request_body_normalization_before_before_proxy("),
+            && h3.contains("normalize_retained_request_body_before_before_proxy("),
         "native H3 must use the shared body transform helpers and pre-before_proxy normalization"
     );
     assert!(
-        h3_cross.contains("apply_request_body_plugins_with_context("),
+        h3_cross.contains("apply_retained_request_body_plugins_with_context("),
         "H3 cross-protocol must use the shared request-body transform helper"
     );
 }

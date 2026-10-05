@@ -11312,12 +11312,7 @@ pub mod _test_support {
             headers: &HashMap<String, String>,
             identity_ready: bool,
         ) -> (&'static str, Option<u64>) {
-            self.selection_at_boundary(
-                ctx,
-                headers,
-                identity_ready,
-                identity_ready,
-            )
+            self.selection_at_boundary(ctx, headers, identity_ready, identity_ready)
         }
 
         pub fn selection_at_boundary(
@@ -11328,12 +11323,10 @@ pub mod _test_support {
             authorization_ready: bool,
         ) -> (&'static str, Option<u64>) {
             use crate::plugins::early_route_total::EarlyRouteTotalSelection as Selection;
-            match self.0.select(
-                ctx,
-                headers,
-                identity_ready,
-                authorization_ready,
-            ) {
+            match self
+                .0
+                .select(ctx, headers, identity_ready, authorization_ready)
+            {
                 Selection::NoMatch => ("no_match", None),
                 Selection::Untimed => ("untimed", None),
                 Selection::Timed(ms) => ("timed", Some(ms)),
@@ -14816,7 +14809,60 @@ pub mod _test_support {
         }
     }
 
+    /// Production retry handoff used by reqwest and native-H3 replay.
+    pub fn replay_retained_request_body_for_test(body: &bytes::Bytes) -> bytes::Bytes {
+        crate::proxy::replay_retained_request_body(Some(body))
+    }
+
     impl RequestBufferBudgetProbe {
+        /// The actual native-H3/bridge body-hook handoff under this budget.
+        pub async fn prepare_retained_body(
+            &self,
+            plugins: &[Arc<dyn crate::plugins::Plugin>],
+            ctx: &mut crate::plugins::RequestContext,
+            headers: &HashMap<String, String>,
+            body: bytes::Bytes,
+            effective_limit: usize,
+        ) -> Result<bytes::Bytes, crate::plugins::PluginResult> {
+            let deadline = ctx.grpc_deadline_at();
+            let body = crate::proxy::apply_retained_request_body_plugins_in(
+                plugins,
+                ctx,
+                deadline,
+                headers,
+                body,
+                effective_limit,
+                self.0.handle(),
+            )
+            .await?;
+            match crate::proxy::run_final_request_body_hooks(
+                plugins,
+                Some(ctx),
+                deadline,
+                headers,
+                &body,
+            )
+            .await
+            {
+                crate::plugins::PluginResult::Continue => Ok(body),
+                reject => Err(reject),
+            }
+        }
+
+        /// The production pre-allocation copy admission used by normalization.
+        pub fn copy_retained_body(
+            &self,
+            body: &[u8],
+            effective_limit: usize,
+        ) -> Option<bytes::Bytes> {
+            let (data, permit) = crate::proxy::copy_retained_request_body_in(
+                body,
+                effective_limit,
+                self.0.handle(),
+            )?;
+            permit.into_covered_bytes(data)
+        }
+
         pub async fn collect_retained_chunks<S>(
             &self,
             chunks: S,
@@ -14836,7 +14882,15 @@ pub mod _test_support {
             .await?;
             Ok(match result {
                 RetainedRequestOutcome::Collected(data, charge) => {
-                    RetainedRequestOutcomeForTest::Collected(charge.bytes(data))
+                    let mut ctx = crate::plugins::RequestContext::new(
+                        "127.0.0.1".into(),
+                        "POST".into(),
+                        "/upload".into(),
+                    );
+                    ctx.request_buffer_charge = Some(charge);
+                    RetainedRequestOutcomeForTest::Collected(
+                        ctx.charged_retained_request_bytes(data),
+                    )
                 }
                 RetainedRequestOutcome::TooLarge => RetainedRequestOutcomeForTest::TooLarge,
                 RetainedRequestOutcome::CapacityExceeded => {

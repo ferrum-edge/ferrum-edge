@@ -352,12 +352,16 @@ fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
         "all early H3 phases must use the captured route/read/RPC/auth owner"
     );
     assert_eq!(
-        source.matches("early_upload::EarlyCollectorWitness::select(").count(),
+        source
+            .matches("early_upload::EarlyCollectorWitness::select(")
+            .count(),
         3,
         "all early H3 phases must select from their pinned effective chain"
     );
     assert_eq!(
-        source.matches("ctx.request_buffer_charge = Some(charge)").count(),
+        source
+            .matches("ctx.request_buffer_charge = Some(charge)")
+            .count(),
         7,
         "all retained native-H3 success sites must transfer the admission charge"
     );

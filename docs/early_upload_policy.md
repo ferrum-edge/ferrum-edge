@@ -3,8 +3,11 @@
 This entire change is a draft for issues #6008 and #6009. Deterministic route-total
 selection restores the configured receipt-anchored HTTPRoute budget. The refusal
 policy below is a proposed change to supported released profiles: **no owner
-approval exists**. Root must review this proposal, obtain a fresh independent
-source review, qualify the exact candidate in hosted CI, and obtain the owner's
+approval exists**. A mandatory finite pre-routing deadline or alternative local
+policy, and the resulting supported SOAP/HMAC/request-identity profiles, remain
+an owner decision after concrete qualification. No new timeout or unsupported
+profile default is silently selected here. Root must review this proposal, obtain
+a fresh independent source review, qualify the exact candidate in hosted CI, and obtain the owner's
 profile decision before adopting or releasing it. This document is not approval.
 
 The inspected released v0.9.11 commit is
@@ -40,7 +43,12 @@ authorization, an available destination veto is terminal. An existing private AI
 its normal precedence; a possible intervening AI claim is unprojectable.
 Memoized wrapper trigger decisions retain their normal meaning. An undecided
 identity trigger remains unresolved before authentication; post-authentication
-facts can resolve it. Unprojectable header/query/destination mutations before the
+facts can resolve it. A correlation ID already established by
+`on_request_received` is projectable when its authoritative private value agrees
+with the outgoing header; both method-only and known-header rules keep their
+normal timed or untimed selection. A differing outgoing correlation header
+remains unresolved because the later hook would restore it. No hook is run by
+this projection. Unprojectable header/query/destination mutations before the
 last mesh selector remain conservative dependencies, even when a particular
 request might happen to be unaffected. Destination publishers after that selector
 also remain unresolved because they can replace the final routing policy. No
@@ -120,11 +128,19 @@ allocation capacity is bounded, all Buf runs are counted, and a partial body and
 its charge drop inside the cancelled/failed future before rejection hooks.
 Capacity refusal is the existing 503 / gRPC RESOURCE_EXHAUSTED retained-request
 contract. Completed bytes share the charge across plugin metadata, reuse,
-backend handoff and retry clones until the final owner drops. No second upload
-reservation is taken. Body-transform growth and text/decoded plugin working
-sets retain their existing separate contracts; this change is not a claim that
-the upload budget covers every plugin allocation. Streaming zero remains
-unlimited; QUIC flow control is not an aggregate retained-body cap. Trailers and
+backend handoff and retry clones until the final owner drops. Reqwest/native-H3
+retry and no-op bridge preparation borrow those same Bytes without copying or
+retaking their reservation. A distinct normalization copy or transform output
+gets a separate finite request-buffer window before construction/invocation,
+and publication refuses an allocation whose capacity exceeds that window.
+Original metadata and replay owners keep their original charge; output/retry
+owners keep the replacement's independent charge. Windows are released on a
+no-op, rejection or cancellation. The finite window uses the effective request
+ceiling, with the existing retained fallback at zero; memory pressure or an
+uncovered output yields the existing capacity terminal. Plugin-internal
+transform/decode working sets and text views keep their separate contracts;
+this change does not claim that the upload budget covers every plugin allocation.
+Streaming zero remains unlimited; QUIC flow control is not an aggregate retained-body cap. Trailers and
 H2 open-DATA GET/HEAD/OPTIONS without Content-Length retain their transport
 semantics. HMAC still requires valid header preverification; timestamp-only SOAP
 remains in its later phase; native gRPC/gRPC-Web folding and attempt clocks,
@@ -139,7 +155,12 @@ deferred destination dependence and identity-trigger refusal. The actual H3
 collector seam also proves unresolved refusal before admission/body polling and
 receipt-anchored gRPC folding without early RPC/attempt publication. The real shared retained collector
 is tested for partial cancellation, over-ceiling failure, read failure, admission
-before source polling and successful final-clone ownership. Real ingress tests
+before source polling and successful final-clone ownership. Actual bridge hook
+and cross-protocol retry handoffs prove allocation identity under an exhausted
+budget; independently admitted copies/transform outputs prove simultaneous
+original/output ownership, refusal before producer invocation and cancellation
+release. These tests use the same isolated-budget implementation as production,
+without assuming Vec capacity equals length. Real ingress tests
 exercise UsernameToken/X.509/SAML and timestamp-only SOAP stalls through H1
 chunked/Content-Length, H2 open DATA without Content-Length (POST/GET/HEAD/OPTIONS)
 and native H3 terminal HEADERS, with backend, circuit-breaker and health

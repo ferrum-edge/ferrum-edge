@@ -2124,8 +2124,7 @@ impl Plugin for MeshRouteDispatch {
                 host: next_host,
             };
         }
-        if self.config.reject_unmatched
-            && !self.aggregate_reject_unmatched.load(Ordering::Relaxed)
+        if self.config.reject_unmatched && !self.aggregate_reject_unmatched.load(Ordering::Relaxed)
         {
             EarlyRouteTotalStep::Terminal
         } else {

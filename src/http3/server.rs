@@ -4605,25 +4605,26 @@ async fn handle_h3_request(
         if capabilities
             .has(crate::plugin_cache::PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
         {
-            let mut normalized_body = body_data.to_vec();
             let mut tmp_headers = std::mem::take(&mut ctx.headers);
-            let normalize_result =
-                crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
-                    &plugins,
-                    &mut ctx,
-                    &mut tmp_headers,
-                    &mut normalized_body,
-                    before_proxy_body_requirements.needs_text,
-                    before_proxy_body_requirements.needs_bytes,
-                )
-                .await;
-            *body_data = ctx.charged_retained_request_bytes(normalized_body);
-            if before_proxy_body_requirements.needs_bytes {
-                ctx.request_body_bytes = Some(body_data.clone());
-            }
+            let normalized = crate::proxy::normalize_retained_request_body_before_before_proxy(
+                &plugins,
+                &mut ctx,
+                &mut tmp_headers,
+                body_data.clone(),
+                effective_max_request_body_size_bytes,
+                before_proxy_body_requirements.needs_text,
+                before_proxy_body_requirements.needs_bytes,
+            )
+            .await;
             ctx.headers = tmp_headers;
-            if !matches!(normalize_result, PluginResult::Continue) {
-                rejected = Some((normalize_result, "normalize_buffered_request_body"));
+            match normalized {
+                Ok(normalized) => {
+                    *body_data = normalized;
+                    if before_proxy_body_requirements.needs_bytes {
+                        ctx.request_body_bytes = Some(body_data.clone());
+                    }
+                }
+                Err(reject) => rejected = Some((reject, "normalize_buffered_request_body")),
             }
         }
         if rejected.is_none() && before_proxy_body_requirements.validates_client_contract {
@@ -5852,36 +5853,37 @@ async fn handle_h3_request(
             .or_insert_with(|| method.clone());
         let terminal_hook_start = std::time::Instant::now();
         let grpc_deadline_at = ctx.grpc_deadline_at();
-        let transformed = if capabilities
-            .has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_BODY)
-        {
-            let transform_body = body_data.to_vec();
-            drop(body_data);
-            let transformed = crate::proxy::apply_request_body_plugins_with_context(
-                &plugins,
-                Some(&mut ctx),
-                grpc_deadline_at,
-                &hook_headers,
-                transform_body,
-            )
-            .await;
-            ctx.charged_retained_request_bytes(transformed)
-        } else {
-            body_data
+        let transformed = crate::proxy::apply_retained_request_body_plugins_with_context(
+            &plugins,
+            &mut ctx,
+            grpc_deadline_at,
+            &hook_headers,
+            body_data,
+            effective_max_request_body_size_bytes,
+        )
+        .await;
+        let (transformed, transform_rejection) = match transformed {
+            Ok(body) => (body, None),
+            Err(reject) => (Bytes::new(), Some(reject)),
         };
         // `bytes_sent` above is the raw client-wire length; gRPC messages come
         // from the transformed, backend-visible body so translated gRPC-Web
         // requests count native frames instead of base64 / trailer framing,
         // and an untranslated pass-through upload counts its decoded frames.
         crate::plugins::grpc_web::record_request_grpc_message_count(&ctx, &transformed);
-        let final_body_result = crate::proxy::run_final_request_body_hooks(
-            &plugins,
-            Some(&mut ctx),
-            grpc_deadline_at,
-            &hook_headers,
-            &transformed,
-        )
-        .await;
+        let final_body_result = match transform_rejection {
+            Some(reject) => reject,
+            None => {
+                crate::proxy::run_final_request_body_hooks(
+                    &plugins,
+                    Some(&mut ctx),
+                    grpc_deadline_at,
+                    &hook_headers,
+                    &transformed,
+                )
+                .await
+            }
+        };
         plugin_execution_ns += terminal_hook_start.elapsed().as_nanos() as u64;
         match final_body_result {
             PluginResult::Continue => {
@@ -6443,36 +6445,37 @@ async fn handle_h3_request(
             .entry(":method".to_string())
             .or_insert_with(|| method.clone());
         let grpc_deadline_at = ctx.grpc_deadline_at();
-        let transformed = if capabilities
-            .has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_BODY)
-        {
-            let transform_body = body_data.to_vec();
-            drop(body_data);
-            let transformed = crate::proxy::apply_request_body_plugins_with_context(
-                &plugins,
-                Some(&mut ctx),
-                grpc_deadline_at,
-                &hook_headers,
-                transform_body,
-            )
-            .await;
-            ctx.charged_retained_request_bytes(transformed)
-        } else {
-            body_data
+        let transformed = crate::proxy::apply_retained_request_body_plugins_with_context(
+            &plugins,
+            &mut ctx,
+            grpc_deadline_at,
+            &hook_headers,
+            body_data,
+            effective_max_request_body_size_bytes,
+        )
+        .await;
+        let (transformed, transform_rejection) = match transformed {
+            Ok(body) => (body, None),
+            Err(reject) => (Bytes::new(), Some(reject)),
         };
         // Same contract as the terminal-hook ladder above: count the
         // backend-visible representation, not the client wire bytes, and an
         // untranslated pass-through upload on its decoded frames.
         crate::plugins::grpc_web::record_request_grpc_message_count(&ctx, &transformed);
-        match crate::proxy::run_final_request_body_hooks(
-            &plugins,
-            Some(&mut ctx),
-            grpc_deadline_at,
-            &hook_headers,
-            &transformed,
-        )
-        .await
-        {
+        let final_body_result = match transform_rejection {
+            Some(reject) => reject,
+            None => {
+                crate::proxy::run_final_request_body_hooks(
+                    &plugins,
+                    Some(&mut ctx),
+                    grpc_deadline_at,
+                    &hook_headers,
+                    &transformed,
+                )
+                .await
+            }
+        };
+        match final_body_result {
             PluginResult::Continue => {
                 prebuffered_body_data = Some(transformed);
                 request_body_prepared = true;
@@ -9006,7 +9009,7 @@ async fn handle_h3_request(
     let raw_request_body_bytes = prepared_raw_request_body_bytes.unwrap_or(body_data.len() as u64);
 
     // Transform request body via plugins when buffering is active
-    let mut body_data = if !request_body_prepared
+    let (mut body_data, transform_rejection) = if !request_body_prepared
         && needs_request_buffering
         && !body_data.is_empty()
         && capabilities.has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_BODY)
@@ -9022,26 +9025,30 @@ async fn handle_h3_request(
             .entry(":method".to_string())
             .or_insert_with(|| method.clone());
         let grpc_deadline_at = ctx.grpc_deadline_at();
-        let transform_body = body_data.to_vec();
-        drop(body_data);
-        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+        match crate::proxy::apply_retained_request_body_plugins_with_context(
             &plugins,
-            Some(&mut ctx),
+            &mut ctx,
             grpc_deadline_at,
             &hook_headers,
-            transform_body,
+            body_data,
+            effective_max_request_body_size_bytes,
         )
-        .await;
-        ctx.charged_retained_request_bytes(transformed)
+        .await
+        {
+            Ok(body) => (body, None),
+            Err(reject) => (Bytes::new(), Some(reject)),
+        }
     } else {
-        body_data
+        (body_data, None)
     };
 
     // Skip the per-plugin context-aware dispatch when no plugin opted in via
     // `needs_final_request_body_context`. The default impl of
     // `on_final_request_body_with_context` would just delegate back to
     // `on_final_request_body`; passing `None` keeps us on the direct path.
-    let final_body_result = if request_body_prepared {
+    let final_body_result = if let Some(reject) = transform_rejection {
+        reject
+    } else if request_body_prepared {
         PluginResult::Continue
     } else {
         let grpc_deadline_at = ctx.grpc_deadline_at();
@@ -10026,7 +10033,7 @@ async fn handle_h3_request(
                         &method,
                         attempt_headers,
                         current_target.as_deref(),
-                        Some(body_data.as_ref()),
+                        Some(&body_data),
                         false,
                         &plugins,
                         &ctx,
@@ -18416,9 +18423,9 @@ async fn finalize_h3_early_policy_rejection(
         )
         .await;
     }
-    let Some(mut reject) = plugin_result_into_reject_parts(
-        crate::proxy::early_upload::unresolved_policy_result(),
-    ) else {
+    let Some(mut reject) =
+        plugin_result_into_reject_parts(crate::proxy::early_upload::unresolved_policy_result())
+    else {
         return Err(anyhow::anyhow!(
             "canonical early upload refusal could not be normalized"
         ));

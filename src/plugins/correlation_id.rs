@@ -244,6 +244,26 @@ impl Plugin for CorrelationId {
         true
     }
 
+    fn early_route_total<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        headers: &HashMap<String, String>,
+        _host: Option<&'a str>,
+        _query: Option<&super::utils::query::CanonicalQuery>,
+        _facts: super::early_route_total::EarlyRouteTotalFacts,
+    ) -> super::early_route_total::EarlyRouteTotalStep<'a> {
+        // on_request_received already established this private value. The
+        // later hook is a no-op when the outgoing header still agrees. If an
+        // intervening mutation changed it, restoration could affect a header
+        // matcher, so keep that dependency unresolved instead of running a hook.
+        match self.request_id(ctx) {
+            Some(id) if headers.get(&self.header_name).map(String::as_str) != Some(id) => {
+                super::early_route_total::EarlyRouteTotalStep::Unresolved
+            }
+            _ => super::early_route_total::EarlyRouteTotalStep::NoMatch,
+        }
+    }
+
     async fn on_stream_connect(
         &self,
         ctx: &mut super::StreamConnectionContext,

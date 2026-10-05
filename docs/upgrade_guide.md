@@ -35,17 +35,18 @@ routing dependencies with a fixed 503; **no owner approval exists**. Review the
 this draft. v0.9.11 remains the inspected affected release; its published
 artifacts and contracts are immutable. The advisory metadata remains unchanged.
 
-## Upgrading to 0.9.11 (release draft)
+## Upgrading to 0.9.11
 
-0.9.11 is not published or qualified yet. This candidate was prepared on
-2026-10-04 UTC, the planned cut date rather than a publication timestamp; root
-must adjust the date before the actual cut if it changes. The guidance below
-covers main through `3ce21ad101f164f70cb7f7f77fb033db828b9518`, including
-the merged dependency security fix
-[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) and qualified gRPC
-fixture repair [#6007](https://github.com/ferrum-edge/ferrum-edge/pull/6007).
-Use the [release draft](releases/v0.9.11.md) for outstanding evidence and publication
-requirements. Version pins in this draft become usable only after publication.
+[v0.9.11](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.11)
+was published on 2026-10-04 at 21:26:11 UTC from
+`c764084b3b51c3f7ffde268c039688d35e49c553`. Its tag and distributed artifacts
+are immutable. It includes dependency security fix
+[#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) and gRPC fixture
+repair [#6007](https://github.com/ferrum-edge/ferrum-edge/pull/6007).
+The [release preparation record](releases/v0.9.11.md) preserves the historical
+source evidence and pre-publication requirements. It does not qualify the
+future, unreleased #6008/#6009 upload candidate. v0.9.11 remains affected by the
+inspected SOAP total-deadline gap; GHSA-gxfv-924p-wvx4 has no patched-version claim.
 
 **TLS source selectors must match their field (issue #5959; breaking).**
 Correct references whose explicit fragment, Kubernetes data key, `?kind=` hint,
@@ -116,12 +117,12 @@ with no findings after the accepted completion finding was fixed. All 12
 hosted workflows succeeded; all 80 checks completed (49 successful and 31
 nonapplicable PR skips), all nine protected Actions contexts passed, and there
 were zero review threads. PR #6007 merged and issue #6006 closed on
-2026-10-04; this release branch now normally integrates the fix. The failed
+2026-10-04; published v0.9.11 includes the fix. The failed
 historical `5bab92a367c69ececaaa81e535fca45ba4436f38` release run and
 `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017` main run remain failure evidence,
-not candidates for blind reruns. Fresh exact-release-head review and hosted
-gates, the eventual main merge/push gates, tag, and artifact verification are
-still pending. See [the failure analysis](grpc_qualification_6006.md) and
+not candidates for blind reruns. v0.9.11 was subsequently published at the
+immutable commit above; these historical failures do not qualify the unreleased
+early-upload candidate. See [the failure analysis](grpc_qualification_6006.md) and
 [fixture source qualification](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
 
 **Dependency security chain (#5912 / #6004).** The integrated Hyper 1.10.0
@@ -134,14 +135,15 @@ producer; this release
 changes only their own `ferrum-edge` package version to 0.9.11. Dependency
 versions, checksums, graph inputs and producer provenance are unchanged from
 main's security fix. Hosted source qualification passed at the reviewed
-#6004 head and issue #5912 is closed; fresh integrated-release qualification
-and published artifacts are still pending. Cloud secrets remain unsupported
+#6004 head and issue #5912 is closed. The integrated changes are included in
+the published v0.9.11 artifacts. Cloud secrets remain unsupported
 in enforcing FIPS mode. See
 [the security upgrade record](dependency-security-upgrade-5912.md) for exact
 producer provenance and patch-port risks, and the
 [completed source integration evidence](releases/v0.9.11.md#dependency-source-integration-evidence)
-for the merge and exact-head hosted proof. Upgrade deployed binaries only after
-the release is qualified and its artifacts are verified.
+for the merge and exact-head hosted proof. Verify the immutable published
+artifacts before rollout; this dependency upgrade does not patch the inspected
+SOAP early-upload advisory.
 
 **Conditional admin snapshots and restore (#5992).** Use an admin-role JWT
 for `GET /consumers/{id}/verification` when checking the complete stored

@@ -1012,30 +1012,42 @@ where
             // they do on the H1/H2 dispatch path. This bridge path has no
             // `:method` pseudo-header for the no-context hook to consult.
             let grpc_deadline_at = ctx.grpc_deadline_at();
-            let transform_body = body.to_vec();
-            drop(body);
-            let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            let retained_limit = crate::proxy::effective_request_body_limit(
+                state.max_request_body_size_bytes,
+                ctx.route_request_body_limit(),
+            );
+            let transformed = crate::proxy::apply_retained_request_body_plugins_with_context(
                 plugins,
-                Some(&mut *ctx),
+                ctx,
                 grpc_deadline_at,
                 proxy_headers,
-                transform_body,
+                body,
+                retained_limit,
             )
             .await;
+            let (transformed, transform_rejection) = match transformed {
+                Ok(body) => (body, None),
+                Err(reject) => (Bytes::new(), Some(reject)),
+            };
             // Run validators. Reject = emit a trailers-only native gRPC error,
             // a gRPC-Web trailer frame when that client representation was
             // retained, or a plain JSON error otherwise, then return early
             // WITHOUT dispatching to the backend.
-            match crate::proxy::run_final_request_body_hooks(
-                plugins,
-                Some(ctx),
-                grpc_deadline_at,
-                proxy_headers,
-                &transformed,
-            )
-            .await
-            {
-                PluginResult::Continue => Some(ctx.charged_retained_request_bytes(transformed)),
+            let final_body_result = match transform_rejection {
+                Some(reject) => reject,
+                None => {
+                    crate::proxy::run_final_request_body_hooks(
+                        plugins,
+                        Some(ctx),
+                        grpc_deadline_at,
+                        proxy_headers,
+                        &transformed,
+                    )
+                    .await
+                }
+            };
+            match final_body_result {
+                PluginResult::Continue => Some(transformed),
                 reject => {
                     drop(transformed);
                     ctx.discard_retained_request_metadata();
@@ -8260,7 +8272,7 @@ where
         body.len() as u64
     };
     // `body` is already the backend-visible native representation: a prebuffered
-    // body went through `apply_request_body_plugins_with_context` in
+    // body went through `apply_retained_request_body_plugins_with_context` in
     // `cross_protocol::run` (that is where gRPC-Web text base64 is decoded and
     // the terminal trailer frame is split off), and the non-prebuffered arm is
     // reachable only when no body-transforming plugin is configured. `bytes_sent`
@@ -12102,7 +12114,10 @@ where
                     0,
                     backend_start,
                     bytes_sent,
-                    matches!(error, crate::http3::stream_util::H3ResponseWriteError::Write(_)),
+                    matches!(
+                        error,
+                        crate::http3::stream_util::H3ResponseWriteError::Write(_)
+                    ),
                 )
             }
         };

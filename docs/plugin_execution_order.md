@@ -2189,7 +2189,9 @@ gRPC requests are detected by their `content-type: application/grpc` header and 
 The H1/H2 and native-H3 authenticate/authorize/pre-before_proxy sibling collectors
 preview only deterministic compiled mesh selection in their pinned generation.
 This pure selector runs no hooks and publishes no routing or authorization
-override. Normal before_proxy/deferred ordering and later arm/rearm remain;
+override. Already-established correlation headers can project a no-op without
+invoking a hook; differing authoritative/outgoing values remain unresolved.
+Normal before_proxy/deferred ordering and later arm/rearm remain;
 non-gRPC untimed replacement can clear or extend the receipt-anchored total.
 SOAP UsernameToken/X.509/SAML, timestamp-only SOAP, HMAC preverification,
 gRPC/gRPC-Web attempts, WebSocket/CONNECT exclusions and trailers retain their

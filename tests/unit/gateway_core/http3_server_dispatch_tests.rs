@@ -215,7 +215,9 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
         .expect("bounded retained capacity refusal");
     assert!(
         capacity.find("cb_probe.release_neutral()").unwrap()
-            < capacity.find("write_retained_request_capacity_terminal(").unwrap(),
+            < capacity
+                .find("write_retained_request_capacity_terminal(")
+                .unwrap(),
         "capacity refusal must release the probe before its bounded terminal write"
     );
 

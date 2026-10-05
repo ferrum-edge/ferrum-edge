@@ -54,7 +54,10 @@ pub(crate) struct EarlyRouteTotalPlan {
 
 impl EarlyRouteTotalPlan {
     pub(crate) fn compile(plugins: &[Arc<dyn Plugin>]) -> Self {
-        let Some(last) = plugins.iter().rposition(|p| p.name() == "mesh_route_dispatch") else {
+        let Some(last) = plugins
+            .iter()
+            .rposition(|p| p.name() == "mesh_route_dispatch")
+        else {
             return Self::default();
         };
         let steps: Vec<_> = plugins
@@ -66,7 +69,7 @@ impl EarlyRouteTotalPlan {
             })
             .map(|(_, p)| Arc::clone(p))
             .collect();
-        let needs_query = steps.iter().any(|p| p.needs_decoded_query_params());
+        let needs_query = steps.iter().any(|p| p.requires_decoded_query_params());
         let authorization_publishers = plugins
             .iter()
             .filter(|p| p.may_publish_route_authorization())
@@ -103,13 +106,7 @@ impl EarlyRouteTotalPlan {
         let mut host = headers.get("host").map(String::as_str);
         let mut selected = EarlyRouteTotalSelection::NoMatch;
         for plugin in &self.steps {
-            match plugin.early_route_total(
-                ctx,
-                headers,
-                host,
-                query.as_ref(),
-                facts,
-            ) {
+            match plugin.early_route_total(ctx, headers, host, query.as_ref(), facts) {
                 EarlyRouteTotalStep::NoMatch => {}
                 EarlyRouteTotalStep::Matched {
                     timeout_ms,

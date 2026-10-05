@@ -4271,12 +4271,14 @@ async fn buffer_request_body_with_early_bound(
                 early_upload::UploadExpiry::Rpc => RequestBodyBufferError::DeadlineExceeded,
                 other => RequestBodyBufferError::EarlyPolicy(other),
             })?,
-        None => collect_request_body_with_deadline(
-            limited.collect(),
-            grpc_deadline_at,
-            request_body_read_timeout_ms,
-        )
-        .await?,
+        None => {
+            collect_request_body_with_deadline(
+                limited.collect(),
+                grpc_deadline_at,
+                request_body_read_timeout_ms,
+            )
+            .await?
+        }
     };
     // Limited::collect() returns either a LengthLimitError (the body actually
     // exceeded the cap -> 413) or the underlying transport error (the client
@@ -6228,6 +6230,12 @@ fn is_forwarded_token(value: &str) -> bool {
         })
 }
 
+/// Replay the same allocation, including its admission owner, on every protocol.
+/// Borrowing a slice here would force a second full allocation on each attempt.
+pub(crate) fn replay_retained_request_body(body: Option<&Bytes>) -> Bytes {
+    body.cloned().unwrap_or_default()
+}
+
 pub(crate) async fn apply_request_body_plugins_with_context(
     plugins: &[Arc<dyn Plugin>],
     mut ctx: Option<&mut RequestContext>,
@@ -6295,6 +6303,184 @@ pub(crate) async fn apply_request_body_plugins_with_context(
         }
     }
     current
+}
+
+/// Existing health-neutral request-buffer terminal, shared by retained copies
+/// and producers. The same finalized-rejection funnel protects its provenance.
+pub(crate) fn retained_request_capacity_result(ctx: &mut RequestContext) -> PluginResult {
+    use response_buffer_budget as budget;
+
+    ctx.mark_gateway_capacity_response_selected();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    if ctx.is_native_grpc_request()
+        || crate::plugins::grpc_web::client_grpc_framing_representation(ctx).is_some()
+    {
+        headers.insert(
+            "grpc-status".to_string(),
+            budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
+        );
+        headers.insert(
+            "grpc-message".to_string(),
+            budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+        );
+    }
+    PluginResult::Reject {
+        status_code: budget::REQUEST_BUFFER_OVERLOAD_STATUS,
+        body: budget::REQUEST_BUFFER_OVERLOAD_BODY.to_string(),
+        headers,
+    }
+}
+
+/// Admission precedes a genuinely distinct gateway-owned copy. The caller
+/// keeps this permit with the Vec through normalization and publication.
+pub(crate) fn copy_retained_request_body_in(
+    body: &[u8],
+    effective_limit: usize,
+    budget: response_buffer_budget::BudgetRef<'_>,
+) -> Option<(Vec<u8>, response_buffer_budget::RequestBufferPermit)> {
+    let ceiling = budget.request_ceiling(effective_limit);
+    if body.len() > ceiling {
+        return None;
+    }
+    let permit = response_buffer_budget::RequestBufferPermit::reserve_in(budget, ceiling)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(body.len()).ok()?;
+    if data.capacity() > permit.reserved_bytes() {
+        return None;
+    }
+    data.extend_from_slice(body);
+    Some((data, permit))
+}
+
+/// Native H3 normalization keeps the input Bytes charged and admits its Vec
+/// independently. Byte metadata is refreshed with a cheap clone only after the
+/// new allocation has acquired its own owner.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn normalize_retained_request_body_before_before_proxy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: Bytes,
+    effective_limit: usize,
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+) -> Result<Bytes, PluginResult> {
+    let Some((mut normalized, permit)) = copy_retained_request_body_in(
+        &body,
+        effective_limit,
+        response_buffer_budget::BudgetRef::request_buffer(),
+    ) else {
+        return Err(retained_request_capacity_result(ctx));
+    };
+    let was_decoded = ctx
+        .metadata
+        .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    for plugin in plugins {
+        if !plugin.normalizes_buffered_request_body_before_before_proxy() {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.normalize_buffered_request_body_before_before_proxy(
+                ctx,
+                headers,
+                &mut normalized,
+            ),
+        )
+        .await
+        .into_plugin_result(ctx);
+        if !matches!(result, PluginResult::Continue) {
+            crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
+            return Err(result);
+        }
+    }
+    let Some(normalized) = permit.into_covered_bytes(normalized) else {
+        return Err(retained_request_capacity_result(ctx));
+    };
+    let body_was_rewritten = !was_decoded
+        && ctx
+            .metadata
+            .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    if body_was_rewritten {
+        let had_body_bytes = ctx.request_body_bytes.take().is_some();
+        refresh_request_body_views_after_normalization(ctx, &normalized, needs_body_text, false);
+        if needs_body_bytes || had_body_bytes {
+            ctx.request_body_bytes = Some(normalized.clone());
+        }
+    }
+    Ok(normalized)
+}
+
+pub(crate) async fn apply_retained_request_body_plugins_with_context(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    headers: &HashMap<String, String>,
+    body: Bytes,
+    effective_limit: usize,
+) -> Result<Bytes, PluginResult> {
+    apply_retained_request_body_plugins_in(
+        plugins,
+        ctx,
+        grpc_deadline_at,
+        headers,
+        body,
+        effective_limit,
+        response_buffer_budget::BudgetRef::request_buffer(),
+    )
+    .await
+}
+
+/// Borrow the charged input directly. No-op hooks, including the ordinary SOAP
+/// bridge, preserve the exact Bytes owner. Each producer gets a separate finite
+/// output window before invocation; that window follows only its allocation.
+/// Plugin-internal transform/decode working sets keep their separate contracts.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_retained_request_body_plugins_in(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    headers: &HashMap<String, String>,
+    mut current: Bytes,
+    effective_limit: usize,
+    budget: response_buffer_budget::BudgetRef<'_>,
+) -> Result<Bytes, PluginResult> {
+    if current.is_empty() {
+        return Ok(current);
+    }
+    let content_type = headers.get("content-type").map(String::as_str);
+    let ceiling = budget.request_ceiling(effective_limit);
+    for plugin in plugins.iter().filter(|plugin| plugin.modifies_request_body()) {
+        let Some(permit) = response_buffer_budget::RequestBufferPermit::reserve_in(budget, ceiling)
+        else {
+            return Err(retained_request_capacity_result(ctx));
+        };
+        let deadline = ctx.grpc_deadline_at().or(grpc_deadline_at);
+        let transform =
+            plugin.transform_request_body_with_context(ctx, &current, content_type, headers);
+        let transformed = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, transform).await {
+                Ok(transformed) => transformed,
+                Err(_) => {
+                    ctx.metadata.insert(
+                        "grpc_deadline.request_body_transform_timed_out".to_string(),
+                        "true".to_string(),
+                    );
+                    break;
+                }
+            }
+        } else {
+            transform.await
+        };
+        if let Some(transformed) = transformed {
+            let Some(charged) = permit.into_covered_bytes(transformed) else {
+                return Err(retained_request_capacity_result(ctx));
+            };
+            current = charged;
+        }
+    }
+    Ok(current)
 }
 
 pub(crate) async fn run_final_request_body_hooks(
@@ -30860,15 +31046,8 @@ async fn finalize_early_upload_policy_rejection(
     apply_grpc_reject_metadata(ctx, &reject);
     let grpc_web_response = build_grpc_web_reject_response(plugins, ctx, grpc_web, &reject).await;
     let status = reject.http_status.as_u16();
-    log_pre_backend_rejected_request(
-        plugins,
-        ctx,
-        status,
-        start_time,
-        phase,
-        plugin_execution_ns,
-    )
-    .await;
+    log_pre_backend_rejected_request(plugins, ctx, status, start_time, phase, plugin_execution_ns)
+        .await;
     record_request(state, status);
     grpc_web_response.unwrap_or_else(|| build_response_from_normalized_reject(reject))
 }
@@ -41581,7 +41760,7 @@ async fn handle_proxy_request_inner(
                             &method,
                             retry_attempt_headers,
                             current_target.as_deref(),
-                            retained_body.as_deref(),
+                            retained_body.as_ref(),
                             should_stream,
                             &plugins,
                             &ctx,
@@ -41606,7 +41785,7 @@ async fn handle_proxy_request_inner(
                             &method,
                             retry_attempt_headers,
                             current_target.as_deref(),
-                            retained_body.as_deref(),
+                            retained_body.as_ref(),
                             should_stream,
                             &plugins,
                             &ctx,
@@ -44908,7 +45087,7 @@ pub(crate) async fn proxy_to_backend_retry(
     method: &str,
     headers: &HashMap<String, String>,
     upstream_target: Option<&UpstreamTarget>,
-    request_body: Option<&[u8]>,
+    request_body: Option<&Bytes>,
     stream_response: bool,
     plugins: &[Arc<dyn Plugin>],
     request_ctx: &RequestContext,
@@ -45275,7 +45454,7 @@ pub(crate) async fn proxy_to_backend_retry(
     if let Some(body) = request_body
         && !body.is_empty()
     {
-        let body_bytes = request_ctx.charged_retained_request_copy(body);
+        let body_bytes = replay_retained_request_body(Some(body));
         let (upload_body, pump) = install_buffered_upload_write_watermark(
             body_bytes.clone(),
             proxy.backend_write_timeout_ms,
@@ -62402,7 +62581,7 @@ async fn proxy_to_backend_http3_retry(
     method: &str,
     headers: &HashMap<String, String>,
     upstream_target: Option<&UpstreamTarget>,
-    request_body: Option<&[u8]>,
+    request_body: Option<&Bytes>,
     stream_response: bool,
     plugins: &[Arc<dyn Plugin>],
     request_ctx: &RequestContext,
@@ -62477,7 +62656,7 @@ async fn proxy_to_backend_http3_retry(
         },
     );
 
-    let body_bytes = request_ctx.charged_retained_request_copy(request_body.unwrap_or(&[]));
+    let body_bytes = replay_retained_request_body(request_body);
     let may_release_after_headers =
         !stream_response && plugins_may_release_response_body_under_retries(plugins, request_ctx);
     let retry_ctx = may_release_after_headers.then(|| retry_response_decision_context(request_ctx));

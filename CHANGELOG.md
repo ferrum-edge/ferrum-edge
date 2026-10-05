@@ -15,14 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The unresolved-selection 503 policy is **not owner-approved**. The entire
   candidate remains draft; GHSA-gxfv-924p-wvx4 is not closed and v0.9.11 is not
   patched. See [the concrete policy proposal](docs/early_upload_policy.md).
+  Deterministic routes with already-established correlation headers retain
+  their timed/untimed selection. Retry and no-op bridge handoffs reuse the
+  charged Bytes allocation; distinct retained transform/normalization outputs
+  require separate admission and retain their own charge through final drop.
   ferrum-contracts parity is required for the next qualified release.
 
 ## [0.9.11] - 2026-10-04
 
-Release candidate prepared on 2026-10-04 UTC; this is the planned cut/preparation
-date, not an asserted publication timestamp. Root must adjust it before the
-actual cut if the calendar date changes. Publication and final qualification
-evidence remain pending. See the [0.9.11 release draft](docs/releases/v0.9.11.md).
+[v0.9.11](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.11)
+was published on 2026-10-04 at 21:26:11 UTC from immutable commit
+`c764084b3b51c3f7ffde268c039688d35e49c553`. The
+[release preparation record](docs/releases/v0.9.11.md) preserves historical
+pre-publication evidence. The early-upload candidate above is unreleased;
+v0.9.11 is not patched for GHSA-gxfv-924p-wvx4.
 
 ### Security
 
@@ -36,8 +42,8 @@ evidence remain pending. See the [0.9.11 release draft](docs/releases/v0.9.11.md
   Hyper/reqwest pair per production graph. The source fix was merged through
   [PR #6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) at
   `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; issue #5912 is closed. Its
-  exact-head hosted checks passed, but 0.9.11 qualification and publication
-  remain pending. See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
+  exact-head hosted checks passed; the changes are included in published
+  v0.9.11. See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
   and [completed source integration evidence](docs/releases/v0.9.11.md#dependency-source-integration-evidence).
 
 - **Conditional admin reads and restores use authoritative strong state tags**
@@ -143,8 +149,8 @@ evidence remain pending. See the [0.9.11 release draft](docs/releases/v0.9.11.md
   all 80 checks completed (49 successful, 31 nonapplicable PR skips), all nine
   protected Actions contexts passed, and there were zero review threads.
   PR #6007 merged at `3ce21ad101f164f70cb7f7f77fb033db828b9518` and
-  issue #6006 closed on 2026-10-04. This release branch normally integrates
-  that fix; new release-head qualification and publication remain pending.
+  issue #6006 closed on 2026-10-04. Published v0.9.11 includes that fix;
+  qualification of the future early-upload candidate remains separate.
   See [the root-cause record](docs/grpc_qualification_6006.md) and
   [completed fixture source evidence](docs/releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
 

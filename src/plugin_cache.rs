@@ -1078,7 +1078,8 @@ impl Plugin for PluginInstanceWrapper {
                 Some(true) => {}
             }
         }
-        self.inner.early_route_total(ctx, headers, host, query, facts)
+        self.inner
+            .early_route_total(ctx, headers, host, query, facts)
     }
 
     fn name(&self) -> &str {
@@ -6126,12 +6127,8 @@ impl PluginCacheRequestView {
         identity_ready: bool,
         authorization_ready: bool,
     ) -> crate::plugins::early_route_total::EarlyRouteTotalSelection {
-        self.early_route_total_plan.select(
-            ctx,
-            headers,
-            identity_ready,
-            authorization_ready,
-        )
+        self.early_route_total_plan
+            .select(ctx, headers, identity_ready, authorization_ready)
     }
 
     /// Strictest active client-facing request-body ceiling for this

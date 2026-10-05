@@ -738,17 +738,25 @@ async fn assert_no_soap_backend(backend: &ScriptedHttp1Backend) {
 }
 
 fn assert_no_soap_health_charge(metrics: &serde_json::Value) {
-    for breaker in metrics["circuit_breakers"].as_array().expect("breaker snapshot") {
+    for breaker in metrics["circuit_breakers"]
+        .as_array()
+        .expect("breaker snapshot")
+    {
         if breaker["proxy_id"] == "soap-upload" {
-            assert_eq!(breaker["failure_count"], 0, "client upload is health-neutral");
+            assert_eq!(
+                breaker["failure_count"], 0,
+                "client upload is health-neutral"
+            );
             assert_eq!(breaker["state"], "closed");
         }
     }
     assert_eq!(metrics["health_check"]["unhealthy_target_count"], 0);
-    assert!(metrics["load_balancers"]["active_connections"]
-        .as_array()
-        .expect("load-balancer snapshot")
-        .is_empty());
+    assert!(
+        metrics["load_balancers"]["active_connections"]
+            .as_array()
+            .expect("load-balancer snapshot")
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

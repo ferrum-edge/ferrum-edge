@@ -2248,7 +2248,9 @@ fn pre_authentication_prebuffer_uses_a_private_witness_without_inventing_authori
     assert!(!prebuffer.contains("arm_route_request_deadline("));
     assert!(!prebuffer.contains("plugin.before_proxy("));
     assert_eq!(
-        PROXY_SOURCE.matches("early_upload::EarlyCollectorWitness::select(").count(),
+        PROXY_SOURCE
+            .matches("early_upload::EarlyCollectorWitness::select(")
+            .count(),
         3,
         "all H1/H2 early phases use the same pure witness"
     );

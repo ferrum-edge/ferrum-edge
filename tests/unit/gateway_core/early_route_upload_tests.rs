@@ -8,7 +8,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ferrum_edge::PluginCache;
 use ferrum_edge::_test_support::{
     EarlyRouteTotalPlanForTest, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
     RequestBufferBudgetProbe, RetainedRequestOutcomeForTest,
@@ -18,6 +17,7 @@ use ferrum_edge::_test_support::{
     mark_early_upload_terminal_for_test, set_grpc_deadline_budget_for_test,
     set_request_credential_deadline_for_test,
 };
+use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginScope};
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
@@ -27,11 +27,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 
 fn request() -> RequestContext {
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".into(),
-        "POST".into(),
-        "/upload".into(),
-    );
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/upload".into());
     ctx.headers.insert("host".into(), "original.example".into());
     ctx
 }
@@ -97,9 +93,15 @@ fn nonmatch_preserves_timed_selection_and_is_distinct_from_an_untimed_match() {
     let first = route(json!([timed_rule(Some(50))]));
     let second = route(json!([nonmatch]));
     let plan = EarlyRouteTotalPlanForTest::new(&[first, second.clone()]);
-    assert_eq!(plan.selection(&ctx, &ctx.headers, false), ("timed", Some(50)));
+    assert_eq!(
+        plan.selection(&ctx, &ctx.headers, false),
+        ("timed", Some(50))
+    );
     let plan = EarlyRouteTotalPlanForTest::new(&[second]);
-    assert_eq!(plan.selection(&ctx, &ctx.headers, false), ("no_match", None));
+    assert_eq!(
+        plan.selection(&ctx, &ctx.headers, false),
+        ("no_match", None)
+    );
 }
 
 #[tokio::test]
@@ -144,12 +146,18 @@ fn terminals_veto_prior_timing_and_stochastic_faults_are_unresolved() {
             route(json!([timed_rule(Some(5))])),
             route(json!([terminal])),
         ]);
-        assert_eq!(plan.selection(&ctx, &ctx.headers, false), ("terminal", None));
+        assert_eq!(
+            plan.selection(&ctx, &ctx.headers, false),
+            ("terminal", None)
+        );
     }
     let mut stochastic = timed_rule(Some(100));
     stochastic["fault"] = json!({"abort": {"status_code": 503, "percentage": 50.0}});
     let plan = EarlyRouteTotalPlanForTest::new(&[route(json!([stochastic]))]);
-    assert_eq!(plan.selection(&ctx, &ctx.headers, false), ("unresolved", None));
+    assert_eq!(
+        plan.selection(&ctx, &ctx.headers, false),
+        ("unresolved", None)
+    );
     let mut waypoint = timed_rule(Some(100));
     waypoint["destination"]["requires_node_waypoint_authz"] = json!(true);
     let plan = EarlyRouteTotalPlanForTest::new(&[route(json!([waypoint]))]);
@@ -158,7 +166,10 @@ fn terminals_veto_prior_timing_and_stochastic_faults_are_unresolved() {
         "mesh_authz.node_waypoint_scoped_authz_active".into(),
         "true".into(),
     );
-    assert_eq!(plan.selection(&ctx, &ctx.headers, false), ("unresolved", None));
+    assert_eq!(
+        plan.selection(&ctx, &ctx.headers, false),
+        ("unresolved", None)
+    );
     assert_eq!(plan.selection(&ctx, &ctx.headers, true), ("terminal", None));
 }
 
@@ -179,7 +190,10 @@ fn pending_waypoint_stamps_are_cached_and_distinct_from_authenticated_identity()
     let plugins = [route(json!([timed_rule(Some(100))])), authz];
     let plan = EarlyRouteTotalPlanForTest::new(&plugins);
     let mut ctx = request();
-    assert!(!ctx.metadata.contains_key("mesh_authz.node_waypoint_scoped_authz_active"));
+    assert!(
+        !ctx.metadata
+            .contains_key("mesh_authz.node_waypoint_scoped_authz_active")
+    );
     assert_eq!(
         plan.selection_at_boundary(&ctx, &ctx.headers, false, false),
         ("unresolved", None)
@@ -206,10 +220,7 @@ fn pending_waypoint_stamps_are_cached_and_distinct_from_authenticated_identity()
     );
     let mut redirect = timed_rule(Some(100));
     redirect["redirect"] = json!({"uri": "/new", "redirect_code": 302});
-    let plan = EarlyRouteTotalPlanForTest::new(&[
-        route(json!([redirect])),
-        plugins[1].clone(),
-    ]);
+    let plan = EarlyRouteTotalPlanForTest::new(&[route(json!([redirect])), plugins[1].clone()]);
     assert_eq!(
         plan.selection_at_boundary(&ctx, &ctx.headers, true, false),
         ("terminal", None)
@@ -239,7 +250,10 @@ fn possible_deferred_destination_replacement_on_either_side_is_explicit() {
     let mutator: Arc<dyn Plugin> = Arc::new(DeferredDestinationPublisher);
     for plugins in [vec![mesh.clone(), mutator.clone()], vec![mutator, mesh]] {
         let plan = EarlyRouteTotalPlanForTest::new(&plugins);
-        assert_eq!(plan.selection(&ctx, &ctx.headers, false), ("unresolved", None));
+        assert_eq!(
+            plan.selection(&ctx, &ctx.headers, false),
+            ("unresolved", None)
+        );
         assert_eq!(ctx.route_override_request_timeout_ms, None);
     }
 }
@@ -295,7 +309,11 @@ async fn accepted_authorization_and_rpc_ties_keep_the_established_owner() {
         assert_eq!(bound.owner(), Some(owner));
         tokio::time::advance(Duration::from_millis(100)).await;
         assert_eq!(bound.collect(async {}).await, Err(owner));
-        assert_eq!(ctx.route_request_deadline_at(), None, "selection is read-only");
+        assert_eq!(
+            ctx.route_request_deadline_at(),
+            None,
+            "selection is read-only"
+        );
     }
 }
 
@@ -343,14 +361,8 @@ fn effective_cache_scope_protocol_and_priority_match_the_normal_hook_chain() {
     let ctx = request();
     for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
         let view = cache.request_view("ferrum", "upload", protocol);
-        let bound = capture_early_route_upload_bound_for_test(
-            &view,
-            &ctx,
-            &ctx.headers,
-            false,
-            0,
-        )
-        .unwrap();
+        let bound =
+            capture_early_route_upload_bound_for_test(&view, &ctx, &ctx.headers, false, 0).unwrap();
         assert_eq!(bound.owner(), Some("route"));
     }
     let plugins = cache.get_plugins("ferrum", "upload");
@@ -360,16 +372,13 @@ fn effective_cache_scope_protocol_and_priority_match_the_normal_hook_chain() {
         "proxy-scoped same-name instances replace the global"
     );
     let plan = EarlyRouteTotalPlanForTest::new(&plugins);
-    assert_eq!(plan.selection(&ctx, &ctx.headers, false), ("timed", Some(50)));
+    assert_eq!(
+        plan.selection(&ctx, &ctx.headers, false),
+        ("timed", Some(50))
+    );
     let tcp = cache.request_view("ferrum", "upload", ProxyProtocol::Tcp);
-    let bound = capture_early_route_upload_bound_for_test(
-        &tcp,
-        &ctx,
-        &ctx.headers,
-        false,
-        0,
-    )
-    .unwrap();
+    let bound =
+        capture_early_route_upload_bound_for_test(&tcp, &ctx, &ctx.headers, false, 0).unwrap();
     assert_eq!(bound.owner(), None);
 }
 
@@ -381,22 +390,10 @@ async fn pinned_reload_and_identity_trigger_refusal() {
     cache.rebuild(&cache_config(500, None)).unwrap();
     let live = cache.request_view("ferrum", "upload", ProxyProtocol::Http);
     let ctx = request();
-    let old = capture_early_route_upload_bound_for_test(
-        &pinned,
-        &ctx,
-        &ctx.headers,
-        false,
-        0,
-    )
-    .unwrap();
-    let new = capture_early_route_upload_bound_for_test(
-        &live,
-        &ctx,
-        &ctx.headers,
-        false,
-        0,
-    )
-    .unwrap();
+    let old =
+        capture_early_route_upload_bound_for_test(&pinned, &ctx, &ctx.headers, false, 0).unwrap();
+    let new =
+        capture_early_route_upload_bound_for_test(&live, &ctx, &ctx.headers, false, 0).unwrap();
     tokio::time::advance(Duration::from_millis(20)).await;
     assert_eq!(old.collect(async {}).await, Err("route"));
     assert_eq!(new.collect(async {}).await, Ok(()));
@@ -418,16 +415,13 @@ async fn pinned_reload_and_identity_trigger_refusal() {
         panic!("refusal");
     };
     assert_eq!(status_code, 503);
-    assert_eq!(body, r#"{"error":"Request body policy cannot be resolved"}"#);
+    assert_eq!(
+        body,
+        r#"{"error":"Request body policy cannot be resolved"}"#
+    );
     assert!(!body.contains("timeout") && !body.contains("authentication"));
-    let bound = capture_early_route_upload_bound_for_test(
-        &view,
-        &ctx,
-        &ctx.headers,
-        true,
-        0,
-    )
-    .unwrap();
+    let bound =
+        capture_early_route_upload_bound_for_test(&view, &ctx, &ctx.headers, true, 0).unwrap();
     assert_eq!(
         bound.owner(),
         None,
@@ -486,18 +480,18 @@ async fn actual_h3_seam_keeps_untimed_read_zero_and_folds_grpc_without_an_early_
             polls.fetch_add(1, Ordering::SeqCst);
             Poll::Ready(Ok::<_, ()>(()))
         });
-        let result = collect_h3_early_route_upload_for_test(
-            &view,
-            &ctx,
-            false,
-            grpc,
-            0,
-            body,
-        )
-        .await;
+        let result =
+            collect_h3_early_route_upload_for_test(&view, &ctx, false, grpc, 0, body).await;
         assert_eq!(result.err(), expected);
-        assert_eq!(polls.load(Ordering::SeqCst), usize::from(expected.is_none()));
-        assert_eq!(ctx.grpc_deadline_at(), None, "no RPC or attempt policy is armed");
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            usize::from(expected.is_none())
+        );
+        assert_eq!(
+            ctx.grpc_deadline_at(),
+            None,
+            "no RPC or attempt policy is armed"
+        );
         assert_eq!(ctx.route_request_deadline_at(), None);
         assert_eq!(ctx.route_override_request_timeout_ms, None);
     }
@@ -639,7 +633,9 @@ async fn actual_collector_route_cancellation_and_admission_before_poll() {
     let source = futures_util::stream::iter([Ok(Bytes::from_static(b"partial"))])
         .chain(futures_util::stream::pending());
     assert!(matches!(
-        bound.collect(budget.collect_retained_chunks(source, 0)).await,
+        bound
+            .collect(budget.collect_retained_chunks(source, 0))
+            .await,
         Err("route")
     ));
     assert_eq!(budget.available_bytes(), UNIT);
@@ -655,4 +651,231 @@ async fn actual_collector_route_cancellation_and_admission_before_poll() {
     ));
     assert_eq!(polls.load(Ordering::SeqCst), 0);
     drop(permit);
+}
+
+#[tokio::test]
+async fn established_correlation_headers_preserve_timed_and_untimed_method_routes() {
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+
+    for inbound in [None, Some("client-request-17")] {
+        for timeout in [None, Some(50)] {
+            let correlation: Arc<dyn Plugin> = Arc::new(CorrelationId::new(&json!({})).unwrap());
+            let mut ctx = request();
+            if let Some(id) = inbound {
+                ctx.headers.insert("x-request-id".into(), id.into());
+            }
+            assert!(matches!(
+                correlation.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ));
+            for header_match in [false, true] {
+                let mut rule = timed_rule(timeout);
+                if header_match {
+                    rule["match"]["headers"] = json!({"x-request-id": ctx.headers["x-request-id"]});
+                }
+                let plugins = vec![correlation.clone(), route(json!([rule]))];
+                let plan = EarlyRouteTotalPlanForTest::new(&plugins);
+                let original_headers = ctx.headers.clone();
+                let expected = match timeout {
+                    Some(ms) => ("timed", Some(ms)),
+                    None => ("untimed", None),
+                };
+                assert_eq!(plan.selection(&ctx, &ctx.headers, false), expected);
+                assert_eq!(ctx.headers, original_headers);
+                assert_eq!(ctx.route_request_deadline_at(), None);
+                let mut headers = ctx.headers.clone();
+                for plugin in &plugins {
+                    assert!(matches!(
+                        plugin.before_proxy(&mut ctx, &mut headers).await,
+                        PluginResult::Continue
+                    ));
+                }
+                assert_eq!(ctx.route_override_request_timeout_ms, timeout);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn correlation_projection_cannot_hide_an_intervening_header_mutation() {
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+
+    let correlation: Arc<dyn Plugin> = Arc::new(CorrelationId::new(&json!({})).unwrap());
+    let mut ctx = request();
+    correlation.on_request_received(&mut ctx).await;
+    let plan =
+        EarlyRouteTotalPlanForTest::new(&[correlation, route(json!([timed_rule(Some(50))]))]);
+    let mut mutated = ctx.headers.clone();
+    mutated.insert("x-request-id".into(), "intervening-value".into());
+    assert_eq!(plan.selection(&ctx, &mutated, false), ("unresolved", None));
+}
+
+async fn retained_body(budget: &RequestBufferBudgetProbe) -> Bytes {
+    let chunks = futures_util::stream::iter([Ok(Bytes::from_static(b"retained request body"))]);
+    match budget.collect_retained_chunks(chunks, 0).await.unwrap() {
+        RetainedRequestOutcomeForTest::Collected(body) => body,
+        _ => panic!("retained collector admission"),
+    }
+}
+
+#[tokio::test]
+async fn actual_noop_bridge_hooks_and_cross_protocol_retry_keep_one_allocation_charged() {
+    use ferrum_edge::_test_support::replay_retained_request_body_for_test;
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+
+    let budget = RequestBufferBudgetProbe::new(UNIT, UNIT);
+    let body = retained_body(&budget).await;
+    let original_address = body.as_ptr();
+    let mut ctx = request();
+    ctx.request_body_bytes = Some(body.clone());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CorrelationId::new(&json!({})).unwrap())];
+    let headers = ctx.headers.clone();
+    let backend = budget
+        .prepare_retained_body(&plugins, &mut ctx, &headers, body, 0)
+        .await
+        .unwrap_or_else(|_| panic!("no-op hooks require no additional admission"));
+    assert_eq!(backend.as_ptr(), original_address);
+    let h1_retry = replay_retained_request_body_for_test(&backend);
+    let h3_retry = replay_retained_request_body_for_test(&backend);
+    assert_eq!(h1_retry.as_ptr(), original_address);
+    assert_eq!(h3_retry.as_ptr(), original_address);
+    assert_eq!(budget.available_bytes(), 0);
+    drop(backend);
+    drop(h1_retry);
+    drop(ctx);
+    assert_eq!(budget.available_bytes(), 0);
+    drop(h3_retry);
+    assert_eq!(budget.available_bytes(), UNIT);
+}
+
+struct RetainedProducer {
+    budget: Arc<RequestBufferBudgetProbe>,
+    calls: Arc<AtomicUsize>,
+    stall: bool,
+}
+
+#[async_trait::async_trait]
+impl Plugin for RetainedProducer {
+    fn name(&self) -> &str {
+        "test_retained_producer"
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        true
+    }
+
+    async fn transform_request_body(
+        &self,
+        body: &[u8],
+        _content_type: Option<&str>,
+        _headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            self.budget.available_bytes(),
+            0,
+            "output admitted before the hook"
+        );
+        if self.stall {
+            pending::<()>().await;
+        }
+        Some(body.to_vec())
+    }
+}
+
+#[tokio::test]
+async fn actual_transform_output_has_its_own_retained_allocation_lifetime() {
+    use ferrum_edge::_test_support::replay_retained_request_body_for_test;
+
+    let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, 2 * UNIT));
+    let body = retained_body(&budget).await;
+    let original = body.clone();
+    let mut ctx = request();
+    ctx.request_body_bytes = Some(body.clone());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetainedProducer {
+        budget: budget.clone(),
+        calls: calls.clone(),
+        stall: false,
+    })];
+    let headers = ctx.headers.clone();
+    let output = budget
+        .prepare_retained_body(&plugins, &mut ctx, &headers, body, 0)
+        .await
+        .unwrap_or_else(|_| panic!("independently admitted output"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_ne!(output.as_ptr(), original.as_ptr());
+    assert_eq!(budget.available_bytes(), 0);
+    let retry = replay_retained_request_body_for_test(&output);
+    drop(output);
+    drop(original);
+    assert_eq!(
+        budget.available_bytes(),
+        0,
+        "metadata retains the original"
+    );
+    drop(ctx);
+    assert_eq!(budget.available_bytes(), UNIT);
+    drop(retry);
+    assert_eq!(budget.available_bytes(), 2 * UNIT);
+}
+
+#[tokio::test]
+async fn actual_transform_refusal_and_cancellation_release_only_their_own_admission() {
+    for stall in [false, true] {
+        let total = if stall { 2 * UNIT } else { UNIT };
+        let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, total));
+        let body = retained_body(&budget).await;
+        let mut ctx = request();
+        ctx.request_body_bytes = Some(body.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetainedProducer {
+            budget: budget.clone(),
+            calls: calls.clone(),
+            stall,
+        })];
+        let headers = ctx.headers.clone();
+        let mut prepare =
+            Box::pin(budget.prepare_retained_body(&plugins, &mut ctx, &headers, body, 0));
+        if stall {
+            let waker = futures_util::task::noop_waker();
+            assert!(
+                prepare
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(budget.available_bytes(), 0);
+            drop(prepare);
+            assert_eq!(budget.available_bytes(), UNIT);
+        } else {
+            let PluginResult::Reject {
+                status_code, body, ..
+            } = prepare.await.unwrap_err()
+            else {
+                panic!("capacity refusal");
+            };
+            assert_eq!(status_code, 503);
+            assert_eq!(body, ferrum_edge::_test_support::REQUEST_BUFFER_OVERLOAD_BODY);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(budget.available_bytes(), 0);
+        }
+        drop(ctx);
+        assert_eq!(budget.available_bytes(), total);
+    }
+}
+
+#[tokio::test]
+async fn actual_normalization_copy_admission_preserves_both_allocation_owners() {
+    let budget = RequestBufferBudgetProbe::new(UNIT, 2 * UNIT);
+    let body = retained_body(&budget).await;
+    let copy = budget.copy_retained_body(&body, 0).unwrap();
+    assert_ne!(body.as_ptr(), copy.as_ptr());
+    assert_eq!(budget.available_bytes(), 0);
+    assert!(budget.copy_retained_body(&body, 0).is_none());
+    drop(body);
+    assert_eq!(budget.available_bytes(), UNIT);
+    drop(copy);
+    assert_eq!(budget.available_bytes(), 2 * UNIT);
 }

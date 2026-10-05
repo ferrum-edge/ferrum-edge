@@ -570,6 +570,10 @@ impl<'a> BudgetRef<'a> {
             BudgetTarget::RequestBuffer => request_buffer_budget(),
         }
     }
+
+    pub(crate) fn request_ceiling(self, effective_limit: usize) -> usize {
+        self.resolve().ceiling(effective_limit)
+    }
 }
 
 fn budget() -> &'static Budget {
@@ -725,6 +729,15 @@ impl RequestBufferPermit {
         self.reservation.reserved_bytes()
     }
 
+    /// A replacement cannot reuse the original allocation's claim, or retain
+    /// more capacity than its own pre-construction admission covered.
+    pub(crate) fn into_covered_bytes(self, data: Vec<u8>) -> Option<Bytes> {
+        if data.capacity() > self.reserved_bytes() {
+            return None;
+        }
+        Some(self.into_charged_bytes(data))
+    }
+
     /// Publish `data` as cheaply cloneable [`Bytes`] whose charge is released
     /// when the last clone drops — not when the collector's stack frame ends.
     ///
@@ -775,7 +788,7 @@ impl SharedRequestBufferCharge {
         Self(std::sync::Arc::new(permit))
     }
 
-    pub(crate) fn bytes(&self, data: Vec<u8>) -> Bytes {
+    pub(crate) fn bytes(self, data: Vec<u8>) -> Bytes {
         struct Owner {
             data: Vec<u8>,
             _charge: SharedRequestBufferCharge,
@@ -789,7 +802,7 @@ impl SharedRequestBufferCharge {
         // retained allocation. The collector reserves exactly its finite cap.
         Bytes::from_owner(Owner {
             data,
-            _charge: self.clone(),
+            _charge: self,
         })
     }
 

@@ -31,12 +31,8 @@ impl EarlyCollectorWitness {
         identity_ready: bool,
         authorization_ready: bool,
     ) -> Self {
-        let selection = view.early_route_total_selection(
-            ctx,
-            headers,
-            identity_ready,
-            authorization_ready,
-        );
+        let selection =
+            view.early_route_total_selection(ctx, headers, identity_ready, authorization_ready);
         let route_at = match selection {
             EarlyRouteTotalSelection::Timed(ms) => ctx.receipt_anchored_route_total(Some(ms)),
             _ => None,
@@ -69,12 +65,8 @@ impl EarlyCollectorWitness {
                 },
             )
         });
-        let bound = CapturedUploadBound::compose(
-            ctx.grpc_deadline_at(),
-            route,
-            authorization,
-            read_ms,
-        );
+        let bound =
+            CapturedUploadBound::compose(ctx.grpc_deadline_at(), route, authorization, read_ms);
         // A configured but unrepresentable read window is not an unbounded
         // policy. An existing finite absolute bound still safely caps it.
         if read_ms > 0 && bound.0.is_none() {
