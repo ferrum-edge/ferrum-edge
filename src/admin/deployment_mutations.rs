@@ -7,7 +7,9 @@ use super::{AdminState, json_response};
 use crate::config::db_backend::{
     DatabaseBackend, DbWriteTopologyPermit, NamespacePreconditionFailed,
 };
-use crate::config::deployment_mutation::{DeploymentGraphInvalid, DeploymentPrecondition};
+use crate::config::deployment_mutation::{
+    DeploymentGraphInvalid, DeploymentPrecondition, ExternalSpecUpstreamConflict,
+};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{HeaderMap, Response, StatusCode};
@@ -117,7 +119,10 @@ pub(super) fn unavailable(durable: &str) -> Response<Full<Bytes>> {
 pub(super) fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
     let status = if error.chain().any(|e| e.is::<NamespacePreconditionFailed>()) {
         StatusCode::PRECONDITION_FAILED
-    } else if error.chain().any(|e| e.is::<DeploymentGraphInvalid>()) {
+    } else if error
+        .chain()
+        .any(|e| e.is::<DeploymentGraphInvalid>() || e.is::<ExternalSpecUpstreamConflict>())
+    {
         StatusCode::CONFLICT
     } else if crate::config::db_backend::atomic_batch_unsupported(error).is_some() {
         StatusCode::NOT_IMPLEMENTED

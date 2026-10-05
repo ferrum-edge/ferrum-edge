@@ -28,8 +28,8 @@ use crate::config::db_backend::{
     NamespacePreconditionFailed,
 };
 use crate::config::deployment_mutation::{
-    DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot, sort_stored_rows,
-    validate_deployment_candidate,
+    DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
+    ExternalSpecUpstreamConflict, sort_stored_rows, validate_deployment_candidate,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
@@ -11282,13 +11282,12 @@ impl DatabaseStore {
             let upstream_id = row
                 .try_get::<String, _>("upstream_id")
                 .unwrap_or_else(|_| "<unknown>".to_string());
-            anyhow::bail!(
-                "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
-                 detach it before replacing or deleting the API spec",
+            return Err(ExternalSpecUpstreamConflict::Proxy {
                 proxy_id,
                 upstream_id,
-                spec_id
-            );
+                spec_id: spec_id.to_string(),
+            }
+            .into());
         }
 
         // Every selected spec-owned upstream id must decode. Silently dropping
@@ -11336,14 +11335,12 @@ impl DatabaseStore {
             if let Some(upstream_id) =
                 mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
             {
-                anyhow::bail!(
-                    "mesh_route_dispatch plugin_config {:?} references a spec-owned upstream {:?} \
-                     from api_spec {:?}; \
-                     detach it before replacing or deleting the API spec",
-                    plugin.id,
+                return Err(ExternalSpecUpstreamConflict::MeshRouteDispatch {
+                    plugin_config_id: plugin.id,
                     upstream_id,
-                    spec_id
-                );
+                    spec_id: spec_id.to_string(),
+                }
+                .into());
             }
         }
 

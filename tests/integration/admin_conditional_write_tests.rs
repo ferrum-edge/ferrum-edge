@@ -2499,6 +2499,8 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     use ferrum_edge::config::deployment_mutation::DeploymentPrecondition;
     use ferrum_edge::config::types::Consumer;
 
+    assert_deployment_external_dependencies_refused(db.clone()).await;
+
     let validation_http_client = ferrum_edge::plugins::PluginHttpClient::default();
     let namespace = format!("deployment-{}", uuid::Uuid::new_v4());
     let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
@@ -2886,6 +2888,7 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
 
     // Failure immediately before commit must roll back both operations and
     // retain the original token, without compensation or freshly read retries.
+    let sequence_before_fault = db.latest_change_sequence(&namespace).await.unwrap();
     for (method, path, body) in [
         (Method::DELETE, remove_path, None),
         (Method::PUT, replace_path.as_str(), Some(&document)),
@@ -2906,10 +2909,20 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         .await;
         set_atomic_batch_fault_for_test(&namespace, None);
         assert_eq!(failed.status, 503, "{}", failed.body);
+        // An untyped persistence failure is still uncertain, even when this
+        // fixture knows that its injected pre-commit fault rolls back.
+        assert_eq!(failed.body["durable"], "unknown");
+        assert_eq!(failed.body["live"], "unconfirmed");
         assert_eq!(failed.body["recovery_cleanup_authorized"], false);
+        let unchanged = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        assert!(unchanged.etag == original.etag);
+        assert!(
+            unchanged.body == original.body,
+            "untyped persistence failure changed complete typed/raw evidence"
+        );
         assert_eq!(
-            get_ns(&base, "/deployment-snapshot", &namespace).await.etag,
-            original.etag
+            db.latest_change_sequence(&namespace).await.unwrap(),
+            sequence_before_fault
         );
     }
 
@@ -3076,6 +3089,254 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             .unwrap(),
         trust_before
     );
+}
+
+/// Each dependency shape retains one original authority through repeated
+/// conditional refusals and the ordinary endpoints' existing error contracts.
+async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBackend>) {
+    use ferrum_edge::config::types::Consumer;
+
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    for external_mesh in [false, true] {
+        let namespace = format!("deployment-dependency-{}", uuid::Uuid::new_v4());
+        let mut document = json!({
+            "openapi": "3.0.3", "info": {"title": "Dependency", "version": "1"},
+            "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+            "x-ferrum-proxy": {"id": "dependency", "listen_path": "/dependency",
+                "backend_host": "backend.example.com", "backend_port": 8080},
+            "x-ferrum-upstream": {"id": "owned-upstream", "name": "owned-upstream",
+                "targets": [{"host": "backend.example.com", "port": 8080}]},
+            "x-ferrum-plugins": [{"id": "owned-plugin", "plugin_name": "cors",
+                "config": {"allowed_origins": ["https://original.example"]}}]
+        });
+        let imported = send_ns(
+            Method::POST,
+            &base,
+            "/api-specs",
+            &admin_token(),
+            None,
+            Some(&document),
+            &namespace,
+        )
+        .await;
+        assert_eq!(imported.status, 201, "{}", imported.body);
+        let spec_id = imported.body["id"].as_str().unwrap();
+        let mut external_proxy = json!({
+            "id": "external", "listen_path": "/external",
+            "backend_host": "external.example.com", "backend_port": 8080,
+            "labels": {"future-owner-metadata": "retained"}
+        });
+        if !external_mesh {
+            external_proxy["upstream_id"] = json!("owned-upstream");
+        }
+        let created = send_ns(
+            Method::POST,
+            &base,
+            "/proxies",
+            &admin_token(),
+            None,
+            Some(&external_proxy),
+            &namespace,
+        )
+        .await;
+        assert_eq!(created.status, 201, "{}", created.body);
+        if external_mesh {
+            let plugin = send_ns(
+                Method::POST,
+                &base,
+                "/plugins/config",
+                &admin_token(),
+                None,
+                Some(&json!({
+                    "id": "external-mesh", "plugin_name": "mesh_route_dispatch",
+                    "scope": "global", "enabled": true,
+                    "config": {"rules": [{"match": {"methods": ["GET"]},
+                        "destination": {"upstream_id": "owned-upstream"}}]},
+                    "labels": {"future-owner-metadata": "retained"}
+                })),
+                &namespace,
+            )
+            .await;
+            assert_eq!(plugin.status, 201, "{}", plugin.body);
+        }
+        let consumer: Consumer = serde_json::from_value(json!({
+            "namespace": namespace, "id": "historical", "username": "historical",
+            "credentials": {"custom": [{"legacy": "  dependency-canary  ",
+                "future": {"preserve": true}}]},
+            "created_at": "2000-01-01T00:00:00Z", "updated_at": "2001-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        db.create_consumer(&consumer).await.unwrap();
+        db.create_gateway_trust_bundle(&deployment_trust_record(&namespace))
+            .await
+            .unwrap();
+
+        // Ordinary metadata-only PUT still takes the matching-resource shortcut
+        // while an external owner references the generated upstream.
+        let proxy_before = get_ns(&base, "/proxies/dependency", &namespace).await;
+        let ordinary_replace = format!("/api-specs/{spec_id}");
+        document["info"]["description"] = json!("metadata-only update");
+        let metadata = send_ns(
+            Method::PUT,
+            &base,
+            &ordinary_replace,
+            &admin_token(),
+            None,
+            Some(&document),
+            &namespace,
+        )
+        .await;
+        assert_eq!(metadata.status, 200, "{}", metadata.body);
+        let proxy_after = get_ns(&base, "/proxies/dependency", &namespace).await;
+        assert!(proxy_after.etag == proxy_before.etag);
+        assert!(proxy_after.body == proxy_before.body);
+
+        let stored_before = db.load_deployment_snapshot(&namespace).await.unwrap();
+        let config = &stored_before.snapshot.config;
+        assert_eq!(stored_before.snapshot.api_specs.len(), 1);
+        assert_eq!(stored_before.snapshot.api_specs[0].id, spec_id);
+        assert_eq!(config.proxies.len(), 2);
+        assert_eq!(config.upstreams.len(), 1);
+        assert_eq!(config.upstreams[0].id, "owned-upstream");
+        assert_eq!(config.upstreams[0].api_spec_id.as_deref(), Some(spec_id));
+        let plugin_count = if external_mesh { 2 } else { 1 };
+        assert_eq!(config.plugin_configs.len(), plugin_count);
+        let owned_plugin = config
+            .plugin_configs
+            .iter()
+            .find(|p| p.id == "owned-plugin")
+            .unwrap();
+        assert_eq!(owned_plugin.api_spec_id.as_deref(), Some(spec_id));
+        let external = config.proxies.iter().find(|p| p.id == "external").unwrap();
+        assert!(external.api_spec_id.is_none());
+        if external_mesh {
+            assert!(external.upstream_id.is_none());
+            let plugin = config
+                .plugin_configs
+                .iter()
+                .find(|p| p.id == "external-mesh")
+                .unwrap();
+            assert!(plugin.enabled);
+            assert!(plugin.api_spec_id.is_none());
+            assert_eq!(
+                plugin.config["rules"][0]["destination"]["upstream_id"],
+                "owned-upstream"
+            );
+        } else {
+            assert_eq!(external.upstream_id.as_deref(), Some("owned-upstream"));
+        }
+        assert_eq!(config.consumers.len(), 1);
+        assert!(
+            serde_json::to_value(&config.consumers[0]).unwrap()
+                == serde_json::to_value(&consumer).unwrap(),
+            "historical credential evidence changed during setup"
+        );
+        let evidence_before = stored_before.representation().unwrap();
+        let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
+        assert_eq!(original.status, 200);
+        assert!(original.etag.is_some());
+        assert!(original.body["evidence"] == evidence_before);
+        assert!(original.body["namespace_etag"].as_str() == original.etag.as_deref());
+        let sequence_before = db.latest_change_sequence(&namespace).await.unwrap();
+
+        // The shared helper's Display remains useful to ordinary store callers.
+        // Mongo's ordinary PUT exercises its non-session guard here as well.
+        let mut bundle = deployment_bundle(&stored_before, "dependency", spec_id);
+        bundle.upstream = Some(config.upstreams[0].clone());
+        bundle.proxy.backend_host = "replacement.example.com".to_string();
+        let mut spec = stored_before.snapshot.api_specs[0].clone();
+        spec.resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle).unwrap();
+        let error = db.replace_api_spec_bundle(&bundle, &spec).await.unwrap_err();
+        let expected_message = if external_mesh {
+            format!(
+                "mesh_route_dispatch plugin_config \"external-mesh\" references a spec-owned \
+                 upstream \"owned-upstream\" from api_spec {spec_id:?}; \
+                 detach it before replacing or deleting the API spec"
+            )
+        } else {
+            format!(
+                "proxy \"external\" references a spec-owned upstream \"owned-upstream\" \
+                 from api_spec {spec_id:?}; detach it before replacing or deleting the API spec"
+            )
+        };
+        assert_eq!(error.to_string(), expected_message);
+
+        // Change resources, not just spec metadata, so PUT must reach the
+        // external dependency guard rather than its matching-resource shortcut.
+        document["x-ferrum-proxy"]["backend_host"] = json!("replacement.example.com");
+        document["x-ferrum-upstream"]["targets"][0]["host"] = json!("replacement.example.com");
+        document["x-ferrum-plugins"][0]["config"]["allowed_origins"] =
+            json!(["https://replacement.example"]);
+        let conditional_replace = format!("{ordinary_replace}?conditional=true");
+        let ordinary_remove = "/proxies/dependency?cleanup_orphaned_upstream=false";
+        let conditional_remove =
+            "/proxies/dependency?conditional=true&cleanup_orphaned_upstream=false";
+        for conditional in [true, false, true] {
+            for (method, ordinary_path, conditional_path, body, ordinary_status) in [
+                (Method::DELETE, ordinary_remove, conditional_remove, None, 503),
+                (
+                    Method::PUT,
+                    ordinary_replace.as_str(),
+                    conditional_replace.as_str(),
+                    Some(&document),
+                    422,
+                ),
+            ] {
+                let result = send_ns(
+                    method,
+                    &base,
+                    if conditional {
+                        conditional_path
+                    } else {
+                        ordinary_path
+                    },
+                    &admin_token(),
+                    if conditional {
+                        original.etag.as_deref()
+                    } else {
+                        None
+                    },
+                    body,
+                    &namespace,
+                )
+                .await;
+                if conditional {
+                    assert_eq!(result.status, 409, "{}", result.body);
+                    assert_eq!(result.body["durable"], "not_committed");
+                    assert_eq!(result.body["live"], "unconfirmed");
+                    assert_eq!(result.body["recovery_cleanup_authorized"], false);
+                } else {
+                    assert_eq!(result.status, ordinary_status, "{}", result.body);
+                    assert!(result.body.get("durable").is_none());
+                    assert!(result.body.get("recovery_cleanup_authorized").is_none());
+                }
+                assert!(!result.body.to_string().contains("dependency-canary"));
+                let unchanged = get_ns(&base, "/deployment-snapshot", &namespace).await;
+                assert_eq!(unchanged.status, 200);
+                assert!(
+                    unchanged.etag == original.etag,
+                    "original authority changed"
+                );
+                assert!(
+                    unchanged.body == original.body,
+                    "external dependency refusal changed complete typed/raw evidence"
+                );
+                assert!(
+                    db.load_deployment_snapshot(&namespace)
+                        .await
+                        .unwrap()
+                        .representation()
+                        .unwrap()
+                        == evidence_before,
+                    "external dependency refusal changed persisted resources or identity indexes"
+                );
+                assert_eq!(
+                    db.latest_change_sequence(&namespace).await.unwrap(),
+                    sequence_before
+                );
+            }
+        }
+    }
 }
 
 fn deployment_trust_record(

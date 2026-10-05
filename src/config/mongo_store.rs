@@ -69,8 +69,8 @@ mod inner {
         format_consumer_identity_conflict, mark_row_decode_rejection, proxy_route_key_hash,
     };
     use crate::config::deployment_mutation::{
-        DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot, sort_stored_rows,
-        validate_deployment_candidate,
+        DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
+        ExternalSpecUpstreamConflict, sort_stored_rows, validate_deployment_candidate,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -5205,13 +5205,12 @@ mod inner {
                 if let Some(doc) = external {
                     let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
-                    anyhow::bail!(
-                        "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
-                         detach it before replacing or deleting the API spec",
-                        proxy_id,
-                        upstream_id,
-                        spec_id
-                    );
+                    return Err(ExternalSpecUpstreamConflict::Proxy {
+                        proxy_id: proxy_id.to_string(),
+                        upstream_id: upstream_id.to_string(),
+                        spec_id: spec_id.to_string(),
+                    }
+                    .into());
                 }
 
                 let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
@@ -5232,14 +5231,12 @@ mod inner {
                     if let Some(upstream_id) =
                         mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
                     {
-                        anyhow::bail!(
-                            "mesh_route_dispatch plugin_config {:?} references a spec-owned \
-                             upstream {:?} from api_spec {:?}; \
-                             detach it before replacing or deleting the API spec",
-                            plugin.id,
+                        return Err(ExternalSpecUpstreamConflict::MeshRouteDispatch {
+                            plugin_config_id: plugin.id,
                             upstream_id,
-                            spec_id
-                        );
+                            spec_id: spec_id.to_string(),
+                        }
+                        .into());
                     }
                 }
             } else {
@@ -5282,13 +5279,12 @@ mod inner {
                 if let Some(doc) = external {
                     let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
-                    anyhow::bail!(
-                        "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
-                         detach it before replacing or deleting the API spec",
-                        proxy_id,
-                        upstream_id,
-                        spec_id
-                    );
+                    return Err(ExternalSpecUpstreamConflict::Proxy {
+                        proxy_id: proxy_id.to_string(),
+                        upstream_id: upstream_id.to_string(),
+                        spec_id: spec_id.to_string(),
+                    }
+                    .into());
                 }
 
                 let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
@@ -5308,14 +5304,12 @@ mod inner {
                     if let Some(upstream_id) =
                         mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
                     {
-                        anyhow::bail!(
-                            "mesh_route_dispatch plugin_config {:?} references a spec-owned \
-                             upstream {:?} from api_spec {:?}; \
-                             detach it before replacing or deleting the API spec",
-                            plugin.id,
+                        return Err(ExternalSpecUpstreamConflict::MeshRouteDispatch {
+                            plugin_config_id: plugin.id,
                             upstream_id,
-                            spec_id
-                        );
+                            spec_id: spec_id.to_string(),
+                        }
+                        .into());
                     }
                 }
             }
@@ -6093,6 +6087,12 @@ mod inner {
                             }
                             if inner.chain().any(|e| e.is::<DeploymentGraphInvalid>()) {
                                 return anyhow::Error::new(DeploymentGraphInvalid);
+                            }
+                            if let Some(conflict) = inner
+                                .chain()
+                                .find_map(|e| e.downcast_ref::<ExternalSpecUpstreamConflict>())
+                            {
+                                return anyhow::Error::new(conflict.clone());
                             }
                             if inner.chain().any(|e| e.is::<BatchAdmissionLeaseLost>()) {
                                 return anyhow::Error::new(BatchAdmissionLeaseLost);

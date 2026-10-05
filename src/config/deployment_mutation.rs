@@ -210,6 +210,50 @@ impl std::fmt::Display for DeploymentGraphInvalid {
 
 impl std::error::Error for DeploymentGraphInvalid {}
 
+/// A proven external reference that refuses removal of a spec-owned upstream.
+/// Driver, decoding and transaction failures must retain their own error types.
+#[derive(Debug, Clone)]
+pub(crate) enum ExternalSpecUpstreamConflict {
+    Proxy {
+        proxy_id: String,
+        upstream_id: String,
+        spec_id: String,
+    },
+    MeshRouteDispatch {
+        plugin_config_id: String,
+        upstream_id: String,
+        spec_id: String,
+    },
+}
+
+impl std::fmt::Display for ExternalSpecUpstreamConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proxy {
+                proxy_id,
+                upstream_id,
+                spec_id,
+            } => write!(
+                f,
+                "proxy {proxy_id:?} references a spec-owned upstream {upstream_id:?} \
+                 from api_spec {spec_id:?}; detach it before replacing or deleting the API spec"
+            ),
+            Self::MeshRouteDispatch {
+                plugin_config_id,
+                upstream_id,
+                spec_id,
+            } => write!(
+                f,
+                "mesh_route_dispatch plugin_config {plugin_config_id:?} references a spec-owned \
+                 upstream {upstream_id:?} from api_spec {spec_id:?}; \
+                 detach it before replacing or deleting the API spec"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExternalSpecUpstreamConflict {}
+
 /// Run the existing composition and named-schema admission rules against the
 /// exact fenced candidate with the process-configured validation client.
 pub(crate) async fn validate_deployment_candidate(
