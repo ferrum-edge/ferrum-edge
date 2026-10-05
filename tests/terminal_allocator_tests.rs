@@ -769,12 +769,12 @@ mod qualified {
                 let before_allocation = allocated.get();
                 let before_deallocation = deallocated.get();
                 let refusal = match operation {
-                    TerminalResult::Fields(patch) => {
-                        destination_chain.apply_fields(patch, &mut headers).unwrap_err()
-                    }
-                    TerminalResult::Cookie(value) => {
-                        destination_chain.apply_cookie(value, &mut headers).unwrap_err()
-                    }
+                    TerminalResult::Fields(patch) => destination_chain
+                        .apply_fields(patch, &mut headers)
+                        .unwrap_err(),
+                    TerminalResult::Cookie(value) => destination_chain
+                        .apply_cookie(value, &mut headers)
+                        .unwrap_err(),
                     _ => panic!("expected fields or cookie"),
                 };
                 assert_eq!(refusal.reason, TerminalRefusal::PinnedGeneration);
@@ -803,12 +803,16 @@ mod qualified {
                 ]);
                 match source_chain.next_operation().unwrap().execute() {
                     TerminalResult::Fields(patch) => {
-                        source_chain.apply_fields(patch, &mut source_headers).unwrap();
+                        source_chain
+                            .apply_fields(patch, &mut source_headers)
+                            .unwrap();
                         assert_eq!(source_headers.get("x-method").unwrap(), "POST");
                         assert!(!source_headers.contains_key("x-remove"));
                     }
                     TerminalResult::Cookie(value) => {
-                        source_chain.apply_cookie(value, &mut source_headers).unwrap();
+                        source_chain
+                            .apply_cookie(value, &mut source_headers)
+                            .unwrap();
                         assert_eq!(
                             source_headers.get("set-cookie").unwrap(),
                             "opaque=a\nopaque=a\na=3\na=4",
