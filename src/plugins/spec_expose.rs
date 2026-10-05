@@ -1000,7 +1000,13 @@ impl Plugin for SpecExpose {
         if !view.action_allowed() {
             return Ok(PreparedTerminalOp::Noop);
         }
-        if view.context.metadata.remove(HEAD_RESPONSE_MARKER).as_deref() == Some("true") {
+        if view
+            .context
+            .metadata
+            .remove(HEAD_RESPONSE_MARKER)
+            .as_deref()
+            == Some("true")
+        {
             Ok(PreparedTerminalOp::EmptyBody)
         } else {
             Ok(PreparedTerminalOp::Noop)

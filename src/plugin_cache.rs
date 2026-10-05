@@ -1083,7 +1083,8 @@ impl Plugin for PluginInstanceWrapper {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
         let mut declaration = self.inner.terminal_declaration();
         if let crate::plugins::terminal_preparation::TerminalDeclaration::Prepared {
-            trigger_reads, ..
+            trigger_reads,
+            ..
         } = &mut declaration
             && self.trigger.is_some()
         {

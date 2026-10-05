@@ -347,7 +347,9 @@ impl Plugin for CorrelationId {
     > {
         use super::terminal_preparation::PreparedTerminalOp;
         let mut patch = view.patch(1)?;
-        if self.echo_downstream && let Some(value) = self.request_id(view.context) {
+        if self.echo_downstream
+            && let Some(value) = self.request_id(view.context)
+        {
             if value.len() > 8192 {
                 return Err(super::terminal_preparation::TerminalAdmissionError::new(
                     super::terminal_preparation::TerminalRefusal::FieldCapacity,

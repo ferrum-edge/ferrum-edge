@@ -162,7 +162,10 @@ impl Plugin for SecurityHeaders {
             || self.set.iter().any(|(name, value)| {
                 name.len() > MAX_FIELD_NAME_BYTES || value.len() > MAX_FIELD_VALUE_BYTES
             })
-            || self.remove.iter().any(|name| name.len() > MAX_FIELD_NAME_BYTES)
+            || self
+                .remove
+                .iter()
+                .any(|name| name.len() > MAX_FIELD_NAME_BYTES)
         {
             // Whole-chain composition refusal, never constructor quarantine
             // that would silently omit the configured security participant.

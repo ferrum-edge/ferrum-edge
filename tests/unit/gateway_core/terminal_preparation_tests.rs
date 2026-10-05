@@ -134,7 +134,9 @@ fn exact_control_limit_one_byte_beyond_and_overflow_refuse_atomically() {
 fn a_rejected_manifest_cannot_admit_a_prefix_that_omits_the_bad_participant() {
     let ledger = PreparationLedger::new();
     let mut manifest = TerminalManifest::new();
-    manifest.push(entry(1, TerminalDeclaration::PureNoop)).unwrap();
+    manifest
+        .push(entry(1, TerminalDeclaration::PureNoop))
+        .unwrap();
     let first = manifest
         .push(entry(2, TerminalDeclaration::Undeclared))
         .unwrap_err();
@@ -276,14 +278,20 @@ fn request_facts_cannot_be_written_after_suspension() {
                 },
             ))
             .unwrap_err();
-        assert_eq!(refused.reason, TerminalRefusal::PreparationWriteAfterSuspension);
+        assert_eq!(
+            refused.reason,
+            TerminalRefusal::PreparationWriteAfterSuspension
+        );
         assert_eq!(manifest.participant_count(), 0);
     }
 }
 
 #[test]
 fn response_scope_is_a_cursor_input_and_cannot_be_predecided() {
-    for response_fact in [TerminalFacts::RESPONSE_STATUS, TerminalFacts::RESPONSE_HEADERS] {
+    for response_fact in [
+        TerminalFacts::RESPONSE_STATUS,
+        TerminalFacts::RESPONSE_HEADERS,
+    ] {
         let mut manifest = TerminalManifest::new();
         let refused = manifest
             .push(entry(
@@ -297,7 +305,10 @@ fn response_scope_is_a_cursor_input_and_cannot_be_predecided() {
                 },
             ))
             .unwrap_err();
-        assert_eq!(refused.reason, TerminalRefusal::ResponseReadDuringPreparation);
+        assert_eq!(
+            refused.reason,
+            TerminalRefusal::ResponseReadDuringPreparation
+        );
     }
 }
 
@@ -311,7 +322,10 @@ fn process_byte_failure_allocates_nothing_and_leaks_no_ticket() {
     assert_eq!(before.bytes, PROCESS_BYTES);
     let (allocation, refused) = measure(|| ledger.reserve_control(ROOT_BYTES));
     assert_eq!(allocation, (0, 0));
-    assert_eq!(refused.unwrap_err().reason, TerminalRefusal::ProcessCapacity);
+    assert_eq!(
+        refused.unwrap_err().reason,
+        TerminalRefusal::ProcessCapacity
+    );
     assert_eq!(ledger.usage(), before);
     drop(owners);
     assert_eq!(ledger.usage(), zero_usage());
@@ -356,7 +370,11 @@ fn synchronous_workspace_returns_before_control_cleanup_and_can_be_reused() {
     let ledger = PreparationLedger::new();
     let control = ledger.reserve_control(CONTROL_BYTES).unwrap();
     let (allocation, workspace) = measure(|| control.workspace(WORKSPACE_BYTES));
-    assert_eq!(allocation, (0, 0), "workspace credit is not an eager buffer");
+    assert_eq!(
+        allocation,
+        (0, 0),
+        "workspace credit is not an eager buffer"
+    );
     let workspace = workspace.unwrap();
     assert_eq!(workspace.bytes(), WORKSPACE_BYTES);
     assert_eq!(ledger.usage().bytes, CONTROL_BYTES + WORKSPACE_BYTES);
@@ -386,7 +404,10 @@ fn fourth_maximum_workspace_refuses_then_recovers_without_another_ticket() {
     let before = ledger.usage();
     let (allocation, refused) = measure(|| controls[3].workspace(WORKSPACE_BYTES));
     assert_eq!(allocation, (0, 0));
-    assert_eq!(refused.unwrap_err().reason, TerminalRefusal::ProcessCapacity);
+    assert_eq!(
+        refused.unwrap_err().reason,
+        TerminalRefusal::ProcessCapacity
+    );
     assert_eq!(ledger.usage(), before);
     drop(workspaces.pop());
     let fourth = controls[3].workspace(WORKSPACE_BYTES).unwrap();
@@ -409,13 +430,19 @@ fn zero_and_unrounded_control_are_refused_and_workspace_zero_is_finite_noop() {
         TerminalRefusal::UnroundedReservation
     );
     assert_eq!(
-        ledger.reserve_control(CONTROL_BYTES + 4096).unwrap_err().reason,
+        ledger
+            .reserve_control(CONTROL_BYTES + 4096)
+            .unwrap_err()
+            .reason,
         TerminalRefusal::ControlCapacity
     );
     assert_eq!(ledger.usage(), zero_usage());
     let control = ledger.reserve_control(ROOT_BYTES).unwrap();
     assert_eq!(
-        control.workspace(WORKSPACE_BYTES + 4096).unwrap_err().reason,
+        control
+            .workspace(WORKSPACE_BYTES + 4096)
+            .unwrap_err()
+            .reason,
         TerminalRefusal::WorkspaceCapacity
     );
     let empty = control.workspace(0).unwrap();
@@ -498,7 +525,10 @@ impl Plugin for InheritedNoop {
 #[test]
 fn inherited_noop_custom_hook_still_needs_an_explicit_declaration() {
     let plugin = InheritedNoop;
-    assert_eq!(plugin.terminal_declaration(), TerminalDeclaration::Undeclared);
+    assert_eq!(
+        plugin.terminal_declaration(),
+        TerminalDeclaration::Undeclared
+    );
     let mut manifest = TerminalManifest::new();
     let mut participant = entry(1, plugin.terminal_declaration());
     participant.eligibility.rejection = false;
@@ -511,7 +541,10 @@ fn inherited_noop_custom_hook_still_needs_an_explicit_declaration() {
 #[test]
 fn default_declaration_does_not_trust_an_overridden_hook_or_builtin_name() {
     let plugin = SpoofedBuiltin;
-    assert_eq!(plugin.terminal_declaration(), TerminalDeclaration::Undeclared);
+    assert_eq!(
+        plugin.terminal_declaration(),
+        TerminalDeclaration::Undeclared
+    );
     let mut manifest = TerminalManifest::new();
     assert_eq!(
         manifest
@@ -525,7 +558,9 @@ fn default_declaration_does_not_trust_an_overridden_hook_or_builtin_name() {
 #[test]
 fn one_participant_reserves_one_carrier_and_returns_it_with_the_ticket() {
     let mut manifest = TerminalManifest::new();
-    manifest.push(entry(1, TerminalDeclaration::PureNoop)).unwrap();
+    manifest
+        .push(entry(1, TerminalDeclaration::PureNoop))
+        .unwrap();
     let ledger = PreparationLedger::new();
     let owner = manifest.admit(&ledger).unwrap().unwrap();
     assert_eq!(CARRIER_BYTES, CARRIER_OWNED_BYTES + CARRIER_OVERHEAD_BYTES);
@@ -857,8 +892,12 @@ impl Plugin for ImmediateDecorator {
         if self.replacement && !view.action_allowed() && !self.capture {
             return Ok(ferrum_edge::plugins::terminal_preparation::PreparedTerminalOp::Noop);
         }
-        self.prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(view.context.request_body_bytes.as_deref(), Some(&b"reached"[..]));
+        self.prepared
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            view.context.request_body_bytes.as_deref(),
+            Some(&b"reached"[..])
+        );
         let mut patch = view.patch(1)?;
         patch.set("x-ordered", self.value, true)?;
         Ok(ferrum_edge::plugins::terminal_preparation::PreparedTerminalOp::Fields(patch))
@@ -875,8 +914,8 @@ impl Plugin for ImmediateDecorator {
 }
 
 fn pin_actual_chain(plugins: &[Arc<dyn Plugin>], ctx: &mut RequestContext) {
-    let manifest = ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest(plugins)
-        .unwrap();
+    let manifest =
+        ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest(plugins).unwrap();
     Arc::new(manifest).pin(ctx).unwrap();
 }
 
@@ -905,7 +944,8 @@ impl AsRef<[u8]> for RetainedRawOwner {
 
 impl Drop for RetainedRawOwner {
     fn drop(&mut self) {
-        self.dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.dropped
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1220,7 +1260,6 @@ fn preparation_refuses_an_unpinned_or_different_actual_generation_before_hook_wo
     assert!(ctx.request_body_bytes.is_none());
 }
 
-
 #[test]
 fn rejection_prepares_charged_only_participant_without_applying_its_response_action() {
     use ferrum_edge::plugins::terminal_preparation::{PreparedTerminalChain, TerminalResult};
@@ -1242,7 +1281,6 @@ fn rejection_prepares_charged_only_participant_without_applying_its_response_act
     ));
     assert!(ctx.request_body_bytes.is_none());
 }
-
 
 #[test]
 fn a_shared_existing_ticket_cannot_admit_a_rejected_manifest_prefix() {

@@ -234,7 +234,10 @@ impl TerminalManifest {
             };
             if !eligibility.participates()
                 || !plugin.supported_protocols().iter().any(|protocol| {
-                    matches!(protocol, super::ProxyProtocol::Http | super::ProxyProtocol::Grpc)
+                    matches!(
+                        protocol,
+                        super::ProxyProtocol::Http | super::ProxyProtocol::Grpc
+                    )
                 })
             {
                 continue;
@@ -632,7 +635,9 @@ impl WorkspaceReservation<'_, '_> {
 impl Drop for WorkspaceReservation<'_, '_> {
     fn drop(&mut self) {
         self.control.ledger.release(self.bytes, false);
-        self.control.workspace_borrowed.store(false, Ordering::Release);
+        self.control
+            .workspace_borrowed
+            .store(false, Ordering::Release);
     }
 }
 
@@ -675,15 +680,20 @@ impl ReachedRequestView<'_> {
                 allowed,
             ));
         }
-        if cookie.bytes().any(|byte| {
-            (byte < 0x20 && byte != b'\t' && byte != b'\n') || byte == 0x7f
-        }) {
+        if cookie
+            .bytes()
+            .any(|byte| (byte < 0x20 && byte != b'\t' && byte != b'\n') || byte == 0x7f)
+        {
             return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
         }
-        Ok(self.context.metadata.remove(key).map(|value| TerminalCookie {
-            value,
-            _ticket: self.ticket.clone(),
-        }))
+        Ok(self
+            .context
+            .metadata
+            .remove(key)
+            .map(|value| TerminalCookie {
+                value,
+                _ticket: self.ticket.clone(),
+            }))
     }
 
     /// Construct a patch using only this instance's admitted output credit.
@@ -724,13 +734,21 @@ impl PreparedTerminalOp {
         let output = match declaration {
             TerminalDeclaration::Prepared { bounds, .. } => bounds.output,
             TerminalDeclaration::PureNoop if matches!(self, Self::Noop) => return Ok(()),
-            _ => return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0)),
+            _ => {
+                return Err(capacity_error(
+                    TerminalRefusal::UnimplementedOperation,
+                    0,
+                    0,
+                ));
+            }
         };
         let required = match self {
             Self::Noop | Self::EmptyBody => 0,
             Self::Fields(patch) => patch.owned_bytes,
             Self::Cookie(cookie) => {
-                if cookie.value.len() > MAX_COOKIE_BYTES || cookie.value.capacity() > MAX_COOKIE_BYTES {
+                if cookie.value.len() > MAX_COOKIE_BYTES
+                    || cookie.value.capacity() > MAX_COOKIE_BYTES
+                {
                     return Err(capacity_error(
                         TerminalRefusal::FieldCapacity,
                         cookie.value.capacity(),
@@ -826,10 +844,12 @@ impl TerminalPatch {
             ));
         }
         if name.is_empty()
-            || !name.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-            })
-            || value.bytes().any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            || value
+                .bytes()
+                .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
         {
             return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
         }
@@ -980,12 +1000,7 @@ pub fn apply_terminal_patch(
                 } else {
                     headers.contains_key(name.as_ref())
                 };
-                check_carrier_growth(
-                    headers,
-                    name.len(),
-                    value.len(),
-                    usize::from(!replacing),
-                )?;
+                check_carrier_growth(headers, name.len(), value.len(), usize::from(!replacing))?;
                 if case_insensitive {
                     headers.retain(|key, _| !key.eq_ignore_ascii_case(&name));
                 }
@@ -1005,7 +1020,9 @@ fn check_carrier_growth(
     let owned = headers
         .iter()
         .try_fold(name + value, |bytes, (name, value)| {
-            bytes.checked_add(name.capacity())?.checked_add(value.capacity())
+            bytes
+                .checked_add(name.capacity())?
+                .checked_add(value.capacity())
         })
         .unwrap_or(usize::MAX);
     let occurrences: usize = headers
@@ -1060,7 +1077,10 @@ pub fn compile_terminal_manifest(
     let mut manifest = TerminalManifest::new();
     for plugin in plugins {
         if !plugin.supported_protocols().iter().any(|protocol| {
-            matches!(protocol, super::ProxyProtocol::Http | super::ProxyProtocol::Grpc)
+            matches!(
+                protocol,
+                super::ProxyProtocol::Http | super::ProxyProtocol::Grpc
+            )
         }) {
             continue;
         }
@@ -1146,7 +1166,10 @@ impl PreparedTerminalChain {
                 return Err(capacity_error(TerminalRefusal::AuthorizationExpired, 0, 0));
             }
             if !plugin.supported_protocols().iter().any(|protocol| {
-                matches!(protocol, super::ProxyProtocol::Http | super::ProxyProtocol::Grpc)
+                matches!(
+                    protocol,
+                    super::ProxyProtocol::Http | super::ProxyProtocol::Grpc
+                )
             }) {
                 continue;
             }
@@ -1361,12 +1384,7 @@ pub fn apply_terminal_cookie(
         ));
     }
     let Some(existing) = headers.get("set-cookie") else {
-        check_carrier_growth(
-            headers,
-            10,
-            cookie.capacity(),
-            cookie.split('\n').count(),
-        )?;
+        check_carrier_growth(headers, 10, cookie.capacity(), cookie.split('\n').count())?;
         headers.insert("set-cookie".to_string(), cookie);
         return Ok(());
     };

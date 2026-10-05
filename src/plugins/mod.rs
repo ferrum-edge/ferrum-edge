@@ -2215,7 +2215,9 @@ impl From<&RequestContext> for HboneReuseContext {
 fn retain_typed_terminal_gateway_headers(headers: &mut HashMap<String, String>) {
     let preserve_origin_vary = headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("vary")
-            && value.split(',').any(|token| token.trim().eq_ignore_ascii_case("origin"))
+            && value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("origin"))
     });
     headers.retain(|name, _| {
         ![

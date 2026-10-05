@@ -24635,7 +24635,8 @@ async fn run_after_proxy_hooks_on_rejection(
             "true".to_string(),
         )
     } else {
-        ctx.metadata.remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY)
+        ctx.metadata
+            .remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY)
     };
     let previous_marker = ctx.metadata.insert(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
@@ -24695,9 +24696,8 @@ async fn run_after_proxy_hooks_on_rejection(
         || charged_backend_deadline
         || ctx.early_upload_terminal_selected()
         || ctx.gateway_capacity_response_selected();
-    let prepared = validate_terminal_headers(response_headers).and_then(|()| {
-        PreparedTerminalChain::prepare(plugins, ctx, false, authoritative)
-    });
+    let prepared = validate_terminal_headers(response_headers)
+        .and_then(|()| PreparedTerminalChain::prepare(plugins, ctx, false, authoritative));
     // This boundary executes even when a preparation fails. The chain's RAII
     // owner drops every unconsumed operation; none has run or started I/O.
     ctx.retire_terminal_request_views();
@@ -26395,13 +26395,7 @@ pub(crate) async fn run_after_proxy_hooks(
     if ctx.charged_backend_deadline_terminal() {
         let mut status = response_status;
         let mut body = Bytes::new();
-        run_prepared_charged_terminal_hooks(
-            plugins,
-            ctx,
-            &mut status,
-            &mut body,
-            response_headers,
-        );
+        run_prepared_charged_terminal_hooks(plugins, ctx, &mut status, &mut body, response_headers);
         return (status != response_status).then(|| AfterProxyReject {
             status_code: status,
             body,
@@ -32660,25 +32654,26 @@ async fn admit_proxy_request_on_frontend_port(
     // outlives this function scope.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
-    let (response, terminal_ticket) = crate::plugins::terminal_preparation::RESPONSE_TERMINAL_TICKET
-        .scope(std::cell::RefCell::new(None), async {
-            let response = boxed_handle_proxy_request_inner(
-                req,
-                state,
-                remote_addr,
-                is_tls,
-                tls_client_cert_der,
-                tls_client_cert_chain_der,
-                mtls_auth_connection_cache,
-                connection_metadata,
-            )
-            .await;
+    let (response, terminal_ticket) =
+        crate::plugins::terminal_preparation::RESPONSE_TERMINAL_TICKET
+            .scope(std::cell::RefCell::new(None), async {
+                let response = boxed_handle_proxy_request_inner(
+                    req,
+                    state,
+                    remote_addr,
+                    is_tls,
+                    tls_client_cert_der,
+                    tls_client_cert_chain_der,
+                    mtls_auth_connection_cache,
+                    connection_metadata,
+                )
+                .await;
 
-            let ticket = crate::plugins::terminal_preparation::RESPONSE_TERMINAL_TICKET
-                .with(|slot| slot.borrow_mut().take());
-            (response, ticket)
-        })
-        .await;
+                let ticket = crate::plugins::terminal_preparation::RESPONSE_TERMINAL_TICKET
+                    .with(|slot| slot.borrow_mut().take());
+                (response, ticket)
+            })
+            .await;
 
     // Attach the guard to the response body so active_requests stays incremented
     // for the full response lifetime (including streaming bodies).
@@ -33856,7 +33851,10 @@ async fn handle_proxy_request_inner(
             .plugin_cache
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
-    if plugin_cache_view.admit_terminal_preparation(&mut ctx).is_err() {
+    if plugin_cache_view
+        .admit_terminal_preparation(&mut ctx)
+        .is_err()
+    {
         ctx.retire_terminal_request_views();
         // No body poll, lifecycle/provider work or plugin decoration on failed
         // ticket admission. Transport intake owners die before returning.

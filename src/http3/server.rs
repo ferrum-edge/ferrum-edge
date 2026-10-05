@@ -3544,7 +3544,10 @@ async fn handle_h3_request(
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
 
-    if plugin_cache_view.admit_terminal_preparation(&mut ctx).is_err() {
+    if plugin_cache_view
+        .admit_terminal_preparation(&mut ctx)
+        .is_err()
+    {
         ctx.retire_terminal_request_views();
         record_request(&state, 503);
         let (status, headers, body) = crate::plugins::terminal_preparation::capacity_wire_parts(
