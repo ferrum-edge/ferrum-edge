@@ -4426,10 +4426,7 @@ async fn assert_sql_deployment_raw_preservation(
                 assert_eq!(proxy_id, "sql");
             }
             let value = row.try_get_raw("deployment_future_metadata").unwrap();
-            assert!(
-                !value.is_null(),
-                "{table} metadata unexpectedly NULL"
-            );
+            assert!(!value.is_null(), "{table} metadata unexpectedly NULL");
             let bytes = match value.type_info().kind() {
                 AnyTypeInfoKind::Text => row
                     .try_get::<String, _>("deployment_future_metadata")
