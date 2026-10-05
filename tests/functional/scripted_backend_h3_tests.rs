@@ -629,8 +629,7 @@ async fn h3_native_pool_buffered_grpc_web_passthrough_uses_the_protocol_upload_c
                 .any(|(name, _)| name == "grpc-timeout")
         );
         assert_eq!(
-            request.body,
-            upload,
+            request.body, upload,
             "the retained binary upload must replay intact"
         );
     }

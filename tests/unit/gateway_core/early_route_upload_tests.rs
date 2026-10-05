@@ -1121,13 +1121,7 @@ async fn exhausted_retained_xml_skips_only_the_proven_outbound_noop_transformer(
             }),
         );
         let result = budget
-            .prepare_retained_body(
-                &producer_plugins,
-                &mut ctx,
-                &headers,
-                output.clone(),
-                UNIT,
-            )
+            .prepare_retained_body(&producer_plugins, &mut ctx, &headers, output.clone(), UNIT)
             .await;
         assert!(matches!(
             result,
