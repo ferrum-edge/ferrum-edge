@@ -636,6 +636,28 @@ impl NamespaceConfigAdmissionGuard {
         held
     }
 
+    pub(crate) async fn release_after_deployment(mut self) -> Result<(), anyhow::Error> {
+        if self.renew_task.is_some() || self.stop_tx.is_some() {
+            anyhow::bail!("Deployment keeper was not handed off");
+        }
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Admission store missing"))?;
+        match tokio::time::timeout(
+            CONFIG_ADMISSION_LEASE_RELEASE_TIMEOUT,
+            db.release_namespace_config_admission_lease(&self.namespace, &self.owner),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {
+                self.db.take();
+                Ok(())
+            }
+            _ => anyhow::bail!("Deployment admission release was not acknowledged"),
+        }
+    }
+
     /// Test-only: mark the lease invalid so [`Self::ensure_held`] and
     /// [`Self::run_to_completion_while_held`] observe loss without waiting for
     /// the production renewer / TTL.

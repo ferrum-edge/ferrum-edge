@@ -27,6 +27,10 @@ use crate::config::db_backend::{
     ConditionalNamespaceRestore, ConditionalNamespaceSnapshot, GatewayTrustBundleRevisionConflict,
     NamespacePreconditionFailed,
 };
+use crate::config::deployment_mutation::{
+    DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
+    ExternalSpecUpstreamConflict, sort_stored_rows, validate_deployment_candidate,
+};
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
     NamespaceRegistryError as RegistryError, NamespaceRegistryPhase as RegistryPhase,
@@ -2993,6 +2997,180 @@ impl DatabaseStore {
             .await?;
         tx.commit().await?;
         Ok(snapshot)
+    }
+
+    async fn deployment_snapshot_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<DeploymentSnapshot, anyhow::Error> {
+        let snapshot = self
+            .conditional_namespace_snapshot_tx(tx, namespace)
+            .await?;
+        let mut stored = serde_json::Map::new();
+        for table in [
+            "proxies",
+            "consumers",
+            "upstreams",
+            "plugin_configs",
+            "proxy_plugins",
+            "api_specs",
+            "gateway_trust_bundles",
+            "consumer_identity_index",
+            "consumer_credential_index",
+            "namespaces",
+        ] {
+            let column = if table == "namespaces" {
+                "name"
+            } else {
+                "namespace"
+            };
+            let rows = sqlx::query(&self.q(&format!("SELECT * FROM {table} WHERE {column} = ?")))
+                .bind(namespace)
+                .fetch_all(&mut **tx)
+                .await?;
+            let mut rows = rows
+                .iter()
+                .map(deployment_raw_sql_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            sort_stored_rows(&mut rows);
+            stored.insert(table.to_string(), serde_json::Value::Array(rows));
+        }
+        Ok(DeploymentSnapshot {
+            snapshot,
+            stored: serde_json::Value::Object(stored),
+        })
+    }
+
+    async fn load_deployment_snapshot_inner(
+        &self,
+        namespace: &str,
+    ) -> Result<DeploymentSnapshot, anyhow::Error> {
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+        let snapshot = self.deployment_snapshot_tx(&mut tx, namespace).await?;
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+
+    /// Entry pin precedes every snapshot read. Commit renewal is only valid
+    /// after this pin; no external keeper runs during these transactions.
+    async fn enter_deployment_mutation_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        precondition: &DeploymentPrecondition<'_>,
+    ) -> Result<DeploymentSnapshot, anyhow::Error> {
+        // PostgreSQL locking reads establish an MVCC snapshot before a
+        // contended fence is acquired. READ COMMITTED deliberately refreshes
+        // that snapshot after the fences; every namespace writer holds the
+        // mTLS admission row, so the following multi-table read stays coherent.
+        if self.db_type == "postgres" {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut **tx)
+                .await?;
+        }
+        if self.db_type == "mysql" {
+            let isolation = Self::mysql_transaction_isolation(tx).await?;
+            if !Self::is_mysql_repeatable_read(&isolation) {
+                anyhow::bail!("Deployment mutations require REPEATABLE READ isolation");
+            }
+        }
+        self.verify_namespace_config_admission_lease_tx(
+            tx,
+            precondition.namespace,
+            &precondition.lease,
+        )
+        .await?;
+        self.lock_mtls_dns_admission_tx(tx, precondition.namespace)
+            .await?;
+        self.lock_config_change_sequence_tx(tx, precondition.namespace)
+            .await?;
+        let snapshot = self
+            .deployment_snapshot_tx(tx, precondition.namespace)
+            .await?;
+        if snapshot.representation()? != *precondition.expected {
+            return Err(NamespacePreconditionFailed.into());
+        }
+        crate::config::batch_atomicity::pause_conditional_restore_for_test(precondition.namespace)
+            .await;
+        Ok(snapshot)
+    }
+
+    async fn remove_deployment_inner(
+        &self,
+        id: &str,
+        precondition: &DeploymentPrecondition<'_>,
+    ) -> Result<(), anyhow::Error> {
+        let namespace = precondition.namespace;
+        let mut tx = self.begin_write_tx().await?;
+        let snapshot = self
+            .enter_deployment_mutation_tx(&mut tx, precondition)
+            .await?;
+        let plan = snapshot.removal_plan(id)?;
+        if let Some(spec_id) = &plan.spec_id {
+            self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, spec_id, id)
+                .await?;
+        }
+        let mut candidate = snapshot.snapshot.config.clone();
+        candidate.proxies.retain(|p| p.id != id);
+        candidate
+            .plugin_configs
+            .retain(|p| !plan.plugins.contains(&p.id));
+        candidate
+            .upstreams
+            .retain(|u| !plan.upstreams.contains(&u.id));
+        validate_deployment_candidate(&candidate, precondition.validation_http_client).await?;
+        let prior_conflicts = self
+            .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
+            .await?;
+        // Only selected associations and rows are removed. Never run the
+        // namespace-wide orphan sweeper or restore unrelated stored resources.
+        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
+            .bind(namespace)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for plugin_id in &plan.plugins {
+            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE namespace = ? AND id = ?"))
+                .bind(namespace)
+                .bind(plugin_id)
+                .execute(&mut *tx)
+                .await?;
+            self.record_config_change_tx(&mut tx, namespace, "plugin_config", plugin_id, "delete")
+                .await?;
+        }
+        sqlx::query(&self.q("DELETE FROM proxies WHERE namespace = ? AND id = ?"))
+            .bind(namespace)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(spec_id) = &plan.spec_id {
+            sqlx::query(&self.q("DELETE FROM api_specs WHERE namespace = ? AND id = ?"))
+                .bind(namespace)
+                .bind(spec_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for upstream_id in &plan.upstreams {
+            sqlx::query(&self.q("DELETE FROM upstreams WHERE namespace = ? AND id = ?"))
+                .bind(namespace)
+                .bind(upstream_id)
+                .execute(&mut *tx)
+                .await?;
+            self.record_config_change_tx(&mut tx, namespace, "upstream", upstream_id, "delete")
+                .await?;
+        }
+        self.validate_namespace_repair_delete_admission_tx(&mut tx, namespace, &prior_conflicts)
+            .await?;
+        self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
+            .await?;
+        self.compact_config_changes_tx(&mut tx, namespace).await?;
+        self.renew_pinned_restore_lease_tx(&mut tx, namespace, &precondition.lease)
+            .await?;
+        let (fault, _) = crate::config::batch_atomicity::atomic_batch_test_overrides(namespace);
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Count ApiSpecs from the authoritative primary pool without hydrating rows.
@@ -10113,6 +10291,15 @@ impl DatabaseStore {
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
+        self.replace_api_spec_bundle_inner(bundle, spec, None).await
+    }
+
+    async fn replace_api_spec_bundle_inner(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        precondition: Option<&DeploymentPrecondition<'_>>,
+    ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
         crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
@@ -10131,8 +10318,43 @@ impl DatabaseStore {
         // admin CRUD drift forces the full replace path even when the submitted
         // spec's resource_hash matches the stored metadata.
         let mut tx = self.begin_write_tx().await?;
-        self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
-            .await?;
+        let previous_proxy = if let Some(precondition) = precondition {
+            if precondition.namespace != spec.namespace
+                || bundle.proxy.namespace != spec.namespace
+                || bundle.proxy.id != spec.proxy_id
+                || bundle.plugins.iter().any(|p| {
+                    p.namespace != spec.namespace
+                        || p.scope != crate::config::types::PluginScope::Proxy
+                        || p.proxy_id.as_deref() != Some(spec.proxy_id.as_str())
+                })
+                || bundle
+                    .upstream
+                    .as_ref()
+                    .is_some_and(|u| u.namespace != spec.namespace)
+            {
+                return Err(DeploymentGraphInvalid.into());
+            }
+            let snapshot = self
+                .enter_deployment_mutation_tx(&mut tx, precondition)
+                .await?;
+            let plan = snapshot.removal_plan(&spec.proxy_id)?;
+            if plan.spec_id.as_deref() != Some(spec.id.as_str()) {
+                return Err(DeploymentGraphInvalid.into());
+            }
+            Some(
+                snapshot
+                    .snapshot
+                    .config
+                    .proxies
+                    .into_iter()
+                    .find(|p| p.id == spec.proxy_id)
+                    .ok_or(DeploymentGraphInvalid)?,
+            )
+        } else {
+            self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
+                .await?;
+            None
+        };
 
         // Existence read inside the transaction is the not-found authority —
         // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
@@ -10229,6 +10451,31 @@ impl DatabaseStore {
             .bind(&spec.id)
             .execute(&mut *tx)
             .await?;
+            if let Some(precondition) = precondition {
+                let candidate = self
+                    .conditional_namespace_snapshot_tx(&mut tx, &spec.namespace)
+                    .await?;
+                validate_deployment_candidate(
+                    &candidate.config,
+                    precondition.validation_http_client,
+                )
+                .await?;
+                self.record_config_change_tx(
+                    &mut tx,
+                    &spec.namespace,
+                    "proxy",
+                    &spec.proxy_id,
+                    "upsert",
+                )
+                .await?;
+                self.renew_pinned_restore_lease_tx(&mut tx, &spec.namespace, &precondition.lease)
+                    .await?;
+            }
+            if precondition.is_some() {
+                let (fault, _) =
+                    crate::config::batch_atomicity::atomic_batch_test_overrides(&spec.namespace);
+                Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
+            }
             tx.commit().await?;
             return Ok(());
         }
@@ -10243,6 +10490,31 @@ impl DatabaseStore {
             &spec.proxy_id,
         )
         .await?;
+        // Preserve unknown columns when a selected generated identity survives.
+        let retained_generated_rows = if precondition.is_some() {
+            let mut rows = Vec::new();
+            for table in ["proxies", "plugin_configs", "upstreams"] {
+                let stored = sqlx::query(&self.q(&format!(
+                    "SELECT * FROM {table} WHERE namespace = ? AND api_spec_id = ?"
+                )))
+                .bind(&spec.namespace)
+                .bind(&spec.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                rows.extend(stored.into_iter().map(|row| (table, row)));
+            }
+            let associations = sqlx::query(
+                &self.q("SELECT * FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"),
+            )
+            .bind(&spec.namespace)
+            .bind(&spec.proxy_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            rows.extend(associations.into_iter().map(|row| ("proxy_plugins", row)));
+            rows
+        } else {
+            Vec::new()
+        };
         let deleted_plugin_config_ids = self
             .select_resource_ids_tx(
                 &mut tx,
@@ -10537,6 +10809,9 @@ impl DatabaseStore {
             }
         }
         for assoc in &bundle.proxy.plugins {
+            if precondition.is_some() {
+                continue;
+            }
             sqlx::query(&self.q("DELETE FROM proxy_plugins \
                  WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ?"))
             .bind(&spec.namespace)
@@ -10547,18 +10822,28 @@ impl DatabaseStore {
         }
         // Re-insert — plugin_configs rows now exist (inserted above), so FK is satisfied.
         for assoc in &bundle.proxy.plugins {
-            sqlx::query(&self.q(
-                "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) \
-                 VALUES (?, ?, ?)",
-            ))
+            let exists = sqlx::query(&self.q("SELECT 1 FROM proxy_plugins \
+                WHERE namespace = ? AND proxy_id = ? AND plugin_config_id = ?"))
             .bind(&spec.namespace)
             .bind(&bundle.proxy.id)
             .bind(&assoc.plugin_config_id)
-            .execute(&mut *tx)
-            .await?;
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            if !exists {
+                sqlx::query(&self.q("INSERT INTO proxy_plugins \
+                    (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)"))
+                .bind(&spec.namespace)
+                .bind(&bundle.proxy.id)
+                .bind(&assoc.plugin_config_id)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
-        self.cleanup_orphaned_proxy_group_plugins(&mut tx, &spec.namespace)
-            .await?;
+        if precondition.is_none() {
+            self.cleanup_orphaned_proxy_group_plugins(&mut tx, &spec.namespace)
+                .await?;
+        }
 
         // Update the api_specs row (no CASCADE delete needed since proxy survives).
         let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
@@ -10624,7 +10909,242 @@ impl DatabaseStore {
         self.compact_config_changes_tx(&mut tx, &spec.namespace)
             .await?;
 
+        for (table, row) in &retained_generated_rows {
+            self.preserve_deployment_unknown_columns_tx(
+                &mut tx,
+                table,
+                row,
+                previous_proxy.as_ref(),
+            )
+            .await?;
+        }
+        if let Some(precondition) = precondition {
+            let candidate = self
+                .conditional_namespace_snapshot_tx(&mut tx, &spec.namespace)
+                .await?;
+            validate_deployment_candidate(&candidate.config, precondition.validation_http_client)
+                .await?;
+            self.renew_pinned_restore_lease_tx(&mut tx, &spec.namespace, &precondition.lease)
+                .await?;
+        }
+        if precondition.is_some() {
+            let (fault, _) =
+                crate::config::batch_atomicity::atomic_batch_test_overrides(&spec.namespace);
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
+        }
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn preserve_deployment_unknown_columns_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        table: &str,
+        row: &AnyRow,
+        previous_proxy: Option<&Proxy>,
+    ) -> Result<(), anyhow::Error> {
+        use sqlx::Column;
+        use sqlx::any::AnyTypeInfoKind;
+        let known: &[&str] = match table {
+            "proxies" => &[
+                "labels",
+                "id",
+                "namespace",
+                "name",
+                "hosts",
+                "listen_path",
+                "backend_scheme",
+                "backend_host",
+                "backend_port",
+                "backend_path",
+                "strip_listen_path",
+                "preserve_host_header",
+                "backend_connect_timeout_ms",
+                "backend_read_timeout_ms",
+                "backend_write_timeout_ms",
+                "backend_tls_client_cert_path",
+                "backend_tls_client_key_path",
+                "backend_tls_verify_server_cert",
+                "backend_tls_server_ca_cert_path",
+                "dns_override",
+                "dns_cache_ttl_seconds",
+                "auth_mode",
+                "upstream_id",
+                "upstream_subset",
+                "circuit_breaker",
+                "retry",
+                "response_body_mode",
+                "pool_idle_timeout_seconds",
+                "pool_enable_http_keep_alive",
+                "pool_enable_http2",
+                "pool_tcp_keepalive_seconds",
+                "pool_http2_keep_alive_interval_seconds",
+                "pool_http2_keep_alive_timeout_seconds",
+                "pool_http2_initial_stream_window_size",
+                "pool_http2_initial_connection_window_size",
+                "pool_http2_adaptive_window",
+                "pool_http2_max_frame_size",
+                "pool_http2_max_concurrent_streams",
+                "pool_http3_connections_per_backend",
+                "pool_max_requests_per_connection",
+                "listen_port",
+                "frontend_tls",
+                "passthrough",
+                "udp_idle_timeout_seconds",
+                "tcp_idle_timeout_seconds",
+                "websocket_idle_timeout_seconds",
+                "websocket_permessage_deflate",
+                "allow_path_parameters",
+                "allowed_methods",
+                "allowed_ws_origins",
+                "udp_max_response_amplification_factor",
+                "stream_proxy_protocol",
+                "backend_proxy_protocol",
+                "stream_match",
+                "api_spec_id",
+                "created_at",
+                "updated_at",
+            ],
+            "upstreams" => &[
+                "labels",
+                "id",
+                "namespace",
+                "name",
+                "targets",
+                "algorithm",
+                "hash_on",
+                "hash_on_cookie_config",
+                "health_checks",
+                "service_discovery",
+                "subsets",
+                "backend_tls_client_cert_path",
+                "backend_tls_client_key_path",
+                "backend_tls_verify_server_cert",
+                "backend_tls_server_ca_cert_path",
+                "backend_tls_sni",
+                "backend_tls_san_allow_list",
+                "api_spec_id",
+                "created_at",
+                "updated_at",
+            ],
+            "plugin_configs" => &[
+                "labels",
+                "id",
+                "namespace",
+                "plugin_name",
+                "config",
+                "scope",
+                "proxy_id",
+                "enabled",
+                "priority_override",
+                "trigger_json",
+                "api_spec_id",
+                "created_at",
+                "updated_at",
+            ],
+            "proxy_plugins" => &["namespace", "proxy_id", "plugin_config_id"],
+            _ => anyhow::bail!("Unsupported deployment resource table"),
+        };
+        let predicate = if table == "proxy_plugins" {
+            "namespace = ? AND proxy_id = ? AND plugin_config_id = ?"
+        } else {
+            "namespace = ? AND id = ?"
+        };
+        let select = self.q(&format!("SELECT * FROM {table} WHERE {predicate}"));
+        let query = sqlx::query(&select).bind(row.try_get::<String, _>("namespace")?);
+        let query = if table == "proxy_plugins" {
+            query
+                .bind(row.try_get::<String, _>("proxy_id")?)
+                .bind(row.try_get::<String, _>("plugin_config_id")?)
+        } else {
+            query.bind(row.try_get::<String, _>("id")?)
+        };
+        let Some(current) = query.fetch_optional(&mut **tx).await? else {
+            // A selected identity intentionally removed by this replacement.
+            return Ok(());
+        };
+        // Compare the final association projection, after generated links are
+        // rebuilt and hand-added links have survived the replacement.
+        let (old_plugins, new_plugins) = if table == "proxies" {
+            let previous = previous_proxy.ok_or(DeploymentGraphInvalid)?;
+            let mut associations = self
+                .load_proxy_plugin_associations_for_namespace_tx(
+                    &previous.namespace,
+                    "deployment preservation",
+                    tx,
+                )
+                .await?;
+            (
+                previous.plugins.clone(),
+                associations.remove(&previous.id).unwrap_or_default(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut old_known = deployment_known_sql_resource(table, row, old_plugins)?;
+        let mut new_known = deployment_known_sql_resource(table, &current, new_plugins)?;
+        for value in [&mut old_known, &mut new_known] {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("created_at");
+                object.remove("updated_at");
+            }
+        }
+        let unchanged = old_known == new_known;
+        for column in row.columns() {
+            if !unchanged && known.contains(&column.name()) && column.name() != "created_at" {
+                continue;
+            }
+            // Identifiers come from database metadata, never request input.
+            // Refuse an identifier that cannot be quoted safely on every store.
+            if !column
+                .name()
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                anyhow::bail!("Unsupported deployment column identifier");
+            }
+            let quoted = if self.db_type == "mysql" {
+                format!("`{}`", column.name())
+            } else {
+                format!("\"{}\"", column.name())
+            };
+            let sql = self.q(&format!(
+                "UPDATE {table} SET {quoted} = ? WHERE {predicate}"
+            ));
+            let value = deployment_sql_scalar(row, column.ordinal())?;
+            let query = sqlx::query(&sql);
+            let query = match value {
+                DeploymentSqlScalar::Null(kind) => match kind {
+                    AnyTypeInfoKind::Bool => query.bind(Option::<bool>::None),
+                    AnyTypeInfoKind::SmallInt => query.bind(Option::<i16>::None),
+                    AnyTypeInfoKind::Integer => query.bind(Option::<i32>::None),
+                    AnyTypeInfoKind::BigInt => query.bind(Option::<i64>::None),
+                    AnyTypeInfoKind::Real => query.bind(Option::<f32>::None),
+                    AnyTypeInfoKind::Double => query.bind(Option::<f64>::None),
+                    AnyTypeInfoKind::Blob => query.bind(Option::<Vec<u8>>::None),
+                    AnyTypeInfoKind::Text | AnyTypeInfoKind::Null => {
+                        query.bind(Option::<String>::None)
+                    }
+                },
+                DeploymentSqlScalar::Bool(value) => query.bind(value),
+                DeploymentSqlScalar::SmallInt(value) => query.bind(value),
+                DeploymentSqlScalar::Integer(value) => query.bind(value),
+                DeploymentSqlScalar::BigInt(value) => query.bind(value),
+                DeploymentSqlScalar::Real(value) => query.bind(value),
+                DeploymentSqlScalar::Double(value) => query.bind(value),
+                DeploymentSqlScalar::Text(value) => query.bind(value),
+                DeploymentSqlScalar::Blob(value) => query.bind(value),
+            };
+            let query = query.bind(row.try_get::<String, _>("namespace")?);
+            let query = if table == "proxy_plugins" {
+                query
+                    .bind(row.try_get::<String, _>("proxy_id")?)
+                    .bind(row.try_get::<String, _>("plugin_config_id")?)
+            } else {
+                query.bind(row.try_get::<String, _>("id")?)
+            };
+            query.execute(&mut **tx).await?;
+        }
         Ok(())
     }
 
@@ -10762,13 +11282,12 @@ impl DatabaseStore {
             let upstream_id = row
                 .try_get::<String, _>("upstream_id")
                 .unwrap_or_else(|_| "<unknown>".to_string());
-            anyhow::bail!(
-                "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
-                 detach it before replacing or deleting the API spec",
+            return Err(ExternalSpecUpstreamConflict::Proxy {
                 proxy_id,
                 upstream_id,
-                spec_id
-            );
+                spec_id: spec_id.to_string(),
+            }
+            .into());
         }
 
         // Every selected spec-owned upstream id must decode. Silently dropping
@@ -10816,14 +11335,12 @@ impl DatabaseStore {
             if let Some(upstream_id) =
                 mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
             {
-                anyhow::bail!(
-                    "mesh_route_dispatch plugin_config {:?} references a spec-owned upstream {:?} \
-                     from api_spec {:?}; \
-                     detach it before replacing or deleting the API spec",
-                    plugin.id,
+                return Err(ExternalSpecUpstreamConflict::MeshRouteDispatch {
+                    plugin_config_id: plugin.id,
                     upstream_id,
-                    spec_id
-                );
+                    spec_id: spec_id.to_string(),
+                }
+                .into());
             }
         }
 
@@ -11867,6 +12384,31 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_namespace_snapshot(self, namespace).await
+    }
+
+    async fn load_deployment_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<DeploymentSnapshot, anyhow::Error> {
+        self.load_deployment_snapshot_inner(namespace).await
+    }
+
+    async fn remove_deployment_conditionally(
+        &self,
+        id: &str,
+        precondition: &DeploymentPrecondition<'_>,
+    ) -> Result<(), anyhow::Error> {
+        self.remove_deployment_inner(id, precondition).await
+    }
+
+    async fn replace_deployment_conditionally(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        precondition: &DeploymentPrecondition<'_>,
+    ) -> Result<(), anyhow::Error> {
+        self.replace_api_spec_bundle_inner(bundle, spec, Some(precondition))
+            .await
     }
 
     async fn load_conditional_namespace_snapshot(
@@ -13607,6 +14149,126 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
             Utc::now()
         }
     }
+}
+
+/// Compare known semantics before deciding whether a surviving row changed.
+/// Unchanged generated resources retain their complete historical stored row.
+fn deployment_known_sql_resource(
+    table: &str,
+    row: &AnyRow,
+    mut plugins: Vec<PluginAssociation>,
+) -> Result<serde_json::Value, anyhow::Error> {
+    match table {
+        "proxies" => {
+            plugins.sort_by(|a, b| a.plugin_config_id.cmp(&b.plugin_config_id));
+            let mut proxy = row_to_proxy(row, row.try_get("id")?, plugins)?;
+            proxy.normalize_fields();
+            Ok(serde_json::to_value(proxy)?)
+        }
+        "plugin_configs" => {
+            let mut plugin = row_to_plugin_config(row)?;
+            plugin.normalize_fields();
+            Ok(serde_json::to_value(plugin)?)
+        }
+        "upstreams" => {
+            let mut upstream = row_to_upstream(row)?;
+            upstream.normalize_fields();
+            Ok(serde_json::to_value(upstream)?)
+        }
+        "proxy_plugins" => Ok(serde_json::json!({
+            "namespace": row.try_get::<String, _>("namespace")?,
+            "proxy_id": row.try_get::<String, _>("proxy_id")?,
+            "plugin_config_id": row.try_get::<String, _>("plugin_config_id")?,
+        })),
+        _ => Err(DeploymentGraphInvalid.into()),
+    }
+}
+
+/// Owned scalars decoded through SQLx's public Any API. Decode each non-null
+/// value by its runtime type, not its declared column type (SQLite is dynamic).
+/// Nulls retain the column type for correctly typed binds on PostgreSQL.
+enum DeploymentSqlScalar {
+    Null(sqlx::any::AnyTypeInfoKind),
+    Bool(bool),
+    SmallInt(i16),
+    Integer(i32),
+    BigInt(i64),
+    Real(f32),
+    Double(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+fn deployment_sql_scalar(
+    row: &AnyRow,
+    ordinal: usize,
+) -> Result<DeploymentSqlScalar, anyhow::Error> {
+    use sqlx::any::AnyTypeInfoKind;
+    use sqlx::{Column, ValueRef};
+
+    let raw = row.try_get_raw(ordinal)?;
+    if raw.is_null() {
+        return Ok(DeploymentSqlScalar::Null(
+            row.try_column(ordinal)?.type_info().kind(),
+        ));
+    }
+    Ok(match raw.type_info().kind() {
+        AnyTypeInfoKind::Bool => DeploymentSqlScalar::Bool(row.try_get(ordinal)?),
+        AnyTypeInfoKind::SmallInt => DeploymentSqlScalar::SmallInt(row.try_get(ordinal)?),
+        AnyTypeInfoKind::Integer => DeploymentSqlScalar::Integer(row.try_get(ordinal)?),
+        AnyTypeInfoKind::BigInt => DeploymentSqlScalar::BigInt(row.try_get(ordinal)?),
+        AnyTypeInfoKind::Real => {
+            let value: f32 = row.try_get(ordinal)?;
+            if !value.is_finite() {
+                anyhow::bail!("Non-finite stored scalar");
+            }
+            DeploymentSqlScalar::Real(value)
+        }
+        AnyTypeInfoKind::Double => {
+            let value: f64 = row.try_get(ordinal)?;
+            if !value.is_finite() {
+                anyhow::bail!("Non-finite stored scalar");
+            }
+            DeploymentSqlScalar::Double(value)
+        }
+        AnyTypeInfoKind::Text => DeploymentSqlScalar::Text(row.try_get(ordinal)?),
+        AnyTypeInfoKind::Blob => DeploymentSqlScalar::Blob(row.try_get(ordinal)?),
+        AnyTypeInfoKind::Null => anyhow::bail!("Non-null stored scalar has null type"),
+    })
+}
+
+/// Full typed column evidence, including columns unknown to the domain decoder.
+/// Float bits, integer widths, blobs and typed nulls cannot alias text or each
+/// other. Unsupported SQLx Any types refuse authority at row loading.
+fn deployment_raw_sql_row(row: &AnyRow) -> Result<serde_json::Value, anyhow::Error> {
+    use sqlx::{Column, TypeInfo, ValueRef};
+
+    let mut fields = serde_json::Map::new();
+    for column in row.columns() {
+        let raw = row.try_get_raw(column.ordinal())?;
+        let value = match deployment_sql_scalar(row, column.ordinal())? {
+            DeploymentSqlScalar::Null(_) => serde_json::Value::Null,
+            DeploymentSqlScalar::Bool(value) => serde_json::json!(value),
+            DeploymentSqlScalar::SmallInt(value) => serde_json::json!(value),
+            DeploymentSqlScalar::Integer(value) => serde_json::json!(value),
+            DeploymentSqlScalar::BigInt(value) => serde_json::json!(value),
+            DeploymentSqlScalar::Real(value) => serde_json::json!({"bits": value.to_bits()}),
+            DeploymentSqlScalar::Double(value) => serde_json::json!({"bits": value.to_bits()}),
+            DeploymentSqlScalar::Text(value) => serde_json::json!(value),
+            DeploymentSqlScalar::Blob(value) => {
+                serde_json::json!({"bytes_hex": hex::encode(value)})
+            }
+        };
+        fields.insert(
+            column.name().to_string(),
+            serde_json::json!({
+                "column_type": column.type_info().name(),
+                "value_type": raw.type_info().name(),
+                "value": value,
+            }),
+        );
+    }
+    Ok(serde_json::Value::Object(fields))
 }
 
 #[cfg(test)]

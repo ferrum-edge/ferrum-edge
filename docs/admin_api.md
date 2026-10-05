@@ -1430,7 +1430,9 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   matches if any member does. A malformed or empty `If-Match` is `400`, never
   treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the
   four resource routes above. `POST /restore` supports the separate namespace
-  precondition described below. `If-Match` on any other mutating route (including
+  precondition described below. Opt-in deployment removal and spec replacement
+  use the separate [deployment authority profile](deployment_mutations.md).
+  `If-Match` on any other mutating route (including
   `POST` creates, `/batch`, and `/gateway-trust-bundles/{id}`, which keeps its
   own body `revision` contract) is `400` rather than applied unconditionally.
   A request that would be `404` without the header is still `404`.
@@ -1454,6 +1456,24 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   carries none, because it may lag the database.
 - **Unconditional writes are unchanged.** Omitting `If-Match` keeps today's
   last-writer-wins behavior, including unconditional restore.
+
+## Dependency-fenced deployment recovery (#6010)
+
+Use admin-only `GET /deployment-snapshot` for complete original spec/plugin and
+raw dependency evidence. Send its original deployment token to
+`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
+`PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
+partially mutate inside one owner-fenced transaction on all four supported
+stores (MongoDB requires a replica set). Stale evidence is `412`; invalid modes
+or headers refuse without fallback. Ordinary row deletion, spec replacement,
+backup and restore profiles retain their supported behavior.
+
+Only an acknowledgement with `durable: "committed"`, `live: "applied"` and
+`recovery_cleanup_authorized: true` authorizes automatic journal removal.
+Durable-only CP/unserved results explicitly return `false`. Preserve the original
+encrypted journal after every refusal or uncertain outcome. See the
+[consumer adoption guide](deployment_mutations.md) for exact evidence, query,
+ownership, preservation and acknowledgement rules.
 
 ## Plugin Configs
 

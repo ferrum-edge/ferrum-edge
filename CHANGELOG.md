@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Correct SQLx Any floating-point NULL parameter types** (#6010).
+  REAL NULL now binds through `Option<f32>` and DOUBLE NULL through
+  `Option<f64>`. The hosted PostgreSQL regression checks native parameter
+  types and explicit NULL results without casting the parameters.
+
+- **Dependency-fenced partial deployment mutations** (#6010). Admin-only
+  `GET /deployment-snapshot` binds complete spec/plugin/association and raw
+  namespace evidence. Opt-in proxy cascade removal and API-spec replacement
+  compare the original deployment token within entry/commit admission fences
+  on SQLite, PostgreSQL, MySQL and replica-set MongoDB. Partial writes preserve
+  unrelated rows, historical credentials, timestamps, trust and shared owners.
+  Plugin-only replacement also retains an unchanged proxy's raw fields,
+  timestamps and row ETag after merging hand-added associations;
+  ordinary endpoint profiles remain supported. Strict durable/live/audit/lease
+  acknowledgements refuse automatic journal cleanup after uncertain outcomes.
+  See the consumer adoption guide; downstream adoption and packaged qualification
+  are not asserted.
+
 ## [0.9.11] - 2026-10-04
 
 Release candidate prepared on 2026-10-04 UTC; this is the planned cut/preparation
