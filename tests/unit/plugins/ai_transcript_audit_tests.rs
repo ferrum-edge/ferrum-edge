@@ -12603,6 +12603,433 @@ struct ChargedShortCircuitWitness {
     request_ptr: usize,
 }
 
+#[path = "retained_admission_h3_exchange.rs"]
+mod retained_admission_h3_exchange;
+
+struct AdmissionCaptureWitness {
+    budget: Arc<ferrum_edge::_test_support::RequestBufferBudgetProbe>,
+    available: usize,
+    request_ptr: usize,
+}
+
+#[async_trait]
+impl Plugin for AdmissionCaptureWitness {
+    fn name(&self) -> &str {
+        "admission_capture_witness"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _status: u16,
+        _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        assert_eq!(self.budget.available_bytes(), self.available);
+        assert_eq!(
+            ctx.request_body_bytes.as_ref().unwrap().as_ptr() as usize,
+            self.request_ptr
+        );
+        PluginResult::Continue
+    }
+}
+
+struct AdmissionCommitWitness {
+    budget: Arc<ferrum_edge::_test_support::RequestBufferBudgetProbe>,
+    audit: Arc<AiTranscriptAudit>,
+    available: usize,
+    grpc: bool,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Plugin for AdmissionCommitWitness {
+    fn name(&self) -> &str {
+        "admission_commit_witness"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        status: u16,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        use ferrum_edge::_test_support::RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT;
+
+        assert_eq!(status, if self.grpc { 200 } else { 503 });
+        if self.grpc {
+            assert_eq!(headers.get("grpc-status").map(String::as_str), Some("14"));
+        }
+        assert_eq!(self.audit.capture_counters(), (1, 0));
+        assert!(ctx.request_body_bytes.is_none());
+        assert!(!ctx.metadata.contains_key("request_body"));
+        let clone = ctx.clone();
+        assert!(clone.request_body_bytes.is_none());
+        assert!(!clone.metadata.contains_key("request_body"));
+        assert_eq!(self.budget.available_bytes(), self.available);
+        if self.available == 0 {
+            assert!(
+                self.budget.try_reserve(UNIT).is_none(),
+                "external clone still owns its charge"
+            );
+        } else {
+            let next = self.budget.try_reserve(UNIT).expect("next upload admitted");
+            drop(next);
+        }
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
+fn admission_test_state() -> ferrum_edge::proxy::ProxyState {
+    let _env = EnvGuard::new(&[]);
+    ferrum_edge::proxy::ProxyState::new(
+        ferrum_edge::config::types::GatewayConfig {
+            version: "1".into(),
+            ..Default::default()
+        },
+        DnsCache::new(DnsConfig::default()),
+        ferrum_edge::config::EnvConfig::default(),
+        None,
+        None,
+    )
+    .unwrap()
+    .0
+}
+
+/// The real H1/H2 admission finalizer owns the transport Vec, collected Bytes,
+/// and gRPC replacement while audit staging still awaits the rejection chain.
+/// An owned hook context and cancellation must not retain those uploads after
+/// the committed observer starts. Capture keeps its original pointer and exact
+/// non-UTF-8 or peer-redacted protobuf view.
+#[tokio::test(flavor = "current_thread")]
+async fn backend_admission_retires_all_h1_h2_upload_owners_before_committed_wait() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RejectedUploadForTest,
+        RequestBufferBudgetProbe, run_before_proxy_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(2);
+    const HASH_SECRET: &str = "admission-capture-ownership-proof";
+    for mode in ["buffered", "native_grpc", "retained"] {
+        for peer_redacted in [false, true] {
+            for owned_hooks in [false, true] {
+                let server = mock_sink().await;
+                let mut overrides = grpc_audit_overrides();
+                overrides["redaction"]["hash_secret"] = json!(HASH_SECRET);
+                let audit = Arc::new(
+                    AiTranscriptAudit::new(
+                        &config_with_sink(&format!("{}/ingest", server.uri()), overrides),
+                        loopback_http_client(),
+                    )
+                    .unwrap(),
+                );
+                audit.start_background_tasks().unwrap();
+                audit.commit_background_tasks();
+                let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, 2 * UNIT));
+                let request = grpc_frame(&hello_request_bytes_with_age("admission-original", -1));
+                assert!(std::str::from_utf8(&request).is_err());
+                let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+                ctx.request_body_bytes = Some(Bytes::copy_from_slice(&request));
+                if owned_hooks {
+                    set_grpc_deadline_budget_for_test(&mut ctx, Some(30_000));
+                }
+                let permit = budget.try_reserve(UNIT).unwrap();
+                let upload = match mode {
+                    "buffered" => RejectedUploadForTest::buffered(request, permit),
+                    "native_grpc" => RejectedUploadForTest::native_grpc(
+                        permit.into_charged_bytes(request),
+                        budget
+                            .try_reserve(UNIT)
+                            .unwrap()
+                            .into_charged_bytes(vec![0; 32]),
+                    ),
+                    "retained" => {
+                        RejectedUploadForTest::retained(permit.into_charged_bytes(request))
+                    }
+                    _ => unreachable!(),
+                };
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let mut plugins: Vec<Arc<dyn Plugin>> = vec![
+                    Arc::new(AdmissionCaptureWitness {
+                        budget: Arc::clone(&budget),
+                        available: UNIT,
+                        request_ptr: ctx.request_body_bytes.as_ref().unwrap().as_ptr() as usize,
+                    }),
+                    audit.clone(),
+                    Arc::new(AdmissionCommitWitness {
+                        budget: Arc::clone(&budget),
+                        audit: Arc::clone(&audit),
+                        available: 2 * UNIT,
+                        grpc: true,
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    }),
+                ];
+                if peer_redacted {
+                    plugins.insert(
+                        2,
+                        Arc::new(PeerRequestTextRewrite {
+                            body: String::from_utf8(grpc_frame(&hello_request_bytes_with_age(
+                                "admission-redacted",
+                                0,
+                            )))
+                            .unwrap(),
+                        }),
+                    );
+                }
+                let mut headers = ctx.headers.clone();
+                assert!(matches!(
+                    run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await,
+                    PluginResult::Continue
+                ));
+                assert_eq!(audit.capture_counters(), (0, 0));
+                let state = admission_test_state();
+                let task = tokio::spawn(async move {
+                    let response = upload.finalize(&plugins, &mut ctx, &state, true).await;
+                    assert_eq!(response.status(), http::StatusCode::OK);
+                    ctx
+                });
+                tokio::time::timeout(WAIT, entered.notified()).await.unwrap();
+                let records = wait_for_total_records(&server, 1).await;
+                assert_eq!(records.len(), 1);
+                assert!(records[0].get("request_body_omitted_reason").is_none());
+                let excerpt: Value =
+                    serde_json::from_str(records[0]["request_body"].as_str().unwrap()).unwrap();
+                let (name, age) = if peer_redacted {
+                    ("admission-redacted", 0)
+                } else {
+                    ("admission-original", -1)
+                };
+                assert_eq!(excerpt["grpc_method"], "/test.Greeter/SayHello");
+                assert_eq!(excerpt["messages"].as_array().unwrap().len(), 1);
+                assert_eq!(excerpt["messages"][0]["fields"]["name"], name);
+                assert_eq!(
+                    records[0]["request_hash"],
+                    keyed_reference(HASH_SECRET)
+                        .keyed_hash_hex(&grpc_frame(&hello_request_bytes_with_age(name, age)))
+                );
+                assert_eq!(budget.available_bytes(), 2 * UNIT);
+                let next = budget
+                    .collect_retained_chunks(
+                        futures_util::stream::iter([Ok(Bytes::from_static(b"next upload"))]),
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    &next,
+                    ferrum_edge::_test_support::RetainedRequestOutcomeForTest::Collected(_)
+                ));
+                drop(next);
+                if peer_redacted {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                } else {
+                    release.notify_one();
+                    let ctx = tokio::time::timeout(WAIT, task).await.unwrap().unwrap();
+                    assert!(ctx.request_body_bytes.is_none());
+                }
+                assert_eq!(budget.available_bytes(), 2 * UNIT);
+            }
+        }
+    }
+}
+
+struct RetainedAdmissionRefusal;
+
+#[async_trait]
+impl Plugin for RetainedAdmissionRefusal {
+    fn name(&self) -> &str {
+        "test_retained_admission_refusal"
+    }
+
+    fn is_backend_admission_plugin(&self) -> bool {
+        true
+    }
+
+    fn try_backend_admission(
+        &self,
+        _ctx: &RequestContext,
+        _admission: &ferrum_edge::plugins::BackendAdmissionContext<'_>,
+    ) -> ferrum_edge::plugins::BackendAdmissionDecision {
+        ferrum_edge::plugins::BackendAdmissionDecision::Reject {
+            status_code: 503,
+            body: vec![b'x'; 2 * 1024 * 1024],
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// Actual native-H3 and bridge admission callers keep their frame alive first
+/// inside a committed observer, then inside a QUIC writer parked on receive
+/// credit. The next charged collector must work at both boundaries.
+#[tokio::test(flavor = "current_thread")]
+async fn h3_admission_releases_upload_before_committed_and_flow_control_waits() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
+        RetainedRequestOutcomeForTest, run_before_proxy_hooks_for_test,
+        run_h3_retained_admission_for_test,
+    };
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(2);
+    for (bridge, keep_clone) in [(false, false), (false, true), (true, false), (true, true)] {
+        let server = mock_sink().await;
+        let audit = Arc::new(
+            AiTranscriptAudit::new(
+                &config_with_sink(
+                    &format!("{}/ingest", server.uri()),
+                    json!({"capture": {"request": true, "response": false}}),
+                ),
+                loopback_http_client(),
+            )
+            .unwrap(),
+        );
+        audit.start_background_tasks().unwrap();
+        audit.commit_background_tasks();
+        let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, UNIT));
+        let RetainedRequestOutcomeForTest::Collected(mut upload) = budget
+            .collect_retained_chunks(
+                futures_util::stream::iter([Ok(Bytes::from_static(ai_request_body()))]),
+                0,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("actual H3 collector must admit the fixture");
+        };
+        let mut ctx = make_ctx();
+        let last_clone = keep_clone.then(|| upload.clone());
+        ctx.request_body_bytes = Some(upload.clone());
+        ctx.metadata.insert(
+            "request_body".into(),
+            String::from_utf8(upload.to_vec()).unwrap(),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(AdmissionCaptureWitness {
+                budget: Arc::clone(&budget),
+                available: 0,
+                request_ptr: upload.as_ptr() as usize,
+            }),
+            audit.clone(),
+            Arc::new(AdmissionCommitWitness {
+                budget: Arc::clone(&budget),
+                audit: Arc::clone(&audit),
+                available: if keep_clone { 0 } else { UNIT },
+                grpc: false,
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        ];
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(audit.capture_counters(), (0, 0));
+        let mut exchange = tokio::time::timeout(WAIT, retained_admission_h3_exchange::exchange())
+            .await
+            .unwrap();
+        let mut stream = exchange.server_stream.take().unwrap();
+        let state = admission_test_state();
+        let proxy = create_test_proxy();
+        let request_ptr = upload.as_ptr();
+        assert!(
+            !run_h3_retained_admission_for_test(
+                bridge,
+                &state,
+                &proxy,
+                &plugins,
+                &[],
+                &mut ctx,
+                &mut upload,
+                &mut stream,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            upload.as_ptr(),
+            request_ptr,
+            "success keeps its charged owner"
+        );
+        assert_eq!(budget.available_bytes(), 0);
+        assert_eq!(audit.capture_counters(), (0, 0));
+        let task = tokio::spawn(async move {
+            let admission_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetainedAdmissionRefusal)];
+            let rejected = run_h3_retained_admission_for_test(
+                bridge,
+                &state,
+                &proxy,
+                &plugins,
+                &admission_plugins,
+                &mut ctx,
+                &mut upload,
+                &mut stream,
+            )
+            .await
+            .unwrap();
+            assert!(rejected);
+            assert!(upload.is_empty());
+        });
+        tokio::time::timeout(WAIT, entered.notified()).await.unwrap();
+        let records = wait_for_total_records(&server, 1).await;
+        assert_eq!(records.len(), 1);
+        assert!(records[0].get("request_body_omitted_reason").is_none());
+        assert_eq!(budget.available_bytes(), if keep_clone { 0 } else { UNIT });
+        drop(last_clone);
+        assert_eq!(
+            budget.available_bytes(),
+            UNIT,
+            "last clone releases its charge"
+        );
+        let next = budget
+            .try_reserve(UNIT)
+            .expect("next upload while observer waits");
+        drop(next);
+        release.notify_one();
+        let response = tokio::time::timeout(WAIT, exchange.client_stream.recv_response())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "large response must wait for QUIC credit"
+        );
+        assert_eq!(budget.available_bytes(), UNIT);
+        let next = budget
+            .collect_retained_chunks(
+                futures_util::stream::iter([Ok(Bytes::from_static(b"next upload"))]),
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(&next, RetainedRequestOutcomeForTest::Collected(_)));
+        drop(next);
+        assert_eq!(budget.available_bytes(), UNIT);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.available_bytes(), UNIT);
+    }
+}
+
 #[async_trait]
 impl Plugin for ChargedShortCircuitWitness {
     fn name(&self) -> &str {

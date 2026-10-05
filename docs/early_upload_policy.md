@@ -173,18 +173,60 @@ request-body hook and never recaptures stale pre-transform metadata.
 | H1/H2 native-gRPC final-body rejection | Transformed transport Bytes are dropped; the already-charged collected owner moves behind the existing metadata view without changing it | Same shared finalizer, after the final-body or short-circuit capture decision |
 | Native H3 completed rejection | Redundant transport/replacement Bytes are dropped; the metadata snapshot keeps its original allocation charge | Same shared finalizer, including when commitment is deferred for gRPC-Web/native gRPC |
 | H3 cross-protocol final-body rejection | Replacement transport owner is dropped; metadata survives the reject `after_proxy` chain | Reject-only committed delegate, before any observer or context clone |
+| Circuit-breaker and backend-admission rejection | H1/H2 callers move their transport/replay representation into the admission finalizer; split native gRPC drops its replacement and hands the collected charge to the existing snapshot. Native H3 and bridge admission callers empty their separate Bytes owner before running the ordered rejection hooks; gRPC replay clones are created only after admission succeeds | After the ordered capture chain completes, the shared finalizer or H3 reject committed delegate clears its request view before observers, logging and the terminal writer |
 | Incomplete collection or malformed normalization fallback | Partial collector/permit is dropped on failure or cancellation; no complete capture is fabricated | Before rejection hooks or a direct transport write, respectively |
 
-Raw request text, binary snapshots and context-held collector charges are cleared
-before committed observers, detached transaction logging or terminal stream
-writes can wait. Committed audit hooks consume their instance's separately
-bounded captured result. Existing plugin text/decode working-set contracts are
+When the ordered capture hooks complete, raw request text, binary snapshots and
+context-held collector charges are cleared before committed observers,
+transaction logging or terminal stream writes can wait. Committed audit hooks
+consume their instance's separately bounded captured result. Existing plugin
+text/decode working-set contracts are
 unchanged. The original non-UTF-8 functional assertion remains strict; added
 coverage requires an exact method/name excerpt, a single capture and full upload
 admission while a committed observer is stalled, including observer cancellation,
 owned context clones, native H3 and bridge commitment, and a peer-redacted view.
+Admission coverage drives the actual H1/H2 finalizer and both H3 admission
+runners, with a second charged collection while a committed observer or real
+QUIC flow-control write remains pending. Complete caller tables require every
+separate upload owner to enter that handoff; successful generic attempts drop
+their redundant `BackendAttemptHandoff` replay clone before a later admission
+can reject. Retry breaker vetoes that preserve the previous backend outcome
+still use its normal response pipeline; they do not author a new breaker reject.
 These are hosted regression requirements, not local test results or a release
 qualification claim.
+
+### Unresolved deadline detachment (review5 P2)
+
+The above retirement does not free an independently live clone. The rejection
+runner's `owned_rejection_hook_future` clones the context before polling
+`Plugin::after_proxy`. If the RPC deadline expires while that hook is pending,
+`spawn_detached_rejection_cleanup` retains that future and its raw upload owner,
+then runs remaining non-replacing hooks in order. Charged-terminal single-hook
+detachment has the same ownership gap. The existing five-second cleanup bound
+and earlier credential lifetime still apply. Clearing the original context at
+commitment cannot retire either cloned allocation or charge. This is a remaining
+lifecycle defect, and no claim of full admission recovery on that path is made.
+
+The public async `after_proxy(&mut RequestContext, ...)` contract permits a
+plugin to read or rewrite request views before or after an await. The real audit
+instance captures a short-circuit request from its ordered authoritative view,
+preferring peer-redacted text and using the backend-effective enrolled gRPC
+method. A peer still pending before that instance may yet change that view.
+Capturing earlier on the original context would bypass those changes; dropping
+and restarting the pending hook could duplicate external side effects. Rust's
+in-flight mutable borrow also prevents retiring the future's context in place.
+No such approximation is implemented.
+
+A complete fix needs an explicit plugin phase contract that settles all raw
+request-view mutation and per-instance capture before cleanup may become
+detachable, with cleanup futures owning only bounded staged state. That contract
+must specify how a pending pre-capture peer settles when the RPC or credential
+deadline wins, and preserve trigger decisions, ordering and exactly-once work.
+Alternatively, retaining the current async hook contract requires acknowledging
+the bounded raw-retention exception. Neither an extended deadline nor a full
+capture after credential expiry is acceptable: expiry can preclude protected
+capture, and only a record legitimately staged before it may exist. Root must
+resolve this contract tradeoff before P2 or the candidate is qualified.
 
 ## Qualification and contract handoff
 

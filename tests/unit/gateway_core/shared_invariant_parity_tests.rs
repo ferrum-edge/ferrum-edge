@@ -2998,6 +2998,185 @@ fn streaming_h2_arm_uses_the_tested_body_regime() {
 /// Raw uploads belong to request-capture/shaping hooks, never to committed
 /// observers, detached logging, or a stalled terminal transport write.
 #[test]
+fn every_backend_admission_caller_transfers_its_upload_before_finalization() {
+    use super::http3_server_dispatch_tests::compact_code;
+    use super::native_grpc_dispatch_auth_lifetime_tests::{direct_source_statement, source_group};
+
+    fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.find(marker).expect("named production function");
+        let (_, signature_end) = source_group(source, start + marker.len() - 1).unwrap();
+        let body_at = signature_end + source[signature_end..].find('{').unwrap();
+        source_group(source, body_at).unwrap().0
+    }
+
+    fn calls<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {
+        source
+            .match_indices(marker)
+            .map(|(at, _)| source_group(source, at + marker.len() - 1).unwrap().0)
+            .collect()
+    }
+
+    let h1 = compact_code(include_str!("../../../src/proxy/mod.rs"));
+    let h3 = compact_code(include_str!("../../../src/http3/server.rs"));
+    let bridge = compact_code(include_str!("../../../src/http3/cross_protocol.rs"));
+    // The finalizer definition, the boxed factory's delegate, the WebSocket caller and
+    // eight ordinary frontend callers. A new sibling anywhere breaks this table.
+    assert_eq!(h1.matches("handle_backend_admission_rejection(").count(), 11);
+    assert_eq!(h3.matches("run_h3_backend_admission_or_send_reject(").count(), 6);
+    let websocket = function_body(&h1, "asyncfnhandle_websocket_request_authenticated(");
+    let websocket_calls = calls(websocket, "handle_backend_admission_rejection(");
+    assert_eq!(websocket_calls.len(), 1);
+    assert!(websocket_calls[0].starts_with("rejection,RejectedUpload::None,"));
+    let frontend = function_body(&h1, "asyncfnhandle_proxy_request_inner(");
+    let admission_calls = calls(frontend, "boxed_handle_backend_admission_rejection(");
+    let uploads = [
+        "RejectedUpload::Client(client_request_body)",
+        "RejectedUpload::NativeGrpc{collected:collected_grpc_req_body,transformed:grpc_req_body,}",
+        "RejectedUpload::None",
+        "RejectedUpload::Retained(grpc_req_body)",
+        "RejectedUpload::Retained(grpc_body_bytes)",
+        "RejectedUpload::None",
+        "retained_body.map_or(RejectedUpload::None,RejectedUpload::Retained)",
+        "RejectedUpload::None",
+    ];
+    assert_eq!(admission_calls.len(), uploads.len());
+    for (call, upload) in admission_calls.iter().zip(uploads) {
+        assert!(call.starts_with(&format!("rejection,{upload},")), "{call}");
+    }
+    // The only unbuffered native-gRPC caller retires its unread request before
+    // the None handoff. Generic dispatch consumes its request inside the
+    // attempt, so its admission-refusal arms have no remaining transport owner.
+    let streaming_call = frontend.find(admission_calls[2]).unwrap();
+    let streaming_reject = frontend[..streaming_call].rfind("Err(rejection)=>{").unwrap();
+    assert!(direct_source_statement(
+        &frontend[streaming_reject + "Err(rejection)=>{".len()..streaming_call],
+        "drop(request);"
+    ));
+    let finalizer = function_body(&h1, "asyncfnhandle_backend_admission_rejection(");
+    assert!(finalizer.starts_with("upload.retire(ctx);"));
+    assert!(
+        finalizer.contains("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+    );
+    let retired = function_body(&h1, "fnretire(");
+    assert!(retired.contains("Self::Client(mutbody)=>retire_client_request_body_for_rejection("));
+    assert!(
+        retired.contains("Self::Retained(body)=>retain_charged_request_metadata_on_rejection(")
+    );
+    let grpc_retire = "Self::NativeGrpc{collected,transformed,}=>{";
+    let at = retired.find(grpc_retire).unwrap();
+    let (grpc_retire, _) = source_group(retired, at + grpc_retire.len() - 1).unwrap();
+    assert!(grpc_retire.starts_with("drop(transformed);"));
+    assert!(grpc_retire.contains("retain_charged_request_metadata_on_rejection(ctx,collected);"));
+    let breaker = "matchbackend_dispatch::check_circuit_breaker(\
+                   &proxy,&state,upstream_target.as_deref()){";
+    let at = frontend.find(breaker).unwrap();
+    let (breaker, _) = source_group(frontend, at + breaker.len() - 1).unwrap();
+    let rejected = "Err(())=>{";
+    let at = breaker.find(rejected).unwrap();
+    let (rejected, _) = source_group(breaker, at + rejected.len() - 1).unwrap();
+    let retire = "retire_client_request_body_for_rejection(&mutclient_request_body,&mutctx);";
+    assert!(direct_source_statement(rejected, retire));
+    assert!(
+        rejected.find(retire).unwrap()
+            < rejected.find("finalize_reject_response_with_after_proxy_hooks(").unwrap()
+    );
+
+    // A successful generic attempt returns its replay body through dispatch.
+    // Its separate OnceLock witness must not survive into retry admission.
+    for marker in [
+        "letinitial_dispatch=matchinitial_attempt{",
+        "letdispatch=matchdispatch_attempt{",
+    ] {
+        let at = frontend.find(marker).unwrap();
+        let (outcome, _) = source_group(frontend, at + marker.len() - 1).unwrap();
+        let ok = "Ok(dispatch)=>{";
+        let at = outcome.find(ok).unwrap();
+        let (ok, _) = source_group(outcome, at + ok.len() - 1).unwrap();
+        assert!(ok.starts_with("drop("));
+        assert!(ok.contains("attempt_handoff);dispatch"));
+    }
+
+    // Include every native H3 call, even the streaming branch whose optional
+    // prebuffer is provably absent and the native-gRPC relay with no collector.
+    let h3_frontend = function_body(&h3, "asyncfnhandle_h3_request(");
+    let h3_calls = calls(h3_frontend, "run_h3_backend_admission_or_send_reject(");
+    assert_eq!(h3_calls.len(), 4);
+    for (call, owner) in h3_calls.iter().zip([
+        "prebuffered_body_data.as_mut()",
+        "prebuffered_body_data.as_mut()",
+        "Some(&mutbody_data)",
+        "Some(&mutbody_data)",
+    ]) {
+        assert!(call.starts_with(&format!(
+            "backend_admission_plugins.as_ref(),&plugins,&mutctx,{owner},"
+        )));
+    }
+    let native_grpc = function_body(&h3, "asyncfndispatch_grpc_native_h3(");
+    let native_calls = calls(native_grpc, "run_h3_backend_admission_or_send_reject(");
+    assert_eq!(native_calls.len(), 1);
+    assert!(native_calls[0].starts_with("backend_admission_plugins,plugins,ctx,None,"));
+    let bridge_calls = calls(&bridge, "run_cross_protocol_backend_admission_or_reject(");
+    assert_eq!(bridge_calls.len(), 5);
+    for (call, owner) in bridge_calls.iter().zip([
+        "Some(&mutbuffered_body)",
+        "None",
+        "Some(&mutbody_bytes)",
+        "Some(&mutbody_bytes)",
+        "None",
+    ]) {
+        assert!(call.starts_with(&format!("backend_admission_plugins,plugins,ctx,{owner},")));
+    }
+    for (source, marker, committed) in [
+        (
+            &h3,
+            "pub(crate)asyncfnrun_h3_backend_admission_or_send_reject(",
+            "run_h3_deadline_bounded_reject_committed_hooks(",
+        ),
+        (
+            &bridge,
+            "pub(crate)asyncfnrun_cross_protocol_backend_admission_or_reject<S>(",
+            "run_cross_protocol_reject_committed_hooks(",
+        ),
+    ] {
+        let helper = function_body(source, marker);
+        assert!(helper.contains("Ok(permits)=>Ok(Ok(permits))"));
+        let rejected = "Err(rejection)=>{";
+        let at = helper.find(rejected).unwrap();
+        let (rejected, _) = source_group(helper, at + rejected.len() - 1).unwrap();
+        let capture = "crate::proxy::apply_retained_upload_rejection_hooks(\
+                       plugins,ctx,retained_body,";
+        assert_eq!(rejected.matches(capture).count(), 1);
+        assert!(rejected.find(capture).unwrap() < rejected.find(committed).unwrap());
+        assert_eq!(rejected.matches("cb_probe.release_neutral();").count(), 1);
+        assert!(
+            !rejected[..rejected.find(capture).unwrap()]
+                .contains("discard_retained_request_metadata")
+        );
+    }
+    let breaker = "matchcircuit_breaker_admission{";
+    let at = h3_frontend.find(breaker).unwrap();
+    let (breaker, _) = source_group(h3_frontend, at + breaker.len() - 1).unwrap();
+    let rejected = "Err(())=>{";
+    let at = breaker.find(rejected).unwrap();
+    let (rejected, _) = source_group(breaker, at + rejected.len() - 1).unwrap();
+    let capture = "crate::proxy::apply_retained_upload_rejection_hooks(\
+                   &plugins,&mutctx,prebuffered_body_data.as_mut(),";
+    assert!(
+        rejected.find(capture).unwrap()
+            < rejected.find("run_h3_deadline_bounded_reject_committed_hooks(").unwrap()
+    );
+    assert!(rejected.contains("log_rejected_request("));
+    assert!(rejected.contains("send_h3_plugin_reject_flavor_aware("));
+    let shared = function_body(&h1, "pub(crate)asyncfnapply_retained_upload_rejection_hooks(");
+    assert!(
+        shared.find("retire_retained_request_body_for_rejection(body,ctx);").unwrap()
+            < shared.find("apply_replaceable_after_proxy_hooks_to_rejection(").unwrap()
+    );
+}
+
+/// Raw uploads belong to request-capture/shaping hooks, never to committed
+/// observers, detached logging, or a stalled terminal transport write.
+#[test]
 fn short_circuit_request_capture_and_retirement_have_frontend_parity() {
     use super::http3_server_dispatch_tests::compact_code;
     use super::native_grpc_dispatch_auth_lifetime_tests::{direct_source_statement, source_group};

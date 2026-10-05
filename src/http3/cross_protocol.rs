@@ -677,10 +677,11 @@ fn cross_protocol_header_write_disconnect_outcome(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_cross_protocol_backend_admission_or_reject<S>(
+pub(crate) async fn run_cross_protocol_backend_admission_or_reject<S>(
     backend_admission_plugins: &[Arc<dyn Plugin>],
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
+    retained_body: Option<&mut Bytes>,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     flavor: HttpFlavor,
@@ -716,9 +717,10 @@ where
                 drop(slot.take());
             }
             let mut headers = rejection.headers;
-            crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+            crate::proxy::apply_retained_upload_rejection_hooks(
                 plugins,
                 ctx,
+                retained_body,
                 &mut rejection.status_code,
                 &mut rejection.body,
                 &mut headers,
@@ -3503,7 +3505,7 @@ where
 
     let (response, bytes_sent, mut backend_admission_permits, backend_admission_elapsed) =
         match prebuffered_body {
-            Some(buffered_body) => {
+            Some(mut buffered_body) => {
                 let bytes_sent = raw_prebuffered_body_bytes;
                 let mut attempt = 0u32;
                 let final_backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -3580,6 +3582,7 @@ where
                                 backend_admission_plugins,
                                 plugins,
                                 ctx,
+                                Some(&mut buffered_body),
                                 dispatch_proxy,
                                 current_target.as_deref(),
                                 policy_flavor,
@@ -4777,6 +4780,7 @@ where
                         backend_admission_plugins,
                         plugins,
                         ctx,
+                        None,
                         dispatch_proxy,
                         current_target.as_deref(),
                         policy_flavor,
@@ -8314,17 +8318,7 @@ where
         ctx,
         requires_response_body_buffering,
     );
-    let body_bytes = body;
-    let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry {
-        (
-            hmap.clone(),
-            body_bytes.clone(),
-            Some(hmap),
-            Some(body_bytes),
-        )
-    } else {
-        (hmap, body_bytes, None, None)
-    };
+    let mut body_bytes = body;
     let mut backend_admission_start = Instant::now();
     let mut backend_admission_permits =
         if let Some(permits) = preacquired_backend_admission.take_if_acquired() {
@@ -8334,6 +8328,7 @@ where
                 backend_admission_plugins,
                 plugins,
                 ctx,
+                Some(&mut body_bytes),
                 proxy,
                 current_target.as_deref(),
                 HttpFlavor::Grpc,
@@ -8351,6 +8346,18 @@ where
                 Err(outcome) => return Ok(outcome),
             }
         };
+    // Clone replay state only after admission succeeds. A rejection has one
+    // caller-owned upload to retire before capture, observers and the writer.
+    let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry {
+        (
+            hmap.clone(),
+            body_bytes.clone(),
+            Some(hmap),
+            Some(body_bytes),
+        )
+    } else {
+        (hmap, body_bytes, None, None)
+    };
     // Held for the whole dispatch: its drop is the one least-connections
     // release for the current attempt (issue #5693).
     let mut lb_connection_guard = None;
@@ -8401,7 +8408,7 @@ where
 
     if grpc_has_retry
         && let Some(retry_config) = &proxy.retry
-        && let (Some(hmap), Some(body_bytes)) = (retry_hmap, retry_body)
+        && let (Some(hmap), Some(mut body_bytes)) = (retry_hmap, retry_body)
     {
         let route_retry_ceiling = crate::proxy::route_retry_ceiling(proxy).unwrap_or(0);
         let mut attempt = 0u32;
@@ -8589,6 +8596,7 @@ where
                 backend_admission_plugins,
                 plugins,
                 ctx,
+                Some(&mut body_bytes),
                 proxy,
                 current_target.as_deref(),
                 HttpFlavor::Grpc,
@@ -9967,6 +9975,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         backend_admission_plugins,
         plugins,
         ctx,
+        None,
         proxy,
         current_target.as_deref(),
         HttpFlavor::Grpc,

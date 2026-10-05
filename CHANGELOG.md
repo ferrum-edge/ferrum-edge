@@ -26,8 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   types and undecided triggers retain conservative admission.
   Completed short-circuit uploads remain available through existing audit
   capture hooks, including non-UTF-8 native gRPC and peer-redacted request views.
-  Their retained admission is released before committed observers, logging or
-  terminal transport waits; H1/H2 and H3 share that lifecycle boundary.
+  Circuit-breaker and backend-admission rejection callers now retire their
+  separate transport/replay owners through that capture handoff, including
+  collected/transformed native-gRPC bodies and H3 bridge retries. Completed
+  generic attempts also retire redundant replay handoff witnesses. When the
+  ordered capture hooks complete, context-owned uploads retire before committed
+  observers, logging or terminal transport waits. A pending reject-path hook
+  detached on deadline expiry can still retain a raw context clone through the
+  existing bounded cleanup period; review5 P2 remains unresolved. This boundary
+  concerns those upload owners, not whole-process RSS or independently live
+  clones. No complete-remediation claim is made.
   ferrum-contracts parity is required for the next qualified release.
 
 ## [0.9.11] - 2026-10-04

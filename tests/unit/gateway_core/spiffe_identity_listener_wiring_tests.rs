@@ -80,7 +80,7 @@ fn h3_connection_shares_spiffe_cache_with_request_contexts() {
     let request_handler = source_section(
         source,
         "async fn handle_h3_request(",
-        "\nasync fn run_h3_backend_admission_or_send_reject(",
+        "\npub(crate) async fn run_h3_backend_admission_or_send_reject(",
     );
     assert!(
         compact_whitespace(request_handler)

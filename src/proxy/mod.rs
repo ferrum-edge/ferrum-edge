@@ -3797,6 +3797,38 @@ enum ClientRequestBody {
     Buffered(Box<BufferedClientRequestBody>),
 }
 
+/// The terminal caller moves every transport/replay owner here. Retirement is
+/// synchronous in the admission finalizer, before any capture hook can wait.
+enum RejectedUpload {
+    None,
+    Client(ClientRequestBody),
+    Retained(Bytes),
+    NativeGrpc {
+        collected: Bytes,
+        transformed: Bytes,
+    },
+}
+
+impl RejectedUpload {
+    fn retire(self, ctx: &mut RequestContext) {
+        match self {
+            Self::None => {}
+            Self::Client(mut body) => retire_client_request_body_for_rejection(&mut body, ctx),
+            Self::Retained(body) => retain_charged_request_metadata_on_rejection(ctx, body),
+            Self::NativeGrpc {
+                collected,
+                transformed,
+            } => {
+                drop(transformed);
+                retain_charged_request_metadata_on_rejection(ctx, collected);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // The binary omits lib::_test_support; external tests use this fixture.
+pub(crate) mod retained_upload_rejection_test_support;
+
 /// Request body representation accepted by the secured mesh transports.
 ///
 /// The ordinary fast path keeps streaming the frontend body. Retry-enabled or
@@ -3899,6 +3931,16 @@ pub(crate) fn retain_charged_request_metadata_on_rejection(
             _charged_body: charged_body,
         }));
     }
+}
+
+/// Terminal-only handoff of a caller's collected or transformed upload. Keep
+/// the existing capture view and its charge, but leave no transport/replay owner
+/// in the caller while rejection hooks, committed observers or writers wait.
+pub(crate) fn retire_retained_request_body_for_rejection(
+    body: &mut Bytes,
+    ctx: &mut RequestContext,
+) {
+    retain_charged_request_metadata_on_rejection(ctx, std::mem::take(body));
 }
 
 enum RequestBodyBufferError {
@@ -15890,6 +15932,7 @@ async fn handle_websocket_request_authenticated(
                 cb_probe.release_neutral();
                 let response = handle_backend_admission_rejection(
                     rejection,
+                    RejectedUpload::None,
                     &plugins,
                     &mut ctx,
                     &state,
@@ -25207,6 +25250,31 @@ pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
     .await;
 }
 
+/// H3 admission and breaker terminals own their upload outside the context.
+/// Transfer that owner before the real ordered capture hooks run. The reject
+/// committed delegate retires the context view after capture, before observers
+/// or a transport write. Admission success never calls this terminal helper.
+pub(crate) async fn apply_retained_upload_rejection_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    retained_body: Option<&mut Bytes>,
+    status_code: &mut u16,
+    response_body: &mut Bytes,
+    response_headers: &mut HashMap<String, String>,
+) {
+    if let Some(body) = retained_body {
+        retire_retained_request_body_for_rejection(body, ctx);
+    }
+    apply_replaceable_after_proxy_hooks_to_rejection(
+        plugins,
+        ctx,
+        status_code,
+        response_body,
+        response_headers,
+    )
+    .await;
+}
+
 /// Reject-path `after_proxy` over a charged backend deadline terminal (#5744):
 /// a deadline the backend was charged for (`Backend deadline exceeded`), which
 /// is written after that deadline passed. Every hook is bounded as over the
@@ -31020,6 +31088,7 @@ async fn finalize_terminal_request_body_read_rejection(
 #[allow(clippy::too_many_arguments)]
 async fn handle_backend_admission_rejection(
     rejection: backend_dispatch::BackendAdmissionRejection,
+    upload: RejectedUpload,
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     state: &ProxyState,
@@ -31029,6 +31098,7 @@ async fn handle_backend_admission_rejection(
     is_grpc_request: bool,
     grpc_web_error_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
+    upload.retire(ctx);
     let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
@@ -31519,6 +31589,7 @@ fn boxed_finalize_upload_deadline_rejection<'a>(
 #[inline(never)]
 fn boxed_handle_backend_admission_rejection<'a>(
     rejection: backend_dispatch::BackendAdmissionRejection,
+    upload: RejectedUpload,
     plugins: &'a [Arc<dyn Plugin>],
     ctx: &'a mut RequestContext,
     state: &'a ProxyState,
@@ -31530,6 +31601,7 @@ fn boxed_handle_backend_admission_rejection<'a>(
 ) -> BoxedRejectionResponseFuture<'a> {
     Box::pin(handle_backend_admission_rejection(
         rejection,
+        upload,
         plugins,
         ctx,
         state,
@@ -36525,6 +36597,7 @@ async fn handle_proxy_request_inner(
                     cb_probe.release_neutral();
                     return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
+                        RejectedUpload::Client(client_request_body),
                         &plugins,
                         &mut ctx,
                         &state,
@@ -37622,6 +37695,10 @@ async fn handle_proxy_request_inner(
                     cb_probe.release_neutral();
                     return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
+                        RejectedUpload::NativeGrpc {
+                            collected: collected_grpc_req_body,
+                            transformed: grpc_req_body,
+                        },
                         &plugins,
                         &mut ctx,
                         &state,
@@ -37794,8 +37871,10 @@ async fn handle_proxy_request_inner(
                         // the other admission paths (see the split-path branch above).
                         // Taking the slot is what stops the guard's Drop repeating it.
                         cb_probe.release_neutral();
+                        drop(request);
                         return Ok(boxed_handle_backend_admission_rejection(
                             rejection,
+                            RejectedUpload::None,
                             &plugins,
                             &mut ctx,
                             &state,
@@ -37940,6 +38019,7 @@ async fn handle_proxy_request_inner(
                                     cb_probe.release_neutral();
                                     return Ok(boxed_handle_backend_admission_rejection(
                                         rejection,
+                                        RejectedUpload::Retained(grpc_req_body),
                                         &plugins,
                                         &mut ctx,
                                         &state,
@@ -38465,6 +38545,7 @@ async fn handle_proxy_request_inner(
                         cb_probe.release_neutral();
                         return Ok(boxed_handle_backend_admission_rejection(
                             rejection,
+                            RejectedUpload::Retained(grpc_body_bytes),
                             &plugins,
                             &mut ctx,
                             &state,
@@ -41178,7 +41259,10 @@ async fn handle_proxy_request_inner(
             initial_attempt_span.handed_off_at(backend_admission_started_at);
         }
         let initial_dispatch = match initial_attempt {
-            Ok(dispatch) => dispatch,
+            Ok(dispatch) => {
+                drop(initial_attempt_handoff);
+                dispatch
+            }
             Err(expiry) => route_deadline_dispatch_result(
                 expiry,
                 initial_attempt_handoff,
@@ -41242,6 +41326,7 @@ async fn handle_proxy_request_inner(
                 // gRPC reject instead of HTTP/JSON.
                 return Ok(boxed_handle_backend_admission_rejection(
                     rejection,
+                    RejectedUpload::None,
                     &plugins,
                     &mut ctx,
                     &state,
@@ -41767,6 +41852,7 @@ async fn handle_proxy_request_inner(
                     // gRPC-flavored requests (see the initial-dispatch arm).
                     return Ok(boxed_handle_backend_admission_rejection(
                         rejection,
+                        retained_body.map_or(RejectedUpload::None, RejectedUpload::Retained),
                         &plugins,
                         &mut ctx,
                         &state,
@@ -42030,7 +42116,10 @@ async fn handle_proxy_request_inner(
             dispatch_attempt_span.handed_off_at(backend_admission_started_at);
         }
         let dispatch = match dispatch_attempt {
-            Ok(dispatch) => dispatch,
+            Ok(dispatch) => {
+                drop(dispatch_attempt_handoff);
+                dispatch
+            }
             Err(expiry) => route_deadline_dispatch_result(
                 expiry,
                 dispatch_attempt_handoff,
@@ -42090,6 +42179,7 @@ async fn handle_proxy_request_inner(
                 // gRPC-flavored requests (see the initial-dispatch arm).
                 return Ok(boxed_handle_backend_admission_rejection(
                     rejection,
+                    RejectedUpload::None,
                     &plugins,
                     &mut ctx,
                     &state,

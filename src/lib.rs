@@ -14840,6 +14840,94 @@ pub mod _test_support {
     /// released when the last clone drops (issue #4231).
     pub struct RequestBufferPermitProbe(crate::proxy::response_buffer_budget::RequestBufferPermit);
 
+    /// Own the exact transport representations moved by admission callers into
+    /// the production H1/H2 finalizer, including the separate gRPC replacement.
+    pub struct RejectedUploadForTest(crate::proxy::retained_upload_rejection_test_support::Upload);
+
+    impl RejectedUploadForTest {
+        pub fn buffered(body: Vec<u8>, permit: RequestBufferPermitProbe) -> Self {
+            use crate::proxy::retained_upload_rejection_test_support::Upload;
+
+            Self(Upload::buffered(body, permit.0))
+        }
+
+        pub fn retained(body: bytes::Bytes) -> Self {
+            use crate::proxy::retained_upload_rejection_test_support::Upload;
+
+            Self(Upload::retained(body))
+        }
+
+        pub fn native_grpc(collected: bytes::Bytes, transformed: bytes::Bytes) -> Self {
+            use crate::proxy::retained_upload_rejection_test_support::Upload;
+
+            Self(Upload::native_grpc(collected, transformed))
+        }
+
+        pub async fn finalize(
+            self,
+            plugins: &[Arc<dyn crate::plugins::Plugin>],
+            ctx: &mut crate::plugins::RequestContext,
+            state: &crate::proxy::ProxyState,
+            grpc: bool,
+        ) -> hyper::Response<crate::proxy::body::ProxyBody> {
+            self.0.finalize(plugins, ctx, state, grpc).await
+        }
+    }
+
+    /// Actual H3 admission rejection runners and writers, with caller-owned
+    /// charged bytes still present when admission is attempted. Tests supply a
+    /// real QUIC stream so a blocked observer or write retains the caller frame.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_h3_retained_admission_for_test(
+        bridge: bool,
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        admission_plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        upload: &mut bytes::Bytes,
+        stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
+    ) -> Result<bool, anyhow::Error> {
+        let probe = crate::proxy::HalfOpenProbeGuard::new(state, proxy, None, false);
+        if bridge {
+            return crate::http3::cross_protocol::run_cross_protocol_backend_admission_or_reject(
+                admission_plugins,
+                plugins,
+                ctx,
+                Some(upload),
+                proxy,
+                None,
+                crate::config::types::HttpFlavor::Plain,
+                stream,
+                std::time::Instant::now(),
+                0,
+                state,
+                &probe,
+                None,
+            )
+            .await
+            .map(|outcome| outcome.is_err());
+        }
+        crate::http3::server::run_h3_backend_admission_or_send_reject(
+            admission_plugins,
+            plugins,
+            ctx,
+            Some(upload),
+            proxy,
+            None,
+            crate::config::types::HttpFlavor::Plain,
+            None,
+            &[],
+            stream,
+            state,
+            std::time::Instant::now(),
+            0,
+            &probe,
+        )
+        .await
+        .map(|outcome| outcome.is_err())
+    }
+
     impl RequestBufferPermitProbe {
         /// Capacity this claim currently holds, in whole reservation blocks.
         pub fn reserved_bytes(&self) -> usize {

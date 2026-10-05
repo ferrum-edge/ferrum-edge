@@ -6143,9 +6143,10 @@ async fn handle_h3_request(
                     br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                 );
                 let mut rej_headers = crate::proxy::circuit_breaker_open_reject_headers();
-                crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+                crate::proxy::apply_retained_upload_rejection_hooks(
                     &plugins,
                     &mut ctx,
+                    prebuffered_body_data.as_mut(),
                     &mut reject_status,
                     &mut reject_body,
                     &mut rej_headers,
@@ -6282,6 +6283,7 @@ async fn handle_h3_request(
                 backend_admission_plugins.as_ref(),
                 &plugins,
                 &mut ctx,
+                prebuffered_body_data.as_mut(),
                 &proxy,
                 upstream_target.as_deref(),
                 http_flavor,
@@ -7452,6 +7454,7 @@ async fn handle_h3_request(
             backend_admission_plugins.as_ref(),
             &plugins,
             &mut ctx,
+            prebuffered_body_data.as_mut(),
             &proxy,
             upstream_target.as_deref(),
             http_flavor,
@@ -9170,6 +9173,7 @@ async fn handle_h3_request(
                 backend_admission_plugins.as_ref(),
                 &plugins,
                 &mut ctx,
+                Some(&mut body_data),
                 &proxy,
                 upstream_target.as_deref(),
                 http_flavor,
@@ -9902,6 +9906,7 @@ async fn handle_h3_request(
                     backend_admission_plugins.as_ref(),
                     &plugins,
                     &mut ctx,
+                    Some(&mut body_data),
                     &proxy,
                     current_target.as_deref(),
                     http_flavor,
@@ -11002,10 +11007,11 @@ async fn run_h3_backend_path_plugins_or_send_reject(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_h3_backend_admission_or_send_reject(
+pub(crate) async fn run_h3_backend_admission_or_send_reject(
     backend_admission_plugins: &[Arc<dyn Plugin>],
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
+    retained_body: Option<&mut Bytes>,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     flavor: HttpFlavor,
@@ -11035,9 +11041,10 @@ async fn run_h3_backend_admission_or_send_reject(
             // the slot is freed even when the reject write fails.
             cb_probe.release_neutral();
             let mut headers = rejection.headers;
-            crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+            crate::proxy::apply_retained_upload_rejection_hooks(
                 plugins,
                 ctx,
+                retained_body,
                 &mut rejection.status_code,
                 &mut rejection.body,
                 &mut headers,
@@ -14276,6 +14283,7 @@ async fn dispatch_grpc_native_h3(
         backend_admission_plugins,
         plugins,
         ctx,
+        None,
         proxy,
         upstream_target,
         HttpFlavor::Grpc,
