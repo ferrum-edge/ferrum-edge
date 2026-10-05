@@ -13337,6 +13337,14 @@ components:
         `enabled` is true or omitted, matching admin admission. `PUT
         /plugins/config/{id}` uses `PluginConfigReplace` instead — an `allOf`
         onto `PluginConfig` cannot relax that schema's required `enabled`.
+        Draft terminal composition admission also requires an explicit available
+        declaration for every effective HTTP/gRPC/gRPC-Web rejection or ordinary
+        charged non-replacer participant, compatible preparation/cursor facts,
+        at most 64 participants, 2 MiB control and 32 MiB synchronous workspace.
+        Unknown or unmigrated terminal implementations refuse the whole enabled
+        candidate with HTTP 400; no reduced chain is committed. This runtime
+        composition gate is shared with full/incremental cache preparation and
+        cannot be represented by this individual plugin-config schema.
       allOf:
         - $ref: "#/components/schemas/PluginConfigBase"
         - type: object
@@ -13357,6 +13365,9 @@ components:
         must be sent explicitly because its default is true and an omitted key
         would re-enable a deliberately disabled configuration. Plugin-specific
         construction constraints apply only when `enabled` is true.
+        Enabled candidates also use the complete terminal composition refusal
+        gate described by PluginConfigCreate, including undeclared/unavailable
+        participants, dependency compatibility and fixed capacity ceilings.
       allOf:
         - $ref: "#/components/schemas/PluginConfigBase"
         - type: object
@@ -29063,7 +29074,7 @@ components:
     SecurityHeadersConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, `config` must be an object, and `set` rejects protocol-managed hop-by-hop / framing destinations (`remove` of those names remains allowed). An effective policy that sets and removes nothing is rejected."
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, `config` must be an object, and `set` rejects protocol-managed hop-by-hop / framing destinations (`remove` of those names remains allowed). An effective policy that sets and removes nothing is rejected. Draft terminal composition additionally refuses policies exceeding 64 combined set/remove actions, 256 UTF-8 bytes per field name, 16384 bytes per value, or 65536 bytes of prepared output (owned name/value bytes plus 128 bytes per action and 1024 bytes overhead, rounded to 1024). This is a whole-chain publication refusal, not omission of the configured security policy; the aggregate cannot be expressed by this individual schema."
       not:
         allOf:
           - required: [content_type_options]

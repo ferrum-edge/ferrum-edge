@@ -633,10 +633,14 @@ pub(crate) fn should_replace_sender_on_resolve(
     elapsed >= interval && current_addr != Some(new_addr)
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for UdpLogging {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

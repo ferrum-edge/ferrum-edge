@@ -273,10 +273,14 @@ fn json_type_name(value: &Value) -> &'static str {
 /// Plugin priority: runs early in pre-processing (before auth).
 pub const BOT_DETECTION_PRIORITY: u16 = super::priority::BOT_DETECTION;
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for BotDetection {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

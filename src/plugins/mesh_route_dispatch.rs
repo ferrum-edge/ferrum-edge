@@ -2057,10 +2057,14 @@ fn compile_header_matchers(
     Ok(compiled)
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for MeshRouteDispatch {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn early_route_total_participant(&self) -> bool {

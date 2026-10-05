@@ -517,10 +517,14 @@ fn is_host_any_port_entry(entry: &str) -> bool {
     split_registry_host_any_port(entry).is_some()
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for OutboundRegistry {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

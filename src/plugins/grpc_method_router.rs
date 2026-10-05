@@ -613,10 +613,14 @@ fn grpc_json_error_body(message: String) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for GrpcMethodRouter {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

@@ -62,6 +62,8 @@ pub struct ProxyBody {
     /// Dropped when hyper finishes sending the body (or the connection closes),
     /// decrementing `OverloadState.active_requests`.
     _request_guard: Option<crate::overload::RequestGuard>,
+    _terminal_preparation_ticket:
+        Option<Arc<crate::plugins::terminal_preparation::ControlReservation<'static>>>,
     /// Dropped when a reqwest-backed response body finishes, so the
     /// runtime port-pressure estimate tracks streaming backend sockets too.
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
@@ -848,6 +850,7 @@ impl ProxyBody {
         Self {
             kind: ProxyBodyKind::Full(Full::new(data.into())),
             _request_guard: None,
+            _terminal_preparation_ticket: None,
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _frontend_stream: None,
@@ -881,6 +884,7 @@ impl ProxyBody {
         Self {
             kind: ProxyBodyKind::Full(Full::default()),
             _request_guard: None,
+            _terminal_preparation_ticket: None,
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _frontend_stream: None,
@@ -1076,8 +1080,16 @@ impl ProxyBody {
         }
     }
 
-    /// Attach a [`RequestGuard`] to this body so the `active_requests`
-    /// counter stays incremented until hyper finishes sending the response.
+    /// Keep the shared admission ticket alive through the response lifetime.
+    pub(crate) fn with_terminal_preparation_ticket(
+        mut self,
+        ticket: Option<Arc<crate::plugins::terminal_preparation::ControlReservation<'static>>>,
+    ) -> Self {
+        self._terminal_preparation_ticket = ticket;
+        self
+    }
+
+    /// Attach a [`RequestGuard`] until hyper finishes sending the response.
     pub fn with_request_guard(mut self, guard: crate::overload::RequestGuard) -> Self {
         self._request_guard = Some(guard);
         self
@@ -1643,6 +1655,7 @@ impl ProxyBody {
         Self {
             kind: ProxyBodyKind::Stream(body),
             _request_guard: None,
+            _terminal_preparation_ticket: None,
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _frontend_stream: None,

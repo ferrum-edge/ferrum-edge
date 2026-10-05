@@ -429,10 +429,14 @@ pub(crate) fn is_native_grpc_request(ctx: &RequestContext) -> bool {
     ctx.is_native_grpc_request()
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for FaultInjectionPlugin {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

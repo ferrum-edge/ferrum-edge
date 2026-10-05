@@ -421,15 +421,29 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 
 ### Capability Methods
 
-The staged rejection-preparation API adds `terminal_declaration()`, defaulting
-to `TerminalDeclaration::Undeclared` even when `after_proxy` is inherited.
-`PureNoop` explicitly describes an implementation with no terminal action;
-`Prepared` describes finite C/O/W and typed preparation/cursor dependencies.
-A declaration does not authorize an adapter calling the old async hook, nor
-prove raw-free operation ownership. Runtime terminal admission and the custom
-prepared-operation/result API remain incomplete; the ordinary lifecycle below
-still executes through the existing hooks. See the exact
-[implementation status](docs/rejection_preparation_implementation.md).
+The draft rejection-preparation API defaults `terminal_declaration()` to
+`TerminalDeclaration::Undeclared`, even for an inherited no-op. Effective HTTP
+R/C chains refuse undeclared participants during complete composition admission;
+a plugin name cannot confer built-in trust. `PureNoop` authorizes only Noop.
+
+An immediate prepared implementation declares finite C/O/W and typed dependency
+facts, opts into `terminal_preparation_available()`, and implements synchronous
+`prepare_terminal(&mut ReachedRequestView)`. Build fields with `view.patch()`:
+its output credit is private and comes from the admitted declaration. Return a
+closed `PreparedTerminalOp`; core uses the pinned generation, prepares all participants before consuming
+operations once in order and retiring context body/text/collector/decode views.
+See [`ExamplePlugin`](custom_plugins/examples/example_plugin.rs) for two bounded
+fields. The ordinary successful-response `after_proxy` lifecycle is unchanged.
+
+Arbitrary futures, closures, plugin/context handles and raw bodies cannot be
+stored in an operation. External terminal I/O needs a reviewed bounded core
+variant; it cannot adapt the old async hook. Trigger wrappers freeze decisions
+during synchronous preparation. All R/C participants prepare even when response actions are suppressed.
+`view.action_allowed()` reports the action gate: one-shot response state must
+remain unconsumed when it is false, while capture still prepares. This infrastructure does not implement audit.
+The API and runtime remain a draft subset; audits, limiter/Redis, additional
+active hooks and hosted qualification are pending. See the exact
+[completed/remaining inventory](docs/rejection_preparation_implementation.md).
 
 | Method | Default | Description |
 |--------|---------|-------------|

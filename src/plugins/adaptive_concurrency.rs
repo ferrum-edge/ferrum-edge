@@ -69,9 +69,13 @@ pub(crate) fn parse_config_value(config: &Value) -> Result<AdaptiveConcurrencyCo
     parse_config(object)
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 impl Plugin for AdaptiveConcurrency {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

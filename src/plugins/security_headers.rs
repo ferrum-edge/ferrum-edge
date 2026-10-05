@@ -144,6 +144,55 @@ impl Plugin for SecurityHeaders {
         HTTP_FAMILY_PROTOCOLS
     }
 
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        use super::terminal_preparation::{
+            MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_PATCH_ACTIONS, TerminalDeclaration,
+            field_declaration,
+        };
+        let fields = self.set.len() + self.remove.len();
+        let owned: usize = self
+            .set
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum::<usize>()
+            + self.remove.iter().map(String::len).sum::<usize>();
+        let required = owned.saturating_add(fields.saturating_mul(128).saturating_add(1024));
+        if fields > MAX_PATCH_ACTIONS
+            || required > 65_536
+            || self.set.iter().any(|(name, value)| {
+                name.len() > MAX_FIELD_NAME_BYTES || value.len() > MAX_FIELD_VALUE_BYTES
+            })
+            || self.remove.iter().any(|name| name.len() > MAX_FIELD_NAME_BYTES)
+        {
+            // Whole-chain composition refusal, never constructor quarantine
+            // that would silently omit the configured security participant.
+            return TerminalDeclaration::Undeclared;
+        }
+        field_declaration(1024, required.div_ceil(1024) * 1024)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        use super::terminal_preparation::PreparedTerminalOp;
+        let mut patch = view.patch(self.set.len() + self.remove.len())?;
+        for name in &self.remove {
+            patch.remove(name)?;
+        }
+        for (name, value) in &self.set {
+            patch.set_policy(name, value, self.override_existing)?;
+        }
+        Ok(PreparedTerminalOp::Fields(patch))
+    }
+
     async fn after_proxy(
         &self,
         _ctx: &mut RequestContext,

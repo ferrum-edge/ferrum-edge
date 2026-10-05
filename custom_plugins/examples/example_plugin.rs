@@ -261,6 +261,42 @@ impl Plugin for ExamplePlugin {
         PluginResult::Continue
     }
 
+    fn terminal_declaration(&self) -> crate::plugins::TerminalDeclaration {
+        use crate::plugins::terminal_preparation::{MAX_FIELD_NAME_BYTES, field_declaration};
+        let name_bytes = self.correlation_header_name.as_ref().map_or(0, String::len);
+        let fields = 1 + usize::from(self.correlation_header_name.is_some());
+        let output = self
+            .header_value
+            .len()
+            .saturating_mul(fields)
+            .saturating_add(name_bytes)
+            .saturating_add(1024);
+        if name_bytes > MAX_FIELD_NAME_BYTES || output > 16_384 {
+            return crate::plugins::TerminalDeclaration::Undeclared;
+        }
+        field_declaration(1024, 16_384)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut crate::plugins::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        crate::plugins::terminal_preparation::PreparedTerminalOp,
+        crate::plugins::terminal_preparation::TerminalAdmissionError,
+    > {
+        use crate::plugins::terminal_preparation::PreparedTerminalOp;
+        let mut patch = view.patch(2)?;
+        patch.set("x-custom-gateway", &self.header_value, true)?;
+        if let Some(name) = &self.correlation_header_name {
+            patch.set(name, &self.header_value, true)?;
+        }
+        Ok(PreparedTerminalOp::Fields(patch))
+    }
+
     /// Called after the backend response is received.
     /// Use this to add/modify response headers sent to the client.
     async fn after_proxy(

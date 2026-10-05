@@ -812,3 +812,454 @@ fn auth_macro_noop_declaration_is_backed_by_every_current_expansion() {
         assert!(!source.contains("async fn after_proxy("));
     }
 }
+
+struct ImmediateDecorator {
+    prepared: Arc<std::sync::atomic::AtomicUsize>,
+    reject_gate: bool,
+    replacement: bool,
+    capture: bool,
+    value: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for ImmediateDecorator {
+    fn name(&self) -> &str {
+        "typed_decorator"
+    }
+
+    fn priority(&self) -> u16 {
+        1
+    }
+
+    fn terminal_declaration(&self) -> TerminalDeclaration {
+        ferrum_edge::plugins::terminal_preparation::field_declaration(1024, 1024)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.reject_gate
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        self.replacement
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut ferrum_edge::plugins::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        ferrum_edge::plugins::terminal_preparation::PreparedTerminalOp,
+        ferrum_edge::plugins::terminal_preparation::TerminalAdmissionError,
+    > {
+        if self.replacement && !view.action_allowed() && !self.capture {
+            return Ok(ferrum_edge::plugins::terminal_preparation::PreparedTerminalOp::Noop);
+        }
+        self.prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(view.context.request_body_bytes.as_deref(), Some(&b"reached"[..]));
+        let mut patch = view.patch(1)?;
+        patch.set("x-ordered", self.value, true)?;
+        Ok(ferrum_edge::plugins::terminal_preparation::PreparedTerminalOp::Fields(patch))
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _status: u16,
+        _headers: &mut HashMap<String, String>,
+    ) -> ferrum_edge::plugins::PluginResult {
+        panic!("typed terminal execution must never call the old async hook")
+    }
+}
+
+fn pin_actual_chain(plugins: &[Arc<dyn Plugin>], ctx: &mut RequestContext) {
+    let manifest = ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest(plugins)
+        .unwrap();
+    Arc::new(manifest).pin(ctx).unwrap();
+}
+
+fn reached_context() -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/terminal".to_string(),
+    );
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"reached"));
+    ctx.metadata
+        .insert("request_body".to_string(), "reached".to_string());
+    ctx
+}
+
+struct RetainedRawOwner {
+    bytes: Vec<u8>,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AsRef<[u8]> for RetainedRawOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for RetainedRawOwner {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn complete_preparation_precedes_ordered_once_only_actions_and_retires_raw_context_views() {
+    use ferrum_edge::plugins::terminal_preparation::{
+        PreparedTerminalChain, TerminalResult, apply_terminal_patch,
+    };
+    let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = ["first", "second"]
+        .into_iter()
+        .map(|value| {
+            Arc::new(ImmediateDecorator {
+                prepared: Arc::clone(&prepared),
+                reject_gate: true,
+                replacement: false,
+                capture: false,
+                value,
+            }) as Arc<dyn Plugin>
+        })
+        .collect();
+    let mut ctx = reached_context();
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    ctx.request_body_bytes = Some(bytes::Bytes::from_owner(RetainedRawOwner {
+        bytes: b"reached".to_vec(),
+        dropped: Arc::clone(&dropped),
+    }));
+    pin_actual_chain(&plugins, &mut ctx);
+    let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
+    assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(ctx.request_body_bytes.is_none());
+    assert!(!ctx.metadata.contains_key("request_body"));
+    // No context or plugin handle is needed by any operation after preparation.
+    drop(ctx);
+    drop(plugins);
+    let mut headers = HashMap::new();
+    for expected in ["first", "second"] {
+        let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
+            panic!("expected the next ordered field patch");
+        };
+        apply_terminal_patch(patch, &mut headers).unwrap();
+        assert_eq!(headers.get("x-ordered").map(String::as_str), Some(expected));
+    }
+    assert!(chain.next_operation().is_none());
+    assert!(chain.next_operation().is_none());
+}
+
+#[test]
+fn charged_default_false_is_prepared_and_suppressed_capture_remains_distinct_from_action() {
+    use ferrum_edge::plugins::terminal_preparation::{PreparedTerminalChain, TerminalResult};
+    for (reject_gate, replacement, capture, expected) in [
+        (false, false, false, 1),
+        (true, true, false, 0),
+        (true, true, true, 1),
+    ] {
+        let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ImmediateDecorator {
+            prepared: Arc::clone(&prepared),
+            reject_gate,
+            replacement,
+            capture,
+            value: "charged",
+        })];
+        let mut ctx = reached_context();
+        pin_actual_chain(&plugins, &mut ctx);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, true).unwrap();
+        assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst), expected);
+        assert!(ctx.request_body_bytes.is_none());
+        if replacement {
+            assert!(matches!(
+                chain.next_operation().unwrap().execute(),
+                TerminalResult::Noop
+            ));
+        } else {
+            assert!(matches!(
+                chain.next_operation().unwrap().execute(),
+                TerminalResult::Fields(_)
+            ));
+        }
+    }
+}
+
+struct MissingOperation;
+
+impl Plugin for MissingOperation {
+    fn name(&self) -> &str {
+        "security_headers"
+    }
+
+    fn priority(&self) -> u16 {
+        1
+    }
+
+    fn terminal_declaration(&self) -> TerminalDeclaration {
+        ferrum_edge::plugins::terminal_preparation::field_declaration(1024, 1024)
+    }
+}
+
+#[test]
+fn actual_chain_refuses_spoof_and_declared_but_unimplemented_operations_without_allocation() {
+    use ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest;
+    for (plugin, reason) in [
+        (
+            Arc::new(SpoofedBuiltin) as Arc<dyn Plugin>,
+            TerminalRefusal::Undeclared,
+        ),
+        (
+            Arc::new(MissingOperation) as Arc<dyn Plugin>,
+            TerminalRefusal::UnimplementedOperation,
+        ),
+    ] {
+        let plugins = [plugin];
+        let (allocation, result) = measure(|| compile_terminal_manifest(&plugins));
+        assert_eq!(allocation, (0, 0));
+        assert_eq!(result.unwrap_err().reason, reason);
+    }
+}
+
+struct OversizedPatch {
+    value: String,
+    zero_credit: bool,
+}
+
+impl Plugin for OversizedPatch {
+    fn name(&self) -> &str {
+        "bounded_custom"
+    }
+
+    fn priority(&self) -> u16 {
+        1
+    }
+
+    fn terminal_declaration(&self) -> TerminalDeclaration {
+        ferrum_edge::plugins::terminal_preparation::field_declaration(
+            1024,
+            if self.zero_credit { 0 } else { 1024 },
+        )
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut ferrum_edge::plugins::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        ferrum_edge::plugins::terminal_preparation::PreparedTerminalOp,
+        ferrum_edge::plugins::terminal_preparation::TerminalAdmissionError,
+    > {
+        let (allocation, patch) = measure(|| view.patch(1));
+        if self.zero_credit {
+            assert_eq!(
+                allocation,
+                (0, 0),
+                "zero credit refuses before action allocation"
+            );
+        }
+        let mut patch = patch?;
+        let (allocation, staged) = measure(|| patch.set("x-bounded", &self.value, true));
+        assert_eq!(
+            allocation,
+            (0, 0),
+            "oversize is checked before copying custom text"
+        );
+        staged?;
+        Ok(ferrum_edge::plugins::terminal_preparation::PreparedTerminalOp::Fields(patch))
+    }
+}
+
+#[test]
+fn failed_preparation_returns_no_operations_and_retires_raw_views_for_zero_or_oversize_credit() {
+    use ferrum_edge::plugins::terminal_preparation::PreparedTerminalChain;
+    for zero_credit in [true, false] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(OversizedPatch {
+            value: "x".repeat(16_385),
+            zero_credit,
+        })];
+        let mut ctx = reached_context();
+        pin_actual_chain(&plugins, &mut ctx);
+        let refused = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false);
+        assert!(refused.is_err());
+        assert!(ctx.request_body_bytes.is_none());
+        assert!(!ctx.metadata.contains_key("request_body"));
+    }
+}
+
+#[test]
+fn a_request_clone_cannot_repeat_terminal_preparation_or_open_another_ticket() {
+    use ferrum_edge::plugins::terminal_preparation::PreparedTerminalChain;
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ImmediateDecorator {
+        prepared: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        reject_gate: true,
+        replacement: false,
+        capture: false,
+        value: "once",
+    })];
+    let mut ctx = reached_context();
+    pin_actual_chain(&plugins, &mut ctx);
+    let chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
+    let mut sibling = ctx.clone();
+    let refused = PreparedTerminalChain::prepare(&plugins, &mut sibling, false, false);
+    assert!(matches!(refused, Err(error) if error.reason == TerminalRefusal::AlreadyPrepared));
+    drop(chain);
+}
+
+#[test]
+fn carrier_checks_retained_capacity_cookie_occurrences_and_exact_field_edges() {
+    use ferrum_edge::plugins::terminal_preparation::validate_terminal_headers;
+    let mut headers = HashMap::new();
+    let mut value = String::with_capacity(CARRIER_OWNED_BYTES + 1);
+    value.push('x');
+    headers.insert("x-capacity".to_string(), value);
+    let (allocation, refused) = measure(|| validate_terminal_headers(&headers));
+    assert_eq!(allocation, (0, 0));
+    assert!(refused.is_err());
+    headers = HashMap::new();
+    headers.insert("set-cookie".to_string(), "x=1\n".repeat(255) + "x=1");
+    assert!(validate_terminal_headers(&headers).is_ok());
+    headers.get_mut("set-cookie").unwrap().push_str("\nx=1");
+    assert!(validate_terminal_headers(&headers).is_err());
+    headers = (0..256)
+        .map(|index| (format!("x-{index}"), "x".to_string()))
+        .collect();
+    assert!(validate_terminal_headers(&headers).is_ok());
+    headers.insert("x-257".to_string(), "x".to_string());
+    assert!(validate_terminal_headers(&headers).is_err());
+}
+
+#[test]
+fn emergency_capacity_profiles_have_exact_native_and_web_wire_shapes() {
+    use base64::Engine;
+    use ferrum_edge::plugins::terminal_preparation::{
+        CAPACITY_GRPC_WEB_BINARY, CAPACITY_GRPC_WEB_TEXT, CAPACITY_HTTP_BODY, CAPACITY_MESSAGE,
+        capacity_wire_parts,
+    };
+    let (status, headers, body) = capacity_wire_parts(false, None, false);
+    assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(body.as_ref(), CAPACITY_HTTP_BODY);
+    assert!(capacity_wire_parts(false, None, true).2.is_empty());
+    let (status, headers, body) = capacity_wire_parts(true, None, false);
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(headers["content-type"], "application/grpc");
+    assert_eq!(headers["grpc-status"], "8");
+    assert_eq!(headers["grpc-message"], CAPACITY_MESSAGE);
+    assert!(body.is_empty());
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(CAPACITY_GRPC_WEB_TEXT)
+        .unwrap();
+    assert_eq!(decoded, CAPACITY_GRPC_WEB_BINARY);
+    assert_eq!(&decoded[..5], &[0x80, 0, 0, 0, 71]);
+    assert_eq!(decoded.len(), 76);
+    for content_type in [
+        "application/grpc-web",
+        "application/grpc-web+proto",
+        "application/grpc-web-text",
+        "application/grpc-web-text+proto",
+    ] {
+        let (status, headers, body) = capacity_wire_parts(false, Some(content_type), false);
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(headers["content-type"], content_type);
+        assert_eq!(headers["x-grpc-web"], "1");
+        assert_eq!(headers["vary"], "Accept");
+        assert_eq!(
+            headers["access-control-expose-headers"],
+            "grpc-status, grpc-message, grpc-status-details-bin"
+        );
+        assert_eq!(
+            body.as_ref(),
+            if content_type.contains("text") {
+                CAPACITY_GRPC_WEB_TEXT
+            } else {
+                CAPACITY_GRPC_WEB_BINARY
+            },
+        );
+        assert!(
+            !headers.contains_key("grpc-status"),
+            "web status is in the DATA trailer frame"
+        );
+    }
+}
+
+#[test]
+fn preparation_refuses_an_unpinned_or_different_actual_generation_before_hook_work() {
+    use ferrum_edge::plugins::terminal_preparation::PreparedTerminalChain;
+    let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let make = || {
+        Arc::new(ImmediateDecorator {
+            prepared: Arc::clone(&prepared),
+            reject_gate: true,
+            replacement: false,
+            capture: false,
+            value: "generation",
+        }) as Arc<dyn Plugin>
+    };
+    let old = [make()];
+    let changed = [make()];
+    let mut ctx = reached_context();
+    let refused = PreparedTerminalChain::prepare(&old, &mut ctx, false, false);
+    assert!(matches!(refused, Err(error) if error.reason == TerminalRefusal::PinnedGeneration));
+    let mut ctx = reached_context();
+    pin_actual_chain(&old, &mut ctx);
+    let refused = PreparedTerminalChain::prepare(&changed, &mut ctx, false, false);
+    assert!(matches!(refused, Err(error) if error.reason == TerminalRefusal::PinnedGeneration));
+    assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(ctx.request_body_bytes.is_none());
+}
+
+
+#[test]
+fn rejection_prepares_charged_only_participant_without_applying_its_response_action() {
+    use ferrum_edge::plugins::terminal_preparation::{PreparedTerminalChain, TerminalResult};
+    let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ImmediateDecorator {
+        prepared: Arc::clone(&prepared),
+        reject_gate: false,
+        replacement: false,
+        capture: false,
+        value: "charged-only",
+    })];
+    let mut ctx = reached_context();
+    pin_actual_chain(&plugins, &mut ctx);
+    let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
+    assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(matches!(
+        chain.next_operation().unwrap().execute(),
+        TerminalResult::Noop
+    ));
+    assert!(ctx.request_body_bytes.is_none());
+}
+
+
+#[test]
+fn a_shared_existing_ticket_cannot_admit_a_rejected_manifest_prefix() {
+    use ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest;
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ImmediateDecorator {
+        prepared: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        reject_gate: true,
+        replacement: false,
+        capture: false,
+        value: "valid",
+    })];
+    let mut ctx = reached_context();
+    pin_actual_chain(&plugins, &mut ctx);
+    let mut rejected = compile_terminal_manifest(&plugins).unwrap();
+    let error = rejected
+        .push(entry(u64::MAX, TerminalDeclaration::Undeclared))
+        .unwrap_err();
+    assert_eq!(error.reason, TerminalRefusal::Undeclared);
+    assert_eq!(Arc::new(rejected).pin(&mut ctx).unwrap_err(), error);
+}

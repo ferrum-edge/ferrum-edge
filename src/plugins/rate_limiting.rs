@@ -1220,6 +1220,43 @@ impl Plugin for RateLimiting {
         PluginResult::Continue
     }
 
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        super::terminal_preparation::field_declaration(4096, 8192)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        use super::terminal_preparation::PreparedTerminalOp;
+        let mut patch = view.patch(4)?;
+        patch.remove(RATE_LIMIT_IDENTITY_HEADER)?;
+        if self.expose_headers {
+            for &(key, name) in EXPOSED_RATELIMIT_HEADERS {
+                if let Some(value) = view.context.metadata.get(key) {
+                    // Source telemetry is numeric; no arbitrary metadata text
+                    // is retained as accounting state in a terminal operation.
+                    if value.parse::<u64>().is_err() {
+                        return Err(super::terminal_preparation::TerminalAdmissionError::new(
+                            super::terminal_preparation::TerminalRefusal::FieldCapacity,
+                            value.len(),
+                            20,
+                        ));
+                    }
+                    patch.set(name, value, true)?;
+                }
+            }
+        }
+        Ok(PreparedTerminalOp::Fields(patch))
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,

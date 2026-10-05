@@ -610,10 +610,14 @@ macro_rules! emit_ws_disconnect_log {
     };
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for WsFrameLogging {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

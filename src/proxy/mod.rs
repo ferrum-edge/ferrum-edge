@@ -24575,66 +24575,6 @@ fn replace_rejection_with_gateway_deadline(
 
 pub(crate) const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct OwnedRejectionHookResult {
-    ctx: RequestContext,
-    status_code: u16,
-    response_body: Option<Bytes>,
-    response_headers: HashMap<String, String>,
-    result: PluginResult,
-}
-
-type OwnedRejectionHookFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = OwnedRejectionHookResult> + Send + 'static>>;
-
-fn owned_rejection_hook_future(
-    plugin: Arc<dyn Plugin>,
-    mut ctx: RequestContext,
-    status_code: u16,
-    response_body: Option<Bytes>,
-    mut response_headers: HashMap<String, String>,
-) -> OwnedRejectionHookFuture {
-    Box::pin(async move {
-        let result = plugin
-            .after_proxy(&mut ctx, status_code, &mut response_headers)
-            .await;
-        OwnedRejectionHookResult {
-            ctx,
-            status_code,
-            response_body,
-            response_headers,
-            result,
-        }
-    })
-}
-
-async fn poll_owned_rejection_hook_once(
-    future: &mut OwnedRejectionHookFuture,
-) -> Option<OwnedRejectionHookResult> {
-    futures_util::future::poll_fn(|cx| {
-        Poll::Ready(match std::future::Future::poll(future.as_mut(), cx) {
-            Poll::Ready(result) => Some(result),
-            Poll::Pending => None,
-        })
-    })
-    .await
-}
-
-fn adopt_owned_rejection_hook_result(
-    outcome: OwnedRejectionHookResult,
-    ctx: &mut RequestContext,
-    status_code: &mut u16,
-    response_body: &mut Option<&mut Bytes>,
-    response_headers: &mut HashMap<String, String>,
-) -> PluginResult {
-    *ctx = outcome.ctx;
-    *status_code = outcome.status_code;
-    if let (Some(body), Some(owned_body)) = (response_body.as_deref_mut(), outcome.response_body) {
-        *body = owned_body;
-    }
-    *response_headers = outcome.response_headers;
-    outcome.result
-}
-
 fn restore_rejection_response_markers(
     ctx: &mut RequestContext,
     previous_marker: Option<String>,
@@ -24657,185 +24597,6 @@ fn restore_rejection_response_markers(
     }
 }
 
-/// Continue ONE `after_proxy` hook still pending after its single poll over a
-/// charged backend deadline terminal (#5744) off the response frame. The
-/// terminal is already decided, so the hook's result and header changes are
-/// discarded and every later hook has already had its own poll; only this
-/// hook's own work continues.
-///
-/// Authorization is never detached past its lifetime: the work runs under the
-/// EARLIEST of the fixed post-response cleanup timeout and the admitted
-/// credential's absolute authorization deadline, enforced as
-/// [`spawn_detached_response_committed_hooks`] enforces it. A hook scheduled
-/// at or after that deadline is dropped without another poll, and a per-poll
-/// clock gate never resumes it at or after the deadline.
-fn spawn_detached_charged_terminal_hook(
-    mut pending_hook: OwnedRejectionHookFuture,
-    authorization_at: Option<tokio::time::Instant>,
-) {
-    std::mem::drop(tokio::spawn(async move {
-        let started_at = tokio::time::Instant::now();
-        let cleanup_at = started_at + DETACHED_REJECTION_CLEANUP_TIMEOUT;
-        let authorization_at = authorization_at.filter(|at| *at < cleanup_at);
-        // PAST-DEADLINE REFUSAL: dropping the hook drops its cloned request
-        // context without polling it again.
-        if authorization_at.is_some_and(|at| started_at >= at) {
-            debug!(
-                "detached charged-terminal hook was refused: the admitted request's \
-                 authorization lifetime had already elapsed when it was scheduled"
-            );
-            return;
-        }
-        let mut guarded = std::future::poll_fn(move |cx| {
-            if authorization_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
-                return Poll::Ready(false);
-            }
-            std::future::Future::poll(pending_hook.as_mut(), cx).map(|_| true)
-        });
-        let deadline_sleep = tokio::time::sleep_until(authorization_at.unwrap_or(cleanup_at));
-        tokio::pin!(deadline_sleep);
-        // Deadline-biased, so a hook that becomes ready in the same wake-up as
-        // the bound loses to it.
-        let completed = tokio::select! {
-            biased;
-            () = &mut deadline_sleep => false,
-            completed = &mut guarded => completed,
-        };
-        if !completed {
-            if authorization_at.is_some() {
-                debug!(
-                    "detached charged-terminal hook was cancelled at the admitted request's \
-                     authorization lifetime"
-                );
-            } else {
-                warn!(
-                    timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
-                    "detached charged-terminal hook exceeded its post-response bound"
-                );
-            }
-        }
-    }));
-}
-
-/// The admitted credential's absolute authorization deadline, which bounds
-/// reject-path cleanup detached at the gateway's own deadline (#5747). `None`
-/// for a request with no authorization plan.
-fn rejection_cleanup_authorization_at(ctx: &RequestContext) -> Option<tokio::time::Instant> {
-    ctx.precommit_response_phase_bound()
-        .authorization_deadline_at()
-}
-
-/// Continue reject-path cleanup off the response frame once the gateway's own
-/// deadline terminal is selected: the pending hook, then every remaining
-/// non-replacing hook in order, on owned state.
-///
-/// Authorization is never detached past its lifetime (#5747): the cleanup runs
-/// under the EARLIEST of the fixed post-response cleanup timeout and the
-/// admitted credential's absolute authorization deadline, enforced as
-/// [`spawn_detached_charged_terminal_hook`] enforces it. Cleanup scheduled at
-/// or after that deadline is dropped without another poll, and a per-poll
-/// clock gate never resumes it at or after the deadline.
-fn spawn_detached_rejection_cleanup(
-    pending_hook: OwnedRejectionHookFuture,
-    remaining_plugins: Vec<Arc<dyn Plugin>>,
-    previous_marker: Option<String>,
-    previous_replaceable_marker: Option<String>,
-    authorization_at: Option<tokio::time::Instant>,
-) {
-    std::mem::drop(tokio::spawn(async move {
-        let started_at = tokio::time::Instant::now();
-        let cleanup_at = started_at + DETACHED_REJECTION_CLEANUP_TIMEOUT;
-        let authorization_at = authorization_at.filter(|at| *at < cleanup_at);
-        // PAST-DEADLINE REFUSAL: dropping the hook drops its cloned request
-        // context without polling it again.
-        if authorization_at.is_some_and(|at| started_at >= at) {
-            debug!(
-                "detached rejection cleanup was refused: the admitted request's \
-                 authorization lifetime had already elapsed when it was scheduled"
-            );
-            return;
-        }
-        let cleanup = async move {
-            let OwnedRejectionHookResult {
-                mut ctx,
-                mut status_code,
-                mut response_body,
-                mut response_headers,
-                result: _,
-            } = pending_hook.await;
-            ctx.mark_gateway_deadline_response_selected();
-            replace_rejection_with_gateway_deadline(
-                &mut ctx,
-                &mut status_code,
-                response_body.as_mut(),
-                &mut response_headers,
-            );
-            for plugin in remaining_plugins {
-                if plugin.may_replace_rejection_response() {
-                    continue;
-                }
-                let _ = plugin
-                    .after_proxy(&mut ctx, status_code, &mut response_headers)
-                    .await;
-            }
-            restore_rejection_response_markers(
-                &mut ctx,
-                previous_marker,
-                previous_replaceable_marker,
-            );
-        };
-        let mut cleanup = Box::pin(cleanup);
-        let mut guarded = std::future::poll_fn(move |cx| {
-            if authorization_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
-                return Poll::Ready(false);
-            }
-            std::future::Future::poll(cleanup.as_mut(), cx).map(|_| true)
-        });
-        let deadline_sleep = tokio::time::sleep_until(authorization_at.unwrap_or(cleanup_at));
-        tokio::pin!(deadline_sleep);
-        // Deadline-biased, so cleanup that becomes ready in the same wake-up as
-        // the bound loses to it.
-        let completed = tokio::select! {
-            biased;
-            () = &mut deadline_sleep => false,
-            completed = &mut guarded => completed,
-        };
-        if !completed {
-            if authorization_at.is_some() {
-                debug!(
-                    "detached rejection cleanup was cancelled at the admitted request's \
-                     authorization lifetime"
-                );
-            } else {
-                warn!(
-                    timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
-                    "detached rejection cleanup exceeded its post-response bound"
-                );
-            }
-        }
-    }));
-}
-
-fn maybe_finalize_route_override_response_headers(
-    plugins: &[Arc<dyn Plugin>],
-    ctx: &mut RequestContext,
-    response_headers: &mut HashMap<String, String>,
-) {
-    if ctx.route_override_response_transform.is_none() {
-        return;
-    }
-    if !plugins
-        .iter()
-        .any(|plugin| plugin.participates_in_route_response_header_finalization())
-    {
-        return;
-    }
-    crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
-        ctx,
-        response_headers,
-    );
-}
-
 /// Whether the reject-path hooks must answer with the gateway's own deadline
 /// terminal: one is already selected, or the RPC deadline in force elapsed. A
 /// charged backend deadline terminal (#5744) never is: its deadline was the
@@ -24853,13 +24614,9 @@ fn rejection_selects_gateway_deadline(
             .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
 }
 
-/// `charged_backend_deadline` selects the charged-terminal mode (#5744): the
-/// rejection is a backend deadline the gateway already charged, written after
-/// that deadline passed, so every hook is bounded as over the gateway deadline
-/// terminal — replacers skipped, one poll for the rest, a pending hook detached
-/// alone while later hooks still get their poll — even with no RPC deadline in
-/// force, and the rejection keeps its wording. A gateway-generated gRPC-Web
-/// error terminal takes the same mode (#5747).
+/// Rejection delegates prepare the whole chain synchronously before consuming
+/// closed response operations. Authoritative terminals suppress replacement
+/// actions. Unsupported I/O/capture/lineage is refused with no old-hook adapter.
 async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -24868,25 +24625,33 @@ async fn run_after_proxy_hooks_on_rejection(
     response_headers: &mut HashMap<String, String>,
     charged_backend_deadline: bool,
 ) {
-    ctx.begin_rejection_deadline_response_header_provenance(response_headers);
+    use crate::plugins::terminal_preparation::{
+        PreparedTerminalChain, TerminalResult, apply_terminal_cookie, apply_terminal_patch,
+        validate_terminal_headers,
+    };
     let previous_replaceable_marker = if response_body.is_some() {
         ctx.metadata.insert(
             REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
             "true".to_string(),
         )
     } else {
-        ctx.metadata
-            .remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY)
+        ctx.metadata.remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY)
     };
     let previous_marker = ctx.metadata.insert(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
-    if let Some(termination) = ctx.authorization_termination() {
-        // Authorization expiry is an authoritative gateway terminal, not a
-        // plugin-authored rejection. Do not construct or poll reject-path
-        // hooks: replacers must not overwrite it, and even non-replacing hooks
-        // must not retain protected request state after the credential expires.
+    if let Some(termination) = ctx
+        .authorization_termination()
+        .or_else(|| ctx.precommit_response_phase_bound().elapsed_authorization())
+    {
+        ctx.retire_terminal_request_views();
+        if validate_terminal_headers(response_headers).is_err()
+            || ctx.enter_typed_terminal_response(true).is_err()
+        {
+            ctx.discard_terminal_header_provenance();
+            *response_headers = HashMap::new();
+        }
         replace_rejection_with_authorization_terminal(
             ctx,
             termination,
@@ -24897,12 +24662,27 @@ async fn run_after_proxy_hooks_on_rejection(
         restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
         return;
     }
-    let initial_terminal_gateway_deadline =
-        rejection_selects_gateway_deadline(ctx, charged_backend_deadline);
-    let last_route_response_finalizer = plugins
-        .iter()
-        .rposition(|plugin| plugin.participates_in_route_response_header_finalization());
-    if initial_terminal_gateway_deadline {
+    if validate_terminal_headers(response_headers).is_err()
+        || ctx.enter_typed_terminal_response(true).is_err()
+    {
+        ctx.retire_terminal_request_views();
+        if !charged_backend_deadline
+            && !ctx.early_upload_terminal_selected()
+            && !ctx.gateway_deadline_response_selected()
+            && !ctx.gateway_capacity_response_selected()
+        {
+            select_terminal_preparation_capacity(
+                ctx,
+                status_code,
+                response_body.as_deref_mut(),
+                response_headers,
+            );
+        }
+        restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
+        return;
+    }
+    let gateway_deadline = rejection_selects_gateway_deadline(ctx, charged_backend_deadline);
+    if gateway_deadline {
         ctx.mark_gateway_deadline_response_selected();
         replace_rejection_with_gateway_deadline(
             ctx,
@@ -24911,19 +24691,53 @@ async fn run_after_proxy_hooks_on_rejection(
             response_headers,
         );
     }
-    for (index, plugin) in plugins.iter().enumerate() {
-        if !plugin.applies_after_proxy_on_reject() {
-            continue;
+    let authoritative = gateway_deadline
+        || charged_backend_deadline
+        || ctx.early_upload_terminal_selected()
+        || ctx.gateway_capacity_response_selected();
+    let prepared = validate_terminal_headers(response_headers).and_then(|()| {
+        PreparedTerminalChain::prepare(plugins, ctx, false, authoritative)
+    });
+    // This boundary executes even when a preparation fails. The chain's RAII
+    // owner drops every unconsumed operation; none has run or started I/O.
+    ctx.retire_terminal_request_views();
+    let Ok(mut chain) = prepared else {
+        if let Some(termination) = ctx.precommit_response_phase_bound().elapsed_authorization() {
+            if !ctx.early_upload_terminal_selected() {
+                replace_rejection_with_authorization_terminal(
+                    ctx,
+                    termination,
+                    status_code,
+                    response_body.as_deref_mut(),
+                    response_headers,
+                );
+            }
+        } else if !authoritative {
+            select_terminal_preparation_capacity(
+                ctx,
+                status_code,
+                response_body.as_deref_mut(),
+                response_headers,
+            );
         }
-        // Decoded semantic-cache hits defer the one transport-planning hook
-        // until final header rules and body policy have accepted the replay.
-        if ctx.semantic_cache_response_replay && plugin.applies_response_transport_encoding() {
-            continue;
+        restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
+        return;
+    };
+    while let Some(operation) = chain.next_operation() {
+        let bound = ctx.precommit_response_phase_bound();
+        if let Some(termination) = bound.elapsed_authorization() {
+            if !ctx.early_upload_terminal_selected() {
+                replace_rejection_with_authorization_terminal(
+                    ctx,
+                    termination,
+                    status_code,
+                    response_body.as_deref_mut(),
+                    response_headers,
+                );
+            }
+            break;
         }
-        let terminal_gateway_deadline =
-            rejection_selects_gateway_deadline(ctx, charged_backend_deadline);
-        let terminal_gateway_capacity = ctx.gateway_capacity_response_selected();
-        if terminal_gateway_deadline {
+        if rejection_selects_gateway_deadline(ctx, charged_backend_deadline) {
             ctx.mark_gateway_deadline_response_selected();
             replace_rejection_with_gateway_deadline(
                 ctx,
@@ -24932,304 +24746,65 @@ async fn run_after_proxy_hooks_on_rejection(
                 response_headers,
             );
         }
-        // Once an earlier phase has selected the canonical client-deadline
-        // response, give non-replacing decorators and cleanup hooks one
-        // immediate poll. Pending work continues in order on owned state under
-        // the detached cleanup bound and cannot retain the response writer.
-        // Response-replacing hooks are skipped after either authoritative
-        // gateway terminal is selected: an already-ready replacer must never
-        // overwrite DEADLINE_EXCEEDED or the retained-response capacity
-        // refusal at the publication boundary. Non-replacing decorators and
-        // cleanup hooks still run. A charged backend deadline terminal
-        // (#5744) is bounded the same way, with or without an RPC deadline in
-        // force.
-        let post_deadline_terminal = terminal_gateway_deadline
-            || charged_backend_deadline
-            || ctx.early_upload_terminal_selected();
-        if (post_deadline_terminal || terminal_gateway_capacity)
-            && plugin.may_replace_rejection_response()
-        {
-            continue;
-        }
-        let result = if post_deadline_terminal {
-            if ctx.early_upload_terminal_selected()
-                && ctx
-                    .precommit_response_phase_bound()
-                    .elapsed_authorization()
-                    .is_some()
-            {
-                // The collector's earlier owner remains authoritative. Do not
-                // poll protected cleanup after a later credential expiry or
-                // relabel this terminal as that later authorization deadline.
-                restore_rejection_response_markers(
-                    ctx,
-                    previous_marker,
-                    previous_replaceable_marker,
-                );
-                return;
+        let result = match operation.execute() {
+            TerminalResult::Noop => Ok(()),
+            TerminalResult::Fields(patch) => apply_terminal_patch(patch, response_headers),
+            TerminalResult::Cookie(cookie) => apply_terminal_cookie(cookie, response_headers),
+            TerminalResult::EmptyBody => {
+                if !authoritative
+                    && !ctx.gateway_deadline_response_selected()
+                    && let Some(body) = response_body.as_deref_mut()
+                {
+                    *body = Bytes::new();
+                    ctx.mark_final_body_policy_terminal_replacement();
+                }
+                Ok(())
             }
-            // A charged terminal composes the credential's lifetime: an elapsed
-            // one answers with the fixed authorization terminal before the hook
-            // is polled, and a pending hook detaches only under it. The gate is
-            // the credential's own deadline, not the winning bound: when an
-            // earlier RPC deadline won the composition, a credential that has
-            // since elapsed still gets no further poll (#5747).
-            let charged_bound =
-                charged_backend_deadline.then(|| ctx.precommit_response_phase_bound());
-            let expired = charged_bound.and_then(|bound| bound.elapsed_authorization());
-            if let Some(termination) = expired {
-                replace_rejection_with_authorization_terminal(
+        };
+        if result.is_err() {
+            if !authoritative && !ctx.gateway_deadline_response_selected() {
+                select_terminal_preparation_capacity(
                     ctx,
-                    termination,
                     status_code,
                     response_body.as_deref_mut(),
                     response_headers,
                 );
-                restore_rejection_response_markers(
-                    ctx,
-                    previous_marker,
-                    previous_replaceable_marker,
-                );
-                return;
             }
-            let mut future = owned_rejection_hook_future(
-                Arc::clone(plugin),
-                ctx.clone(),
-                *status_code,
-                response_body.as_deref().cloned(),
-                response_headers.clone(),
-            );
-            match poll_owned_rejection_hook_once(&mut future).await {
-                Some(outcome) => adopt_owned_rejection_hook_result(
-                    outcome,
-                    ctx,
-                    status_code,
-                    &mut response_body,
-                    response_headers,
-                ),
-                None if charged_backend_deadline => {
-                    // Over a charged terminal only the pending hook detaches.
-                    // Every later hook still gets its one poll, so a decorator
-                    // that completes within it (CORS) decorates the terminal.
-                    let authorization_at =
-                        charged_bound.and_then(|bound| bound.authorization_deadline_at());
-                    spawn_detached_charged_terminal_hook(future, authorization_at);
-                    continue;
-                }
-                None => {
-                    // Commit route policy before detaching remaining hooks so a
-                    // mid-chain deadline cannot drop matched response transforms.
-                    maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
-                    spawn_detached_rejection_cleanup(
-                        future,
-                        plugins[index + 1..]
-                            .iter()
-                            .filter(|plugin| plugin.applies_after_proxy_on_reject())
-                            .cloned()
-                            .collect(),
-                        previous_marker.clone(),
-                        previous_replaceable_marker.clone(),
-                        rejection_cleanup_authorization_at(ctx),
-                    );
-                    restore_rejection_response_markers(
-                        ctx,
-                        previous_marker,
-                        previous_replaceable_marker,
-                    );
-                    return;
-                }
-            }
-        } else if let Some(deadline) = ctx.grpc_deadline_at() {
-            let mut future = owned_rejection_hook_future(
-                Arc::clone(plugin),
-                ctx.clone(),
-                *status_code,
-                response_body.as_deref().cloned(),
-                response_headers.clone(),
-            );
-            let deadline_sleep = tokio::time::sleep_until(deadline);
-            tokio::pin!(deadline_sleep);
-            tokio::select! {
-                biased;
-                () = &mut deadline_sleep => {
-                    ctx.mark_gateway_deadline_response_selected();
-                    replace_rejection_with_gateway_deadline(
-                        ctx,
-                        status_code,
-                        response_body.as_deref_mut(),
-                        response_headers,
-                    );
-                    // Apply route policy onto the committed deadline map when the
-                    // last eligible transformer never ran (GHSA-3xxr-xhhj-9962).
-                    maybe_finalize_route_override_response_headers(
-                        plugins,
-                        ctx,
-                        response_headers,
-                    );
-                    spawn_detached_rejection_cleanup(
-                        future,
-                        plugins[index + 1..]
-                            .iter()
-                            .filter(|plugin| plugin.applies_after_proxy_on_reject())
-                            .cloned()
-                            .collect(),
-                        previous_marker.clone(),
-                        previous_replaceable_marker.clone(),
-                        rejection_cleanup_authorization_at(ctx),
-                    );
-                    restore_rejection_response_markers(
-                        ctx,
-                        previous_marker,
-                        previous_replaceable_marker,
-                    );
-                    return;
-                }
-                outcome = &mut future => adopt_owned_rejection_hook_result(
-                    outcome,
-                    ctx,
-                    status_code,
-                    &mut response_body,
-                    response_headers,
-                ),
-            }
-        } else {
-            plugin
-                .after_proxy(ctx, *status_code, response_headers)
-                .await
-        };
-        if terminal_gateway_deadline {
-            ctx.mark_gateway_deadline_response_selected();
-        }
-        if matches!(&result, PluginResult::Continue) || !plugin.may_replace_rejection_response() {
-            ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
-        }
-        if matches!(&result, PluginResult::Continue) && last_route_response_finalizer == Some(index)
-        {
-            crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
-                ctx,
-                response_headers,
-            );
-        }
-        match result {
-            PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    warn_sampled!(
-                        rejecting_plugin = plugin.name(),
-                        "after_proxy rejection could not be normalized"
-                    );
-                    continue;
-                };
-                let reject_status = reject.status_code;
-                if plugin.may_replace_rejection_response()
-                    && let Some(body) = response_body.as_deref_mut()
-                {
-                    let replaced_status = *status_code;
-                    *status_code = reject.status_code;
-                    *body = reject.body;
-                    // Keep headers already attached by earlier decorators (for
-                    // example CORS and correlation IDs), but discard metadata
-                    // describing the representation that is being replaced.
-                    // Explicit replacement headers below then define the new
-                    // body and win over any retained decorator header.
-                    let preserve_origin_vary = response_headers.get("vary").is_some_and(|value| {
-                        value
-                            .split(',')
-                            .any(|token| token.trim().eq_ignore_ascii_case("origin"))
-                    });
-                    for header in [
-                        "content-length",
-                        "content-encoding",
-                        "content-range",
-                        "content-md5",
-                        "digest",
-                        "content-digest",
-                        "repr-digest",
-                        "etag",
-                        "last-modified",
-                        "cache-control",
-                        "cdn-cache-control",
-                        "surrogate-control",
-                        "expires",
-                        "age",
-                        "pragma",
-                        "vary",
-                        "warning",
-                    ] {
-                        response_headers.remove(header);
-                    }
-                    response_headers.extend(reject.headers);
-                    if preserve_origin_vary {
-                        response_headers
-                            .entry("vary".to_string())
-                            .and_modify(|value| {
-                                if !value
-                                    .split(',')
-                                    .any(|token| token.trim().eq_ignore_ascii_case("origin"))
-                                {
-                                    value.push_str(", Origin");
-                                }
-                            })
-                            .or_insert_with(|| "Origin".to_string());
-                    }
-                    ctx.record_deadline_response_header_mutations(response_headers);
-                    // A narrow set of trusted built-in normalizers author a
-                    // complete gateway/protocol terminal here. Record those
-                    // exactly once so application-response body policy does not
-                    // reinterpret the terminal payload. Ordinary fail-closed or
-                    // custom replacements intentionally remain re-decidable when
-                    // they change status or representation scope.
-                    if plugin.rejection_replacement_is_final_body_policy_terminal() {
-                        ctx.mark_final_body_policy_terminal_replacement();
-                    }
-                    if plugin.warn_on_rejection_response_replacement() {
-                        warn_sampled!(
-                            rejecting_plugin = plugin.name(),
-                            replacement_status = *status_code,
-                            replaced_status,
-                            "after_proxy plugin replaced an uncommitted rejection response"
-                        );
-                    } else {
-                        debug!(
-                            replacing_plugin = plugin.name(),
-                            replacement_status = *status_code,
-                            replaced_status,
-                            "after_proxy plugin normalized an uncommitted rejection response"
-                        );
-                    }
-                    continue;
-                }
-                // The gateway is already committed to emitting this rejection
-                // response (the status/body are fixed by the time after-proxy-on-
-                // reject hooks run), so a hook cannot replace it here — it is
-                // ignored and only logged. Known consequence: `ai_rate_limiter`'s
-                // `on_unmetered_response: "reject"` is best-effort for synthetic
-                // responses such as `ai_federation`'s final-request-body
-                // short-circuit — a federated 2xx missing usage metadata is still
-                // returned to the client. See docs/plugins.md (ai_rate_limiter
-                // federation limitation).
-                warn_sampled!(
-                    rejecting_plugin = plugin.name(),
-                    attempted_reject_status = reject_status,
-                    committed_status = *status_code,
-                    "after_proxy plugin returned Reject during rejection handling; \
-                     ignoring (response already committed)"
-                );
-            }
+            break;
         }
     }
-
-    if rejection_selects_gateway_deadline(ctx, charged_backend_deadline) {
-        ctx.mark_gateway_deadline_response_selected();
-        replace_rejection_with_gateway_deadline(ctx, status_code, response_body, response_headers);
-    }
-
-    // Defense in depth: if every eligible transformer was skipped (for example
-    // only response-replacing hooks ran after a terminal deadline), still apply
-    // the matched route list exactly once onto the committed rejection map.
-    maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
-
     restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
+}
+
+fn select_terminal_preparation_capacity(
+    ctx: &mut RequestContext,
+    status: &mut u16,
+    body: Option<&mut Bytes>,
+    headers: &mut HashMap<String, String>,
+) {
+    use crate::plugins::terminal_preparation::{CAPACITY_HTTP_BODY, CAPACITY_MESSAGE};
+    ctx.mark_gateway_capacity_response_selected();
+    // Drop capacity-holding maps and bodies. This fixed core shape does not
+    // invoke a plugin or recursively stage another terminal chain.
+    *headers = HashMap::new();
+    if is_native_grpc_request(ctx) {
+        *status = 200;
+        grpc_proxy::finalize_grpc_error_response_headers(
+            headers,
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            CAPACITY_MESSAGE,
+            &[],
+        );
+        if let Some(body) = body {
+            *body = Bytes::new();
+        }
+    } else {
+        *status = 503;
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        if let Some(body) = body {
+            *body = Bytes::from_static(CAPACITY_HTTP_BODY);
+        }
+    }
 }
 
 pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
@@ -25275,14 +24850,8 @@ pub(crate) async fn apply_retained_upload_rejection_hooks(
     .await;
 }
 
-/// Reject-path `after_proxy` over a charged backend deadline terminal (#5744):
-/// a deadline the backend was charged for (`Backend deadline exceeded`), which
-/// is written after that deadline passed. Every hook is bounded as over the
-/// gateway's own deadline terminal even when no RPC deadline remains in force
-/// — replacers skipped, one poll for decorators and cleanup, and each pending
-/// hook detached alone under the cleanup bound, so a later decorator that
-/// completes within its poll still decorates — while the rejection keeps the
-/// charged wording instead of turning into `Deadline exceeded at gateway`.
+/// Preserve the charged backend deadline wording while applying admitted
+/// immediate terminal decorators. Replacement actions remain suppressed.
 pub(crate) async fn apply_after_proxy_hooks_to_charged_deadline_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -25301,15 +24870,8 @@ pub(crate) async fn apply_after_proxy_hooks_to_charged_deadline_rejection(
     .await;
 }
 
-/// Reject-path `after_proxy` over a gateway-generated gRPC-Web error terminal
-/// (#5747): backend unavailable, the gateway's own deadline, an oversized or
-/// unretainable response. The terminal is the gateway's decision, not a
-/// plugin-authored rejection, so it runs in the charged-terminal mode of
-/// [`apply_after_proxy_hooks_to_charged_deadline_rejection`]: a replacer never
-/// rewrites it, every other hook (CORS) gets one poll so a browser client can
-/// read the gRPC status, a hook still pending detaches alone under the
-/// credential's lifetime, and the terminal keeps its wording. An elapsed
-/// credential still gets the authorization terminal.
+/// Apply admitted immediate decorators to a gateway-owned gRPC-Web error.
+/// Authorization expiry remains authoritative; no pending hook is detached.
 pub(crate) async fn apply_after_proxy_hooks_to_gateway_error_terminal(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -26753,68 +26315,75 @@ async fn encode_semantic_cache_replay(
     .await;
 }
 
-/// One `after_proxy` hook over proxy core's charged backend deadline terminal
-/// (#5744).
-enum ChargedTerminalAfterProxyHook {
-    /// The hook completed within its one poll, or the admitted credential's
-    /// authorization lifetime had already elapsed; act on the result.
-    Completed(PluginResult),
-    /// A response replacer, which never runs over the charged terminal.
-    Skipped,
-    /// The hook was still pending after its one poll. It alone continues
-    /// detached under the cleanup bound; every later hook still gets its poll.
-    Detached,
-}
-
-/// Run one `after_proxy` hook over proxy core's charged backend deadline
-/// terminal (#5744), bounded as the HTTP/3 bridge bounds its charged terminal
-/// (`apply_after_proxy_hooks_to_charged_deadline_rejection`). The terminal is
-/// written after its deadline passed, so no hook may hold it, whether or not an
-/// RPC deadline is still in force. A response replacer is skipped. Any other
-/// hook gets one poll. A hook still pending after it continues detached on
-/// owned state, alone: a later decorator that completes within its own poll
-/// still decorates the terminal. A rejection from a hook that completed is
-/// ignored, so the terminal keeps its `Backend deadline exceeded` wording. An
-/// elapsed authorization lifetime is never detached: it settles the fixed
-/// authorization terminal before any hook is polled. The gate is the
-/// credential's own deadline, not the winning bound: when an earlier RPC
-/// deadline won the composition, a credential that has since elapsed still
-/// gets no further poll, as on the reject path.
-async fn run_charged_terminal_after_proxy_hook(
-    plugin: &Arc<dyn Plugin>,
+/// Ordered immediate operations over a charged backend deadline terminal.
+fn run_prepared_charged_terminal_hooks(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
-    response_status: u16,
-    response_headers: &mut HashMap<String, String>,
-) -> ChargedTerminalAfterProxyHook {
-    if plugin.may_replace_rejection_response() {
-        return ChargedTerminalAfterProxyHook::Skipped;
-    }
-    let bound = ctx.precommit_response_phase_bound();
-    if let Some(termination) = bound.elapsed_authorization() {
-        let result = settle_precommit_authorization_expiry(ctx, termination);
-        return ChargedTerminalAfterProxyHook::Completed(result);
-    }
-    let mut future = owned_rejection_hook_future(
-        Arc::clone(plugin),
-        ctx.clone(),
-        response_status,
-        None,
-        response_headers.clone(),
-    );
-    let Some(outcome) = poll_owned_rejection_hook_once(&mut future).await else {
-        spawn_detached_charged_terminal_hook(future, bound.authorization_deadline_at());
-        return ChargedTerminalAfterProxyHook::Detached;
+    status: &mut u16,
+    body: &mut Bytes,
+    headers: &mut HashMap<String, String>,
+) {
+    use crate::plugins::terminal_preparation::{
+        PreparedTerminalChain, TerminalResult, apply_terminal_cookie, apply_terminal_patch,
+        validate_terminal_headers,
     };
-    *ctx = outcome.ctx;
-    *response_headers = outcome.response_headers;
-    if !matches!(outcome.result, PluginResult::Continue) {
-        warn_sampled!(
-            rejecting_plugin = plugin.name(),
-            "after_proxy plugin returned Reject over a charged backend deadline terminal; \
-             ignoring (the terminal keeps its wording)"
+    if let Some(termination) = ctx.precommit_response_phase_bound().elapsed_authorization() {
+        ctx.retire_terminal_request_views();
+        if validate_terminal_headers(headers).is_err()
+            || ctx.enter_typed_terminal_response(false).is_err()
+        {
+            ctx.discard_terminal_header_provenance();
+            *headers = HashMap::new();
+        }
+        replace_rejection_with_authorization_terminal(
+            ctx,
+            termination,
+            status,
+            Some(body),
+            headers,
         );
+        return;
     }
-    ChargedTerminalAfterProxyHook::Completed(PluginResult::Continue)
+    let prepared = validate_terminal_headers(headers)
+        .and_then(|()| ctx.enter_typed_terminal_response(false))
+        .and_then(|()| PreparedTerminalChain::prepare(plugins, ctx, true, true));
+    ctx.retire_terminal_request_views();
+    let Ok(mut chain) = prepared else {
+        if let Some(termination) = ctx.precommit_response_phase_bound().elapsed_authorization() {
+            ctx.discard_terminal_header_provenance();
+            *headers = HashMap::new();
+            replace_rejection_with_authorization_terminal(
+                ctx,
+                termination,
+                status,
+                Some(body),
+                headers,
+            );
+        }
+        // Preserve the charged terminal's selected wording. Unsupported chains
+        // cannot publish; direct injected callers also get no old-hook fallback.
+        return;
+    };
+    while let Some(operation) = chain.next_operation() {
+        if let Some(termination) = ctx.precommit_response_phase_bound().elapsed_authorization() {
+            replace_rejection_with_authorization_terminal(
+                ctx,
+                termination,
+                status,
+                Some(body),
+                headers,
+            );
+            break;
+        }
+        let applied = match operation.execute() {
+            TerminalResult::Noop | TerminalResult::EmptyBody => Ok(()),
+            TerminalResult::Fields(patch) => apply_terminal_patch(patch, headers),
+            TerminalResult::Cookie(cookie) => apply_terminal_cookie(cookie, headers),
+        };
+        if applied.is_err() {
+            break;
+        }
+    }
 }
 
 pub(crate) async fn run_after_proxy_hooks(
@@ -26823,6 +26392,22 @@ pub(crate) async fn run_after_proxy_hooks(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
+    if ctx.charged_backend_deadline_terminal() {
+        let mut status = response_status;
+        let mut body = Bytes::new();
+        run_prepared_charged_terminal_hooks(
+            plugins,
+            ctx,
+            &mut status,
+            &mut body,
+            response_headers,
+        );
+        return (status != response_status).then(|| AfterProxyReject {
+            status_code: status,
+            body,
+            headers: std::mem::take(response_headers),
+        });
+    }
     // ORIGIN response-header boundary. Runs before every other response hook so
     // a plugin that routed this request to a third-party destination can bound
     // what that destination contributed WITHOUT discarding the gateway
@@ -26923,28 +26508,13 @@ pub(crate) async fn run_after_proxy_hooks(
             ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
         }
 
-        let result = if ctx.charged_backend_deadline_terminal() {
-            match run_charged_terminal_after_proxy_hook(
-                plugin,
-                ctx,
-                response_status,
-                response_headers,
-            )
-            .await
-            {
-                ChargedTerminalAfterProxyHook::Completed(result) => result,
-                ChargedTerminalAfterProxyHook::Skipped
-                | ChargedTerminalAfterProxyHook::Detached => continue,
-            }
-        } else {
-            let bound = ctx.precommit_response_phase_bound();
-            crate::plugins::await_precommit_response_phase(
-                bound,
-                plugin.after_proxy(ctx, response_status, response_headers),
-            )
-            .await
-            .into_plugin_result(ctx)
-        };
+        let bound = ctx.precommit_response_phase_bound();
+        let result = crate::plugins::await_precommit_response_phase(
+            bound,
+            plugin.after_proxy(ctx, response_status, response_headers),
+        )
+        .await
+        .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {
                 // After the last eligible response_transformer static-rule pass,
@@ -27018,12 +26588,6 @@ pub(crate) async fn run_after_proxy_hooks(
     ctx.metadata
         .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
     ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
-    // Over a charged terminal the last route response finalizer may have been
-    // skipped or detached; apply the matched route list exactly once.
-    if ctx.charged_backend_deadline_terminal() {
-        maybe_finalize_route_override_response_headers(plugins, ctx, response_headers);
-    }
-
     // Final response-header phase. Reached only when the whole `after_proxy`
     // chain accepted this response, which makes `response_headers` the
     // client-visible header set for the response the proxy actually selected:
@@ -33096,23 +32660,33 @@ async fn admit_proxy_request_on_frontend_port(
     // outlives this function scope.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 
-    let response = boxed_handle_proxy_request_inner(
-        req,
-        state,
-        remote_addr,
-        is_tls,
-        tls_client_cert_der,
-        tls_client_cert_chain_der,
-        mtls_auth_connection_cache,
-        connection_metadata,
-    )
-    .await;
+    let (response, terminal_ticket) = crate::plugins::terminal_preparation::RESPONSE_TERMINAL_TICKET
+        .scope(std::cell::RefCell::new(None), async {
+            let response = boxed_handle_proxy_request_inner(
+                req,
+                state,
+                remote_addr,
+                is_tls,
+                tls_client_cert_der,
+                tls_client_cert_chain_der,
+                mtls_auth_connection_cache,
+                connection_metadata,
+            )
+            .await;
+
+            let ticket = crate::plugins::terminal_preparation::RESPONSE_TERMINAL_TICKET
+                .with(|slot| slot.borrow_mut().take());
+            (response, ticket)
+        })
+        .await;
 
     // Attach the guard to the response body so active_requests stays incremented
     // for the full response lifetime (including streaming bodies).
     response.map(|mut resp| {
         let body = std::mem::replace(resp.body_mut(), ProxyBody::empty());
-        *resp.body_mut() = body.with_request_guard(request_guard);
+        *resp.body_mut() = body
+            .with_terminal_preparation_ticket(terminal_ticket)
+            .with_request_guard(request_guard);
         resp
     })
 }
@@ -34282,6 +33856,22 @@ async fn handle_proxy_request_inner(
             .plugin_cache
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
+    if plugin_cache_view.admit_terminal_preparation(&mut ctx).is_err() {
+        ctx.retire_terminal_request_views();
+        // No body poll, lifecycle/provider work or plugin decoration on failed
+        // ticket admission. Transport intake owners die before returning.
+        drop(req);
+        record_request(&state, 503);
+        let (status, headers, bytes) = crate::plugins::terminal_preparation::capacity_wire_parts(
+            flavor == HttpFlavor::Grpc,
+            grpc_web_response_content_type,
+            method == "HEAD",
+        );
+        let mut response = Response::new(ProxyBody::full(bytes));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        return Ok(response);
+    }
     // Publish this route's effective client-facing body ceilings on the context
     // before any body is forwarded, retained, or collected. Every streaming
     // adapter, buffered collector, retry replay, and coalescer folds these with

@@ -3544,6 +3544,35 @@ async fn handle_h3_request(
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
 
+    if plugin_cache_view.admit_terminal_preparation(&mut ctx).is_err() {
+        ctx.retire_terminal_request_views();
+        record_request(&state, 503);
+        let (status, headers, body) = crate::plugins::terminal_preparation::capacity_wire_parts(
+            matches!(http_flavor, HttpFlavor::Grpc),
+            grpc_web_response_content_type,
+            method == "HEAD",
+        );
+        let mut response = Response::new(());
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        let write = async {
+            stream
+                .send_response(crate::diagnostic_ref::stamp_h3_response(response))
+                .await?;
+            if !body.is_empty() {
+                stream.send_data(body).await?;
+            }
+            stream.finish().await
+        };
+        let written =
+            crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await;
+        if written.is_err() {
+            crate::http3::stream_util::abort_response_stream(&mut stream);
+        }
+        crate::http3::stream_util::halt_request_body(&mut stream);
+        return Ok(());
+    }
+
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
     // Publish this route's client-facing body ceilings before any request DATA

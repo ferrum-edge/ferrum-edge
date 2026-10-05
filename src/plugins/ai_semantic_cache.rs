@@ -4645,6 +4645,10 @@ fn normalize_text(text: &str) -> String {
     result
 }
 
+pub(crate) fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::terminal_preparation::field_declaration(1024, 1024)
+}
+
 #[async_trait]
 impl Plugin for AiSemanticCache {
     fn name(&self) -> &str {
@@ -5211,6 +5215,42 @@ impl Plugin for AiSemanticCache {
         self.set_cache_status(ctx, "MISS");
 
         PluginResult::Continue
+    }
+
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        terminal_composition_declaration()
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        use super::terminal_preparation::PreparedTerminalOp;
+        let mut patch = view.patch(1)?;
+        if let Some(value) = self.cache_status(view.context) {
+            let status = match value {
+                "HIT" => "HIT",
+                "MISS" => "MISS",
+                "BYPASS" => "BYPASS",
+                "ERROR" => "ERROR",
+                _ => {
+                    return Err(super::terminal_preparation::TerminalAdmissionError::new(
+                        super::terminal_preparation::TerminalRefusal::FieldCapacity,
+                        value.len(),
+                        6,
+                    ));
+                }
+            };
+            patch.set("x-ai-cache-status", status, true)?;
+        }
+        Ok(PreparedTerminalOp::Fields(patch))
     }
 
     async fn after_proxy(

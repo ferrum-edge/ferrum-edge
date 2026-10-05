@@ -559,10 +559,14 @@ impl RequestTransformer {
     }
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for RequestTransformer {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

@@ -166,12 +166,21 @@ impl PluginInstanceWrapper {
 /// `serverless_function` resolves node-local credentials and environment, which
 /// must happen only where the data-plane plugin instance will execute.
 struct ServerlessSecurityCompositionPlugin {
+    terminal_wrapped: bool,
     priority: u16,
     terminate: bool,
 }
 
 #[async_trait]
 impl Plugin for ServerlessSecurityCompositionPlugin {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::serverless_function::terminal_composition_declaration()
+    }
+
+    fn terminal_is_wrapped(&self) -> bool {
+        self.terminal_wrapped
+    }
+
     fn name(&self) -> &str {
         "serverless_function"
     }
@@ -210,6 +219,7 @@ impl Plugin for ServerlessSecurityCompositionPlugin {
 /// remote-endpoint clients merely to learn static name/protocol/capability
 /// metadata for candidate admission (GHSA-4vr5-4wm3-x5xv).
 struct FinalizedRequestPolicyCompositionPlugin {
+    terminal_wrapped: bool,
     name: &'static str,
     priority: u16,
     protocols: &'static [ProxyProtocol],
@@ -217,6 +227,18 @@ struct FinalizedRequestPolicyCompositionPlugin {
 
 #[async_trait]
 impl Plugin for FinalizedRequestPolicyCompositionPlugin {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::builtin_composition_declaration(self.name)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        self.terminal_declaration() != crate::plugins::TerminalDeclaration::Undeclared
+    }
+
+    fn terminal_is_wrapped(&self) -> bool {
+        self.terminal_wrapped
+    }
+
     fn name(&self) -> &str {
         self.name
     }
@@ -304,6 +326,10 @@ struct DeferredCorsPlugin {
 
 #[async_trait]
 impl Plugin for DeferredCorsPlugin {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -379,6 +405,10 @@ struct MeshRouteDispatchFinalizer {
 
 #[async_trait]
 impl Plugin for MeshRouteDispatchFinalizer {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         MESH_ROUTE_DISPATCH_FINALIZER_NAME
     }
@@ -508,6 +538,18 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
 pub(crate) fn validate_plugin_security_composition(
     plugins: &[Arc<dyn Plugin>],
 ) -> Result<(), String> {
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        let filtered = filter_for_protocol(plugins, protocol);
+        crate::plugins::terminal_preparation::compile_terminal_manifest(&filtered)
+            .map_err(|error| error.to_string())?;
+    }
+    let grpc_web = build_grpc_web_protocol_entry(plugins);
+    grpc_web
+        .phase
+        .terminal_manifest
+        .as_ref()
+        .map_err(|error| error.to_string())?;
+
     // The client-request-contract phase runs only over the pre-`before_proxy`
     // buffer. A plugin that claims to decide a client-facing body contract but
     // does not also require that buffer would silently never be invoked, and its
@@ -1039,7 +1081,44 @@ pub(crate) fn validate_correlation_id_composition(
 #[async_trait]
 impl Plugin for PluginInstanceWrapper {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        self.inner.terminal_declaration()
+        let mut declaration = self.inner.terminal_declaration();
+        if let crate::plugins::terminal_preparation::TerminalDeclaration::Prepared {
+            trigger_reads, ..
+        } = &mut declaration
+            && self.trigger.is_some()
+        {
+            use crate::plugins::terminal_preparation::TerminalFacts;
+            *trigger_reads = trigger_reads.union(
+                TerminalFacts::METHOD
+                    .union(TerminalFacts::PATH)
+                    .union(TerminalFacts::IDENTITY)
+                    .union(TerminalFacts::REQUEST_HEADERS)
+                    .union(TerminalFacts::TRIGGER),
+            );
+        }
+        declaration
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        self.inner.terminal_preparation_available()
+    }
+
+    fn terminal_is_wrapped(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut crate::plugins::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        crate::plugins::terminal_preparation::PreparedTerminalOp,
+        crate::plugins::terminal_preparation::TerminalAdmissionError,
+    > {
+        if self.runs(view.context, TriggerPhase::PostAuth) {
+            self.inner.prepare_terminal(view)
+        } else {
+            Ok(crate::plugins::terminal_preparation::PreparedTerminalOp::Noop)
+        }
     }
 
     fn early_route_total_participant(&self) -> bool {
@@ -4417,6 +4496,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "oidc_relying_party",
     "otel_tracing",
     "rate_limiting",
+    "security_headers",
     "request_deduplication",
     "response_caching",
     "request_transformer",
@@ -4442,6 +4522,7 @@ fn is_security_composition_candidate_plugin(
 /// concrete implementations; config-dependent security capabilities below
 /// continue to use their established constructors or dedicated pure views.
 struct CompositionShapePlugin {
+    terminal_wrapped: bool,
     name: &'static str,
     priority: u16,
     protocols: &'static [ProxyProtocol],
@@ -4449,6 +4530,18 @@ struct CompositionShapePlugin {
 
 #[async_trait]
 impl Plugin for CompositionShapePlugin {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::builtin_composition_declaration(self.name)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        self.terminal_declaration() != crate::plugins::TerminalDeclaration::Undeclared
+    }
+
+    fn terminal_is_wrapped(&self) -> bool {
+        self.terminal_wrapped
+    }
+
     fn name(&self) -> &str {
         self.name
     }
@@ -4468,6 +4561,7 @@ fn composition_shape_plugin(config: &PluginConfig) -> Option<Arc<dyn Plugin>> {
         return None;
     }
     Some(Arc::new(CompositionShapePlugin {
+        terminal_wrapped: config.priority_override.is_some() || config.trigger.is_some(),
         name: metadata.name,
         priority: config.priority_override.unwrap_or(metadata.priority),
         protocols: metadata.matrix_protocols,
@@ -4599,6 +4693,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             )
             .map(|(_forward_body, terminate)| {
                 Some(Arc::new(ServerlessSecurityCompositionPlugin {
+                    terminal_wrapped: plugin_config.priority_override.is_some(),
                     priority: plugin_config
                         .priority_override
                         .unwrap_or(crate::plugins::priority::SERVERLESS_FUNCTION),
@@ -4609,6 +4704,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             finalized_request_policy_composition_spec(plugin_config.plugin_name.as_str())
         {
             Ok(Some(Arc::new(FinalizedRequestPolicyCompositionPlugin {
+                terminal_wrapped: plugin_config.priority_override.is_some(),
                 name: spec.name,
                 priority: plugin_config
                     .priority_override
@@ -4934,6 +5030,11 @@ pub struct PluginPhaseData {
     pub conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Reload-compiled, actual-instance terminal union or whole-chain refusal.
+    terminal_manifest: Result<
+        Arc<crate::plugins::terminal_preparation::TerminalManifest>,
+        crate::plugins::terminal_preparation::TerminalAdmissionError,
+    >,
     /// Reload-compiled pure route selection and dependency topology.
     early_route_total_plan: Arc<crate::plugins::early_route_total::EarlyRouteTotalPlan>,
     /// Capability bitset for fast boolean checks.
@@ -5143,6 +5244,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
             conditional_unbounded_trailer_policy_plugins,
         ),
         response_committed_plugins: Arc::new(response_committed),
+        terminal_manifest: crate::plugins::terminal_preparation::compile_terminal_manifest(plugins)
+            .map(Arc::new),
         early_route_total_plan: Arc::new(
             crate::plugins::early_route_total::EarlyRouteTotalPlan::compile(plugins),
         ),
@@ -6043,6 +6146,7 @@ impl PluginCacheInner {
             ),
             response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
             response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
+            terminal_manifest: entry.phase.terminal_manifest.clone(),
             early_route_total_plan: Arc::clone(&entry.phase.early_route_total_plan),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
@@ -6072,6 +6176,7 @@ impl PluginCacheInner {
             conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
             response_committed_plugins: Arc::new(Vec::new()),
             response_presentation_policy_digest: None,
+            terminal_manifest: Ok(Arc::default()),
             early_route_total_plan: Arc::default(),
             capabilities: PluginCapabilities::default(),
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
@@ -6123,6 +6228,11 @@ pub struct PluginCacheRequestView {
     conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_presentation_policy_digest: Option<[u8; 32]>,
+    terminal_manifest: Result<
+        Arc<crate::plugins::terminal_preparation::TerminalManifest>,
+        crate::plugins::terminal_preparation::TerminalAdmissionError,
+    >,
+    /// Reload-compiled pure route selection and dependency topology.
     early_route_total_plan: Arc<crate::plugins::early_route_total::EarlyRouteTotalPlan>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
@@ -6134,6 +6244,16 @@ pub struct PluginCacheRequestView {
 }
 
 impl PluginCacheRequestView {
+    /// Pinned-generation admission before lifecycle/body/provider work. Reading
+    /// this manifest invokes no trigger or plugin method and stages no data.
+    pub(crate) fn admit_terminal_preparation(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Result<(), crate::plugins::terminal_preparation::TerminalAdmissionError> {
+        let manifest = self.terminal_manifest.as_ref().map_err(|error| *error)?;
+        ctx.pin_terminal_manifest(Arc::clone(manifest))
+    }
+
     pub(crate) fn early_route_total_selection(
         &self,
         ctx: &RequestContext,

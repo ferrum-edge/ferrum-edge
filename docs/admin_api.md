@@ -1539,6 +1539,15 @@ the rejected plugin row and association are not committed. File/DB/CP admission
 and runtime cache publication use the same checks. See
 [Composition admission](plugins.md#composition-admission).
 
+In the #6011 draft, complete enabled HTTP/gRPC/gRPC-Web compositions also require
+an explicit available terminal declaration, a compatible dependency plan, at
+most 64 participants and at most 2 MiB control / 32 MiB synchronous workspace.
+Undeclared/unmigrated custom or built-in participants refuse the whole candidate
+with `400` rather than publishing a reduced chain. Runtime full/incremental
+cache preparation repeats this gate. The draft currently refuses several active
+built-ins; this is not full runtime qualification. See the
+[implementation inventory](rejection_preparation_implementation.md).
+
 `201` from `POST /plugins/config` means *attached*, not merely created. A
 `proxy_id` that does not exist in the request's namespace is rejected with
 `400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing

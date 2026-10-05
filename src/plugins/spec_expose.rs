@@ -874,6 +874,10 @@ fn decode_identity_spec_body(
     })
 }
 
+pub(crate) fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::terminal_preparation::field_declaration(1024, 1024)
+}
+
 #[async_trait]
 impl Plugin for SpecExpose {
     fn name(&self) -> &str {
@@ -974,6 +978,32 @@ impl Plugin for SpecExpose {
         match outcome {
             Ok(entry) => spec_response(entry),
             Err(failure) => failure.into_plugin_result(),
+        }
+    }
+
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        terminal_composition_declaration()
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        use super::terminal_preparation::PreparedTerminalOp;
+        if !view.action_allowed() {
+            return Ok(PreparedTerminalOp::Noop);
+        }
+        if view.context.metadata.remove(HEAD_RESPONSE_MARKER).as_deref() == Some("true") {
+            Ok(PreparedTerminalOp::EmptyBody)
+        } else {
+            Ok(PreparedTerminalOp::Noop)
         }
     }
 

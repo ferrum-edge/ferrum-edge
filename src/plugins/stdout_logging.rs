@@ -419,10 +419,14 @@ fn write_access_log_line<T: Serialize + ?Sized>(value: &T) -> Result<(), serde_j
     Ok(())
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for StdoutLogging {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

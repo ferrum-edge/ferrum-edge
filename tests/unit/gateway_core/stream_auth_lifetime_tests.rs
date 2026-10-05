@@ -3012,146 +3012,76 @@ async fn a_live_or_absent_credential_leaves_the_buffered_terminal_summary_untouc
     assert!(!gate.log_metadata.contains_key(TERMINATION_REASON_KEY));
 }
 
-/// Every awaited pre-commitment RESPONSE phase runs under the composed bound.
-///
-/// `grpc_deadline_at()` alone is `None` for an ordinary HTTP request, which left
-/// `after_proxy`, the buffered body hooks, the final client-visible body and
-/// header policies, and the response-committed hook completely unbounded.
-///
-/// The bound carries the authorization PLAN, not just the composed instant, so
-/// the phase that ends at it can tell whose deadline it was.
-///
-/// The eighth site is the deferred semantic-cache replay transport encoder
-/// (`encode_semantic_cache_replay`), which runs the compression `after_proxy`
-/// hook after the synthetic header chain and must stay under the same bound.
-///
-/// The ninth and tenth are the charged backend deadline terminal's hook runners
-/// (#5744): proxy core's one-poll `after_proxy` runner and the reject-path
-/// runner's charged mode. Neither races an awaited phase, since each hook gets
-/// one poll, so each composes the bound at its two edges: an elapsed
-/// credential answers with the fixed terminal before any poll, and a pending
-/// hook detaches only under the credential's lifetime.
-///
-/// The eleventh is not a phase but the detach bound of the reject-path cleanup
-/// that continues after the gateway's own deadline terminal is selected
-/// (`rejection_cleanup_authorization_at`, #5747). That cleanup runs off the
-/// response frame, so, like the charged-terminal detach, it composes only the
-/// credential's lifetime: it is refused once that lifetime elapsed and
-/// cancelled at it, and it never outlives the fixed cleanup timeout.
+/// Ordinary awaited phases keep the authorization plan. Typed terminal
+/// preparation/actions check the credential before work and contain no opaque
+/// future or detached old-hook fallback. Dynamic authorization fixtures above
+/// and below retain their existing exact outcome assertions.
 #[test]
 fn every_precommit_response_phase_composes_the_authorization_lifetime() {
-    assert_eq!(
-        PROXY_SOURCE
-            .matches("ctx.precommit_response_phase_bound()")
-            .count(),
-        11,
-        "a pre-commitment response phase lost its authorization bound"
-    );
-    let charged_runner = PROXY_SOURCE
-        .split("async fn run_charged_terminal_after_proxy_hook(")
-        .nth(1)
-        .expect("charged-terminal after_proxy runner")
-        .split("\n}\n")
-        .next()
-        .expect("charged-terminal after_proxy runner bounded");
-    // Like the reject path, the charged runner gates on the credential's own
-    // elapsed deadline, not the winning bound, so an earlier RPC deadline
-    // cannot buy an expired credential one more poll.
-    let settle_at = charged_runner
-        .find("if let Some(termination) = bound.elapsed_authorization() {")
-        .expect("the charged after_proxy runner gates on the credential's own deadline");
-    let poll_at = charged_runner
-        .find("owned_rejection_hook_future(")
-        .expect("the charged after_proxy runner constructs the hook future");
-    assert!(
-        settle_at < poll_at
-            && !charged_runner.contains("bound.expired_authorization()")
-            && charged_runner.contains("settle_precommit_authorization_expiry(ctx, termination)"),
-        "the charged after_proxy runner must settle an elapsed credential before polling"
-    );
-    let bounded_detach =
-        "spawn_detached_charged_terminal_hook(future, bound.authorization_deadline_at())";
-    assert!(
-        charged_runner.contains(bounded_detach),
-        "the charged after_proxy runner must detach only under the credential's lifetime"
-    );
-    let charged_reject_path = PROXY_SOURCE
-        .split("async fn run_after_proxy_hooks_on_rejection(")
-        .nth(1)
-        .expect("reject-path after_proxy runner")
-        .split("\n}\n")
-        .next()
-        .expect("reject-path after_proxy runner bounded");
-    // The reject path gates on the credential's own elapsed deadline, not the
-    // winning bound, so an earlier RPC deadline cannot buy an expired
-    // credential one more poll (#5747).
-    let settles_expiry = "charged_bound.and_then(|bound| bound.elapsed_authorization())";
-    assert!(
-        charged_reject_path.contains(settles_expiry)
-            && charged_reject_path.contains("replace_rejection_with_authorization_terminal("),
-        "the charged reject path must settle an elapsed credential before polling"
-    );
-    assert!(
-        charged_reject_path
-            .contains("charged_bound.and_then(|bound| bound.authorization_deadline_at())"),
-        "the charged reject path must detach only under the credential's lifetime"
-    );
-    let detached = PROXY_SOURCE
-        .split("fn spawn_detached_charged_terminal_hook(")
-        .nth(1)
-        .expect("charged-terminal detached runner")
-        .split("\nfn spawn_detached_rejection_cleanup(")
-        .next()
-        .expect("charged-terminal detached runner bounded");
-    let rejection_cleanup = PROXY_SOURCE
-        .split("\nfn spawn_detached_rejection_cleanup(")
-        .nth(1)
-        .expect("detached rejection cleanup")
-        .split("\n}\n")
-        .next()
-        .expect("detached rejection cleanup bounded");
-    for enforced in [
-        "if authorization_at.is_some_and(|at| started_at >= at) {",
-        "if authorization_at.is_some_and(|at| tokio::time::Instant::now() >= at) {",
-        "tokio::time::sleep_until(authorization_at.unwrap_or(cleanup_at))",
-        "biased;",
+    for phase in [
+        "run_after_proxy_hooks",
+        "encode_semantic_cache_replay",
+        "run_final_client_visible_response_body_policy",
+        "evaluate_final_client_visible_response_header_policy",
+        "transform_buffered_response_body_with_deadline_inner",
+        "run_response_committed_hook_until_deadline",
     ] {
+        let boundary = format!("fn {phase}(");
+        let body = PROXY_SOURCE
+            .split(boundary.as_str())
+            .nth(1)
+            .expect("pre-commitment response phase exists")
+            .split("\n}\n")
+            .next()
+            .unwrap();
         assert!(
-            detached.contains(enforced),
-            "the detached charged-terminal hook must enforce the authorization bound: {enforced}"
-        );
-        assert!(
-            rejection_cleanup.contains(enforced),
-            "the detached rejection cleanup must enforce the authorization bound: {enforced}"
+            body.contains("precommit_response_phase_bound()"),
+            "{phase} lost its bound"
         );
     }
-    for detach in [
+    for phase in [
+        "run_after_proxy_hooks_on_rejection",
+        "run_prepared_charged_terminal_hooks",
+    ] {
+        let boundary = format!("fn {phase}(");
+        let body = PROXY_SOURCE
+            .split(boundary.as_str())
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let gate = body
+            .find("elapsed_authorization()")
+            .expect("credential gate before prepare");
+        let prepare = body
+            .find("PreparedTerminalChain::prepare(")
+            .expect("typed preparation");
+        let retire = body
+            .rfind("ctx.retire_terminal_request_views()")
+            .expect("raw retirement");
+        let cursor = body
+            .find("while let Some(operation) = chain.next_operation()")
+            .unwrap();
+        let action = body.find("operation.execute()").unwrap();
+        assert!(gate < prepare && prepare < retire && retire < cursor && cursor < action);
+        assert!(body[cursor..action].contains("elapsed_authorization()"));
+        assert!(!body.contains(".after_proxy("));
+        assert!(!body.contains("ctx.clone()"));
+        assert!(!body.contains("tokio::spawn"));
+    }
+    for retired in [
+        "OwnedRejectionHookFuture",
+        "owned_rejection_hook_future(",
+        "spawn_detached_charged_terminal_hook(",
         "spawn_detached_rejection_cleanup(",
-        "rejection_cleanup_authorization_at(ctx),",
     ] {
-        assert_eq!(
-            charged_reject_path.matches(detach).count(),
-            2,
-            "every detached rejection cleanup must carry the credential's lifetime: {detach}"
+        assert!(
+            !PROXY_SOURCE.contains(retired),
+            "raw-capable terminal runner remains: {retired}"
         );
     }
-    let cleanup_bound = PROXY_SOURCE
-        .split("fn rejection_cleanup_authorization_at(")
-        .nth(1)
-        .expect("rejection cleanup authorization bound")
-        .split("\n}\n")
-        .next()
-        .expect("rejection cleanup authorization bound bounded");
-    assert!(
-        cleanup_bound.contains("ctx.precommit_response_phase_bound()")
-            && cleanup_bound.contains(".authorization_deadline_at()"),
-        "the rejection cleanup bound must be the credential's authorization deadline"
-    );
-    assert!(
-        !PROXY_SOURCE.contains("ctx.precommit_response_phase_deadline_at()"),
-        "a pre-commitment phase that keeps only the composed instant cannot tell an \
-         authorization expiry from the client's own RPC deadline"
-    );
+    assert!(!PROXY_SOURCE.contains("ctx.precommit_response_phase_deadline_at()"));
 }
 
 /// An authorization expiry never blames the plugin or the backend, and never

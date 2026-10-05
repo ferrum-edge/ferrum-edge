@@ -1040,6 +1040,36 @@ impl Plugin for OtelTracing {
         PluginResult::Continue
     }
 
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        super::terminal_preparation::field_declaration(1024, 1024)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        use super::terminal_preparation::PreparedTerminalOp;
+        let mut patch = view.patch(1)?;
+        if let Some(value) = view.context.metadata.get(TRACEPARENT_HEADER) {
+            if value.len() != 55 || Self::parse_traceparent(value).is_none() {
+                return Err(super::terminal_preparation::TerminalAdmissionError::new(
+                    super::terminal_preparation::TerminalRefusal::FieldCapacity,
+                    value.len(),
+                    55,
+                ));
+            }
+            patch.set(TRACEPARENT_HEADER, value, true)?;
+        }
+        Ok(PreparedTerminalOp::Fields(patch))
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,

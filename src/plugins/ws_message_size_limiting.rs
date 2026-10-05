@@ -105,9 +105,13 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
         .ok_or_else(|| format!("ws_message_size_limiting: `{field}` must be a string"))
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 impl Plugin for WsMessageSizeLimiting {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn name(&self) -> &str {

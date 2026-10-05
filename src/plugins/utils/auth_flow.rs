@@ -12,6 +12,10 @@ use crate::plugins::{PluginResult, RequestContext};
 use super::auth_attempt::AuthenticationAttempt;
 use super::replay_partition::PartitionHasher;
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 /// What an auth plugin extracted from the request.
 #[derive(Debug, Clone)]
 pub enum ExtractedCredential {
@@ -553,7 +557,7 @@ macro_rules! impl_auth_plugin {
             fn terminal_declaration(
                 &self,
             ) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-                crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+                crate::plugins::utils::auth_flow::terminal_composition_declaration()
             }
 
             fn name(&self) -> &str {

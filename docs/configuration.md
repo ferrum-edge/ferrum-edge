@@ -1440,6 +1440,15 @@ A reference `ferrum.conf` with all available fields and descriptions is included
 
 ## File Mode Configuration Format
 
+The #6011 draft adds a complete enabled HTTP/gRPC/gRPC-Web terminal-composition
+gate shared with CP/admin and runtime full/incremental preparation. Undeclared
+or unavailable terminal implementations refuse the candidate rather than being
+silently omitted. Fixed limits are 64 participants, 2 MiB control, 32 MiB
+synchronous workspace and a process total of 128 MiB / 1,024 request tickets;
+there is no environment override. The draft refuses unmigrated active built-ins
+and is not fully qualified. See the
+[exact implementation inventory](rejection_preparation_implementation.md).
+
 Configuration files can be YAML or JSON. See `tests/config.yaml` for a complete example.
 
 Publish replacements atomically (temp file + `rename`, or an equivalent ConfigMap symlink swap). See [File Mode](#file-mode) for the loader's stability contract and optional `resource_counts` seal.

@@ -327,6 +327,39 @@ impl Plugin for CorrelationId {
         PluginResult::Continue
     }
 
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        if self.header_name.len() > super::terminal_preparation::MAX_FIELD_NAME_BYTES {
+            return super::terminal_preparation::TerminalDeclaration::Undeclared;
+        }
+        super::terminal_preparation::field_declaration(12_288, 12_288)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        use super::terminal_preparation::PreparedTerminalOp;
+        let mut patch = view.patch(1)?;
+        if self.echo_downstream && let Some(value) = self.request_id(view.context) {
+            if value.len() > 8192 {
+                return Err(super::terminal_preparation::TerminalAdmissionError::new(
+                    super::terminal_preparation::TerminalRefusal::FieldCapacity,
+                    value.len(),
+                    8192,
+                ));
+            }
+            patch.set(&self.header_name, value, true)?;
+        }
+        Ok(PreparedTerminalOp::Fields(patch))
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,

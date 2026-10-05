@@ -124,6 +124,7 @@ pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod tcp_logging;
 pub mod terminal_preparation;
+pub use terminal_preparation::TerminalDeclaration;
 pub mod transaction_debugger;
 pub mod transaction_log_schema;
 pub mod trigger;
@@ -518,23 +519,6 @@ impl BufferedDeadlineResponseHeaderProvenance {
         }
     }
 
-    /// Rejection headers are gateway/plugin output rather than backend
-    /// metadata. Their provenance is already known; later non-replacing hooks
-    /// are tracked by mutation like buffered responses.
-    fn gateway_rejection(headers: &HashMap<String, String>) -> Self {
-        let observed_headers = Self::canonical_snapshot(headers);
-        let gateway_headers = observed_headers.clone();
-        Self {
-            observed_headers,
-            gateway_headers,
-            // A gateway rejection has no backend contribution, so every
-            // `Set-Cookie` line — and every element of every other field — is
-            // gateway-authored.
-            backend_set_cookie_lines: Vec::new(),
-            backend_headers: HashMap::new(),
-        }
-    }
-
     /// Split a `Set-Cookie` header value into its individual cookie lines. The
     /// gateway stores multiple `Set-Cookie` values newline-joined (RFC 6265
     /// requires separate header lines downstream); this recovers each line so
@@ -807,7 +791,7 @@ impl BufferedDeadlineResponseHeaderProvenance {
                 // the appended line, dropped the operator-configured replacement
                 // cookie, and left a stale backend baseline that then filtered
                 // later gateway appends matching the overwritten backend value.
-                // Same rationale as `adopt_gateway_rejection`: once the backend
+                // Once the backend
                 // bytes are gone from the tracked map, the baseline no longer
                 // describes it.
                 self.gateway_headers.insert(name.clone(), value.clone());
@@ -956,68 +940,6 @@ impl BufferedDeadlineResponseHeaderProvenance {
             headers.insert("vary".to_string(), "Origin".to_string());
         }
         self.observed_headers = Self::canonical_snapshot(headers);
-    }
-
-    /// Transition an in-flight buffered-response provenance into a gateway
-    /// rejection without discarding decorations that completed hooks already
-    /// recorded. The rejection headers are freshly generated gateway output, so
-    /// they join `gateway_headers`, while previously recorded gateway output
-    /// (correlation, CORS, ...) is preserved for a terminal deadline rebuild.
-    /// The observed baseline resets to the rejection headers so any non-replacing
-    /// reject hook that runs next is tracked by mutation. When no gateway output
-    /// was recorded yet, `gateway_headers` is empty and this is identical to
-    /// starting a fresh [`Self::gateway_rejection`].
-    ///
-    /// # Why the backend baselines are retired here
-    ///
-    /// (The reasoning below is written for `backend_set_cookie_lines`; it
-    /// applies verbatim to the `backend_headers` append baseline, which is
-    /// captured from the same discarded backend map.)
-    ///
-    /// `headers` is a gateway-authored REPLACEMENT map, never the mutated
-    /// backend response map. Every caller of
-    /// [`RequestContext::begin_rejection_deadline_response_header_provenance`]
-    /// reaches it with either a freshly constructed map, a
-    /// `PluginResult::Reject{,Binary}` header map lifted out by
-    /// `plugin_result_into_reject_parts`, or gateway-synthesized error headers.
-    /// The two sites whose caller-supplied map has backend lineage
-    /// (`apply_plugin_rejection_response` and
-    /// `apply_reject_after_proxy_and_synthetic_body_hooks`) both run
-    /// `rebuild_plugin_rejection_response_headers` first, which does
-    /// `response_headers.clear()` before re-populating from the rejection parts.
-    /// So no backend-sent header survives into this transition.
-    ///
-    /// That makes `backend_set_cookie_lines` — the baseline captured from the
-    /// BACKEND response map in [`Self::backend_response`] — no longer a
-    /// description of the map being tracked. Continuing to filter against it
-    /// misattributed authorship: a rejection that intentionally sets
-    /// `Set-Cookie: X` while the discarded backend response happened to have
-    /// sent a byte-identical `Set-Cookie: X` scored zero surplus occurrences and
-    /// was dropped, so a later gRPC-deadline rebuild silently discarded an
-    /// authored rejection/session cookie.
-    ///
-    /// Retiring the baseline does not weaken the leak boundary. It is the
-    /// buffered path's [`Self::record_gateway_mutations`] that defends against
-    /// backend cookies, and it still holds the baseline for as long as the
-    /// backend map is the response. A backend-only `Set-Cookie` can only reach a
-    /// deadline response by being present in some map, and after this transition
-    /// the backend map is gone — the response is rebuilt from the rejection.
-    /// Keeping a stale baseline could therefore only produce further false
-    /// drops, never prevent a real leak.
-    fn adopt_gateway_rejection(&mut self, headers: &HashMap<String, String>) {
-        let rejection = Self::canonical_snapshot(headers);
-        for (name, value) in &rejection {
-            self.gateway_headers.insert(name.clone(), value.clone());
-        }
-        // The backend response map has been replaced wholesale by gateway
-        // output, so neither the backend cookie baseline nor the backend
-        // header baseline describes what is being tracked. Retire both,
-        // matching [`Self::gateway_rejection`], so hooks that run after this
-        // transition are credited for what they actually author on the
-        // rejection map.
-        self.backend_set_cookie_lines = Vec::new();
-        self.backend_headers = HashMap::new();
-        self.observed_headers = rejection;
     }
 
     fn sync_terminal_headers(&mut self, headers: &HashMap<String, String>) {
@@ -2290,6 +2212,65 @@ impl From<&RequestContext> for HboneReuseContext {
     }
 }
 
+fn retain_typed_terminal_gateway_headers(headers: &mut HashMap<String, String>) {
+    let preserve_origin_vary = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("vary")
+            && value.split(',').any(|token| token.trim().eq_ignore_ascii_case("origin"))
+    });
+    headers.retain(|name, _| {
+        ![
+            "accept-ranges",
+            "age",
+            "authorization",
+            "cache-control",
+            "cdn-cache-control",
+            "connection",
+            "content-digest",
+            "content-encoding",
+            "content-language",
+            "content-length",
+            "content-location",
+            "content-md5",
+            "content-range",
+            "content-type",
+            "cookie",
+            "digest",
+            "etag",
+            "expires",
+            "grpc-accept-encoding",
+            "grpc-encoding",
+            "grpc-message",
+            "grpc-previous-rpc-attempts",
+            "grpc-retry-pushback-ms",
+            "grpc-status",
+            "grpc-status-details-bin",
+            "keep-alive",
+            "last-modified",
+            "pragma",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "proxy-status",
+            "repr-digest",
+            "retry-after",
+            "surrogate-control",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "www-authenticate",
+            "x-grpc-web",
+            "vary",
+            "warning",
+        ]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    });
+    if preserve_origin_vary {
+        headers.insert("vary".to_string(), "Origin".to_string());
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -3195,6 +3176,11 @@ pub struct RequestContext {
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
+    /// One process ticket shared by request clones, response and terminal slots.
+    pub(crate) terminal_manifest_pin: Option<Arc<terminal_preparation::TerminalManifest>>,
+    terminal_response_gateway_owned: bool,
+    pub(crate) terminal_control_reservation:
+        Option<Arc<terminal_preparation::ControlReservation<'static>>>,
     /// Native-H3 collector admission, transferred once onto its Bytes owner.
     /// Private and unlogged; retained replacements acquire independent admission.
     pub(crate) request_buffer_charge:
@@ -4134,6 +4120,9 @@ impl RequestContext {
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            terminal_manifest_pin: None,
+            terminal_response_gateway_owned: false,
+            terminal_control_reservation: None,
             request_buffer_charge: None,
             request_body_sha256: None,
             request_body_sha512: None,
@@ -4642,6 +4631,84 @@ impl RequestContext {
             Some(charge) => charge.bytes(data),
             None => bytes::Bytes::from(data),
         }
+    }
+
+    pub(crate) fn pin_terminal_manifest(
+        &mut self,
+        manifest: Arc<terminal_preparation::TerminalManifest>,
+    ) -> Result<(), terminal_preparation::TerminalAdmissionError> {
+        self.admit_terminal_manifest(&manifest)?;
+        self.terminal_manifest_pin = Some(manifest);
+        Ok(())
+    }
+
+    pub(crate) fn admit_terminal_manifest(
+        &mut self,
+        manifest: &terminal_preparation::TerminalManifest,
+    ) -> Result<(), terminal_preparation::TerminalAdmissionError> {
+        if let Some(error) = manifest.admission_refusal() {
+            return Err(error);
+        }
+        if self
+            .terminal_manifest_pin
+            .as_ref()
+            .is_some_and(|pin| !pin.same_chain(manifest))
+        {
+            return Err(terminal_preparation::TerminalAdmissionError::new(
+                terminal_preparation::TerminalRefusal::PinnedGeneration,
+                0,
+                0,
+            ));
+        }
+        if let Some(ticket) = &self.terminal_control_reservation {
+            if manifest.control_bytes() > ticket.bytes() {
+                return Err(terminal_preparation::TerminalAdmissionError::new(
+                    terminal_preparation::TerminalRefusal::ControlCapacity,
+                    manifest.control_bytes(),
+                    ticket.bytes(),
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(ticket) = manifest.admit(&terminal_preparation::PROCESS_PREPARATION_LEDGER)? {
+            let ticket = Arc::new(ticket);
+            let _ = terminal_preparation::RESPONSE_TERMINAL_TICKET.try_with(|slot| {
+                *slot.borrow_mut() = Some(Arc::clone(&ticket));
+            });
+            self.terminal_control_reservation = Some(ticket);
+        }
+        Ok(())
+    }
+
+    /// The immediate typed cursor can retain a gateway-authored rejection in
+    /// place. Migrating a mixed backend/gateway snapshot is still unsupported;
+    /// refuse that lineage rather than cloning it through the old recorder.
+    pub(crate) fn enter_typed_terminal_response(
+        &mut self,
+        gateway_owned: bool,
+    ) -> Result<(), terminal_preparation::TerminalAdmissionError> {
+        if self.buffered_deadline_response_header_provenance.is_some() {
+            return Err(terminal_preparation::TerminalAdmissionError::new(
+                terminal_preparation::TerminalRefusal::UnimplementedOperation,
+                0,
+                0,
+            ));
+        }
+        self.terminal_response_gateway_owned = gateway_owned;
+        Ok(())
+    }
+
+    pub(crate) fn discard_terminal_header_provenance(&mut self) {
+        self.buffered_deadline_response_header_provenance = None;
+        self.terminal_response_gateway_owned = false;
+    }
+
+    /// Explicit terminal retirement. This drops allocation owners rather than
+    /// clearing their capacity, including separately charged decode scratch.
+    pub(crate) fn retire_terminal_request_views(&mut self) {
+        self.discard_retained_request_metadata();
+        self.clear_governed_request_body_plaintext();
+        self.compression_staged_request_plaintext = None;
     }
 
     pub(crate) fn discard_retained_request_metadata(&mut self) {
@@ -5189,53 +5256,6 @@ impl RequestContext {
         }
     }
 
-    /// Start a rejection response at the gateway provenance boundary. The
-    /// response did not come from a backend, so its plugin-produced fields are
-    /// provenance-known gateway output.
-    ///
-    /// # Contract
-    ///
-    /// `response_headers` MUST be a gateway-authored REPLACEMENT map: a freshly
-    /// built map, a `PluginResult::Reject{,Binary}` header map, or
-    /// gateway-synthesized error headers. It must not be a backend response map,
-    /// nor a map that still carries backend-sent headers — callers whose map has
-    /// backend lineage clear it first (see
-    /// `rebuild_plugin_rejection_response_headers`). This transition declares
-    /// the whole map gateway-owned and retires the backend `Set-Cookie`
-    /// baseline (see `adopt_gateway_rejection`), so handing it a mixed map would
-    /// credit backend lines as gateway-authored. A future caller that cannot
-    /// satisfy this must clear or partition its map rather than relaxing the
-    /// transition.
-    pub(crate) fn begin_rejection_deadline_response_header_provenance(
-        &mut self,
-        response_headers: &HashMap<String, String>,
-    ) {
-        // A final response-header policy also enables this provenance without a
-        // gRPC deadline so its rejection can retain gateway-authored output
-        // without preserving same-named backend fields. Keep an existing state
-        // in that case; callers that need neither contract arrive with `None`.
-        if !(self.grpc_deadline_at.is_some() || self.gateway_deadline_response_selected)
-            && self.buffered_deadline_response_header_provenance.is_none()
-        {
-            return;
-        }
-        match self.buffered_deadline_response_header_provenance.as_mut() {
-            // A rejection generated after the buffered-response path already ran
-            // trusted `after_proxy` hooks — for example a later hook exhausting
-            // the RPC deadline, which converts into a fresh
-            // `grpc_deadline_exceeded_plugin_result()` — must not throw away the
-            // gateway decorations those completed hooks recorded. Fold the new
-            // rejection headers into the existing gateway-owned set instead of
-            // restarting provenance from the rejection headers alone.
-            Some(state) => Arc::make_mut(state).adopt_gateway_rejection(response_headers),
-            None => {
-                self.buffered_deadline_response_header_provenance = Some(Arc::new(
-                    BufferedDeadlineResponseHeaderProvenance::gateway_rejection(response_headers),
-                ));
-            }
-        }
-    }
-
     /// Record the header result of one completed trusted gateway phase.
     pub(crate) fn record_deadline_response_header_mutations(
         &mut self,
@@ -5373,6 +5393,10 @@ impl RequestContext {
         &mut self,
         response_headers: &mut HashMap<String, String>,
     ) {
+        if self.terminal_response_gateway_owned {
+            retain_typed_terminal_gateway_headers(response_headers);
+            return;
+        }
         if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
             Arc::make_mut(state).retain_gateway_output(response_headers);
             return;
@@ -5769,6 +5793,9 @@ impl RequestContext {
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            terminal_manifest_pin: self.terminal_manifest_pin.clone(),
+            terminal_response_gateway_owned: self.terminal_response_gateway_owned,
+            terminal_control_reservation: self.terminal_control_reservation.clone(),
             request_buffer_charge: None,
             request_body_sha256: None,
             request_body_sha512: None,
@@ -10935,9 +10962,41 @@ pub trait Plugin: Send + Sync {
     /// The default is deliberately undeclared even for an inherited no-op:
     /// an opaque override cannot inherit a trusted terminal contract. This
     /// declaration does not authorize an adapter to the async `after_proxy`.
-    /// Runtime terminal admission/execution is still pending migration.
     fn terminal_declaration(&self) -> terminal_preparation::TerminalDeclaration {
         terminal_preparation::TerminalDeclaration::Undeclared
+    }
+
+    /// Prepared implementations must explicitly declare that their typed
+    /// operation migration exists. Inheriting the rejecting default prepare
+    /// method cannot accidentally publish a Prepared composition.
+    fn terminal_preparation_available(&self) -> bool {
+        self.terminal_declaration() == terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
+    /// Core wrapper credit, propagated without evaluating a request trigger.
+    fn terminal_is_wrapped(&self) -> bool {
+        false
+    }
+
+    /// Synchronous preparation in configured order. Returned variants are
+    /// raw-free and cannot invoke the ordinary async hook. An explicit no-op
+    /// declaration authorizes only Noop, never an overridden after_proxy.
+    fn prepare_terminal(
+        &self,
+        _view: &mut terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        terminal_preparation::PreparedTerminalOp,
+        terminal_preparation::TerminalAdmissionError,
+    > {
+        if self.terminal_declaration() == terminal_preparation::TerminalDeclaration::PureNoop {
+            Ok(terminal_preparation::PreparedTerminalOp::Noop)
+        } else {
+            Err(terminal_preparation::TerminalAdmissionError::new(
+                terminal_preparation::TerminalRefusal::UnimplementedOperation,
+                0,
+                0,
+            ))
+        }
     }
 
     /// Called after the response is received from the backend.

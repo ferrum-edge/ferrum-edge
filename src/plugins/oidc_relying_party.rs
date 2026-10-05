@@ -2714,6 +2714,30 @@ impl super::Plugin for OidcRelyingParty {
         apply_claim_headers_from_context(ctx, headers, &self.provider.claim_header_destinations);
         PluginResult::Continue
     }
+
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        super::terminal_preparation::field_declaration(16_384, 16_384)
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        use super::terminal_preparation::PreparedTerminalOp;
+        // The view checks admitted credit before moving the one-shot owner.
+        // A suppressed action leaves it unconsumed; there is no re-seal/resend.
+        Ok(view
+            .take_cookie_metadata(SESSION_SET_COOKIE_METADATA_KEY)?
+            .map_or(PreparedTerminalOp::Noop, PreparedTerminalOp::Cookie))
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,

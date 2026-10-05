@@ -1,9 +1,9 @@
 //! Admission primitives for the approved rejection preparation contract.
 //!
-//! These types do not invoke a plugin, evaluate a trigger, allocate a body, or
-//! establish that an operation is raw-free. Runtime enrollment must additionally
-//! supply the reviewed typed operation and retire every caller-owned raw view.
-//! The existing terminal runners have not yet migrated to these primitives.
+//! Generation manifests and one process ledger bound the synchronous prepared
+//! boundary. Only closed immediate operations are currently implemented.
+//! Unmigrated participants are refused; an ordinary async successful-response
+//! hook is never used as a terminal adapter. Full qualification remains pending.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -142,6 +142,12 @@ pub enum TerminalRefusal {
     TicketCapacity,
     WorkspaceAlreadyBorrowed,
     UnroundedReservation,
+    UnimplementedOperation,
+    FieldCapacity,
+    PatchCapacity,
+    AuthorizationExpired,
+    AlreadyPrepared,
+    PinnedGeneration,
 }
 
 /// Fixed reasons and numeric counts only; no request values or provider errors.
@@ -154,7 +160,7 @@ pub struct TerminalAdmissionError {
 }
 
 impl TerminalAdmissionError {
-    fn new(reason: TerminalRefusal, required: usize, allowed: usize) -> Self {
+    pub fn new(reason: TerminalRefusal, required: usize, allowed: usize) -> Self {
         Self {
             reason,
             instance: None,
@@ -163,7 +169,7 @@ impl TerminalAdmissionError {
         }
     }
 
-    fn at(mut self, instance: TerminalInstanceToken) -> Self {
+    pub fn at(mut self, instance: TerminalInstanceToken) -> Self {
         self.instance = Some(instance);
         self
     }
@@ -181,7 +187,7 @@ impl fmt::Display for TerminalAdmissionError {
 
 impl std::error::Error for TerminalAdmissionError {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalManifestEntry {
     pub instance: TerminalInstanceToken,
     pub declaration: TerminalDeclaration,
@@ -210,6 +216,44 @@ impl Default for TerminalManifest {
 }
 
 impl TerminalManifest {
+    /// Pin an already compiled generation before request lifecycle/body work.
+    /// Custom runtimes must use the same actual plugin chain at preparation.
+    pub fn pin(
+        self: &std::sync::Arc<Self>,
+        ctx: &mut super::RequestContext,
+    ) -> Result<(), TerminalAdmissionError> {
+        ctx.pin_terminal_manifest(std::sync::Arc::clone(self))
+    }
+
+    fn matches_plugins(&self, plugins: &[std::sync::Arc<dyn super::Plugin>]) -> bool {
+        let mut index = 0;
+        for plugin in plugins {
+            let eligibility = TerminalEligibility {
+                rejection: plugin.applies_after_proxy_on_reject(),
+                charged: !plugin.may_replace_rejection_response(),
+            };
+            if !eligibility.participates()
+                || !plugin.supported_protocols().iter().any(|protocol| {
+                    matches!(protocol, super::ProxyProtocol::Http | super::ProxyProtocol::Grpc)
+                })
+            {
+                continue;
+            }
+            let pointer = std::sync::Arc::as_ptr(plugin) as *const () as usize;
+            let actual = TerminalManifestEntry {
+                instance: TerminalInstanceToken(pointer as u64),
+                declaration: plugin.terminal_declaration(),
+                eligibility,
+                wrapped: plugin.terminal_is_wrapped(),
+            };
+            if index == self.len || self.entries[index] != Some(actual) {
+                return false;
+            }
+            index += 1;
+        }
+        index == self.len
+    }
+
     pub const fn new() -> Self {
         Self {
             entries: [None; MAX_PARTICIPANTS],
@@ -341,6 +385,14 @@ impl TerminalManifest {
         self.entries[..self.len].iter().filter_map(Option::as_ref)
     }
 
+    pub(crate) fn admission_refusal(&self) -> Option<TerminalAdmissionError> {
+        self.refusal
+    }
+
+    pub fn same_chain(&self, other: &Self) -> bool {
+        self.len == other.len && self.entries().eq(other.entries())
+    }
+
     pub const fn participant_count(&self) -> usize {
         self.len
     }
@@ -434,6 +486,7 @@ impl PreparationLedger {
             ledger: self,
             bytes,
             workspace_borrowed: AtomicBool::new(false),
+            terminal_prepared: AtomicBool::new(false),
         })
     }
 
@@ -510,9 +563,17 @@ pub struct ControlReservation<'a> {
     ledger: &'a PreparationLedger,
     bytes: usize,
     workspace_borrowed: AtomicBool,
+    terminal_prepared: AtomicBool,
 }
 
 impl<'a> ControlReservation<'a> {
+    fn claim_preparation(&self) -> Result<(), TerminalAdmissionError> {
+        self.terminal_prepared
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| capacity_error(TerminalRefusal::AlreadyPrepared, 1, 0))
+    }
+
     pub const fn bytes(&self) -> usize {
         self.bytes
     }
@@ -573,4 +634,761 @@ impl Drop for WorkspaceReservation<'_, '_> {
         self.control.ledger.release(self.bytes, false);
         self.control.workspace_borrowed.store(false, Ordering::Release);
     }
+}
+
+/// Only a synchronous borrow may expose request state to terminal preparation.
+/// No operation variant below can contain this view, a context, a plugin, a
+/// closure, a request body or a collector charge.
+pub struct ReachedRequestView<'a> {
+    pub context: &'a mut super::RequestContext,
+    output_limit: usize,
+    action_allowed: bool,
+    ticket: Option<std::sync::Arc<ControlReservation<'static>>>,
+}
+
+impl ReachedRequestView<'_> {
+    /// Preparation and response action eligibility are distinct. Capture must
+    /// still prepare when this is false; one-shot response actions must not
+    /// consume their source state merely because they were suppressed.
+    pub const fn action_allowed(&self) -> bool {
+        self.action_allowed
+    }
+
+    /// Transfer an existing staged cookie only after checking its full capacity
+    /// against admitted O credit. The closed wrapper cannot be constructed by
+    /// an arbitrary caller with an unchecked String.
+    pub fn take_cookie_metadata(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<TerminalCookie>, TerminalAdmissionError> {
+        if !self.action_allowed {
+            return Ok(None);
+        }
+        let Some(cookie) = self.context.metadata.get(key) else {
+            return Ok(None);
+        };
+        let allowed = self.output_limit.min(MAX_COOKIE_BYTES);
+        if cookie.len() > allowed || cookie.capacity() > allowed {
+            return Err(capacity_error(
+                TerminalRefusal::FieldCapacity,
+                cookie.capacity(),
+                allowed,
+            ));
+        }
+        if cookie.bytes().any(|byte| {
+            (byte < 0x20 && byte != b'\t' && byte != b'\n') || byte == 0x7f
+        }) {
+            return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
+        }
+        Ok(self.context.metadata.remove(key).map(|value| TerminalCookie {
+            value,
+            _ticket: self.ticket.clone(),
+        }))
+    }
+
+    /// Construct a patch using only this instance's admitted output credit.
+    pub fn patch(&self, actions: usize) -> Result<TerminalPatch, TerminalAdmissionError> {
+        let mut patch = TerminalPatch::new(actions, self.output_limit)?;
+        patch._ticket = self.ticket.clone();
+        Ok(patch)
+    }
+}
+
+/// Closed terminal actions. External operations require their own reviewed
+/// typed variant; arbitrary futures and plugin handles cannot be inserted here.
+pub enum PreparedTerminalOp {
+    Noop,
+    Fields(TerminalPatch),
+    EmptyBody,
+    Cookie(TerminalCookie),
+}
+
+/// Capacity-checked, moved cookie owner; construction is confined to the
+/// synchronous admitted view, before any cursor or external poll.
+pub struct TerminalCookie {
+    value: String,
+    _ticket: Option<std::sync::Arc<ControlReservation<'static>>>,
+}
+
+/// Closed results carry response work only. No request-fact or raw metadata
+/// patch can be produced after the preparation boundary.
+pub enum TerminalResult {
+    Noop,
+    Fields(TerminalPatch),
+    EmptyBody,
+    Cookie(TerminalCookie),
+}
+
+impl PreparedTerminalOp {
+    fn validate(&self, declaration: TerminalDeclaration) -> Result<(), TerminalAdmissionError> {
+        let output = match declaration {
+            TerminalDeclaration::Prepared { bounds, .. } => bounds.output,
+            TerminalDeclaration::PureNoop if matches!(self, Self::Noop) => return Ok(()),
+            _ => return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0)),
+        };
+        let required = match self {
+            Self::Noop | Self::EmptyBody => 0,
+            Self::Fields(patch) => patch.owned_bytes,
+            Self::Cookie(cookie) => {
+                if cookie.value.len() > MAX_COOKIE_BYTES || cookie.value.capacity() > MAX_COOKIE_BYTES {
+                    return Err(capacity_error(
+                        TerminalRefusal::FieldCapacity,
+                        cookie.value.capacity(),
+                        MAX_COOKIE_BYTES,
+                    ));
+                }
+                cookie.value.capacity()
+            }
+        };
+        if required > output {
+            return Err(capacity_error(
+                TerminalRefusal::PatchCapacity,
+                required,
+                output,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn execute(self) -> TerminalResult {
+        match self {
+            Self::Noop => TerminalResult::Noop,
+            Self::Fields(patch) => TerminalResult::Fields(patch),
+            Self::EmptyBody => TerminalResult::EmptyBody,
+            Self::Cookie(cookie) => TerminalResult::Cookie(cookie),
+        }
+    }
+}
+
+enum TerminalFieldAction {
+    Set {
+        name: Box<str>,
+        value: Box<str>,
+        override_existing: bool,
+        case_insensitive: bool,
+    },
+    Remove(Box<str>),
+}
+
+/// Allocates a fixed action vector only after the declaration's output credit
+/// is known. Names/values use exact-size boxed strings, never cloned capacities.
+/// Push never grows the vector, and checks before constructing either string.
+pub struct TerminalPatch {
+    actions: Vec<TerminalFieldAction>,
+    output_limit: usize,
+    owned_bytes: usize,
+    _ticket: Option<std::sync::Arc<ControlReservation<'static>>>,
+}
+
+impl TerminalPatch {
+    fn new(actions: usize, output: usize) -> Result<Self, TerminalAdmissionError> {
+        let required = actions
+            .checked_mul(128)
+            .and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| {
+                capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, output)
+            })?;
+        if actions > MAX_PATCH_ACTIONS {
+            return Err(capacity_error(
+                TerminalRefusal::PatchCapacity,
+                actions,
+                MAX_PATCH_ACTIONS,
+            ));
+        }
+        if required > output {
+            return Err(capacity_error(
+                TerminalRefusal::PatchCapacity,
+                required,
+                output,
+            ));
+        }
+        Ok(Self {
+            actions: Vec::with_capacity(actions),
+            output_limit: output,
+            owned_bytes: required,
+            _ticket: None,
+        })
+    }
+
+    fn reserve_field(&mut self, name: &str, value: &str) -> Result<(), TerminalAdmissionError> {
+        if name.len() > MAX_FIELD_NAME_BYTES {
+            return Err(capacity_error(
+                TerminalRefusal::FieldCapacity,
+                name.len(),
+                MAX_FIELD_NAME_BYTES,
+            ));
+        }
+        if value.len() > MAX_FIELD_VALUE_BYTES {
+            return Err(capacity_error(
+                TerminalRefusal::FieldCapacity,
+                value.len(),
+                MAX_FIELD_VALUE_BYTES,
+            ));
+        }
+        if name.is_empty()
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+            })
+            || value.bytes().any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+        {
+            return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
+        }
+        if self.actions.len() == self.actions.capacity() {
+            return Err(capacity_error(
+                TerminalRefusal::PatchCapacity,
+                self.actions.len() + 1,
+                self.actions.capacity(),
+            ));
+        }
+        let required = self
+            .owned_bytes
+            .checked_add(name.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
+        if required > self.output_limit {
+            return Err(capacity_error(
+                TerminalRefusal::PatchCapacity,
+                required,
+                self.output_limit,
+            ));
+        }
+        self.owned_bytes = required;
+        Ok(())
+    }
+
+    pub fn set(
+        &mut self,
+        name: &str,
+        value: &str,
+        override_existing: bool,
+    ) -> Result<(), TerminalAdmissionError> {
+        self.reserve_field(name, value)?;
+        self.actions.push(TerminalFieldAction::Set {
+            name: name.into(),
+            value: value.into(),
+            override_existing,
+            case_insensitive: false,
+        });
+        Ok(())
+    }
+
+    pub fn set_policy(
+        &mut self,
+        name: &str,
+        value: &str,
+        override_existing: bool,
+    ) -> Result<(), TerminalAdmissionError> {
+        self.reserve_field(name, value)?;
+        self.actions.push(TerminalFieldAction::Set {
+            name: name.into(),
+            value: value.into(),
+            override_existing,
+            case_insensitive: true,
+        });
+        Ok(())
+    }
+
+    pub fn remove(&mut self, name: &str) -> Result<(), TerminalAdmissionError> {
+        self.reserve_field(name, "")?;
+        self.actions.push(TerminalFieldAction::Remove(name.into()));
+        Ok(())
+    }
+}
+
+fn capacity_error(
+    reason: TerminalRefusal,
+    required: usize,
+    allowed: usize,
+) -> TerminalAdmissionError {
+    TerminalAdmissionError::new(reason, required, allowed)
+}
+
+/// Check the actual allocated capacities, repeated wire fields (including
+/// newline-separated cookies), and retained map backing before any cursor work.
+pub fn validate_terminal_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> Result<(), TerminalAdmissionError> {
+    let mut owned = 0usize;
+    let mut fields = 0usize;
+    for (name, value) in headers {
+        if name.len() > MAX_FIELD_NAME_BYTES {
+            return Err(capacity_error(
+                TerminalRefusal::FieldCapacity,
+                name.len(),
+                MAX_FIELD_NAME_BYTES,
+            ));
+        }
+        if value.len() > MAX_FIELD_VALUE_BYTES {
+            return Err(capacity_error(
+                TerminalRefusal::FieldCapacity,
+                value.len(),
+                MAX_FIELD_VALUE_BYTES,
+            ));
+        }
+        owned = owned
+            .checked_add(name.capacity())
+            .and_then(|bytes| bytes.checked_add(value.capacity()))
+            .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
+        fields += if name.eq_ignore_ascii_case("set-cookie") {
+            value.split('\n').count()
+        } else {
+            1
+        };
+    }
+    // HashMap's supported load factor rounds backing buckets above capacity.
+    // 64 bytes per reported capacity conservatively covers buckets/control
+    // bytes, entries, allocator and map ownership, within the fixed allowance.
+    let overhead = headers.capacity().checked_mul(64).unwrap_or(usize::MAX);
+    if owned > CARRIER_OWNED_BYTES
+        || overhead > CARRIER_OVERHEAD_BYTES
+        || fields > MAX_FIELD_OCCURRENCES
+    {
+        return Err(capacity_error(
+            TerminalRefusal::FieldCapacity,
+            owned,
+            CARRIER_OWNED_BYTES,
+        ));
+    }
+    Ok(())
+}
+
+/// Apply one closed result to the sole selected response. Check prospective
+/// allocation/field counts first. No raw request facts are available here.
+pub fn apply_terminal_patch(
+    patch: TerminalPatch,
+    headers: &mut std::collections::HashMap<String, String>,
+) -> Result<(), TerminalAdmissionError> {
+    validate_terminal_headers(headers)?;
+    for action in patch.actions {
+        match action {
+            TerminalFieldAction::Remove(name) => {
+                headers.retain(|key, _| !key.eq_ignore_ascii_case(&name));
+            }
+            TerminalFieldAction::Set {
+                name,
+                value,
+                override_existing,
+                case_insensitive,
+            } => {
+                if !override_existing && headers.keys().any(|key| key.eq_ignore_ascii_case(&name)) {
+                    continue;
+                }
+                // Reserve the complete prospective carrier before map or string
+                // growth, including simultaneous old and new owned field bytes.
+                let replacing = if case_insensitive {
+                    headers.keys().any(|key| key.eq_ignore_ascii_case(&name))
+                } else {
+                    headers.contains_key(name.as_ref())
+                };
+                check_carrier_growth(
+                    headers,
+                    name.len(),
+                    value.len(),
+                    usize::from(!replacing),
+                )?;
+                if case_insensitive {
+                    headers.retain(|key, _| !key.eq_ignore_ascii_case(&name));
+                }
+                headers.insert(name.into_string(), value.into_string());
+            }
+        }
+    }
+    validate_terminal_headers(headers)
+}
+
+fn check_carrier_growth(
+    headers: &std::collections::HashMap<String, String>,
+    name: usize,
+    value: usize,
+    fields: usize,
+) -> Result<(), TerminalAdmissionError> {
+    let owned = headers
+        .iter()
+        .try_fold(name + value, |bytes, (name, value)| {
+            bytes.checked_add(name.capacity())?.checked_add(value.capacity())
+        })
+        .unwrap_or(usize::MAX);
+    let occurrences: usize = headers
+        .iter()
+        .map(|(name, value)| {
+            if name.eq_ignore_ascii_case("set-cookie") {
+                value.split('\n').count()
+            } else {
+                1
+            }
+        })
+        .sum();
+    // Bound the next HashMap growth BEFORE insert, including its old allocation
+    // while rehashing. No growth occurs when spare entry capacity remains.
+    let capacity = if fields != 0 && headers.len() == headers.capacity() {
+        headers.capacity().max(3).saturating_mul(3)
+    } else {
+        headers.capacity()
+    };
+    if owned > CARRIER_OWNED_BYTES
+        || capacity.saturating_mul(64) > CARRIER_OVERHEAD_BYTES
+        || occurrences + fields > MAX_FIELD_OCCURRENCES
+    {
+        return Err(capacity_error(
+            TerminalRefusal::FieldCapacity,
+            owned,
+            CARRIER_OWNED_BYTES,
+        ));
+    }
+    Ok(())
+}
+
+pub fn field_declaration(control: usize, output: usize) -> TerminalDeclaration {
+    TerminalDeclaration::Prepared {
+        bounds: TerminalBounds {
+            control,
+            output,
+            workspace: 0,
+        },
+        prep_reads: TerminalFacts::TELEMETRY,
+        prep_writes: TerminalFacts::NONE,
+        trigger_reads: TerminalFacts::NONE,
+        cursor_writes: TerminalFacts::RESPONSE_HEADERS,
+    }
+}
+
+/// Compile the actual implementation union. Names never establish trust.
+/// Stream/WebSocket-only chains do not enter the HTTP terminal lifecycle.
+pub fn compile_terminal_manifest(
+    plugins: &[std::sync::Arc<dyn super::Plugin>],
+) -> Result<TerminalManifest, TerminalAdmissionError> {
+    let mut manifest = TerminalManifest::new();
+    for plugin in plugins {
+        if !plugin.supported_protocols().iter().any(|protocol| {
+            matches!(protocol, super::ProxyProtocol::Http | super::ProxyProtocol::Grpc)
+        }) {
+            continue;
+        }
+        let pointer = std::sync::Arc::as_ptr(plugin) as *const () as usize;
+        let instance = TerminalInstanceToken(pointer as u64);
+        let declaration = plugin.terminal_declaration();
+        if (plugin.applies_after_proxy_on_reject() || !plugin.may_replace_rejection_response())
+            && matches!(declaration, TerminalDeclaration::Prepared { .. })
+            && !plugin.terminal_preparation_available()
+        {
+            return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0).at(instance));
+        }
+        manifest.push(TerminalManifestEntry {
+            instance,
+            declaration,
+            eligibility: TerminalEligibility {
+                rejection: plugin.applies_after_proxy_on_reject(),
+                charged: !plugin.may_replace_rejection_response(),
+            },
+            wrapped: plugin.terminal_is_wrapped(),
+        })?;
+    }
+    Ok(manifest)
+}
+
+/// All preparations finish before the caller executes any cursor action.
+/// This fixed slot owner contains no plugin/context/raw view and invokes no
+/// old-hook fallback. Unsupported operations fail before terminal execution.
+pub struct PreparedTerminalChain {
+    slots: [Option<PreparedTerminalOp>; MAX_PARTICIPANTS],
+    len: usize,
+    cursor: usize,
+    _ticket: Option<std::sync::Arc<ControlReservation<'static>>>,
+}
+
+impl PreparedTerminalChain {
+    pub fn prepare(
+        plugins: &[std::sync::Arc<dyn super::Plugin>],
+        ctx: &mut super::RequestContext,
+        charged: bool,
+        suppress_replacers: bool,
+    ) -> Result<Self, TerminalAdmissionError> {
+        let prepared = Self::prepare_operations(plugins, ctx, charged, suppress_replacers);
+        // Including refusal/partial preparation: no context-owned upload or
+        // decoder owner survives the public preparation boundary.
+        ctx.retire_terminal_request_views();
+        prepared
+    }
+
+    fn prepare_operations(
+        plugins: &[std::sync::Arc<dyn super::Plugin>],
+        ctx: &mut super::RequestContext,
+        charged: bool,
+        suppress_replacers: bool,
+    ) -> Result<Self, TerminalAdmissionError> {
+        let Some(manifest) = ctx.terminal_manifest_pin.clone() else {
+            return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+        };
+        if !manifest.matches_plugins(plugins) {
+            return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+        }
+        ctx.admit_terminal_manifest(&manifest)?;
+        let ticket = ctx.terminal_control_reservation.clone();
+        if let Some(ticket) = &ticket {
+            ticket.claim_preparation()?;
+        }
+        let workspace = ticket
+            .as_ref()
+            .map(|ticket| ticket.workspace(manifest.workspace_bytes()))
+            .transpose()?;
+        let mut chain = Self {
+            slots: std::array::from_fn(|_| None),
+            len: 0,
+            cursor: 0,
+            _ticket: ticket.clone(),
+        };
+        for plugin in plugins {
+            if ctx
+                .precommit_response_phase_bound()
+                .elapsed_authorization()
+                .is_some()
+            {
+                return Err(capacity_error(TerminalRefusal::AuthorizationExpired, 0, 0));
+            }
+            if !plugin.supported_protocols().iter().any(|protocol| {
+                matches!(protocol, super::ProxyProtocol::Http | super::ProxyProtocol::Grpc)
+            }) {
+                continue;
+            }
+            let rejection = plugin.applies_after_proxy_on_reject();
+            let charged_action = !plugin.may_replace_rejection_response();
+            if !rejection && !charged_action {
+                continue;
+            }
+            let action_allowed = (if charged { charged_action } else { rejection })
+                && !(suppress_replacers && plugin.may_replace_rejection_response());
+            if chain.len == MAX_PARTICIPANTS {
+                return Err(capacity_error(
+                    TerminalRefusal::TooManyParticipants,
+                    chain.len + 1,
+                    MAX_PARTICIPANTS,
+                ));
+            }
+            let declaration = plugin.terminal_declaration();
+            let pure_noop = declaration == TerminalDeclaration::PureNoop;
+            let operation = if pure_noop {
+                PreparedTerminalOp::Noop
+            } else {
+                let output_limit = match declaration {
+                    TerminalDeclaration::Prepared { bounds, .. } => bounds.output,
+                    _ => 0,
+                };
+                plugin.prepare_terminal(&mut ReachedRequestView {
+                    context: ctx,
+                    output_limit,
+                    action_allowed,
+                    ticket: ticket.clone(),
+                })?
+            };
+            operation.validate(declaration)?;
+            chain.slots[chain.len] = Some(if !action_allowed {
+                PreparedTerminalOp::Noop
+            } else {
+                operation
+            });
+            chain.len += 1;
+        }
+        drop(workspace);
+        Ok(chain)
+    }
+
+    /// Consume each operation exactly once in source order. All currently
+    /// admitted variants are immediate; pending I/O variants are deliberately
+    /// unavailable until their bounded transport/accounting migration exists.
+    pub fn next_operation(&mut self) -> Option<PreparedTerminalOp> {
+        if self.cursor == self.len {
+            return None;
+        }
+        let operation = self.slots[self.cursor].take();
+        self.cursor += 1;
+        operation
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static RESPONSE_TERMINAL_TICKET:
+        std::cell::RefCell<Option<std::sync::Arc<ControlReservation<'static>>>>;
+}
+
+pub const CAPACITY_GRPC_WEB_BINARY: &[u8] =
+    b"\x80\x00\x00\x00\x47grpc-status: 8\r\ngrpc-message: Rejection preparation capacity exceeded\r\n";
+pub const CAPACITY_GRPC_WEB_TEXT: &[u8] = concat!(
+    "gAAAAEdncnBjLXN0YXR1czogOA0KZ3JwYy1tZXNzYWdlOiBSZWplY3Rpb24gcHJlcGFy",
+    "YXRpb24gY2FwYWNpdHkgZXhjZWVkZWQNCg==",
+)
+.as_bytes();
+
+/// Emergency transport shape. Every value/body is static, and the fixed number
+/// of transport header entries stays within the independent 4096-byte reserve.
+/// No ledger, hook, parser, fallible staged writer or recursive rejection runs.
+pub fn capacity_wire_parts(
+    native_grpc: bool,
+    grpc_web: Option<&str>,
+    head: bool,
+) -> (http::StatusCode, http::HeaderMap, bytes::Bytes) {
+    let mut headers = http::HeaderMap::with_capacity(6);
+    let (status, content_type, body) = if let Some(content_type) = grpc_web {
+        let text = content_type.starts_with("application/grpc-web-text");
+        let proto = content_type.ends_with("+proto");
+        let content_type = match (text, proto) {
+            (true, true) => "application/grpc-web-text+proto",
+            (true, false) => "application/grpc-web-text",
+            (false, true) => "application/grpc-web+proto",
+            (false, false) => "application/grpc-web",
+        };
+        headers.insert("x-grpc-web", http::HeaderValue::from_static("1"));
+        headers.insert("vary", http::HeaderValue::from_static("Accept"));
+        headers.insert(
+            "access-control-expose-headers",
+            http::HeaderValue::from_static("grpc-status, grpc-message, grpc-status-details-bin"),
+        );
+        let body = if text {
+            CAPACITY_GRPC_WEB_TEXT
+        } else {
+            CAPACITY_GRPC_WEB_BINARY
+        };
+        (http::StatusCode::OK, content_type, body)
+    } else if native_grpc {
+        headers.insert("grpc-status", http::HeaderValue::from_static("8"));
+        headers.insert(
+            "grpc-message",
+            http::HeaderValue::from_static(CAPACITY_MESSAGE),
+        );
+        (http::StatusCode::OK, "application/grpc", &[][..])
+    } else {
+        (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            CAPACITY_HTTP_BODY,
+        )
+    };
+    headers.insert("content-type", http::HeaderValue::from_static(content_type));
+    let body = if head && !native_grpc && grpc_web.is_none() {
+        &[][..]
+    } else {
+        body
+    };
+    (status, headers, bytes::Bytes::from_static(body))
+}
+
+/// Pure candidate registry. Each row delegates to the actual implementation's
+/// source-owned declaration, not a name reported by an arbitrary Plugin. Custom
+/// factories always use their real constructed object and bypass this registry.
+/// Active/unmigrated implementations have no trusted placeholder declaration.
+pub(crate) fn builtin_composition_declaration(name: &str) -> TerminalDeclaration {
+    match name {
+        "__mesh_bpf_metrics" => super::mesh::bpf_metrics::terminal_composition_declaration(),
+        "access_control" => super::access_control::terminal_composition_declaration(),
+        "adaptive_concurrency" => super::adaptive_concurrency::terminal_composition_declaration(),
+        "ai_prompt_compressor" => super::ai_prompt_compressor::terminal_composition_declaration(),
+        "ai_prompt_shield" => super::ai_prompt_shield::terminal_composition_declaration(),
+        "ai_request_guard" => super::ai_request_guard::terminal_composition_declaration(),
+        "ai_semantic_firewall" => super::ai_semantic_firewall::terminal_composition_declaration(),
+        "ai_token_metrics" => super::ai_token_metrics::terminal_composition_declaration(),
+        "ai_tool_governor" => super::ai_tool_governor::terminal_composition_declaration(),
+        "api_chargeback" => super::api_chargeback::terminal_composition_declaration(),
+        "api_chargeback_sink" => super::api_chargeback_sink::terminal_composition_declaration(),
+        "basic_auth" => super::utils::auth_flow::terminal_composition_declaration(),
+        "bot_detection" => super::bot_detection::terminal_composition_declaration(),
+        "fault_injection" => super::fault_injection::terminal_composition_declaration(),
+        "geo_restriction" => super::geo_restriction::terminal_composition_declaration(),
+        "graphql" => super::graphql::terminal_composition_declaration(),
+        "grpc_deadline" => super::grpc_deadline::terminal_composition_declaration(),
+        "grpc_method_router" => super::grpc_method_router::terminal_composition_declaration(),
+        "hmac_auth" => super::utils::auth_flow::terminal_composition_declaration(),
+        "http_logging" => super::http_logging::terminal_composition_declaration(),
+        "ip_restriction" => super::ip_restriction::terminal_composition_declaration(),
+        "jwks_auth" => super::jwks_auth::terminal_composition_declaration(),
+        "jwt_auth" => super::utils::auth_flow::terminal_composition_declaration(),
+        "kafka_logging" => super::kafka_logging::terminal_composition_declaration(),
+        "key_auth" => super::utils::auth_flow::terminal_composition_declaration(),
+        "ldap_auth" => super::utils::auth_flow::terminal_composition_declaration(),
+        "load_testing" => super::load_testing::terminal_composition_declaration(),
+        "loki_logging" => super::loki_logging::terminal_composition_declaration(),
+        "mesh_authz" => super::mesh::authz::terminal_composition_declaration(),
+        "mesh_outbound_registry" => {
+            super::mesh::outbound_registry::terminal_composition_declaration()
+        }
+        "mesh_route_dispatch" => super::mesh_route_dispatch::terminal_composition_declaration(),
+        "mtls_auth" => super::utils::auth_flow::terminal_composition_declaration(),
+        "oauth2_introspection" => super::oauth2_introspection::terminal_composition_declaration(),
+        "opa" => super::opa::terminal_composition_declaration(),
+        "prometheus_metrics" => super::prometheus_metrics::terminal_composition_declaration(),
+        "proxy_alerts" => super::proxy_alerts::terminal_composition_declaration(),
+        "request_deduplication" => super::request_deduplication::terminal_composition_declaration(),
+        "request_mirror" => super::request_mirror::terminal_composition_declaration(),
+        "request_size_limiting" => super::request_size_limiting::terminal_composition_declaration(),
+        "request_termination" => super::request_termination::terminal_composition_declaration(),
+        "request_transformer" => super::request_transformer::terminal_composition_declaration(),
+        "response_mock" => super::response_mock::terminal_composition_declaration(),
+        "serverless_function" => super::serverless_function::terminal_composition_declaration(),
+        "soap_ws_security" => super::soap_ws_security::terminal_composition_declaration(),
+        "spiffe_identity" => super::mesh::spiffe_identity::terminal_composition_declaration(),
+        "statsd_logging" => super::statsd_logging::terminal_composition_declaration(),
+        "stdout_logging" => super::stdout_logging::terminal_composition_declaration(),
+        "tcp_connection_throttle" => {
+            super::tcp_connection_throttle::terminal_composition_declaration()
+        }
+        "tcp_logging" => super::tcp_logging::terminal_composition_declaration(),
+        "udp_logging" => super::udp_logging::terminal_composition_declaration(),
+        "udp_rate_limiting" => super::udp_rate_limiting::terminal_composition_declaration(),
+        "ws_frame_logging" => super::ws_frame_logging::terminal_composition_declaration(),
+        "ws_logging" => super::ws_logging::terminal_composition_declaration(),
+        "ws_message_size_limiting" => {
+            super::ws_message_size_limiting::terminal_composition_declaration()
+        }
+        "ws_rate_limiting" => super::ws_rate_limiting::terminal_composition_declaration(),
+        "ai_semantic_cache" => super::ai_semantic_cache::terminal_composition_declaration(),
+        "spec_expose" => super::spec_expose::terminal_composition_declaration(),
+        _ => TerminalDeclaration::Undeclared,
+    }
+}
+
+pub fn apply_terminal_cookie(
+    cookie: TerminalCookie,
+    headers: &mut std::collections::HashMap<String, String>,
+) -> Result<(), TerminalAdmissionError> {
+    let TerminalCookie {
+        value: cookie,
+        _ticket,
+    } = cookie;
+    validate_terminal_headers(headers)?;
+    if cookie.len() > MAX_COOKIE_BYTES || cookie.capacity() > MAX_COOKIE_BYTES {
+        return Err(capacity_error(
+            TerminalRefusal::FieldCapacity,
+            cookie.capacity(),
+            MAX_COOKIE_BYTES,
+        ));
+    }
+    let Some(existing) = headers.get("set-cookie") else {
+        check_carrier_growth(
+            headers,
+            10,
+            cookie.capacity(),
+            cookie.split('\n').count(),
+        )?;
+        headers.insert("set-cookie".to_string(), cookie);
+        return Ok(());
+    };
+    let length = existing
+        .len()
+        .checked_add(cookie.len())
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
+    // Cookie ownership remains charged to O. New and old selected field
+    // capacities are charged to the carrier before allocating the combination.
+    if length > MAX_COOKIE_BYTES {
+        return Err(capacity_error(
+            TerminalRefusal::FieldCapacity,
+            length,
+            MAX_COOKIE_BYTES,
+        ));
+    }
+    check_carrier_growth(headers, 10, length, cookie.split('\n').count())?;
+    let mut combined = String::with_capacity(length);
+    combined.push_str(existing);
+    combined.push('\n');
+    combined.push_str(&cookie);
+    headers.insert("set-cookie".to_string(), combined);
+    validate_terminal_headers(headers)
 }

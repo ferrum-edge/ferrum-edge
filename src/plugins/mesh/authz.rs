@@ -2778,10 +2778,14 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
     Ok(())
 }
 
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 #[async_trait]
 impl Plugin for MeshAuthz {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        terminal_composition_declaration()
     }
 
     fn may_publish_route_authorization(&self) -> bool {
