@@ -46608,6 +46608,9 @@ fn boxed_unix_backend_checkout_h2c<'a>(
 /// helper frame; [`boxed_proxy_h3_plain_http_mesh_buffered`] then keeps that
 /// helper off `dispatch_plain` / `handle_h3_request`. The allocation is
 /// confined to H3 plain requests that already require a secured mesh bridge.
+/// Box the argument-only trampoline before constructing the retry coroutine;
+/// directly boxing the coroutine still builds a large temporary on the deep
+/// plain-dispatch construction stack. Cancellation stays in the calling task.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_proxy_to_backend_mesh_retry<'a>(
@@ -46628,24 +46631,27 @@ fn boxed_proxy_to_backend_mesh_retry<'a>(
     request_is_secure: bool,
     ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
 ) -> BoxedMeshRetryDispatchFuture<'a> {
-    Box::pin(proxy_to_backend_mesh_retry(
-        state,
-        proxy,
-        backend_url,
-        method,
-        headers,
-        upstream_target,
-        request_body,
-        replay_headers,
-        dispatch_hbone,
-        plugins,
-        request_ctx,
-        stream_response,
-        client_ip,
-        xff_append_ip,
-        request_is_secure,
-        ctx_bytes_sent_observed,
-    ))
+    Box::pin(async move {
+        proxy_to_backend_mesh_retry(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            upstream_target,
+            request_body,
+            replay_headers,
+            dispatch_hbone,
+            plugins,
+            request_ctx,
+            stream_response,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+            ctx_bytes_sent_observed,
+        )
+        .await
+    })
 }
 
 /// Dispatch a buffered plain-HTTP attempt over the mesh transport required by
@@ -46759,9 +46765,10 @@ pub(crate) type BoxedH3PlainHttpMeshBufferedFuture<'a> =
 /// that parent is already large, and a healthy HBONE / Sidecar attempt
 /// reaches the helper; boxing AT the call site is not enough.
 ///
-/// Building the future in this `#[inline(never)]` factory that RETURNS before
-/// anything is awaited keeps the large temporary off the deep H3 poll stack:
-/// each call site stores only a pointer. The cost is one allocation, and only
+/// Box a thin `async move` trampoline in this `#[inline(never)]` factory,
+/// returning before constructing the concrete helper. Directly boxing that
+/// helper still creates its temporary on the deep H3 poll stack. Each call
+/// site stores only a pointer. The cost is one allocation, and only
 /// when an H3 plain attempt has already selected secured mesh egress. Do not
 /// fold this back into the call sites without re-measuring those frames.
 #[allow(clippy::too_many_arguments)]
@@ -46780,20 +46787,23 @@ pub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>(
     xff_append_ip: &'a str,
     request_is_secure: bool,
 ) -> BoxedH3PlainHttpMeshBufferedFuture<'a> {
-    Box::pin(proxy_h3_plain_http_mesh_buffered(
-        state,
-        proxy,
-        backend_url,
-        method,
-        headers,
-        body,
-        upstream_target,
-        plugins,
-        request_ctx,
-        client_ip,
-        xff_append_ip,
-        request_is_secure,
-    ))
+    Box::pin(async move {
+        proxy_h3_plain_http_mesh_buffered(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            body,
+            upstream_target,
+            plugins,
+            request_ctx,
+            client_ip,
+            xff_append_ip,
+            request_is_secure,
+        )
+        .await
+    })
 }
 
 /// Fold the mesh-retry side channel into the buffered H3 response.

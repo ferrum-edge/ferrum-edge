@@ -938,11 +938,10 @@ pub(crate) fn run<'a, S>(
 where
     S: RecvStream + SendStream<Bytes> + SendStreamStopped + Send + 'a,
 {
-    // `run_inner` contains the buffered gRPC dispatcher as well as the boxed
-    // plain dispatcher. Its concrete future is therefore large even for plain
-    // mesh traffic. Keep it out of handle_h3_request's poll frame before that
-    // frame calls through dispatch_plain -> mesh retry -> mTLS send/collect.
-    // A box around dispatch_plain alone does not cut this enclosing edge.
+    // Keep preparation and flavor orchestration out of handle_h3_request's
+    // poll frame before it calls through dispatch_plain -> mesh retry -> mTLS
+    // send/collect. Both buffered dispatchers have their own boxed boundaries;
+    // otherwise the unused gRPC branch still enlarges every plain request.
     // Box a thin trampoline: constructing run_inner here would still put its
     // concrete future on the request poll stack before moving it to the heap.
     // Retained-upload preparation enlarged that future (#6008/#6009). Build it
@@ -1128,7 +1127,7 @@ where
             .await
         }
         HttpFlavor::Grpc => {
-            dispatch_grpc(
+            boxed_dispatch_grpc(
                 state,
                 epoch,
                 proxy,
@@ -7989,6 +7988,99 @@ fn resolve_h3_grpc_transport<'a>(
     // also uses (issue #3728), so the two frontends cannot drift on target
     // validation, dial-plan resolution, or error mapping.
     crate::proxy::resolve_grpc_dispatch_transport(state, target, asserted_source_identity)
+}
+
+type BoxedGrpcDispatchFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<CrossProtocolOutcome, anyhow::Error>> + Send + 'a>,
+>;
+
+/// Isolate the buffered gRPC coroutine from the shared flavor orchestrator.
+///
+/// Streaming-safe gRPC bypasses `run_inner`, while buffered plain requests
+/// traverse it. At opt-level 0, an inline `dispatch_grpc` gives `run_inner` a
+/// large frame slot even on its plain branch. Boxing `run_inner` alone leaves
+/// that poll/construction frame above plain dispatch and the mesh children.
+/// The hosted plain/local-policy and Sidecar aborts, beside passing streaming
+/// gRPC cases, motivate cutting this edge; they do not prove its causal size.
+/// Construct the coroutine only after this thin factory has returned. The
+/// same task keeps the mutable stream/context borrows, retained body, admission
+/// and retry owners, response-buffering decision and trailer governance.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_dispatch_grpc<'a, S>(
+    state: &'a ProxyState,
+    epoch: &'a RequestEpoch,
+    proxy: &'a Proxy,
+    stream: &'a mut RequestStream<S, Bytes>,
+    method: &'a str,
+    proxy_headers: &'a HashMap<String, String>,
+    path: &'a str,
+    query_string: &'a str,
+    backend_url: &'a str,
+    strip_len: usize,
+    backend_path_is_policy_bound: bool,
+    lb_hash_key: Option<&'a str>,
+    upstream_target: Option<&'a UpstreamTarget>,
+    upstream_balancer: Option<&'a Arc<LoadBalancer>>,
+    cb_target_key: Option<&'a str>,
+    cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
+    prebuffered_body: Option<Bytes>,
+    raw_prebuffered_body_bytes: u64,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    backend_start: Instant,
+    ctx: &'a mut RequestContext,
+    plugins: &'a [Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
+    initial_response_header_policy_names: Arc<Vec<String>>,
+    backend_admission_plugins: &'a [Arc<dyn Plugin>],
+    preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
+    requires_response_body_buffering: bool,
+    response_committed_plugins: &'a [Arc<dyn Plugin>],
+    sticky_cookie_needed: bool,
+    request_authority: Option<&'a str>,
+    response_trailer_governance: ResponseTrailerGovernance<'a>,
+) -> BoxedGrpcDispatchFuture<'a>
+where
+    S: RecvStream + SendStream<Bytes> + Send + 'a,
+{
+    Box::pin(async move {
+        dispatch_grpc(
+            state,
+            epoch,
+            proxy,
+            stream,
+            method,
+            proxy_headers,
+            path,
+            query_string,
+            backend_url,
+            strip_len,
+            backend_path_is_policy_bound,
+            lb_hash_key,
+            upstream_target,
+            upstream_balancer,
+            cb_target_key,
+            cb_probe,
+            prebuffered_body,
+            raw_prebuffered_body_bytes,
+            client_ip,
+            xff_append_ip,
+            backend_start,
+            ctx,
+            plugins,
+            initial_response_header_policy_plugins,
+            initial_response_header_policy_names,
+            backend_admission_plugins,
+            preacquired_backend_admission,
+            requires_response_body_buffering,
+            response_committed_plugins,
+            sticky_cookie_needed,
+            request_authority,
+            response_trailer_governance,
+        )
+        .await
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

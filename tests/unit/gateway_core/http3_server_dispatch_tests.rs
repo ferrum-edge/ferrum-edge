@@ -140,6 +140,10 @@ fn h3_plain_dispatcher_is_boxed_off_the_cross_protocol_run_stack() {
         run.contains("boxed_dispatch_plain(") && !run.contains("\n            dispatch_plain("),
         "run must not materialize the oversized plain bridge future in its poll frame"
     );
+    assert!(
+        run.contains("boxed_dispatch_grpc(") && !run.contains("\n            dispatch_grpc("),
+        "the unused buffered gRPC branch must not enlarge run_inner's plain poll frame"
+    );
 
     let boxed = source
         .split("fn boxed_dispatch_plain<'a, S>(")
@@ -155,6 +159,100 @@ fn h3_plain_dispatcher_is_boxed_off_the_cross_protocol_run_stack() {
             && !boxed.contains("Box::pin(dispatch_plain("),
         "plain-dispatch boxing must use an out-of-line trampoline, not a stack temporary"
     );
+}
+
+/// These construction seams sit below the generic H3 handler. The hosted
+/// functional suite is the stack/behavior witness; source checks only prevent
+/// restoring a concrete future temporary or changing ownership at these seams.
+#[test]
+fn h3_buffered_bridge_factories_defer_construction_and_forward_exact_owners() {
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let grpc_args = "state,epoch,proxy,stream,method,proxy_headers,path,query_string,backend_url,\
+        strip_len,backend_path_is_policy_bound,lb_hash_key,upstream_target,upstream_balancer,\
+        cb_target_key,cb_probe,prebuffered_body,raw_prebuffered_body_bytes,client_ip,xff_append_ip,\
+        backend_start,ctx,plugins,initial_response_header_policy_plugins,\
+        initial_response_header_policy_names,backend_admission_plugins,\
+        preacquired_backend_admission,requires_response_body_buffering,response_committed_plugins,\
+        sticky_cookie_needed,request_authority,response_trailer_governance";
+    let mesh_args = "state,proxy,backend_url,method,headers,body,upstream_target,plugins,\
+        request_ctx,client_ip,xff_append_ip,request_is_secure";
+    let retry_args = "state,proxy,backend_url,method,headers,upstream_target,request_body,\
+        replay_headers,dispatch_hbone,plugins,request_ctx,stream_response,client_ip,xff_append_ip,\
+        request_is_secure,ctx_bytes_sent_observed";
+
+    for (source, marker, attributed, relay, args) in [
+        (
+            bridge,
+            "fn boxed_dispatch_grpc<'a, S>(",
+            "#[inline(never)]\nfn boxed_dispatch_grpc<'a, S>(",
+            "dispatch_grpc",
+            grpc_args,
+        ),
+        (
+            proxy,
+            "fn boxed_proxy_h3_plain_http_mesh_buffered<'a>(",
+            "#[inline(never)]\npub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>(",
+            "proxy_h3_plain_http_mesh_buffered",
+            mesh_args,
+        ),
+        (
+            proxy,
+            "fn boxed_proxy_to_backend_mesh_retry<'a>(",
+            "#[inline(never)]\nfn boxed_proxy_to_backend_mesh_retry<'a>(",
+            "proxy_to_backend_mesh_retry",
+            retry_args,
+        ),
+    ] {
+        assert!(
+            source.contains(attributed),
+            "{relay} factory must remain out of line"
+        );
+        let factory = compact_code(source_region(source, marker, "\n}\n"));
+        let body_at = factory.find('{').expect("factory body");
+        assert_eq!(
+            &factory[body_at + 1..],
+            format!("Box::pin(asyncmove{{{relay}({args}).await}})"),
+            "{relay} must only capture its exact arguments before future construction; \
+             no clone, spawn, second admission or direct concrete boxing"
+        );
+    }
+
+    let run = source_region(
+        bridge,
+        "async fn run_inner<S>(",
+        "\ntype BoxedPlainDispatchFuture",
+    );
+    let grpc_arm = compact_code(source_region(
+        run,
+        "HttpFlavor::Grpc => {",
+        "HttpFlavor::WebSocket => {",
+    ));
+    let caller_args = grpc_args.replace(
+        "initial_response_header_policy_plugins,",
+        "initial_response_header_policy_plugins.as_ref(),",
+    );
+    assert!(grpc_arm.starts_with(&format!("boxed_dispatch_grpc({caller_args}).await}}")));
+    assert_eq!(grpc_arm.matches("dispatch_grpc(").count(), 1);
+
+    let mesh_helper = source_region(
+        proxy,
+        "pub(crate) async fn proxy_h3_plain_http_mesh_buffered(",
+        "\n/// One H3 plain mesh helper future",
+    );
+    // This scope has no string containing //; remove the buffered-response
+    // argument's trailing line comment as well as whole comment lines.
+    let mesh_code: String = mesh_helper
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect();
+    let mesh_helper = compact_code(&mesh_code);
+    assert!(mesh_helper.contains(
+        "boxed_proxy_to_backend_mesh_retry(state,proxy,backend_url,method,headers,\
+         Some(upstream_target),Some(&body),Some(&replay_headers),dispatch_hbone,plugins,\
+         request_ctx,false,client_ip,xff_append_ip,request_is_secure,\
+         &request_ctx.bytes_sent_observed).await"
+    ));
 }
 
 #[test]
