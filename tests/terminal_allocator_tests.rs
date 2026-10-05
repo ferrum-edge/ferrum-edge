@@ -16,8 +16,8 @@ mod qualified {
     use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
     use ferrum_edge::plugins::rate_limiting::RateLimiting;
     use ferrum_edge::plugins::terminal_preparation::{
-        CONTROL_BYTES, MAX_FIELD_OCCURRENCES, PROCESS_BYTES, PreparationLedger,
-        PreparedTerminalChain, PreparedTerminalOp, REQUEST_TICKETS, ROOT_BYTES,
+        CONTROL_BYTES, MAX_FIELD_OCCURRENCES, PROCESS_BYTES, PROCESS_PREPARATION_LEDGER,
+        PreparationLedger, PreparedTerminalChain, PreparedTerminalOp, REQUEST_TICKETS, ROOT_BYTES,
         SelectedTerminalCarrier, TerminalAdmissionError, TerminalDeclaration, TerminalFieldLineage,
         TerminalFieldOrigin, TerminalFieldSection, TerminalRefusal, TerminalResult,
         apply_terminal_patch, compile_terminal_manifest, field_declaration,
@@ -103,6 +103,46 @@ mod qualified {
 
     struct Replay {
         operation: std::sync::Mutex<Option<PreparedTerminalOp>>,
+    }
+
+    struct CookieReplay {
+        operation: std::sync::Mutex<Option<PreparedTerminalOp>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Plugin for CookieReplay {
+        fn name(&self) -> &str {
+            "fixture_cookie_replay"
+        }
+
+        fn priority(&self) -> u16 {
+            1
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        fn terminal_declaration(&self) -> TerminalDeclaration {
+            field_declaration(16_384, 16_384)
+        }
+
+        fn terminal_preparation_available(&self) -> bool {
+            true
+        }
+
+        fn prepare_terminal(
+            &self,
+            view: &mut ferrum_edge::plugins::terminal_preparation::ReachedRequestView<'_>,
+        ) -> Result<PreparedTerminalOp, TerminalAdmissionError> {
+            let mut retained = self.operation.lock().unwrap();
+            if let Some(operation) = retained.take() {
+                return Ok(operation);
+            }
+            let cookie = view.take_cookie_metadata("cookie")?.unwrap();
+            *retained = Some(PreparedTerminalOp::Cookie(cookie));
+            Ok(PreparedTerminalOp::Noop)
+        }
     }
 
     #[async_trait::async_trait]
@@ -330,6 +370,183 @@ mod qualified {
             PreparedTerminalChain::prepare(&replay, &mut ctx, false, false),
             Err(error) if error.reason == TerminalRefusal::PinnedGeneration,
         ));
+    }
+
+    #[test]
+    fn a_cookie_cannot_be_replayed_between_requests_in_the_same_manifest() {
+        let before = PROCESS_PREPARATION_LEDGER.usage();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CookieReplay {
+            operation: std::sync::Mutex::new(None),
+        })];
+        let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+        let mut source = context();
+        let value = "opaque=request-a";
+        let cookie_backing = AllocationPlan::array::<u8>(value.len())
+            .unwrap()
+            .backing_bytes();
+        source.metadata.insert("cookie".into(), value.into());
+        let mut destination = context();
+        destination
+            .metadata
+            .insert("cookie".into(), "opaque=request-b".into());
+        destination.headers.insert("x-request".into(), "b".into());
+        // Compile once: both requests get the same configured instance token,
+        // while admission reserves a distinct ticket for each request.
+        manifest.pin(&mut source).unwrap();
+        manifest.pin(&mut destination).unwrap();
+        let admitted = PROCESS_PREPARATION_LEDGER.usage();
+        assert_eq!(admitted.tickets, before.tickets + 2);
+        let mut chain =
+            PreparedTerminalChain::prepare(&plugins, &mut source, false, false).unwrap();
+        assert!(matches!(
+            chain.next_operation(),
+            Some(PreparedTerminalOp::Noop)
+        ));
+        assert!(!source.metadata.contains_key("cookie"));
+        let source_metadata = source.metadata.clone();
+        let destination_metadata = destination.metadata.clone();
+        let destination_headers = destination.headers.clone();
+        let source_backing = chain.allocated_backing_bytes();
+
+        assert!(matches!(
+            PreparedTerminalChain::prepare(&plugins, &mut destination, false, false),
+            Err(error) if error.reason == TerminalRefusal::PinnedGeneration,
+        ));
+
+        assert_eq!(source.metadata, source_metadata);
+        assert_eq!(destination.metadata, destination_metadata);
+        assert_eq!(destination.headers, destination_headers);
+        assert_eq!(
+            chain.allocated_backing_bytes(),
+            source_backing - cookie_backing,
+        );
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), admitted);
+        drop(chain);
+        drop(source);
+        assert_eq!(
+            PROCESS_PREPARATION_LEDGER.usage().tickets,
+            before.tickets + 1
+        );
+        drop(destination);
+        drop(manifest);
+        drop(plugins);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), before);
+    }
+
+    #[test]
+    fn direct_cookie_append_rejects_another_ticket_without_mutation_and_preserves_custody() {
+        let before = PROCESS_PREPARATION_LEDGER.usage();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(Cookie { key: "cookie" })];
+        let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+        let instance = manifest.entries().next().unwrap().instance;
+        let mut source = context();
+        source.metadata.insert(
+            "cookie".into(),
+            "opaque=request-a\nrotated=request-a".into(),
+        );
+        let mut destination = context();
+        destination.metadata.insert("untouched".into(), "b".into());
+        destination.headers.insert("x-request".into(), "b".into());
+        manifest.pin(&mut source).unwrap();
+        manifest.pin(&mut destination).unwrap();
+        assert_eq!(
+            PROCESS_PREPARATION_LEDGER.usage().tickets,
+            before.tickets + 2
+        );
+        let mut source_chain =
+            PreparedTerminalChain::prepare(&plugins, &mut source, false, false).unwrap();
+        let destination_chain =
+            PreparedTerminalChain::prepare(&plugins, &mut destination, false, false).unwrap();
+        let TerminalResult::Cookie(cookie) = source_chain.next_operation().unwrap().execute() else {
+            panic!("cookie operation")
+        };
+        let slots =
+            AllocationPlan::array::<Option<PreparedTerminalOp>>(manifest.participant_count())
+                .unwrap()
+                .backing_bytes();
+        let cookie_and_root_backing = source_chain.allocated_backing_bytes() - slots;
+        let mut source_carrier = source_chain.new_selected_carrier().unwrap();
+        let mut destination_carrier = destination_chain.new_selected_carrier().unwrap();
+        destination_carrier
+            .push("x-opaque", &[0x80, 0xff], backend())
+            .unwrap();
+        destination_carrier
+            .push("set-cookie", b"opaque=request-b", backend())
+            .unwrap();
+        let original: Vec<_> = destination_carrier
+            .occurrences()
+            .map(|(name, value, lineage)| (name.to_vec(), value.to_vec(), lineage))
+            .collect();
+        let metadata = destination.metadata.clone();
+        let headers = destination.headers.clone();
+        let source_backing = source_chain.allocated_backing_bytes();
+        let destination_backing = destination_chain.allocated_backing_bytes();
+        let admitted = PROCESS_PREPARATION_LEDGER.usage();
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        let before_allocation = allocated.get();
+        let refusal = destination_carrier.append_cookie(&cookie).unwrap_err();
+        assert_eq!(refusal.reason, TerminalRefusal::PinnedGeneration);
+        assert_eq!(allocated.get(), before_allocation);
+        let unchanged: Vec<_> = destination_carrier
+            .occurrences()
+            .map(|(name, value, lineage)| (name.to_vec(), value.to_vec(), lineage))
+            .collect();
+        assert_eq!(unchanged, original);
+        assert_eq!(destination.metadata, metadata);
+        assert_eq!(destination.headers, headers);
+        assert_eq!(source_chain.allocated_backing_bytes(), source_backing);
+        assert_eq!(
+            destination_chain.allocated_backing_bytes(),
+            destination_backing
+        );
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), admitted);
+
+        // Refusing the other request neither consumes nor invalidates this
+        // cookie: the originating request still accepts both occurrences.
+        source_carrier.append_cookie(&cookie).unwrap();
+        let values: Vec<_> = source_carrier
+            .occurrences()
+            .map(|(name, value, lineage)| {
+                assert_eq!(name, b"set-cookie");
+                assert_eq!(
+                    lineage.origin,
+                    TerminalFieldOrigin::GatewayInstance(instance)
+                );
+                value.to_vec()
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [b"opaque=request-a".to_vec(), b"rotated=request-a".to_vec()]
+        );
+        assert_eq!(source_chain.allocated_backing_bytes(), source_backing);
+        drop(source_carrier);
+        drop(source_chain);
+        drop(source);
+        let retained = PROCESS_PREPARATION_LEDGER.usage();
+        assert_eq!(retained.tickets, before.tickets + 2);
+        // The cookie alone retains A's reservation after every other A owner
+        // retires. Its last drop returns that ticket and its full logical sum.
+        let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+        let before_deallocation = deallocated.get();
+        drop(cookie);
+        assert_eq!(
+            deallocated.get() - before_deallocation,
+            cookie_and_root_backing as u64,
+        );
+        let retired = PROCESS_PREPARATION_LEDGER.usage();
+        assert_eq!(retired.tickets, before.tickets + 1);
+        assert_eq!(retired.bytes, retained.bytes - manifest.control_bytes());
+        assert_eq!(
+            destination_chain.allocated_backing_bytes(),
+            destination_backing
+        );
+        drop(destination_carrier);
+        drop(destination_chain);
+        drop(destination);
+        drop(manifest);
+        drop(plugins);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), before);
     }
 
     #[test]

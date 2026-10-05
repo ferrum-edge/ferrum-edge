@@ -948,7 +948,11 @@ impl ReachedRequestView<'_> {
         let value = TerminalString::copy(cookie, plan, ticket)?;
         // The old staged backing is dropped before this operation can escape.
         self.context.metadata.remove(key);
-        Ok(Some(TerminalCookie { value, lineage }))
+        Ok(Some(TerminalCookie {
+            value,
+            lineage,
+            ticket: ticket.clone(),
+        }))
     }
 
     /// Construct a patch using only this instance's admitted output credit.
@@ -971,10 +975,24 @@ pub enum PreparedTerminalOp {
 }
 
 /// Capacity-checked, moved cookie owner; construction is confined to the
-/// synchronous admitted view, before any cursor or external poll.
+/// synchronous admitted view, before any cursor or external poll. Its immutable
+/// ticket binds the value to the originating request throughout its lifetime.
 pub struct TerminalCookie {
     value: TerminalString,
     lineage: TerminalFieldLineage,
+    ticket: TerminalTicket,
+}
+
+impl TerminalCookie {
+    fn validate_ticket(
+        &self,
+        ticket: Option<&TerminalTicket>,
+    ) -> Result<(), TerminalAdmissionError> {
+        if ticket.is_none_or(|ticket| !ticket.ptr_eq(&self.ticket)) {
+            return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+        }
+        Ok(())
+    }
 }
 
 /// Closed results carry response work only. No request-fact or raw metadata
@@ -1000,10 +1018,11 @@ impl PreparedTerminalOp {
             {
                 return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
             }
-            Self::Cookie(cookie)
-                if cookie.lineage.origin != TerminalFieldOrigin::GatewayInstance(instance) =>
-            {
-                return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+            Self::Cookie(cookie) => {
+                if cookie.lineage.origin != TerminalFieldOrigin::GatewayInstance(instance) {
+                    return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+                }
+                cookie.validate_ticket(ticket)?;
             }
             _ => {}
         }
@@ -2189,6 +2208,7 @@ impl PreparedTerminalChain {
         cookie: TerminalCookie,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> Result<(), TerminalAdmissionError> {
+        cookie.validate_ticket(self._ticket.as_ref())?;
         preflight_legacy_cookie(cookie.value.as_str(), headers)?;
         self.selected(headers)?.append_cookie(&cookie)?;
         apply_terminal_cookie(cookie, headers)

@@ -176,6 +176,7 @@ impl SelectedTerminalCarrier {
     }
 
     pub fn append_cookie(&mut self, cookie: &TerminalCookie) -> Result<(), TerminalAdmissionError> {
+        cookie.validate_ticket(Some(&self.ticket))?;
         let lines = cookie.value.as_str().split('\n');
         let mut count = self.field_count();
         let mut required = self.used;
