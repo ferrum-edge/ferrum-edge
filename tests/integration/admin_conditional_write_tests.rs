@@ -21,7 +21,9 @@ use ferrum_edge::admin::{
     jwt_auth::{JwtConfig, JwtManager},
     serve_admin_on_listener,
 };
-use ferrum_edge::config::db_backend::{DatabaseBackend, NamespaceConfigAdmissionLeaseBackend};
+use ferrum_edge::config::db_backend::{
+    BatchConfigWriteMode, DatabaseBackend, NamespaceConfigAdmissionLeaseBackend,
+};
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Method;
@@ -2740,7 +2742,12 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             _ => {
                 let mut changed = consumer.clone();
                 changed.acl_groups = vec!["operator".to_string()];
-                db.update_consumer(&changed).await.unwrap();
+                db.update_consumer(
+                    &changed,
+                    &BatchConfigWriteMode::Admission,
+                )
+                .await
+                .unwrap();
                 (String::new(), None)
             }
         };
