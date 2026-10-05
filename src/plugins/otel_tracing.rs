@@ -3436,9 +3436,9 @@ fn unique_header_value_case_insensitive<'a>(
 
 fn terminal_uuid_bytes() -> Result<[u8; 16], TerminalAdmissionError> {
     let mut bytes = [0u8; 16];
-    SystemRandom::new().fill(&mut bytes).map_err(|_| {
-        TerminalAdmissionError::new(TerminalRefusal::EntropyUnavailable, 0, 0)
-    })?;
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| TerminalAdmissionError::new(TerminalRefusal::EntropyUnavailable, 0, 0))?;
     // Same version/variant bits as UUID v4, with fallible entropy acquisition.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;

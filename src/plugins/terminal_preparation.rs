@@ -427,10 +427,8 @@ impl TerminalManifest {
             (&mut cloned.sources, &self.sources),
         ] {
             if let Some(source) = source {
-                let mut slots = FixedSlots::generation(
-                    source.as_slice().len(),
-                    &PROCESS_PREPARATION_LEDGER,
-                )?;
+                let mut slots =
+                    FixedSlots::generation(source.as_slice().len(), &PROCESS_PREPARATION_LEDGER)?;
                 for plugin in source.as_slice() {
                     slots.push(std::sync::Arc::clone(plugin))?;
                 }
@@ -699,7 +697,11 @@ impl<'a> ControlReservation<'a> {
         }
         let plan = AllocationPlan::array::<u8>(bytes)?;
         let charged = round_pages(plan.backing_bytes()).ok_or_else(|| {
-            capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, WORKSPACE_BYTES)
+            capacity_error(
+                TerminalRefusal::ArithmeticOverflow,
+                usize::MAX,
+                WORKSPACE_BYTES,
+            )
         })?;
         let lease = self.workspace(charged)?;
         let result = lease.synchronous(bytes, use_workspace);
@@ -869,9 +871,10 @@ impl ReachedRequestView<'_> {
         &self,
         actions: usize,
     ) -> Result<TerminalPatch, TerminalAdmissionError> {
-        let ticket = self.ticket.as_ref().ok_or_else(|| {
-            capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
-        })?;
+        let ticket = self
+            .ticket
+            .as_ref()
+            .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
         TerminalPatch::new(actions, self.control_limit, ticket, self.instance)
     }
 
@@ -924,9 +927,10 @@ impl ReachedRequestView<'_> {
         {
             return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
         }
-        let ticket = self.ticket.as_ref().ok_or_else(|| {
-            capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
-        })?;
+        let ticket = self
+            .ticket
+            .as_ref()
+            .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
         let plan = TerminalString::plan(cookie)?;
         if plan.backing_bytes() > allowed {
             return Err(capacity_error(
@@ -949,9 +953,10 @@ impl ReachedRequestView<'_> {
 
     /// Construct a patch using only this instance's admitted output credit.
     pub fn patch(&self, actions: usize) -> Result<TerminalPatch, TerminalAdmissionError> {
-        let ticket = self.ticket.as_ref().ok_or_else(|| {
-            capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
-        })?;
+        let ticket = self
+            .ticket
+            .as_ref()
+            .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
         TerminalPatch::new(actions, self.output_limit, ticket, self.instance)
     }
 }
@@ -1145,7 +1150,11 @@ impl TerminalPatch {
         }
         let required = AllocationPlan::array::<TerminalFieldAction>(actions)?.backing_bytes();
         if required > output {
-            return Err(capacity_error(TerminalRefusal::PatchCapacity, required, output));
+            return Err(capacity_error(
+                TerminalRefusal::PatchCapacity,
+                required,
+                output,
+            ));
         }
         Ok(Self {
             actions: FixedSlots::request(actions, ticket)?,
@@ -1499,10 +1508,12 @@ fn validate_field(name: &str, value: &str) -> Result<(), TerminalAdmissionError>
         ));
     }
     if name.is_empty()
-        || !name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-        })
-        || value.bytes().any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+        || value
+            .bytes()
+            .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
     {
         return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
     }
@@ -1534,12 +1545,16 @@ pub fn validate_terminal_headers(
             for value in value.split('\n') {
                 validate_field(name, value)?;
                 fields += 1;
-                wire_bytes = wire_bytes.saturating_add(name.len()).saturating_add(value.len());
+                wire_bytes = wire_bytes
+                    .saturating_add(name.len())
+                    .saturating_add(value.len());
             }
         } else {
             validate_field(name, value)?;
             fields += 1;
-            wire_bytes = wire_bytes.saturating_add(name.len()).saturating_add(value.len());
+            wire_bytes = wire_bytes
+                .saturating_add(name.len())
+                .saturating_add(value.len());
         }
     }
     // Copying repeated cookies charges every name occurrence. A tiny value
@@ -1613,7 +1628,11 @@ fn preflight_legacy_patch(
             }
             TerminalFieldAction::Remove(_) => {}
             TerminalFieldAction::Metadata { .. } => {
-                return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+                return Err(capacity_error(
+                    TerminalRefusal::UnimplementedOperation,
+                    0,
+                    0,
+                ));
             }
         }
     }
@@ -1656,7 +1675,11 @@ fn apply_legacy_patch(
                 headers.insert(name.as_str().to_string(), value.as_str().to_string());
             }
             TerminalFieldAction::Metadata { .. } => {
-                return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+                return Err(capacity_error(
+                    TerminalRefusal::UnimplementedOperation,
+                    0,
+                    0,
+                ));
             }
         }
     }
@@ -1753,7 +1776,10 @@ pub fn compile_terminal_manifest(
     manifest.source_chain = Some(chain);
     for plugin in plugins {
         if !plugin.supported_protocols().iter().any(|protocol| {
-            matches!(protocol, super::ProxyProtocol::Http | super::ProxyProtocol::Grpc)
+            matches!(
+                protocol,
+                super::ProxyProtocol::Http | super::ProxyProtocol::Grpc
+            )
         }) {
             continue;
         }
@@ -1856,12 +1882,11 @@ impl PreparedTerminalChain {
         let slots = if manifest.participant_count() == 0 {
             None
         } else {
-            let ticket = ticket.as_ref().ok_or_else(|| {
-                capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
-            })?;
-            let plan = AllocationPlan::array::<Option<PreparedTerminalOp>>(
-                manifest.participant_count(),
-            )?;
+            let ticket = ticket
+                .as_ref()
+                .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
+            let plan =
+                AllocationPlan::array::<Option<PreparedTerminalOp>>(manifest.participant_count())?;
             let allowance = manifest.participant_count() * SLOT_BYTES;
             if plan.backing_bytes() > allowance {
                 return Err(capacity_error(
@@ -1930,9 +1955,10 @@ impl PreparedTerminalChain {
             } else {
                 operation
             });
-            let slots = chain.slots.as_mut().ok_or_else(|| {
-                capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
-            })?;
+            let slots = chain
+                .slots
+                .as_mut()
+                .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
             slots.push(operation)?;
             chain.len += 1;
         }
@@ -1945,16 +1971,17 @@ impl PreparedTerminalChain {
         headers: &std::collections::HashMap<String, String>,
     ) -> Result<&mut SelectedTerminalCarrier, TerminalAdmissionError> {
         if self.selected.is_none() {
-            let ticket = self._ticket.as_ref().ok_or_else(|| {
-                capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
-            })?;
+            let ticket = self
+                ._ticket
+                .as_ref()
+                .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
             let mut selected = SelectedTerminalCarrier::new(ticket)?;
             selected.load_legacy(headers)?;
             self.selected = Some(selected);
         }
-        self.selected.as_mut().ok_or_else(|| {
-            capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
-        })
+        self.selected
+            .as_mut()
+            .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))
     }
 
     pub(crate) fn reset_selected(
@@ -2192,7 +2219,11 @@ pub fn apply_terminal_cookie(
         return Ok(());
     };
     let Some(existing) = headers.get("set-cookie") else {
-        return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+        return Err(capacity_error(
+            TerminalRefusal::UnimplementedOperation,
+            0,
+            0,
+        ));
     };
     let mut combined = String::with_capacity(length);
     combined.push_str(existing);

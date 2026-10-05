@@ -406,11 +406,7 @@ fn prepare_trace(
             *target = source.to_ascii_lowercase();
         }
         let span = OtelTracing::generate_span_id_fixed()?;
-        let traceparent = traceparent(
-            fixed_text(&trace)?,
-            fixed_text(&span)?,
-            metadata.sampled(),
-        );
+        let traceparent = traceparent(fixed_text(&trace)?, fixed_text(&span)?, metadata.sampled());
         metadata.set("trace_id", fixed_text(&trace)?)?;
         metadata.set("parent_span_id", fixed_text(&parent)?)?;
         metadata.set("span_id", fixed_text(&span)?)?;

@@ -358,16 +358,18 @@ mod qualified {
         let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(Noop)];
         let mut ctx = context();
         pin(&plugins, &mut ctx);
-        let candidate: Vec<Arc<dyn Plugin>> = (0..65)
-            .map(|_| Arc::new(Noop) as Arc<dyn Plugin>)
-            .collect();
+        let candidate: Vec<Arc<dyn Plugin>> =
+            (0..65).map(|_| Arc::new(Noop) as Arc<dyn Plugin>).collect();
         assert_eq!(
             compile_terminal_manifest(&candidate).unwrap_err().reason,
             TerminalRefusal::TooManyParticipants,
         );
         drop(candidate);
         let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
-        assert!(matches!(chain.next_operation(), Some(PreparedTerminalOp::Noop)));
+        assert!(matches!(
+            chain.next_operation(),
+            Some(PreparedTerminalOp::Noop)
+        ));
         assert!(chain.next_operation().is_none());
     }
 
@@ -407,8 +409,12 @@ mod qualified {
             let ticket = ledger().reserve_owned(CONTROL_BYTES).unwrap();
             let mut carrier = SelectedTerminalCarrier::new(&ticket).unwrap();
             carrier.push("vary", b"Origin", backend()).unwrap();
-            carrier.push("set-cookie", b"opaque=same", backend()).unwrap();
-            carrier.push("set-cookie", b"opaque=same", backend()).unwrap();
+            carrier
+                .push("set-cookie", b"opaque=same", backend())
+                .unwrap();
+            carrier
+                .push("set-cookie", b"opaque=same", backend())
+                .unwrap();
             let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(Fields {
                 values: vec![("vary", "Origin".into())],
                 override_existing,
@@ -550,8 +556,10 @@ mod qualified {
             "mesh.source.principal".into(),
             "spiffe://evil/ns/forged/sa/forged".into(),
         );
-        ctx.metadata.insert("mesh.source.namespace".into(), "forged".into());
-        ctx.metadata.insert("mesh.source.service_account".into(), "forged".into());
+        ctx.metadata
+            .insert("mesh.source.namespace".into(), "forged".into());
+        ctx.metadata
+            .insert("mesh.source.service_account".into(), "forged".into());
         ctx.metadata.insert(
             "traceparent".into(),
             "00-0123456789abcdef0123456789abcdef-0123456789abcdef-00".into(),
@@ -562,7 +570,9 @@ mod qualified {
         );
         let mut ordinary = ctx.clone();
         let mut ordinary_headers = HashMap::new();
-        plugin.after_proxy(&mut ordinary, 403, &mut ordinary_headers).await;
+        plugin
+            .after_proxy(&mut ordinary, 403, &mut ordinary_headers)
+            .await;
         let plugins: Vec<Arc<dyn Plugin>> = vec![plugin];
         pin(&plugins, &mut ctx);
         let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();
@@ -587,9 +597,8 @@ mod qualified {
     async fn real_metrics_b3_import_preserves_sampling_parent_and_single_header_precedence() {
         allocator_profile();
         for mode in [0, 1, 2] {
-            let plugin = Arc::new(
-                WorkloadMetrics::new(&json!({"sampling_percentage": 0.0})).unwrap(),
-            );
+            let plugin =
+                Arc::new(WorkloadMetrics::new(&json!({"sampling_percentage": 0.0})).unwrap());
             let mut ctx = context();
             ctx.metadata.reserve(128);
             ctx.peer_spiffe_id =
@@ -599,13 +608,13 @@ mod qualified {
                 "pod_uid_mismatch".into(),
             );
             if mode == 0 {
-                ctx.headers.insert(
-                    "b3".into(),
-                    "0123456789ABCDEF-0123456789ABCDEF-0".into(),
-                );
+                ctx.headers
+                    .insert("b3".into(), "0123456789ABCDEF-0123456789ABCDEF-0".into());
             } else {
-                ctx.headers.insert("x-b3-traceid".into(), "0123456789ABCDEF".into());
-                ctx.headers.insert("x-b3-spanid".into(), "0123456789ABCDEF".into());
+                ctx.headers
+                    .insert("x-b3-traceid".into(), "0123456789ABCDEF".into());
+                ctx.headers
+                    .insert("x-b3-spanid".into(), "0123456789ABCDEF".into());
                 ctx.headers.insert("x-b3-sampled".into(), "0".into());
                 if mode == 2 {
                     ctx.headers.insert("b3".into(), "invalid".into());
@@ -613,7 +622,9 @@ mod qualified {
             }
             let mut ordinary = ctx.clone();
             let mut ordinary_headers = HashMap::new();
-            plugin.after_proxy(&mut ordinary, 403, &mut ordinary_headers).await;
+            plugin
+                .after_proxy(&mut ordinary, 403, &mut ordinary_headers)
+                .await;
             let plugins: Vec<Arc<dyn Plugin>> = vec![plugin];
             pin(&plugins, &mut ctx);
             let mut chain =
@@ -634,7 +645,10 @@ mod qualified {
             assert!(traceparent.starts_with("00-00000000000000000123456789abcdef-"));
             assert_eq!(traceparent.len(), 55);
             assert!(traceparent.ends_with("-00"));
-            assert_eq!(ctx.metadata.get("parent_span_id").unwrap(), "0123456789abcdef");
+            assert_eq!(
+                ctx.metadata.get("parent_span_id").unwrap(),
+                "0123456789abcdef"
+            );
             // Independent hooks mint distinct spans; all other facts must agree.
             for key in ["span_id", "traceparent"] {
                 ctx.metadata.remove(key);
@@ -662,7 +676,9 @@ mod qualified {
         let mut ordinary = ctx.clone();
         let mut ordinary_headers = HashMap::new();
         ordinary_headers.insert("x-ratelimit-identity".into(), "private".into());
-        plugin.after_proxy(&mut ordinary, 403, &mut ordinary_headers).await;
+        plugin
+            .after_proxy(&mut ordinary, 403, &mut ordinary_headers)
+            .await;
         let plugins: Vec<Arc<dyn Plugin>> = vec![plugin];
         pin(&plugins, &mut ctx);
         let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false).unwrap();

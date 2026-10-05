@@ -62,8 +62,7 @@ pub struct ProxyBody {
     /// Dropped when hyper finishes sending the body (or the connection closes),
     /// decrementing `OverloadState.active_requests`.
     _request_guard: Option<crate::overload::RequestGuard>,
-    _terminal_preparation_ticket:
-        Option<crate::plugins::terminal_storage::TerminalTicket>,
+    _terminal_preparation_ticket: Option<crate::plugins::terminal_storage::TerminalTicket>,
     /// Dropped when a reqwest-backed response body finishes, so the
     /// runtime port-pressure estimate tracks streaming backend sockets too.
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,

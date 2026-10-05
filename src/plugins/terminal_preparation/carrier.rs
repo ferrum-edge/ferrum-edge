@@ -106,7 +106,9 @@ impl SelectedTerminalCarrier {
         let mut required = self.used;
         for value in lines.clone() {
             if value.len() > MAX_FIELD_VALUE_BYTES
-                || value.bytes().any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+                || value
+                    .bytes()
+                    .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
             {
                 return Err(capacity_error(
                     TerminalRefusal::FieldCapacity,
@@ -202,7 +204,11 @@ impl SelectedTerminalCarrier {
                 let Some(TerminalFieldAction::Set { name, value, .. }) =
                     patch.actions.as_slice().get(index as usize)
                 else {
-                    return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+                    return Err(capacity_error(
+                        TerminalRefusal::UnimplementedOperation,
+                        0,
+                        0,
+                    ));
                 };
                 if matches!(source, Source::Name(_)) {
                     Ok(name.as_str().as_bytes())
@@ -241,7 +247,11 @@ impl SelectedTerminalCarrier {
                     Some(*lineage),
                 ),
                 TerminalFieldAction::Metadata { .. } => {
-                    return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+                    return Err(capacity_error(
+                        TerminalRefusal::UnimplementedOperation,
+                        0,
+                        0,
+                    ));
                 }
             };
             let mut exists = false;
@@ -339,7 +349,11 @@ impl SelectedTerminalCarrier {
                     name: key, value, ..
                 }) = patch.actions.as_slice().get(index as usize)
                 else {
-                    return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+                    return Err(capacity_error(
+                        TerminalRefusal::UnimplementedOperation,
+                        0,
+                        0,
+                    ));
                 };
                 let bytes = if name {
                     key.as_str().as_bytes()

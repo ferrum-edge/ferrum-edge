@@ -157,7 +157,8 @@ impl AllocationCredit {
         let Self::Request {
             ticket: other_ticket,
             bytes: other_bytes,
-        } = &other else {
+        } = &other
+        else {
             return Err(error(TerminalRefusal::PinnedGeneration, 0, 0));
         };
         if ticket.pointer != other_ticket.pointer {
@@ -519,7 +520,9 @@ impl TerminalTicket {
         }
         value.reserve_backing(plan.backing)?;
         let block = AllocationBlock::allocate(plan, AllocationCredit::Root)?;
-        let pointer = block.pointer.cast::<SharedHeader<ControlReservation<'static>>>();
+        let pointer = block
+            .pointer
+            .cast::<SharedHeader<ControlReservation<'static>>>();
         // SAFETY: the plan is for this exact header, and backing is unique.
         unsafe {
             pointer.as_ptr().write(SharedHeader {
@@ -588,11 +591,7 @@ impl<T> Drop for SharedTerminal<T> {
         let credit = unsafe { std::ptr::read(&self.pointer.as_ref().credit) };
         #[cfg(not(windows))]
         unsafe {
-            sdallocx(
-                self.pointer.as_ptr().cast(),
-                plan.layout.size(),
-                plan.flags,
-            );
+            sdallocx(self.pointer.as_ptr().cast(), plan.layout.size(), plan.flags);
         }
         drop(value);
         drop(credit);

@@ -3182,8 +3182,7 @@ pub struct RequestContext {
     /// One process ticket shared by request clones, response and terminal slots.
     pub(crate) terminal_manifest_pin: Option<terminal_preparation::TerminalGeneration>,
     terminal_response_gateway_owned: bool,
-    pub(crate) terminal_control_reservation:
-        Option<terminal_storage::TerminalTicket>,
+    pub(crate) terminal_control_reservation: Option<terminal_storage::TerminalTicket>,
     pub(crate) terminal_metadata_custody:
         Option<terminal_storage::SharedTerminal<terminal_preparation::TerminalMetadataCustody>>,
     /// Native-H3 collector admission, transferred once onto its Bytes owner.
