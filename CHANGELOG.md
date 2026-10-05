@@ -12,7 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace evidence. Opt-in proxy cascade removal and API-spec replacement
   compare the original deployment token within entry/commit admission fences
   on SQLite, PostgreSQL, MySQL and replica-set MongoDB. Partial writes preserve
-  unrelated rows, historical credentials, timestamps, trust and shared owners;
+  unrelated rows, historical credentials, timestamps, trust and shared owners.
+  Plugin-only replacement also retains an unchanged proxy's raw fields,
+  timestamps and row ETag after merging hand-added associations;
   ordinary endpoint profiles remain supported. Strict durable/live/audit/lease
   acknowledgements refuse automatic journal cleanup after uncertain outcomes.
   See the consumer adoption guide; downstream adoption and packaged qualification

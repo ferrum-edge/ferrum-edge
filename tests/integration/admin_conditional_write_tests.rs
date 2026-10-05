@@ -2696,7 +2696,11 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             "/proxies/missing?conditional=true&cleanup_orphaned_upstream=false",
             None,
         ),
-        (Method::PUT, "/api-specs/missing?conditional=true", Some(&document)),
+        (
+            Method::PUT,
+            "/api-specs/missing?conditional=true",
+            Some(&document),
+        ),
     ] {
         let missing = send_ns(
             method,
@@ -2723,7 +2727,9 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
                 ("/proxies/deployment".to_string(), Some(proxy))
             }
             "plugin" => {
-                let mut plugin = get_ns(&base, "/plugins/config/generated", &namespace).await.body;
+                let mut plugin = get_ns(&base, "/plugins/config/generated", &namespace)
+                    .await
+                    .body;
                 plugin["config"] = json!({"allowed_origins": ["https://operator.example"]});
                 ("/plugins/config/generated".to_string(), Some(plugin))
             }
@@ -2825,7 +2831,10 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     }))
     .unwrap();
     db.create_consumer(&other).await.unwrap();
-    assert_eq!(get_ns(&base, "/deployment-snapshot", &namespace).await.etag, original.etag);
+    assert_eq!(
+        get_ns(&base, "/deployment-snapshot", &namespace).await.etag,
+        original.etag
+    );
 
     // Entry loss with matching evidence cannot authorize either mutation.
     let snapshot = db.load_deployment_snapshot(&namespace).await.unwrap();
@@ -2875,14 +2884,37 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         set_atomic_batch_fault_for_test(&namespace, None);
         assert_eq!(failed.status, 503, "{}", failed.body);
         assert_eq!(failed.body["recovery_cleanup_authorized"], false);
-        assert_eq!(get_ns(&base, "/deployment-snapshot", &namespace).await.etag, original.etag);
+        assert_eq!(
+            get_ns(&base, "/deployment-snapshot", &namespace).await.etag,
+            original.etag
+        );
     }
 
-    let consumer_before = db.get_consumer(&namespace, "historical").await.unwrap().unwrap();
-    let unrelated_before = db.get_proxy_for_write(&namespace, "unrelated").await.unwrap().unwrap();
-    let shared_before = db.get_plugin_config(&namespace, "shared").await.unwrap().unwrap();
-    let upstream_before = db.get_upstream(&namespace, "retained").await.unwrap().unwrap();
-    let generated_before = db.get_plugin_config(&namespace, "generated").await.unwrap().unwrap();
+    let consumer_before = db
+        .get_consumer(&namespace, "historical")
+        .await
+        .unwrap()
+        .unwrap();
+    let unrelated_before = db
+        .get_proxy_for_write(&namespace, "unrelated")
+        .await
+        .unwrap()
+        .unwrap();
+    let shared_before = db
+        .get_plugin_config(&namespace, "shared")
+        .await
+        .unwrap()
+        .unwrap();
+    let upstream_before = db
+        .get_upstream(&namespace, "retained")
+        .await
+        .unwrap()
+        .unwrap();
+    let generated_before = db
+        .get_plugin_config(&namespace, "generated")
+        .await
+        .unwrap()
+        .unwrap();
     document["x-ferrum-proxy"]["backend_host"] = json!("replacement.example.com");
     let replaced = send_ns(
         Method::PUT,
@@ -2899,9 +2931,18 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     // No serving poll loop: a durable-only acknowledgement forbids cleanup.
     assert_eq!(replaced.body["live"], "not_applicable");
     assert_eq!(replaced.body["recovery_cleanup_authorized"], false);
-    let target = db.get_proxy_for_write(&namespace, "deployment").await.unwrap().unwrap();
+    let target = db
+        .get_proxy_for_write(&namespace, "deployment")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(target.backend_host, "replacement.example.com");
-    assert!(target.plugins.iter().any(|a| a.plugin_config_id == "shared"));
+    assert!(
+        target
+            .plugins
+            .iter()
+            .any(|a| a.plugin_config_id == "shared")
+    );
     assert_eq!(
         db.get_plugin_config(&namespace, "generated")
             .await
@@ -2946,9 +2987,24 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     assert_eq!(removed.status, 200, "{}", removed.body);
     assert_eq!(removed.body["durable"], "committed");
     assert_eq!(removed.body["recovery_cleanup_authorized"], false);
-    assert!(db.get_proxy_for_write(&namespace, "deployment").await.unwrap().is_none());
-    assert!(db.get_api_spec(&namespace, &spec_id).await.unwrap().is_none());
-    assert!(db.get_plugin_config(&namespace, "generated").await.unwrap().is_none());
+    assert!(
+        db.get_proxy_for_write(&namespace, "deployment")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.get_api_spec(&namespace, &spec_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.get_plugin_config(&namespace, "generated")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         serde_json::to_value(
             db.get_consumer(&namespace, "historical")
@@ -3116,10 +3172,23 @@ async fn assert_deployment_cancellation_and_live_ack(db: Arc<dyn DatabaseBackend
         }
         let response = request.await.unwrap();
         assert_eq!(response.body["durable"], "committed");
-        assert_eq!(response.status, if live { 200 } else { 503 }, "{}", response.body);
+        assert_eq!(
+            response.status,
+            if live { 200 } else { 503 },
+            "{}",
+            response.body
+        );
         assert_eq!(response.body["recovery_cleanup_authorized"], live);
-        assert_eq!(response.body["live"], if live { "applied" } else { "unconfirmed" });
-        assert!(db.get_proxy_for_write(&namespace, "live").await.unwrap().is_none());
+        assert_eq!(
+            response.body["live"],
+            if live { "applied" } else { "unconfirmed" }
+        );
+        assert!(
+            db.get_proxy_for_write(&namespace, "live")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     for replacement in [false, true] {
@@ -3192,7 +3261,10 @@ async fn assert_deployment_cancellation_and_live_ack(db: Arc<dyn DatabaseBackend
                         .unwrap()
                         .is_some_and(|s| s.description.as_deref() == Some("cancellation completed"))
                 } else {
-                    db.get_proxy_for_write(&namespace, "cancel").await.unwrap().is_none()
+                    db.get_proxy_for_write(&namespace, "cancel")
+                        .await
+                        .unwrap()
+                        .is_none()
                 };
                 if settled {
                     break;
@@ -3324,6 +3396,152 @@ async fn assert_deployment_concurrent_writer_fences(db: Arc<dyn DatabaseBackend>
     }
 }
 
+/// Run on SQLite, PostgreSQL, MySQL and replica-set MongoDB, both with only
+/// generated associations and with a hand-added association carrying raw metadata.
+async fn assert_plugin_only_replacement_preserves_proxy(
+    db: &dyn DatabaseBackend,
+    base: &str,
+    namespace: &str,
+    spec_id: &str,
+    document: &mut Value,
+    hand_added: bool,
+) {
+    let proxy_id = document["x-ferrum-proxy"]["id"].as_str().unwrap().to_string();
+    let plugin_id = document["x-ferrum-plugins"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let proxy_path = format!("/proxies/{proxy_id}");
+    let plugin_path = format!("/plugins/config/{plugin_id}");
+    let proxy_before = get_ns(base, &proxy_path, namespace).await;
+    let plugin_before = get_ns(base, &plugin_path, namespace).await;
+    let stored_before = db.load_deployment_snapshot(namespace).await.unwrap();
+    let original = get_ns(base, "/deployment-snapshot", namespace).await;
+    assert_eq!(original.status, 200, "{}", original.body);
+    assert_eq!(proxy_before.status, 200, "{}", proxy_before.body);
+    assert_eq!(plugin_before.status, 200, "{}", plugin_before.body);
+    assert_eq!(
+        proxy_before.body["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["plugin_config_id"] == "hand-added"),
+        hand_added
+    );
+    assert!(proxy_before.etag.is_some());
+    assert!(plugin_before.etag.is_some());
+
+    // Keep all IDs and proxy fields identical; only the plugin body changes.
+    document["x-ferrum-plugins"][0]["config"] = json!({
+        "allowed_origins": [format!("https://{}.example", uuid::Uuid::new_v4())]
+    });
+    let replace_path = format!("/api-specs/{spec_id}?conditional=true");
+    let replaced = send_ns(
+        Method::PUT,
+        base,
+        &replace_path,
+        &admin_token(),
+        original.etag.as_deref(),
+        Some(&*document),
+        namespace,
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    assert_eq!(replaced.body["durable"], "committed");
+    assert_eq!(replaced.body["recovery_cleanup_authorized"], false);
+    let proxy_after = get_ns(base, &proxy_path, namespace).await;
+    let plugin_after = get_ns(base, &plugin_path, namespace).await;
+    assert_eq!(proxy_after.body, proxy_before.body);
+    assert_eq!(proxy_after.etag, proxy_before.etag);
+    assert_eq!(
+        proxy_after.body["updated_at"],
+        proxy_before.body["updated_at"]
+    );
+    assert_eq!(
+        plugin_after.body["config"],
+        document["x-ferrum-plugins"][0]["config"]
+    );
+    assert_ne!(plugin_after.body["config"], plugin_before.body["config"]);
+    assert_ne!(plugin_after.etag, plugin_before.etag);
+    let stored_after = db.load_deployment_snapshot(namespace).await.unwrap();
+    // SQL captures every column; Mongo includes complete, ordered BSON bytes.
+    assert_eq!(stored_before.stored["proxies"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        stored_after.stored["proxies"],
+        stored_before.stored["proxies"]
+    );
+    assert_eq!(
+        stored_after.stored.get("proxy_plugins"),
+        stored_before.stored.get("proxy_plugins")
+    );
+    for row in stored_before.stored["plugin_configs"].as_array().unwrap() {
+        if row["id"]["value"] == plugin_id {
+            let after = stored_after.stored["plugin_configs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"]["value"] == plugin_id)
+                .unwrap();
+            for (column, value) in row.as_object().unwrap() {
+                if column.starts_with("deployment_future_") || column == "created_at" {
+                    assert_eq!(&after[column], value, "changed stored column {column}");
+                }
+            }
+        }
+    }
+    let fresh = get_ns(base, "/deployment-snapshot", namespace).await;
+    assert_ne!(fresh.etag, original.etag);
+    let replay = send_ns(
+        Method::PUT,
+        base,
+        &replace_path,
+        &admin_token(),
+        original.etag.as_deref(),
+        Some(&*document),
+        namespace,
+    )
+    .await;
+    assert_eq!(replay.status, 412, "{}", replay.body);
+    assert_eq!(
+        get_ns(base, "/deployment-snapshot", namespace).await.etag,
+        fresh.etag
+    );
+}
+
+async fn add_hand_added_deployment_association(base: &str, namespace: &str, proxy_id: &str) {
+    let created = send_ns(
+        Method::POST,
+        base,
+        "/plugins/config",
+        &admin_token(),
+        None,
+        Some(&json!({
+            "id": "hand-added", "plugin_name": "cors", "scope": "proxy_group",
+            "config": {"allowed_origins": ["https://hand-added.example"]}
+        })),
+        namespace,
+    )
+    .await;
+    assert_eq!(created.status, 201, "{}", created.body);
+    let path = format!("/proxies/{proxy_id}");
+    let mut target = get_ns(base, &path, namespace).await.body;
+    target["plugins"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"plugin_config_id": "hand-added"}));
+    let updated = send_ns(
+        Method::PUT,
+        base,
+        &path,
+        &admin_token(),
+        None,
+        Some(&target),
+        namespace,
+    )
+    .await;
+    assert_eq!(updated.status, 200, "{}", updated.body);
+}
+
 async fn assert_mongo_deployment_raw_preservation(
     db: Arc<dyn DatabaseBackend>,
     raw: &mongodb::Database,
@@ -3361,6 +3579,37 @@ async fn assert_mongo_deployment_raw_preservation(
         )
         .await
         .unwrap();
+    assert_plugin_only_replacement_preserves_proxy(
+        db.as_ref(),
+        &base,
+        &namespace,
+        spec_id,
+        &mut document,
+        false,
+    )
+    .await;
+    add_hand_added_deployment_association(&base, &namespace, "raw").await;
+    proxies
+        .update_one(
+            doc! { "_id": format!("{namespace}:raw") },
+            doc! { "$set": {
+                "plugins.0.future_metadata": { "owner": "generated", "nested": [1, "opaque"] },
+                "plugins.1.future_metadata": { "owner": "hand-added", "nested": [2, "opaque"] },
+                "created_at": "2000-01-01T00:00:00Z",
+                "updated_at": "2001-01-01T00:00:00Z",
+            } },
+        )
+        .await
+        .unwrap();
+    assert_plugin_only_replacement_preserves_proxy(
+        db.as_ref(),
+        &base,
+        &namespace,
+        spec_id,
+        &mut document,
+        true,
+    )
+    .await;
     let association_before = proxies
         .find_one(doc! { "_id": format!("{namespace}:raw") })
         .await
@@ -3462,7 +3711,12 @@ async fn assert_mongo_deployment_raw_preservation(
         )
         .await
         .unwrap();
-    assert_eq!(get_ns(&base, "/deployment-snapshot", &namespace).await.status, 503);
+    assert_eq!(
+        get_ns(&base, "/deployment-snapshot", &namespace)
+            .await
+            .status,
+        503
+    );
     consumers
         .update_one(
             doc! { "_id": format!("{namespace}:historical") },
@@ -3485,7 +3739,12 @@ async fn assert_mongo_deployment_raw_preservation(
     let mut state = admin_state(db.clone(), JWT_SECRET);
     state.admin_audit_fallback_dir = Some(fallback.path().to_path_buf());
     let (denied_base, _denied_shutdown) = start_admin(state).await;
-    assert_eq!(get_ns(&denied_base, "/deployment-snapshot", &namespace).await.status, 503);
+    assert_eq!(
+        get_ns(&denied_base, "/deployment-snapshot", &namespace)
+            .await
+            .status,
+        503
+    );
     for (method, path, body) in [
         (Method::DELETE, remove_path, None),
         (Method::PUT, replace_path.as_str(), Some(&document)),
@@ -3508,7 +3767,10 @@ async fn assert_mongo_deployment_raw_preservation(
     raw.run_command(doc! { "collMod": "audit_events", "validator": {} })
         .await
         .unwrap();
-    assert_eq!(get_ns(&base, "/deployment-snapshot", &namespace).await.etag, original.etag);
+    assert_eq!(
+        get_ns(&base, "/deployment-snapshot", &namespace).await.etag,
+        original.etag
+    );
     // Audit rejection after a proven commit and local application still
     // denies successful cleanup. The admitted intent itself remains durable.
     raw.run_command(doc! {
@@ -3570,7 +3832,12 @@ async fn assert_mongo_deployment_raw_preservation(
     raw.run_command(doc! { "collMod": "audit_events", "validator": {} })
         .await
         .unwrap();
-    assert!(db.get_proxy_for_write(&namespace, "raw").await.unwrap().is_none());
+    assert!(
+        db.get_proxy_for_write(&namespace, "raw")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         consumers
             .find_one(doc! { "_id": format!("{namespace}:historical") })
@@ -3588,11 +3855,52 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
 
     let namespace = format!("deployment-sql-{}", uuid::Uuid::new_v4());
     let pool = db.pool();
-    for table in ["plugin_configs", "proxy_plugins"] {
-        sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN deployment_future_metadata TEXT"))
+    for table in ["proxies", "plugin_configs", "proxy_plugins"] {
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ADD COLUMN deployment_future_metadata TEXT"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let blob_type = if dialect == "postgres" { "BYTEA" } else { "BLOB" };
+        let real_type = if dialect == "mysql" { "FLOAT" } else { "REAL" };
+        for (column, sql_type) in [
+            ("deployment_future_count", "BIGINT"),
+            ("deployment_future_small", "SMALLINT"),
+            ("deployment_future_integer", "INTEGER"),
+            ("deployment_future_real", real_type),
+            ("deployment_future_double", "DOUBLE PRECISION"),
+            ("deployment_future_bytes", blob_type),
+            ("deployment_future_null_small", "SMALLINT"),
+            ("deployment_future_null_int", "INTEGER"),
+            ("deployment_future_null_integer", "BIGINT"),
+            ("deployment_future_null_real", real_type),
+            ("deployment_future_null_double", "DOUBLE PRECISION"),
+            ("deployment_future_null_text", "TEXT"),
+            ("deployment_future_null_bytes", blob_type),
+        ] {
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        if dialect == "postgres" {
+            for column in ["deployment_future_flag", "deployment_future_null_flag"] {
+                sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} BOOLEAN"))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        } else if dialect == "sqlite" {
+            // SQLite can store text in an integer-affinity column. Decoding by
+            // column type instead of runtime value type would fail this fixture.
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN deployment_future_dynamic BIGINT"
+            ))
             .execute(&pool)
             .await
             .unwrap();
+        }
     }
     let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
     let mut document = json!({
@@ -3615,7 +3923,7 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
     assert_eq!(imported.status, 201, "{}", imported.body);
     let spec_id = imported.body["id"].as_str().unwrap();
     let placeholder = if dialect == "postgres" { "$1" } else { "?" };
-    for table in ["plugin_configs", "proxy_plugins"] {
+    for table in ["proxies", "plugin_configs", "proxy_plugins"] {
         sqlx::query(&format!(
             "UPDATE {table} SET deployment_future_metadata = ' opaque-original ' \
              WHERE namespace = {placeholder}"
@@ -3624,6 +3932,116 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
         .execute(&pool)
         .await
         .unwrap();
+    }
+    for hand_added in [false, true] {
+        if hand_added {
+            add_hand_added_deployment_association(&base, &namespace, "sql").await;
+        }
+        let second = if dialect == "postgres" { "$2" } else { "?" };
+        for table in ["proxies", "plugin_configs", "proxy_plugins"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET deployment_future_metadata = ' opaque-original ', \
+                 deployment_future_count = 9007199254740993, deployment_future_small = -123, \
+                 deployment_future_integer = 123456, deployment_future_real = 1.25, \
+                 deployment_future_double = -0.125, deployment_future_bytes = {placeholder} \
+                 WHERE namespace = {second}"
+            ))
+            .bind(vec![0u8, 255, 1, 128])
+            .bind(&namespace)
+            .execute(&pool)
+            .await
+            .unwrap();
+            if dialect == "postgres" {
+                sqlx::query(&format!(
+                    "UPDATE {table} SET deployment_future_flag = TRUE \
+                     WHERE namespace = {placeholder}"
+                ))
+                .bind(&namespace)
+                .execute(&pool)
+                .await
+                .unwrap();
+            } else if dialect == "sqlite" {
+                sqlx::query(&format!(
+                    "UPDATE {table} SET deployment_future_dynamic = '007opaque' \
+                     WHERE namespace = {placeholder}"
+                ))
+                .bind(&namespace)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        sqlx::query(&format!(
+            "UPDATE proxies SET hosts = ' [ ] ', created_at = '2000-01-01T00:00:00Z', \
+             updated_at = '2001-01-01T00:00:00Z' WHERE namespace = {placeholder}"
+        ))
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let raw_before = db.load_deployment_snapshot(&namespace).await.unwrap();
+        let proxy_row = &raw_before.stored["proxies"][0];
+        assert_eq!(
+            proxy_row["deployment_future_count"]["value"],
+            9007199254740993i64
+        );
+        assert_eq!(proxy_row["deployment_future_small"]["value"], -123);
+        assert_eq!(proxy_row["deployment_future_integer"]["value"], 123456);
+        assert_eq!(
+            proxy_row["deployment_future_bytes"]["value"],
+            json!({"bytes_hex": "00ff0180"})
+        );
+        for column in [
+            "deployment_future_null_small",
+            "deployment_future_null_int",
+            "deployment_future_null_integer",
+            "deployment_future_null_real",
+            "deployment_future_null_double",
+            "deployment_future_null_text",
+            "deployment_future_null_bytes",
+        ] {
+            assert_eq!(proxy_row[column]["value"], Value::Null);
+        }
+        if dialect == "sqlite" {
+            assert_eq!(
+                proxy_row["deployment_future_dynamic"]["value"],
+                "007opaque"
+            );
+            assert_eq!(proxy_row["deployment_future_dynamic"]["value_type"], "TEXT");
+        }
+        if dialect == "postgres" {
+            assert_eq!(proxy_row["deployment_future_flag"]["value"], true);
+            assert_eq!(
+                proxy_row["deployment_future_null_flag"]["value"],
+                Value::Null
+            );
+            assert_eq!(
+                proxy_row["deployment_future_small"]["column_type"],
+                "SMALLINT"
+            );
+            assert_eq!(proxy_row["deployment_future_real"]["value_type"], "REAL");
+            assert_eq!(
+                proxy_row["deployment_future_real"]["value"]["bits"],
+                1.25f32.to_bits()
+            );
+            assert_eq!(
+                proxy_row["deployment_future_null_integer"]["column_type"],
+                "BIGINT"
+            );
+            assert_eq!(
+                proxy_row["deployment_future_null_bytes"]["column_type"],
+                "BLOB"
+            );
+        }
+        assert_plugin_only_replacement_preserves_proxy(
+            db.as_ref(),
+            &base,
+            &namespace,
+            spec_id,
+            &mut document,
+            hand_added,
+        )
+        .await;
     }
     let original = get_ns(&base, "/deployment-snapshot", &namespace).await;
     assert_eq!(original.status, 200, "{}", original.body);
@@ -3670,6 +4088,7 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
     .await;
     assert_eq!(replaced.status, 200, "{}", replaced.body);
     for (table, expected) in [
+        ("proxies", " opaque-original "),
         ("plugin_configs", " opaque-original "),
         ("proxy_plugins", "operator"),
     ] {

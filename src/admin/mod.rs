@@ -4042,20 +4042,19 @@ async fn handle_admin_request_inner(
                 return Ok(response);
             }
             if crate::config::types::validate_resource_id(id).is_err() {
-                return Ok(deployment_mutations::refusal("Invalid deployment target id"));
+                return Ok(deployment_mutations::refusal(
+                    "Invalid deployment target id",
+                ));
             }
-            let original = match deployment_mutations::parse_request(
-                req.uri().query(),
-                req.headers(),
-                true,
-            ) {
-                Ok(Some(original)) => original,
-                _ => {
-                    return Ok(deployment_mutations::refusal(
-                        "Invalid deployment mode or precondition",
-                    ));
-                }
-            };
+            let original =
+                match deployment_mutations::parse_request(req.uri().query(), req.headers(), true) {
+                    Ok(Some(original)) => original,
+                    _ => {
+                        return Ok(deployment_mutations::refusal(
+                            "Invalid deployment mode or precondition",
+                        ));
+                    }
+                };
             drop(req.into_body());
             return Ok(deployment_mutations::remove(&state, &auth, &namespace, id, original).await);
         }
@@ -4804,9 +4803,7 @@ async fn handle_admin_request_inner(
             {
                 return Ok(response);
             }
-            Ok(
-                deployment_mutations::snapshot(&state, &auth, &namespace, &audit_request_ctx).await,
-            )
+            Ok(deployment_mutations::snapshot(&state, &auth, &namespace, &audit_request_ctx).await)
         }
         (Method::GET, ["backup"]) => {
             // Backup returns unredacted credentials and consul tokens — Admin only.

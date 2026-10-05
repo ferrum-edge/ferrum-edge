@@ -7,7 +7,13 @@ const HANDLERS: &str = include_str!("../../../src/admin/api_specs/handlers.rs");
 const ROUTES: &str = include_str!("../../../src/admin/mod.rs");
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    source.split(start).nth(1).unwrap().split(end).next().unwrap()
+    source
+        .split(start)
+        .nth(1)
+        .unwrap()
+        .split(end)
+        .next()
+        .unwrap()
 }
 
 #[test]
@@ -68,7 +74,11 @@ fn deployment_entry_pins_precede_dependency_reads_and_original_comparison() {
 
 #[test]
 fn deployment_operations_never_restore_the_namespace_or_compensate_uncertain_commits() {
-    let remove = section(SQL, "async fn remove_deployment_inner(", "/// Count ApiSpecs");
+    let remove = section(
+        SQL,
+        "async fn remove_deployment_inner(",
+        "/// Count ApiSpecs",
+    );
     let mongo = section(
         MONGO,
         "async fn mutate_deployment_in_session(",
@@ -82,7 +92,10 @@ fn deployment_operations_never_restore_the_namespace_or_compensate_uncertain_com
             "compensate_late",
             "cleanup_orphaned_proxy_group_plugins(",
         ] {
-            assert!(!source.contains(forbidden), "unexpected broad mutation: {forbidden}");
+            assert!(
+                !source.contains(forbidden),
+                "unexpected broad mutation: {forbidden}"
+            );
         }
     }
     assert!(remove.contains("for plugin_id in &plan.plugins"));
@@ -115,8 +128,7 @@ fn deployment_ack_requires_audit_release_and_live_evidence() {
             < finish.find("drop(permit)").unwrap()
     );
     assert!(
-        finish.find("drop(permit)").unwrap()
-            < finish.find("await_prepared_live_apply(").unwrap()
+        finish.find("drop(permit)").unwrap() < finish.find("await_prepared_live_apply(").unwrap()
     );
     assert!(finish.contains("\"recovery_cleanup_authorized\": applicable"));
     assert!(finish.contains("unavailable(\"committed\")"));

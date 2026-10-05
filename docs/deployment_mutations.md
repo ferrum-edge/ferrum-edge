@@ -20,9 +20,10 @@ Read `GET /deployment-snapshot` with an admin-role JWT and the intended
 - `evidence`: the complete comparison representation. It binds all namespace
   resources, full specs, associations, trust, namespace metadata, the durable
   change watermark, and raw stored rows/documents. SQL includes every column of
-  the resource and association tables, including credential indexes. MongoDB
-  includes raw documents and their BSON bytes, including embedded association
-  metadata. Lease maintenance and audit records do not invalidate authority.
+  the resource and association tables, including credential indexes, with each
+  column's SQLx type, runtime value type and lossless scalar evidence (float bits
+  and blob bytes). Typed nulls retain their column type. MongoDB includes raw
+  documents and their BSON bytes, including embedded association metadata. Lease maintenance and audit records do not invalidate authority.
 
 The read is admin-only because evidence contains unredacted credentials and
 spec/plugin material. Security-audit admission is mandatory before disclosure,
@@ -92,9 +93,12 @@ plugin left without associations by spec replacement is retained for explicit
 operator cleanup. Generated rows retain their original creation timestamps and
 supported unknown columns/fields when the same ID survives. A surviving row
 whose known semantics did not change retains its complete historical fields and
-both timestamps. Explicit associations must be unique and reference existing plugins
-scoped to this proxy, or ownerless group plugins; foreign scopes refuse. A store
-schema that cannot reinsert a selected row safely refuses and rolls back.
+both timestamps. This includes a proxy whose final merged fields and associations
+are unchanged during a plugin-only replacement: its raw row/document, timestamps
+and row ETag stay intact, including hand-added association metadata. Explicit
+associations must be unique and reference existing plugins scoped to this proxy,
+or ownerless group plugins; foreign scopes refuse. A store schema that cannot
+reinsert a selected row safely refuses and rolls back.
 
 Missing or inconsistent target ownership/dependencies, foreign owners or shared
 owners of a plugin the cascade would delete return `409` before selected writes.

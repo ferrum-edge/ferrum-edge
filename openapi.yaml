@@ -9047,7 +9047,12 @@ components:
         evidence:
           type: object
           additionalProperties: true
-          description: Complete secret-bearing typed and raw stored identity; retain with the original token
+          description: |
+            Complete secret-bearing typed and raw stored identity; retain with the
+            original token. SQL column evidence includes column_type, value_type
+            and a lossless value (float bits or blob bytes where applicable);
+            null values retain their column type. MongoDB includes raw documents
+            and BSON bytes. Treat the complete evidence as the comparison basis.
         proxies:
           type: array
           items:

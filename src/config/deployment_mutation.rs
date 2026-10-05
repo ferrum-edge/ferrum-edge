@@ -31,7 +31,12 @@ impl DeploymentSnapshot {
         let Some(previous_spec) = self.snapshot.api_specs.iter().find(|s| s.id == spec.id) else {
             return Ok(false);
         };
-        let Some(mut proxy) = config.proxies.iter().find(|p| p.id == spec.proxy_id).cloned() else {
+        let Some(mut proxy) = config
+            .proxies
+            .iter()
+            .find(|p| p.id == spec.proxy_id)
+            .cloned()
+        else {
             return Ok(false);
         };
         let plugins: Vec<_> = config
@@ -159,7 +164,10 @@ impl DeploymentSnapshot {
             }
         }
         if config.proxies.iter().any(|p| {
-            p.id != id && p.plugins.iter().any(|a| plugins.contains(&a.plugin_config_id))
+            p.id != id
+                && p.plugins
+                    .iter()
+                    .any(|a| plugins.contains(&a.plugin_config_id))
         }) {
             return Err(DeploymentGraphInvalid.into());
         }

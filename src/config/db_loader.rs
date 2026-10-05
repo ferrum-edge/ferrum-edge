@@ -3004,7 +3004,9 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
-        let snapshot = self.conditional_namespace_snapshot_tx(tx, namespace).await?;
+        let snapshot = self
+            .conditional_namespace_snapshot_tx(tx, namespace)
+            .await?;
         let mut stored = serde_json::Map::new();
         for table in [
             "proxies",
@@ -3079,9 +3081,13 @@ impl DatabaseStore {
             &precondition.lease,
         )
         .await?;
-        self.lock_mtls_dns_admission_tx(tx, precondition.namespace).await?;
-        self.lock_config_change_sequence_tx(tx, precondition.namespace).await?;
-        let snapshot = self.deployment_snapshot_tx(tx, precondition.namespace).await?;
+        self.lock_mtls_dns_admission_tx(tx, precondition.namespace)
+            .await?;
+        self.lock_config_change_sequence_tx(tx, precondition.namespace)
+            .await?;
+        let snapshot = self
+            .deployment_snapshot_tx(tx, precondition.namespace)
+            .await?;
         if snapshot.representation()? != *precondition.expected {
             return Err(NamespacePreconditionFailed.into());
         }
@@ -3097,7 +3103,9 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let namespace = precondition.namespace;
         let mut tx = self.begin_write_tx().await?;
-        let snapshot = self.enter_deployment_mutation_tx(&mut tx, precondition).await?;
+        let snapshot = self
+            .enter_deployment_mutation_tx(&mut tx, precondition)
+            .await?;
         let plan = snapshot.removal_plan(id)?;
         if let Some(spec_id) = &plan.spec_id {
             self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, spec_id, id)
@@ -3105,10 +3113,16 @@ impl DatabaseStore {
         }
         let mut candidate = snapshot.snapshot.config.clone();
         candidate.proxies.retain(|p| p.id != id);
-        candidate.plugin_configs.retain(|p| !plan.plugins.contains(&p.id));
-        candidate.upstreams.retain(|u| !plan.upstreams.contains(&u.id));
+        candidate
+            .plugin_configs
+            .retain(|p| !plan.plugins.contains(&p.id));
+        candidate
+            .upstreams
+            .retain(|u| !plan.upstreams.contains(&u.id));
         validate_deployment_candidate(&candidate, precondition.validation_http_client).await?;
-        let prior_conflicts = self.mtls_dns_identity_conflicts_tx(&mut tx, namespace).await?;
+        let prior_conflicts = self
+            .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
+            .await?;
         // Only selected associations and rows are removed. Never run the
         // namespace-wide orphan sweeper or restore unrelated stored resources.
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"))
@@ -10304,7 +10318,7 @@ impl DatabaseStore {
         // admin CRUD drift forces the full replace path even when the submitted
         // spec's resource_hash matches the stored metadata.
         let mut tx = self.begin_write_tx().await?;
-        if let Some(precondition) = precondition {
+        let previous_proxy = if let Some(precondition) = precondition {
             if precondition.namespace != spec.namespace
                 || bundle.proxy.namespace != spec.namespace
                 || bundle.proxy.id != spec.proxy_id
@@ -10313,18 +10327,34 @@ impl DatabaseStore {
                         || p.scope != crate::config::types::PluginScope::Proxy
                         || p.proxy_id.as_deref() != Some(spec.proxy_id.as_str())
                 })
-                || bundle.upstream.as_ref().is_some_and(|u| u.namespace != spec.namespace)
+                || bundle
+                    .upstream
+                    .as_ref()
+                    .is_some_and(|u| u.namespace != spec.namespace)
             {
                 return Err(DeploymentGraphInvalid.into());
             }
-            let snapshot = self.enter_deployment_mutation_tx(&mut tx, precondition).await?;
+            let snapshot = self
+                .enter_deployment_mutation_tx(&mut tx, precondition)
+                .await?;
             let plan = snapshot.removal_plan(&spec.proxy_id)?;
             if plan.spec_id.as_deref() != Some(spec.id.as_str()) {
                 return Err(DeploymentGraphInvalid.into());
             }
+            Some(
+                snapshot
+                    .snapshot
+                    .config
+                    .proxies
+                    .into_iter()
+                    .find(|p| p.id == spec.proxy_id)
+                    .ok_or(DeploymentGraphInvalid)?,
+            )
         } else {
-            self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace).await?;
-        }
+            self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
+                .await?;
+            None
+        };
 
         // Existence read inside the transaction is the not-found authority —
         // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
@@ -10463,7 +10493,7 @@ impl DatabaseStore {
         // Preserve unknown columns when a selected generated identity survives.
         let retained_generated_rows = if precondition.is_some() {
             let mut rows = Vec::new();
-            for table in ["plugin_configs", "upstreams"] {
+            for table in ["proxies", "plugin_configs", "upstreams"] {
                 let stored = sqlx::query(&self.q(&format!(
                     "SELECT * FROM {table} WHERE namespace = ? AND api_spec_id = ?"
                 )))
@@ -10473,9 +10503,9 @@ impl DatabaseStore {
                 .await?;
                 rows.extend(stored.into_iter().map(|row| (table, row)));
             }
-            let associations = sqlx::query(&self.q(
-                "SELECT * FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?",
-            ))
+            let associations = sqlx::query(
+                &self.q("SELECT * FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?"),
+            )
             .bind(&spec.namespace)
             .bind(&spec.proxy_id)
             .fetch_all(&mut *tx)
@@ -10880,8 +10910,13 @@ impl DatabaseStore {
             .await?;
 
         for (table, row) in &retained_generated_rows {
-            self.preserve_deployment_unknown_columns_tx(&mut tx, table, row)
-                .await?;
+            self.preserve_deployment_unknown_columns_tx(
+                &mut tx,
+                table,
+                row,
+                previous_proxy.as_ref(),
+            )
+            .await?;
         }
         if let Some(precondition) = precondition {
             let candidate = self
@@ -10906,10 +10941,70 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         table: &str,
         row: &AnyRow,
+        previous_proxy: Option<&Proxy>,
     ) -> Result<(), anyhow::Error> {
         use sqlx::Column;
-        use sqlx::any::{AnyTypeInfoKind, AnyValueKind};
+        use sqlx::any::AnyTypeInfoKind;
         let known: &[&str] = match table {
+            "proxies" => &[
+                "labels",
+                "id",
+                "namespace",
+                "name",
+                "hosts",
+                "listen_path",
+                "backend_scheme",
+                "backend_host",
+                "backend_port",
+                "backend_path",
+                "strip_listen_path",
+                "preserve_host_header",
+                "backend_connect_timeout_ms",
+                "backend_read_timeout_ms",
+                "backend_write_timeout_ms",
+                "backend_tls_client_cert_path",
+                "backend_tls_client_key_path",
+                "backend_tls_verify_server_cert",
+                "backend_tls_server_ca_cert_path",
+                "dns_override",
+                "dns_cache_ttl_seconds",
+                "auth_mode",
+                "upstream_id",
+                "upstream_subset",
+                "circuit_breaker",
+                "retry",
+                "response_body_mode",
+                "pool_idle_timeout_seconds",
+                "pool_enable_http_keep_alive",
+                "pool_enable_http2",
+                "pool_tcp_keepalive_seconds",
+                "pool_http2_keep_alive_interval_seconds",
+                "pool_http2_keep_alive_timeout_seconds",
+                "pool_http2_initial_stream_window_size",
+                "pool_http2_initial_connection_window_size",
+                "pool_http2_adaptive_window",
+                "pool_http2_max_frame_size",
+                "pool_http2_max_concurrent_streams",
+                "pool_http3_connections_per_backend",
+                "pool_max_requests_per_connection",
+                "listen_port",
+                "frontend_tls",
+                "passthrough",
+                "udp_idle_timeout_seconds",
+                "tcp_idle_timeout_seconds",
+                "websocket_idle_timeout_seconds",
+                "websocket_permessage_deflate",
+                "allow_path_parameters",
+                "allowed_methods",
+                "allowed_ws_origins",
+                "udp_max_response_amplification_factor",
+                "stream_proxy_protocol",
+                "backend_proxy_protocol",
+                "stream_match",
+                "api_spec_id",
+                "created_at",
+                "updated_at",
+            ],
             "upstreams" => &[
                 "labels",
                 "id",
@@ -10968,8 +11063,26 @@ impl DatabaseStore {
             // A selected identity intentionally removed by this replacement.
             return Ok(());
         };
-        let mut old_known = deployment_known_sql_resource(table, row)?;
-        let mut new_known = deployment_known_sql_resource(table, &current)?;
+        // Compare the final association projection, after generated links are
+        // rebuilt and hand-added links have survived the replacement.
+        let (old_plugins, new_plugins) = if table == "proxies" {
+            let previous = previous_proxy.ok_or(DeploymentGraphInvalid)?;
+            let mut associations = self
+                .load_proxy_plugin_associations_for_namespace_tx(
+                    &previous.namespace,
+                    "deployment preservation",
+                    tx,
+                )
+                .await?;
+            (
+                previous.plugins.clone(),
+                associations.remove(&previous.id).unwrap_or_default(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut old_known = deployment_known_sql_resource(table, row, old_plugins)?;
+        let mut new_known = deployment_known_sql_resource(table, &current, new_plugins)?;
         for value in [&mut old_known, &mut new_known] {
             if let Some(object) = value.as_object_mut() {
                 object.remove("created_at");
@@ -10995,11 +11108,13 @@ impl DatabaseStore {
             } else {
                 format!("\"{}\"", column.name())
             };
-            let sql = self.q(&format!("UPDATE {table} SET {quoted} = ? WHERE {predicate}"));
-            let value = sqlx::ValueRef::to_owned(&row.try_get_raw(column.ordinal())?);
+            let sql = self.q(&format!(
+                "UPDATE {table} SET {quoted} = ? WHERE {predicate}"
+            ));
+            let value = deployment_sql_scalar(row, column.ordinal())?;
             let query = sqlx::query(&sql);
-            let query = match value.kind {
-                AnyValueKind::Null(kind) => match kind {
+            let query = match value {
+                DeploymentSqlScalar::Null(kind) => match kind {
                     AnyTypeInfoKind::Bool => query.bind(Option::<bool>::None),
                     AnyTypeInfoKind::SmallInt => query.bind(Option::<i16>::None),
                     AnyTypeInfoKind::Integer => query.bind(Option::<i32>::None),
@@ -11011,15 +11126,14 @@ impl DatabaseStore {
                         query.bind(Option::<String>::None)
                     }
                 },
-                AnyValueKind::Bool(value) => query.bind(value),
-                AnyValueKind::SmallInt(value) => query.bind(value),
-                AnyValueKind::Integer(value) => query.bind(value),
-                AnyValueKind::BigInt(value) => query.bind(value),
-                AnyValueKind::Real(value) => query.bind(value),
-                AnyValueKind::Double(value) => query.bind(value),
-                AnyValueKind::Text(value) => query.bind(value.into_owned()),
-                AnyValueKind::Blob(value) => query.bind(value.into_owned()),
-                _ => anyhow::bail!("Unsupported stored scalar"),
+                DeploymentSqlScalar::Bool(value) => query.bind(value),
+                DeploymentSqlScalar::SmallInt(value) => query.bind(value),
+                DeploymentSqlScalar::Integer(value) => query.bind(value),
+                DeploymentSqlScalar::BigInt(value) => query.bind(value),
+                DeploymentSqlScalar::Real(value) => query.bind(value),
+                DeploymentSqlScalar::Double(value) => query.bind(value),
+                DeploymentSqlScalar::Text(value) => query.bind(value),
+                DeploymentSqlScalar::Blob(value) => query.bind(value),
             };
             let query = query.bind(row.try_get::<String, _>("namespace")?);
             let query = if table == "proxy_plugins" {
@@ -14045,8 +14159,15 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
 fn deployment_known_sql_resource(
     table: &str,
     row: &AnyRow,
+    mut plugins: Vec<PluginAssociation>,
 ) -> Result<serde_json::Value, anyhow::Error> {
     match table {
+        "proxies" => {
+            plugins.sort_by(|a, b| a.plugin_config_id.cmp(&b.plugin_config_id));
+            let mut proxy = row_to_proxy(row, row.try_get("id")?, plugins)?;
+            proxy.normalize_fields();
+            Ok(serde_json::to_value(proxy)?)
+        }
         "plugin_configs" => {
             let mut plugin = row_to_plugin_config(row)?;
             plugin.normalize_fields();
@@ -14066,37 +14187,89 @@ fn deployment_known_sql_resource(
     }
 }
 
-/// Full raw column evidence, including columns unknown to the domain decoder.
-/// Unsupported scalar types refuse authority rather than disappear from it.
+/// Owned scalars decoded through SQLx's public Any API. Decode each non-null
+/// value by its runtime type, not its declared column type (SQLite is dynamic).
+/// Nulls retain the column type for correctly typed binds on PostgreSQL.
+enum DeploymentSqlScalar {
+    Null(sqlx::any::AnyTypeInfoKind),
+    Bool(bool),
+    SmallInt(i16),
+    Integer(i32),
+    BigInt(i64),
+    Real(f32),
+    Double(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+fn deployment_sql_scalar(
+    row: &AnyRow,
+    ordinal: usize,
+) -> Result<DeploymentSqlScalar, anyhow::Error> {
+    use sqlx::any::AnyTypeInfoKind;
+    use sqlx::{Column, ValueRef};
+
+    let raw = row.try_get_raw(ordinal)?;
+    if raw.is_null() {
+        return Ok(DeploymentSqlScalar::Null(
+            row.try_column(ordinal)?.type_info().kind(),
+        ));
+    }
+    Ok(match raw.type_info().kind() {
+        AnyTypeInfoKind::Bool => DeploymentSqlScalar::Bool(row.try_get(ordinal)?),
+        AnyTypeInfoKind::SmallInt => DeploymentSqlScalar::SmallInt(row.try_get(ordinal)?),
+        AnyTypeInfoKind::Integer => DeploymentSqlScalar::Integer(row.try_get(ordinal)?),
+        AnyTypeInfoKind::BigInt => DeploymentSqlScalar::BigInt(row.try_get(ordinal)?),
+        AnyTypeInfoKind::Real => {
+            let value: f32 = row.try_get(ordinal)?;
+            if !value.is_finite() {
+                anyhow::bail!("Non-finite stored scalar");
+            }
+            DeploymentSqlScalar::Real(value)
+        }
+        AnyTypeInfoKind::Double => {
+            let value: f64 = row.try_get(ordinal)?;
+            if !value.is_finite() {
+                anyhow::bail!("Non-finite stored scalar");
+            }
+            DeploymentSqlScalar::Double(value)
+        }
+        AnyTypeInfoKind::Text => DeploymentSqlScalar::Text(row.try_get(ordinal)?),
+        AnyTypeInfoKind::Blob => DeploymentSqlScalar::Blob(row.try_get(ordinal)?),
+        AnyTypeInfoKind::Null => anyhow::bail!("Non-null stored scalar has null type"),
+    })
+}
+
+/// Full typed column evidence, including columns unknown to the domain decoder.
+/// Float bits, integer widths, blobs and typed nulls cannot alias text or each
+/// other. Unsupported SQLx Any types refuse authority at row loading.
 fn deployment_raw_sql_row(row: &AnyRow) -> Result<serde_json::Value, anyhow::Error> {
-    use sqlx::Column;
-    use sqlx::any::AnyValueKind;
+    use sqlx::{Column, TypeInfo, ValueRef};
+
     let mut fields = serde_json::Map::new();
     for column in row.columns() {
-        let value = sqlx::ValueRef::to_owned(&row.try_get_raw(column.ordinal())?);
-        let value = match value.kind {
-            AnyValueKind::Null(_) => serde_json::Value::Null,
-            AnyValueKind::Bool(value) => serde_json::json!(value),
-            AnyValueKind::SmallInt(value) => serde_json::json!(value),
-            AnyValueKind::Integer(value) => serde_json::json!(value),
-            AnyValueKind::BigInt(value) => serde_json::json!(value),
-            AnyValueKind::Real(value) => {
-                if !value.is_finite() {
-                    anyhow::bail!("Non-finite stored scalar");
-                }
-                serde_json::json!(value)
+        let raw = row.try_get_raw(column.ordinal())?;
+        let value = match deployment_sql_scalar(row, column.ordinal())? {
+            DeploymentSqlScalar::Null(_) => serde_json::Value::Null,
+            DeploymentSqlScalar::Bool(value) => serde_json::json!(value),
+            DeploymentSqlScalar::SmallInt(value) => serde_json::json!(value),
+            DeploymentSqlScalar::Integer(value) => serde_json::json!(value),
+            DeploymentSqlScalar::BigInt(value) => serde_json::json!(value),
+            DeploymentSqlScalar::Real(value) => serde_json::json!({"bits": value.to_bits()}),
+            DeploymentSqlScalar::Double(value) => serde_json::json!({"bits": value.to_bits()}),
+            DeploymentSqlScalar::Text(value) => serde_json::json!(value),
+            DeploymentSqlScalar::Blob(value) => {
+                serde_json::json!({"bytes_hex": hex::encode(value)})
             }
-            AnyValueKind::Double(value) => {
-                if !value.is_finite() {
-                    anyhow::bail!("Non-finite stored scalar");
-                }
-                serde_json::json!(value)
-            }
-            AnyValueKind::Text(value) => serde_json::json!(value),
-            AnyValueKind::Blob(value) => serde_json::json!({"bytes_hex": hex::encode(value)}),
-            _ => anyhow::bail!("Unsupported stored scalar"),
         };
-        fields.insert(column.name().to_string(), value);
+        fields.insert(
+            column.name().to_string(),
+            serde_json::json!({
+                "column_type": column.type_info().name(),
+                "value_type": raw.type_info().name(),
+                "value": value,
+            }),
+        );
     }
     Ok(serde_json::Value::Object(fields))
 }

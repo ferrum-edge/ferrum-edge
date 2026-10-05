@@ -2962,11 +2962,8 @@ pub async fn handle_put_api_spec(
     };
     if deployment_original.is_some()
         && actor.allowed_namespaces.is_present()
-        && let Some(response) = crate::admin::enforce_namespace_claim(
-            actor,
-            namespace,
-            req.uri().path(),
-        )
+        && let Some(response) =
+            crate::admin::enforce_namespace_claim(actor, namespace, req.uri().path())
     {
         return Ok(response);
     }
@@ -3185,7 +3182,9 @@ pub async fn handle_put_api_spec(
         )
         .await
         {
-            return Ok(crate::admin::deployment_mutations::unavailable("not_started"));
+            return Ok(crate::admin::deployment_mutations::unavailable(
+                "not_started",
+            ));
         }
         return Ok(
             match audit::spawn_with_request_slot(crate::admin::deployment_mutations::finish_boxed(

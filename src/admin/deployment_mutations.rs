@@ -268,7 +268,10 @@ pub(super) fn finish_boxed(
     guard: NamespaceConfigAdmissionGuard,
     permit: DbWriteTopologyPermit,
     expected: Value,
-    replacement: Option<(super::api_specs::ExtractedBundle, crate::config::types::ApiSpec)>,
+    replacement: Option<(
+        super::api_specs::ExtractedBundle,
+        crate::config::types::ApiSpec,
+    )>,
 ) -> Pin<Box<dyn Future<Output = Response<Full<Bytes>>> + Send>> {
     Box::pin(finish(
         state,
@@ -295,7 +298,10 @@ async fn finish(
     mut guard: NamespaceConfigAdmissionGuard,
     permit: DbWriteTopologyPermit,
     expected: Value,
-    replacement: Option<(super::api_specs::ExtractedBundle, crate::config::types::ApiSpec)>,
+    replacement: Option<(
+        super::api_specs::ExtractedBundle,
+        crate::config::types::ApiSpec,
+    )>,
 ) -> Response<Full<Bytes>> {
     if guard.hand_off_to_restore_transaction().await.is_err() {
         return unavailable("not_started");

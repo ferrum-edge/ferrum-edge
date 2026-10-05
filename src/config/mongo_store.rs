@@ -5601,10 +5601,7 @@ mod inner {
             let owner = precondition.lease.owner;
             if !self
                 .verify_namespace_config_admission_lease_in_session(
-                    session,
-                    namespace,
-                    owner,
-                    generation,
+                    session, namespace, owner, generation,
                 )
                 .await?
             {
@@ -5621,7 +5618,9 @@ mod inner {
             if pinned.matched_count != 1 {
                 return Err(BatchAdmissionLeaseLost.into());
             }
-            let snapshot = self.deployment_snapshot_in_session(session, namespace).await?;
+            let snapshot = self
+                .deployment_snapshot_in_session(session, namespace)
+                .await?;
             if snapshot.representation()? != *precondition.expected {
                 return Err(NamespacePreconditionFailed.into());
             }
@@ -5642,8 +5641,12 @@ mod inner {
             match replacement {
                 None => {
                     candidate.proxies.retain(|p| p.id != id);
-                    candidate.plugin_configs.retain(|p| !plan.plugins.contains(&p.id));
-                    candidate.upstreams.retain(|u| !plan.upstreams.contains(&u.id));
+                    candidate
+                        .plugin_configs
+                        .retain(|p| !plan.plugins.contains(&p.id));
+                    candidate
+                        .upstreams
+                        .retain(|u| !plan.upstreams.contains(&u.id));
                     for plugin_id in &plan.plugins {
                         let deleted = self
                             .plugin_configs()
@@ -5708,7 +5711,10 @@ mod inner {
                                 || p.scope != PluginScope::Proxy
                                 || p.proxy_id.as_deref() != Some(id)
                         })
-                        || bundle.upstream.as_ref().is_some_and(|u| u.namespace != namespace)
+                        || bundle
+                            .upstream
+                            .as_ref()
+                            .is_some_and(|u| u.namespace != namespace)
                     {
                         return Err(DeploymentGraphInvalid.into());
                     }
@@ -5753,19 +5759,12 @@ mod inner {
                             return Err(DeploymentGraphInvalid.into());
                         }
                         self.record_config_change_in_session(
-                            session,
-                            namespace,
-                            "proxy",
-                            id,
-                            "upsert",
+                            session, namespace, "proxy", id, "upsert",
                         )
                         .await?;
                         if !self
                             .renew_pinned_restore_lease_in_session(
-                                session,
-                                namespace,
-                                owner,
-                                generation,
+                                session, namespace, owner, generation,
                             )
                             .await?
                         {
@@ -5804,11 +5803,6 @@ mod inner {
                         .session(&mut *session)
                         .await?
                         .ok_or(DeploymentGraphInvalid)?;
-                    let mut proxy_doc = merge_deployment_document(
-                        previous_doc.clone(),
-                        proxy_to_doc(previous_proxy)?,
-                        prepared.proxy.1,
-                    );
                     // Retain complete raw association objects, including their
                     // unknown fields, whenever their identity survives.
                     let old_associations = previous_doc
@@ -5842,13 +5836,34 @@ mod inner {
                             associations.push(mongodb::bson::to_bson(association)?);
                         }
                     }
-                    proxy_doc.insert("plugins", associations);
-                    let effective_proxy = doc_to_proxy(proxy_doc.clone())?;
+                    // Compare typed fields only after restoring hand-added
+                    // associations. Keep raw association objects for persistence,
+                    // but strip their unknown fields from the semantic comparison.
+                    let mut replacement_proxy = prepared.proxy.1;
+                    replacement_proxy.insert("plugins", associations);
+                    let effective_proxy = doc_to_proxy(replacement_proxy.clone())?;
+                    let mut proxy_doc = merge_deployment_document(
+                        previous_doc,
+                        proxy_to_doc(previous_proxy)?,
+                        proxy_to_doc(&effective_proxy)?,
+                    );
+                    proxy_doc.insert(
+                        "plugins",
+                        replacement_proxy
+                            .remove("plugins")
+                            .ok_or(DeploymentGraphInvalid)?,
+                    );
                     candidate.proxies.retain(|p| p.id != id);
                     candidate.proxies.push(effective_proxy);
-                    candidate.plugin_configs.retain(|p| !old_plugins.contains(&p.id));
-                    candidate.plugin_configs.extend(bundle.plugins.iter().cloned());
-                    candidate.upstreams.retain(|u| !plan.upstreams.contains(&u.id));
+                    candidate
+                        .plugin_configs
+                        .retain(|p| !old_plugins.contains(&p.id));
+                    candidate
+                        .plugin_configs
+                        .extend(bundle.plugins.iter().cloned());
+                    candidate
+                        .upstreams
+                        .retain(|u| !plan.upstreams.contains(&u.id));
                     candidate.upstreams.extend(bundle.upstream.iter().cloned());
                     let new_plugins: HashSet<_> =
                         bundle.plugins.iter().map(|p| p.id.as_str()).collect();
@@ -5902,7 +5917,11 @@ mod inner {
                         changes.push(("plugin_config", plugin_id, "upsert"));
                     }
                     for upstream_id in &plan.upstreams {
-                        if bundle.upstream.as_ref().is_none_or(|u| u.id != *upstream_id) {
+                        if bundle
+                            .upstream
+                            .as_ref()
+                            .is_none_or(|u| u.id != *upstream_id)
+                        {
                             let deleted = self
                                 .upstreams()
                                 .delete_one(doc! {
