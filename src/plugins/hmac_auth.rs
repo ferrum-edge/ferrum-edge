@@ -1806,11 +1806,17 @@ async fn run_hmac_auth(
     }
 }
 
+// Body-digest authentication and replay activation have no terminal hook.
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 auth_flow::impl_auth_plugin!(
     HmacAuth,
     "hmac_auth",
     super::priority::HMAC_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    terminal_composition_declaration,
     run_hmac_auth;
 
     fn requires_request_body_before_authenticate(&self) -> bool {

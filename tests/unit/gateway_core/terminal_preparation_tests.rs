@@ -833,7 +833,7 @@ fn explicit_noop_inventory_has_no_after_proxy_override() {
 }
 
 #[test]
-fn auth_macro_noop_declaration_is_backed_by_every_current_expansion() {
+fn auth_macro_requires_each_current_implementation_to_own_its_declaration() {
     let sources = [
         include_str!("../../../src/plugins/mtls_auth.rs"),
         include_str!("../../../src/plugins/jwt_auth.rs"),
@@ -844,8 +844,12 @@ fn auth_macro_noop_declaration_is_backed_by_every_current_expansion() {
     ];
     for source in sources {
         assert!(source.contains("impl_auth_plugin!("));
+        assert!(source.contains("const fn terminal_composition_declaration()"));
         assert!(!source.contains("async fn after_proxy("));
     }
+    let macro_source = include_str!("../../../src/plugins/utils/auth_flow.rs");
+    assert!(macro_source.contains("$terminal_declaration:path"));
+    assert!(!macro_source.contains("TerminalDeclaration::PureNoop"));
 }
 
 struct ImmediateDecorator {

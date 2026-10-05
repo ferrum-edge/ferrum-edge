@@ -321,11 +321,17 @@ fn strip_basic_authorization(headers: &mut std::collections::HashMap<String, Str
     headers.retain(|name, value| !is_basic_authorization_field(name, value));
 }
 
+// Request authentication and stripping define no after-proxy/rejection terminal hook.
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 auth_flow::impl_auth_plugin!(
     BasicAuth,
     "basic_auth",
     super::priority::BASIC_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    terminal_composition_declaration,
     auth_flow::run_auth;
 
     fn modifies_request_headers(&self) -> bool {

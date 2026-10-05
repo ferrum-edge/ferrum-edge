@@ -6,6 +6,10 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(not(windows))]
+#[path = "unit/env_lock.rs"]
+mod env_lock;
+
+#[cfg(not(windows))]
 mod qualified {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -16,12 +20,12 @@ mod qualified {
     use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
     use ferrum_edge::plugins::rate_limiting::RateLimiting;
     use ferrum_edge::plugins::terminal_preparation::{
-        CONTROL_BYTES, MAX_FIELD_OCCURRENCES, PROCESS_BYTES, PROCESS_PREPARATION_LEDGER,
+        CARRIER_BYTES, CONTROL_BYTES, MAX_FIELD_OCCURRENCES, PROCESS_BYTES, PROCESS_PREPARATION_LEDGER,
         PreparationLedger, PreparedTerminalChain, PreparedTerminalOp, REQUEST_TICKETS, ROOT_BYTES,
-        SelectedTerminalCarrier, TerminalAdmissionError, TerminalBounds, TerminalDeclaration,
-        TerminalFacts, TerminalFieldLineage, TerminalFieldOrigin, TerminalFieldSection,
-        TerminalRefusal, TerminalResult, compile_terminal_manifest, field_declaration,
-        validate_terminal_headers,
+        SLOT_BYTES, SelectedTerminalCarrier, TerminalAdmissionError, TerminalBounds,
+        TerminalDeclaration, TerminalFacts, TerminalFieldLineage, TerminalFieldOrigin,
+        TerminalFieldSection, TerminalRefusal, TerminalResult, WRAPPER_BYTES,
+        compile_terminal_manifest, field_declaration, validate_terminal_headers,
     };
     use ferrum_edge::plugins::terminal_storage::{AllocationPlan, TerminalTicket};
     use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
@@ -1386,6 +1390,278 @@ mod qualified {
         }
         config.proxies.push(proxy);
         ferrum_edge::PluginCache::new(&config).unwrap()
+    }
+
+    fn participant_config(
+        name: &str,
+        policy: serde_json::Value,
+        instances: usize,
+        triggered: bool,
+    ) -> ferrum_edge::config::types::GatewayConfig {
+        use chrono::Utc;
+        use ferrum_edge::config::types::{
+            GatewayConfig, PluginAssociation, PluginConfig, PluginScope,
+        };
+        let mut config = GatewayConfig::default();
+        let mut proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(json!({
+            "id": "participant-route",
+            "namespace": "default",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080,
+            "backend_scheme": "http"
+        }))
+        .unwrap();
+        for index in 0..instances {
+            let id = format!("participant-{index}");
+            proxy.plugins.push(PluginAssociation {
+                plugin_config_id: id.clone(),
+            });
+            config.plugin_configs.push(PluginConfig {
+                labels: Default::default(),
+                id,
+                plugin_name: name.into(),
+                namespace: "default".into(),
+                config: policy.clone(),
+                scope: PluginScope::Proxy,
+                proxy_id: Some(proxy.id.clone()),
+                enabled: true,
+                priority_override: Some(100 + index as u16),
+                trigger: triggered.then(|| {
+                    serde_json::from_value(json!({
+                        "when": {"match": {"method": ["GET"]}}
+                    }))
+                    .unwrap()
+                }),
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        }
+        config.proxies.push(proxy);
+        config
+    }
+
+    #[tokio::test]
+    async fn twelve_production_noops_keep_configured_instances_and_native_bounds() {
+        use ferrum_edge::plugins::ProxyProtocol;
+        allocator_profile();
+        let guard = crate::env_lock::EnvGuard::new(&["FERRUM_BASIC_AUTH_HMAC_SECRET"]);
+        guard.set(
+            "FERRUM_BASIC_AUTH_HMAC_SECRET",
+            "terminal-participant-hosted-fixture-secret-33",
+        );
+        let policies = [
+            ("adaptive_concurrency", json!({})),
+            ("access_control", json!({"allowed_groups": ["operators"]})),
+            ("ip_restriction", json!({"allow": ["127.0.0.0/8"]})),
+            ("grpc_deadline", json!({"default_deadline_ms": 5000})),
+            ("stdout_logging", json!({})),
+            ("request_size_limiting", json!({"max_bytes": 1024})),
+            ("basic_auth", json!({})),
+            ("jwt_auth", json!({})),
+            ("key_auth", json!({})),
+            (
+                "ldap_auth",
+                json!({
+                    "ldap_url": "ldaps://ldap.example.com:636",
+                    "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+                    "canonical_identity_attribute": "uid"
+                }),
+            ),
+            ("mtls_auth", json!({})),
+            ("hmac_auth", json!({"replay_scope": "process"})),
+        ];
+        for (name, policy) in policies {
+            let config = participant_config(name, policy, 1, false);
+            let cache = ferrum_edge::PluginCache::new(&config).unwrap();
+            let protocol = if name == "grpc_deadline" {
+                ProxyProtocol::Grpc
+            } else {
+                ProxyProtocol::Http
+            };
+            let view = cache.request_view("default", "participant-route", protocol);
+            let plugins = view.plugins();
+            assert_eq!(plugins.len(), 1, "{name}");
+            assert_eq!(plugins[0].name(), name);
+            assert_eq!(plugins[0].priority(), 100);
+            let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+            let entry = manifest.entries().next().unwrap();
+            assert_eq!(entry.declaration, TerminalDeclaration::PureNoop);
+            assert!(entry.wrapped);
+            assert!(!entry.eligibility.rejection);
+            assert!(entry.eligibility.charged);
+            assert_eq!(manifest.participant_count(), 1);
+            assert_eq!(manifest.workspace_bytes(), 0);
+            let control = ROOT_BYTES
+                + CARRIER_BYTES
+                + SLOT_BYTES
+                + TerminalBounds::PURE_NOOP.control
+                + WRAPPER_BYTES;
+            assert_eq!(manifest.control_bytes(), control.div_ceil(4096) * 4096);
+
+            let mut ctx = context();
+            let mut headers = HashMap::from([("x-preserved".into(), "value".into())]);
+            assert!(matches!(
+                plugins[0].after_proxy(&mut ctx, 403, &mut headers).await,
+                PluginResult::Continue
+            ));
+            assert_eq!(headers.get("x-preserved").unwrap(), "value");
+            assert_eq!(headers.len(), 1);
+            manifest.pin(&mut ctx).unwrap();
+            let slots = AllocationPlan::array::<Option<PreparedTerminalOp>>(1).unwrap();
+            let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+            let before = allocated.get();
+            let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+            let backing = chain.allocated_backing_bytes();
+            assert!(backing > 0);
+            // Pinning already admitted the root; preparation allocates only
+            // the exact fixed operation slots, with no capture or workspace.
+            assert_eq!(allocated.get() - before, slots.backing_bytes() as u64);
+            assert!(backing >= slots.backing_bytes());
+            assert!(backing <= manifest.control_bytes());
+            assert!(matches!(
+                chain.next_operation().unwrap().execute(),
+                TerminalResult::Noop
+            ));
+            assert!(chain.next_operation().is_none());
+            assert_eq!(
+                PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false)
+                    .unwrap_err()
+                    .reason,
+                TerminalRefusal::AlreadyPrepared
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn separate_configured_noops_cannot_substitute_for_a_pinned_generation() {
+        use ferrum_edge::plugins::ProxyProtocol;
+        allocator_profile();
+        let config = participant_config("key_auth", json!({}), 2, true);
+        let cache = ferrum_edge::PluginCache::new(&config).unwrap();
+        let foreign = ferrum_edge::PluginCache::new(&config).unwrap();
+        let plugins = cache.get_plugins_for_protocol(
+            "default",
+            "participant-route",
+            ProxyProtocol::Http,
+        );
+        let foreign_plugins = foreign.get_plugins_for_protocol(
+            "default",
+            "participant-route",
+            ProxyProtocol::Http,
+        );
+        assert_eq!(plugins.len(), 2);
+        assert!(!Arc::ptr_eq(&plugins[0], &plugins[1]));
+        let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+        let entries: Vec<_> = manifest.entries().collect();
+        assert_ne!(entries[0].instance, entries[1].instance);
+        assert!(entries.iter().all(|entry| entry.wrapped));
+        let mut ctx = context();
+        manifest.pin(&mut ctx).unwrap();
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        let before = allocated.get();
+        let error =
+            PreparedTerminalChain::prepare(&foreign_plugins, &mut ctx, true, false).unwrap_err();
+        assert_eq!(error.reason, TerminalRefusal::PinnedGeneration);
+        assert_eq!(allocated.get(), before);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                chain.next_operation().unwrap().execute(),
+                TerminalResult::Noop
+            ));
+        }
+        assert!(chain.next_operation().is_none());
+    }
+
+    struct OpaqueAfterProxy(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl Plugin for OpaqueAfterProxy {
+        fn name(&self) -> &str {
+            "key_auth"
+        }
+
+        fn priority(&self) -> u16 {
+            100
+        }
+
+        async fn after_proxy(
+            &self,
+            _ctx: &mut RequestContext,
+            _status: u16,
+            headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            headers.insert("x-opaque-effect".into(), "active".into());
+            PluginResult::Continue
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_side_effect_and_actual_active_participants_remain_undeclared() {
+        use ferrum_edge::plugins::ai_rate_limiter::AiRateLimiter;
+        use ferrum_edge::plugins::transaction_debugger::TransactionDebugger;
+        let opaque = Arc::new(OpaqueAfterProxy(std::sync::atomic::AtomicUsize::new(0)));
+        let plugin: Arc<dyn Plugin> = opaque.clone();
+        assert_eq!(
+            plugin.terminal_declaration(),
+            TerminalDeclaration::Undeclared
+        );
+        assert_eq!(
+            compile_terminal_manifest(&[plugin]).unwrap_err().reason,
+            TerminalRefusal::Undeclared
+        );
+        assert_eq!(opaque.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut ctx = context();
+        let mut headers = HashMap::new();
+        opaque.after_proxy(&mut ctx, 200, &mut headers).await;
+        assert_eq!(headers.get("x-opaque-effect").unwrap(), "active");
+
+        let debugger: Arc<dyn Plugin> = Arc::new(TransactionDebugger::new(&json!({})).unwrap());
+        assert_eq!(
+            debugger.terminal_declaration(),
+            TerminalDeclaration::Undeclared
+        );
+        assert_eq!(
+            compile_terminal_manifest(&[debugger]).unwrap_err().reason,
+            TerminalRefusal::Undeclared
+        );
+        let config = participant_config("transaction_debugger", json!({}), 1, true);
+        let error = match ferrum_edge::PluginCache::new(&config) {
+            Ok(_) => panic!("a nonmatching trigger cannot admit an active undeclared participant"),
+            Err(error) => error,
+        };
+        assert!(error.contains("terminal preparation Undeclared"), "{error}");
+
+        let policy = json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        });
+        let limiter: Arc<dyn Plugin> = Arc::new(
+            AiRateLimiter::new_with_config_id(
+                &policy,
+                PluginHttpClient::default(),
+                "participant-0",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            limiter.terminal_declaration(),
+            TerminalDeclaration::Undeclared
+        );
+        assert_eq!(
+            compile_terminal_manifest(&[limiter]).unwrap_err().reason,
+            TerminalRefusal::Undeclared
+        );
+        let config = participant_config("ai_rate_limiter", policy, 1, true);
+        let error = match ferrum_edge::PluginCache::new(&config) {
+            Ok(_) => panic!("a nonmatching trigger cannot admit an undeclared active limiter"),
+            Err(error) => error,
+        };
+        assert!(error.contains("terminal preparation Undeclared"), "{error}");
     }
 
     async fn cors_request(plugins: &[Arc<dyn Plugin>], preflight: bool) -> RequestContext {

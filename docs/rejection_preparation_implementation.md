@@ -1,6 +1,6 @@
 # Rejection preparation implementation status
 
-PR #6011, issues #6008/#6009; implementation round 32, preserving rounds 20–31.
+PR #6011, issues #6008/#6009; implementation round 33, preserving rounds 20–32.
 **Draft subset only. P2 remains open; the whole approved contract is not implemented or qualified.**
 The owner approved the complete 883-line round-17 contract identified by SHA-256
 `641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
@@ -103,6 +103,52 @@ actual policy, and its finalizer folds the complete configured sibling union.
 Deferred wrappers return no response action while retaining the inner prepared
 declaration; the mesh request-only sentinel remains a no-op.
 No source-owned registry row trusts an arbitrary runtime `Plugin::name()`.
+
+## Round-33 bounded production no-op declaration controls
+
+This round reviews twelve concrete production implementations: `AdaptiveConcurrency`,
+`AccessControl`, `IpRestriction`, `GrpcDeadline`, `StdoutLogging`, `RequestSizeLimiting`,
+`BasicAuth`, `JwtAuth`, `KeyAuth`, `LdapAuth`, `MtlsAuth`, and `HmacAuth`. All twelve
+already declared `PureNoop` at starting head
+`8dd35e21d99c5ad306a59da5fb6f2631829eacf9`. The six auth types previously obtained
+that declaration from a shared macro function. Each now owns its explicit source
+declaration, passed as a required macro argument; sealed candidate admission uses
+the same owning module. The macro grants no default no-op declaration to future
+implementations. Existing request/auth/body/stream/WebSocket behavior is retained.
+The other six declarations are unchanged.
+
+New fixtures in the existing native `terminal_allocator_tests` hosted target
+construct all twelve through production `PluginCache` with configured resource
+IDs and priority wrappers. They check the exact no-op manifest charge, zero
+workspace, measured native operation-slot backing, one-time execution, distinct
+configured instances, and refusal of a foreign cache generation. A custom plugin
+with an overridden side-effect hook and a reported `key_auth` name still refuses.
+Actual `TransactionDebugger` and `AiRateLimiter` implementations still refuse,
+including configured nonmatching triggers. These controls are **HOSTED UNVERIFIED**;
+no local formatter, compiler, test, validator, generator, or project tool ran.
+
+Old-head run `37361364307` at `e7835cbcb8d52f887afd67ac9330748b33af534f`
+contains nine failed jobs. Its cited adaptive/auth/Redis startup failures include
+active `BodyValidator`, `AiStreamRouter`, `AiFederation`, `TransactionDebugger`,
+`AiTranscriptAudit`, and `AiRateLimiter` peers. Those implementations need real
+bounded typed terminal operations; none receives a no-op declaration here. This
+round does not claim to repair those startup failures or migrate all participants.
+Assertion-only failures, including native-gRPC status 14 versus 8, remain **UNKNOWN** until their actual
+request generation pins and lifecycle are traced. Unrelated fixtures and expected
+statuses are unchanged. Internal composition views, trigger/priority wrappers,
+deferred CORS, the CORS finalizer, mesh request dispatch, and WebSocket sessions
+retain their previous declaration/identity behavior; they are outside this twelve
+type review.
+
+All ten original acceptance areas remain **OPEN/UNQUALIFIED**, P2 remains open,
+and the separate unresolved-route HTTP 503/native-gRPC 14 profile remains pending.
+The exact approved 883-line proposal was not present in this assigned checkout
+or the issue/PR comments; its recorded hash above is retained without claiming
+that the historical design document is that proposal. ROOT must supply the exact
+approved text and own exact-head hosted qualification and the cross-repository
+catalog handoff. No new public trait fact is introduced: handoff must continue to
+describe actual implementation declarations, availability, wrapper/trigger facts,
+eligibility, bounds, and configured instance identity, never trust reported names.
 
 ## Round-24 storage boundary and exact gaps
 

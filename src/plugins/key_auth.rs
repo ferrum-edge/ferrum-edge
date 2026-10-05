@@ -219,11 +219,17 @@ impl AuthMechanism for KeyAuth {
     }
 }
 
+// Authentication and request credential removal have no terminal hook.
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 auth_flow::impl_auth_plugin!(
     KeyAuth,
     "key_auth",
     super::priority::KEY_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    terminal_composition_declaration,
     auth_flow::run_auth;
 
     fn mark_query_credentials_for_redaction(&self, ctx: &mut crate::plugins::RequestContext) {

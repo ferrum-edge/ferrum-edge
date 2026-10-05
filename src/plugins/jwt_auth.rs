@@ -283,11 +283,17 @@ impl AuthMechanism for JwtAuth {
     }
 }
 
+// Authentication and request credential redaction have no terminal hook.
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 auth_flow::impl_auth_plugin!(
     JwtAuth,
     "jwt_auth",
     super::priority::JWT_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    terminal_composition_declaration,
     auth_flow::run_auth;
 
     fn mark_query_credentials_for_redaction(&self, ctx: &mut crate::plugins::RequestContext) {

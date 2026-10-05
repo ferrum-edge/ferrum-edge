@@ -1150,11 +1150,17 @@ impl AuthMechanism for MtlsAuth {
     }
 }
 
+// HTTP authentication and stream admission have no HTTP terminal hook.
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 auth_flow::impl_auth_plugin!(
     MtlsAuth,
     "mtls_auth",
     super::priority::MTLS_AUTH,
     crate::plugins::HTTP_FAMILY_AND_STREAM_PROTOCOLS,
+    terminal_composition_declaration,
     auth_flow::run_auth;
     /// `on_stream_connect` below maps a client certificate to a consumer and
     /// contributes the leaf's `notAfter` as the session authorization deadline,

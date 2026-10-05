@@ -1993,11 +1993,17 @@ impl AuthMechanism for LdapAuth {
     }
 }
 
+// Directory authentication, warmup, and request stripping have no terminal hook.
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    crate::plugins::TerminalDeclaration::PureNoop
+}
+
 auth_flow::impl_auth_plugin!(
     LdapAuth,
     "ldap_auth",
     super::priority::LDAP_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    terminal_composition_declaration,
     auth_flow::run_auth_external_identity;
     fn warmup_hostnames(&self) -> Vec<String> {
         vec![self.ldap_hostname.clone()]
