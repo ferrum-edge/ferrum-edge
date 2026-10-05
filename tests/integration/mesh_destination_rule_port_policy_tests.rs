@@ -1723,6 +1723,33 @@ fn destination_rule_subset_zero_pending_fails_while_zero_retries_is_valid() {
 // harness — the property under test is route-policy application at mesh
 // prepare time, the same layer the DR tests above exercise.
 
+fn assert_actual_cors_cache_admitted(config: &GatewayConfig) {
+    let cache = ferrum_edge::PluginCache::new(config).expect("actual CORS cache admits");
+    let mut admitted = 0;
+    for proxy in &config.proxies {
+        for protocol in [
+            ferrum_edge::plugins::ProxyProtocol::Http,
+            ferrum_edge::plugins::ProxyProtocol::Grpc,
+        ] {
+            let chain = cache.get_plugins_for_protocol(&proxy.namespace, &proxy.id, protocol);
+            let Some(cors) = chain.iter().find(|plugin| plugin.name() == "cors") else {
+                continue;
+            };
+            let manifest =
+                ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest(&chain)
+                    .expect("actual CORS terminal declaration");
+            assert!(manifest.participant_count() > 0);
+            assert!(matches!(
+                cors.terminal_declaration(),
+                ferrum_edge::plugins::TerminalDeclaration::Prepared { .. }
+            ));
+            assert!(cors.terminal_preparation_available());
+            admitted += 1;
+        }
+    }
+    assert!(admitted >= 2, "actual HTTP and gRPC CORS chains admitted");
+}
+
 #[test]
 fn virtual_service_cors_policy_synthesizes_cors_plugin_on_mesh_outbound_route() {
     // The mesh document shape is exactly what the file source accepts —
@@ -1769,7 +1796,8 @@ virtual_service_cors_policies:
         ..GatewayConfig::default()
     };
 
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let prepared =
+        prepare_gateway_config_for_mesh(config.clone(), &runtime()).expect("mesh config");
 
     let proxy = prepared
         .proxies
@@ -1810,6 +1838,21 @@ virtual_service_cors_policies:
             .any(|association| association.plugin_config_id == plugin.id),
         "route must carry the plugin association"
     );
+    // The actual live svc-cors fixture reaches this synthesis and then the
+    // production cache. A policy row alone cannot witness startup admission.
+    assert_actual_cors_cache_admitted(&prepared);
+
+    // Match the live client config's policy exactly, retaining the original
+    // bare-host projection assertions above as a separate schema witness.
+    let mut live_fixture = config;
+    let policy = &mut live_fixture.mesh.as_mut().unwrap().virtual_service_cors_policies[0];
+    policy.host = "svc.default.svc.cluster.local".into();
+    policy.cors.allowed_methods = vec!["GET".into(), "POST".into(), "OPTIONS".into()];
+    policy.cors.allowed_headers = vec!["content-type".into(), "authorization".into()];
+    policy.cors.unmatched_preflights = Some(MeshCorsUnmatchedPreflights::Forward);
+    let live_fixture =
+        prepare_gateway_config_for_mesh(live_fixture, &runtime()).expect("live fixture synthesis");
+    assert_actual_cors_cache_admitted(&live_fixture);
 }
 
 #[test]
@@ -1879,6 +1922,7 @@ fn virtual_service_cors_policy_rides_the_mesh_block_and_matches_gateway_projecti
         gateway_cors.config,
         "slice-carried and gateway-projected CORS configs must be identical"
     );
+    assert_actual_cors_cache_admitted(&translated.config);
 }
 
 #[test]

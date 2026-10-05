@@ -9,9 +9,11 @@ Rejection and charged-terminal runners prepare the whole admitted chain
 synchronously, retire context-owned upload views, and consume closed immediate
 operations once in order. Charged exact-N storage and field-origin records now
 back the immediate operations, including active workload-metrics preparation.
-Legacy wire conversion, emergency storage and complete provenance remain open.
-They never adapt the ordinary async `after_proxy`.
-Audit, limiter/Redis, CORS/finalizer, transformers, compression, mixed response
+CORS instances and their aggregate finalizer now prepare bounded field patches,
+including atomic prefix stripping and Vary token co-ownership. Legacy wire
+conversion, emergency storage and complete provenance remain open. These
+operations never adapt the ordinary async `after_proxy`.
+Audit, limiter/Redis, transformers, compression, mixed response
 provenance and external terminal operations remain refused or unimplemented;
 P2 and hosted runtime qualification remain open. See the
 [exact completed/remaining inventory](rejection_preparation_implementation.md).

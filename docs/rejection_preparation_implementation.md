@@ -1,6 +1,6 @@
 # Rejection preparation implementation status
 
-PR #6011, issues #6008/#6009; implementation round 24, preserving rounds 20–23.
+PR #6011, issues #6008/#6009; implementation round 27, preserving rounds 20–26.
 **Draft subset only. P2 remains open; the whole approved contract is not implemented or qualified.**
 The owner approved the complete 883-line round-17 contract identified by SHA-256
 `641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
@@ -94,11 +94,14 @@ profile is approved; interim refusals below are not final qualification of it.
 | `spec_expose` | Consume the HEAD marker once and emit EmptyBody; C/O 1,024 each. |
 | `ai_semantic_cache` | Closed cache-status field; C/O 1,024 each. |
 | `ExamplePlugin` | Custom two-field patch built with admitted credit; C 1,024 / O 16,384. |
+| `cors` / `__cors_finalizer` | Borrow reached aggregate policy facts into a closed field patch; C/O 16,384 each, W 0. Direct instances and cache finalizers declare real configured output sizes; deferred wrappers retain inner declarations and wrapper credit. No raw context, policy-list clone or old-hook adapter escapes preparation. |
 | `mesh/workload_metrics` | Actual synchronous reject restamp and traceparent operation; C 16,384 / O 4,096 / W 0. Borrowed authenticated peer/header/config facts, composed CEL label requirements, sampling/B3/W3C state and capture-marker retirement; no cloned raw header map in the operation. |
 
 The round-19 explicit no-op inventory remains. Pure candidate rows now delegate
-to those same source-owned declarations. Deferred CORS and the mesh request-only
-sentinel are no-ops; **the active CORS response finalizer is still refused**.
+to those same source-owned declarations. CORS candidate admission constructs the
+actual policy, and its finalizer folds the complete configured sibling union.
+Deferred wrappers return no response action while retaining the inner prepared
+declaration; the mesh request-only sentinel remains a no-op.
 No source-owned registry row trusts an arbitrary runtime `Plugin::name()`.
 
 ## Round-24 storage boundary and exact gaps
@@ -146,8 +149,9 @@ The **complete common foundation is not yet closed**. Remaining gaps include:
 - Transport handoff still constructs legacy Strings, HashMaps, HeaderMaps and
   dynamic HeaderName/Bytes owners outside the new allocation API. The ordinary
   three-map provenance recorder remains. Core diagnostics, sticky cookies and
-  native-gRPC encoded cells are not migrated producers. The carrier lacks mixed
-  append segments and explicit identical-token contribution/dedup handling.
+  native-gRPC encoded cells are not migrated producers. CORS now has mixed
+  Vary append segments and explicit identical-token co-ownership; other dynamic
+  append/merge producers and the legacy wire export remain unqualified.
 - Pre-owned emergency backing is absent. No 4 KiB emergency or complete 128 KiB
   wire-handoff proof is claimed. Existing earlier-authoritative terminal handling
   is preserved; no unresolved-route/native-14 policy was introduced.
@@ -167,6 +171,51 @@ The **complete common foundation is not yet closed**. Remaining gaps include:
 All ten approved runtime acceptance areas remain **UNQUALIFIED**. This round
 adds actual storage and the first active Mesh participant; it does not authorize
 landing the original P2 or claim the whole foundation, audit or Redis complete.
+
+## Round-27 CORS startup repair and remaining qualification
+
+The actual hosted mesh client log at source `b4850ffb` reports five materialized
+outbound routes, one synthesized VirtualService CORS plugin, then terminal
+`Undeclared` and fatal cache startup refusal. The fixture's `svc-cors` policy
+belongs to the client-side outbound `svc` route; no example/custom plugin or
+infrastructure failure is substituted for this source path.
+
+Both actual CORS implementations now synchronously copy only admitted response
+fields from borrowed private aggregate facts. Token joins and decimal max age
+write directly into bounded storage, with allocator-class admission before
+allocation. Static policy sizes are checked during chain compilation; aggregate
+methods/headers account the configured sibling union, while exposure accounts
+its intersection ceiling. Dynamic reflection and merges still refuse exact
+output overflow. No cap, matcher, credentials, request decision, status/body,
+WebSocket behavior or mesh operator profile changes.
+
+The narrow carrier extension preflights open-ended prefix removal, all field
+writes, Vary occurrence/value/byte limits and token-storage capacity before any
+selected mutation. It inserts missing CORS tokens in-place in the sole arena,
+retains opaque cookie occurrences and backend Vary segments, records ensures
+satisfied by unchanged backend tokens, and preserves those records on rename.
+Token storage derives from actual class-sized layouts inside the existing
+32,768-byte overhead allowance. A foreign request ticket cannot apply a CORS
+merge. Native-gRPC and HTTP terminal normalization and deadline ownership remain
+with their existing core paths.
+
+Added fixtures cover actual direct and cached finalizer instances, real native
+mesh synthesis and Istio projection followed by cache compilation, priorities and conservative
+trigger refusal, reload rollback, ordinary/typed policy parity, originless and
+unmatched native/Istio states, credentials, stale prefix fields, wildcard and
+case-insensitive Vary tokens, duplicate opaque cookies, atomic overflow,
+foreign-ticket refusal, native allocation witnesses, raw-owner drop and
+operations surviving context/plugin/cache drop. The actual rejection runner is
+covered with HTTP/native-gRPC normalization and an elapsed deadline. Existing
+CORS functional suites and strict assertions are unchanged.
+
+These are **unexecuted hosted fixtures**, not qualification. Legacy String/map
+export and transport ownership remain outside the allocation proof; this round
+adds no claim that those existing adapters or the whole generation/config
+construction overlap are charged. All ten acceptance areas, the complete common
+foundation and P2 remain OPEN. ROOT owns exact-head hosted execution, independent
+review and the ferrum-contracts plugin-catalog handoff for the new trait fact.
+The separate unresolved-route HTTP 503/native-gRPC 14 profile stays PENDING.
 
 ## Concrete dependency boundary
 
@@ -216,7 +265,7 @@ boundary before declaring the limiter migration conforming.
 | Audit (section 6) | All `ai_transcript_audit` and `transaction_debugger` active terminal capture remains Undeclared/refused. No private per-instance Complete/Refuted/Unfinished reached-body/method/header authority, staging guard transfer, immediate audit abort, or record-lease move has been implemented. Shared `MD_FINAL_REQ_SEEN` is not replaced. |
 | Bounded audit parser | No bounded JSON/protobuf/redaction arena or reserve-before-node/encoder growth migration. Ordinary `serde_json::Value` paths are not claimed conforming. |
 | Limiter / paid provider | `ai_rate_limiter`, including local/federation accounting and Redis reconciliation, remains Undeclared/refused before request provider work in configured terminal chains. No paid-operation cancellation/once/uncertainty semantics are invented. Root must implement the bounded RESP path described above with existing pool/TLS/config/deadline semantics. |
-| Other active hooks | `CorsPlugin`/`CorsFinalizer`, `response_transformer`/core route-header finalizer, `compression`, `sse`, `a2a_gateway`, `ai_federation`, `ai_stream_router`, `body_validator`, `openapi_validator`, `waf`, `ai_response_guard`, `response_size_limiting`, `response_caching`, `grpc_web`, `transaction_debugger`, and the audit/limiter rows above remain Undeclared/refused in their effective HTTP R/C union. There is no opaque fallback. Configuring a currently unmigrated participant can reject an otherwise valid proxy config. |
+| Other active hooks | `response_transformer`/core route-header finalizer, `compression`, `sse`, `a2a_gateway`, `ai_federation`, `ai_stream_router`, `body_validator`, `openapi_validator`, `waf`, `ai_response_guard`, `response_size_limiting`, `response_caching`, `grpc_web`, `transaction_debugger`, and the audit/limiter rows above remain Undeclared/refused in their effective HTTP R/C union. There is no opaque fallback. Configuring a currently unmigrated participant can reject an otherwise valid proxy config. |
 | External operations / cursor | Add reviewed typed I/O/result/cleanup variants, selected-response scope and replacement/result replay, authorization/deadline rechecks before every external poll, independent finite detach summary, held-operation cancellation and once/paid-state semantics. The immediate driver is not an implementation of these requirements. |
 | Provenance / final policies | Migrate mixed backend/gateway provenance, exact authored-field/cookie occurrence ownership and route finalizers under finite cursor credit; preserve every admitted terminal's final header/body policy and HEAD/CORS/compression semantics. Current legacy-lineage refusal must be retired by the full migration. |
 | Complete teardown proof | Context retirement and existing retained-upload handoffs are connected, but every raw caller/replay/decode/collector/request-view sibling and cancellation site still needs exact-head real ownership proof. Committed-response/logging observers keep their existing separate lifecycle; no claim is made that their opaque state is a conforming typed terminal operation. |

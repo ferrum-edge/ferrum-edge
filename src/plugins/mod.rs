@@ -10431,6 +10431,12 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Source-owned configured CORS output sizes. A name alone cannot supply
+    /// these facts or authorize a cache-internal finalizer.
+    fn cors_terminal_config(&self) -> Option<cors::CorsTerminalConfig> {
+        None
+    }
+
     /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.
     async fn authenticate(
         &self,

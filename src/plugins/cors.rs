@@ -618,6 +618,168 @@ fn origin_pattern_breadth(pattern: &OriginPattern) -> OriginPolicyBreadth {
     origin_matcher_breadth(spec)
 }
 
+/// Cold-path sizes of the actual configured policy. Wrappers forward these
+/// facts; the installed finalizer folds its complete sibling union without
+/// cloning a policy list or constructing request-dependent output.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CorsTerminalConfig {
+    methods: usize,
+    headers: usize,
+    exposed: usize,
+}
+
+impl CorsTerminalConfig {
+    pub(crate) fn union(self, other: Self) -> Option<Self> {
+        Some(Self {
+            methods: self.methods.checked_add(other.methods)?.checked_add(2)?,
+            headers: self.headers.checked_add(other.headers)?.checked_add(2)?,
+            exposed: self.exposed.max(other.exposed),
+        })
+    }
+
+    fn declaration(self) -> super::terminal_preparation::TerminalDeclaration {
+        use super::terminal_preparation::{
+            TerminalBounds, TerminalDeclaration, TerminalFacts, field_output_size_bound,
+        };
+        let required = field_output_size_bound(
+            8,
+            [
+                ("access-control-", 0),
+                ("access-control-allow-origin", MAX_ORIGIN_MATCHER_BYTES),
+                ("access-control-allow-credentials", 4),
+                ("access-control-expose-headers", self.exposed),
+                ("access-control-allow-methods", self.methods),
+                ("access-control-allow-headers", self.headers),
+                ("access-control-max-age", 20),
+            ],
+        );
+        if required.is_err() || required.is_ok_and(|bytes| bytes > 16_384) {
+            return TerminalDeclaration::Undeclared;
+        }
+        TerminalDeclaration::Prepared {
+            bounds: TerminalBounds {
+                control: 16_384,
+                output: 16_384,
+                workspace: 0,
+            },
+            prep_reads: TerminalFacts::ENROLLMENT.union(TerminalFacts::TELEMETRY),
+            prep_writes: TerminalFacts::NONE,
+            trigger_reads: TerminalFacts::NONE,
+            cursor_writes: TerminalFacts::RESPONSE_HEADERS,
+        }
+    }
+}
+
+/// Synchronous extraction from the reached aggregate. Only a bounded closed
+/// field patch escapes; neither CorsRequestState nor its String/Arc lists move
+/// into an operation. Response status/body and response headers are untouched.
+fn prepare_cors_response(
+    view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+) -> Result<
+    super::terminal_preparation::PreparedTerminalOp,
+    super::terminal_preparation::TerminalAdmissionError,
+> {
+    use super::terminal_preparation::PreparedTerminalOp;
+
+    if !view.action_allowed() {
+        return Ok(PreparedTerminalOp::Noop);
+    }
+    let state = &view.context.cors_state;
+    let should_sanitize =
+        state.sanitize_response || state.native_policy_seen || state.istio_policy_seen;
+    let rejection = view
+        .context
+        .metadata
+        .get(crate::proxy::REJECTION_RESPONSE_METADATA_KEY)
+        .is_some_and(|value| value == "true");
+    let owns_rejection = state.policy_count > 0 || state.istio_policy_seen;
+    let sanitize = should_sanitize && (!rejection || owns_rejection);
+    if !should_sanitize && state.policy_count == 0 {
+        return Ok(PreparedTerminalOp::Noop);
+    }
+    let mut patch = view.patch(8)?;
+    if sanitize {
+        patch.remove_cors_prefix()?;
+    }
+    if state.policy_count > 0
+        && state.response_allowed
+        && let Some(origin) = state.matched_origin.as_deref()
+    {
+        patch.set_policy(
+            "access-control-allow-origin",
+            if state.all_wildcard && !state.allow_credentials {
+                "*"
+            } else {
+                origin
+            },
+            true,
+        )?;
+        if state.allow_credentials {
+            patch.set_policy("access-control-allow-credentials", "true", true)?;
+        }
+        if let Some(exposed) = state
+            .exposed_headers
+            .as_ref()
+            .filter(|values| !values.is_empty())
+        {
+            patch.set_policy_tokens(
+                "access-control-expose-headers",
+                exposed.iter().map(String::as_str),
+            )?;
+        }
+        if state.is_preflight {
+            for (name, values) in [
+                (
+                    "access-control-allow-methods",
+                    state.allowed_methods.as_ref(),
+                ),
+                (
+                    "access-control-allow-headers",
+                    state.allowed_headers.as_ref(),
+                ),
+            ] {
+                if let Some(values) = values {
+                    let tokens = values
+                        .values
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|value| {
+                            values.wildcard || state.allow_credentials || *value != "*"
+                        });
+                    if tokens.clone().next().is_some() {
+                        patch.set_policy_tokens(name, tokens)?;
+                    }
+                }
+            }
+            if let Some(Some(max_age)) = state.max_age {
+                let mut bytes = [0u8; 20];
+                let mut remaining = max_age;
+                let mut start = bytes.len();
+                loop {
+                    start -= 1;
+                    bytes[start] = b'0' + (remaining % 10) as u8;
+                    remaining /= 10;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                let value = std::str::from_utf8(&bytes[start..]).map_err(|_| {
+                    super::terminal_preparation::TerminalAdmissionError::new(
+                        super::terminal_preparation::TerminalRefusal::FieldCapacity,
+                        0,
+                        0,
+                    )
+                })?;
+                patch.set_policy("access-control-max-age", value, true)?;
+            }
+        }
+    }
+    if should_sanitize {
+        patch.cors_vary(state.is_preflight)?;
+    }
+    Ok(PreparedTerminalOp::Fields(patch))
+}
+
 /// CORS (Cross-Origin Resource Sharing) plugin.
 ///
 /// Handles preflight OPTIONS requests at the gateway level and injects the
@@ -756,6 +918,24 @@ impl CorsPlugin {
             max_age,
             preflight_continue,
             unmatched_preflights,
+        })
+    }
+
+    fn terminal_config(&self) -> Option<CorsTerminalConfig> {
+        use super::terminal_preparation::joined_token_bytes;
+        Some(CorsTerminalConfig {
+            methods: joined_token_bytes(
+                self.allowed_methods.values.iter().map(String::as_str),
+            )
+            .ok()?,
+            headers: joined_token_bytes(
+                self.allowed_headers.values.iter().map(String::as_str),
+            )
+            .ok()?,
+            exposed: joined_token_bytes(
+                self.exposed_headers.iter().map(String::as_str),
+            )
+            .ok()?,
         })
     }
 
@@ -1064,6 +1244,35 @@ impl Plugin for CorsPlugin {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    fn cors_terminal_config(&self) -> Option<CorsTerminalConfig> {
+        self.terminal_config()
+    }
+
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        self.terminal_config().map_or(
+            super::terminal_preparation::TerminalDeclaration::Undeclared,
+            CorsTerminalConfig::declaration,
+        )
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        if view.context.cors_state.defer_finalization {
+            Ok(super::terminal_preparation::PreparedTerminalOp::Noop)
+        } else {
+            prepare_cors_response(view)
+        }
+    }
+
     fn cors_uses_strict_origin_policy(&self) -> bool {
         self.uses_strict_origin_policy()
     }
@@ -1214,16 +1423,41 @@ impl Plugin for CorsPlugin {
 /// Cache-internal boundary after a contiguous set of CORS instances.
 pub(crate) struct CorsFinalizer {
     priority: u16,
+    terminal_config: Option<CorsTerminalConfig>,
 }
 
 impl CorsFinalizer {
-    pub(crate) fn new(priority: u16) -> Self {
-        Self { priority }
+    pub(crate) fn new(priority: u16, terminal_config: Option<CorsTerminalConfig>) -> Self {
+        Self {
+            priority,
+            terminal_config,
+        }
     }
 }
 
 #[async_trait]
 impl Plugin for CorsFinalizer {
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        self.terminal_config.map_or(
+            super::terminal_preparation::TerminalDeclaration::Undeclared,
+            CorsTerminalConfig::declaration,
+        )
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        prepare_cors_response(view)
+    }
+
     fn name(&self) -> &str {
         CORS_FINALIZER_NAME
     }

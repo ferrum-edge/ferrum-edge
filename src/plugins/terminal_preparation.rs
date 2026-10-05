@@ -1100,7 +1100,7 @@ impl TerminalString {
     }
 
     fn as_str(&self) -> &str {
-        // SAFETY: construction copies exactly one already validated Rust str;
+        // SAFETY: construction copies validated Rust strs and ASCII separators;
         // this owner exposes no mutable access to those bytes.
         unsafe { std::str::from_utf8_unchecked(self.block.bytes()) }
     }
@@ -1115,6 +1115,11 @@ enum TerminalFieldAction {
         lineage: TerminalFieldLineage,
     },
     Remove(TerminalString),
+    RemovePrefix(TerminalString),
+    CorsVary {
+        preflight: bool,
+        lineage: TerminalFieldLineage,
+    },
     Metadata {
         name: String,
         value: Option<String>,
@@ -1265,6 +1270,88 @@ impl TerminalPatch {
         Ok(())
     }
 
+    /// Closed CORS family removal, preflighted with every other field action.
+    pub(crate) fn remove_cors_prefix(&mut self) -> Result<(), TerminalAdmissionError> {
+        let prefix = "access-control-";
+        let (plan, _) = self.field_plans(prefix, "")?;
+        let prefix = TerminalString::copy(prefix, plan, &self.ticket)?;
+        self.actions.push(TerminalFieldAction::RemovePrefix(prefix))?;
+        self.owned_bytes += plan.backing_bytes();
+        Ok(())
+    }
+
+    /// Last action only. The closed token list is evaluated against the selected
+    /// response at the cursor, never against a preparation-time response copy.
+    pub(crate) fn cors_vary(&mut self, preflight: bool) -> Result<(), TerminalAdmissionError> {
+        if self.actions.as_slice().len() == self.action_limit {
+            return Err(capacity_error(
+                TerminalRefusal::PatchCapacity,
+                self.action_limit + 1,
+                self.action_limit,
+            ));
+        }
+        let lineage = TerminalFieldLineage {
+            origin: TerminalFieldOrigin::GatewayInstance(self.instance),
+            policy_contribution: true,
+            section: TerminalFieldSection::Initial,
+            epoch: self.ticket.next_field_epoch()?,
+        };
+        self.actions
+            .push(TerminalFieldAction::CorsVary { preflight, lineage })
+    }
+
+    /// Copy joined borrowed policy tokens straight into admitted backing.
+    pub(crate) fn set_policy_tokens<'a>(
+        &mut self,
+        name: &str,
+        tokens: impl Iterator<Item = &'a str> + Clone,
+    ) -> Result<(), TerminalAdmissionError> {
+        let length = joined_token_bytes(tokens.clone())?;
+        let (name_plan, _) = self.field_plans_unchecked(name, "")?;
+        validate_field(name, "")?;
+        let value_plan = AllocationPlan::array::<u8>(length)?;
+        let required = self
+            .owned_bytes
+            .saturating_add(name_plan.backing_bytes())
+            .saturating_add(value_plan.backing_bytes());
+        if length > MAX_FIELD_VALUE_BYTES || required > self.output_limit {
+            return Err(capacity_error(
+                TerminalRefusal::PatchCapacity,
+                required,
+                self.output_limit,
+            ));
+        }
+        for token in tokens.clone() {
+            validate_field(name, token)?;
+        }
+        let lineage = TerminalFieldLineage {
+            origin: TerminalFieldOrigin::GatewayInstance(self.instance),
+            policy_contribution: true,
+            section: TerminalFieldSection::Initial,
+            epoch: self.ticket.next_field_epoch()?,
+        };
+        let name = TerminalString::copy(name, name_plan, &self.ticket)?;
+        let mut block = AllocationBlock::zeroed_request(value_plan, &self.ticket)?;
+        let mut offset = 0;
+        for (index, token) in tokens.enumerate() {
+            if index != 0 {
+                block.bytes_mut()[offset..offset + 2].copy_from_slice(b", ");
+                offset += 2;
+            }
+            block.bytes_mut()[offset..offset + token.len()].copy_from_slice(token.as_bytes());
+            offset += token.len();
+        }
+        self.actions.push(TerminalFieldAction::Set {
+            name,
+            value: TerminalString { block },
+            override_existing: true,
+            case_insensitive: true,
+            lineage,
+        })?;
+        self.owned_bytes = required;
+        Ok(())
+    }
+
     pub(crate) fn set_metadata(
         &mut self,
         name: &str,
@@ -1403,7 +1490,9 @@ fn apply_terminal_metadata(
         let (name, value) = match action {
             TerminalFieldAction::Set { name, value, .. } => (name.as_str(), value.as_str()),
             TerminalFieldAction::Remove(_) => continue,
-            TerminalFieldAction::Metadata { .. } => {
+            TerminalFieldAction::RemovePrefix(_)
+            | TerminalFieldAction::CorsVary { .. }
+            | TerminalFieldAction::Metadata { .. } => {
                 return Err(capacity_error(TerminalRefusal::AlreadyPrepared, 1, 0));
             }
         };
@@ -1463,7 +1552,9 @@ fn apply_terminal_metadata(
         let (name, value) = match action {
             TerminalFieldAction::Set { name, value, .. } => (name.as_str(), Some(value.as_str())),
             TerminalFieldAction::Remove(_) => continue,
-            TerminalFieldAction::Metadata { .. } => {
+            TerminalFieldAction::RemovePrefix(_)
+            | TerminalFieldAction::CorsVary { .. }
+            | TerminalFieldAction::Metadata { .. } => {
                 return Err(capacity_error(TerminalRefusal::AlreadyPrepared, 1, 0));
             }
         };
@@ -1493,7 +1584,9 @@ fn apply_terminal_metadata(
             TerminalFieldAction::Remove(name) => {
                 ctx.metadata.remove(name.as_str());
             }
-            TerminalFieldAction::Set { .. } => {}
+            TerminalFieldAction::Set { .. }
+            | TerminalFieldAction::RemovePrefix(_)
+            | TerminalFieldAction::CorsVary { .. } => {}
         }
     }
     Ok(())
@@ -1584,8 +1677,7 @@ pub fn apply_terminal_patch(
     carrier.apply(&patch)?;
     // The legacy adapter below remains outside the qualified wire-handoff
     // proof. All semantic/field-capacity checks finish before its mutations.
-    drop(carrier);
-    apply_legacy_patch(&patch, headers)
+    apply_legacy_patch(&patch, headers, &carrier)
 }
 
 // This is a logical legacy-String guard, not a foreign-table allocation proof.
@@ -1626,7 +1718,19 @@ fn preflight_legacy_patch(
                     .saturating_add(name.as_str().len())
                     .saturating_add(value.as_str().len());
             }
-            TerminalFieldAction::Remove(_) => {}
+            TerminalFieldAction::Remove(_) | TerminalFieldAction::RemovePrefix(_) => {}
+            TerminalFieldAction::CorsVary { preflight, .. } => {
+                let tokens = if *preflight { 3 } else { 1 };
+                owned = headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+                    .fold(owned.saturating_add(4), |bytes, (_, value)| {
+                        bytes.saturating_add(value.len())
+                    });
+                for token in carrier::CORS_VARY_TOKENS.iter().take(tokens) {
+                    owned = owned.saturating_add(token.len() + 2);
+                }
+            }
             TerminalFieldAction::Metadata { .. } => {
                 return Err(capacity_error(
                     TerminalRefusal::UnimplementedOperation,
@@ -1649,11 +1753,34 @@ fn preflight_legacy_patch(
 fn apply_legacy_patch(
     patch: &TerminalPatch,
     headers: &mut std::collections::HashMap<String, String>,
+    carrier: &SelectedTerminalCarrier,
 ) -> Result<(), TerminalAdmissionError> {
     for action in patch.actions.as_slice() {
         match action {
             TerminalFieldAction::Remove(name) => {
                 headers.retain(|key, _| !key.eq_ignore_ascii_case(name.as_str()));
+            }
+            TerminalFieldAction::RemovePrefix(prefix) => {
+                headers.retain(|key, _| {
+                    !key.as_bytes()
+                        .get(..prefix.as_str().len())
+                        .is_some_and(|name| name.eq_ignore_ascii_case(prefix.as_str().as_bytes()))
+                });
+            }
+            TerminalFieldAction::CorsVary { .. } => {
+                // Export the already merged carrier value in one copy. No
+                // plain-String append can erase its segment/token provenance.
+                for (name, value, _) in carrier.occurrences() {
+                    if name.eq_ignore_ascii_case(b"vary") {
+                        let name = std::str::from_utf8(name).map_err(|_| {
+                            capacity_error(TerminalRefusal::FieldCapacity, 0, 0)
+                        })?;
+                        let value = std::str::from_utf8(value).map_err(|_| {
+                            capacity_error(TerminalRefusal::FieldCapacity, 0, 0)
+                        })?;
+                        headers.insert(name.to_string(), value.to_string());
+                    }
+                }
             }
             TerminalFieldAction::Set {
                 name,
@@ -1734,6 +1861,48 @@ pub fn field_declaration(control: usize, output: usize) -> TerminalDeclaration {
         trigger_reads: TerminalFacts::NONE,
         cursor_writes: TerminalFacts::RESPONSE_HEADERS,
     }
+}
+
+pub(crate) fn joined_token_bytes<'a>(
+    tokens: impl Iterator<Item = &'a str>,
+) -> Result<usize, TerminalAdmissionError> {
+    tokens.enumerate().try_fold(0usize, |bytes, (index, token)| {
+        bytes
+            .checked_add(token.len())
+            .and_then(|bytes| bytes.checked_add(if index == 0 { 0 } else { 2 }))
+            .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))
+    })
+}
+
+pub(crate) fn field_output_size_bound<'a>(
+    actions: usize,
+    fields: impl IntoIterator<Item = (&'a str, usize)>,
+) -> Result<usize, TerminalAdmissionError> {
+    if actions > MAX_PATCH_ACTIONS {
+        return Err(capacity_error(
+            TerminalRefusal::PatchCapacity,
+            actions,
+            MAX_PATCH_ACTIONS,
+        ));
+    }
+    let mut required = AllocationPlan::array::<TerminalFieldAction>(actions)?.backing_bytes();
+    for (name, length) in fields {
+        validate_field(name, "")?;
+        if length > MAX_FIELD_VALUE_BYTES {
+            return Err(capacity_error(
+                TerminalRefusal::FieldCapacity,
+                length,
+                MAX_FIELD_VALUE_BYTES,
+            ));
+        }
+        let name_bytes = TerminalString::plan(name)?.backing_bytes();
+        let value_bytes = AllocationPlan::array::<u8>(length)?.backing_bytes();
+        required = required
+            .checked_add(name_bytes)
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
+    }
+    Ok(required)
 }
 
 /// Cold-path bound for the same action table and exact field blocks used by
@@ -1984,6 +2153,15 @@ impl PreparedTerminalChain {
             .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))
     }
 
+    /// Construct a carrier sharing this prepared request's one admitted ticket.
+    pub fn new_selected_carrier(&self) -> Result<SelectedTerminalCarrier, TerminalAdmissionError> {
+        let ticket = self
+            ._ticket
+            .as_ref()
+            .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
+        SelectedTerminalCarrier::new(ticket)
+    }
+
     pub(crate) fn reset_selected(
         &mut self,
         headers: &std::collections::HashMap<String, String>,
@@ -2000,8 +2178,9 @@ impl PreparedTerminalChain {
         headers: &mut std::collections::HashMap<String, String>,
     ) -> Result<(), TerminalAdmissionError> {
         preflight_legacy_patch(&patch, headers)?;
-        self.selected(headers)?.apply(&patch)?;
-        apply_legacy_patch(&patch, headers)
+        let selected = self.selected(headers)?;
+        selected.apply(&patch)?;
+        apply_legacy_patch(&patch, headers, selected)
     }
 
     pub(crate) fn apply_cookie(

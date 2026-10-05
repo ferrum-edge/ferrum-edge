@@ -3194,3 +3194,54 @@ fn documented_per_proxy_cors_example_passes_file_admission() {
     assert_eq!(config.proxies.len(), 2);
     assert_eq!(config.plugin_configs.len(), 2);
 }
+
+#[test]
+fn terminal_cors_admission_rejects_configured_output_overflow_and_preserves_reload_generation() {
+    use ferrum_edge::plugins::ProxyProtocol;
+    use ferrum_edge::plugins::terminal_preparation::{TerminalDeclaration, compile_terminal_manifest};
+
+    let mut config = gateway_with_cors_proxy(json!(["https://app.example"]), vec![]);
+    let cache = PluginCache::new(&config).unwrap();
+    let before = cache.get_plugins_for_protocol("ferrum", "ws-api", ProxyProtocol::Http);
+    assert!(compile_terminal_manifest(&before).is_ok());
+    config.plugin_configs[0].config["exposed_headers"] = json!(["x".repeat(16_385)]);
+    let actual = CorsPlugin::new(&config.plugin_configs[0].config).unwrap();
+    assert_eq!(actual.terminal_declaration(), TerminalDeclaration::Undeclared);
+    assert!(cache.rebuild(&config).is_err());
+    let after = cache.get_plugins_for_protocol("ferrum", "ws-api", ProxyProtocol::Http);
+    assert!(std::sync::Arc::ptr_eq(&before, &after));
+}
+
+#[test]
+fn terminal_cors_keeps_contextless_trailer_trigger_refusal() {
+    let mut config = gateway_with_cors_proxy(json!(["https://app.example"]), vec![]);
+    config.plugin_configs[0].trigger = Some(
+        serde_json::from_value(json!({
+            "when": {"match": {"method": ["GET"]}}
+        }))
+        .unwrap(),
+    );
+    assert!(PluginCache::new(&config).is_err());
+}
+
+#[test]
+fn terminal_cors_finalizer_admission_includes_the_full_configured_sibling_union() {
+    use ferrum_edge::plugins::terminal_preparation::TerminalDeclaration;
+
+    let mut config = gateway_with_cors_proxy(json!(["https://app.example"]), vec![]);
+    config.plugin_configs[0].config["allowed_headers"] = json!(["a".repeat(8_000)]);
+    assert!(PluginCache::new(&config).is_ok());
+    let mut sibling = config.plugin_configs[0].clone();
+    sibling.id = "cors-sibling".into();
+    sibling.config["allowed_headers"] = json!(["b".repeat(8_000)]);
+    let actual = CorsPlugin::new(&sibling.config).unwrap();
+    assert!(matches!(
+        actual.terminal_declaration(),
+        TerminalDeclaration::Prepared { .. }
+    ));
+    config.proxies[0].plugins.push(PluginAssociation {
+        plugin_config_id: sibling.id.clone(),
+    });
+    config.plugin_configs.push(sibling);
+    assert!(PluginCache::new(&config).is_err());
+}

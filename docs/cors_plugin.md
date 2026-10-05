@@ -14,6 +14,17 @@ The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/
 
 Denials use a JSON object with a fixed `error` message (`CORS origin not allowed`, `CORS method not allowed`, or `CORS header not allowed`). Denied method and header values are not reflected. Successful preflights keep their empty response bodies.
 
+Rejection and charged-terminal cleanup prepare CORS fields synchronously from
+the reached private policy state. Cached multiple-instance chains prepare one
+aggregate finalizer after the contiguous CORS instances. Each actual instance
+and finalizer reserves the approved 16 KiB control and 16 KiB output ceilings;
+configured policy output or aggregate composition beyond the terminal limits
+refuses the complete candidate at startup/reload. Dynamic reflection or Vary
+merge overflow refuses before changing the selected headers. The ordinary
+successful-response hook retains its existing policy behavior. Full allocation
+and protocol qualification remains pending; see
+[implementation status](rejection_preparation_implementation.md).
+
 ## Configuration
 
 The CORS plugin is configured via the `plugin_configs` section in your YAML configuration file, or through the admin API when running in control-plane mode.

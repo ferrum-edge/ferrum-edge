@@ -327,7 +327,31 @@ struct DeferredCorsPlugin {
 #[async_trait]
 impl Plugin for DeferredCorsPlugin {
     fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
-        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+        self.inner.terminal_declaration()
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        self.inner.terminal_preparation_available()
+    }
+
+    fn terminal_is_wrapped(&self) -> bool {
+        true
+    }
+
+    fn cors_terminal_config(&self) -> Option<crate::plugins::cors::CorsTerminalConfig> {
+        self.inner.cors_terminal_config()
+    }
+
+    fn prepare_terminal(
+        &self,
+        _view: &mut crate::plugins::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        crate::plugins::terminal_preparation::PreparedTerminalOp,
+        crate::plugins::terminal_preparation::TerminalAdmissionError,
+    > {
+        // Its response hook is deferred. The separate, admitted finalizer owns
+        // aggregate output; inner declaration/trigger dependencies still count.
+        Ok(crate::plugins::terminal_preparation::PreparedTerminalOp::Noop)
     }
 
     fn name(&self) -> &str {
@@ -518,6 +542,19 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
                 .to_string(),
         );
     }
+    let terminal_config = plugins[first_index..=last_index]
+        .iter()
+        .filter(|plugin| plugin.name() == CORS_NAME)
+        .try_fold(None, |aggregate, plugin| {
+            let current = plugin.cors_terminal_config()?;
+            Some(Some(match aggregate {
+                None => current,
+                Some(previous) => {
+                    crate::plugins::cors::CorsTerminalConfig::union(previous, current)?
+                }
+            }))
+        })
+        .flatten();
     for plugin in &mut plugins[first_index..=last_index] {
         if plugin.name() == CORS_NAME && !plugin.is_deferred_cors_wrapper() {
             *plugin = Arc::new(DeferredCorsPlugin {
@@ -528,7 +565,10 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
     let priority = plugins[last_index].priority();
     plugins.insert(
         last_index + 1,
-        Arc::new(crate::plugins::cors::CorsFinalizer::new(priority)),
+        Arc::new(crate::plugins::cors::CorsFinalizer::new(
+            priority,
+            terminal_config,
+        )),
     );
     Ok(())
 }
@@ -1120,6 +1160,10 @@ impl Plugin for PluginInstanceWrapper {
         } else {
             Ok(crate::plugins::terminal_preparation::PreparedTerminalOp::Noop)
         }
+    }
+
+    fn cors_terminal_config(&self) -> Option<crate::plugins::cors::CorsTerminalConfig> {
+        self.inner.cors_terminal_config()
     }
 
     fn early_route_total_participant(&self) -> bool {
@@ -4638,7 +4682,15 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         // cross-plugin admission can use a cheap capability stand-in; otherwise
         // an admin write can accept a row that runtime publication rejects and
         // wedge every subsequent reload behind it.
-        let created = if plugin_config.plugin_name == "oidc_relying_party" {
+        let created = if plugin_config.plugin_name == "cors" {
+            // Pure constructor: admission needs the actual configured output
+            // sizes and source-owned preparation, including priority wrappers.
+            finalize_created_plugin(
+                plugin_config,
+                crate::plugins::cors::CorsPlugin::new(&plugin_config.config)
+                    .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>)),
+            )
+        } else if plugin_config.plugin_name == "oidc_relying_party" {
             // The production constructor starts a discovery task and a JWKS
             // refresh worker. Candidate admission also runs on the synchronous
             // `ferrum-edge validate` CLI path, which has no Tokio reactor, so
