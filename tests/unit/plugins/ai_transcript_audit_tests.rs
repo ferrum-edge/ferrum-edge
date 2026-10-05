@@ -12888,18 +12888,23 @@ async fn h3_admission_releases_upload_before_committed_and_flow_control_waits() 
     use std::time::Duration;
 
     const WAIT: Duration = Duration::from_secs(2);
+    const HASH_SECRET: &str = "h3-admission-response-capture-proof";
     for (bridge, keep_clone) in [(false, false), (false, true), (true, false), (true, true)] {
         let server = mock_sink().await;
         let audit = Arc::new(
             AiTranscriptAudit::new(
                 &config_with_sink(
                     &format!("{}/ingest", server.uri()),
-                    json!({"capture": {"request": true, "response": false}}),
+                    json!({
+                        "capture": {"request": true, "response": true},
+                        "redaction": {"hash_secret": HASH_SECRET}
+                    }),
                 ),
                 loopback_http_client(),
             )
             .unwrap(),
         );
+        assert!(audit.requires_response_committed_hook());
         audit.start_background_tasks().unwrap();
         audit.commit_background_tasks();
         let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, UNIT));
@@ -12995,6 +13000,15 @@ async fn h3_admission_releases_upload_before_committed_and_flow_control_waits() 
         let records = wait_for_total_records(&server, 1).await;
         assert_eq!(records.len(), 1);
         assert!(records[0].get("request_body_omitted_reason").is_none());
+        // The log fallback has no response hash. This exact digest proves the
+        // real audit committed hook captured the response before the witness.
+        assert_eq!(records[0]["status_code"], 503);
+        assert_eq!(records[0]["response_hash_scope"], "full");
+        assert_eq!(records[0]["response_hash_bytes"], 2 * 1024 * 1024);
+        assert_eq!(
+            records[0]["response_hash"],
+            keyed_reference(HASH_SECRET).keyed_hash_hex(&vec![b'x'; 2 * 1024 * 1024])
+        );
         assert_eq!(budget.available_bytes(), if keep_clone { 0 } else { UNIT });
         drop(last_clone);
         assert_eq!(
