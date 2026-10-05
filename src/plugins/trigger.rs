@@ -225,13 +225,18 @@ impl PluginTriggerGate {
     }
 
     /// Read-only view of an already-memoized decision.
+    pub(crate) fn cached_request_decision(&self, ctx: &RequestContext) -> Option<bool> {
+        ctx.plugin_trigger_decision(self.token)
+    }
+
+    /// Read-only view of an already-memoized decision, defaulting to "runs".
     ///
     /// Used by the `&RequestContext` capability predicates (buffering,
     /// enforcement claims) that cannot memoize. It fails closed: an
     /// undecided instance reports "runs", so a trigger can only ever REMOVE
     /// work, never suppress a guard whose decision has not been made.
     pub fn request_decision_or_run(&self, ctx: &RequestContext) -> bool {
-        ctx.plugin_trigger_decision(self.token).unwrap_or(true)
+        self.cached_request_decision(ctx).unwrap_or(true)
     }
 
     /// Read the decision this instance took at `on_stream_connect`, carried on

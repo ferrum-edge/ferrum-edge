@@ -1705,6 +1705,11 @@ ownership preserves 504/request_timeout before dispatch and existing RPC/read/
 authorization precedence. All retained native-H3 drains use finite fallback and
 aggregate request-buffer admission before allocation; Bytes clones retain the
 charge without copying on bridge/retry handoff. Distinct retained body replacements
-need independent admission and retain their own allocation charge. Response-before-STOP_SENDING and bounded terminal write grace remain.
+need independent admission and retain their own allocation charge. Buffered
+untranslated gRPC-Web pass-through uses the gRPC receive ceiling, including when
+retry requires replay through the native-H3 backend pool; ordinary HTTP retains
+its separately configured ceiling. A JSON transformer with a proven non-JSON
+outbound type needs no replacement reservation. Response-before-STOP_SENDING and
+bounded terminal write grace remain.
 The unresolved-selection refusal is an unapproved supported-profile proposal;
 see [the draft policy and qualification requirements](early_upload_policy.md).

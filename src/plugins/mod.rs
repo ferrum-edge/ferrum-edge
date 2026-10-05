@@ -10472,7 +10472,13 @@ pub trait Plugin: Send + Sync {
     /// Trigger wrappers consult the memoized decision without evaluating a
     /// trigger early; missing or undecided state must retain the output window
     /// and invoke the ordinary context-aware hook.
-    fn may_transform_request_body(&self, _ctx: &RequestContext) -> bool {
+    /// `content_type` is the actual outbound value passed to that hook, not
+    /// the original inbound header retained in `ctx`.
+    fn may_transform_request_body(
+        &self,
+        _ctx: &RequestContext,
+        _content_type: Option<&str>,
+    ) -> bool {
         self.modifies_request_body()
     }
 

@@ -6478,7 +6478,7 @@ pub(crate) async fn apply_retained_request_body_plugins_in(
         .iter()
         .filter(|plugin| plugin.modifies_request_body())
     {
-        if !plugin.may_transform_request_body(ctx) {
+        if !plugin.may_transform_request_body(ctx, content_type) {
             continue;
         }
         let Some(permit) = response_buffer_budget::RequestBufferPermit::reserve_in(budget, ceiling)

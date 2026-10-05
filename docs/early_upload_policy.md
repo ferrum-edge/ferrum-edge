@@ -138,9 +138,15 @@ owners keep the replacement's independent charge. Windows are released on a
 no-op, rejection or cancellation. The finite window uses the effective request
 ceiling: `max_grpc_recv_size_bytes` for native gRPC and gRPC-Web, or
 `max_request_body_size_bytes` for HTTP, composed with the route ceiling and the
-existing retained fallback at zero. A producer with a memoized-false execution
-trigger is skipped before output admission; undecided or eligible producers
-retain admission and their normal context-aware trigger/security hooks. Memory
+existing retained fallback at zero. The actual buffered native-H3 pass-through
+drain uses that protocol ceiling even when untranslated gRPC-Web retains Plain
+backend transport and retries require replay. A producer with a memoized-false
+execution trigger is skipped before output admission. A JSON request transformer
+also skips output admission when the actual outbound content type passed to its
+hook proves a concrete non-JSON representation; stale inbound context headers
+cannot establish that proof. Absent, malformed or non-concrete types and
+undecided triggers retain admission, as do all possible producers and their
+normal context-aware trigger/security hooks. Memory
 pressure or an uncovered output yields the existing capacity terminal.
 Plugin-internal transform/decode working sets and text views keep their separate contracts;
 this change does not claim that the upload budget covers every plugin allocation.
@@ -165,11 +171,17 @@ budget; independently admitted copies/transform outputs prove simultaneous
 original/output ownership, refusal before producer invocation and cancellation
 release. Regression cases cover a small output with uncovered allocation
 capacity, refusal before final policy and finalized egress, complete
-normalization success/rejection/cancellation and memoized-false no-op behavior
-under pressure. A real gRPC-Web text decode and native gRPC replacements exercise
+normalization success/rejection/cancellation, memoized-false no-op behavior and
+actual outbound XML transformer no-ops under an exhausted budget. The XML bytes
+and retry allocation remain charged; an actual producer still refuses capacity
+before invocation. A real gRPC-Web text decode and native gRPC replacements exercise
 differing HTTP/gRPC ceilings and narrower route caps. These tests use the same
 isolated-budget implementation as production, without assuming Vec capacity
-equals length. Real ingress tests
+equals length. A real untranslated binary gRPC-Web upload without Content-Length
+or deadline reaches a proven native-H3 backend through the retry-buffered handler
+with differing HTTP/gRPC ceilings, replays intact after a 503, and preserves both
+protocol size refusals. These are regression requirements pending hosted CI.
+Real ingress tests
 exercise UsernameToken/X.509/SAML and timestamp-only SOAP stalls through H1
 chunked/Content-Length, H2 open DATA without Content-Length (POST/GET/HEAD/OPTIONS)
 and native H3 terminal HEADERS, with backend, circuit-breaker and health

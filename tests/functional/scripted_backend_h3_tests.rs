@@ -525,6 +525,157 @@ async fn h3_native_pool_route_attempt_budget_retries_and_replays_the_body() {
     );
 }
 
+/// The actual buffered native-H3 handler must collect untranslated gRPC-Web
+/// under the gRPC ceiling even when retries select Plain backend transport.
+/// No body plugin or deadline can prebuffer the upload and mask that branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_pool_buffered_grpc_web_passthrough_uses_the_protocol_upload_ceiling() {
+    const MIB: usize = 1024 * 1024;
+    const CONTENT_TYPE: &str = "application/grpc-web+proto";
+    let ca = TestCa::new("h3-grpc-web-retained-limit").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+    let backend_port = tcp.port;
+    let _h2 = spawn_h2_bridge_backend(tcp.into_listener(), &cert, &key, b"fallback");
+    let mut reply = grpc_frame(b"native-h3-passthrough");
+    let mut trailer = grpc_frame(b"grpc-status: 0\r\n");
+    trailer[0] = 0x80;
+    reply.extend_from_slice(&trailer);
+    let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::DrainRequestBody)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "503".into()),
+            ("content-type", CONTENT_TYPE.into()),
+        ]))
+        .step(H3Step::RespondTrailers(vec![]))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::DrainRequestBody)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", CONTENT_TYPE.into()),
+            ("x-native-h3", "passthrough-upload".into()),
+        ]))
+        .step(H3Step::RespondData(Bytes::from(reply.clone())))
+        .step(H3Step::RespondTrailers(vec![]))
+        .step(H3Step::StallFor(Duration::from_secs(30)))
+        .spawn()
+        .expect("h3 backend");
+    let mut config: Value =
+        serde_yaml::from_str(&file_mode_yaml_for_h3(backend_port)).expect("fixture config");
+    config["proxies"][0]["retry"] = json!({
+        "max_retries": 1,
+        "retry_on_connect_failure": true,
+        "retryable_status_codes": [503],
+        "retryable_methods": ["POST"]
+    });
+    let (harness, _, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+        to_file_mode_yaml(&config),
+        true,
+        None,
+        &[
+            ("FERRUM_HTTP3_CONNECTIONS_PER_BACKEND", "1"),
+            ("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "1048576"),
+            ("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", "4194304"),
+            ("FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES", "8388608"),
+            ("FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES", "16777216"),
+        ],
+    )
+    .await;
+    wait_for_h3_class(&harness, "supported", Duration::from_secs(15))
+        .await
+        .expect("capability probe")
+        .expect("native H3 must be selected");
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/upload");
+    let upload = grpc_frame(&vec![b'x'; 2 * MIB - 5]);
+    assert_eq!(upload.len(), 2 * MIB);
+    // The client sends DATA and FIN without Content-Length or grpc-timeout.
+    let response = client
+        .get_with_options(
+            &url,
+            GetOptions::default()
+                .method(http::Method::POST)
+                .header("content-type", CONTENT_TYPE)
+                .body(Bytes::from(upload.clone())),
+        )
+        .await
+        .expect("valid 2 MiB pass-through upload");
+    assert_eq!(response.status.as_u16(), 200);
+    assert_eq!(response.headers["x-native-h3"], "passthrough-upload");
+    assert_eq!(response.headers["content-type"], CONTENT_TYPE);
+    assert_eq!(response.body_bytes.as_ref(), reply.as_slice());
+    assert!(response.body_error.is_none(), "{:?}", response.body_error);
+    assert!(response.trailers.unwrap_or_default().is_empty());
+    let requests = backend.received_requests().await;
+    let uploads: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path == "/upload")
+        .collect();
+    assert_eq!(uploads.len(), 2, "one upload and its retry");
+    for request in uploads {
+        assert_eq!(request.method, "POST");
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(name, value)| name == "content-type" && value == CONTENT_TYPE)
+        );
+        assert!(
+            !request
+                .headers
+                .iter()
+                .any(|(name, _)| name == "grpc-timeout")
+        );
+        assert_eq!(
+            request.body,
+            upload,
+            "the retained binary upload must replay intact"
+        );
+    }
+    assert!(backend.step_errors().await.is_empty());
+
+    // Neither the larger gRPC ceiling nor the finite fallback may weaken the
+    // configured HTTP or gRPC limits. A refused upload reaches no backend.
+    for (content_type, size) in [
+        ("application/octet-stream", 2 * MIB),
+        (CONTENT_TYPE, 5 * MIB),
+    ] {
+        let mut stream = client
+            .open_request_stream_with_content_type(&url, content_type, &[])
+            .await
+            .expect("open oversized upload");
+        let oversized = Bytes::from(grpc_frame(&vec![b'x'; size - 5]));
+        if stream.send_raw_data(oversized).await.is_ok() {
+            let _ = stream.finish().await;
+        }
+        let (status, headers) = stream.recv_response().await.expect("body-size refusal");
+        let (body, trailers) = stream.recv_body_and_trailers().await.expect("refusal body");
+        assert!(trailers.is_empty());
+        if content_type == CONTENT_TYPE {
+            assert_eq!(status.as_u16(), 200);
+            assert_eq!(headers["content-type"], CONTENT_TYPE);
+            assert_eq!(body[0], 0x80, "gRPC-Web refusal is a trailer frame");
+            assert!(
+                String::from_utf8_lossy(&body[5..]).contains("grpc-status: 8\r\n"),
+                "gRPC receive ceiling must yield RESOURCE_EXHAUSTED"
+            );
+        } else {
+            assert_eq!(status.as_u16(), 413);
+        }
+    }
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/upload")
+            .count(),
+        2
+    );
+    assert!(backend.step_errors().await.is_empty());
+}
+
 /// Spawn a protocol-honest H2-only TLS responder for capability probes,
 /// reqwest warmup, and H3 cross-protocol bridge requests.
 fn spawn_h2_bridge_backend(

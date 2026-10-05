@@ -19,8 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their timed/untimed selection. Retry and no-op bridge handoffs reuse the
   charged Bytes allocation; distinct retained transform/normalization outputs
   require separate admission and retain their own charge through final drop.
-  H3 replacement admission preserves the native gRPC/gRPC-Web receive ceiling
-  and route caps; memoized-false producers require no replacement window.
+  H3 collection and replacement admission preserve the native gRPC/gRPC-Web
+  receive ceiling and route caps, including untranslated native-H3 pass-through
+  uploads retained for retries. Memoized-false producers and JSON transformers
+  with a proven non-JSON outbound type require no replacement window; unknown
+  types and undecided triggers retain conservative admission.
   ferrum-contracts parity is required for the next qualified release.
 
 ## [0.9.11] - 2026-10-04

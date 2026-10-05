@@ -14859,7 +14859,8 @@ pub mod _test_support {
                 return Err(result);
             }
             let path = ctx.path.clone();
-            let egress = run_finalized_request_egress_hooks(plugins, ctx, &path, headers, &body).await;
+            let egress =
+                run_finalized_request_egress_hooks(plugins, ctx, &path, headers, &body).await;
             match egress.result {
                 crate::plugins::PluginResult::Continue => Ok(body),
                 reject => Err(reject),

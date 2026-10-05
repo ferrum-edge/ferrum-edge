@@ -25490,6 +25490,11 @@ components:
                   reused through no-op body hooks and cross-protocol retries;
                   distinct retained replacements require independent finite admission
                   and keep their own allocation charge until the final owner drops.
+                  Proven non-JSON outbound types skip JSON transformer replacement
+                  admission; absent/invalid/non-concrete types and undecided triggers
+                  remain conservative. Buffered native-H3 gRPC-Web pass-through
+                  preserves the gRPC receive ceiling when retries retain Plain
+                  backend transport.
                   This draft does not declare
                   v0.9.11 patched or close GHSA-gxfv-924p-wvx4.
                   Expiry is charged to a backend's health

@@ -1045,6 +1045,189 @@ async fn memoized_false_producer_needs_no_window_but_eligible_and_undecided_do()
     }
 }
 
+#[tokio::test]
+async fn exhausted_retained_xml_skips_only_the_proven_outbound_noop_transformer() {
+    use ferrum_edge::_test_support::replay_retained_request_body_for_test;
+    use ferrum_edge::plugins::request_transformer::RequestTransformer;
+
+    let xml = b"<Envelope><Body>original</Body></Envelope>";
+    for content_type in [
+        "text/xml",
+        "application/xml",
+        "application/soap+xml; charset=utf-8",
+    ] {
+        let transformer = Arc::new(
+            RequestTransformer::new(&json!({"rules": [
+                {"operation": "update", "target": "header", "key": "content-type",
+                 "value": content_type},
+                {"operation": "add", "target": "body", "key": "added", "value": "yes"}
+            ]}))
+            .unwrap(),
+        );
+        let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, UNIT));
+        let chunks = futures_util::stream::iter([Ok(Bytes::copy_from_slice(xml))]);
+        let collected = budget.collect_retained_chunks(chunks, UNIT).await.unwrap();
+        let RetainedRequestOutcomeForTest::Collected(body) = collected else {
+            panic!("admitted XML body");
+        };
+        let original = body.clone();
+        let mut ctx = request();
+        // The inbound view is deliberately stale after the actual header hook.
+        ctx.headers
+            .insert("content-type".into(), "application/json".into());
+        ctx.request_body_bytes = Some(body.clone());
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            transformer.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(ctx.headers["content-type"], "application/json");
+        assert_eq!(headers["content-type"], content_type);
+        assert!(
+            transformer
+                .transform_request_body(&body, Some(content_type), &headers)
+                .await
+                .is_none()
+        );
+        assert_eq!(budget.available_bytes(), 0);
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let egress_calls = Arc::new(AtomicUsize::new(0));
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            transformer.clone(),
+            Arc::new(FinalizedEgressProbe {
+                final_calls: final_calls.clone(),
+                egress_calls: egress_calls.clone(),
+            }),
+        ];
+        let output = budget
+            .prepare_retained_body(&plugins, &mut ctx, &headers, body, UNIT)
+            .await
+            .unwrap_or_else(|_| panic!("proven XML no-op needs no output reservation"));
+        assert_eq!(output.as_ref(), xml);
+        assert_eq!(output.as_ptr(), original.as_ptr());
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(egress_calls.load(Ordering::SeqCst), 1);
+        let retry = replay_retained_request_body_for_test(&output);
+        assert_eq!(retry.as_ptr(), original.as_ptr());
+        let producer_calls = Arc::new(AtomicUsize::new(0));
+        let mut producer_plugins = plugins.clone();
+        producer_plugins.insert(
+            1,
+            Arc::new(RetainedProducer {
+                budget: budget.clone(),
+                calls: producer_calls.clone(),
+                stall: false,
+                output_capacity: None,
+            }),
+        );
+        let result = budget
+            .prepare_retained_body(
+                &producer_plugins,
+                &mut ctx,
+                &headers,
+                output.clone(),
+                UNIT,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(PluginResult::Reject {
+                status_code: 503,
+                ..
+            })
+        ));
+        assert_eq!(producer_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(egress_calls.load(Ordering::SeqCst), 1);
+        drop(output);
+        drop(ctx);
+        drop(original);
+        assert_eq!(budget.available_bytes(), 0);
+        drop(retry);
+        assert_eq!(budget.available_bytes(), UNIT);
+    }
+}
+
+#[tokio::test]
+async fn transformer_admission_preserves_unknown_types_and_undecided_triggers() {
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let mut config = cache_config(50, None);
+    let producer = &mut config.plugin_configs[0];
+    producer.plugin_name = "request_transformer".into();
+    producer.config = json!({"rules": [{
+        "operation": "add", "target": "body", "key": "added", "value": "yes"
+    }]});
+    producer.trigger = Some(
+        serde_json::from_value(json!({
+            "when": {"match": {"path": {"prefix": ["/upload"]}}}
+        }))
+        .unwrap(),
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("ferrum", "upload", ProxyProtocol::Http);
+    for decided in [false, true] {
+        for content_type in [
+            None,
+            Some("unknown"),
+            Some("application/*"),
+            Some("application/xml; charset=\"unterminated"),
+            Some("application/json"),
+            Some("application/problem+json"),
+            Some("application/soap+xml"),
+        ] {
+            let budget = RequestBufferBudgetProbe::new(UNIT, UNIT);
+            let chunks = futures_util::stream::iter([Ok(Bytes::from_static(b"{}"))]);
+            let collected = budget.collect_retained_chunks(chunks, UNIT).await.unwrap();
+            let RetainedRequestOutcomeForTest::Collected(body) = collected else {
+                panic!("admitted JSON body");
+            };
+            let original = body.clone();
+            let mut ctx = request();
+            // A stale inbound XML type cannot suppress an actual JSON producer.
+            ctx.headers
+                .insert("content-type".into(), "application/xml".into());
+            ctx.request_body_bytes = Some(body.clone());
+            if decided {
+                assert!(matches!(
+                    plugins[0].on_request_received(&mut ctx).await,
+                    PluginResult::Continue
+                ));
+            }
+            let mut headers = ctx.headers.clone();
+            headers.remove("content-type");
+            if let Some(content_type) = content_type {
+                headers.insert("content-type".into(), content_type.into());
+            }
+            let result = budget
+                .prepare_retained_body(&plugins, &mut ctx, &headers, body, UNIT)
+                .await;
+            if decided && content_type == Some("application/soap+xml") {
+                let output = result.unwrap_or_else(|_| panic!("memoized eligible XML no-op"));
+                assert_eq!(output.as_ptr(), original.as_ptr());
+                assert_eq!(output.as_ref(), b"{}");
+                drop(output);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(PluginResult::Reject {
+                        status_code: 503,
+                        ..
+                    })
+                ));
+            }
+            assert_eq!(budget.available_bytes(), 0);
+            assert_eq!(
+                ctx.request_body_bytes.as_ref().unwrap().as_ptr(),
+                original.as_ptr()
+            );
+            drop(ctx);
+            assert_eq!(budget.available_bytes(), 0);
+            drop(original);
+            assert_eq!(budget.available_bytes(), UNIT);
+        }
+    }
+}
+
 enum NormalizerOutcome {
     Rewrite,
     Reject,

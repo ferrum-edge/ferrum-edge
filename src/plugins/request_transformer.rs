@@ -600,6 +600,22 @@ impl Plugin for RequestTransformer {
         self.rules_enabled && !self.body_rules.is_empty()
     }
 
+    fn may_transform_request_body(
+        &self,
+        _ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        // A body retained for another hook or retry may need no replacement.
+        // Consult the SAME outbound value as the transform, since before_proxy
+        // may have rewritten the original Content-Type retained in ctx.headers.
+        // Missing, malformed or non-concrete types keep conservative admission.
+        self.modifies_request_body()
+            && content_type.is_none_or(|ct| {
+                !crate::util::media_type::is_concrete_http_media_type(ct)
+                    || body_transform::is_json_content_type(ct)
+            })
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         // `modifies_request_body` is only the config-time upper bound. Refine it
         // per request so an ordinary binary or form upload is not collected in

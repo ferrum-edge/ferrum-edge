@@ -999,9 +999,13 @@ Draft #6008/#6009 extends the retained-request admission contract to all native-
 early collectors: finite fallback at effective zero, aggregate reservation before
 allocation, and charge ownership through retained Bytes/retry clones. No-op bridge
 preparation and retry borrow the same allocation; distinct retained normalization/
-transform allocations require separate finite admission before production. Genuine
-streaming zero behavior is unchanged. The early route-total and unresolved-policy
-proposal remains [draft pending owner approval](early_upload_policy.md).
+transform allocations require separate finite admission before production.
+JSON transformer no-ops proven from the actual outbound content type need no
+replacement window; unknown types and undecided triggers remain conservative.
+Buffered native-H3 gRPC-Web pass-through uses the gRPC receive ceiling even when
+retry retains the Plain backend transport. Genuine streaming zero behavior is
+unchanged. The early route-total and unresolved-policy proposal remains
+[draft pending owner approval](early_upload_policy.md).
 
 ### DNS
 

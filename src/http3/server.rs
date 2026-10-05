@@ -8882,7 +8882,7 @@ async fn handle_h3_request(
     let mut body_data = prebuffered_body_data.take().unwrap_or_default();
     if !body_was_prebuffered {
         body_data = match collect_h3_request_body_under_authorization(
-            drain_h3_request_body(&mut stream, effective_max_request_body_size_bytes),
+            drain_h3_request_body(&mut stream, protocol_body_limit),
             h3_upload_authorization_bound(
                 &ctx,
                 state.env_config.authenticated_stream_max_lifetime_seconds,

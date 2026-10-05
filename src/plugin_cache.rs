@@ -1241,8 +1241,15 @@ impl Plugin for PluginInstanceWrapper {
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
     }
-    fn may_transform_request_body(&self, ctx: &RequestContext) -> bool {
-        self.runs_cached(ctx) && self.inner.may_transform_request_body(ctx)
+    fn may_transform_request_body(&self, ctx: &RequestContext, content_type: Option<&str>) -> bool {
+        if let Some(gate) = &self.trigger {
+            match gate.cached_request_decision(ctx) {
+                Some(false) => return false,
+                None => return self.inner.modifies_request_body(),
+                Some(true) => {}
+            }
+        }
+        self.inner.may_transform_request_body(ctx, content_type)
     }
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.inner.egresses_request_body_before_finalization()

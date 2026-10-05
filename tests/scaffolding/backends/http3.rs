@@ -88,6 +88,9 @@ pub enum H3Step {
     /// stream is still open. Fails the script if the client half-closes (or
     /// resets) before sending any DATA.
     ReadRequestData,
+    /// Drain the current request through DATA EOF and trailers, recording every
+    /// byte on this stream's own request. Bounded to 15 seconds.
+    DrainRequestBody,
     /// Consume any already-buffered DATA, then require H3_REQUEST_CANCELLED.
     /// Clean EOF is a failure even when the request has no Content-Length.
     ExpectRequestReset,
@@ -399,7 +402,7 @@ pub struct H3RecordedRequest {
     pub path: String,
     pub authority: Option<String>,
     pub headers: Vec<(String, String)>,
-    /// Request DATA the script explicitly read via [`H3Step::ReadRequestData`]
+    /// Request DATA read via [`H3Step::ReadRequestData`] or [`H3Step::DrainRequestBody`]
     /// **on this request's own stream**. Empty unless the script asked for it —
     /// the scripted backend otherwise never consumes the request body.
     pub body: Vec<u8>,
@@ -650,6 +653,31 @@ async fn run_h3_script(
                     chunk.advance(take.len());
                 }
                 record_request_body(&state, request_index, &bytes).await?;
+            }
+            H3Step::DrainRequestBody => {
+                let stream = response_stream
+                    .as_mut()
+                    .ok_or_else(|| "DrainRequestBody without an accepted stream".to_string())?;
+                let request_index = current_request_index
+                    .ok_or_else(|| "DrainRequestBody without a recorded request".to_string())?;
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while let Some(mut chunk) = stream
+                        .recv_data()
+                        .await
+                        .map_err(|e| format!("drain request DATA: {e}"))?
+                    {
+                        let len = chunk.remaining();
+                        let chunk = chunk.copy_to_bytes(len);
+                        record_request_body(&state, request_index, &chunk).await?;
+                    }
+                    let _ = stream
+                        .recv_trailers()
+                        .await
+                        .map_err(|e| format!("drain request trailers: {e}"))?;
+                    Ok::<(), String>(())
+                })
+                .await
+                .map_err(|_| "request body did not finish within 15 seconds".to_string())??;
             }
             H3Step::ExpectRequestReset => {
                 let stream = response_stream
