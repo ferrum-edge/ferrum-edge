@@ -769,7 +769,8 @@ fn stage_h3_terminal_request_views(
 
     let raw = RetainedH3RawView(Arc::clone(dropped));
     ctx.request_body_bytes = Some(bytes::Bytes::from_owner(raw));
-    ctx.metadata.insert("request_body".into(), "raw upload".into());
+    ctx.metadata
+        .insert("request_body".into(), "raw upload".into());
     let retained = budget
         .try_reserve(RESPONSE_BUFFER_RESERVATION_UNIT_BYTES)
         .unwrap()
@@ -787,7 +788,9 @@ async fn h3_reject_refuses_carrier_or_mixed_lineage_before_any_committed_observe
         gateway_deadline_response_selected_for_test,
         stage_buffered_replacement_header_provenance_for_test,
     };
-    use ferrum_edge::plugins::terminal_preparation::{CARRIER_OWNED_BYTES, validate_terminal_headers};
+    use ferrum_edge::plugins::terminal_preparation::{
+        CARRIER_OWNED_BYTES, validate_terminal_headers,
+    };
 
     for (mixed_lineage, normalized_overflow) in [(false, false), (true, false), (false, true)] {
         let capture = Arc::new(CommittedCapturePlugin::default());
@@ -839,7 +842,10 @@ async fn h3_reject_refuses_carrier_or_mixed_lineage_before_any_committed_observe
         assert!(ctx.request_body_bytes.is_none());
         assert!(!ctx.metadata.contains_key("request_body"));
         assert!(!ctx.final_request_body_was_decoded());
-        assert!(!ctx.metadata.contains_key("ferrum:finalized_synthetic_response"));
+        assert!(
+            !ctx.metadata
+                .contains_key("ferrum:finalized_synthetic_response")
+        );
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert_eq!(budget.available_bytes(), UNIT);
         assert_eq!(capture.committed_calls.load(Ordering::SeqCst), 0);
@@ -903,7 +909,10 @@ async fn direct_h3_typed_gateway_terminal_preserves_correlated_native_grpc_wire(
     assert!(ctx.request_body_bytes.is_none());
     assert!(!ctx.metadata.contains_key("request_body"));
     assert!(!ctx.final_request_body_was_decoded());
-    assert!(!ctx.metadata.contains_key("ferrum:finalized_synthetic_response"));
+    assert!(
+        !ctx.metadata
+            .contains_key("ferrum:finalized_synthetic_response")
+    );
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     assert_eq!(budget.available_bytes(), UNIT);
 }

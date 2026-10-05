@@ -18332,7 +18332,8 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
 
     // Wire normalization can add fields to a carrier already at its limit.
     // Refuse that observer view too, without changing the caller's response.
-    if crate::plugins::terminal_preparation::validate_terminal_headers(&committed_headers).is_err() {
+    if crate::plugins::terminal_preparation::validate_terminal_headers(&committed_headers).is_err()
+    {
         ctx.metadata
             .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
         return false;

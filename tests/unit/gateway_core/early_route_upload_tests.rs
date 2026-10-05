@@ -788,10 +788,7 @@ async fn admitted_typed_rejection_chain_retires_views_and_skips_work_after_later
         );
         ctx.authenticated_identity = Some("test-admitted-principal".into());
         let now = tokio::time::Instant::now();
-        set_request_credential_deadline_for_test(
-            &mut ctx,
-            Some(now + Duration::from_millis(10)),
-        );
+        set_request_credential_deadline_for_test(&mut ctx, Some(now + Duration::from_millis(10)));
         let bound = capture_route_upload_bound_for_test(&ctx, Some(5), 0, None);
         let budget = RequestBufferBudgetProbe::new(UNIT, UNIT);
         ctx.request_body_bytes = Some(
@@ -800,7 +797,8 @@ async fn admitted_typed_rejection_chain_retires_views_and_skips_work_after_later
                 .unwrap()
                 .into_charged_bytes(b"raw upload".to_vec()),
         );
-        ctx.metadata.insert("request_body".into(), "raw upload".into());
+        ctx.metadata
+            .insert("request_body".into(), "raw upload".into());
         stage_final_request_body_plaintext(&mut ctx, b"decoded upload".to_vec());
         assert_eq!(budget.available_bytes(), 0);
         tokio::time::advance(Duration::from_millis(if late_wake { 100 } else { 5 })).await;
@@ -832,7 +830,10 @@ async fn admitted_typed_rejection_chain_retires_views_and_skips_work_after_later
         assert!(!ctx.metadata.contains_key("request_body"));
         assert!(!ctx.final_request_body_was_decoded());
         assert!(!ctx.metadata.contains_key("ferrum:rejection_response"));
-        assert!(!ctx.metadata.contains_key("ferrum:replaceable_rejection_response"));
+        assert!(
+            !ctx.metadata
+                .contains_key("ferrum:replaceable_rejection_response")
+        );
         assert_eq!(budget.available_bytes(), UNIT);
         let expected = if late_wake { 0 } else { 2 };
         assert_eq!(prepared.load(Ordering::SeqCst), expected);

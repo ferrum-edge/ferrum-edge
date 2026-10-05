@@ -3305,21 +3305,23 @@ fn short_circuit_request_capture_and_retirement_have_frontend_parity() {
     // gRPC-Web defer commitment after the shared synthetic pipeline. Both
     // delegates must retire even with no observer and before any owned clone.
     let bridge = compact_code(include_str!("../../../src/http3/cross_protocol.rs"));
-    for (source, marker, next) in [
+    for (source, marker, retire, next) in [
         (
             &h3,
             "asyncfnrun_h3_deadline_bounded_reject_committed_hooks_with_policy(",
+            "ctx.retire_terminal_request_views();",
             "if!plugins",
         ),
         (
             &bridge,
             "pub(crate)asyncfnrun_cross_protocol_reject_committed_hooks(",
+            cleanup,
             "for(index,plugin)",
         ),
     ] {
         let body = function_body(source, marker);
-        assert!(body.starts_with(cleanup));
-        assert!(body.find(cleanup).unwrap() < body.find(next).unwrap());
+        assert!(body.starts_with(retire));
+        assert!(body.find(retire).unwrap() < body.find(next).unwrap());
     }
 
     // Native gRPC's final-body path owns collected and transformed Bytes
