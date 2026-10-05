@@ -433,7 +433,7 @@ a749ac71046e68f2e184399e160d04d71aa99c089b2e3a4f8353c406552bd6f5  vendor/sqlx-co
 9be39331309bc958aab10457c1a8459c038ae95662f26dfcf6c9088e2b3d653f  vendor/sqlx-core-0.8.6-ferrum-patched/LICENSE-APACHE
 44b1600a26039a75b28e1ce154a5dd163b16549f50e34fa577d9efe9c1bae179  vendor/sqlx-core-0.8.6-ferrum-patched/LICENSE-MIT
 541492016d684f29d9a9f4e8f70d4bda7fc457e1e136097563ed443248a6dcb5  vendor/sqlx-core-0.8.6-ferrum-patched/src/acquire.rs
-16161c745a86fe8df5af253b0f91c2e2546704aeabb7a4104d49e87281a29c21  vendor/sqlx-core-0.8.6-ferrum-patched/src/any/arguments.rs
+b2fdc278a6883a7fc47ee9686f09bcfa19cf8708a2e67a98e6d6d67c0f1daba8  vendor/sqlx-core-0.8.6-ferrum-patched/src/any/arguments.rs
 7a4effdf7730d293ddc14e2f11ec55f2f9be153b70113b8f6282e7c243f6cf24  vendor/sqlx-core-0.8.6-ferrum-patched/src/any/column.rs
 61313123763c3c5afd3aba3984baaf135a2f756bd6ce69d5913bf385f2c804b0  vendor/sqlx-core-0.8.6-ferrum-patched/src/any/connection/backend.rs
 6fa7b76c86f58066ecff7a8f9b71ad753547081b5a37ebe8da502c7aa6985a18  vendor/sqlx-core-0.8.6-ferrum-patched/src/any/connection/executor.rs

@@ -97,6 +97,36 @@
       ]
     },
     {
+      "id": "sqlx-core-002-typed-float-null-bindings",
+      "label": "SQLx Any native floating-point NULL parameter types",
+      "crate": "sqlx-core",
+      "vendored_version": "0.8.6",
+      "vendor_path": "vendor/sqlx-core-0.8.6-ferrum-patched",
+      "docs_path": "docs/upstream-sqlx-patches/002-typed-float-null-bindings/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "SQLx Any reverses REAL and DOUBLE native parameter types when converting typed NULL arguments in 0.8.6; the correction preserves the supplied floating-point type.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "launchbadge/sqlx",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "A compatible SQLx release preserves native REAL/DOUBLE typed-NULL parameter types and passes the hosted PostgreSQL regression. Retain the vendor while patch 001 remains.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/admin_conditional_write_tests.rs::postgres_conditional_restore_checks_state_and_lease_in_transaction (assert_postgres_any_float_null_parameter_types; Integration Tests conditional-live-stores)"
+      ]
+    },
+    {
       "id": "reqwest-001-per-request-connect-timeout",
       "label": "reqwest per-request connect_timeout",
       "crate": "reqwest",

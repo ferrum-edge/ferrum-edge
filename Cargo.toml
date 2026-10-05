@@ -672,13 +672,15 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # process default was installed. A gateway-side TLS option cannot reach SQLx
 # Any's internal verifier, and a SQLx 0.9 migration would change the whole
 # database dependency graph for a compatibility fix.
+# The same vendor also corrects Any typed-NULL conversion: REAL binds through
+# Option<f32>, and DOUBLE through Option<f64> (patch 002).
 #
 # Retirement plan: when a compatible SQLx release treats a configured root CA
 # as exclusive and handles both rustls hostname-error variants while keeping
-# chain, validity, and signature verification, remove the `[patch.crates-io]`
-# line, drop `vendor/sqlx-core-0.8.6-ferrum-patched/`, and update both
-# lockfiles and the drift manifest. See
-# `docs/upstream-sqlx-patches/001-verify-ca-name-context/README.md`.
+# chain, validity, and signature verification, and preserves native REAL/DOUBLE
+# typed-NULL parameter types, remove the `[patch.crates-io]` line, drop
+# `vendor/sqlx-core-0.8.6-ferrum-patched/`, and update both lockfiles and the drift
+# manifest. See `docs/upstream-sqlx-patches/` for both retirement plans.
 #
 # We also carry a vendored copy of hyper-util 0.1.21 whose legacy client stops
 # holding an HTTP/1 connection's only request sender once that connection's

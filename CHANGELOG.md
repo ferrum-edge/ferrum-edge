@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Correct SQLx Any floating-point NULL parameter types** (#6010).
+  REAL NULL now binds through `Option<f32>` and DOUBLE NULL through
+  `Option<f64>`. The hosted PostgreSQL regression checks native parameter
+  types and explicit NULL results without casting the parameters.
+
 - **Dependency-fenced partial deployment mutations** (#6010). Admin-only
   `GET /deployment-snapshot` binds complete spec/plugin/association and raw
   namespace evidence. Opt-in proxy cascade removal and API-spec replacement

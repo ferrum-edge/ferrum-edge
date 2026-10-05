@@ -69,6 +69,10 @@ fn admin_token() -> String {
 }
 
 async fn make_store(dir: &TempDir) -> Arc<DatabaseStore> {
+    make_store_with_url(dir).await.0
+}
+
+async fn make_store_with_url(dir: &TempDir) -> (Arc<DatabaseStore>, String) {
     let db_path = dir
         .path()
         .join(format!("conditional-{}.db", uuid::Uuid::new_v4()));
@@ -88,7 +92,7 @@ async fn make_store(dir: &TempDir) -> Arc<DatabaseStore> {
     )
     .await
     .expect("connect sqlite store");
-    Arc::new(store)
+    (Arc::new(store), url)
 }
 
 fn admin_state(db: Arc<dyn DatabaseBackend>, secret: &str) -> AdminState {
@@ -1422,9 +1426,9 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
 #[tokio::test]
 async fn sqlite_conditional_restore_checks_state_and_lease_inside_the_transaction() {
     let dir = TempDir::new().unwrap();
-    let db = make_store(&dir).await;
+    let (db, url) = make_store_with_url(&dir).await;
     assert_transaction_precondition(db.as_ref()).await;
-    assert_sql_deployment_raw_preservation(db.clone(), "sqlite").await;
+    assert_sql_deployment_raw_preservation(db.clone(), "sqlite", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;
@@ -2447,7 +2451,7 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
         .unwrap();
     assert_transaction_precondition(&db).await;
     let db = Arc::new(db);
-    assert_sql_deployment_raw_preservation(db.clone(), "postgres").await;
+    assert_sql_deployment_raw_preservation(db.clone(), "postgres", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;
@@ -2475,7 +2479,7 @@ async fn mysql_conditional_restore_checks_state_and_lease_in_transaction() {
         .unwrap();
     assert_transaction_precondition(&db).await;
     let db = Arc::new(db);
-    assert_sql_deployment_raw_preservation(db.clone(), "mysql").await;
+    assert_sql_deployment_raw_preservation(db.clone(), "mysql", &url).await;
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;
@@ -4049,10 +4053,85 @@ async fn assert_mongo_deployment_raw_preservation(
     );
 }
 
-/// Fixture-only schema drift proves unknown SQL columns participate in authority
-/// and survive selected replacement. No production schema change is required.
-async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect: &str) {
+/// Probe admission reads without exposing the graph or driver error text.
+async fn assert_postgres_fixture_policy_graph_read(db: &DatabaseStore, namespace: &str) {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.load_namespace_policy_graph(namespace),
+    )
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            let sqlx_error = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<sqlx::Error>());
+            let category = match sqlx_error {
+                Some(sqlx::Error::Database(_)) => "database",
+                Some(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_)) => "decode",
+                Some(sqlx::Error::AnyDriverError(_)) => "any_driver_mapping",
+                Some(sqlx::Error::Io(_)) => "io",
+                Some(sqlx::Error::Tls(_)) => "tls",
+                Some(sqlx::Error::Protocol(_)) => "protocol",
+                Some(sqlx::Error::PoolTimedOut) => "pool_timeout",
+                Some(sqlx::Error::PoolClosed) => "pool_closed",
+                Some(sqlx::Error::WorkerCrashed) => "worker_crashed",
+                Some(_) => "sqlx_other",
+                None => "non_sqlx",
+            };
+            let sqlstate = sqlx_error
+                .and_then(sqlx::Error::as_database_error)
+                .and_then(|error| error.code())
+                .filter(|code| {
+                    code.len() == 5
+                        && code
+                            .bytes()
+                            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                });
+            panic!(
+                "operation=load_namespace_policy_graph category={category} sqlstate={}",
+                sqlstate.as_deref().unwrap_or("unavailable")
+            );
+        }
+        Err(_) => {
+            panic!("operation=load_namespace_policy_graph category=timeout sqlstate=unavailable")
+        }
+    }
+}
+
+/// PostgreSQL must see the native parameter types supplied through SQLx Any.
+/// Casting only pg_typeof's result cannot hide reversed typed-NULL bindings.
+async fn assert_postgres_any_float_null_parameter_types(pool: &sqlx::AnyPool) {
     use sqlx::Row;
+
+    let row = sqlx::query(
+        "SELECT pg_typeof($1)::text AS real_type, $1 IS NULL AS real_is_null, \
+         pg_typeof($2)::text AS double_type, $2 IS NULL AS double_is_null",
+    )
+    .bind(Option::<f32>::None)
+    .bind(Option::<f64>::None)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let real_type: String = row.try_get("real_type").unwrap();
+    let real_is_null: bool = row.try_get("real_is_null").unwrap();
+    let double_type: String = row.try_get("double_type").unwrap();
+    let double_is_null: bool = row.try_get("double_is_null").unwrap();
+    assert_eq!(real_type, "real");
+    assert!(real_is_null);
+    assert_eq!(double_type, "double precision");
+    assert!(double_is_null);
+}
+
+/// Fixture-only extended schemas prove unknown SQL columns participate in
+/// authority and survive selected replacement. This does not qualify online DDL.
+async fn assert_sql_deployment_raw_preservation(
+    db: Arc<DatabaseStore>,
+    dialect: &str,
+    db_url: &str,
+) {
+    use sqlx::any::AnyTypeInfoKind;
+    use sqlx::{Row, ValueRef};
 
     let namespace = format!("deployment-sql-{}", uuid::Uuid::new_v4());
     let pool = db.pool();
@@ -4108,6 +4187,18 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
             .await
             .unwrap();
         }
+    }
+    // Precondition reads have warmed SELECT * before the fixture's ALTERs.
+    // Refresh cached statement metadata once, on the SAME durable database,
+    // after every table is extended and before any raw authority is captured.
+    drop(pool);
+    db.reconnect(db_url)
+        .await
+        .unwrap_or_else(|_| panic!("SQL raw fixture reconnect failed"));
+    let pool = db.pool();
+    if dialect == "postgres" {
+        assert_postgres_fixture_policy_graph_read(db.as_ref(), &namespace).await;
+        assert_postgres_any_float_null_parameter_types(&pool).await;
     }
     let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
     let mut document = json!({
@@ -4292,18 +4383,67 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
     )
     .await;
     assert_eq!(replaced.status, 200, "{}", replaced.body);
-    for (table, expected) in [
-        ("proxies", " opaque-original "),
-        ("plugin_configs", " opaque-original "),
-        ("proxy_plugins", "operator"),
+    for (table, identity_columns, expected, expected_count, expected_ids) in [
+        (
+            "proxies",
+            "id AS fixture_id",
+            " opaque-original ",
+            1,
+            &["sql"][..],
+        ),
+        (
+            "plugin_configs",
+            "id AS fixture_id",
+            " opaque-original ",
+            2,
+            &["hand-added", "sql-generated"][..],
+        ),
+        (
+            "proxy_plugins",
+            "proxy_id, plugin_config_id AS fixture_id",
+            "operator",
+            2,
+            &["hand-added", "sql-generated"][..],
+        ),
     ] {
-        let row = sqlx::query(&format!(
-            "SELECT deployment_future_metadata FROM {table} WHERE namespace = {placeholder}"
+        let rows = sqlx::query(&format!(
+            "SELECT {identity_columns}, deployment_future_metadata FROM {table} \
+             WHERE namespace = {placeholder}"
         ))
         .bind(&namespace)
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(row.get::<String, _>("deployment_future_metadata"), expected);
+        let row_count = rows.len();
+        assert_eq!(row_count, expected_count, "{table} row count");
+        let expected_bytes = expected.as_bytes();
+        let mut identities = Vec::new();
+        for row in rows {
+            let fixture_id: String = row.try_get("fixture_id").unwrap();
+            identities.push(fixture_id);
+            if table == "proxy_plugins" {
+                let proxy_id: String = row.try_get("proxy_id").unwrap();
+                assert_eq!(proxy_id, "sql");
+            }
+            let value = row.try_get_raw("deployment_future_metadata").unwrap();
+            assert!(
+                !value.is_null(),
+                "{table} metadata unexpectedly NULL"
+            );
+            let bytes = match value.type_info().kind() {
+                AnyTypeInfoKind::Text => row
+                    .try_get::<String, _>("deployment_future_metadata")
+                    .unwrap()
+                    .into_bytes(),
+                AnyTypeInfoKind::Blob => row
+                    .try_get::<Vec<u8>, _>("deployment_future_metadata")
+                    .unwrap(),
+                kind => panic!("{table} metadata has unexpected Any kind {kind:?}"),
+            };
+            assert_eq!(bytes, expected_bytes, "{table} metadata bytes");
+        }
+        identities.sort();
+        let expected_ids: Vec<String> = expected_ids.iter().map(|id| (*id).to_string()).collect();
+        assert_eq!(identities, expected_ids, "{table} row identities");
     }
 }
