@@ -12642,7 +12642,8 @@ impl Plugin for PeerRequestTextRewrite {
         ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        ctx.metadata.insert("request_body".into(), self.body.clone());
+        ctx.metadata
+            .insert("request_body".into(), self.body.clone());
         PluginResult::Continue
     }
 }
@@ -12674,17 +12675,17 @@ impl Plugin for ShortCircuitCommitWitness {
         use ferrum_edge::_test_support::RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT;
 
         assert_eq!(status, 200);
-        assert_eq!(
-            headers.get("grpc-status").map(String::as_str),
-            Some("14")
-        );
+        assert_eq!(headers.get("grpc-status").map(String::as_str), Some("14"));
         assert_eq!(self.audit.capture_counters(), (1, 0));
         assert!(ctx.request_body_bytes.is_none());
         assert!(!ctx.metadata.contains_key("request_body"));
         assert_eq!(self.budget.available_bytes(), UNIT);
         // Admission for the next upload must succeed while this observer is
         // still stalled. Merely clearing metadata after the await is too late.
-        let next_upload = self.budget.try_reserve(UNIT).expect("next upload admission");
+        let next_upload = self
+            .budget
+            .try_reserve(UNIT)
+            .expect("next upload admission");
         drop(next_upload);
         self.entered.notify_one();
         self.release.notified().await;
@@ -12825,13 +12826,8 @@ async fn grpc_short_circuit_capture_releases_upload_ownership_before_committed_w
                         )
                         .await;
                         assert_eq!(audit.capture_counters(), (1, 0));
-                        h3_run_reject_committed_hooks_for_test(
-                            &plugins,
-                            &mut ctx,
-                            &headers,
-                            false,
-                        )
-                        .await;
+                        h3_run_reject_committed_hooks_for_test(&plugins, &mut ctx, &headers, false)
+                            .await;
                         return ctx;
                     }
                     finalize_native_grpc_rejection_for_test(
@@ -12880,8 +12876,8 @@ async fn grpc_short_circuit_capture_releases_upload_ownership_before_committed_w
                 };
                 assert_eq!(excerpt["messages"][0]["fields"]["name"], expected_name);
                 let expected_payload = hello_request_bytes_with_age(expected_name, expected_age);
-                let expected_hash = keyed_reference(HASH_SECRET)
-                    .keyed_hash_hex(&grpc_frame(&expected_payload));
+                let expected_hash =
+                    keyed_reference(HASH_SECRET).keyed_hash_hex(&grpc_frame(&expected_payload));
                 assert_eq!(records[0]["request_hash"], expected_hash);
                 assert_eq!(observed_budget.available_bytes(), UNIT);
                 if peer_redacted {

@@ -14857,10 +14857,7 @@ pub mod _test_support {
         /// The H1/H2 terminal handoff after its transport Vec has been retired.
         /// Transfers the existing claim without allocating/copying a raw body.
         pub fn retain_rejection_metadata(self, ctx: &mut crate::plugins::RequestContext) {
-            crate::proxy::retain_request_metadata_charge_on_rejection(
-                ctx,
-                Some(self.0),
-            );
+            crate::proxy::retain_request_metadata_charge_on_rejection(ctx, Some(self.0));
         }
     }
 

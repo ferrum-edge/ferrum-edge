@@ -3025,7 +3025,10 @@ fn short_circuit_request_capture_and_retirement_have_frontend_parity() {
         let (clone_branch, clone_end) =
             source_group(source, clone_at + "ifneeds_header_clone".len()).unwrap();
         let no_clone = &source[clone_end..];
-        assert!(no_clone.starts_with("elseif!plugins.is_empty(){"), "{label}");
+        assert!(
+            no_clone.starts_with("elseif!plugins.is_empty(){"),
+            "{label}"
+        );
         let (no_clone_branch, _) =
             source_group(no_clone, "elseif!plugins.is_empty()".len()).unwrap();
         for branch in [clone_branch, no_clone_branch] {

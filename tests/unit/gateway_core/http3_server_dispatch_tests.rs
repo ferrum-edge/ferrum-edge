@@ -2326,8 +2326,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
              plugin_execution_ns,authorization_expiry,false).await?;returnOk(());"
         );
         assert_eq!(
-            *branch,
-            expected,
+            *branch, expected,
             "complete cleanup/return sequence for {phase}"
         );
     }

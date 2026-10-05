@@ -1217,9 +1217,8 @@ async fn grpc_audit_captures_a_non_utf8_request_short_circuited_in_before_proxy(
 #[tokio::test]
 #[ignore]
 async fn grpc_audit_captures_a_non_utf8_short_circuit_with_cloned_headers() {
-    let extra_plugins = format!(
-        "{ABORT_PROXY_PLUGIN}\n      - plugin_config_id: \"late-header-transform\""
-    );
+    let extra_plugins =
+        format!("{ABORT_PROXY_PLUGIN}\n      - plugin_config_id: \"late-header-transform\"");
     let extra_configs = format!(
         r#"{ABORT_PLUGIN_CONFIG}
   - id: "late-header-transform"
@@ -1239,20 +1238,11 @@ async fn grpc_audit_captures_a_non_utf8_short_circuit_with_cloned_headers() {
     let payload = encode_hello_request("binary-safe-subject", -1);
     let body = grpc_frame(&payload);
     assert!(std::str::from_utf8(&body).is_err());
-    let call = send_grpc_request(
-        &harness.addr,
-        ENROLLED_METHOD,
-        &body,
-        &[],
-    )
-    .await
-    .expect("gRPC call");
+    let call = send_grpc_request(&harness.addr, ENROLLED_METHOD, &body, &[])
+        .await
+        .expect("gRPC call");
     assert_eq!(call.status, 200);
-    assert_eq!(
-        call.grpc_status(),
-        "14",
-        "the configured abort must win"
-    );
+    assert_eq!(call.grpc_status(), "14", "the configured abort must win");
     let records = harness.records.wait_for(1).await;
     assert_eq!(records.len(), 1, "one complete audit record: {records:?}");
     let request_body = request_excerpt(&records[0]);

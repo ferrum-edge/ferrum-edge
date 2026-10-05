@@ -3860,10 +3860,7 @@ fn retire_client_request_body_for_rejection(
     );
     if let ClientRequestBody::Buffered(mut buffered) = retired {
         buffered.body = Vec::new();
-        retain_request_metadata_charge_on_rejection(
-            ctx,
-            buffered.budget.take(),
-        );
+        retain_request_metadata_charge_on_rejection(ctx, buffered.budget.take());
     }
 }
 

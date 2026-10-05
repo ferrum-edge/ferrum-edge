@@ -2235,8 +2235,7 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
             format!("{prefix}letresponse={call};returnOk(response);")
         };
         assert_eq!(
-            *branch,
-            expected,
+            *branch, expected,
             "complete cleanup/return sequence for {phase}"
         );
     }
@@ -4476,8 +4475,7 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
         .find("lettransformed=crate::proxy::apply_retained_request_body_plugins_with_context(")
         .unwrap();
     assert!(transform_at < h3_final_hook);
-    let (final_result, _) =
-        source_group(terminal, h3_final_hook + final_marker.len() - 1).unwrap();
+    let (final_result, _) = source_group(terminal, h3_final_hook + final_marker.len() - 1).unwrap();
     assert_eq!(
         final_result,
         "Some(reject)=>reject,None=>{crate::proxy::run_final_request_body_hooks(\
@@ -4485,9 +4483,13 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
     );
     let continue_marker = "PluginResult::Continue=>{";
     let result_marker = "matchfinal_body_result{";
-    let result_at = terminal.find(result_marker).expect("H3 final policy outcome");
+    let result_at = terminal
+        .find(result_marker)
+        .expect("H3 final policy outcome");
     let (outcome, _) = source_group(terminal, result_at + result_marker.len() - 1).unwrap();
-    let start = outcome.find(continue_marker).expect("H3 accepted final body");
+    let start = outcome
+        .find(continue_marker)
+        .expect("H3 accepted final body");
     let (accepted, _) = source_group(outcome, start + continue_marker.len() - 1).unwrap();
     assert_eq!(
         accepted,
@@ -4516,11 +4518,7 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
     // plugin rejection whose request metadata is still needed by audit hooks.
     let fallback_marker = "letSome(mutreject)=plugin_result_into_reject_parts(reject)else{";
     let fallback_at = rejected.find(fallback_marker).unwrap();
-    let (fallback, _) = source_group(
-        rejected,
-        fallback_at + fallback_marker.len() - 1,
-    )
-    .unwrap();
+    let (fallback, _) = source_group(rejected, fallback_at + fallback_marker.len() - 1).unwrap();
     assert!(direct_source_statement(
         fallback,
         "ctx.discard_retained_request_metadata();"
