@@ -77,6 +77,41 @@ use super::utils::validation_diagnostics::{
 use super::utils::xml_bounds::{XML_MAX_NESTING_DEPTH, xml_nesting_depth_within_limit};
 use super::{Plugin, PluginResult, RequestContext};
 
+/// The complete terminal hook has no parser or descriptor ownership. Its
+/// configured response-policy vote and method are bounded preparation facts;
+/// status and representation remain ordered cursor inputs.
+pub(crate) const fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    use super::terminal_preparation::{TerminalBounds, TerminalDeclaration, TerminalFacts};
+    TerminalDeclaration::Prepared {
+        bounds: TerminalBounds {
+            control: 1024,
+            output: 4096,
+            workspace: 0,
+        },
+        prep_reads: TerminalFacts::METHOD,
+        prep_writes: TerminalFacts::NONE,
+        trigger_reads: TerminalFacts::NONE,
+        cursor_writes: TerminalFacts::RESPONSE_STATUS.union(TerminalFacts::RESPONSE_HEADERS),
+    }
+}
+
+pub(crate) const TERMINAL_EVENT_STREAM_BODY: &str = concat!(
+    "{\"details\":\"event-stream responses require a bounded streaming validator\",",
+    "\"error\":\"Response body validation failed\"}"
+);
+
+pub(crate) fn terminal_refuses_event_stream(
+    has_response_validation: bool,
+    method_omits_body: bool,
+    response_status: u16,
+    event_stream: bool,
+) -> bool {
+    has_response_validation
+        && !method_omits_body
+        && !super::utils::synthetic_response::status_forbids_response_body(response_status)
+        && event_stream
+}
+
 /// Per-method message type descriptors for protobuf validation.
 struct ProtobufMethodEntry {
     request: Option<MessageDescriptor>,
@@ -2909,6 +2944,24 @@ fn protobuf_reject(status_code: u16, direction: &str, msg: &str) -> PluginResult
 
 #[async_trait]
 impl Plugin for BodyValidator {
+    fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
+        terminal_composition_declaration()
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut super::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        super::terminal_preparation::PreparedTerminalOp,
+        super::terminal_preparation::TerminalAdmissionError,
+    > {
+        view.body_validator_decision(self.has_response_validation)
+    }
+
     fn name(&self) -> &str {
         "body_validator"
     }

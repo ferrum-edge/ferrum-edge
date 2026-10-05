@@ -24757,10 +24757,16 @@ async fn run_after_proxy_hooks_on_rejection(
         {
             break;
         }
+        chain.refresh_response_origin(ctx);
         let result = match operation.execute() {
             TerminalResult::Noop => Ok(()),
             TerminalResult::Fields(patch) => chain.apply_fields(patch, response_headers),
             TerminalResult::Cookie(cookie) => chain.apply_cookie(cookie, response_headers),
+            TerminalResult::BodyValidator(decision) => chain
+                .selected(response_headers)
+                .and_then(|selected| decision.decide(*status_code, selected))
+                // BodyValidator is C-only and cannot replace an R terminal.
+                .map(|_| ()),
             TerminalResult::EmptyBody => {
                 if !authoritative
                     && !ctx.gateway_deadline_response_selected()
@@ -26385,10 +26391,17 @@ fn run_prepared_charged_terminal_hooks(
             );
             break;
         }
+        chain.refresh_response_origin(ctx);
         let applied = match operation.execute() {
             TerminalResult::Noop | TerminalResult::EmptyBody => Ok(()),
             TerminalResult::Fields(patch) => chain.apply_fields(patch, headers),
             TerminalResult::Cookie(cookie) => chain.apply_cookie(cookie, headers),
+            TerminalResult::BodyValidator(decision) => chain
+                .selected(headers)
+                .and_then(|selected| decision.decide(*status, selected))
+                // Preserve the charged terminal, as the ordinary hook runner
+                // did when a non-replacer completed with a rejection.
+                .map(|_| ()),
         };
         if applied.is_err() {
             break;

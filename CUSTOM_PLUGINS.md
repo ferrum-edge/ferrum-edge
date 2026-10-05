@@ -433,7 +433,13 @@ its output credit is private and comes from the admitted declaration. Return a
 closed `PreparedTerminalOp`; core uses the pinned generation, prepares all participants before consuming
 operations once in order and retiring context body/text/collector/decode views.
 See [`ExamplePlugin`](custom_plugins/examples/example_plugin.rs) for two bounded
-fields. The ordinary successful-response `after_proxy` lifecycle is unchanged.
+fields. A source-owned BodyValidator operation carries only a response-policy
+vote, method omission boolean, configured nonce and shared ticket. Its sealed
+cursor decision consumes current status and the ticket-bound selected carrier,
+preserving pristine SSE evidence and allocating no response state. The complete
+SSE refusal is evaluated in C and cannot replace its charged terminal; it does
+not grant R participation or trust a custom reported `body_validator` name.
+The ordinary successful-response `after_proxy` lifecycle is unchanged.
 
 Arbitrary futures, closures, plugin/context handles and raw bodies cannot be
 stored in an operation. External terminal I/O needs a reviewed bounded core

@@ -30595,7 +30595,14 @@ components:
       additionalProperties: false
       description: >-
         Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation
-        for request/response bodies. Unknown top-level keys and unknown keys
+        for request/response bodies. Its complete terminal after_proxy SSE
+        refusal has a bounded Prepared declaration (C 1024, O 4096, W 0),
+        including request-only configurations. Method/policy facts prepare
+        synchronously; current selected status and representation decide at the
+        cursor. It remains a charged-terminal non-replacer with default-false
+        rejection participation; request and full response-body validation keep
+        their existing strict behavior. This draft subset is not whole-contract
+        hosted qualification. Unknown top-level keys and unknown keys
         inside a protobuf_method_messages entry are rejected at construction, so
         a typo can never silently disable an intended rule; the plugin is
         fail-closed, and a rejected configuration keeps the last known-good

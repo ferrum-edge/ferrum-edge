@@ -1,6 +1,6 @@
 # Rejection preparation implementation status
 
-PR #6011, issues #6008/#6009; implementation round 33, preserving rounds 20–32.
+PR #6011, issues #6008/#6009; implementation round 34, preserving rounds 20–33.
 **Draft subset only. P2 remains open; the whole approved contract is not implemented or qualified.**
 The owner approved the complete 883-line round-17 contract identified by SHA-256
 `641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
@@ -36,8 +36,8 @@ profile is approved; interim refusals below are not final qualification of it.
   the stack context owner. No eager 2/32 MiB buffer is allocated.
 - `ReachedRequestView` provides only a synchronous borrow. `view.patch()` uses
   private admitted output credit. The closed `PreparedTerminalOp` /
-  `TerminalResult` variants are Noop, Fields, EmptyBody and moved Cookie. Their
-  owner contains no plugin/context/raw body/collector/closure/future. The whole
+  `TerminalResult` variants are Noop, Fields, EmptyBody, moved Cookie and a sealed
+  BodyValidator response decision. Their owner contains no plugin/context/raw body/collector/closure/future. The whole
   chain prepares before any operation is consumed; every operation is taken
   once in order. The public preparation boundary retires context body/text,
   collector and governed/decode plaintext on success and partial refusal.
@@ -95,6 +95,7 @@ profile is approved; interim refusals below are not final qualification of it.
 | `ai_semantic_cache` | Closed cache-status field; C/O 1,024 each. |
 | `ExamplePlugin` | Custom two-field patch built with admitted credit; C 1,024 / O 16,384. |
 | `cors` / `__cors_finalizer` | Borrow reached aggregate policy facts into a closed field patch; C/O 16,384 each, W 0. Direct instances and cache finalizers declare real configured output sizes; deferred wrappers retain inner declarations and wrapper credit. No raw context, policy-list clone or old-hook adapter escapes preparation. |
+| `body_validator` | Complete terminal SSE refusal as a sealed response decision; C 1,024 / O 4,096 / W 0 for every configuration, including request-only protobuf. Current selected status/media and pristine origin evidence are cursor inputs; full-body validation is separate. |
 | `mesh/workload_metrics` | Actual synchronous reject restamp and traceparent operation; C 16,384 / O 4,096 / W 0. Borrowed authenticated peer/header/config facts, composed CEL label requirements, sampling/B3/W3C state and capture-marker retirement; no cloned raw header map in the operation. |
 
 The round-19 explicit no-op inventory remains. Pure candidate rows now delegate
@@ -142,13 +143,88 @@ type review.
 
 All ten original acceptance areas remain **OPEN/UNQUALIFIED**, P2 remains open,
 and the separate unresolved-route HTTP 503/native-gRPC 14 profile remains pending.
-The exact approved 883-line proposal was not present in this assigned checkout
-or the issue/PR comments; its recorded hash above is retained without claiming
-that the historical design document is that proposal. ROOT must supply the exact
-approved text and own exact-head hosted qualification and the cross-repository
-catalog handoff. No new public trait fact is introduced: handoff must continue to
+Round 33 could not locate the proposal under its ambiguous supplied path. Round
+34 read the entire exact 883-line approved artifact at
+`/Volumes/JeremyStorage/Dev/repos/GitHub/ferrum-edge/orchestration/2026-10-04-root/work/artifacts/edge6011-worker17-decision/rejection-contract-proposal.md`
+and verified SHA-256
+`641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
+The artifact is present in the authorized Ferrum tree. The historical design
+document is not substituted for it. ROOT owns exact-head hosted qualification
+and the cross-repository catalog handoff. The round-33 handoff must continue to
 describe actual implementation declarations, availability, wrapper/trigger facts,
 eligibility, bounds, and configured instance identity, never trust reported names.
+
+## Round-34 complete BodyValidator terminal hook subset
+
+`BodyValidator` now owns a Prepared declaration and synchronous preparer. The
+sealed built-in candidate row delegates to that owning declaration; the pure
+finalized-request-policy admission view therefore carries the actual terminal
+bounds for all configurations. Runtime configured instances, generations,
+priority wrappers, PostAuth trigger facts and R/C eligibility retain their
+existing identity and composition checks. Reported names confer no trust.
+C=1,024, O=4,096, W=0 are the approved row, with one 256-byte slot and the
+existing 512-byte wrapper allowance when wrapped. No parser, schema, descriptor,
+raw request owner, plugin handle, opaque metadata, closure or future escapes
+preparation. Request-only configuration remains Prepared, with a statically
+false response-policy vote, rather than becoming a trusted no-op type.
+
+The complete original `after_proxy` predicate is preserved: a configured
+response-policy vote, non-HEAD method, body-permitting selected status, and
+original event-stream representation produce the fixed 502 JSON refusal;
+otherwise Continue. The operation stages only the static vote and HEAD boolean
+at its ordered preparation position. Its instance nonce and thin shared ticket
+are validated with the operation. `execute` moves the sealed decision into the
+cursor; `decide` consumes it once against a ticket-bound selected carrier and
+current status, checking destination custody before reading fields. It allocates
+nothing. The refusal outcome is a closed enum exposing static bytes, with no
+JSON tree, String, header map, dynamic body or separate allocation. Actual
+operation/result types fit the approved C/O; fixed slot backing is planned from
+`Option<PreparedTerminalOp>`, and carrier tables/arena/inline ownership remain
+under their existing checked native allowances.
+
+The carrier holds a three-state bounded origin fact: pristine SSE, pristine
+non-SSE/absent type, or unstamped synthetic response. Synthetic media is read
+from current selected fields after preceding cursor patches; pristine evidence
+survives header rewrites and uses the existing case-insensitive media essence
+predicate. Core refreshes the origin fact before each cursor action, after any
+replacement/expiry handling, so clearing a replaced backend stamp selects the
+current synthetic representation. The existing crate-private legacy ingress may
+construct the one bounded carrier; it remains unqualified for full raw-map/wire
+custody. No public raw destination or unchecked copier was added.
+
+BodyValidator still has default-false rejection participation and default-false
+replacer capability: it belongs to C, not R. R preparation suppresses its action.
+C evaluates its real decision and discards a refusal so the charged terminal
+keeps its original status/body, matching the old charged hook behavior. Ordinary
+successful `after_proxy`, response-body buffering/refinement/final validation,
+request validation, descriptor admission and representation-security hooks are
+unchanged. Other unmigrated active types, including AiRateLimiter and
+TransactionDebugger, remain strictly Undeclared.
+
+Four added native hosted fixtures exercise production PluginCache HTTP/gRPC
+instances, sealed pure candidate admission, response/request-only/protobuf
+configuration, exact ordinary hook status/body parity, HEAD and all no-content
+statuses, pristine SSE/non-SSE/absent type, media cases/lookalikes, prior selected
+header effects, once consumption, actual slot/native bounds, foreign generations
+and reordered configured instances before allocation, foreign typed destinations
+before allocation/mutation, replay refusal, true/false configured triggers, C
+terminal preservation and R suppression. Last-owner cancellation checks exact
+native root deallocation and zero residual ticket/ledger usage. External unit
+controls pin the real declaration/effects and refuse an opaque implementation
+reporting `body_validator`. Existing no-op, active limiter/debugger, hazard,
+64/65 participant, 1,024/1,025 ticket, capacity, custody and lifetime controls are
+retained without changing workloads, statuses, timeouts, filters or skips.
+
+These are bounded source changes and unexecuted hosted fixtures. They remove the
+specific BodyValidator Undeclared source cause in the old e783 adaptive descriptor
+startup path; its existing workload is unchanged, and no hosted pass is claimed.
+All original acceptance areas **1–10 remain OPEN/UNQUALIFIED**, and **P2 remains
+OPEN**. Exact-head formatting, lint, compilation, native allocator and runtime
+results remain HOSTED UNVERIFIED. The approved capacity HTTP 503/native-gRPC 8
+profile is distinct from the separately pending unresolved-route 503/14 profile.
+ROOT owns independent review, all current hosted failures and exact-head gates,
+landing and the ferrum-contracts plugin-catalog handoff for the Prepared
+BodyValidator row and sealed response-decision capability.
 
 ## Round-24 storage boundary and exact gaps
 
@@ -394,7 +470,7 @@ boundary before declaring the limiter migration conforming.
 | Audit (section 6) | All `ai_transcript_audit` and `transaction_debugger` active terminal capture remains Undeclared/refused. No private per-instance Complete/Refuted/Unfinished reached-body/method/header authority, staging guard transfer, immediate audit abort, or record-lease move has been implemented. Shared `MD_FINAL_REQ_SEEN` is not replaced. |
 | Bounded audit parser | No bounded JSON/protobuf/redaction arena or reserve-before-node/encoder growth migration. Ordinary `serde_json::Value` paths are not claimed conforming. |
 | Limiter / paid provider | `ai_rate_limiter`, including local/federation accounting and Redis reconciliation, remains Undeclared/refused before request provider work in configured terminal chains. No paid-operation cancellation/once/uncertainty semantics are invented. Root must implement the bounded RESP path described above with existing pool/TLS/config/deadline semantics. |
-| Other active hooks | `response_transformer`/core route-header finalizer, `compression`, `sse`, `a2a_gateway`, `ai_federation`, `ai_stream_router`, `body_validator`, `openapi_validator`, `waf`, `ai_response_guard`, `response_size_limiting`, `response_caching`, `grpc_web`, `transaction_debugger`, and the audit/limiter rows above remain Undeclared/refused in their effective HTTP R/C union. There is no opaque fallback. Configuring a currently unmigrated participant can reject an otherwise valid proxy config. |
+| Other active hooks | `response_transformer`/core route-header finalizer, `compression`, `sse`, `a2a_gateway`, `ai_federation`, `ai_stream_router`, `openapi_validator`, `waf`, `ai_response_guard`, `response_size_limiting`, `response_caching`, `grpc_web`, `transaction_debugger`, and the audit/limiter rows above remain Undeclared/refused in their effective HTTP R/C union. There is no opaque fallback. Configuring a currently unmigrated participant can reject an otherwise valid proxy config. |
 | External operations / cursor | Add reviewed typed I/O/result/cleanup variants, selected-response scope and replacement/result replay, authorization/deadline rechecks before every external poll, independent finite detach summary, held-operation cancellation and once/paid-state semantics. The immediate driver is not an implementation of these requirements. |
 | Provenance / final policies | Migrate mixed backend/gateway provenance, exact authored-field/cookie occurrence ownership and route finalizers under finite cursor credit; preserve every admitted terminal's final header/body policy and HEAD/CORS/compression semantics. Current legacy-lineage refusal must be retired by the full migration. |
 | Complete teardown proof | Context retirement and existing retained-upload handoffs are connected, but every raw caller/replay/decode/collector/request-view sibling and cancellation site still needs exact-head real ownership proof. Committed-response/logging observers keep their existing separate lifecycle; no claim is made that their opaque state is a conforming typed terminal operation. |

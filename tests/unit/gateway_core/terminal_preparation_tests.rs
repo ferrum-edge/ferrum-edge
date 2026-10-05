@@ -35,6 +35,83 @@ fn prepared(bounds: TerminalBounds) -> TerminalDeclaration {
     }
 }
 
+#[test]
+fn actual_body_validator_declares_only_bounded_method_preparation_and_cursor_response_effects() {
+    use ferrum_edge::plugins::body_validator::BodyValidator;
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "response_required_fields": ["answer"]
+    }))
+    .unwrap();
+    let declaration = plugin.terminal_declaration();
+    assert_eq!(
+        declaration,
+        TerminalDeclaration::Prepared {
+            bounds: TerminalBounds {
+                control: 1024,
+                output: 4096,
+                workspace: 0,
+            },
+            prep_reads: TerminalFacts::METHOD,
+            prep_writes: TerminalFacts::NONE,
+            trigger_reads: TerminalFacts::NONE,
+            cursor_writes: TerminalFacts::RESPONSE_STATUS.union(TerminalFacts::RESPONSE_HEADERS),
+        }
+    );
+    assert!(plugin.terminal_preparation_available());
+    assert!(!plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.may_replace_rejection_response());
+    let mut manifest = TerminalManifest::new();
+    manifest.push(entry(1, declaration)).unwrap();
+    assert_eq!(manifest.workspace_bytes(), 0);
+    let later = TerminalDeclaration::Prepared {
+        bounds: TerminalBounds::CUSTOM_STARTER,
+        prep_reads: TerminalFacts::RESPONSE_STATUS,
+        prep_writes: TerminalFacts::NONE,
+        trigger_reads: TerminalFacts::NONE,
+        cursor_writes: TerminalFacts::NONE,
+    };
+    assert_eq!(
+        manifest.push(entry(2, later)).unwrap_err().reason,
+        TerminalRefusal::ResponseReadDuringPreparation
+    );
+    assert_eq!(manifest.participant_count(), 1);
+}
+
+struct OpaqueReportedBodyValidator;
+
+#[async_trait::async_trait]
+impl Plugin for OpaqueReportedBodyValidator {
+    fn name(&self) -> &str {
+        "body_validator"
+    }
+
+    fn priority(&self) -> u16 {
+        3500
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _status: u16,
+        _headers: &mut HashMap<String, String>,
+    ) -> ferrum_edge::plugins::PluginResult {
+        ctx.metadata.insert("opaque-effect".into(), "active".into());
+        ferrum_edge::plugins::PluginResult::Continue
+    }
+}
+
+#[test]
+fn body_validator_reported_name_does_not_grant_the_sealed_prepared_variant() {
+    let plugin: Arc<dyn Plugin> = Arc::new(OpaqueReportedBodyValidator);
+    assert_eq!(plugin.terminal_declaration(), TerminalDeclaration::Undeclared);
+    assert_eq!(
+        ferrum_edge::plugins::terminal_preparation::compile_terminal_manifest(&[plugin])
+            .unwrap_err()
+            .reason,
+        TerminalRefusal::Undeclared
+    );
+}
+
 fn zero_usage() -> PreparationUsage {
     PreparationUsage {
         bytes: 0,

@@ -12,7 +12,10 @@ back the immediate operations, including active workload-metrics preparation.
 CORS instances and their aggregate finalizer now prepare bounded field patches,
 including atomic prefix stripping and Vary token co-ownership. Legacy wire
 conversion, emergency storage and complete provenance remain open. These
-operations never adapt the ordinary async `after_proxy`.
+operations never adapt the ordinary async `after_proxy`. BodyValidator now
+prepares a bounded method/policy decision and evaluates SSE refusal from current
+selected response facts at its cursor. Its C-only capability and charged-terminal
+precedence are retained; ordinary body validation stays in its existing phases.
 Audit, limiter/Redis, transformers, compression, mixed response
 provenance and external terminal operations remain refused or unimplemented;
 P2 and hosted runtime qualification remain open. See the

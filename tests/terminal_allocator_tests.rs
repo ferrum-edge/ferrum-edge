@@ -1442,6 +1442,395 @@ mod qualified {
     }
 
     #[tokio::test]
+    async fn body_validator_complete_hook_matches_ordinary_results_without_cursor_allocation() {
+        use ferrum_edge::_test_support as support;
+        use ferrum_edge::plugins::ProxyProtocol;
+        use ferrum_edge::plugins::terminal_preparation::TerminalResponseOutcome;
+        allocator_profile();
+        let _guard = crate::env_lock::EnvGuard::new(&[]);
+        let baseline = PROCESS_PREPARATION_LEDGER.usage();
+        let policies = [
+            json!({"response_required_fields": ["answer"]}),
+            json!({"required_fields": ["question"]}),
+            json!({
+                "protobuf_descriptor_path": concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/test_validator.bin"
+                ),
+                "protobuf_request_type": "test.HelloRequest"
+            }),
+        ];
+        let cases = [
+            ("POST", 200, None, "text/event-stream"),
+            ("POST", 200, None, "application/json"),
+            ("POST", 200, None, "application/event-stream+json"),
+            ("POST", 200, None, " Text/Event-Stream ; charset=UTF-8 "),
+            ("hEaD", 200, None, "text/event-stream"),
+            ("POST", 100, None, "text/event-stream"),
+            ("POST", 199, None, "text/event-stream"),
+            ("POST", 204, None, "text/event-stream"),
+            ("POST", 205, None, "text/event-stream"),
+            ("POST", 304, None, "text/event-stream"),
+            ("POST", 502, None, "text/event-stream"),
+            (
+                "POST",
+                200,
+                Some(Some(" TEXT/EVENT-STREAM; charset=utf-8 ")),
+                "application/json",
+            ),
+            (
+                "POST",
+                200,
+                Some(Some("application/json")),
+                "text/event-stream",
+            ),
+            ("POST", 200, Some(None), "text/event-stream"),
+        ];
+        for (policy_index, policy) in policies.into_iter().enumerate() {
+            let config = participant_config("body_validator", policy, 1, false);
+            support::validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                &config,
+                None,
+            )
+            .unwrap();
+            let cache = ferrum_edge::PluginCache::new(&config).unwrap();
+            for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+                let view = cache.request_view("default", "participant-route", protocol);
+                let plugins = view.plugins();
+                let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+                let entry = manifest.entries().next().unwrap();
+                assert!(entry.wrapped);
+                assert!(!entry.eligibility.rejection);
+                assert!(entry.eligibility.charged);
+                assert_eq!(manifest.workspace_bytes(), 0);
+                let TerminalDeclaration::Prepared {
+                    bounds,
+                    prep_reads,
+                    ..
+                } = entry.declaration
+                else {
+                    panic!("actual BodyValidator must remain Prepared for every configuration")
+                };
+                assert_eq!(bounds.control, 1024);
+                assert_eq!(bounds.output, 4096);
+                assert_eq!(bounds.workspace, 0);
+                assert_eq!(prep_reads, TerminalFacts::METHOD);
+                let control = ROOT_BYTES + CARRIER_BYTES + SLOT_BYTES + 1024 + 4096 + WRAPPER_BYTES;
+                assert_eq!(manifest.control_bytes(), control.div_ceil(4096) * 4096);
+                for (method, status, pristine, media) in cases {
+                    let mut ctx = context();
+                    ctx.method = method.into();
+                    if let Some(pristine) = pristine {
+                        ctx.metadata.insert(
+                            "ferrum:original_response_metadata_stamped".into(),
+                            "true".into(),
+                        );
+                        if let Some(media) = pristine {
+                            ctx.metadata.insert(
+                                "ferrum:original_response_content_type".into(),
+                                media.into(),
+                            );
+                        }
+                    }
+                    ctx.metadata
+                        .insert("request_body".into(), "retire this owner".into());
+                    let mut expected_headers =
+                        HashMap::from([("content-type".into(), media.into())]);
+                    let expected = plugins[0]
+                        .after_proxy(&mut ctx, status, &mut expected_headers)
+                        .await;
+                    manifest.pin(&mut ctx).unwrap();
+                    let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+                    let before = allocated.get();
+                    let mut chain =
+                        PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+                    let slot_plan = AllocationPlan::array::<Option<PreparedTerminalOp>>(1).unwrap();
+                    assert_eq!(allocated.get() - before, slot_plan.backing_bytes() as u64);
+                    assert!(!ctx.metadata.contains_key("request_body"));
+                    let mut carrier = chain.new_selected_carrier().unwrap();
+                    push_headers(&mut carrier, &expected_headers);
+                    assert!(chain.allocated_backing_bytes() <= control.div_ceil(4096) * 4096);
+                    let before = allocated.get();
+                    let TerminalResult::BodyValidator(decision) =
+                        chain.next_operation().unwrap().execute()
+                    else {
+                        panic!("request-only configuration still prepares the actual active type")
+                    };
+                    let outcome = decision.decide(status, &carrier).unwrap();
+                    assert_eq!(allocated.get(), before);
+                    match expected {
+                        PluginResult::Continue => {
+                            assert_eq!(outcome, TerminalResponseOutcome::Continue);
+                        }
+                        PluginResult::Reject {
+                            status_code,
+                            body,
+                            headers,
+                        } => {
+                            assert_eq!(outcome.status_code(), Some(status_code));
+                            assert_eq!(outcome.body(), body.as_bytes());
+                            assert!(headers.is_empty());
+                            assert_eq!(policy_index, 0);
+                        }
+                        PluginResult::RejectBinary { .. } => {
+                            panic!("BodyValidator uses fixed JSON")
+                        }
+                    }
+                    assert_carrier_headers(&carrier, &expected_headers);
+                    assert!(chain.next_operation().is_none());
+                    assert_eq!(
+                        PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false)
+                            .unwrap_err()
+                            .reason,
+                        TerminalRefusal::AlreadyPrepared
+                    );
+                }
+            }
+        }
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), baseline);
+    }
+
+    #[test]
+    fn body_validator_reads_prior_selected_effects_and_releases_its_last_ticket_owner() {
+        use ferrum_edge::plugins::body_validator::BodyValidator;
+        use ferrum_edge::plugins::terminal_preparation::TerminalResponseOutcome;
+        allocator_profile();
+        let baseline = PROCESS_PREPARATION_LEDGER.usage();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(Fields {
+                values: vec![("content-type", "text/event-stream".into())],
+                override_existing: true,
+            }),
+            Arc::new(BodyValidator::new(&json!({"response_required_fields": ["answer"]})).unwrap()),
+        ];
+        let mut ctx = context();
+        pin(&plugins, &mut ctx);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let mut carrier = chain.new_selected_carrier().unwrap();
+        carrier
+            .push("content-type", b"application/json", backend())
+            .unwrap();
+        let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
+            panic!("first cursor action")
+        };
+        carrier.apply(&patch).unwrap();
+        drop(patch);
+        let TerminalResult::BodyValidator(decision) = chain.next_operation().unwrap().execute()
+        else {
+            panic!("second cursor action")
+        };
+        assert!(chain.next_operation().is_none());
+        let backing = chain.allocated_backing_bytes();
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+        drop(chain);
+        drop(ctx);
+        drop(plugins);
+        assert_eq!(
+            PROCESS_PREPARATION_LEDGER.usage().tickets,
+            baseline.tickets + 1
+        );
+        let before = allocated.get();
+        assert_eq!(
+            decision.decide(200, &carrier).unwrap(),
+            TerminalResponseOutcome::BodyValidatorEventStreamRefusal
+        );
+        assert_eq!(allocated.get(), before);
+        assert_eq!(
+            PROCESS_PREPARATION_LEDGER.usage().tickets,
+            baseline.tickets + 1
+        );
+        let before = deallocated.get();
+        drop(carrier);
+        let released = deallocated.get() - before;
+        assert!(released > 0);
+        assert!(released <= backing as u64);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), baseline);
+    }
+
+    #[test]
+    fn cancelled_body_validator_decision_returns_the_exact_last_native_ticket_backing() {
+        use ferrum_edge::plugins::body_validator::BodyValidator;
+        allocator_profile();
+        let baseline = PROCESS_PREPARATION_LEDGER.usage();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            BodyValidator::new(&json!({"response_required_fields": ["answer"]})).unwrap(),
+        )];
+        let mut ctx = context();
+        pin(&plugins, &mut ctx);
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let carrier = chain.new_selected_carrier().unwrap();
+        let operation = chain.next_operation().unwrap();
+        assert!(matches!(&operation, PreparedTerminalOp::BodyValidator(_)));
+        drop(carrier);
+        let slots = AllocationPlan::array::<Option<PreparedTerminalOp>>(1).unwrap();
+        let root_backing = chain.allocated_backing_bytes() - slots.backing_bytes();
+        assert!(root_backing > 0 && root_backing <= ROOT_BYTES);
+        drop(chain);
+        drop(ctx);
+        drop(plugins);
+        assert_eq!(
+            PROCESS_PREPARATION_LEDGER.usage().tickets,
+            baseline.tickets + 1
+        );
+        let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+        let before = deallocated.get();
+        drop(operation);
+        assert_eq!(deallocated.get() - before, root_backing as u64);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), baseline);
+    }
+
+    #[tokio::test]
+    async fn body_validator_generation_destination_trigger_and_terminal_gates_stay_strict() {
+        use ferrum_edge::plugins::ProxyProtocol;
+        allocator_profile();
+        let _guard = crate::env_lock::EnvGuard::new(&[]);
+        let config = participant_config(
+            "body_validator",
+            json!({"response_required_fields": ["answer"]}),
+            2,
+            false,
+        );
+        let cache = ferrum_edge::PluginCache::new(&config).unwrap();
+        let foreign_cache = ferrum_edge::PluginCache::new(&config).unwrap();
+        let view = cache.request_view("default", "participant-route", ProxyProtocol::Http);
+        let plugins = view.plugins();
+        let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+        let mut ctx = context();
+        ctx.headers.insert("x-request".into(), "unchanged".into());
+        manifest.pin(&mut ctx).unwrap();
+        let foreign = foreign_cache.get_plugins_for_protocol(
+            "default",
+            "participant-route",
+            ProxyProtocol::Http,
+        );
+        let reordered: Vec<_> = plugins.iter().rev().cloned().collect();
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        for mismatched in [foreign.as_slice(), reordered.as_slice()] {
+            let before = allocated.get();
+            assert_eq!(
+                PreparedTerminalChain::prepare(mismatched, &mut ctx, true, false)
+                    .unwrap_err()
+                    .reason,
+                TerminalRefusal::PinnedGeneration
+            );
+            assert_eq!(allocated.get(), before);
+            assert_eq!(ctx.headers.get("x-request").unwrap(), "unchanged");
+        }
+        let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
+        let entries = &manifest;
+        assert_ne!(
+            entries.entries().next().unwrap().instance,
+            entries.entries().last().unwrap().instance
+        );
+        let mut foreign_ctx = context();
+        manifest.pin(&mut foreign_ctx).unwrap();
+        let foreign_chain =
+            PreparedTerminalChain::prepare(&plugins, &mut foreign_ctx, true, false).unwrap();
+        let mut foreign_carrier = foreign_chain.new_selected_carrier().unwrap();
+        foreign_carrier
+            .push("content-type", b"text/event-stream", backend())
+            .unwrap();
+        let TerminalResult::BodyValidator(decision) = chain.next_operation().unwrap().execute()
+        else {
+            panic!("actual BodyValidator decision")
+        };
+        let before = allocated.get();
+        let foreign_backing = foreign_chain.allocated_backing_bytes();
+        assert_eq!(
+            decision.decide(200, &foreign_carrier).unwrap_err().reason,
+            TerminalRefusal::PinnedGeneration
+        );
+        assert_eq!(allocated.get(), before);
+        assert_eq!(foreign_chain.allocated_backing_bytes(), foreign_backing);
+        assert_eq!(foreign_carrier.field_count(), 1);
+        assert_eq!(
+            foreign_carrier.occurrences().next().unwrap().1,
+            b"text/event-stream"
+        );
+        let operation = chain.next_operation().unwrap();
+        let replay: Vec<Arc<dyn Plugin>> = vec![Arc::new(Replay {
+            operation: std::sync::Mutex::new(Some(operation)),
+        })];
+        let mut replay_ctx = context();
+        pin(&replay, &mut replay_ctx);
+        assert_eq!(
+            PreparedTerminalChain::prepare(&replay, &mut replay_ctx, true, false)
+                .unwrap_err()
+                .reason,
+            TerminalRefusal::PinnedGeneration
+        );
+
+        let mut charged = context();
+        manifest.pin(&mut charged).unwrap();
+        ferrum_edge::_test_support::end_charged_grpc_route_attempt_for_test(&mut charged);
+        let mut headers = HashMap::from([("content-type".into(), "text/event-stream".into())]);
+        assert!(
+            !ferrum_edge::_test_support::run_after_proxy_hooks_for_test(
+                &plugins,
+                &mut charged,
+                504,
+                &mut headers,
+            )
+            .await
+        );
+        assert_eq!(headers.get("content-type").unwrap(), "text/event-stream");
+        assert_eq!(
+            PreparedTerminalChain::prepare(&plugins, &mut charged, true, false)
+                .unwrap_err()
+                .reason,
+            TerminalRefusal::AlreadyPrepared
+        );
+
+        let triggered = participant_config(
+            "body_validator",
+            json!({"response_required_fields": ["answer"]}),
+            1,
+            true,
+        );
+        let triggered_cache = ferrum_edge::PluginCache::new(&triggered).unwrap();
+        let triggered_view =
+            triggered_cache.request_view("default", "participant-route", ProxyProtocol::Http);
+        let mut triggered_ctx = context();
+        pin(&triggered_view.plugins(), &mut triggered_ctx);
+        let mut triggered_chain = PreparedTerminalChain::prepare(
+            &triggered_view.plugins(),
+            &mut triggered_ctx,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            triggered_chain.next_operation().unwrap().execute(),
+            TerminalResult::Noop
+        ));
+        let mut matched_ctx = context();
+        matched_ctx.method = "GET".into();
+        pin(&triggered_view.plugins(), &mut matched_ctx);
+        let mut matched_chain = PreparedTerminalChain::prepare(
+            &triggered_view.plugins(),
+            &mut matched_ctx,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            matched_chain.next_operation().unwrap().execute(),
+            TerminalResult::BodyValidator(_)
+        ));
+        let mut rejected_ctx = context();
+        manifest.pin(&mut rejected_ctx).unwrap();
+        let mut rejected =
+            PreparedTerminalChain::prepare(&plugins, &mut rejected_ctx, false, false).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                rejected.next_operation().unwrap().execute(),
+                TerminalResult::Noop
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn twelve_production_noops_keep_configured_instances_and_native_bounds() {
         use ferrum_edge::plugins::ProxyProtocol;
         allocator_profile();

@@ -106,6 +106,7 @@ pub struct SelectedTerminalCarrier {
     contribution_capacity: usize,
     used: usize,
     ticket: TerminalTicket,
+    pristine_event_stream: Option<bool>,
 }
 
 impl SelectedTerminalCarrier {
@@ -168,6 +169,32 @@ impl SelectedTerminalCarrier {
             contribution_capacity,
             used: 0,
             ticket: ticket.clone(),
+            pristine_event_stream: None,
+        })
+    }
+
+    pub(crate) fn validate_ticket(
+        &self,
+        ticket: &TerminalTicket,
+    ) -> Result<(), TerminalAdmissionError> {
+        if !self.ticket.ptr_eq(ticket) {
+            return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_pristine_event_stream(&mut self, event_stream: Option<bool>) {
+        self.pristine_event_stream = event_stream;
+    }
+
+    pub(crate) fn original_response_is_event_stream(&self) -> bool {
+        self.pristine_event_stream.unwrap_or_else(|| {
+            // Match the ordinary hook's canonical HashMap lookup exactly;
+            // media-type essence comparison itself is case insensitive.
+            self.occurrences()
+                .find(|(name, _, _)| *name == b"content-type")
+                .and_then(|(_, value, _)| std::str::from_utf8(value).ok())
+                .is_some_and(super::super::utils::sse::is_text_event_stream_media_type)
         })
     }
 

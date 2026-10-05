@@ -839,6 +839,34 @@ pub struct ReachedRequestView<'a> {
 }
 
 impl ReachedRequestView<'_> {
+    pub(crate) fn body_validator_decision(
+        &self,
+        has_response_validation: bool,
+    ) -> Result<PreparedTerminalOp, TerminalAdmissionError> {
+        use super::utils::synthetic_response::request_method_omits_response_body;
+        let ticket = self
+            .ticket
+            .as_ref()
+            .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
+        let required = std::mem::size_of::<BodyValidatorTerminalDecision>();
+        if required > self.control_limit {
+            return Err(capacity_error(
+                TerminalRefusal::ControlCapacity,
+                required,
+                self.control_limit,
+            ));
+        }
+        let method_omits_body = request_method_omits_response_body(&self.context.method);
+        Ok(PreparedTerminalOp::BodyValidator(
+            BodyValidatorTerminalDecision {
+                has_response_validation,
+                method_omits_body,
+                ticket: ticket.clone(),
+                instance: self.instance,
+            },
+        ))
+    }
+
     pub fn with_workspace<R: WorkspaceValue>(
         &self,
         bytes: usize,
@@ -972,6 +1000,79 @@ pub enum PreparedTerminalOp {
     Fields(TerminalPatch),
     EmptyBody,
     Cookie(TerminalCookie),
+    BodyValidator(BodyValidatorTerminalDecision),
+}
+
+/// Closed, raw-free response decision. Only the actual BodyValidator preparer
+/// can construct it. It owns two booleans, a configured-instance nonce and one
+/// shared ticket handle; no schema, descriptor, context or request owner.
+pub struct BodyValidatorTerminalDecision {
+    has_response_validation: bool,
+    method_omits_body: bool,
+    ticket: TerminalTicket,
+    instance: TerminalInstanceToken,
+}
+
+/// A fixed refusal does not allocate a JSON tree, String, map or body owner.
+/// Core retains the invocation's existing replacement capability and terminal
+/// precedence when applying or discarding this outcome.
+#[derive(Debug, Eq, PartialEq)]
+pub enum TerminalResponseOutcome {
+    Continue,
+    BodyValidatorEventStreamRefusal,
+}
+
+impl TerminalResponseOutcome {
+    pub const fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::Continue => None,
+            Self::BodyValidatorEventStreamRefusal => Some(502),
+        }
+    }
+
+    pub const fn body(&self) -> &'static [u8] {
+        match self {
+            Self::Continue => &[],
+            Self::BodyValidatorEventStreamRefusal => {
+                super::body_validator::TERMINAL_EVENT_STREAM_BODY.as_bytes()
+            }
+        }
+    }
+}
+
+impl BodyValidatorTerminalDecision {
+    /// Consume once at the cursor against a ticket-bound selected response.
+    /// Binding is checked before even reading response fields. No raw context,
+    /// header map, body, allocation, async hook or opaque state is accepted.
+    pub fn decide(
+        self,
+        status: u16,
+        selected: &SelectedTerminalCarrier,
+    ) -> Result<TerminalResponseOutcome, TerminalAdmissionError> {
+        selected.validate_ticket(&self.ticket)?;
+        if super::body_validator::terminal_refuses_event_stream(
+            self.has_response_validation,
+            self.method_omits_body,
+            status,
+            selected.original_response_is_event_stream(),
+        ) {
+            Ok(TerminalResponseOutcome::BodyValidatorEventStreamRefusal)
+        } else {
+            Ok(TerminalResponseOutcome::Continue)
+        }
+    }
+}
+
+/// Some(false) includes a stamped-but-absent pristine Content-Type. None is a
+/// synthetic response, whose live selected field is evaluated at the cursor.
+fn pristine_response_event_stream(ctx: &super::RequestContext) -> Option<bool> {
+    ctx.metadata
+        .contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY)
+        .then(|| {
+            ctx.metadata
+                .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+                .is_some_and(|value| super::utils::sse::is_text_event_stream_media_type(value))
+        })
 }
 
 /// Capacity-checked, moved cookie owner; construction is confined to the
@@ -1008,6 +1109,7 @@ pub enum TerminalResult {
     Fields(TerminalPatch),
     EmptyBody,
     Cookie(TerminalCookie),
+    BodyValidator(BodyValidatorTerminalDecision),
 }
 
 impl PreparedTerminalOp {
@@ -1018,6 +1120,12 @@ impl PreparedTerminalOp {
         instance: TerminalInstanceToken,
     ) -> Result<(), TerminalAdmissionError> {
         match self {
+            Self::BodyValidator(decision)
+                if decision.instance != instance
+                    || ticket.is_none_or(|ticket| !ticket.ptr_eq(&decision.ticket)) =>
+            {
+                return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+            }
             Self::Fields(patch)
                 if patch.instance != instance
                     || ticket.is_none_or(|ticket| !ticket.ptr_eq(&patch.ticket)) =>
@@ -1045,6 +1153,7 @@ impl PreparedTerminalOp {
         };
         let required = match self {
             Self::Noop | Self::EmptyBody => 0,
+            Self::BodyValidator(_) => std::mem::size_of::<TerminalResponseOutcome>(),
             Self::Fields(patch) => patch.owned_bytes,
             Self::Cookie(cookie) => {
                 if cookie.value.as_str().len() > MAX_COOKIE_BYTES
@@ -1075,6 +1184,7 @@ impl PreparedTerminalOp {
             Self::Fields(patch) => TerminalResult::Fields(patch),
             Self::EmptyBody => TerminalResult::EmptyBody,
             Self::Cookie(cookie) => TerminalResult::Cookie(cookie),
+            Self::BodyValidator(decision) => TerminalResult::BodyValidator(decision),
         }
     }
 }
@@ -2088,6 +2198,17 @@ pub struct PreparedTerminalChain {
     len: usize,
     cursor: usize,
     _ticket: Option<TerminalTicket>,
+    pristine_event_stream: Option<bool>,
+}
+
+impl fmt::Debug for PreparedTerminalChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Refusal diagnostics expose only cursor counts, never operation data.
+        f.debug_struct("PreparedTerminalChain")
+            .field("len", &self.len)
+            .field("cursor", &self.cursor)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PreparedTerminalChain {
@@ -2149,6 +2270,7 @@ impl PreparedTerminalChain {
             len: 0,
             cursor: 0,
             _ticket: ticket.clone(),
+            pristine_event_stream: None,
         };
         let sources = manifest
             .sources
@@ -2209,10 +2331,11 @@ impl PreparedTerminalChain {
             chain.len += 1;
         }
         drop(workspace);
+        chain.pristine_event_stream = pristine_response_event_stream(ctx);
         Ok(chain)
     }
 
-    fn selected(
+    pub(crate) fn selected(
         &mut self,
         headers: &std::collections::HashMap<String, String>,
     ) -> Result<&mut SelectedTerminalCarrier, TerminalAdmissionError> {
@@ -2222,6 +2345,7 @@ impl PreparedTerminalChain {
                 .as_ref()
                 .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
             let mut selected = SelectedTerminalCarrier::new(ticket)?;
+            selected.set_pristine_event_stream(self.pristine_event_stream);
             selected.load_legacy(headers)?;
             self.selected = Some(selected);
         }
@@ -2236,7 +2360,19 @@ impl PreparedTerminalChain {
             ._ticket
             .as_ref()
             .ok_or_else(|| capacity_error(TerminalRefusal::PinnedGeneration, 0, 0))?;
-        SelectedTerminalCarrier::new(ticket)
+        let mut selected = SelectedTerminalCarrier::new(ticket)?;
+        selected.set_pristine_event_stream(self.pristine_event_stream);
+        Ok(selected)
+    }
+
+    /// Core calls this after selecting any replacement, before cursor work.
+    /// Header-only rewrites retain pristine evidence; a core body replacement
+    /// that clears the origin stamp switches to the current selected fields.
+    pub(crate) fn refresh_response_origin(&mut self, ctx: &super::RequestContext) {
+        self.pristine_event_stream = pristine_response_event_stream(ctx);
+        if let Some(selected) = &mut self.selected {
+            selected.set_pristine_event_stream(self.pristine_event_stream);
+        }
     }
 
     pub(crate) fn reset_selected(
@@ -2382,6 +2518,7 @@ pub(crate) fn builtin_composition_declaration(name: &str) -> TerminalDeclaration
         "api_chargeback" => super::api_chargeback::terminal_composition_declaration(),
         "api_chargeback_sink" => super::api_chargeback_sink::terminal_composition_declaration(),
         "basic_auth" => super::basic_auth::terminal_composition_declaration(),
+        "body_validator" => super::body_validator::terminal_composition_declaration(),
         "bot_detection" => super::bot_detection::terminal_composition_declaration(),
         "fault_injection" => super::fault_injection::terminal_composition_declaration(),
         "geo_restriction" => super::geo_restriction::terminal_composition_declaration(),
