@@ -511,10 +511,7 @@ fn test_deferred_grpc_body_context_preserves_buffered_size_metadata() {
         .find(deferred_marker)
         .expect("deferred final-body context must receive buffered gRPC size");
     assert!(size < primary && primary < deferred);
-    assert_eq!(
-        metadata.matches("letrequest_body_size_bytes=").count(),
-        1
-    );
+    assert_eq!(metadata.matches("letrequest_body_size_bytes=").count(), 1);
     assert_eq!(metadata.matches(".len()").count(), 1);
     // Pin the whole bounded region: both contexts receive the same original
     // collected size, with no transformed-body recomputation or extra writes.

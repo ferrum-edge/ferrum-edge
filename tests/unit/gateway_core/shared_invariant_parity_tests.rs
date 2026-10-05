@@ -3021,8 +3021,15 @@ fn every_backend_admission_caller_transfers_its_upload_before_finalization() {
     let bridge = compact_code(include_str!("../../../src/http3/cross_protocol.rs"));
     // The finalizer definition, the boxed factory's delegate, the WebSocket caller and
     // eight ordinary frontend callers. A new sibling anywhere breaks this table.
-    assert_eq!(h1.matches("handle_backend_admission_rejection(").count(), 11);
-    assert_eq!(h3.matches("run_h3_backend_admission_or_send_reject(").count(), 6);
+    assert_eq!(
+        h1.matches("handle_backend_admission_rejection(").count(),
+        11
+    );
+    assert_eq!(
+        h3.matches("run_h3_backend_admission_or_send_reject(")
+            .count(),
+        6
+    );
     let websocket = function_body(&h1, "asyncfnhandle_websocket_request_authenticated(");
     let websocket_calls = calls(websocket, "handle_backend_admission_rejection(");
     assert_eq!(websocket_calls.len(), 1);
@@ -3047,7 +3054,9 @@ fn every_backend_admission_caller_transfers_its_upload_before_finalization() {
     // the None handoff. Generic dispatch consumes its request inside the
     // attempt, so its admission-refusal arms have no remaining transport owner.
     let streaming_call = frontend.find(admission_calls[2]).unwrap();
-    let streaming_reject = frontend[..streaming_call].rfind("Err(rejection)=>{").unwrap();
+    let streaming_reject = frontend[..streaming_call]
+        .rfind("Err(rejection)=>{")
+        .unwrap();
     assert!(direct_source_statement(
         &frontend[streaming_reject + "Err(rejection)=>{".len()..streaming_call],
         "drop(request);"
@@ -3078,7 +3087,9 @@ fn every_backend_admission_caller_transfers_its_upload_before_finalization() {
     assert!(direct_source_statement(rejected, retire));
     assert!(
         rejected.find(retire).unwrap()
-            < rejected.find("finalize_reject_response_with_after_proxy_hooks(").unwrap()
+            < rejected
+                .find("finalize_reject_response_with_after_proxy_hooks(")
+                .unwrap()
     );
 
     // A successful generic attempt returns its replay body through dispatch.
@@ -3163,14 +3174,23 @@ fn every_backend_admission_caller_transfers_its_upload_before_finalization() {
                    &plugins,&mutctx,prebuffered_body_data.as_mut(),";
     assert!(
         rejected.find(capture).unwrap()
-            < rejected.find("run_h3_deadline_bounded_reject_committed_hooks(").unwrap()
+            < rejected
+                .find("run_h3_deadline_bounded_reject_committed_hooks(")
+                .unwrap()
     );
     assert!(rejected.contains("log_rejected_request("));
     assert!(rejected.contains("send_h3_plugin_reject_flavor_aware("));
-    let shared = function_body(&h1, "pub(crate)asyncfnapply_retained_upload_rejection_hooks(");
+    let shared = function_body(
+        &h1,
+        "pub(crate)asyncfnapply_retained_upload_rejection_hooks(",
+    );
     assert!(
-        shared.find("retire_retained_request_body_for_rejection(body,ctx);").unwrap()
-            < shared.find("apply_replaceable_after_proxy_hooks_to_rejection(").unwrap()
+        shared
+            .find("retire_retained_request_body_for_rejection(body,ctx);")
+            .unwrap()
+            < shared
+                .find("apply_replaceable_after_proxy_hooks_to_rejection(")
+                .unwrap()
     );
 }
 

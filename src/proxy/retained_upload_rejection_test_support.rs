@@ -11,15 +11,15 @@ impl Upload {
         body: Vec<u8>,
         budget: response_buffer_budget::RequestBufferPermit,
     ) -> Self {
-        Self(RejectedUpload::Client(ClientRequestBody::Buffered(Box::new(
-            BufferedClientRequestBody {
+        Self(RejectedUpload::Client(ClientRequestBody::Buffered(
+            Box::new(BufferedClientRequestBody {
                 method: hyper::Method::POST,
                 headers: hyper::HeaderMap::new(),
                 body,
                 trailers: None,
                 budget: Some(budget),
-            },
-        ))))
+            }),
+        )))
     }
 
     pub(crate) fn retained(body: Bytes) -> Self {

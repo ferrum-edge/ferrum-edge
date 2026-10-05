@@ -90,10 +90,9 @@ pub(super) async fn exchange() -> Exchange {
         .unwrap()
         .await
         .unwrap();
-    let (mut driver, mut send_request) =
-        h3::client::new(h3_quinn::Connection::new(connection))
-            .await
-            .unwrap();
+    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .unwrap();
     let client_driver = tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });

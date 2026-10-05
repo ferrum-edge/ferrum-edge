@@ -12802,7 +12802,9 @@ async fn backend_admission_retires_all_h1_h2_upload_owners_before_committed_wait
                     assert_eq!(response.status(), http::StatusCode::OK);
                     ctx
                 });
-                tokio::time::timeout(WAIT, entered.notified()).await.unwrap();
+                tokio::time::timeout(WAIT, entered.notified())
+                    .await
+                    .unwrap();
                 let records = wait_for_total_records(&server, 1).await;
                 assert_eq!(records.len(), 1);
                 assert!(records[0].get("request_body_omitted_reason").is_none());
@@ -12987,7 +12989,9 @@ async fn h3_admission_releases_upload_before_committed_and_flow_control_waits() 
             assert!(rejected);
             assert!(upload.is_empty());
         });
-        tokio::time::timeout(WAIT, entered.notified()).await.unwrap();
+        tokio::time::timeout(WAIT, entered.notified())
+            .await
+            .unwrap();
         let records = wait_for_total_records(&server, 1).await;
         assert_eq!(records.len(), 1);
         assert!(records[0].get("request_body_omitted_reason").is_none());
