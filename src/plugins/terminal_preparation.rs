@@ -977,6 +977,12 @@ pub enum PreparedTerminalOp {
 /// Capacity-checked, moved cookie owner; construction is confined to the
 /// synchronous admitted view, before any cursor or external poll. Its immutable
 /// ticket binds the value to the originating request throughout its lifetime.
+/// Legacy application requires the destination's prepared chain; the raw copier
+/// is private.
+///
+/// ```compile_fail,E0603
+/// use ferrum_edge::plugins::terminal_preparation::apply_terminal_cookie;
+/// ```
 pub struct TerminalCookie {
     value: TerminalString,
     lineage: TerminalFieldLineage,
@@ -1159,6 +1165,16 @@ pub struct TerminalPatch {
 }
 
 impl TerminalPatch {
+    fn validate_ticket(
+        &self,
+        ticket: Option<&TerminalTicket>,
+    ) -> Result<(), TerminalAdmissionError> {
+        if ticket.is_none_or(|ticket| !ticket.ptr_eq(&self.ticket)) {
+            return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+        }
+        Ok(())
+    }
+
     fn new(
         actions: usize,
         output: usize,
@@ -1685,21 +1701,6 @@ pub fn validate_terminal_headers(
     Ok(())
 }
 
-/// Apply one closed result to the sole selected response. Check prospective
-/// allocation/field counts first. No raw request facts are available here.
-pub fn apply_terminal_patch(
-    patch: TerminalPatch,
-    headers: &mut std::collections::HashMap<String, String>,
-) -> Result<(), TerminalAdmissionError> {
-    preflight_legacy_patch(&patch, headers)?;
-    let mut carrier = SelectedTerminalCarrier::new(&patch.ticket)?;
-    carrier.load_legacy(headers)?;
-    carrier.apply(&patch)?;
-    // The legacy adapter below remains outside the qualified wire-handoff
-    // proof. All semantic/field-capacity checks finish before its mutations.
-    apply_legacy_patch(&patch, headers, &carrier)
-}
-
 // This is a logical legacy-String guard, not a foreign-table allocation proof.
 // Conservatively include the old input capacities and every prospective copy
 // before changing either selected representation. Suppressed writes copy nothing.
@@ -2025,6 +2026,12 @@ pub fn compile_terminal_manifest(
 /// All preparations finish before the caller executes any cursor action.
 /// This fixed slot owner contains no plugin/context/raw view and invokes no
 /// old-hook fallback. Unsupported operations fail before terminal execution.
+/// Public legacy application requires this destination request's custody; there
+/// is no free patch application that accepts an arbitrary destination map.
+///
+/// ```compile_fail,E0432
+/// use ferrum_edge::plugins::terminal_preparation::apply_terminal_patch;
+/// ```
 pub struct PreparedTerminalChain {
     slots: Option<FixedSlots<Option<PreparedTerminalOp>>>,
     selected: Option<SelectedTerminalCarrier>,
@@ -2192,18 +2199,23 @@ impl PreparedTerminalChain {
         Ok(())
     }
 
-    pub(crate) fn apply_fields(
+    /// Apply only this request's patch, checking custody before legacy input
+    /// preflight or selected-carrier allocation. Legacy export is unqualified.
+    pub fn apply_fields(
         &mut self,
         patch: TerminalPatch,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> Result<(), TerminalAdmissionError> {
+        patch.validate_ticket(self._ticket.as_ref())?;
         preflight_legacy_patch(&patch, headers)?;
         let selected = self.selected(headers)?;
         selected.apply(&patch)?;
         apply_legacy_patch(&patch, headers, selected)
     }
 
-    pub(crate) fn apply_cookie(
+    /// Apply only this request's cookie through the checked selected carrier.
+    /// Custody is checked before legacy preflight or allocation.
+    pub fn apply_cookie(
         &mut self,
         cookie: TerminalCookie,
         headers: &mut std::collections::HashMap<String, String>,
@@ -2409,7 +2421,9 @@ fn preflight_legacy_cookie(
     Ok(Some(length))
 }
 
-pub fn apply_terminal_cookie(
+// Private legacy export, reached only after the native chain checks custody
+// and appends every occurrence to its checked selected carrier.
+fn apply_terminal_cookie(
     cookie: TerminalCookie,
     headers: &mut std::collections::HashMap<String, String>,
 ) -> Result<(), TerminalAdmissionError> {

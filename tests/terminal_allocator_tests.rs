@@ -18,9 +18,9 @@ mod qualified {
     use ferrum_edge::plugins::terminal_preparation::{
         CONTROL_BYTES, MAX_FIELD_OCCURRENCES, PROCESS_BYTES, PROCESS_PREPARATION_LEDGER,
         PreparationLedger, PreparedTerminalChain, PreparedTerminalOp, REQUEST_TICKETS, ROOT_BYTES,
-        SelectedTerminalCarrier, TerminalAdmissionError, TerminalDeclaration, TerminalFieldLineage,
-        TerminalFieldOrigin, TerminalFieldSection, TerminalRefusal, TerminalResult,
-        apply_terminal_patch, compile_terminal_manifest, field_declaration,
+        SelectedTerminalCarrier, TerminalAdmissionError, TerminalBounds, TerminalDeclaration,
+        TerminalFacts, TerminalFieldLineage, TerminalFieldOrigin, TerminalFieldSection,
+        TerminalRefusal, TerminalResult, compile_terminal_manifest, field_declaration,
         validate_terminal_headers,
     };
     use ferrum_edge::plugins::terminal_storage::{AllocationPlan, TerminalTicket};
@@ -91,6 +91,51 @@ mod qualified {
             for (name, value) in &self.values {
                 patch.set_policy(name, value, self.override_existing)?;
             }
+            Ok(PreparedTerminalOp::Fields(patch))
+        }
+    }
+
+    struct RequestFields;
+
+    #[async_trait::async_trait]
+    impl Plugin for RequestFields {
+        fn name(&self) -> &str {
+            "fixture_request_fields"
+        }
+
+        fn priority(&self) -> u16 {
+            1
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        fn terminal_declaration(&self) -> TerminalDeclaration {
+            TerminalDeclaration::Prepared {
+                bounds: TerminalBounds {
+                    control: 1024,
+                    output: 4096,
+                    workspace: 0,
+                },
+                prep_reads: TerminalFacts::METHOD,
+                prep_writes: TerminalFacts::NONE,
+                trigger_reads: TerminalFacts::NONE,
+                cursor_writes: TerminalFacts::RESPONSE_HEADERS,
+            }
+        }
+
+        fn terminal_preparation_available(&self) -> bool {
+            true
+        }
+
+        fn prepare_terminal(
+            &self,
+            view: &mut ferrum_edge::plugins::terminal_preparation::ReachedRequestView<'_>,
+        ) -> Result<PreparedTerminalOp, TerminalAdmissionError> {
+            let mut patch = view.patch(2)?;
+            patch.set_policy("x-method", &view.context.method, true)?;
+            patch.remove("x-remove")?;
             Ok(PreparedTerminalOp::Fields(patch))
         }
     }
@@ -457,7 +502,8 @@ mod qualified {
             PreparedTerminalChain::prepare(&plugins, &mut source, false, false).unwrap();
         let destination_chain =
             PreparedTerminalChain::prepare(&plugins, &mut destination, false, false).unwrap();
-        let TerminalResult::Cookie(cookie) = source_chain.next_operation().unwrap().execute() else {
+        let TerminalResult::Cookie(cookie) = source_chain.next_operation().unwrap().execute()
+        else {
             panic!("cookie operation")
         };
         let slots =
@@ -550,6 +596,245 @@ mod qualified {
     }
 
     #[test]
+    fn ordinary_fields_reject_another_request_before_allocation_and_keep_source_custody() {
+        let before = PROCESS_PREPARATION_LEDGER.usage();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RequestFields)];
+        let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+        let instance = manifest.entries().next().unwrap().instance;
+        let mut source = context();
+        let mut destination = context();
+        destination.method = "DELETE".into();
+        destination.headers.insert("x-request".into(), "b".into());
+        destination.metadata.insert("untouched".into(), "b".into());
+        // One manifest and producer nonce, but two independently admitted
+        // request tickets. No CORS Vary action participates in this patch.
+        manifest.pin(&mut source).unwrap();
+        manifest.pin(&mut destination).unwrap();
+        assert_eq!(
+            PROCESS_PREPARATION_LEDGER.usage().tickets,
+            before.tickets + 2
+        );
+        let mut source_chain =
+            PreparedTerminalChain::prepare(&plugins, &mut source, false, false).unwrap();
+        let destination_chain =
+            PreparedTerminalChain::prepare(&plugins, &mut destination, false, false).unwrap();
+        let TerminalResult::Fields(patch) = source_chain.next_operation().unwrap().execute() else {
+            panic!("ordinary fields")
+        };
+        let slots =
+            AllocationPlan::array::<Option<PreparedTerminalOp>>(manifest.participant_count())
+                .unwrap()
+                .backing_bytes();
+        let patch_and_root_backing = source_chain.allocated_backing_bytes() - slots;
+        let mut source_carrier = source_chain.new_selected_carrier().unwrap();
+        source_carrier.push("x-remove", b"a", backend()).unwrap();
+        let mut destination_carrier = destination_chain.new_selected_carrier().unwrap();
+        for (name, value) in [
+            ("x-method", b"DELETE".as_slice()),
+            ("x-remove", b"b".as_slice()),
+            ("x-opaque", b"\x80\xff".as_slice()),
+            ("set-cookie", b"opaque=b".as_slice()),
+            ("set-cookie", b"opaque=b".as_slice()),
+        ] {
+            destination_carrier.push(name, value, backend()).unwrap();
+        }
+        let original: Vec<_> = destination_carrier
+            .occurrences()
+            .map(|(name, value, lineage)| (name.to_vec(), value.to_vec(), lineage))
+            .collect();
+        let metadata = destination.metadata.clone();
+        let headers = destination.headers.clone();
+        let source_backing = source_chain.allocated_backing_bytes();
+        let destination_backing = destination_chain.allocated_backing_bytes();
+        let admitted = PROCESS_PREPARATION_LEDGER.usage();
+        let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+        let before_allocation = allocated.get();
+        let refusal = destination_carrier.apply(&patch).unwrap_err();
+        assert_eq!(refusal.reason, TerminalRefusal::PinnedGeneration);
+        assert_eq!(allocated.get(), before_allocation);
+        let unchanged: Vec<_> = destination_carrier
+            .occurrences()
+            .map(|(name, value, lineage)| (name.to_vec(), value.to_vec(), lineage))
+            .collect();
+        assert_eq!(unchanged, original);
+        assert_eq!(destination_carrier.token_contributions().count(), 0);
+        assert_eq!(destination.metadata, metadata);
+        assert_eq!(destination.headers, headers);
+        assert_eq!(source_chain.allocated_backing_bytes(), source_backing);
+        assert_eq!(
+            destination_chain.allocated_backing_bytes(),
+            destination_backing
+        );
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), admitted);
+
+        source_carrier.apply(&patch).unwrap();
+        let fields: Vec<_> = source_carrier.occurrences().collect();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, b"x-method");
+        assert_eq!(fields[0].1, b"POST");
+        assert_eq!(
+            fields[0].2.origin,
+            TerminalFieldOrigin::GatewayInstance(instance)
+        );
+        assert!(fields[0].2.policy_contribution);
+        assert_eq!(source_chain.allocated_backing_bytes(), source_backing);
+        drop(fields);
+        drop(source_carrier);
+        drop(source_chain);
+        drop(source);
+        let retained = PROCESS_PREPARATION_LEDGER.usage();
+        assert_eq!(retained.tickets, before.tickets + 2);
+        // The extracted patch alone keeps A's ticket and its exact backing.
+        let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+        let before_deallocation = deallocated.get();
+        drop(patch);
+        assert_eq!(
+            deallocated.get() - before_deallocation,
+            patch_and_root_backing as u64,
+        );
+        let retired = PROCESS_PREPARATION_LEDGER.usage();
+        assert_eq!(retired.tickets, before.tickets + 1);
+        assert_eq!(retired.bytes, retained.bytes - manifest.control_bytes());
+        assert_eq!(
+            destination_chain.allocated_backing_bytes(),
+            destination_backing
+        );
+        drop(destination_carrier);
+        drop(destination_chain);
+        drop(destination);
+        drop(manifest);
+        drop(plugins);
+        assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), before);
+    }
+
+    #[test]
+    fn checked_legacy_routes_refuse_foreign_custody_before_preflight_or_selected_allocation() {
+        for cookie in [false, true] {
+            for selected_exists in [false, true] {
+                let before = PROCESS_PREPARATION_LEDGER.usage();
+                let plugins: Vec<Arc<dyn Plugin>> = if cookie {
+                    vec![
+                        Arc::new(Cookie { key: "first" }),
+                        Arc::new(Cookie { key: "second" }),
+                    ]
+                } else {
+                    vec![Arc::new(RequestFields), Arc::new(RequestFields)]
+                };
+                let manifest = Arc::new(compile_terminal_manifest(&plugins).unwrap());
+                let mut source = context();
+                source.metadata.insert("first".into(), "a=1\na=2".into());
+                source.metadata.insert("second".into(), "a=3\na=4".into());
+                let mut destination = context();
+                destination.method = "DELETE".into();
+                destination.headers.insert("x-request".into(), "b".into());
+                destination.metadata.insert("first".into(), "b=1".into());
+                destination.metadata.insert("second".into(), "b=2".into());
+                manifest.pin(&mut source).unwrap();
+                manifest.pin(&mut destination).unwrap();
+                let mut source_chain =
+                    PreparedTerminalChain::prepare(&plugins, &mut source, false, false).unwrap();
+                let mut destination_chain =
+                    PreparedTerminalChain::prepare(&plugins, &mut destination, false, false)
+                        .unwrap();
+                let mut headers = HashMap::from([
+                    ("set-cookie".into(), "opaque=b\nopaque=b".into()),
+                    ("x-method".into(), "DELETE".into()),
+                    ("x-remove".into(), "b".into()),
+                ]);
+                if selected_exists {
+                    match destination_chain.next_operation().unwrap().execute() {
+                        TerminalResult::Fields(patch) => {
+                            destination_chain.apply_fields(patch, &mut headers).unwrap();
+                        }
+                        TerminalResult::Cookie(value) => {
+                            destination_chain.apply_cookie(value, &mut headers).unwrap();
+                        }
+                        _ => panic!("expected fields or cookie"),
+                    }
+                }
+                // Invalid legacy input proves custody refusal precedes even
+                // legacy preflight, for fresh and already selected carriers.
+                headers.insert("invalid\nname".into(), "untouched".into());
+                let original = headers.clone();
+                let header_capacity = headers.capacity();
+                let metadata = destination.metadata.clone();
+                let request_headers = destination.headers.clone();
+                let source_backing = source_chain.allocated_backing_bytes();
+                let destination_backing = destination_chain.allocated_backing_bytes();
+                let admitted = PROCESS_PREPARATION_LEDGER.usage();
+                assert_eq!(admitted.tickets, before.tickets + 2);
+                let operation = source_chain.next_operation().unwrap().execute();
+                let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+                let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+                let before_allocation = allocated.get();
+                let before_deallocation = deallocated.get();
+                let refusal = match operation {
+                    TerminalResult::Fields(patch) => {
+                        destination_chain.apply_fields(patch, &mut headers).unwrap_err()
+                    }
+                    TerminalResult::Cookie(value) => {
+                        destination_chain.apply_cookie(value, &mut headers).unwrap_err()
+                    }
+                    _ => panic!("expected fields or cookie"),
+                };
+                assert_eq!(refusal.reason, TerminalRefusal::PinnedGeneration);
+                assert_eq!(allocated.get(), before_allocation);
+                let released_backing = deallocated.get() - before_deallocation;
+                assert!(released_backing > 0);
+                assert_eq!(
+                    source_chain.allocated_backing_bytes(),
+                    source_backing - released_backing as usize,
+                );
+                assert_eq!(
+                    destination_chain.allocated_backing_bytes(),
+                    destination_backing
+                );
+                assert_eq!(headers, original);
+                assert_eq!(headers.capacity(), header_capacity);
+                assert_eq!(destination.metadata, metadata);
+                assert_eq!(destination.headers, request_headers);
+                assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), admitted);
+
+                // A's remaining same-ticket operation is still accepted by
+                // the checked native route, with ordered opaque cookie values.
+                let mut source_headers = HashMap::from([
+                    ("set-cookie".into(), "opaque=a\nopaque=a".into()),
+                    ("x-remove".into(), "a".into()),
+                ]);
+                match source_chain.next_operation().unwrap().execute() {
+                    TerminalResult::Fields(patch) => {
+                        source_chain.apply_fields(patch, &mut source_headers).unwrap();
+                        assert_eq!(source_headers.get("x-method").unwrap(), "POST");
+                        assert!(!source_headers.contains_key("x-remove"));
+                    }
+                    TerminalResult::Cookie(value) => {
+                        source_chain.apply_cookie(value, &mut source_headers).unwrap();
+                        assert_eq!(
+                            source_headers.get("set-cookie").unwrap(),
+                            "opaque=a\nopaque=a\na=3\na=4",
+                        );
+                    }
+                    _ => panic!("expected fields or cookie"),
+                }
+                // Retire the convenience pin's generation backing first,
+                // then observe the chain returning exactly A's request sum.
+                drop(source);
+                let retained = PROCESS_PREPARATION_LEDGER.usage();
+                assert_eq!(retained.tickets, before.tickets + 2);
+                drop(source_chain);
+                let retired = PROCESS_PREPARATION_LEDGER.usage();
+                assert_eq!(retired.tickets, before.tickets + 1);
+                assert_eq!(retired.bytes, retained.bytes - manifest.control_bytes());
+                drop(destination_chain);
+                drop(destination);
+                drop(manifest);
+                drop(plugins);
+                assert_eq!(PROCESS_PREPARATION_LEDGER.usage(), before);
+            }
+        }
+    }
+
+    #[test]
     fn the_cursor_has_exactly_n_allocated_slots_and_a_small_inline_root() {
         assert!(std::mem::size_of::<PreparedTerminalChain>() <= ROOT_BYTES);
         let mut observed = Vec::new();
@@ -594,16 +879,6 @@ mod qualified {
 
     #[test]
     fn whole_patch_failure_leaves_every_existing_occurrence_and_origin_unchanged() {
-        let ticket = ledger().reserve_owned(CONTROL_BYTES).unwrap();
-        let mut carrier = SelectedTerminalCarrier::new(&ticket).unwrap();
-        for _ in 0..5 {
-            carrier.push("x", &[b'a'; 16_384], backend()).unwrap();
-        }
-        carrier.push("x", &[b'b'; 16_100], backend()).unwrap();
-        let before: Vec<_> = carrier
-            .occurrences()
-            .map(|(name, value, origin)| (name.to_vec(), value.to_vec(), origin))
-            .collect();
         let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(Fields {
             values: vec![("x-first", "fits".into()), ("x-last", "z".repeat(16_384))],
             override_existing: true,
@@ -614,7 +889,19 @@ mod qualified {
         let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
             panic!("field operation")
         };
-        assert!(carrier.apply(&patch).is_err());
+        let mut carrier = chain.new_selected_carrier().unwrap();
+        for _ in 0..5 {
+            carrier.push("x", &[b'a'; 16_384], backend()).unwrap();
+        }
+        carrier.push("x", &[b'b'; 16_100], backend()).unwrap();
+        let before: Vec<_> = carrier
+            .occurrences()
+            .map(|(name, value, origin)| (name.to_vec(), value.to_vec(), origin))
+            .collect();
+        assert_eq!(
+            carrier.apply(&patch).unwrap_err().reason,
+            TerminalRefusal::FieldCapacity
+        );
         let after: Vec<_> = carrier
             .occurrences()
             .map(|(name, value, origin)| (name.to_vec(), value.to_vec(), origin))
@@ -625,15 +912,6 @@ mod qualified {
     #[test]
     fn identical_values_rename_and_duplicate_cookies_do_not_bless_backend_origin() {
         for override_existing in [false, true] {
-            let ticket = ledger().reserve_owned(CONTROL_BYTES).unwrap();
-            let mut carrier = SelectedTerminalCarrier::new(&ticket).unwrap();
-            carrier.push("vary", b"Origin", backend()).unwrap();
-            carrier
-                .push("set-cookie", b"opaque=same", backend())
-                .unwrap();
-            carrier
-                .push("set-cookie", b"opaque=same", backend())
-                .unwrap();
             let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(Fields {
                 values: vec![("vary", "Origin".into())],
                 override_existing,
@@ -645,6 +923,14 @@ mod qualified {
             let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
                 panic!("field operation")
             };
+            let mut carrier = chain.new_selected_carrier().unwrap();
+            carrier.push("vary", b"Origin", backend()).unwrap();
+            carrier
+                .push("set-cookie", b"opaque=same", backend())
+                .unwrap();
+            carrier
+                .push("set-cookie", b"opaque=same", backend())
+                .unwrap();
             carrier.apply(&patch).unwrap();
             carrier.rename("vary", "x-renamed").unwrap();
             let origin = carrier
@@ -671,9 +957,6 @@ mod qualified {
 
     #[test]
     fn non_utf8_backend_value_survives_compaction_with_its_origin() {
-        let ticket = ledger().reserve_owned(CONTROL_BYTES).unwrap();
-        let mut carrier = SelectedTerminalCarrier::new(&ticket).unwrap();
-        carrier.push("x-opaque", &[0x80, 0xff], backend()).unwrap();
         let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(Fields {
             values: vec![("x-new", "visible".into())],
             override_existing: true,
@@ -684,6 +967,8 @@ mod qualified {
         let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
             panic!("field operation")
         };
+        let mut carrier = chain.new_selected_carrier().unwrap();
+        carrier.push("x-opaque", &[0x80, 0xff], backend()).unwrap();
         carrier.apply(&patch).unwrap();
         let (_, value, lineage) = carrier
             .occurrences()
@@ -708,10 +993,7 @@ mod qualified {
         let mut retained = String::with_capacity(98_000);
         retained.push('x');
         let mut headers = HashMap::from([("x-retained".to_string(), retained)]);
-        assert!(
-            ferrum_edge::plugins::terminal_preparation::apply_terminal_patch(patch, &mut headers)
-                .is_err(),
-        );
+        assert!(chain.apply_fields(patch, &mut headers).is_err());
         assert_eq!(headers.len(), 1);
         assert_eq!(headers.get("x-retained").unwrap(), "x");
     }
@@ -736,8 +1018,7 @@ mod qualified {
             let TerminalResult::Cookie(cookie) = operation.execute() else {
                 panic!("cookie operation")
             };
-            ferrum_edge::plugins::terminal_preparation::apply_terminal_cookie(cookie, &mut headers)
-                .unwrap();
+            chain.apply_cookie(cookie, &mut headers).unwrap();
         }
         let values: Vec<_> = headers.get("set-cookie").unwrap().split('\n').collect();
         assert_eq!(values, [value.as_str(), value.as_str()]);
@@ -799,8 +1080,7 @@ mod qualified {
             panic!("metrics operation")
         };
         let mut headers = HashMap::new();
-        ferrum_edge::plugins::terminal_preparation::apply_terminal_patch(patch, &mut headers)
-            .unwrap();
+        chain.apply_fields(patch, &mut headers).unwrap();
         assert_eq!(ctx.metadata, ordinary.metadata);
         assert_eq!(headers, ordinary_headers);
         assert_eq!(
@@ -852,8 +1132,7 @@ mod qualified {
                 panic!("metrics trace operation")
             };
             let mut headers = HashMap::new();
-            ferrum_edge::plugins::terminal_preparation::apply_terminal_patch(patch, &mut headers)
-                .unwrap();
+            chain.apply_fields(patch, &mut headers).unwrap();
             if mode == 2 {
                 assert!(headers.is_empty());
                 assert!(!ctx.metadata.contains_key("trace_id"));
@@ -906,8 +1185,7 @@ mod qualified {
         };
         let mut headers = HashMap::new();
         headers.insert("x-ratelimit-identity".into(), "private".into());
-        ferrum_edge::plugins::terminal_preparation::apply_terminal_patch(patch, &mut headers)
-            .unwrap();
+        chain.apply_fields(patch, &mut headers).unwrap();
         assert_eq!(headers, ordinary_headers);
         assert_eq!(headers.get("x-ratelimit-limit"), Some(&value));
         assert!(!headers.contains_key("x-ratelimit-identity"));
@@ -1081,7 +1359,7 @@ mod qualified {
                         match operation.execute() {
                             TerminalResult::Noop => {}
                             TerminalResult::Fields(patch) => {
-                                apply_terminal_patch(patch, &mut actual).unwrap();
+                                chain.apply_fields(patch, &mut actual).unwrap();
                             }
                             _ => panic!("CORS must only decorate fields"),
                         }
@@ -1586,7 +1864,7 @@ mod qualified {
                 let mut actual = initial;
                 while let Some(operation) = chain.next_operation() {
                     if let TerminalResult::Fields(patch) = operation.execute() {
-                        apply_terminal_patch(patch, &mut actual).unwrap();
+                        chain.apply_fields(patch, &mut actual).unwrap();
                     }
                 }
                 assert_eq!(actual, expected);

@@ -951,9 +951,7 @@ impl Drop for RetainedRawOwner {
 
 #[test]
 fn complete_preparation_precedes_ordered_once_only_actions_and_retires_raw_context_views() {
-    use ferrum_edge::plugins::terminal_preparation::{
-        PreparedTerminalChain, TerminalResult, apply_terminal_patch,
-    };
+    use ferrum_edge::plugins::terminal_preparation::{PreparedTerminalChain, TerminalResult};
     let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let plugins: Vec<Arc<dyn Plugin>> = ["first", "second"]
         .into_iter()
@@ -987,7 +985,7 @@ fn complete_preparation_precedes_ordered_once_only_actions_and_retires_raw_conte
         let TerminalResult::Fields(patch) = chain.next_operation().unwrap().execute() else {
             panic!("expected the next ordered field patch");
         };
-        apply_terminal_patch(patch, &mut headers).unwrap();
+        chain.apply_fields(patch, &mut headers).unwrap();
         assert_eq!(headers.get("x-ordered").map(String::as_str), Some(expected));
     }
     assert!(chain.next_operation().is_none());

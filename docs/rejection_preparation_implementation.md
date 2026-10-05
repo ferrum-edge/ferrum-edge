@@ -1,6 +1,6 @@
 # Rejection preparation implementation status
 
-PR #6011, issues #6008/#6009; implementation round 27, preserving rounds 20–26.
+PR #6011, issues #6008/#6009; implementation round 30, preserving rounds 20–29.
 **Draft subset only. P2 remains open; the whole approved contract is not implemented or qualified.**
 The owner approved the complete 883-line round-17 contract identified by SHA-256
 `641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
@@ -131,8 +131,9 @@ The selected carrier checks the actual field table, simultaneous projection
 table and root against 32,768 bytes, and the single byte arena against 98,304.
 It holds 256 real occurrences and compacts in place after complete preflight.
 It is retained by the immediate chain rather than reconstructed for each patch.
-The public legacy adapter performs preflight then exports through existing maps;
-that export is still outside the allocation proof. No second arena is allocated.
+The checked prepared-chain legacy adapter validates the destination request's
+ticket before preflight, then exports through existing maps; that export is still
+outside the allocation proof. No second arena is allocated.
 
 Workload metrics stages its real UDP source-scope restamp through C credit, then
 checks authorization and completes all String adoption before changing metadata.
@@ -216,6 +217,43 @@ construction overlap are charged. All ten acceptance areas, the complete common
 foundation and P2 remain OPEN. ROOT owns exact-head hosted execution, independent
 review and the ferrum-contracts plugin-catalog handoff for the new trait fact.
 The separate unresolved-route HTTP 503/native-gRPC 14 profile stays PENDING.
+
+## Round-30 request custody repair
+
+Every direct selected-carrier field patch now validates its exact request ticket
+before allocating a projection table or changing carrier state. This applies to
+ordinary Set/Remove/Prefix actions as well as CORS Vary actions. The prepared
+chain checks the same ticket before legacy input preflight or first selected
+carrier construction. Existing configured-instance and generation validation at
+preparation remains strict.
+
+The unchecked public cookie copier is private to the checked native chain.
+The free public field adapter that constructed a destination carrier using the
+source patch's ticket is removed. Public legacy application now requires the
+destination's prepared chain and its private admitted custody. Tests use those
+checked routes; no public unchecked map fallback remains. Direct cookie append
+continues to validate custody and retain each opaque occurrence and its lineage.
+This is terminal cookie custody only, not an ordinary OIDC replay claim.
+
+New reachable fixtures prepare two requests from one compiled manifest with the
+same configured producer nonce and distinct admitted tickets. Ordinary
+request-derived Set/Remove patches refuse B's direct carrier without any native
+allocation, occurrence/lineage mutation, backing claim or ledger change, then
+remain valid for A. The last extracted patch retains A's reservation and returns
+its exact native backing and logical ticket sum on drop. Checked legacy field
+and cookie routes refuse before malformed input preflight, with both fresh and
+already selected carriers; B's maps, capacity and backing remain unchanged,
+while A's remaining operations succeed. Existing duplicate-cookie ordering,
+non-UTF-8 compaction, same-ticket field capacity and CORS controls now use checked
+custody. Compile-fail API examples record the removed/private unchecked helpers.
+The exact formatter region printed by the d980 hosted planner is applied.
+
+These fixtures have not been executed locally. Exact-head hosted formatting,
+compilation, lint and runtime results remain UNVERIFIED and are owned by ROOT,
+along with whole-diff inspection and fresh independent review. All ten original
+acceptance areas, complete wire/export allocation proof and P2 remain
+OPEN/UNQUALIFIED. The separate unresolved-route HTTP 503/native-gRPC 14 profile
+remains PENDING; this bounded repair does not qualify the whole contract.
 
 ## Concrete dependency boundary
 

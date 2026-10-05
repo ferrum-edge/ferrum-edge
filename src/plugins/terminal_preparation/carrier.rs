@@ -362,15 +362,7 @@ impl SelectedTerminalCarrier {
     /// Preflight the WHOLE patch before mutating bytes or fields. Suppressed
     /// writes retain their original lineage, including identical backend bytes.
     pub fn apply(&mut self, patch: &TerminalPatch) -> Result<(), TerminalAdmissionError> {
-        if patch
-            .actions
-            .as_slice()
-            .iter()
-            .any(|action| matches!(action, TerminalFieldAction::CorsVary { .. }))
-            && !self.ticket.ptr_eq(&patch.ticket)
-        {
-            return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
-        }
+        patch.validate_ticket(Some(&self.ticket))?;
         let mut projected = FixedSlots::request(MAX_FIELD_OCCURRENCES, &self.ticket)?;
         let mut vary_action = None;
         for field in self.fields.as_slice() {
