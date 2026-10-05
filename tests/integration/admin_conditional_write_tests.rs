@@ -3246,7 +3246,10 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
         bundle.proxy.backend_host = "replacement.example.com".to_string();
         let mut spec = stored_before.snapshot.api_specs[0].clone();
         spec.resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle).unwrap();
-        let error = db.replace_api_spec_bundle(&bundle, &spec).await.unwrap_err();
+        let error = db
+            .replace_api_spec_bundle(&bundle, &spec)
+            .await
+            .unwrap_err();
         let expected_message = if external_mesh {
             format!(
                 "mesh_route_dispatch plugin_config \"external-mesh\" references a spec-owned \
@@ -3273,7 +3276,13 @@ async fn assert_deployment_external_dependencies_refused(db: Arc<dyn DatabaseBac
             "/proxies/dependency?conditional=true&cleanup_orphaned_upstream=false";
         for conditional in [true, false, true] {
             for (method, ordinary_path, conditional_path, body, ordinary_status) in [
-                (Method::DELETE, ordinary_remove, conditional_remove, None, 503),
+                (
+                    Method::DELETE,
+                    ordinary_remove,
+                    conditional_remove,
+                    None,
+                    503,
+                ),
                 (
                     Method::PUT,
                     ordinary_replace.as_str(),
