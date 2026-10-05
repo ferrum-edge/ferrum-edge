@@ -3406,7 +3406,10 @@ async fn assert_plugin_only_replacement_preserves_proxy(
     document: &mut Value,
     hand_added: bool,
 ) {
-    let proxy_id = document["x-ferrum-proxy"]["id"].as_str().unwrap().to_string();
+    let proxy_id = document["x-ferrum-proxy"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let plugin_id = document["x-ferrum-plugins"][0]["id"]
         .as_str()
         .unwrap()
@@ -3862,7 +3865,11 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
         .execute(&pool)
         .await
         .unwrap();
-        let blob_type = if dialect == "postgres" { "BYTEA" } else { "BLOB" };
+        let blob_type = if dialect == "postgres" {
+            "BYTEA"
+        } else {
+            "BLOB"
+        };
         let real_type = if dialect == "mysql" { "FLOAT" } else { "REAL" };
         for (column, sql_type) in [
             ("deployment_future_count", "BIGINT"),
@@ -3879,10 +3886,12 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
             ("deployment_future_null_text", "TEXT"),
             ("deployment_future_null_bytes", blob_type),
         ] {
-            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
         }
         if dialect == "postgres" {
             for column in ["deployment_future_flag", "deployment_future_null_flag"] {
@@ -4003,10 +4012,7 @@ async fn assert_sql_deployment_raw_preservation(db: Arc<DatabaseStore>, dialect:
             assert_eq!(proxy_row[column]["value"], Value::Null);
         }
         if dialect == "sqlite" {
-            assert_eq!(
-                proxy_row["deployment_future_dynamic"]["value"],
-                "007opaque"
-            );
+            assert_eq!(proxy_row["deployment_future_dynamic"]["value"], "007opaque");
             assert_eq!(proxy_row["deployment_future_dynamic"]["value_type"], "TEXT");
         }
         if dialect == "postgres" {
