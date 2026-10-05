@@ -12,7 +12,7 @@
 # tracks the base suite rather than an exact package revision for the same
 # reason the production stage does: a point-release pin would break without
 # bounding anything the digest does not already bound.
-ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
+ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
 ARG TOOLS_BASE=debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 ARG IPROUTE2_VERSION=6.15.0-1
 
