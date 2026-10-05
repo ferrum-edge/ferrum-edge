@@ -1221,7 +1221,7 @@ impl Plugin for RateLimiting {
     }
 
     fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
-        super::terminal_preparation::field_declaration(4096, 8192)
+        super::terminal_preparation::field_declaration(1024, 4096)
     }
 
     fn terminal_preparation_available(&self) -> bool {
@@ -1243,11 +1243,13 @@ impl Plugin for RateLimiting {
                 if let Some(value) = view.context.metadata.get(key) {
                     // Source telemetry is numeric; no arbitrary metadata text
                     // is retained as accounting state in a terminal operation.
-                    if value.parse::<u64>().is_err() {
+                    if value.len() > super::terminal_preparation::MAX_FIELD_VALUE_BYTES
+                        || value.parse::<u64>().is_err()
+                    {
                         return Err(super::terminal_preparation::TerminalAdmissionError::new(
                             super::terminal_preparation::TerminalRefusal::FieldCapacity,
                             value.len(),
-                            20,
+                            super::terminal_preparation::MAX_FIELD_VALUE_BYTES,
                         ));
                     }
                     patch.set(name, value, true)?;

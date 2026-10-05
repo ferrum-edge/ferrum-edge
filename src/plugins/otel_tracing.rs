@@ -23,6 +23,7 @@
 //!   for extensions); `http.request.method` retains the observed token.
 //! - Exporter queues are count- and byte-bounded; diagnostics use redacted URLs.
 
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
@@ -45,6 +46,7 @@ use crate::util::backoff::random_backoff_entropy;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mesh::mesh_trace_attributes;
+use super::terminal_preparation::{TerminalAdmissionError, TerminalRefusal};
 use super::utils::PluginHttpClient;
 use super::utils::byte_budget::{
     JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError, ProcessByteReservation,
@@ -751,6 +753,20 @@ impl OtelTracing {
 
     pub(crate) fn generate_span_id() -> String {
         hex_encode(&Uuid::new_v4().as_bytes()[..8])
+    }
+
+    pub(crate) fn generate_trace_id_fixed() -> Result<[u8; 32], TerminalAdmissionError> {
+        let uuid = terminal_uuid_bytes()?;
+        let mut encoded = [0u8; 32];
+        encode_fixed_hex(&uuid, &mut encoded);
+        Ok(encoded)
+    }
+
+    pub(crate) fn generate_span_id_fixed() -> Result<[u8; 16], TerminalAdmissionError> {
+        let uuid = terminal_uuid_bytes()?;
+        let mut encoded = [0u8; 16];
+        encode_fixed_hex(&uuid[..8], &mut encoded);
+        Ok(encoded)
     }
 
     fn decide_root_sampled(&self) -> bool {
@@ -3416,6 +3432,25 @@ fn unique_header_value_case_insensitive<'a>(
         }
     }
     Ok(value)
+}
+
+fn terminal_uuid_bytes() -> Result<[u8; 16], TerminalAdmissionError> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new().fill(&mut bytes).map_err(|_| {
+        TerminalAdmissionError::new(TerminalRefusal::EntropyUnavailable, 0, 0)
+    })?;
+    // Same version/variant bits as UUID v4, with fallible entropy acquisition.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(bytes)
+}
+
+fn encode_fixed_hex(bytes: &[u8], encoded: &mut [u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (byte, pair) in bytes.iter().zip(encoded.chunks_exact_mut(2)) {
+        pair[0] = HEX[usize::from(byte >> 4)];
+        pair[1] = HEX[usize::from(byte & 0x0f)];
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

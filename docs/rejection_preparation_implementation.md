@@ -1,6 +1,6 @@
 # Rejection preparation implementation status
 
-PR #6011, issues #6008/#6009; implementation round 20 with round-22 repairs.
+PR #6011, issues #6008/#6009; implementation round 24, preserving rounds 20–23.
 **Draft subset only. P2 remains open; the whole approved contract is not implemented or qualified.**
 The owner approved the complete 883-line round-17 contract identified by SHA-256
 `641067eed12615706ff40f2ec81d5797bd379753e905b16ec265f02bedf60346`.
@@ -11,7 +11,7 @@ profile is approved; interim refusals below are not final qualification of it.
 ## Implemented runtime boundary
 
 - The actual protocol-filtered R/C union compiles into a generation-owned,
-  fixed 64-entry manifest. R includes reject delegates; C includes ordinary
+  exact-N out-of-line manifest (N at most 64). R includes reject delegates; C includes ordinary
   charged-terminal non-replacers even with a default-false reject gate. Actual
   declarations and instance identity determine enrollment. Custom reported
   names never grant a declaration. Pure built-in candidate placeholders call
@@ -56,20 +56,23 @@ profile is approved; interim refusals below are not final qualification of it.
   One-shot HEAD/cookie preparers check
   action eligibility before consuming state; suppressed capture must still
   prepare independently.
-- Field patches check output/action credit before allocation, use fixed vector
-  capacity and exact-size boxed fields, and reject invalid custom names/CRLF.
-  Cursor growth checks actual String capacities, map backing, cookie field
-  occurrences, peak replacement allocation and the 98,304 + 32,768-byte carrier
-  split. Limits remain 256 occurrences, 256-byte names, 16,384-byte values,
-  64 patch actions and 16,384-byte cookies. Cookie preparation moves the staged
-  string through a private capacity-checked `TerminalCookie` wrapper; it is
-  neither cloned nor consumed twice.
+- Field patches and cookies use allocation-backed action tables and exact-length
+  copied blocks. The locked allocator's `nallocx` supplies each layout's backing
+  class before the shared credit permits `mallocx`; native backing drops before
+  credit. No `capacity * 64` collection-layout estimate remains in this path.
+  Whole-patch occurrence/arena preflight finishes before the selected carrier
+  mutates. Each value carries producer instance, policy contribution, section
+  and epoch before copying; identical configured overrides have their own
+  origin, override-false retains the prior origin, and rename preserves origin.
+  Legacy input enters as Unknown. Duplicate opaque cookie occurrences remain
+  separate in the carrier. The legacy String/map export remains unqualified.
 - Failed frontend admission emits static HTTP 503 JSON (empty HEAD content),
   native gRPC HTTP 200 Trailers-Only status 8, or exact binary/base64 gRPC-Web
   status-8 trailer DATA profiles with canonical content type/expose/Vary fields.
   H1/H2 drop the request intake before return; H3 stops intake after its bounded
-  terminal write. The fixed emergency header/body shape uses the independent
-  4,096-byte allowance and calls no plugin or recursive rejection chain.
+  terminal write. The wire values/body are static and invoke no plugin or
+  recursive rejection chain. The HeaderMap constructor still allocates:
+  pre-owned emergency backing and its independent 4,096-byte proof are pending.
 - A fresh gateway-authored terminal can retain its headers in place through a
   later deadline without creating an old provenance snapshot. Existing mixed
   backend/gateway snapshot lineage is **explicitly unsupported/refused**; typed
@@ -85,17 +88,85 @@ profile is approved; interim refusals below are not final qualification of it.
 | --- | --- |
 | `otel_tracing` | Canonical 55-byte traceparent field; C/O 1,024 each. |
 | `correlation_id` | Private request ID, at most 8,192 bytes; C/O 12,288 each. |
-| `rate_limiting` | Identity-field removal and three validated numeric telemetry fields; C 4,096 / O 8,192. No new Redis operation here. |
+| `rate_limiting` | Identity-field removal and three checked numeric telemetry fields; approved C 1,024 / O 4,096 restored. Valid long leading-zero values are retained when they fit actual O credit; no 20-digit input assumption. No new Redis operation here. |
 | `security_headers` | Config-derived exact field/action output, at most 65,536; C 1,024. Oversize refuses the whole composition rather than omitting/quarantining this security participant. |
-| `oidc_relying_party` | Move staged cookie once, capacity at most 16,384; C/O 16,384 each. |
+| `oidc_relying_party` | Check staged capacity, copy into charged exact-length backing, then retire the staged String once; C/O 16,384 each. Suppressed actions do not consume it. |
 | `spec_expose` | Consume the HEAD marker once and emit EmptyBody; C/O 1,024 each. |
 | `ai_semantic_cache` | Closed cache-status field; C/O 1,024 each. |
 | `ExamplePlugin` | Custom two-field patch built with admitted credit; C 1,024 / O 16,384. |
+| `mesh/workload_metrics` | Actual synchronous reject restamp and traceparent operation; C 16,384 / O 4,096 / W 0. Borrowed authenticated peer/header/config facts, composed CEL label requirements, sampling/B3/W3C state and capture-marker retirement; no cloned raw header map in the operation. |
 
 The round-19 explicit no-op inventory remains. Pure candidate rows now delegate
 to those same source-owned declarations. Deferred CORS and the mesh request-only
 sentinel are no-ops; **the active CORS response finalizer is still refused**.
 No source-owned registry row trusts an arbitrary runtime `Plugin::name()`.
+
+## Round-24 storage boundary and exact gaps
+
+`terminal_storage` executes plans against the locked prefixed jemalloc, including
+when a non-Windows library uses System globally. `Layout` includes actual typed
+padding/alignment; `nallocx` includes the allocator class. Every generation block,
+shared header, exact-N slot table, patch field and carrier table/arena claims its
+backing before native allocation. Growth keeps old and candidate backing charged
+until the old backing drops. The process ledger owns no block or ticket, so
+block → ticket → ledger ownership has no strong cycle. A thin shared owner keeps
+its original header alive without another allocation until the last clone.
+Generation tables/header use the same 128 MiB ledger without request tickets.
+Frozen protocol/eligibility/declaration/source references are selected once at
+compilation; preparation does not query them again. Prepared field operations
+must carry the current ticket and configured instance nonce; cookies must carry
+the current producer nonce before they can enter the cursor.
+
+The scoped workspace API lends initialized fixed backing only for the synchronous
+callback. A higher-ranked borrow and sealed allocation-free return types prevent
+scratch-backed views, parser trees, closures or futures from escaping as callback
+results; backing drops before W credit. This does **not**
+prove arbitrary parser heap allocations, captured callback state, or custom Rust
+code bounded. Those require the reviewed private codec implementation.
+
+The selected carrier checks the actual field table, simultaneous projection
+table and root against 32,768 bytes, and the single byte arena against 98,304.
+It holds 256 real occurrences and compacts in place after complete preflight.
+It is retained by the immediate chain rather than reconstructed for each patch.
+The public legacy adapter performs preflight then exports through existing maps;
+that export is still outside the allocation proof. No second arena is allocated.
+
+Workload metrics stages its real UDP source-scope restamp through C credit, then
+checks authorization and completes all String adoption before changing metadata.
+Adoption requires the binary's explicitly registered matching global jemalloc and
+spare existing metadata-table capacity; a System-global library or required table
+growth explicitly refuses. Ordinary admitted successful hooks are unchanged.
+B3 validation now borrows validated identifiers; new terminal trace IDs use
+fallible fixed-buffer randomness through the existing crypto-provider seam.
+No baggage tree is parsed on the restamp branch: the existing authorization
+marker unconditionally selects the authenticated attesting-peer fallback.
+
+The **complete common foundation is not yet closed**. Remaining gaps include:
+
+- Transport handoff still constructs legacy Strings, HashMaps, HeaderMaps and
+  dynamic HeaderName/Bytes owners outside the new allocation API. The ordinary
+  three-map provenance recorder remains. Core diagnostics, sticky cookies and
+  native-gRPC encoded cells are not migrated producers. The carrier lacks mixed
+  append segments and explicit identical-token contribution/dedup handling.
+- Pre-owned emergency backing is absent. No 4 KiB emergency or complete 128 KiB
+  wire-handoff proof is claimed. Existing earlier-authoritative terminal handling
+  is preserved; no unresolved-route/native-14 policy was introduced.
+- Existing plugin/config objects are constructed before these generation tables;
+  their complete candidate/old configuration construction overlap is not charged.
+  Generic context clones still copy legacy metadata Strings without obtaining
+  additional backing credit. Custody pins cover adopted originals only.
+- Body/decode retirement retains prior repairs, but raw request headers and all
+  collector/replay siblings still need complete retirement proof. There is no
+  reviewed typed external executor/detach factory or custody cleanup variant.
+- Windows has no qualified nonzero storage allocator and refuses. Non-Windows
+  explicit blocks have source-backed plans, but hosted linkage/layout/FIPS and
+  complete participant proof remain pending. This is no universal Rust allocator
+  or process-RSS claim. Unknown custom implementations stay undeclared unless
+  they supply an actual bounded typed preparation implementation.
+
+All ten approved runtime acceptance areas remain **UNQUALIFIED**. This round
+adds actual storage and the first active Mesh participant; it does not authorize
+landing the original P2 or claim the whole foundation, audit or Redis complete.
 
 ## Concrete dependency boundary
 
@@ -145,11 +216,11 @@ boundary before declaring the limiter migration conforming.
 | Audit (section 6) | All `ai_transcript_audit` and `transaction_debugger` active terminal capture remains Undeclared/refused. No private per-instance Complete/Refuted/Unfinished reached-body/method/header authority, staging guard transfer, immediate audit abort, or record-lease move has been implemented. Shared `MD_FINAL_REQ_SEEN` is not replaced. |
 | Bounded audit parser | No bounded JSON/protobuf/redaction arena or reserve-before-node/encoder growth migration. Ordinary `serde_json::Value` paths are not claimed conforming. |
 | Limiter / paid provider | `ai_rate_limiter`, including local/federation accounting and Redis reconciliation, remains Undeclared/refused before request provider work in configured terminal chains. No paid-operation cancellation/once/uncertainty semantics are invented. Root must implement the bounded RESP path described above with existing pool/TLS/config/deadline semantics. |
-| Other active hooks | `CorsPlugin`/`CorsFinalizer`, `response_transformer`/core route-header finalizer, `compression`, `sse`, `mesh/workload_metrics`, `a2a_gateway`, `ai_federation`, `ai_stream_router`, `body_validator`, `openapi_validator`, `waf`, `ai_response_guard`, `response_size_limiting`, `response_caching`, `grpc_web`, `transaction_debugger`, and the audit/limiter rows above remain Undeclared/refused in their effective HTTP R/C union. There is no opaque fallback. Configuring a currently unmigrated participant can reject an otherwise valid proxy config. |
+| Other active hooks | `CorsPlugin`/`CorsFinalizer`, `response_transformer`/core route-header finalizer, `compression`, `sse`, `a2a_gateway`, `ai_federation`, `ai_stream_router`, `body_validator`, `openapi_validator`, `waf`, `ai_response_guard`, `response_size_limiting`, `response_caching`, `grpc_web`, `transaction_debugger`, and the audit/limiter rows above remain Undeclared/refused in their effective HTTP R/C union. There is no opaque fallback. Configuring a currently unmigrated participant can reject an otherwise valid proxy config. |
 | External operations / cursor | Add reviewed typed I/O/result/cleanup variants, selected-response scope and replacement/result replay, authorization/deadline rechecks before every external poll, independent finite detach summary, held-operation cancellation and once/paid-state semantics. The immediate driver is not an implementation of these requirements. |
 | Provenance / final policies | Migrate mixed backend/gateway provenance, exact authored-field/cookie occurrence ownership and route finalizers under finite cursor credit; preserve every admitted terminal's final header/body policy and HEAD/CORS/compression semantics. Current legacy-lineage refusal must be retired by the full migration. |
 | Complete teardown proof | Context retirement and existing retained-upload handoffs are connected, but every raw caller/replay/decode/collector/request-view sibling and cancellation site still needs exact-head real ownership proof. Committed-response/logging observers keep their existing separate lifecycle; no claim is made that their opaque state is a conforming typed terminal operation. |
-| Capacity details | Qualified fixed-arena emergency storage, header-map allocator/backing bounds, replacement field occurrence accounting, all key/prefix/wire encoder bounds and all per-symbol temporary allocations still need full implementation/hosted proof. New constants and conservative checks are not sufficient evidence. |
+| Capacity details | Pre-owned emergency storage, foreign header/map/name/Bytes owner backing and wire conversion overlap remain unimplemented. New constants and a charged arena do not qualify those legacy allocations. All key/prefix/Redis encoder and active participant temporary bounds still need actual migration. |
 | Config / governance | Hosted full/delta/global/custom/trigger/pure-CP/admin/DB/DP publication parity is pending. Config-dependent declarations for every active hook are pending. Root must publish the edge-owned plugin-catalog contract handoff; this branch does not claim ferrum-contracts publication. |
 
 `mcp_gateway` is a distinct existing case: its default-false reject gate plus
@@ -158,6 +229,40 @@ Its ordinary successful-response lifecycle remains unchanged; no new terminal
 operation is claimed. Configuring future terminal eligibility without a real
 declaration will refuse it. Enabled inactive audits still conservatively refuse
 until their config-derived no-op declaration is implemented.
+
+## Round-24 source and hosted fixture inventory
+
+The locked published archives were read statically and SHA-256 verified:
+
+| Crate | Version | SHA-256 |
+| --- | --- | --- |
+| `tikv-jemallocator` | 0.6.1 | `0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a` |
+| `tikv-jemalloc-ctl` | 0.6.1 | `661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c` |
+| `tikv-jemalloc-sys` | 0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7 | `cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b` |
+| `http` | 1.4.0 | `e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a` |
+| `bytes` | 1.11.1 | `1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33` |
+| `uuid` | 1.23.1 | `ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76` |
+
+The sys API defines prefixed `nallocx`/`mallocx`/`sdallocx`, matching alignment
+flags and the sized-deallocation range. The allocator's global String
+allocation/deallocation has the matching align-1 exact-capacity layout. In
+contrast, `http` owns private bucket/index/extra tables and dynamic names, and
+`Bytes::from_owner` creates a boxed owner: neither is proved by logical capacity.
+`Uuid::new_v4` can panic on entropy failure; the new terminal helper avoids it.
+No dependency, lockfile, release history, version or chart is changed.
+
+`terminal_allocator_tests` installs the production global jemalloc in its own
+hosted target. Fixtures read jemalloc's native per-thread cumulative allocated
+and deallocated bytes, including direct native calls. Production code contains no
+fixture allocation counter. The gateway-core CI shard precompiles and
+runs this target. Fixtures exercise pre-allocation refusal at byte/ticket and
+per-request pressure, last-owner release, exact N slots and small inline root,
+65-participant candidate refusal with the prior generation retained, duplicate
+actual-instance rejection, scoped W reuse, huge-capacity/tiny-value input refusal,
+whole-patch atomicity and legacy refusal before mutation, identical-value
+override/rename origins, non-UTF-8 retention, duplicate opaque cookies with
+independent value limits, 256/257 real occurrences, long numeric telemetry and actual metrics
+restamp versus its ordinary hook. These fixtures have **not** run locally.
 
 ## Tests and qualification
 

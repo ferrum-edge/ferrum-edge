@@ -529,7 +529,7 @@ jobs:
             precompile: "--test unit_plugins_b_tests"
             target: unit_plugins_b_tests
           - shard: gateway-core
-            precompile: "--test unit_gateway_core_tests"
+            precompile: "--test unit_gateway_core_tests --test terminal_allocator_tests"
             target: unit_gateway_core_tests
     env:
       # Cold-cache full-workspace compiles repeatedly kill this hosted runner
@@ -727,6 +727,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/unit-ci"
           /usr/bin/time --format='wall_seconds=%e max_child_rss_kib=%M major_faults=%F minor_faults=%R exit_status=%x' --output="$RUNNER_TEMP/unit-ci/default-unit.time" cargo test --test "$UNIT_TARGET" 2>&1 | tee "$RUNNER_TEMP/unit-ci/default-unit.log"
           python3 .github/scripts/run_unit_ci.py default-unit
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Exercise terminal storage with the production allocator
+        if: matrix.shard == 'gateway-core'
+        run: cargo test --test terminal_allocator_tests -- --test-threads=1
         env:
           RUST_BACKTRACE: 1
 

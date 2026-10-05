@@ -5033,7 +5033,7 @@ pub struct PluginPhaseData {
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Reload-compiled, actual-instance terminal union or whole-chain refusal.
     terminal_manifest: Result<
-        Arc<crate::plugins::terminal_preparation::TerminalManifest>,
+        crate::plugins::terminal_preparation::TerminalGeneration,
         crate::plugins::terminal_preparation::TerminalAdmissionError,
     >,
     /// Reload-compiled pure route selection and dependency topology.
@@ -5246,7 +5246,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         ),
         response_committed_plugins: Arc::new(response_committed),
         terminal_manifest: crate::plugins::terminal_preparation::compile_terminal_manifest(plugins)
-            .map(Arc::new),
+            .and_then(crate::plugins::terminal_preparation::TerminalManifest::into_generation),
         early_route_total_plan: Arc::new(
             crate::plugins::early_route_total::EarlyRouteTotalPlan::compile(plugins),
         ),
@@ -6177,7 +6177,7 @@ impl PluginCacheInner {
             conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
             response_committed_plugins: Arc::new(Vec::new()),
             response_presentation_policy_digest: None,
-            terminal_manifest: Ok(Arc::default()),
+            terminal_manifest: crate::plugins::terminal_preparation::empty_terminal_generation(),
             early_route_total_plan: Arc::default(),
             capabilities: PluginCapabilities::default(),
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
@@ -6230,7 +6230,7 @@ pub struct PluginCacheRequestView {
     response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_presentation_policy_digest: Option<[u8; 32]>,
     terminal_manifest: Result<
-        Arc<crate::plugins::terminal_preparation::TerminalManifest>,
+        crate::plugins::terminal_preparation::TerminalGeneration,
         crate::plugins::terminal_preparation::TerminalAdmissionError,
     >,
     /// Reload-compiled pure route selection and dependency topology.
@@ -6252,7 +6252,7 @@ impl PluginCacheRequestView {
         ctx: &mut RequestContext,
     ) -> Result<(), crate::plugins::terminal_preparation::TerminalAdmissionError> {
         let manifest = self.terminal_manifest.as_ref().map_err(|error| *error)?;
-        ctx.pin_terminal_manifest(Arc::clone(manifest))
+        ctx.pin_terminal_manifest(manifest.clone())
     }
 
     pub(crate) fn early_route_total_selection(

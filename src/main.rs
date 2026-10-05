@@ -44,6 +44,13 @@ unsafe impl Sync for JemallocConf {}
 pub static malloc_conf: JemallocConf = JemallocConf(c"tcache_max:131072".as_ptr());
 
 fn main() {
+    #[cfg(not(windows))]
+    // SAFETY: GLOBAL above is this locked jemalloc, optionally through the
+    // allocation-free forwarding profiler. No worker has started yet.
+    unsafe {
+        plugins::terminal_storage::register_global_jemalloc();
+    }
+
     #[cfg(all(not(windows), feature = "bench-h1-profile"))]
     h1_profile::register_global_allocator();
 

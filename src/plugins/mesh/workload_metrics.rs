@@ -11,6 +11,12 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+mod terminal;
+
+pub(crate) fn terminal_composition_declaration() -> crate::plugins::TerminalDeclaration {
+    terminal::declaration()
+}
+
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::MeshTrafficDirection;
 use crate::modes::mesh::config::{MeshMetricsConfig, MeshTracingConfig, TracingProvider};
@@ -1271,6 +1277,24 @@ impl Plugin for WorkloadMetrics {
         PluginResult::Continue
     }
 
+    fn terminal_declaration(&self) -> crate::plugins::TerminalDeclaration {
+        terminal::declaration()
+    }
+
+    fn terminal_preparation_available(&self) -> bool {
+        true
+    }
+
+    fn prepare_terminal(
+        &self,
+        view: &mut crate::plugins::terminal_preparation::ReachedRequestView<'_>,
+    ) -> Result<
+        crate::plugins::terminal_preparation::PreparedTerminalOp,
+        crate::plugins::terminal_preparation::TerminalAdmissionError,
+    > {
+        self.prepare_bounded_terminal(view)
+    }
+
     fn applies_after_proxy_on_reject(&self) -> bool {
         // Always participate in reject-path `after_proxy`: even with tracing
         // disabled, a mesh_authz UDP source-scope reject needs its RED /
@@ -2508,23 +2532,68 @@ fn b3_sampling_decision(headers: &HashMap<String, String>) -> Option<bool> {
 }
 
 fn has_b3_trace_context(headers: &HashMap<String, String>) -> bool {
-    if let Some(value) = header_value(headers, "b3") {
-        return parse_b3_single_trace_context(value).is_some();
-    }
+    borrowed_b3_context(headers).is_some()
+}
 
-    header_value(headers, "x-b3-traceid")
-        .and_then(normalize_b3_trace_id)
-        .is_some()
-        && header_value(headers, "x-b3-spanid")
-            .and_then(normalize_b3_span_id)
-            .is_some()
+#[derive(Clone, Copy)]
+struct BorrowedB3Context<'a> {
+    trace_id: &'a str,
+    span_id: &'a str,
+    sampled: Option<bool>,
+}
+
+fn valid_b3_id(value: &str, trace: bool) -> bool {
+    (value.len() == 16 || (trace && value.len() == 32))
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().any(|byte| byte != b'0')
+}
+
+fn borrowed_b3_single(value: &str) -> Option<BorrowedB3Context<'_>> {
+    let mut parts = value.trim().split('-');
+    let trace_id = parts.next()?.trim();
+    let span_id = parts.next()?.trim();
+    if !valid_b3_id(trace_id, true) || !valid_b3_id(span_id, false) {
+        return None;
+    }
+    let sampled = match parts.next() {
+        Some(value) => Some(b3_sampling_state(value)?),
+        None => None,
+    };
+    if let Some(parent) = parts.next()
+        && !valid_b3_id(parent.trim(), false)
+    {
+        return None;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(BorrowedB3Context {
+        trace_id,
+        span_id,
+        sampled,
+    })
+}
+
+fn borrowed_b3_context(headers: &HashMap<String, String>) -> Option<BorrowedB3Context<'_>> {
+    if let Some(value) = header_value(headers, "b3") {
+        return borrowed_b3_single(value);
+    }
+    let trace_id = header_value(headers, "x-b3-traceid")?.trim();
+    let span_id = header_value(headers, "x-b3-spanid")?.trim();
+    if !valid_b3_id(trace_id, true) || !valid_b3_id(span_id, false) {
+        return None;
+    }
+    Some(BorrowedB3Context {
+        trace_id,
+        span_id,
+        sampled: None,
+    })
 }
 
 #[derive(Debug, Clone)]
 struct B3SingleTraceContext {
     trace_id: String,
     span_id: String,
-    sampled: Option<bool>,
 }
 
 fn b3_single_sampling_decision(value: &str) -> Option<bool> {
@@ -2533,28 +2602,14 @@ fn b3_single_sampling_decision(value: &str) -> Option<bool> {
         return b3_sampling_state(trimmed);
     }
 
-    parse_b3_single_trace_context(trimmed).and_then(|context| context.sampled)
+    borrowed_b3_single(trimmed).and_then(|context| context.sampled)
 }
 
 fn parse_b3_single_trace_context(value: &str) -> Option<B3SingleTraceContext> {
-    let mut parts = value.trim().split('-');
-    let trace_id = normalize_b3_trace_id(parts.next()?)?;
-    let span_id = normalize_b3_span_id(parts.next()?)?;
-    let sampled = match parts.next() {
-        Some(state) => Some(b3_sampling_state(state)?),
-        None => None,
-    };
-    if let Some(parent_span_id) = parts.next() {
-        normalize_b3_span_id(parent_span_id)?;
-    }
-    if parts.next().is_some() {
-        return None;
-    }
-
+    let borrowed = borrowed_b3_single(value)?;
     Some(B3SingleTraceContext {
-        trace_id,
-        span_id,
-        sampled,
+        trace_id: normalize_b3_trace_id(borrowed.trace_id)?,
+        span_id: normalize_b3_span_id(borrowed.span_id)?,
     })
 }
 

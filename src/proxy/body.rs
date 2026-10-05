@@ -63,7 +63,7 @@ pub struct ProxyBody {
     /// decrementing `OverloadState.active_requests`.
     _request_guard: Option<crate::overload::RequestGuard>,
     _terminal_preparation_ticket:
-        Option<Arc<crate::plugins::terminal_preparation::ControlReservation<'static>>>,
+        Option<crate::plugins::terminal_storage::TerminalTicket>,
     /// Dropped when a reqwest-backed response body finishes, so the
     /// runtime port-pressure estimate tracks streaming backend sockets too.
     _reqwest_backend_guard: Option<crate::runtime_metrics::ReqwestBackendRequestGuard>,
@@ -1083,7 +1083,7 @@ impl ProxyBody {
     /// Keep the shared admission ticket alive through the response lifetime.
     pub(crate) fn with_terminal_preparation_ticket(
         mut self,
-        ticket: Option<Arc<crate::plugins::terminal_preparation::ControlReservation<'static>>>,
+        ticket: Option<crate::plugins::terminal_storage::TerminalTicket>,
     ) -> Self {
         self._terminal_preparation_ticket = ticket;
         self

@@ -147,16 +147,19 @@ impl Plugin for SecurityHeaders {
     fn terminal_declaration(&self) -> super::terminal_preparation::TerminalDeclaration {
         use super::terminal_preparation::{
             MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_PATCH_ACTIONS, TerminalDeclaration,
-            field_declaration,
+            field_declaration, field_output_bound,
         };
         let fields = self.set.len() + self.remove.len();
-        let owned: usize = self
-            .set
-            .iter()
-            .map(|(name, value)| name.len() + value.len())
-            .sum::<usize>()
-            + self.remove.iter().map(String::len).sum::<usize>();
-        let required = owned.saturating_add(fields.saturating_mul(128).saturating_add(1024));
+        let required = field_output_bound(
+            fields,
+            self.set
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .chain(self.remove.iter().map(|name| (name.as_str(), ""))),
+        );
+        let Ok(required) = required else {
+            return TerminalDeclaration::Undeclared;
+        };
         if fields > MAX_PATCH_ACTIONS
             || required > 65_536
             || self.set.iter().any(|(name, value)| {

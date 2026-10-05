@@ -24626,8 +24626,7 @@ async fn run_after_proxy_hooks_on_rejection(
     charged_backend_deadline: bool,
 ) {
     use crate::plugins::terminal_preparation::{
-        PreparedTerminalChain, TerminalResult, apply_terminal_cookie, apply_terminal_patch,
-        validate_terminal_headers,
+        PreparedTerminalChain, TerminalResult, validate_terminal_headers,
     };
     let previous_replaceable_marker = if response_body.is_some() {
         ctx.metadata.insert(
@@ -24753,10 +24752,15 @@ async fn run_after_proxy_hooks_on_rejection(
                 response_headers,
             );
         }
+        if ctx.gateway_deadline_response_selected()
+            && chain.reset_selected(response_headers).is_err()
+        {
+            break;
+        }
         let result = match operation.execute() {
             TerminalResult::Noop => Ok(()),
-            TerminalResult::Fields(patch) => apply_terminal_patch(patch, response_headers),
-            TerminalResult::Cookie(cookie) => apply_terminal_cookie(cookie, response_headers),
+            TerminalResult::Fields(patch) => chain.apply_fields(patch, response_headers),
+            TerminalResult::Cookie(cookie) => chain.apply_cookie(cookie, response_headers),
             TerminalResult::EmptyBody => {
                 if !authoritative
                     && !ctx.gateway_deadline_response_selected()
@@ -26331,8 +26335,7 @@ fn run_prepared_charged_terminal_hooks(
     headers: &mut HashMap<String, String>,
 ) {
     use crate::plugins::terminal_preparation::{
-        PreparedTerminalChain, TerminalResult, apply_terminal_cookie, apply_terminal_patch,
-        validate_terminal_headers,
+        PreparedTerminalChain, TerminalResult, validate_terminal_headers,
     };
     if let Some(termination) = ctx.precommit_response_phase_bound().elapsed_authorization() {
         ctx.retire_terminal_request_views();
@@ -26384,8 +26387,8 @@ fn run_prepared_charged_terminal_hooks(
         }
         let applied = match operation.execute() {
             TerminalResult::Noop | TerminalResult::EmptyBody => Ok(()),
-            TerminalResult::Fields(patch) => apply_terminal_patch(patch, headers),
-            TerminalResult::Cookie(cookie) => apply_terminal_cookie(cookie, headers),
+            TerminalResult::Fields(patch) => chain.apply_fields(patch, headers),
+            TerminalResult::Cookie(cookie) => chain.apply_cookie(cookie, headers),
         };
         if applied.is_err() {
             break;

@@ -7,7 +7,10 @@ The effective HTTP R/C union is admitted before lifecycle/body/provider work;
 undeclared or unimplemented participants refuse the complete composition.
 Rejection and charged-terminal runners prepare the whole admitted chain
 synchronously, retire context-owned upload views, and consume closed immediate
-operations once in order. They never adapt the ordinary async `after_proxy`.
+operations once in order. Charged exact-N storage and field-origin records now
+back the immediate operations, including active workload-metrics preparation.
+Legacy wire conversion, emergency storage and complete provenance remain open.
+They never adapt the ordinary async `after_proxy`.
 Audit, limiter/Redis, CORS/finalizer, transformers, compression, mixed response
 provenance and external terminal operations remain refused or unimplemented;
 P2 and hosted runtime qualification remain open. See the

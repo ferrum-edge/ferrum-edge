@@ -124,6 +124,7 @@ pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod tcp_logging;
 pub mod terminal_preparation;
+pub mod terminal_storage;
 pub use terminal_preparation::TerminalDeclaration;
 pub mod transaction_debugger;
 pub mod transaction_log_schema;
@@ -3179,10 +3180,12 @@ pub struct RequestContext {
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
     /// One process ticket shared by request clones, response and terminal slots.
-    pub(crate) terminal_manifest_pin: Option<Arc<terminal_preparation::TerminalManifest>>,
+    pub(crate) terminal_manifest_pin: Option<terminal_preparation::TerminalGeneration>,
     terminal_response_gateway_owned: bool,
     pub(crate) terminal_control_reservation:
-        Option<Arc<terminal_preparation::ControlReservation<'static>>>,
+        Option<terminal_storage::TerminalTicket>,
+    pub(crate) terminal_metadata_custody:
+        Option<terminal_storage::SharedTerminal<terminal_preparation::TerminalMetadataCustody>>,
     /// Native-H3 collector admission, transferred once onto its Bytes owner.
     /// Private and unlogged; retained replacements acquire independent admission.
     pub(crate) request_buffer_charge:
@@ -4125,6 +4128,7 @@ impl RequestContext {
             terminal_manifest_pin: None,
             terminal_response_gateway_owned: false,
             terminal_control_reservation: None,
+            terminal_metadata_custody: None,
             request_buffer_charge: None,
             request_body_sha256: None,
             request_body_sha512: None,
@@ -4637,7 +4641,7 @@ impl RequestContext {
 
     pub(crate) fn pin_terminal_manifest(
         &mut self,
-        manifest: Arc<terminal_preparation::TerminalManifest>,
+        manifest: terminal_preparation::TerminalGeneration,
     ) -> Result<(), terminal_preparation::TerminalAdmissionError> {
         self.admit_terminal_manifest(&manifest)?;
         self.terminal_manifest_pin = Some(manifest);
@@ -4673,9 +4677,9 @@ impl RequestContext {
             return Ok(());
         }
         if let Some(ticket) = manifest.admit(&terminal_preparation::PROCESS_PREPARATION_LEDGER)? {
-            let ticket = Arc::new(ticket);
+            let ticket = terminal_storage::TerminalTicket::new_ticket(ticket)?;
             let _ = terminal_preparation::RESPONSE_TERMINAL_TICKET.try_with(|slot| {
-                *slot.borrow_mut() = Some(Arc::clone(&ticket));
+                *slot.borrow_mut() = Some(ticket.clone());
             });
             self.terminal_control_reservation = Some(ticket);
         }
@@ -5798,6 +5802,7 @@ impl RequestContext {
             terminal_manifest_pin: self.terminal_manifest_pin.clone(),
             terminal_response_gateway_owned: self.terminal_response_gateway_owned,
             terminal_control_reservation: self.terminal_control_reservation.clone(),
+            terminal_metadata_custody: self.terminal_metadata_custody.clone(),
             request_buffer_charge: None,
             request_body_sha256: None,
             request_body_sha512: None,

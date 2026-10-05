@@ -8,7 +8,26 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+use super::terminal_storage::{
+    AllocationBlock, AllocationPlan, FixedSlots, SharedTerminal, TerminalTicket,
+};
+
+mod carrier;
+pub use carrier::SelectedTerminalCarrier;
+
+#[derive(Clone, Debug)]
+pub struct TerminalGeneration(Option<SharedTerminal<TerminalManifest>>);
+
+impl std::ops::Deref for TerminalGeneration {
+    type Target = TerminalManifest;
+
+    fn deref(&self) -> &TerminalManifest {
+        static EMPTY: TerminalManifest = TerminalManifest::new();
+        self.0.as_deref().unwrap_or(&EMPTY)
+    }
+}
 
 pub const PROCESS_BYTES: usize = 128 * 1024 * 1024;
 pub const REQUEST_TICKETS: usize = 1024;
@@ -148,6 +167,9 @@ pub enum TerminalRefusal {
     AuthorizationExpired,
     AlreadyPrepared,
     PinnedGeneration,
+    AllocatorUnavailable,
+    AllocationFailure,
+    EntropyUnavailable,
 }
 
 /// Fixed reasons and numeric counts only; no request values or provider errors.
@@ -196,17 +218,29 @@ pub struct TerminalManifestEntry {
     pub wrapped: bool,
 }
 
-/// Generation-owned, fixed-capacity manifest. Building it performs neither
+/// Generation-owned, exactly sized manifest. Building it performs neither
 /// trigger evaluation nor per-request staging allocation.
-#[derive(Clone, Debug)]
 pub struct TerminalManifest {
-    entries: [Option<TerminalManifestEntry>; MAX_PARTICIPANTS],
+    entries: Option<FixedSlots<TerminalManifestEntry>>,
+    source_chain: Option<FixedSlots<std::sync::Arc<dyn super::Plugin>>>,
+    sources: Option<FixedSlots<std::sync::Arc<dyn super::Plugin>>>,
     len: usize,
     unrounded_control: usize,
     control: usize,
     workspace: usize,
     earlier_cursor_writes: TerminalFacts,
     refusal: Option<TerminalAdmissionError>,
+}
+
+impl fmt::Debug for TerminalManifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TerminalManifest")
+            .field("entries", &self.entries)
+            .field("control", &self.control)
+            .field("workspace", &self.workspace)
+            .field("refusal", &self.refusal)
+            .finish()
+    }
 }
 
 impl Default for TerminalManifest {
@@ -222,44 +256,28 @@ impl TerminalManifest {
         self: &std::sync::Arc<Self>,
         ctx: &mut super::RequestContext,
     ) -> Result<(), TerminalAdmissionError> {
-        ctx.pin_terminal_manifest(std::sync::Arc::clone(self))
+        // The public Arc convenience entry is copied into charged generation
+        // storage. Runtime cache handles already use TerminalGeneration.
+        ctx.pin_terminal_manifest(self.try_clone()?.into_generation()?)
     }
 
     fn matches_plugins(&self, plugins: &[std::sync::Arc<dyn super::Plugin>]) -> bool {
-        let mut index = 0;
-        for plugin in plugins {
-            let eligibility = TerminalEligibility {
-                rejection: plugin.applies_after_proxy_on_reject(),
-                charged: !plugin.may_replace_rejection_response(),
-            };
-            if !eligibility.participates()
-                || !plugin.supported_protocols().iter().any(|protocol| {
-                    matches!(
-                        protocol,
-                        super::ProxyProtocol::Http | super::ProxyProtocol::Grpc
-                    )
-                })
-            {
-                continue;
-            }
-            let pointer = std::sync::Arc::as_ptr(plugin) as *const () as usize;
-            let actual = TerminalManifestEntry {
-                instance: TerminalInstanceToken(pointer as u64),
-                declaration: plugin.terminal_declaration(),
-                eligibility,
-                wrapped: plugin.terminal_is_wrapped(),
-            };
-            if index == self.len || self.entries[index] != Some(actual) {
-                return false;
-            }
-            index += 1;
-        }
-        index == self.len
+        let Some(chain) = &self.source_chain else {
+            return self.len == 0 && plugins.is_empty();
+        };
+        chain.as_slice().len() == plugins.len()
+            && chain
+                .as_slice()
+                .iter()
+                .zip(plugins)
+                .all(|(pinned, plugin)| std::sync::Arc::ptr_eq(pinned, plugin))
     }
 
     pub const fn new() -> Self {
         Self {
-            entries: [None; MAX_PARTICIPANTS],
+            entries: None,
+            source_chain: None,
+            sources: None,
             len: 0,
             unrounded_control: ROOT_BYTES + CARRIER_BYTES,
             control: 0,
@@ -375,7 +393,15 @@ impl TerminalManifest {
             return Err(error.at(instance));
         }
         let workspace = round_pages(bounds.workspace).ok_or_else(overflow)?;
-        self.entries[self.len] = Some(entry);
+        // Candidate and old allocations coexist until the new prefix is
+        // complete. Each backing obtains process credit before construction;
+        // a rejected candidate leaves the old pinned generation untouched.
+        let mut entries = FixedSlots::generation(self.len + 1, &PROCESS_PREPARATION_LEDGER)?;
+        for previous in self.entries() {
+            entries.push(*previous)?;
+        }
+        entries.push(entry)?;
+        self.entries = Some(entries);
         self.len += 1;
         self.unrounded_control = unrounded_control;
         self.control = control;
@@ -385,7 +411,48 @@ impl TerminalManifest {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &TerminalManifestEntry> {
-        self.entries[..self.len].iter().filter_map(Option::as_ref)
+        self.entries
+            .as_ref()
+            .map_or(&[][..], FixedSlots::as_slice)
+            .iter()
+    }
+
+    fn try_clone(&self) -> Result<Self, TerminalAdmissionError> {
+        let mut cloned = Self::new();
+        for entry in self.entries() {
+            cloned.push(*entry)?;
+        }
+        for (target, source) in [
+            (&mut cloned.source_chain, &self.source_chain),
+            (&mut cloned.sources, &self.sources),
+        ] {
+            if let Some(source) = source {
+                let mut slots = FixedSlots::generation(
+                    source.as_slice().len(),
+                    &PROCESS_PREPARATION_LEDGER,
+                )?;
+                for plugin in source.as_slice() {
+                    slots.push(std::sync::Arc::clone(plugin))?;
+                }
+                *target = Some(slots);
+            }
+        }
+        cloned.refusal = self.refusal;
+        Ok(cloned)
+    }
+
+    pub(crate) fn into_generation(self) -> Result<TerminalGeneration, TerminalAdmissionError> {
+        if self.len == 0
+            && self.refusal.is_none()
+            && self
+                .source_chain
+                .as_ref()
+                .is_none_or(|chain| chain.as_slice().is_empty())
+        {
+            return Ok(TerminalGeneration(None));
+        }
+        SharedTerminal::generation(self, &PROCESS_PREPARATION_LEDGER)
+            .map(|owner| TerminalGeneration(Some(owner)))
     }
 
     pub(crate) fn admission_refusal(&self) -> Option<TerminalAdmissionError> {
@@ -434,6 +501,10 @@ const fn round_pages(bytes: usize) -> Option<usize> {
 /// CAS admits bytes and the ticket together, with no partial ticket reservation,
 /// waiting queue, plugin call or staged allocation on failure.
 pub static PROCESS_PREPARATION_LEDGER: PreparationLedger = PreparationLedger::new();
+
+pub(crate) fn empty_terminal_generation() -> Result<TerminalGeneration, TerminalAdmissionError> {
+    Ok(TerminalGeneration(None))
+}
 
 #[derive(Debug)]
 pub struct PreparationLedger {
@@ -490,7 +561,16 @@ impl PreparationLedger {
             bytes,
             workspace_borrowed: AtomicBool::new(false),
             terminal_prepared: AtomicBool::new(false),
+            allocated_backing: AtomicUsize::new(0),
+            field_epoch: AtomicU64::new(1),
         })
+    }
+
+    pub fn reserve_owned(
+        &'static self,
+        bytes: usize,
+    ) -> Result<TerminalTicket, TerminalAdmissionError> {
+        TerminalTicket::new_ticket(self.reserve_control(bytes)?)
     }
 
     fn reserve(&self, bytes: usize, ticket: bool) -> Result<(), TerminalAdmissionError> {
@@ -539,6 +619,14 @@ impl PreparationLedger {
         let released = bytes as u64 | (u64::from(ticket) << TICKET_SHIFT);
         self.state.fetch_sub(released, Ordering::AcqRel);
     }
+
+    pub(crate) fn reserve_backing(&self, bytes: usize) -> Result<(), TerminalAdmissionError> {
+        self.reserve(bytes, false)
+    }
+
+    pub(crate) fn release_backing(&self, bytes: usize) {
+        self.release(bytes, false);
+    }
 }
 
 fn validate_reservation(
@@ -559,7 +647,25 @@ fn validate_reservation(
     Ok(())
 }
 
-/// One request ticket. Share this owner with `Arc`, rather than acquiring again
+mod workspace_value {
+    pub trait Sealed {}
+
+    impl Sealed for () {}
+    impl Sealed for bool {}
+    impl Sealed for u64 {}
+    impl<const N: usize> Sealed for [u8; N] {}
+}
+
+/// Only closed, allocation-free values can cross a workspace interval. Parser
+/// trees, references, closures and futures cannot implement this sealed trait.
+pub trait WorkspaceValue: workspace_value::Sealed {}
+
+impl WorkspaceValue for () {}
+impl WorkspaceValue for bool {}
+impl WorkspaceValue for u64 {}
+impl<const N: usize> WorkspaceValue for [u8; N] {}
+
+/// One request ticket. Share this owner with `TerminalTicket`, rather than acquiring again
 /// on clone, retry or detached handoff. The last owner returns both resources.
 #[derive(Debug)]
 pub struct ControlReservation<'a> {
@@ -567,9 +673,65 @@ pub struct ControlReservation<'a> {
     bytes: usize,
     workspace_borrowed: AtomicBool,
     terminal_prepared: AtomicBool,
+    allocated_backing: AtomicUsize,
+    field_epoch: AtomicU64,
 }
 
 impl<'a> ControlReservation<'a> {
+    fn next_field_epoch(&self) -> Result<u64, TerminalAdmissionError> {
+        self.field_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))
+    }
+
+    /// Borrow only initialized fixed backing for this synchronous interval.
+    /// The higher-ranked borrow cannot appear in R, including a returned
+    /// parser/tree/future; backing is freed before its W credit is returned.
+    pub fn with_workspace<R: WorkspaceValue>(
+        &self,
+        bytes: usize,
+        use_workspace: impl for<'w> FnOnce(&'w mut [u8]) -> Result<R, TerminalAdmissionError>,
+    ) -> Result<R, TerminalAdmissionError> {
+        if bytes == 0 {
+            return use_workspace(&mut []);
+        }
+        let plan = AllocationPlan::array::<u8>(bytes)?;
+        let charged = round_pages(plan.backing_bytes()).ok_or_else(|| {
+            capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, WORKSPACE_BYTES)
+        })?;
+        let lease = self.workspace(charged)?;
+        let result = lease.synchronous(bytes, use_workspace);
+        drop(lease);
+        result
+    }
+
+    /// Actual backing inside this request's already admitted C/O/carrier sum.
+    /// No allocator is called until this atomic claim succeeds.
+    pub(crate) fn reserve_backing(&self, bytes: usize) -> Result<(), TerminalAdmissionError> {
+        self.allocated_backing
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.bytes)
+            })
+            .map(|_| ())
+            .map_err(|used| {
+                capacity_error(
+                    TerminalRefusal::ControlCapacity,
+                    used.saturating_add(bytes),
+                    self.bytes,
+                )
+            })
+    }
+
+    pub(crate) fn release_backing(&self, bytes: usize) {
+        self.allocated_backing.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    pub fn allocated_backing_bytes(&self) -> usize {
+        self.allocated_backing.load(Ordering::Acquire)
+    }
+
     fn claim_preparation(&self) -> Result<(), TerminalAdmissionError> {
         self.terminal_prepared
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -627,6 +789,25 @@ pub struct WorkspaceReservation<'a, 'b> {
 }
 
 impl WorkspaceReservation<'_, '_> {
+    fn synchronous<R: WorkspaceValue>(
+        &self,
+        bytes: usize,
+        use_workspace: impl for<'w> FnOnce(&'w mut [u8]) -> Result<R, TerminalAdmissionError>,
+    ) -> Result<R, TerminalAdmissionError> {
+        let plan = AllocationPlan::array::<u8>(bytes)?;
+        if plan.backing_bytes() > self.bytes {
+            return Err(capacity_error(
+                TerminalRefusal::WorkspaceCapacity,
+                plan.backing_bytes(),
+                self.bytes,
+            ));
+        }
+        let mut block = AllocationBlock::workspace(plan)?;
+        let result = use_workspace(block.bytes_mut());
+        drop(block);
+        result
+    }
+
     pub const fn bytes(&self) -> usize {
         self.bytes
     }
@@ -647,11 +828,68 @@ impl Drop for WorkspaceReservation<'_, '_> {
 pub struct ReachedRequestView<'a> {
     pub context: &'a mut super::RequestContext,
     output_limit: usize,
+    control_limit: usize,
+    workspace_limit: usize,
+    workspace: Option<&'a WorkspaceReservation<'a, 'static>>,
     action_allowed: bool,
-    ticket: Option<std::sync::Arc<ControlReservation<'static>>>,
+    ticket: Option<TerminalTicket>,
+    instance: TerminalInstanceToken,
 }
 
 impl ReachedRequestView<'_> {
+    pub fn with_workspace<R: WorkspaceValue>(
+        &self,
+        bytes: usize,
+        use_workspace: impl for<'w> FnOnce(&'w mut [u8]) -> Result<R, TerminalAdmissionError>,
+    ) -> Result<R, TerminalAdmissionError> {
+        if bytes > self.workspace_limit {
+            return Err(capacity_error(
+                TerminalRefusal::WorkspaceCapacity,
+                bytes,
+                self.workspace_limit,
+            ));
+        }
+        if bytes == 0 {
+            return use_workspace(&mut []);
+        }
+        let required = AllocationPlan::array::<u8>(bytes)?.backing_bytes();
+        if required > self.workspace_limit {
+            return Err(capacity_error(
+                TerminalRefusal::WorkspaceCapacity,
+                required,
+                self.workspace_limit,
+            ));
+        }
+        self.workspace
+            .ok_or_else(|| capacity_error(TerminalRefusal::WorkspaceCapacity, bytes, 0))?
+            .synchronous(bytes, use_workspace)
+    }
+
+    pub(crate) fn control_patch(
+        &self,
+        actions: usize,
+    ) -> Result<TerminalPatch, TerminalAdmissionError> {
+        let ticket = self.ticket.as_ref().ok_or_else(|| {
+            capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
+        })?;
+        TerminalPatch::new(actions, self.control_limit, ticket, self.instance)
+    }
+
+    pub(crate) fn apply_metadata(
+        &mut self,
+        patch: TerminalPatch,
+    ) -> Result<(), TerminalAdmissionError> {
+        if self
+            .context
+            .precommit_response_phase_bound()
+            .elapsed_authorization()
+            .is_some()
+        {
+            return Err(capacity_error(TerminalRefusal::AuthorizationExpired, 0, 0));
+        }
+        apply_terminal_metadata(patch, self.context)
+    }
+
     /// Preparation and response action eligibility are distinct. Capture must
     /// still prepare when this is false; one-shot response actions must not
     /// consume their source state merely because they were suppressed.
@@ -686,21 +924,35 @@ impl ReachedRequestView<'_> {
         {
             return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
         }
-        Ok(self
-            .context
-            .metadata
-            .remove(key)
-            .map(|value| TerminalCookie {
-                value,
-                _ticket: self.ticket.clone(),
-            }))
+        let ticket = self.ticket.as_ref().ok_or_else(|| {
+            capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
+        })?;
+        let plan = TerminalString::plan(cookie)?;
+        if plan.backing_bytes() > allowed {
+            return Err(capacity_error(
+                TerminalRefusal::FieldCapacity,
+                plan.backing_bytes(),
+                allowed,
+            ));
+        }
+        let lineage = TerminalFieldLineage {
+            origin: TerminalFieldOrigin::GatewayInstance(self.instance),
+            policy_contribution: false,
+            section: TerminalFieldSection::Initial,
+            epoch: ticket.next_field_epoch()?,
+        };
+        let value = TerminalString::copy(cookie, plan, ticket)?;
+        // The old staged backing is dropped before this operation can escape.
+        self.context.metadata.remove(key);
+        Ok(Some(TerminalCookie { value, lineage }))
     }
 
     /// Construct a patch using only this instance's admitted output credit.
     pub fn patch(&self, actions: usize) -> Result<TerminalPatch, TerminalAdmissionError> {
-        let mut patch = TerminalPatch::new(actions, self.output_limit)?;
-        patch._ticket = self.ticket.clone();
-        Ok(patch)
+        let ticket = self.ticket.as_ref().ok_or_else(|| {
+            capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
+        })?;
+        TerminalPatch::new(actions, self.output_limit, ticket, self.instance)
     }
 }
 
@@ -716,8 +968,8 @@ pub enum PreparedTerminalOp {
 /// Capacity-checked, moved cookie owner; construction is confined to the
 /// synchronous admitted view, before any cursor or external poll.
 pub struct TerminalCookie {
-    value: String,
-    _ticket: Option<std::sync::Arc<ControlReservation<'static>>>,
+    value: TerminalString,
+    lineage: TerminalFieldLineage,
 }
 
 /// Closed results carry response work only. No request-fact or raw metadata
@@ -730,7 +982,26 @@ pub enum TerminalResult {
 }
 
 impl PreparedTerminalOp {
-    fn validate(&self, declaration: TerminalDeclaration) -> Result<(), TerminalAdmissionError> {
+    fn validate(
+        &self,
+        declaration: TerminalDeclaration,
+        ticket: Option<&TerminalTicket>,
+        instance: TerminalInstanceToken,
+    ) -> Result<(), TerminalAdmissionError> {
+        match self {
+            Self::Fields(patch)
+                if patch.instance != instance
+                    || ticket.is_none_or(|ticket| !ticket.ptr_eq(&patch.ticket)) =>
+            {
+                return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+            }
+            Self::Cookie(cookie)
+                if cookie.lineage.origin != TerminalFieldOrigin::GatewayInstance(instance) =>
+            {
+                return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
+            }
+            _ => {}
+        }
         let output = match declaration {
             TerminalDeclaration::Prepared { bounds, .. } => bounds.output,
             TerminalDeclaration::PureNoop if matches!(self, Self::Noop) => return Ok(()),
@@ -746,16 +1017,16 @@ impl PreparedTerminalOp {
             Self::Noop | Self::EmptyBody => 0,
             Self::Fields(patch) => patch.owned_bytes,
             Self::Cookie(cookie) => {
-                if cookie.value.len() > MAX_COOKIE_BYTES
-                    || cookie.value.capacity() > MAX_COOKIE_BYTES
+                if cookie.value.as_str().len() > MAX_COOKIE_BYTES
+                    || cookie.value.block.backing_bytes() > MAX_COOKIE_BYTES
                 {
                     return Err(capacity_error(
                         TerminalRefusal::FieldCapacity,
-                        cookie.value.capacity(),
+                        cookie.value.block.backing_bytes(),
                         MAX_COOKIE_BYTES,
                     ));
                 }
-                cookie.value.capacity()
+                cookie.value.block.backing_bytes()
             }
         };
         if required > output {
@@ -778,34 +1049,93 @@ impl PreparedTerminalOp {
     }
 }
 
-enum TerminalFieldAction {
-    Set {
-        name: Box<str>,
-        value: Box<str>,
-        override_existing: bool,
-        case_insensitive: bool,
-    },
-    Remove(Box<str>),
+/// Origin is attached by the producer to each value, before copying it.
+/// Renaming a field cannot change origin or manufacture a policy contribution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalFieldOrigin {
+    Backend,
+    GatewayCore,
+    GatewayInstance(TerminalInstanceToken),
+    Unknown,
 }
 
-/// Allocates a fixed action vector only after the declaration's output credit
-/// is known. Names/values use exact-size boxed strings, never cloned capacities.
-/// Push never grows the vector, and checks before constructing either string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalFieldSection {
+    Initial,
+    ApplicationTrailer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalFieldLineage {
+    pub origin: TerminalFieldOrigin,
+    pub policy_contribution: bool,
+    pub section: TerminalFieldSection,
+    pub epoch: u64,
+}
+
+/// Exact-length copy in a class-sized block. A caller's excess String capacity
+/// is never retained by a prepared operation.
+struct TerminalString {
+    block: AllocationBlock,
+}
+
+impl TerminalString {
+    fn plan(value: &str) -> Result<AllocationPlan, TerminalAdmissionError> {
+        AllocationPlan::array::<u8>(value.len())
+    }
+
+    fn copy(
+        value: &str,
+        plan: AllocationPlan,
+        ticket: &TerminalTicket,
+    ) -> Result<Self, TerminalAdmissionError> {
+        let mut block = AllocationBlock::zeroed_request(plan, ticket)?;
+        block.bytes_mut().copy_from_slice(value.as_bytes());
+        Ok(Self { block })
+    }
+
+    fn as_str(&self) -> &str {
+        // SAFETY: construction copies exactly one already validated Rust str;
+        // this owner exposes no mutable access to those bytes.
+        unsafe { std::str::from_utf8_unchecked(self.block.bytes()) }
+    }
+}
+
+enum TerminalFieldAction {
+    Set {
+        name: TerminalString,
+        value: TerminalString,
+        override_existing: bool,
+        case_insensitive: bool,
+        lineage: TerminalFieldLineage,
+    },
+    Remove(TerminalString),
+    Metadata {
+        name: String,
+        value: Option<String>,
+    },
+}
+
+/// Fixed, allocation-backed actions and exact-length field blocks. Every copy
+/// is planned and claimed before allocation. No push can grow the action table.
 pub struct TerminalPatch {
-    actions: Vec<TerminalFieldAction>,
+    actions: FixedSlots<TerminalFieldAction>,
+    action_limit: usize,
     output_limit: usize,
     owned_bytes: usize,
-    _ticket: Option<std::sync::Arc<ControlReservation<'static>>>,
+    ticket: TerminalTicket,
+    instance: TerminalInstanceToken,
+    // Actions (including adopted Strings) drop before their custody/credit.
+    metadata_custody: Option<SharedTerminal<TerminalMetadataCustody>>,
 }
 
 impl TerminalPatch {
-    fn new(actions: usize, output: usize) -> Result<Self, TerminalAdmissionError> {
-        let required = actions
-            .checked_mul(128)
-            .and_then(|bytes| bytes.checked_add(256))
-            .ok_or_else(|| {
-                capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, output)
-            })?;
+    fn new(
+        actions: usize,
+        output: usize,
+        ticket: &TerminalTicket,
+        instance: TerminalInstanceToken,
+    ) -> Result<Self, TerminalAdmissionError> {
         if actions > MAX_PATCH_ACTIONS {
             return Err(capacity_error(
                 TerminalRefusal::PatchCapacity,
@@ -813,57 +1143,55 @@ impl TerminalPatch {
                 MAX_PATCH_ACTIONS,
             ));
         }
+        let required = AllocationPlan::array::<TerminalFieldAction>(actions)?.backing_bytes();
         if required > output {
-            return Err(capacity_error(
-                TerminalRefusal::PatchCapacity,
-                required,
-                output,
-            ));
+            return Err(capacity_error(TerminalRefusal::PatchCapacity, required, output));
         }
         Ok(Self {
-            actions: Vec::with_capacity(actions),
+            actions: FixedSlots::request(actions, ticket)?,
+            action_limit: actions,
             output_limit: output,
             owned_bytes: required,
-            _ticket: None,
+            ticket: ticket.clone(),
+            instance,
+            metadata_custody: None,
         })
     }
 
-    fn reserve_field(&mut self, name: &str, value: &str) -> Result<(), TerminalAdmissionError> {
-        if name.len() > MAX_FIELD_NAME_BYTES {
-            return Err(capacity_error(
-                TerminalRefusal::FieldCapacity,
-                name.len(),
-                MAX_FIELD_NAME_BYTES,
-            ));
-        }
-        if value.len() > MAX_FIELD_VALUE_BYTES {
+    fn field_plans(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> Result<(AllocationPlan, AllocationPlan), TerminalAdmissionError> {
+        validate_field(name, value)?;
+        self.field_plans_unchecked(name, value)
+    }
+
+    fn field_plans_unchecked(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> Result<(AllocationPlan, AllocationPlan), TerminalAdmissionError> {
+        if name.len() > MAX_FIELD_NAME_BYTES || value.len() > MAX_FIELD_VALUE_BYTES {
             return Err(capacity_error(
                 TerminalRefusal::FieldCapacity,
                 value.len(),
                 MAX_FIELD_VALUE_BYTES,
             ));
         }
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
-            || value
-                .bytes()
-                .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
-        {
-            return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
-        }
-        if self.actions.len() == self.actions.capacity() {
+        if self.actions.as_slice().len() == self.action_limit {
             return Err(capacity_error(
                 TerminalRefusal::PatchCapacity,
-                self.actions.len() + 1,
-                self.actions.capacity(),
+                self.action_limit + 1,
+                self.action_limit,
             ));
         }
+        let name_plan = TerminalString::plan(name)?;
+        let value_plan = TerminalString::plan(value)?;
         let required = self
             .owned_bytes
-            .checked_add(name.len())
-            .and_then(|bytes| bytes.checked_add(value.len()))
+            .checked_add(name_plan.backing_bytes())
+            .and_then(|bytes| bytes.checked_add(value_plan.backing_bytes()))
             .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
         if required > self.output_limit {
             return Err(capacity_error(
@@ -872,8 +1200,7 @@ impl TerminalPatch {
                 self.output_limit,
             ));
         }
-        self.owned_bytes = required;
-        Ok(())
+        Ok((name_plan, value_plan))
     }
 
     pub fn set(
@@ -882,14 +1209,7 @@ impl TerminalPatch {
         value: &str,
         override_existing: bool,
     ) -> Result<(), TerminalAdmissionError> {
-        self.reserve_field(name, value)?;
-        self.actions.push(TerminalFieldAction::Set {
-            name: name.into(),
-            value: value.into(),
-            override_existing,
-            case_insensitive: false,
-        });
-        Ok(())
+        self.set_field(name, value, override_existing, false)
     }
 
     pub fn set_policy(
@@ -898,21 +1218,295 @@ impl TerminalPatch {
         value: &str,
         override_existing: bool,
     ) -> Result<(), TerminalAdmissionError> {
-        self.reserve_field(name, value)?;
+        self.set_field(name, value, override_existing, true)
+    }
+
+    fn set_field(
+        &mut self,
+        name: &str,
+        value: &str,
+        override_existing: bool,
+        case_insensitive: bool,
+    ) -> Result<(), TerminalAdmissionError> {
+        let (name_plan, value_plan) = self.field_plans(name, value)?;
+        let lineage = TerminalFieldLineage {
+            origin: TerminalFieldOrigin::GatewayInstance(self.instance),
+            policy_contribution: case_insensitive,
+            section: TerminalFieldSection::Initial,
+            epoch: self.ticket.next_field_epoch()?,
+        };
+        let name = TerminalString::copy(name, name_plan, &self.ticket)?;
+        let value = TerminalString::copy(value, value_plan, &self.ticket)?;
         self.actions.push(TerminalFieldAction::Set {
-            name: name.into(),
-            value: value.into(),
+            name,
+            value,
             override_existing,
-            case_insensitive: true,
-        });
+            case_insensitive,
+            lineage,
+        })?;
+        self.owned_bytes += name_plan.backing_bytes() + value_plan.backing_bytes();
         Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> Result<(), TerminalAdmissionError> {
-        self.reserve_field(name, "")?;
-        self.actions.push(TerminalFieldAction::Remove(name.into()));
+        let (plan, _) = self.field_plans(name, "")?;
+        let name = TerminalString::copy(name, plan, &self.ticket)?;
+        self.actions.push(TerminalFieldAction::Remove(name))?;
+        self.owned_bytes += plan.backing_bytes();
         Ok(())
     }
+
+    pub(crate) fn set_metadata(
+        &mut self,
+        name: &str,
+        value: &str,
+    ) -> Result<(), TerminalAdmissionError> {
+        let (name_plan, value_plan) = self.field_plans_unchecked(name, value)?;
+        let lineage = TerminalFieldLineage {
+            origin: TerminalFieldOrigin::GatewayInstance(self.instance),
+            policy_contribution: false,
+            section: TerminalFieldSection::Initial,
+            epoch: self.ticket.next_field_epoch()?,
+        };
+        let name = TerminalString::copy(name, name_plan, &self.ticket)?;
+        let value = TerminalString::copy(value, value_plan, &self.ticket)?;
+        self.actions.push(TerminalFieldAction::Set {
+            name,
+            value,
+            override_existing: true,
+            case_insensitive: false,
+            lineage,
+        })?;
+        self.owned_bytes += name_plan.backing_bytes() + value_plan.backing_bytes();
+        Ok(())
+    }
+
+    pub(crate) fn metadata_get(&self, key: &str) -> Option<Option<&str>> {
+        self.actions
+            .as_slice()
+            .iter()
+            .rev()
+            .find_map(|action| match action {
+                TerminalFieldAction::Set { name, value, .. } if name.as_str() == key => {
+                    Some(Some(value.as_str()))
+                }
+                TerminalFieldAction::Remove(name) if name.as_str() == key => Some(None),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn merge_metadata_names(
+        &mut self,
+        key: &str,
+        existing: &str,
+        marker: &str,
+    ) -> Result<(), TerminalAdmissionError> {
+        let mut length = existing.len();
+        let mut count = if existing.is_empty() {
+            0
+        } else {
+            existing.split(',').count()
+        };
+        for name in marker.split(',') {
+            if !existing.split(',').any(|old| old == name) {
+                length = length
+                    .checked_add(name.len() + usize::from(length != 0))
+                    .ok_or_else(|| {
+                        capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0)
+                    })?;
+                count += 1;
+            }
+        }
+        if count > 32 || length > 32 * 128 + 31 {
+            return Err(capacity_error(
+                TerminalRefusal::ControlCapacity,
+                length,
+                32 * 128 + 31,
+            ));
+        }
+        let name_plan = TerminalString::plan(key)?;
+        let value_plan = AllocationPlan::array::<u8>(length)?;
+        let required = self
+            .owned_bytes
+            .saturating_add(name_plan.backing_bytes())
+            .saturating_add(value_plan.backing_bytes());
+        if self.actions.as_slice().len() == self.action_limit || required > self.output_limit {
+            return Err(capacity_error(
+                TerminalRefusal::ControlCapacity,
+                required,
+                self.output_limit,
+            ));
+        }
+        let lineage = TerminalFieldLineage {
+            origin: TerminalFieldOrigin::GatewayInstance(self.instance),
+            policy_contribution: false,
+            section: TerminalFieldSection::Initial,
+            epoch: self.ticket.next_field_epoch()?,
+        };
+        let name = TerminalString::copy(key, name_plan, &self.ticket)?;
+        let mut block = AllocationBlock::zeroed_request(value_plan, &self.ticket)?;
+        block.bytes_mut()[..existing.len()].copy_from_slice(existing.as_bytes());
+        let mut offset = existing.len();
+        for name in marker.split(',') {
+            if !existing.split(',').any(|old| old == name) {
+                if offset != 0 {
+                    block.bytes_mut()[offset] = b',';
+                    offset += 1;
+                }
+                block.bytes_mut()[offset..offset + name.len()].copy_from_slice(name.as_bytes());
+                offset += name.len();
+            }
+        }
+        self.actions.push(TerminalFieldAction::Set {
+            name,
+            value: TerminalString { block },
+            override_existing: true,
+            case_insensitive: false,
+            lineage,
+        })?;
+        self.owned_bytes = required;
+        Ok(())
+    }
+}
+
+/// Keeps adopted metadata strings charged until their context has dropped its
+/// metadata table. A successor keeps the previous custody; no ledger cycle.
+pub(crate) struct TerminalMetadataCustody {
+    _credit: super::terminal_storage::AllocationCredit,
+    _previous: Option<SharedTerminal<TerminalMetadataCustody>>,
+}
+
+impl fmt::Debug for TerminalMetadataCustody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TerminalMetadataCustody")
+    }
+}
+
+fn apply_terminal_metadata(
+    mut patch: TerminalPatch,
+    ctx: &mut super::RequestContext,
+) -> Result<(), TerminalAdmissionError> {
+    use super::terminal_storage::{global_string, global_string_plan, request_credit};
+
+    let mut adopted_bytes = 0usize;
+    let mut added_keys = 0usize;
+    for (index, action) in patch.actions.as_slice().iter().enumerate() {
+        let (name, value) = match action {
+            TerminalFieldAction::Set { name, value, .. } => (name.as_str(), value.as_str()),
+            TerminalFieldAction::Remove(_) => continue,
+            TerminalFieldAction::Metadata { .. } => {
+                return Err(capacity_error(TerminalRefusal::AlreadyPrepared, 1, 0));
+            }
+        };
+        let name_bytes = global_string_plan(name.len())?.backing_bytes();
+        let value_bytes = global_string_plan(value.len())?.backing_bytes();
+        adopted_bytes = adopted_bytes
+            .checked_add(name_bytes)
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
+        if !ctx.metadata.contains_key(name)
+            && !patch.actions.as_slice()[..index].iter().any(|previous| {
+                matches!(
+                    previous,
+                    TerminalFieldAction::Set { name: old, .. } if old.as_str() == name
+                )
+            })
+        {
+            added_keys += 1;
+        }
+    }
+    // Never grow an unqualified foreign HashMap. Capacity is a guarantee of
+    // insertion without reallocation, not an estimate of its owned layout.
+    let required_keys = ctx.metadata.len().saturating_add(added_keys);
+    if required_keys > ctx.metadata.capacity() {
+        return Err(capacity_error(
+            TerminalRefusal::AllocatorUnavailable,
+            required_keys,
+            ctx.metadata.capacity(),
+        ));
+    }
+    let custody_plan = SharedTerminal::<TerminalMetadataCustody>::allocation_plan()?;
+    let custody_bytes = custody_plan.backing_bytes();
+    let required = patch
+        .owned_bytes
+        .saturating_add(adopted_bytes)
+        .saturating_add(custody_bytes);
+    if required > patch.output_limit {
+        return Err(capacity_error(
+            TerminalRefusal::ControlCapacity,
+            required,
+            patch.output_limit,
+        ));
+    }
+    patch.metadata_custody = Some(SharedTerminal::request(
+        TerminalMetadataCustody {
+            _credit: request_credit(global_string_plan(0)?, &patch.ticket)?,
+            _previous: ctx.terminal_metadata_custody.clone(),
+        },
+        &patch.ticket,
+    )?);
+    let custody = patch
+        .metadata_custody
+        .as_mut()
+        .and_then(SharedTerminal::get_mut)
+        .ok_or_else(|| capacity_error(TerminalRefusal::AlreadyPrepared, 1, 0))?;
+    for action in patch.actions.as_mut_slice() {
+        let (name, value) = match action {
+            TerminalFieldAction::Set { name, value, .. } => (name.as_str(), Some(value.as_str())),
+            TerminalFieldAction::Remove(_) => continue,
+            TerminalFieldAction::Metadata { .. } => {
+                return Err(capacity_error(TerminalRefusal::AlreadyPrepared, 1, 0));
+            }
+        };
+        let (name, name_credit) = global_string(name, &patch.ticket)?;
+        custody._credit.merge(name_credit)?;
+        let value = if let Some(value) = value {
+            let (value, value_credit) = global_string(value, &patch.ticket)?;
+            custody._credit.merge(value_credit)?;
+            Some(value)
+        } else {
+            None
+        };
+        *action = TerminalFieldAction::Metadata { name, value };
+    }
+    ctx.terminal_metadata_custody = patch.metadata_custody.take();
+    // All copies and custody construction completed before the first mutation.
+    for action in patch.actions.as_mut_slice() {
+        match action {
+            TerminalFieldAction::Metadata { name, value } => {
+                let name = std::mem::take(name);
+                if let Some(value) = value.take() {
+                    ctx.metadata.insert(name, value);
+                } else {
+                    ctx.metadata.remove(&name);
+                }
+            }
+            TerminalFieldAction::Remove(name) => {
+                ctx.metadata.remove(name.as_str());
+            }
+            TerminalFieldAction::Set { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_field(name: &str, value: &str) -> Result<(), TerminalAdmissionError> {
+    if name.len() > MAX_FIELD_NAME_BYTES || value.len() > MAX_FIELD_VALUE_BYTES {
+        return Err(capacity_error(
+            TerminalRefusal::FieldCapacity,
+            name.len().max(value.len()),
+            MAX_FIELD_VALUE_BYTES,
+        ));
+    }
+    if name.is_empty()
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+        })
+        || value.bytes().any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+    {
+        return Err(capacity_error(TerminalRefusal::FieldCapacity, 0, 0));
+    }
+    Ok(())
 }
 
 fn capacity_error(
@@ -923,49 +1517,40 @@ fn capacity_error(
     TerminalAdmissionError::new(reason, required, allowed)
 }
 
-/// Check the actual allocated capacities, repeated wire fields (including
-/// newline-separated cookies), and retained map backing before any cursor work.
+/// Validate legacy input capacities and repeated wire-field shape. This does
+/// not qualify the foreign HashMap's allocation layout or transport conversion.
 pub fn validate_terminal_headers(
     headers: &std::collections::HashMap<String, String>,
 ) -> Result<(), TerminalAdmissionError> {
     let mut owned = 0usize;
+    let mut wire_bytes = 0usize;
     let mut fields = 0usize;
     for (name, value) in headers {
-        if name.len() > MAX_FIELD_NAME_BYTES {
-            return Err(capacity_error(
-                TerminalRefusal::FieldCapacity,
-                name.len(),
-                MAX_FIELD_NAME_BYTES,
-            ));
-        }
-        if value.len() > MAX_FIELD_VALUE_BYTES {
-            return Err(capacity_error(
-                TerminalRefusal::FieldCapacity,
-                value.len(),
-                MAX_FIELD_VALUE_BYTES,
-            ));
-        }
         owned = owned
             .checked_add(name.capacity())
             .and_then(|bytes| bytes.checked_add(value.capacity()))
             .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
-        fields += if name.eq_ignore_ascii_case("set-cookie") {
-            value.split('\n').count()
+        if name.eq_ignore_ascii_case("set-cookie") {
+            for value in value.split('\n') {
+                validate_field(name, value)?;
+                fields += 1;
+                wire_bytes = wire_bytes.saturating_add(name.len()).saturating_add(value.len());
+            }
         } else {
-            1
-        };
+            validate_field(name, value)?;
+            fields += 1;
+            wire_bytes = wire_bytes.saturating_add(name.len()).saturating_add(value.len());
+        }
     }
-    // HashMap's supported load factor rounds backing buckets above capacity.
-    // 64 bytes per reported capacity conservatively covers buckets/control
-    // bytes, entries, allocator and map ownership, within the fixed allowance.
-    let overhead = headers.capacity().checked_mul(64).unwrap_or(usize::MAX);
+    // Copying repeated cookies charges every name occurrence. A tiny value
+    // with huge caller capacity also refuses before any selected-carrier copy.
     if owned > CARRIER_OWNED_BYTES
-        || overhead > CARRIER_OVERHEAD_BYTES
+        || wire_bytes > CARRIER_OWNED_BYTES
         || fields > MAX_FIELD_OCCURRENCES
     {
         return Err(capacity_error(
             TerminalRefusal::FieldCapacity,
-            owned,
+            owned.max(wire_bytes),
             CARRIER_OWNED_BYTES,
         ));
     }
@@ -978,33 +1563,100 @@ pub fn apply_terminal_patch(
     patch: TerminalPatch,
     headers: &mut std::collections::HashMap<String, String>,
 ) -> Result<(), TerminalAdmissionError> {
+    preflight_legacy_patch(&patch, headers)?;
+    let mut carrier = SelectedTerminalCarrier::new(&patch.ticket)?;
+    carrier.load_legacy(headers)?;
+    carrier.apply(&patch)?;
+    // The legacy adapter below remains outside the qualified wire-handoff
+    // proof. All semantic/field-capacity checks finish before its mutations.
+    drop(carrier);
+    apply_legacy_patch(&patch, headers)
+}
+
+// This is a logical legacy-String guard, not a foreign-table allocation proof.
+// Conservatively include the old input capacities and every prospective copy
+// before changing either selected representation. Suppressed writes copy nothing.
+fn preflight_legacy_patch(
+    patch: &TerminalPatch,
+    headers: &std::collections::HashMap<String, String>,
+) -> Result<(), TerminalAdmissionError> {
     validate_terminal_headers(headers)?;
-    for action in patch.actions {
+    let mut owned = headers.iter().fold(0usize, |bytes, (name, value)| {
+        bytes
+            .saturating_add(name.capacity())
+            .saturating_add(value.capacity())
+    });
+    for (index, action) in patch.actions.as_slice().iter().enumerate() {
+        match action {
+            TerminalFieldAction::Set {
+                name,
+                value,
+                override_existing,
+                ..
+            } => {
+                let exists = headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case(name.as_str()));
+                let previously_removed = patch.actions.as_slice()[..index].iter().any(|previous| {
+                    matches!(
+                        previous,
+                        TerminalFieldAction::Remove(old)
+                            if old.as_str().eq_ignore_ascii_case(name.as_str())
+                    )
+                });
+                if !*override_existing && exists && !previously_removed {
+                    continue;
+                }
+                owned = owned
+                    .saturating_add(name.as_str().len())
+                    .saturating_add(value.as_str().len());
+            }
+            TerminalFieldAction::Remove(_) => {}
+            TerminalFieldAction::Metadata { .. } => {
+                return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+            }
+        }
+    }
+    if owned > CARRIER_OWNED_BYTES {
+        return Err(capacity_error(
+            TerminalRefusal::FieldCapacity,
+            owned,
+            CARRIER_OWNED_BYTES,
+        ));
+    }
+    Ok(())
+}
+
+fn apply_legacy_patch(
+    patch: &TerminalPatch,
+    headers: &mut std::collections::HashMap<String, String>,
+) -> Result<(), TerminalAdmissionError> {
+    for action in patch.actions.as_slice() {
         match action {
             TerminalFieldAction::Remove(name) => {
-                headers.retain(|key, _| !key.eq_ignore_ascii_case(&name));
+                headers.retain(|key, _| !key.eq_ignore_ascii_case(name.as_str()));
             }
             TerminalFieldAction::Set {
                 name,
                 value,
                 override_existing,
                 case_insensitive,
+                lineage: _,
             } => {
-                if !override_existing && headers.keys().any(|key| key.eq_ignore_ascii_case(&name)) {
+                if !*override_existing
+                    && headers
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case(name.as_str()))
+                {
                     continue;
                 }
-                // Reserve the complete prospective carrier before map or string
-                // growth, including simultaneous old and new owned field bytes.
-                let replacing = if case_insensitive {
-                    headers.keys().any(|key| key.eq_ignore_ascii_case(&name))
-                } else {
-                    headers.contains_key(name.as_ref())
-                };
-                check_carrier_growth(headers, name.len(), value.len(), usize::from(!replacing))?;
-                if case_insensitive {
-                    headers.retain(|key, _| !key.eq_ignore_ascii_case(&name));
+                if *case_insensitive {
+                    headers.retain(|key, _| !key.eq_ignore_ascii_case(name.as_str()));
                 }
-                headers.insert(name.into_string(), value.into_string());
+                headers.insert(name.as_str().to_string(), value.as_str().to_string());
+            }
+            TerminalFieldAction::Metadata { .. } => {
+                return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
             }
         }
     }
@@ -1035,17 +1687,9 @@ fn check_carrier_growth(
             }
         })
         .sum();
-    // Bound the next HashMap growth BEFORE insert, including its old allocation
-    // while rehashing. No growth occurs when spare entry capacity remains.
-    let capacity = if fields != 0 && headers.len() == headers.capacity() {
-        headers.capacity().max(3).saturating_mul(3)
-    } else {
-        headers.capacity()
-    };
-    if owned > CARRIER_OWNED_BYTES
-        || capacity.saturating_mul(64) > CARRIER_OVERHEAD_BYTES
-        || occurrences + fields > MAX_FIELD_OCCURRENCES
-    {
+    // Legacy logical growth guard. It does not claim a foreign table layout
+    // or its allocator backing; full wire handoff is still unqualified.
+    if owned > CARRIER_OWNED_BYTES || occurrences + fields > MAX_FIELD_OCCURRENCES {
         return Err(capacity_error(
             TerminalRefusal::FieldCapacity,
             owned,
@@ -1069,25 +1713,73 @@ pub fn field_declaration(control: usize, output: usize) -> TerminalDeclaration {
     }
 }
 
+/// Cold-path bound for the same action table and exact field blocks used by
+/// view.patch(). This includes allocator classes, not guessed per-field bytes.
+pub fn field_output_bound<'a>(
+    actions: usize,
+    fields: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<usize, TerminalAdmissionError> {
+    if actions > MAX_PATCH_ACTIONS {
+        return Err(capacity_error(
+            TerminalRefusal::PatchCapacity,
+            actions,
+            MAX_PATCH_ACTIONS,
+        ));
+    }
+    let mut required = AllocationPlan::array::<TerminalFieldAction>(actions)?.backing_bytes();
+    for (name, value) in fields {
+        validate_field(name, value)?;
+        let name_bytes = TerminalString::plan(name)?.backing_bytes();
+        let value_bytes = TerminalString::plan(value)?.backing_bytes();
+        required = required
+            .checked_add(name_bytes)
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
+    }
+    Ok(required)
+}
+
 /// Compile the actual implementation union. Names never establish trust.
 /// Stream/WebSocket-only chains do not enter the HTTP terminal lifecycle.
 pub fn compile_terminal_manifest(
     plugins: &[std::sync::Arc<dyn super::Plugin>],
 ) -> Result<TerminalManifest, TerminalAdmissionError> {
+    static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
     let mut manifest = TerminalManifest::new();
+    let mut chain = FixedSlots::generation(plugins.len(), &PROCESS_PREPARATION_LEDGER)?;
+    for plugin in plugins {
+        chain.push(std::sync::Arc::clone(plugin))?;
+    }
+    manifest.source_chain = Some(chain);
     for plugin in plugins {
         if !plugin.supported_protocols().iter().any(|protocol| {
-            matches!(
-                protocol,
-                super::ProxyProtocol::Http | super::ProxyProtocol::Grpc
-            )
+            matches!(protocol, super::ProxyProtocol::Http | super::ProxyProtocol::Grpc)
         }) {
             continue;
         }
-        let pointer = std::sync::Arc::as_ptr(plugin) as *const () as usize;
-        let instance = TerminalInstanceToken(pointer as u64);
+        let instance = TerminalInstanceToken(
+            NEXT_INSTANCE
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                    next.checked_add(1)
+                })
+                .map_err(|_| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?,
+        );
+        let eligibility = TerminalEligibility {
+            rejection: plugin.applies_after_proxy_on_reject(),
+            charged: !plugin.may_replace_rejection_response(),
+        };
+        if eligibility.participates()
+            && manifest.sources.as_ref().is_some_and(|sources| {
+                sources
+                    .as_slice()
+                    .iter()
+                    .any(|previous| std::sync::Arc::ptr_eq(previous, plugin))
+            })
+        {
+            return Err(capacity_error(TerminalRefusal::DuplicateInstance, 0, 0).at(instance));
+        }
         let declaration = plugin.terminal_declaration();
-        if (plugin.applies_after_proxy_on_reject() || !plugin.may_replace_rejection_response())
+        if eligibility.participates()
             && matches!(declaration, TerminalDeclaration::Prepared { .. })
             && !plugin.terminal_preparation_available()
         {
@@ -1096,12 +1788,21 @@ pub fn compile_terminal_manifest(
         manifest.push(TerminalManifestEntry {
             instance,
             declaration,
-            eligibility: TerminalEligibility {
-                rejection: plugin.applies_after_proxy_on_reject(),
-                charged: !plugin.may_replace_rejection_response(),
-            },
+            eligibility,
             wrapped: plugin.terminal_is_wrapped(),
         })?;
+        if eligibility.participates() {
+            // The frozen eligibility above selects the exact source instance.
+            // Candidate and old table backing are both charged while copying.
+            let mut sources = FixedSlots::generation(manifest.len, &PROCESS_PREPARATION_LEDGER)?;
+            if let Some(previous) = &manifest.sources {
+                for source in previous.as_slice() {
+                    sources.push(std::sync::Arc::clone(source))?;
+                }
+            }
+            sources.push(std::sync::Arc::clone(plugin))?;
+            manifest.sources = Some(sources);
+        }
     }
     Ok(manifest)
 }
@@ -1110,10 +1811,11 @@ pub fn compile_terminal_manifest(
 /// This fixed slot owner contains no plugin/context/raw view and invokes no
 /// old-hook fallback. Unsupported operations fail before terminal execution.
 pub struct PreparedTerminalChain {
-    slots: [Option<PreparedTerminalOp>; MAX_PARTICIPANTS],
+    slots: Option<FixedSlots<Option<PreparedTerminalOp>>>,
+    selected: Option<SelectedTerminalCarrier>,
     len: usize,
     cursor: usize,
-    _ticket: Option<std::sync::Arc<ControlReservation<'static>>>,
+    _ticket: Option<TerminalTicket>,
 }
 
 impl PreparedTerminalChain {
@@ -1151,13 +1853,37 @@ impl PreparedTerminalChain {
             .as_ref()
             .map(|ticket| ticket.workspace(manifest.workspace_bytes()))
             .transpose()?;
+        let slots = if manifest.participant_count() == 0 {
+            None
+        } else {
+            let ticket = ticket.as_ref().ok_or_else(|| {
+                capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
+            })?;
+            let plan = AllocationPlan::array::<Option<PreparedTerminalOp>>(
+                manifest.participant_count(),
+            )?;
+            let allowance = manifest.participant_count() * SLOT_BYTES;
+            if plan.backing_bytes() > allowance {
+                return Err(capacity_error(
+                    TerminalRefusal::ControlCapacity,
+                    plan.backing_bytes(),
+                    allowance,
+                ));
+            }
+            Some(FixedSlots::request(manifest.participant_count(), ticket)?)
+        };
         let mut chain = Self {
-            slots: std::array::from_fn(|_| None),
+            slots,
+            selected: None,
             len: 0,
             cursor: 0,
             _ticket: ticket.clone(),
         };
-        for plugin in plugins {
+        let sources = manifest
+            .sources
+            .as_ref()
+            .map_or(&[][..], FixedSlots::as_slice);
+        for (plugin, entry) in sources.iter().zip(manifest.entries()) {
             if ctx
                 .precommit_response_phase_bound()
                 .elapsed_authorization()
@@ -1165,21 +1891,10 @@ impl PreparedTerminalChain {
             {
                 return Err(capacity_error(TerminalRefusal::AuthorizationExpired, 0, 0));
             }
-            if !plugin.supported_protocols().iter().any(|protocol| {
-                matches!(
-                    protocol,
-                    super::ProxyProtocol::Http | super::ProxyProtocol::Grpc
-                )
-            }) {
-                continue;
-            }
-            let rejection = plugin.applies_after_proxy_on_reject();
-            let charged_action = !plugin.may_replace_rejection_response();
-            if !rejection && !charged_action {
-                continue;
-            }
+            let rejection = entry.eligibility.rejection;
+            let charged_action = entry.eligibility.charged;
             let action_allowed = (if charged { charged_action } else { rejection })
-                && !(suppress_replacers && plugin.may_replace_rejection_response());
+                && !(suppress_replacers && !charged_action);
             if chain.len == MAX_PARTICIPANTS {
                 return Err(capacity_error(
                     TerminalRefusal::TooManyParticipants,
@@ -1187,32 +1902,89 @@ impl PreparedTerminalChain {
                     MAX_PARTICIPANTS,
                 ));
             }
-            let declaration = plugin.terminal_declaration();
+            let declaration = entry.declaration;
             let pure_noop = declaration == TerminalDeclaration::PureNoop;
             let operation = if pure_noop {
                 PreparedTerminalOp::Noop
             } else {
-                let output_limit = match declaration {
-                    TerminalDeclaration::Prepared { bounds, .. } => bounds.output,
-                    _ => 0,
+                let (control_limit, output_limit, workspace_limit) = match declaration {
+                    TerminalDeclaration::Prepared { bounds, .. } => {
+                        (bounds.control, bounds.output, bounds.workspace)
+                    }
+                    _ => (0, 0, 0),
                 };
                 plugin.prepare_terminal(&mut ReachedRequestView {
                     context: ctx,
                     output_limit,
+                    control_limit,
+                    workspace_limit,
+                    workspace: workspace.as_ref(),
                     action_allowed,
                     ticket: ticket.clone(),
+                    instance: entry.instance,
                 })?
             };
-            operation.validate(declaration)?;
-            chain.slots[chain.len] = Some(if !action_allowed {
+            operation.validate(declaration, ticket.as_ref(), entry.instance)?;
+            let operation = Some(if !action_allowed {
                 PreparedTerminalOp::Noop
             } else {
                 operation
             });
+            let slots = chain.slots.as_mut().ok_or_else(|| {
+                capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
+            })?;
+            slots.push(operation)?;
             chain.len += 1;
         }
         drop(workspace);
         Ok(chain)
+    }
+
+    fn selected(
+        &mut self,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<&mut SelectedTerminalCarrier, TerminalAdmissionError> {
+        if self.selected.is_none() {
+            let ticket = self._ticket.as_ref().ok_or_else(|| {
+                capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
+            })?;
+            let mut selected = SelectedTerminalCarrier::new(ticket)?;
+            selected.load_legacy(headers)?;
+            self.selected = Some(selected);
+        }
+        self.selected.as_mut().ok_or_else(|| {
+            capacity_error(TerminalRefusal::PinnedGeneration, 0, 0)
+        })
+    }
+
+    pub(crate) fn reset_selected(
+        &mut self,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<(), TerminalAdmissionError> {
+        if let Some(selected) = &mut self.selected {
+            selected.load_legacy(headers)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_fields(
+        &mut self,
+        patch: TerminalPatch,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) -> Result<(), TerminalAdmissionError> {
+        preflight_legacy_patch(&patch, headers)?;
+        self.selected(headers)?.apply(&patch)?;
+        apply_legacy_patch(&patch, headers)
+    }
+
+    pub(crate) fn apply_cookie(
+        &mut self,
+        cookie: TerminalCookie,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) -> Result<(), TerminalAdmissionError> {
+        preflight_legacy_cookie(cookie.value.as_str(), headers)?;
+        self.selected(headers)?.append_cookie(&cookie)?;
+        apply_terminal_cookie(cookie, headers)
     }
 
     /// Consume each operation exactly once in source order. All currently
@@ -1222,15 +1994,21 @@ impl PreparedTerminalChain {
         if self.cursor == self.len {
             return None;
         }
-        let operation = self.slots[self.cursor].take();
+        let operation = self.slots.as_mut()?.as_mut_slice()[self.cursor].take();
         self.cursor += 1;
         operation
+    }
+
+    pub fn allocated_backing_bytes(&self) -> usize {
+        self._ticket
+            .as_ref()
+            .map_or(0, |ticket| ticket.allocated_backing_bytes())
     }
 }
 
 tokio::task_local! {
     pub(crate) static RESPONSE_TERMINAL_TICKET:
-        std::cell::RefCell<Option<std::sync::Arc<ControlReservation<'static>>>>;
+        std::cell::RefCell<Option<TerminalTicket>>;
 }
 
 pub const CAPACITY_GRPC_WEB_BINARY: &[u8] =
@@ -1241,9 +2019,10 @@ pub const CAPACITY_GRPC_WEB_TEXT: &[u8] = concat!(
 )
 .as_bytes();
 
-/// Emergency transport shape. Every value/body is static, and the fixed number
-/// of transport header entries stays within the independent 4096-byte reserve.
-/// No ledger, hook, parser, fallible staged writer or recursive rejection runs.
+/// Existing emergency wire shape. Values and body are static, but HeaderMap
+/// construction still allocates. Pre-owned emergency backing and its 4096-byte
+/// proof remain unimplemented; this function does not claim that qualification.
+/// No plugin, parser, staged writer or recursive rejection chain runs.
 pub fn capacity_wire_parts(
     native_grpc: bool,
     grpc_web: Option<&str>,
@@ -1329,6 +2108,7 @@ pub(crate) fn builtin_composition_declaration(name: &str) -> TerminalDeclaration
         "load_testing" => super::load_testing::terminal_composition_declaration(),
         "loki_logging" => super::loki_logging::terminal_composition_declaration(),
         "mesh_authz" => super::mesh::authz::terminal_composition_declaration(),
+        "workload_metrics" => super::mesh::workload_metrics::terminal_composition_declaration(),
         "mesh_outbound_registry" => {
             super::mesh::outbound_registry::terminal_composition_declaration()
         }
@@ -1367,46 +2147,57 @@ pub(crate) fn builtin_composition_declaration(name: &str) -> TerminalDeclaration
     }
 }
 
-pub fn apply_terminal_cookie(
-    cookie: TerminalCookie,
-    headers: &mut std::collections::HashMap<String, String>,
-) -> Result<(), TerminalAdmissionError> {
-    let TerminalCookie {
-        value: cookie,
-        _ticket,
-    } = cookie;
+fn preflight_legacy_cookie(
+    cookie: &str,
+    headers: &std::collections::HashMap<String, String>,
+) -> Result<Option<usize>, TerminalAdmissionError> {
     validate_terminal_headers(headers)?;
-    if cookie.len() > MAX_COOKIE_BYTES || cookie.capacity() > MAX_COOKIE_BYTES {
+    if cookie.len() > MAX_COOKIE_BYTES {
         return Err(capacity_error(
             TerminalRefusal::FieldCapacity,
-            cookie.capacity(),
+            cookie.len(),
             MAX_COOKIE_BYTES,
         ));
     }
     let Some(existing) = headers.get("set-cookie") else {
-        check_carrier_growth(headers, 10, cookie.capacity(), cookie.split('\n').count())?;
-        headers.insert("set-cookie".to_string(), cookie);
-        return Ok(());
+        check_carrier_growth(headers, 10, cookie.len(), cookie.split('\n').count())?;
+        return Ok(None);
     };
     let length = existing
         .len()
         .checked_add(cookie.len())
         .and_then(|bytes| bytes.checked_add(1))
         .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
-    // Cookie ownership remains charged to O. New and old selected field
-    // capacities are charged to the carrier before allocating the combination.
-    if length > MAX_COOKIE_BYTES {
+    // Each opaque cookie occurrence has its own 16 KiB value bound. The
+    // legacy combined String has the whole carrier's logical byte guard;
+    // its foreign backing/export overlap remains unqualified.
+    if length > CARRIER_OWNED_BYTES {
         return Err(capacity_error(
             TerminalRefusal::FieldCapacity,
             length,
-            MAX_COOKIE_BYTES,
+            CARRIER_OWNED_BYTES,
         ));
     }
     check_carrier_growth(headers, 10, length, cookie.split('\n').count())?;
+    Ok(Some(length))
+}
+
+pub fn apply_terminal_cookie(
+    cookie: TerminalCookie,
+    headers: &mut std::collections::HashMap<String, String>,
+) -> Result<(), TerminalAdmissionError> {
+    let cookie = cookie.value.as_str();
+    let Some(length) = preflight_legacy_cookie(cookie, headers)? else {
+        headers.insert("set-cookie".to_string(), cookie.to_string());
+        return Ok(());
+    };
+    let Some(existing) = headers.get("set-cookie") else {
+        return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+    };
     let mut combined = String::with_capacity(length);
     combined.push_str(existing);
     combined.push('\n');
-    combined.push_str(&cookie);
+    combined.push_str(cookie);
     headers.insert("set-cookie".to_string(), combined);
     validate_terminal_headers(headers)
 }
