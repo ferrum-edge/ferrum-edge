@@ -1845,7 +1845,11 @@ virtual_service_cors_policies:
     // Match the live client config's policy exactly, retaining the original
     // bare-host projection assertions above as a separate schema witness.
     let mut live_fixture = config;
-    let policy = &mut live_fixture.mesh.as_mut().unwrap().virtual_service_cors_policies[0];
+    let policy = &mut live_fixture
+        .mesh
+        .as_mut()
+        .unwrap()
+        .virtual_service_cors_policies[0];
     policy.host = "svc.default.svc.cluster.local".into();
     policy.cors.allowed_methods = vec!["GET".into(), "POST".into(), "OPTIONS".into()];
     policy.cors.allowed_headers = vec!["content-type".into(), "authorization".into()];

@@ -739,13 +739,9 @@ fn prepare_cors_response(
                 ),
             ] {
                 if let Some(values) = values {
-                    let tokens = values
-                        .values
-                        .iter()
-                        .map(String::as_str)
-                        .filter(|value| {
-                            values.wildcard || state.allow_credentials || *value != "*"
-                        });
+                    let tokens = values.values.iter().map(String::as_str).filter(|value| {
+                        values.wildcard || state.allow_credentials || *value != "*"
+                    });
                     if tokens.clone().next().is_some() {
                         patch.set_policy_tokens(name, tokens)?;
                     }
@@ -924,18 +920,11 @@ impl CorsPlugin {
     fn terminal_config(&self) -> Option<CorsTerminalConfig> {
         use super::terminal_preparation::joined_token_bytes;
         Some(CorsTerminalConfig {
-            methods: joined_token_bytes(
-                self.allowed_methods.values.iter().map(String::as_str),
-            )
-            .ok()?,
-            headers: joined_token_bytes(
-                self.allowed_headers.values.iter().map(String::as_str),
-            )
-            .ok()?,
-            exposed: joined_token_bytes(
-                self.exposed_headers.iter().map(String::as_str),
-            )
-            .ok()?,
+            methods: joined_token_bytes(self.allowed_methods.values.iter().map(String::as_str))
+                .ok()?,
+            headers: joined_token_bytes(self.allowed_headers.values.iter().map(String::as_str))
+                .ok()?,
+            exposed: joined_token_bytes(self.exposed_headers.iter().map(String::as_str)).ok()?,
         })
     }
 

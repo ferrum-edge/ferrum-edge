@@ -244,7 +244,7 @@ impl SelectedTerminalCarrier {
             .filter(move |field| {
                 self.bytes.bytes()[field.name.range()].eq_ignore_ascii_case(name.as_bytes())
             })
-            .flat_map(|field| {
+            .flat_map(move |field| {
                 let mut offset = field.value.offset;
                 std::iter::from_fn(move || {
                     let end = field.value.offset + field.value.length;
@@ -381,7 +381,11 @@ impl SelectedTerminalCarrier {
         }
         for (index, action) in patch.actions.as_slice().iter().enumerate() {
             if vary_action.is_some() {
-                return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+                return Err(capacity_error(
+                    TerminalRefusal::UnimplementedOperation,
+                    0,
+                    0,
+                ));
             }
             let (name, value, override_existing, case_insensitive, lineage) = match action {
                 TerminalFieldAction::CorsVary { preflight, lineage } => {
@@ -657,7 +661,10 @@ impl SelectedTerminalCarrier {
             let Some(field) = field else {
                 continue;
             };
-            if !self.source(field.name, patch)?.eq_ignore_ascii_case(b"vary") {
+            if !self
+                .source(field.name, patch)?
+                .eq_ignore_ascii_case(b"vary")
+            {
                 continue;
             }
             if target.is_none() || self.source(field.name, patch)? == b"vary" {
@@ -724,7 +731,11 @@ impl SelectedTerminalCarrier {
             ..
         }) = projected.as_slice()[vary.field]
         else {
-            return Err(capacity_error(TerminalRefusal::UnimplementedOperation, 0, 0));
+            return Err(capacity_error(
+                TerminalRefusal::UnimplementedOperation,
+                0,
+                0,
+            ));
         };
         let insertion = value.offset + value.length;
         let mut additional = 0usize;
@@ -736,10 +747,9 @@ impl SelectedTerminalCarrier {
                 length += bytes;
             }
         }
-        self.bytes.bytes_mut().copy_within(
-            insertion as usize..*used,
-            insertion as usize + additional,
-        );
+        self.bytes
+            .bytes_mut()
+            .copy_within(insertion as usize..*used, insertion as usize + additional);
         for field in projected.as_mut_slice().iter_mut().flatten() {
             for source in [&mut field.name, &mut field.value] {
                 if let Source::Final(span) = source

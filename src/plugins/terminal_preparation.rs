@@ -1275,7 +1275,8 @@ impl TerminalPatch {
         let prefix = "access-control-";
         let (plan, _) = self.field_plans(prefix, "")?;
         let prefix = TerminalString::copy(prefix, plan, &self.ticket)?;
-        self.actions.push(TerminalFieldAction::RemovePrefix(prefix))?;
+        self.actions
+            .push(TerminalFieldAction::RemovePrefix(prefix))?;
         self.owned_bytes += plan.backing_bytes();
         Ok(())
     }
@@ -1772,12 +1773,10 @@ fn apply_legacy_patch(
                 // plain-String append can erase its segment/token provenance.
                 for (name, value, _) in carrier.occurrences() {
                     if name.eq_ignore_ascii_case(b"vary") {
-                        let name = std::str::from_utf8(name).map_err(|_| {
-                            capacity_error(TerminalRefusal::FieldCapacity, 0, 0)
-                        })?;
-                        let value = std::str::from_utf8(value).map_err(|_| {
-                            capacity_error(TerminalRefusal::FieldCapacity, 0, 0)
-                        })?;
+                        let name = std::str::from_utf8(name)
+                            .map_err(|_| capacity_error(TerminalRefusal::FieldCapacity, 0, 0))?;
+                        let value = std::str::from_utf8(value)
+                            .map_err(|_| capacity_error(TerminalRefusal::FieldCapacity, 0, 0))?;
                         headers.insert(name.to_string(), value.to_string());
                     }
                 }
@@ -1866,12 +1865,14 @@ pub fn field_declaration(control: usize, output: usize) -> TerminalDeclaration {
 pub(crate) fn joined_token_bytes<'a>(
     tokens: impl Iterator<Item = &'a str>,
 ) -> Result<usize, TerminalAdmissionError> {
-    tokens.enumerate().try_fold(0usize, |bytes, (index, token)| {
-        bytes
-            .checked_add(token.len())
-            .and_then(|bytes| bytes.checked_add(if index == 0 { 0 } else { 2 }))
-            .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))
-    })
+    tokens
+        .enumerate()
+        .try_fold(0usize, |bytes, (index, token)| {
+            bytes
+                .checked_add(token.len())
+                .and_then(|bytes| bytes.checked_add(if index == 0 { 0 } else { 2 }))
+                .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))
+        })
 }
 
 pub(crate) fn field_output_size_bound<'a>(

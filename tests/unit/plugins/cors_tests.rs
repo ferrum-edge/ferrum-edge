@@ -3198,7 +3198,9 @@ fn documented_per_proxy_cors_example_passes_file_admission() {
 #[test]
 fn terminal_cors_admission_rejects_configured_output_overflow_and_preserves_reload_generation() {
     use ferrum_edge::plugins::ProxyProtocol;
-    use ferrum_edge::plugins::terminal_preparation::{TerminalDeclaration, compile_terminal_manifest};
+    use ferrum_edge::plugins::terminal_preparation::{
+        TerminalDeclaration, compile_terminal_manifest,
+    };
 
     let mut config = gateway_with_cors_proxy(json!(["https://app.example"]), vec![]);
     let cache = PluginCache::new(&config).unwrap();
@@ -3206,7 +3208,10 @@ fn terminal_cors_admission_rejects_configured_output_overflow_and_preserves_relo
     assert!(compile_terminal_manifest(&before).is_ok());
     config.plugin_configs[0].config["exposed_headers"] = json!(["x".repeat(16_385)]);
     let actual = CorsPlugin::new(&config.plugin_configs[0].config).unwrap();
-    assert_eq!(actual.terminal_declaration(), TerminalDeclaration::Undeclared);
+    assert_eq!(
+        actual.terminal_declaration(),
+        TerminalDeclaration::Undeclared
+    );
     assert!(cache.rebuild(&config).is_err());
     let after = cache.get_plugins_for_protocol("ferrum", "ws-api", ProxyProtocol::Http);
     assert!(std::sync::Arc::ptr_eq(&before, &after));

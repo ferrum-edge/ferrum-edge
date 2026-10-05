@@ -808,8 +808,7 @@ mod qualified {
                         vec![cors_policy()]
                     };
                     let cache = cors_cache(&policies);
-                    let plugins =
-                        cache.get_plugins_for_protocol("default", "cors-route", protocol);
+                    let plugins = cache.get_plugins_for_protocol("default", "cors-route", protocol);
                     let manifest = compile_terminal_manifest(&plugins).unwrap();
                     assert_eq!(manifest.participant_count(), if deferred { 3 } else { 1 });
                     assert!(manifest.entries().all(|entry| matches!(
@@ -909,7 +908,10 @@ mod qualified {
         for plugin in plugins.iter() {
             plugin.after_proxy(&mut ordinary, 204, &mut expected).await;
         }
-        assert_eq!(expected.get("access-control-allow-methods").unwrap(), "POST");
+        assert_eq!(
+            expected.get("access-control-allow-methods").unwrap(),
+            "POST"
+        );
         assert_eq!(
             expected.get("access-control-allow-headers").unwrap(),
             "authorization"
@@ -940,7 +942,10 @@ mod qualified {
         let actual: HashMap<_, _> = carrier
             .occurrences()
             .map(|(name, value, lineage)| {
-                assert_eq!(lineage.origin, TerminalFieldOrigin::GatewayInstance(finalizer));
+                assert_eq!(
+                    lineage.origin,
+                    TerminalFieldOrigin::GatewayInstance(finalizer)
+                );
                 (
                     std::str::from_utf8(name).unwrap().to_string(),
                     std::str::from_utf8(value).unwrap().to_string(),
@@ -967,7 +972,10 @@ mod qualified {
             if let Some(mode) = mode {
                 policy["unmatched_preflights"] = json!(mode);
             } else {
-                policy.as_object_mut().unwrap().remove("unmatched_preflights");
+                policy
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("unmatched_preflights");
             }
             let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CorsPlugin::new(&policy).unwrap())];
             let mut ctx = context();
@@ -980,7 +988,11 @@ mod qualified {
                 match plugins[0].on_request_received(&mut ctx).await {
                     PluginResult::Continue => {
                         assert_eq!(mode, Some("forward"));
-                        (418, bytes::Bytes::from_static(b"selected body"), HashMap::new())
+                        (
+                            418,
+                            bytes::Bytes::from_static(b"selected body"),
+                            HashMap::new(),
+                        )
                     }
                     PluginResult::Reject {
                         status_code,
@@ -1058,18 +1070,27 @@ mod qualified {
         assert_eq!(tokens.len(), 3);
         assert_eq!(tokens[0].1, b"oRiGiN");
         assert!(!tokens[0].3);
-        assert!(tokens.iter().all(|(_, _, lineage, _)| lineage.policy_contribution));
+        assert!(
+            tokens
+                .iter()
+                .all(|(_, _, lineage, _)| lineage.policy_contribution)
+        );
         let segments: Vec<_> = carrier.value_segments("vary").collect();
         assert_eq!(
             segments[0],
-            (b"Accept-Encoding, opaque-\xff, oRiGiN".as_slice(), backend())
+            (
+                b"Accept-Encoding, opaque-\xff, oRiGiN".as_slice(),
+                backend()
+            )
         );
         assert_eq!(segments[1].0, b", Access-Control-Request-Method");
         assert_eq!(segments[2].0, b", Access-Control-Request-Headers");
-        assert!(segments[1..].iter().all(|(_, lineage)| matches!(
-            lineage.origin,
-            TerminalFieldOrigin::GatewayInstance(_)
-        )));
+        assert!(
+            segments[1..].iter().all(|(_, lineage)| matches!(
+                lineage.origin,
+                TerminalFieldOrigin::GatewayInstance(_)
+            ))
+        );
         assert_eq!(
             carrier
                 .occurrences()
@@ -1107,7 +1128,9 @@ mod qualified {
                 .unwrap();
             match overflow {
                 0 => {
-                    carrier.push("vary", &vec![b'x'; 16_384], backend()).unwrap();
+                    carrier
+                        .push("vary", &vec![b'x'; 16_384], backend())
+                        .unwrap();
                 }
                 1 => {
                     for _ in 1..MAX_FIELD_OCCURRENCES {
@@ -1174,8 +1197,8 @@ mod qualified {
         use bytes::Bytes;
         use ferrum_edge::_test_support::{
             apply_replaceable_after_proxy_hooks_to_rejection_for_test,
-            mark_native_grpc_request_for_test,
-            normalize_reject_response_bytes_with_context, set_grpc_deadline_budget_for_test,
+            mark_native_grpc_request_for_test, normalize_reject_response_bytes_with_context,
+            set_grpc_deadline_budget_for_test,
         };
         for grpc in [false, true] {
             for deadline in [false, true] {
@@ -1254,7 +1277,8 @@ mod qualified {
 
     impl Drop for CorsRawOwner {
         fn drop(&mut self) {
-            self.dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1319,7 +1343,10 @@ mod qualified {
                 if native && origin == Some("https://elsewhere.example") {
                     assert!(matches!(
                         result,
-                        PluginResult::Reject { status_code: 403, .. }
+                        PluginResult::Reject {
+                            status_code: 403,
+                            ..
+                        }
                     ));
                 } else {
                     assert!(matches!(result, PluginResult::Continue));
