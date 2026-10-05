@@ -3447,7 +3447,7 @@ fn terminal_uuid_bytes() -> Result<[u8; 16], TerminalAdmissionError> {
 
 fn encode_fixed_hex(bytes: &[u8], encoded: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for (byte, pair) in bytes.iter().zip(encoded.chunks_exact_mut(2)) {
+    for (byte, pair) in bytes.iter().zip(encoded.as_chunks_mut::<2>().0) {
         pair[0] = HEX[usize::from(byte >> 4)];
         pair[1] = HEX[usize::from(byte & 0x0f)];
     }

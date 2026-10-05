@@ -678,7 +678,7 @@ pub struct ControlReservation<'a> {
 impl<'a> ControlReservation<'a> {
     fn next_field_epoch(&self) -> Result<u64, TerminalAdmissionError> {
         self.field_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
                 epoch.checked_add(1)
             })
             .map_err(|_| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))
@@ -713,7 +713,7 @@ impl<'a> ControlReservation<'a> {
     /// No allocator is called until this atomic claim succeeds.
     pub(crate) fn reserve_backing(&self, bytes: usize) -> Result<(), TerminalAdmissionError> {
         self.allocated_backing
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.bytes)
             })
             .map(|_| ())
@@ -1785,7 +1785,7 @@ pub fn compile_terminal_manifest(
         }
         let instance = TerminalInstanceToken(
             NEXT_INSTANCE
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
                     next.checked_add(1)
                 })
                 .map_err(|_| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?,
