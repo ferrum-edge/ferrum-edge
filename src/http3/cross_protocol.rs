@@ -14310,7 +14310,7 @@ mod tests {
     fn h3_cross_protocol_grpc_retry_passes_streaming_decision_through() {
         let src = include_str!("cross_protocol.rs");
         let loop_start_marker =
-            "&& let (Some(hmap), Some(body_bytes)) = (retry_hmap, retry_body)\n    {";
+            "&& let (Some(hmap), Some(mut body_bytes)) = (retry_hmap, retry_body)\n    {";
         let loop_start = src
             .find(loop_start_marker)
             .expect("cross-protocol gRPC retry loop start not found");
