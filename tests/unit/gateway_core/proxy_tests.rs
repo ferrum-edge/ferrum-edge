@@ -486,24 +486,49 @@ fn test_backend_path_bound_retries_abort_in_every_h1_h2_dispatch_family() {
 
 #[test]
 fn test_deferred_grpc_body_context_preserves_buffered_size_metadata() {
+    use super::http3_server_dispatch_tests::compact_code;
+
     let source = include_str!("../../../src/proxy/mod.rs");
     let metadata = source
         .split_once("// Store body metadata for plugins that read via ctx.metadata")
         .and_then(|(_, rest)| rest.split_once("// Mirror pre-transform bytes"))
         .map(|(body, _)| body)
         .expect("native gRPC request-body metadata region");
+    let metadata = compact_code(metadata);
+    let size_statement = "letrequest_body_size_bytes=collected_grpc_req_body.len().to_string();";
+    let primary_statement = "ctx.metadata.insert(\"request_body_size_bytes\".to_string(),\
+                             request_body_size_bytes.clone());";
+    let deferred_marker = "ifletSome(body_hook_ctx)=deferred_body_hook_ctx.as_mut(){";
+    let deferred_statement = "body_hook_ctx.metadata.insert(\
+                              \"request_body_size_bytes\".to_string(),request_body_size_bytes);";
     let size = metadata
-        .find("let request_body_size_bytes = grpc_req_body.len().to_string();")
+        .find(size_statement)
         .expect("buffered gRPC size must be computed once");
-    let primary = metadata[size..]
-        .find("ctx.metadata.insert(")
-        .map(|offset| size + offset)
+    let primary = metadata
+        .find(primary_statement)
         .expect("primary request context must receive buffered gRPC size");
-    let deferred = metadata[primary..]
-        .find("body_hook_ctx.metadata.insert(")
-        .map(|offset| primary + offset)
+    let deferred = metadata
+        .find(deferred_marker)
         .expect("deferred final-body context must receive buffered gRPC size");
     assert!(size < primary && primary < deferred);
+    assert_eq!(
+        metadata.matches("letrequest_body_size_bytes=").count(),
+        1
+    );
+    assert_eq!(metadata.matches(".len()").count(), 1);
+    // Pin the whole bounded region: both contexts receive the same original
+    // collected size, with no transformed-body recomputation or extra writes.
+    assert_eq!(
+        metadata,
+        [
+            size_statement,
+            primary_statement,
+            deferred_marker,
+            deferred_statement,
+            "}",
+        ]
+        .concat()
+    );
 }
 
 #[test]
@@ -4475,29 +4500,49 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
         .find("lettransformed=crate::proxy::apply_retained_request_body_plugins_with_context(")
         .unwrap();
     assert!(transform_at < h3_final_hook);
-    let (final_result, _) = source_group(terminal, h3_final_hook + final_marker.len() - 1).unwrap();
+    let (final_result, final_result_end) =
+        source_group(terminal, h3_final_hook + final_marker.len() - 1).unwrap();
     assert_eq!(
         final_result,
         "Some(reject)=>reject,None=>{crate::proxy::run_final_request_body_hooks(\
          &plugins,Some(&mutctx),grpc_deadline_at,&hook_headers,&transformed).await}"
     );
+    assert!(direct_source_statement(
+        terminal,
+        &terminal[h3_final_hook..final_result_end + 1]
+    ));
     let continue_marker = "PluginResult::Continue=>{";
     let result_marker = "matchfinal_body_result{";
     let result_at = terminal
         .find(result_marker)
         .expect("H3 final policy outcome");
-    let (outcome, _) = source_group(terminal, result_at + result_marker.len() - 1).unwrap();
+    let (outcome, outcome_end) =
+        source_group(terminal, result_at + result_marker.len() - 1).unwrap();
+    assert!(final_result_end < result_at);
+    assert_eq!(outcome_end, terminal.len());
+    assert!(direct_source_statement(
+        terminal,
+        &terminal[result_at..outcome_end]
+    ));
+    assert_eq!(terminal.matches(final_marker).count(), 1);
+    assert_eq!(terminal.matches(result_marker).count(), 1);
     let start = outcome
         .find(continue_marker)
         .expect("H3 accepted final body");
-    let (accepted, _) = source_group(outcome, start + continue_marker.len() - 1).unwrap();
+    assert_eq!(start, 0);
+    let (accepted, accepted_end) =
+        source_group(outcome, start + continue_marker.len() - 1).unwrap();
     assert_eq!(
         accepted,
         "prebuffered_body_data=Some(transformed);request_body_prepared=true;"
     );
     let reject_marker = "reject@PluginResult::Reject{..}|reject@PluginResult::RejectBinary{..}=>{";
     let start = outcome.find(reject_marker).expect("H3 refused final body");
-    let (rejected, _) = source_group(outcome, start + reject_marker.len() - 1).unwrap();
+    assert_eq!(start, accepted_end);
+    let (rejected, rejected_end) = source_group(outcome, start + reject_marker.len() - 1).unwrap();
+    assert_eq!(rejected_end, outcome.len());
+    assert_eq!(outcome.matches(continue_marker).count(), 1);
+    assert_eq!(outcome.matches(reject_marker).count(), 1);
     assert!(direct_source_statement(rejected, "drop(transformed);"));
     assert!(!direct_source_statement(
         rejected,
@@ -4511,6 +4556,9 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
                      grpc_web_response_content_type,http_status,\
                      reject.body.clone(),&headers).await;";
     assert!(direct_source_statement(rejected, committed));
+    assert_eq!(rejected.matches("drop(transformed);").count(), 1);
+    assert_eq!(rejected.matches(capture).count(), 1);
+    assert_eq!(rejected.matches(committed).count(), 1);
     assert!(rejected.find("drop(transformed);").unwrap() < rejected.find(capture).unwrap());
     assert!(rejected.find(capture).unwrap() < rejected.find(committed).unwrap());
     // The malformed conversion fallback skips capture and must release before
@@ -4534,18 +4582,26 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
 
     let egress_marker = "ifcapabilities.has(crate::plugin_cache::PluginCapabilities::\
                          DISPATCHES_FINALIZED_REQUEST_EGRESS){";
-    let h3_egress = h3[terminal_end..]
+    let h3_egress = h3
         .find(egress_marker)
-        .map(|offset| terminal_end + offset)
         .expect("H3 capability-gated finalized-request-egress boundary");
-    assert!(
-        terminal_end < h3_egress,
-        "H3 egress must run after the terminal final request-body hooks"
+    assert_eq!(h3.matches(egress_marker).count(), 1);
+    // source_group returns the index AFTER the closing brace. In compact
+    // source the next sibling scope starts exactly there, proving adjacency
+    // outside the complete terminal block rather than nesting inside it.
+    assert_eq!(
+        terminal_end, h3_egress,
+        "H3 egress must be the direct next scope after complete terminal finalization"
     );
     let call = "crate::proxy::run_finalized_request_egress_hooks(";
     assert_eq!(h3.matches(call).count(), 1);
     assert!(h3.find(call).unwrap() > h3_egress);
-    let (egress, _) = source_group(&h3, h3_egress + egress_marker.len() - 1).unwrap();
+    let (egress, egress_end) = source_group(&h3, h3_egress + egress_marker.len() - 1).unwrap();
+    assert!(direct_source_statement(
+        &h3[terminal_at..egress_end],
+        &h3[h3_egress..egress_end]
+    ));
+    assert_eq!(egress.matches(call).count(), 1);
     assert!(direct_source_statement(
         egress,
         "letegress_body:&[u8]=prebuffered_body_data.as_deref().unwrap_or(&[]);"

@@ -807,11 +807,18 @@ async fn actual_noop_bridge_hooks_and_cross_protocol_retry_keep_one_allocation_c
     assert_eq!(budget.available_bytes(), UNIT);
 }
 
+#[derive(Default)]
+struct RetainedOutputProbe {
+    length: AtomicUsize,
+    capacity: AtomicUsize,
+}
+
 struct RetainedProducer {
     budget: Arc<RequestBufferBudgetProbe>,
     calls: Arc<AtomicUsize>,
     stall: bool,
     output_capacity: Option<usize>,
+    output_probe: Option<Arc<RetainedOutputProbe>>,
     expected_available_before_hook: usize,
     inner: Option<Arc<dyn Plugin>>,
 }
@@ -878,14 +885,23 @@ impl Plugin for RetainedProducer {
         if self.stall {
             pending::<()>().await;
         }
-        if let Some(inner) = &self.inner {
-            return inner
+        let output = if let Some(inner) = &self.inner {
+            inner
                 .transform_request_body_with_context(ctx, body, content_type, headers)
-                .await;
+                .await
+        } else {
+            let mut output = Vec::with_capacity(self.output_capacity.unwrap_or(body.len()));
+            output.extend_from_slice(body);
+            Some(output)
+        };
+        // Observe the producer's actual allocation before the budget publishes
+        // it as Bytes; neither the visible length nor the charged balance is a
+        // capacity witness for a padded gRPC-Web decode.
+        if let (Some(probe), Some(output)) = (&self.output_probe, &output) {
+            probe.length.store(output.len(), Ordering::SeqCst);
+            probe.capacity.store(output.capacity(), Ordering::SeqCst);
         }
-        let mut output = Vec::with_capacity(self.output_capacity.unwrap_or(body.len()));
-        output.extend_from_slice(body);
-        Some(output)
+        output
     }
 }
 
@@ -904,6 +920,7 @@ async fn actual_transform_output_has_its_own_retained_allocation_lifetime() {
         calls: calls.clone(),
         stall: false,
         output_capacity: None,
+        output_probe: None,
         expected_available_before_hook: 0,
         inner: None,
     })];
@@ -939,6 +956,7 @@ async fn actual_transform_refusal_and_cancellation_release_only_their_own_admiss
             calls: calls.clone(),
             stall,
             output_capacity: None,
+            output_probe: None,
             expected_available_before_hook: 0,
             inner: None,
         })];
@@ -1044,6 +1062,7 @@ async fn small_transform_with_uncovered_capacity_is_refused_before_final_egress(
             calls: calls.clone(),
             stall: false,
             output_capacity: Some(UNIT + 1),
+            output_probe: None,
             expected_available_before_hook: 0,
             inner: None,
         }),
@@ -1227,6 +1246,7 @@ async fn exhausted_retained_xml_skips_only_the_proven_outbound_noop_transformer(
                 calls: producer_calls.clone(),
                 stall: false,
                 output_capacity: None,
+                output_probe: None,
                 expected_available_before_hook: 0,
                 inner: None,
             }),
@@ -1625,12 +1645,14 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
             let final_calls = Arc::new(AtomicUsize::new(0));
             let egress_calls = Arc::new(AtomicUsize::new(0));
             let calls = Arc::new(AtomicUsize::new(0));
+            let output_probe = Arc::new(RetainedOutputProbe::default());
             let output_window = budget.buffered_request_body_ceiling(limit);
             let producer: Arc<dyn Plugin> = Arc::new(RetainedProducer {
                 budget: budget.clone(),
                 calls: calls.clone(),
                 stall: false,
                 output_capacity: None,
+                output_probe: Some(output_probe.clone()),
                 expected_available_before_hook: total - input_charge - output_window,
                 inner: grpc_web.then_some(translator),
             });
@@ -1645,6 +1667,11 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
                 .prepare_retained_body(&plugins, &mut ctx, &headers, body, limit)
                 .await;
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let output_length = output_probe.length.load(Ordering::SeqCst);
+            let output_capacity = output_probe.capacity.load(Ordering::SeqCst);
+            assert_eq!(output_length, frames.len());
+            assert!(output_capacity >= output_length);
+            let output_charge = output_capacity.div_ceil(UNIT) * UNIT;
             if limit >= frames.len() {
                 let output = result.unwrap_or_else(|_| panic!("valid 2 MiB replacement"));
                 assert_eq!(output.as_ref(), frames.as_slice());
@@ -1654,15 +1681,24 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
                 );
                 assert_eq!(final_calls.load(Ordering::SeqCst), 1);
                 assert_eq!(egress_calls.load(Ordering::SeqCst), 1);
-                assert_eq!(budget.available_bytes(), total - input_charge - 2 * MIB);
+                let available = total - input_charge - output_charge;
+                assert_eq!(budget.available_bytes(), available);
+                // The exact remaining balance must govern the next admission,
+                // including the decoder's capacity beyond its visible length.
+                let next = budget.try_reserve(available).unwrap();
+                assert_eq!(next.reserved_bytes(), available);
+                assert_eq!(budget.available_bytes(), 0);
+                assert!(budget.try_reserve(UNIT).is_none());
+                drop(next);
+                assert_eq!(budget.available_bytes(), available);
                 let retry = replay_retained_request_body_for_test(&output);
                 assert_eq!(retry.as_ptr(), output.as_ptr());
                 drop(output);
-                assert_eq!(budget.available_bytes(), total - input_charge - 2 * MIB);
+                assert_eq!(budget.available_bytes(), available);
                 drop(ctx);
-                assert_eq!(budget.available_bytes(), total - input_charge - 2 * MIB);
+                assert_eq!(budget.available_bytes(), available);
                 drop(original);
-                assert_eq!(budget.available_bytes(), total - 2 * MIB);
+                assert_eq!(budget.available_bytes(), total - output_charge);
                 drop(retry);
             } else {
                 assert!(matches!(
