@@ -23,7 +23,7 @@
 
 # ── Stage 1: shared build base ──────────────────────────────────────────
 # Digest resolved 2026-09-14; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS base
+FROM rust:latest@sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49 AS base
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
