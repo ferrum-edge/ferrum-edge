@@ -1,5 +1,10 @@
 # Dependency-fenced deployment mutations
 
+Merged #6012 supplies this source capability for the
+[0.9.12 candidate](releases/v0.9.12.md).
+Release qualification, canonical publication and downstream adoption remain pending;
+published v0.9.11 does not provide this profile.
+
 The opt-in `deployment-v1` profile (#6010) supports exact proxy cascade removal
 and API-spec replacement without replaying a whole namespace through restore.
 Ordinary CRUD, API-spec replacement, backup and restore keep their existing
@@ -106,6 +111,12 @@ reinsert a selected row safely refuses and rolls back.
 
 Missing or inconsistent target ownership/dependencies, foreign owners or shared
 owners of a plugin the cascade would delete return `409` before selected writes.
+Proven external references to spec-owned upstreams use the same typed
+`409/not_committed/unconfirmed/recovery_cleanup_authorized=false` refusal on
+resource-changing PUT/DELETE. Metadata-only replacement keeps its shortcut before
+that guard. Database/commit/lease-release and other untyped failures remain
+uncertain; driver messages cannot prove rollback. Ordinary invalid external-owner
+proxy admission still returns `400` without a durable row or covering change.
 Composition, named-schema, TCP-throttle and mTLS policy admission still apply
 to the fenced candidate using the configured validation client. Invalid
 submitted specs retain their ordinary validation errors. Admission

@@ -10,8 +10,14 @@ qualification. The repairs qualified at final fixture head
 as `3ce21ad101f164f70cb7f7f77fb033db828b9518`; issue #6006 is closed.
 The failed release and main runs remain causal evidence, not rerunnable green
 qualification for a new candidate. No production behavior changes were made
-by this repair. The newly integrated release head still requires fresh review
-and hosted qualification.
+by this repair. The final v0.9.11 head
+`ff0a9d5152dc3cf2fd240158cbdf5551f511212e` subsequently qualified through review
+and hosted CI. Release merge `c764084b3b51c3f7ffde268c039688d35e49c553`
+published as v0.9.11 at 2026-10-04T21:26:11Z; see the
+[completed release record](releases/v0.9.11.md). The new
+[v0.9.12 candidate](releases/v0.9.12.md) requires fresh independent review and
+fresh exact-head, main-push and release evidence; these gates remain root-owned
+and pending.
 
 ## Authorization expiry during sender acquisition
 
@@ -215,13 +221,18 @@ landing.
 squash-merged at 2026-10-04 18:08:04 UTC into
 `3ce21ad101f164f70cb7f7f77fb033db828b9518`.
 [Issue #6006](https://github.com/ferrum-edge/ferrum-edge/issues/6006) closed
-at 18:08:06 UTC. Release PR #6005 now normally integrates that main commit,
+at 18:08:06 UTC. Release PR #6005 normally integrated that main commit,
 preserving the qualified fixture source bytes. See the
 [complete workflow evidence](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
 
-Fresh exact-release-head whole review, independent review, and all new hosted
-gates remain **PENDING**. Root owns the eventual release merge commit and its
-second-parent check, main merge freeze while all push gates qualify, immutable
-tag, release/assets/Docker verification, contracts publication, and downstream
-adoption. Fixture-head success does not qualify the new release head or its
-future main merge/tag target, and neither failed historical head is a substitute.
+The final #6005 head `ff0a9d5152dc3cf2fd240158cbdf5551f511212e` subsequently
+qualified through complete root and fresh independent review and hosted CI.
+Root verified release merge `c764084b3b51c3f7ffde268c039688d35e49c553` with
+that exact second parent, all 14 pre-tag main-push workflows and all 20 release
+jobs successful. v0.9.11 published at 2026-10-04T21:26:11Z and its distribution
+was verified; see the [actual release record](releases/v0.9.11.md) for artifact
+identities and GHCR/revision-label limits. Canonical `contracts-edge-0.9.11`
+subsequently published at `390edbd5b2485af0988e02f7827fde778d76ae0a`.
+Neither historical failed head was used as qualification. These results do not
+qualify the new [0.9.12 candidate](releases/v0.9.12.md), downstream adoption or
+advisory closure; its fresh head/main/release gates remain root-owned and pending.

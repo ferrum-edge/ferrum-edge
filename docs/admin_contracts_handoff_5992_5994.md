@@ -1,11 +1,17 @@
 # Admin contract handoff: #5992 and #5994
 
-This is the pre-release handoff for
+This records the published v0.9.11 baseline for
 [Edge PR #5999](https://github.com/ferrum-edge/ferrum-edge/pull/5999),
 [issue #5992](https://github.com/ferrum-edge/ferrum-edge/issues/5992), and
-[issue #5994](https://github.com/ferrum-edge/ferrum-edge/issues/5994).
-The APIs are Unreleased. This file records publication work still required;
-it is not evidence that a ferrum-contracts update has shipped.
+[issue #5994](https://github.com/ferrum-edge/ferrum-edge/issues/5994), plus the
+next candidate handoff. Edge v0.9.11 was published at 2026-10-04T21:26:11Z at
+`c764084b3b51c3f7ffde268c039688d35e49c553`; its verified distribution and
+limits are in the [release record](releases/v0.9.11.md).
+Canonical [`contracts-edge-0.9.11`](https://github.com/ferrum-edge/ferrum-contracts/tree/390edbd5b2485af0988e02f7827fde778d76ae0a)
+targets `390edbd5b2485af0988e02f7827fde778d76ae0a`, not later main
+`96228e1cc3341c6bd2dff3c47eea9efa45e0545e`. New `deployment-v1` source from
+merged #6012 is in the [0.9.12 candidate](releases/v0.9.12.md); its release,
+canonical contracts and downstream adoption are pending.
 
 ## Edge sources to synchronize
 
@@ -48,18 +54,28 @@ The OpenAPI handoff must verify these exact locations in `openapi.yaml`:
 
 ## ferrum-contracts publication work
 
-Publication remains outstanding before the next Edge release. On 2026-10-04,
-the inspected ferrum-contracts
-[main tree at `c35f4c9d254820ad96e7e308583135127c2003de`](https://github.com/ferrum-edge/ferrum-contracts/tree/c35f4c9d254820ad96e7e308583135127c2003de)
-and published
-[`contracts-edge-0.9.9-r2` at `591c73a3f965fdab440c3a76b2707accdf491ba5`](https://github.com/ferrum-edge/ferrum-contracts/tree/591c73a3f965fdab440c3a76b2707accdf491ba5)
-have no dedicated conditional snapshot or backend egress policy artifacts;
-their `vocabularies/gateway-headers.json` also has no `ETag`/`If-Match` entries.
-No corresponding open ferrum-contracts PR was present at inspection. Root must
-arrange that PR and publication with the actual Edge release tag and full-SHA
-provenance before release. Do not edit an already published `contracts-edge-*` tag.
+The immutable published v0.9.11 tag above contains
+`schemas/admin-conditional-snapshot/v1.schema.json`,
+`schemas/backend-egress-policy/v1.schema.json`, the backend egress vocabulary
+and fixtures, and standard admin ETag/If-Match semantics. Its actual
+[canonical release record](https://github.com/ferrum-edge/ferrum-contracts/blob/390edbd5b2485af0988e02f7827fde778d76ae0a/docs/releases/contracts-edge-0.9.11.md)
+and artifact provenance bind owner source to released Edge
+`c764084b3b51c3f7ffde268c039688d35e49c553`. The plugin catalog references
+OpenAPI SHA-256 `687db80271512a367814ded6002ecce546eb190a347a57e32eca36af7d665020`
+through pointers into that exact owner document. Schema syntax validation does
+not establish cryptographic authority, authorization or downstream live apply.
+Some retained canonical preparation text still says publication pending; the
+actual published ref supplies the target, and later main cannot replace it.
 
-Existing exact paths requiring review/update in ferrum-contracts:
+The earlier inspection on 2026-10-04 at canonical main
+`c35f4c9d254820ad96e7e308583135127c2003de` and historical
+`contracts-edge-0.9.9-r2`/`591c73a3f965fdab440c3a76b2707accdf491ba5` predates
+publication. Its missing-artifact observations are historical, not the current
+baseline. Preserve all published tags. Next root must synchronize the additive
+`deployment-v1` snapshot/mutation contract from the actual verified 0.9.12
+release, then qualify consumers; neither step is complete here.
+
+Canonical paths to retain and review for the next ferrum-contracts publication:
 
 - `vocabularies/gateway-headers.json` and
   `schemas/vocabulary-gateway-headers/v1.schema.json`: add or document admin
@@ -75,8 +91,7 @@ Existing exact paths requiring review/update in ferrum-contracts:
   `fixtures/invalid-expectations.json`: register and validate any new schemas,
   vocabularies, and valid/invalid fixture sets through hosted CI.
 
-Proposed exact paths for the new contract surfaces (not yet published; names
-must be agreed in that PR):
+Exact paths published in the v0.9.11 baseline (retain their semantics):
 
 - `schemas/admin-conditional-snapshot/v1.schema.json` with sanitized examples
   in `fixtures/admin-conditional-snapshot/valid/` and
@@ -112,9 +127,15 @@ The existing `Unit Tests (core)` target includes these unignored tests; hosted
 execution of them is required, not established by this source inspection.
 No global scanner or workflow condition was changed by the guard repair.
 
-Root must confirm hosted CI at the final SHA and actual execution of all three
-PostgreSQL, MySQL and replica-set MongoDB tests in `conditional-live-stores`
-with `--run-ignored=all -j 1`. Local execution was prohibited for this handoff.
+The final v0.9.11 release subsequently qualified at the exact #6005 head
+and merge target: all 14 main-push workflows and all 20 release jobs succeeded.
+The source snapshots below preserve the earlier guard-repair history, not an
+outstanding v0.9.11 publication gate. For the new #6012 head, actual hosted logs
+confirmed all three live PostgreSQL/MySQL/replica-Mongo conditional tests plus
+SQLite's admin control; its exact qualification boundary is recorded in the
+[0.9.12 candidate](releases/v0.9.12.md). Fresh preparation-head and main-push
+qualification remain root-owned and pending. No local project execution occurs.
+
 The new fixture pins were verified on 2026-10-04 against Docker Hub tag metadata and registry OCI index
 `Docker-Content-Digest` headers for `postgres:16-alpine`, `mysql:8`, and `mongo:7`.
 The corresponding Docker Hub tag metadata is available at
@@ -138,6 +159,24 @@ Rust failures:
 The separate source/schema follow-up
 `4405f5e649c0267a5cfecb7e02cc44c7dd89f90e` contains fixes for those findings.
 Its source delta is outside this guard/docs repair; the earlier failed run is
-neither proof of a remaining failure nor evidence that the fixes pass. Hosted
-formatting, compilation, lint, guard mutations and live-store execution for the
-final pushed SHA remain unverified until their actual runs complete.
+neither proof of a remaining failure nor evidence that the fixes pass. The later
+final v0.9.11 qualification superseded this historical pending status. It does not qualify a new 0.9.12 preparation or release head.
+
+## Next deployment-v1 publication (#6010 / #6012)
+
+Carry the new owner surfaces from `openapi.yaml`, `docs/deployment_mutations.md`,
+`src/admin/deployment_mutations.rs` and the SQL/Mongo deployment mutation stores:
+admin-only coherent raw snapshots; original `deployment-v1` namespace authority;
+strict opt-in proxy cascade removal and API-spec replacement; all four stores'
+entry/commit fences and topology requirements; supported unknown-state preservation
+and fail-closed unrepresentable evidence. Publish the exact durable/live/cleanup
+envelopes, typed external-reference `409/not_committed/unconfirmed/false` refusal,
+and uncertain driver/commit/lease handling. Backup tags and row ETags cannot
+substitute. No refreshed token, retry or full restore-minus-target is recovery
+cleanup authority. CP durable-only acknowledgement is not serving-DP application.
+
+Publish from the actual verified 0.9.12 release/full SHA after fresh root review
+and hosted qualification. Preserve the v0.9.11 baseline and its schema/catalog
+provenance. Consumers must retain original encrypted evidence/journals through
+refusal, committed-not-live and uncertainty and qualify their adoption separately.
+No 0.9.12 canonical publication, packaged adoption or advisory closure is claimed.

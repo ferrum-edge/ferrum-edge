@@ -591,20 +591,25 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The latest published tag is
-[`contracts-edge-0.9.9-r2`](https://github.com/ferrum-edge/ferrum-contracts/tree/591c73a3f965fdab440c3a76b2707accdf491ba5)
-at `591c73a3f965fdab440c3a76b2707accdf491ba5`. It carries the published
-**v0.9.9/v0.9.10 contract baseline**; v0.9.10 changed no contract source.
+Edge source. The published baseline is
+[`contracts-edge-0.9.11`](https://github.com/ferrum-edge/ferrum-contracts/tree/390edbd5b2485af0988e02f7827fde778d76ae0a)
+at `390edbd5b2485af0988e02f7827fde778d76ae0a`, with owner provenance from
+verified Edge **v0.9.11** at `c764084b3b51c3f7ffde268c039688d35e49c553`.
+Edge v0.9.11 was published at 2026-10-04T21:26:11Z; its
+[release record](docs/releases/v0.9.11.md) records qualified source, verified
+assets/images and GHCR/revision-label limits. Later contracts main
+`96228e1cc3341c6bd2dff3c47eea9efa45e0545e` is not this tag's target.
 
-The **v0.9.11 release draft** includes new conditional admin snapshot/restore,
-backend egress discovery, and JWT authorization lifetime/dispatch handoff
-contracts. These additions remain pending until the actual Edge release,
-canonical release evidence, and consumer qualification are complete. The
-existing tag does not cover these new surfaces, and historical published tags
-must remain unchanged. See the
-[release draft](docs/releases/v0.9.11.md) and
-[contracts handoff](docs/admin_contracts_handoff_5992_5994.md) before updating
-consumer pins.
+The **0.9.12 candidate**, prepared on 2026-10-05 UTC from merged #6012,
+adds opt-in `deployment-v1` snapshots and dependency-fenced partial removal/spec
+replacement with original namespace authority and strict durable/live/cleanup
+acknowledgements. Main-push and release qualification, publication, new canonical
+contracts and downstream adoption remain pending. Published 0.9.11 backup tags
+and row ETags cannot authorize this new profile. Preserve existing tags and
+consumer pins until the actual release/contracts/adoption sequence completes.
+See the [candidate release](docs/releases/v0.9.12.md),
+[adoption contract](docs/deployment_mutations.md) and
+[contracts handoff](docs/admin_contracts_handoff_5992_5994.md).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the
