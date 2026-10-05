@@ -156,6 +156,36 @@ semantics. HMAC still requires valid header preverification; timestamp-only SOAP
 remains in its later phase; native gRPC/gRPC-Web folding and attempt clocks,
 WebSocket and CONNECT tunnels retain their protocol contracts.
 
+### Completed uploads on rejection
+
+Completed request metadata remains available to synthetic response-body and
+reject-path `after_proxy` capture hooks. An enrolled native-gRPC request can be
+non-UTF-8 and still needs its binary snapshot when `before_proxy` terminates it.
+An existing peer-redacted UTF-8 view takes precedence. Initial and deferred
+short-circuits retain the existing client/backend-effective method and framing
+witness rules; a refuted candidate is discarded by its owning audit instance.
+Successful backend dispatch still captures the finalized request in the final
+request-body hook and never recaptures stale pre-transform metadata.
+
+| Terminal path | Owner through capture | Retirement boundary |
+| --- | --- | --- |
+| H1/H2 completed buffered rejection, including both header branches and deferred hooks | Transport Vec is retired; its existing permit moves onto the existing binary metadata view without copying or taking another reservation | Shared synthetic/reject finalizer, after capture/shaping and before committed observers |
+| H1/H2 native-gRPC final-body rejection | Transformed transport Bytes are dropped; the already-charged collected owner moves behind the existing metadata view without changing it | Same shared finalizer, after the final-body or short-circuit capture decision |
+| Native H3 completed rejection | Redundant transport/replacement Bytes are dropped; the metadata snapshot keeps its original allocation charge | Same shared finalizer, including when commitment is deferred for gRPC-Web/native gRPC |
+| H3 cross-protocol final-body rejection | Replacement transport owner is dropped; metadata survives the reject `after_proxy` chain | Reject-only committed delegate, before any observer or context clone |
+| Incomplete collection or malformed normalization fallback | Partial collector/permit is dropped on failure or cancellation; no complete capture is fabricated | Before rejection hooks or a direct transport write, respectively |
+
+Raw request text, binary snapshots and context-held collector charges are cleared
+before committed observers, detached transaction logging or terminal stream
+writes can wait. Committed audit hooks consume their instance's separately
+bounded captured result. Existing plugin text/decode working-set contracts are
+unchanged. The original non-UTF-8 functional assertion remains strict; added
+coverage requires an exact method/name excerpt, a single capture and full upload
+admission while a committed observer is stalled, including observer cancellation,
+owned context clones, native H3 and bridge commitment, and a peer-redacted view.
+These are hosted regression requirements, not local test results or a release
+qualification claim.
+
 ## Qualification and contract handoff
 
 External controlled-clock tests exercise shared selection, receipt anchoring,

@@ -1210,3 +1210,58 @@ async fn grpc_audit_captures_a_non_utf8_request_short_circuited_in_before_proxy(
     );
     harness.shutdown();
 }
+
+/// The configured late header transformer selects the cloned-header dispatch
+/// branch even though the earlier fault terminates before that transformer runs.
+/// Keep the original no-clone binary short-circuit test unchanged alongside it.
+#[tokio::test]
+#[ignore]
+async fn grpc_audit_captures_a_non_utf8_short_circuit_with_cloned_headers() {
+    let extra_plugins = format!(
+        "{ABORT_PROXY_PLUGIN}\n      - plugin_config_id: \"late-header-transform\""
+    );
+    let extra_configs = format!(
+        r#"{ABORT_PLUGIN_CONFIG}
+  - id: "late-header-transform"
+    plugin_name: "request_transformer"
+    scope: proxy
+    proxy_id: "grpc-audit-proxy"
+    enabled: true
+    config:
+      rules:
+        - operation: add
+          target: header
+          key: x-late-transform
+          value: unreachable
+"#
+    );
+    let harness = Harness::start(&extra_plugins, &extra_configs).await;
+    let payload = encode_hello_request("binary-safe-subject", -1);
+    let body = grpc_frame(&payload);
+    assert!(std::str::from_utf8(&body).is_err());
+    let call = send_grpc_request(
+        &harness.addr,
+        ENROLLED_METHOD,
+        &body,
+        &[],
+    )
+    .await
+    .expect("gRPC call");
+    assert_eq!(call.status, 200);
+    assert_eq!(
+        call.grpc_status(),
+        "14",
+        "the configured abort must win"
+    );
+    let records = harness.records.wait_for(1).await;
+    assert_eq!(records.len(), 1, "one complete audit record: {records:?}");
+    let request_body = request_excerpt(&records[0]);
+    let excerpt: Value = serde_json::from_str(&request_body).unwrap();
+    assert_eq!(excerpt["grpc_method"], ENROLLED_METHOD);
+    assert_eq!(excerpt["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        excerpt["messages"][0]["fields"]["name"],
+        "binary-safe-subject"
+    );
+    harness.shutdown();
+}

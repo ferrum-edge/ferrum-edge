@@ -738,6 +738,26 @@ impl RequestBufferPermit {
         Some(self.into_charged_bytes(data))
     }
 
+    /// Transfer a completed collector's claim to its existing binary metadata
+    /// view when rejection retires the transport Vec. No copy or new admission
+    /// is needed. Keep the full claim: a Bytes view does not expose allocation
+    /// capacity, and a peer may have replaced it under its own body contract.
+    pub(crate) fn into_charged_view(self, data: Bytes) -> Bytes {
+        struct Owner {
+            data: Bytes,
+            _permit: RequestBufferPermit,
+        }
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+        Bytes::from_owner(Owner {
+            data,
+            _permit: self,
+        })
+    }
+
     /// Publish `data` as cheaply cloneable [`Bytes`] whose charge is released
     /// when the last clone drops — not when the collector's stack frame ends.
     ///

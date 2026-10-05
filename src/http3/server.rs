@@ -4037,7 +4037,6 @@ async fn handle_h3_request(
     .await
     {
         drop(prebuffered_body_data.take());
-        ctx.discard_retained_request_metadata();
         let mut reject_status = status_code;
         let mut reject_body = body;
         // Run after_proxy reject hooks AND the synthetic response-body
@@ -4293,7 +4292,6 @@ async fn handle_h3_request(
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
                     drop(prebuffered_body_data.take());
-                    ctx.discard_retained_request_metadata();
                     crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
@@ -4639,7 +4637,6 @@ async fn handle_h3_request(
         }
         if let Some((rejection, reject_phase)) = rejected {
             drop(prebuffered_body_data.take());
-            ctx.discard_retained_request_metadata();
             let Some(reject) = plugin_result_into_reject_parts(rejection) else {
                 tracing::error!(
                     phase = reject_phase,
@@ -4764,7 +4761,6 @@ async fn handle_h3_request(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 drop(prebuffered_body_data.take());
-                ctx.discard_retained_request_metadata();
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
                     run_h3_reject_response_committed_hooks(
@@ -4882,7 +4878,6 @@ async fn handle_h3_request(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 drop(prebuffered_body_data.take());
-                ctx.discard_retained_request_metadata();
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
                     ctx.headers = tmp_headers;
@@ -5055,7 +5050,6 @@ async fn handle_h3_request(
         | crate::proxy::max_forwards::MaxForwardsDecision::Decremented => {}
         crate::proxy::max_forwards::MaxForwardsDecision::Terminal(terminal) => {
             drop(prebuffered_body_data.take());
-            ctx.discard_retained_request_metadata();
             // Heap-pinned like the `boxed_*` reject helpers on the H1/H2
             // ladder: this handler's state machine is already close to the
             // worker stack budget of a debug build, and inlining one more
@@ -5223,7 +5217,6 @@ async fn handle_h3_request(
         )
     {
         drop(prebuffered_body_data.take());
-        ctx.discard_retained_request_metadata();
         if final_body_before_backend_dispatch {
             let rejection = finalize_h3_terminal_body_read_rejection(
                 &state,
@@ -5250,6 +5243,7 @@ async fn handle_h3_request(
             )
             .await?;
         } else {
+            ctx.discard_retained_request_metadata();
             record_h3_flavor_aware_reject(&state, http_flavor, 413);
             send_h3_error_flavor_aware_with_policy(
                 &mut stream,
@@ -5480,7 +5474,6 @@ async fn handle_h3_request(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 drop(prebuffered_body_data.take());
-                ctx.discard_retained_request_metadata();
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     run_h3_reject_response_committed_hooks(
                         &plugins,
@@ -5893,8 +5886,8 @@ async fn handle_h3_request(
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 drop(transformed);
-                ctx.discard_retained_request_metadata();
                 let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
+                    ctx.discard_retained_request_metadata();
                     record_request(&state, 500);
                     let mut body = Bytes::from_static(b"Internal Server Error");
                     let mut headers = HashMap::new();
@@ -6022,8 +6015,8 @@ async fn handle_h3_request(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 drop(prebuffered_body_data.take());
-                ctx.discard_retained_request_metadata();
                 let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
+                    ctx.discard_retained_request_metadata();
                     record_request(&state, 500);
                     let mut body = Bytes::from_static(b"Internal Server Error");
                     let mut headers = HashMap::new();
@@ -6483,7 +6476,6 @@ async fn handle_h3_request(
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 drop(transformed);
-                ctx.discard_retained_request_metadata();
                 cb_probe.release_neutral();
                 let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                     run_h3_reject_response_committed_hooks(
@@ -9079,7 +9071,6 @@ async fn handle_h3_request(
         reject @ crate::plugins::PluginResult::Reject { .. }
         | reject @ crate::plugins::PluginResult::RejectBinary { .. } => {
             drop(body_data);
-            ctx.discard_retained_request_metadata();
             // Gateway-side reject before backend dispatch. The CB check above may
             // have reserved a HALF_OPEN probe; release it before any client-facing
             // reject write (the sends below use `?` and can exit early on client
@@ -9088,6 +9079,7 @@ async fn handle_h3_request(
             // fallback below.
             cb_probe.release_neutral();
             let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
+                ctx.discard_retained_request_metadata();
                 tracing::error!("Plugin result could not be converted to rejection parts");
                 record_request(&state, 500);
                 let mut body = Bytes::from_static(b"Internal Server Error");
@@ -10910,7 +10902,6 @@ async fn run_h3_backend_path_plugins_or_send_reject(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 drop(retained_body.take());
-                ctx.discard_retained_request_metadata();
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     error!(
                         plugin = plugin.name(),
@@ -18232,6 +18223,9 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
     headers: &HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
+    // Capture/shaping has completed (or this is a direct gateway terminal).
+    // Never clone a raw upload into a deferred observer or retain it on QUIC.
+    ctx.discard_retained_request_metadata();
     if !plugins
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())

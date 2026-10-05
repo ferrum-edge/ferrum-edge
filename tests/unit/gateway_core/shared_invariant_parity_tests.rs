@@ -2994,3 +2994,159 @@ fn streaming_h2_arm_uses_the_tested_body_regime() {
     assert!(!arm.contains("grpc_streaming_response_deadline("));
     assert!(!arm.contains("state.response_coalesce_flush("));
 }
+
+/// Raw uploads belong to request-capture/shaping hooks, never to committed
+/// observers, detached logging, or a stalled terminal transport write.
+#[test]
+fn short_circuit_request_capture_and_retirement_have_frontend_parity() {
+    use super::http3_server_dispatch_tests::compact_code;
+    use super::native_grpc_dispatch_auth_lifetime_tests::{direct_source_statement, source_group};
+
+    fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.find(marker).expect("named production function");
+        let (_, signature_end) = source_group(source, start + marker.len() - 1).unwrap();
+        let body_at = signature_end + source[signature_end..].find('{').unwrap();
+        source_group(source, body_at).unwrap().0
+    }
+
+    let h1 = compact_code(include_str!("../../../src/proxy/mod.rs"));
+    let h3 = compact_code(include_str!("../../../src/http3/server.rs"));
+    for (label, source, retire) in [
+        (
+            "H1/H2",
+            &h1,
+            "retire_client_request_body_for_rejection(&mutclient_request_body,&mutctx);",
+        ),
+        ("H3", &h3, "drop(prebuffered_body_data.take());"),
+    ] {
+        let start = source.find("letneeds_header_clone=").expect(label);
+        let source = &source[start..];
+        let clone_at = source.find("ifneeds_header_clone{").expect(label);
+        let (clone_branch, clone_end) =
+            source_group(source, clone_at + "ifneeds_header_clone".len()).unwrap();
+        let no_clone = &source[clone_end..];
+        assert!(no_clone.starts_with("elseif!plugins.is_empty(){"), "{label}");
+        let (no_clone_branch, _) =
+            source_group(no_clone, "elseif!plugins.is_empty()".len()).unwrap();
+        for branch in [clone_branch, no_clone_branch] {
+            let reject = "reject@PluginResult::Reject{..}|reject@PluginResult::RejectBinary{..}=>{";
+            let at = branch.find(reject).expect(label);
+            let (rejected, _) = source_group(branch, at + reject.len() - 1).unwrap();
+            assert!(direct_source_statement(rejected, retire), "{label}");
+            assert!(!direct_source_statement(
+                rejected,
+                "ctx.discard_retained_request_metadata();"
+            ));
+            let capture = if label == "H1/H2" {
+                "letreject=boxed_finalize_reject_response("
+            } else {
+                "apply_reject_after_proxy_and_synthetic_body_hooks("
+            };
+            assert!(
+                rejected.find(retire).unwrap() < rejected.find(capture).unwrap(),
+                "{label}"
+            );
+        }
+    }
+
+    // A deferred short-circuit already resolved the backend-effective method,
+    // but needs the same body lifetime through that method's capture decision.
+    for (source, retire, capture, path_marker, path_retire) in [
+        (
+            &h1,
+            "retire_client_request_body_for_rejection(&mutclient_request_body,&mutctx);",
+            "boxed_finalize_reject_response(",
+            "asyncfnrun_backend_path_plugins_or_build_reject(",
+            "retire_client_request_body_for_rejection(client_request_body,ctx);",
+        ),
+        (
+            &h3,
+            "drop(prebuffered_body_data.take());",
+            "apply_reject_after_proxy_and_synthetic_body_hooks(",
+            "asyncfnrun_h3_backend_path_plugins_or_send_reject(",
+            "drop(retained_body.take());",
+        ),
+    ] {
+        let marker = "matchdeferred_result{";
+        let start = source.find(marker).unwrap();
+        let (outcome, _) = source_group(source, start + marker.len() - 1).unwrap();
+        let reject = "reject@PluginResult::Reject{..}|reject@PluginResult::RejectBinary{..}=>{";
+        let start = outcome.find(reject).unwrap();
+        let (rejected, _) = source_group(outcome, start + reject.len() - 1).unwrap();
+        assert!(direct_source_statement(rejected, retire));
+        assert!(!direct_source_statement(
+            rejected,
+            "ctx.discard_retained_request_metadata();"
+        ));
+        assert!(rejected.find(retire).unwrap() < rejected.find(capture).unwrap());
+        let path_hook = function_body(source, path_marker);
+        assert!(path_hook.find(path_retire).unwrap() < path_hook.find(capture).unwrap());
+        assert!(!path_hook.contains("ctx.discard_retained_request_metadata();"));
+    }
+
+    let shared = function_body(
+        &h1,
+        "pub(crate)asyncfnapply_reject_after_proxy_and_synthetic_body_hooks(",
+    );
+    let cleanup = "ctx.discard_retained_request_metadata();";
+    assert_eq!(shared.matches(cleanup).count(), 1);
+    assert!(direct_source_statement(shared, cleanup));
+    let capture = "apply_replaceable_after_proxy_hooks_to_rejection(\
+                   plugins,ctx,status,body,headers).await;";
+    let capture_end = shared.find(capture).unwrap();
+    let cleanup_at = shared.find(cleanup).unwrap();
+    let committed_at = shared.find("ifinvoke_response_committed&&plugins").unwrap();
+    assert!(capture_end < cleanup_at && cleanup_at < committed_at);
+    assert!(!shared[..capture_end].contains(cleanup));
+
+    // The H3 bridge uses a reject-only after_proxy runner, while H3 native and
+    // gRPC-Web defer commitment after the shared synthetic pipeline. Both
+    // delegates must retire even with no observer and before any owned clone.
+    let bridge = compact_code(include_str!("../../../src/http3/cross_protocol.rs"));
+    for (source, marker, next) in [
+        (
+            &h3,
+            "asyncfnrun_h3_deadline_bounded_reject_committed_hooks_with_policy(",
+            "if!plugins",
+        ),
+        (
+            &bridge,
+            "pub(crate)asyncfnrun_cross_protocol_reject_committed_hooks(",
+            "for(index,plugin)",
+        ),
+    ] {
+        let body = function_body(source, marker);
+        assert!(body.starts_with(cleanup));
+        assert!(body.find(cleanup).unwrap() < body.find(next).unwrap());
+    }
+
+    // Native gRPC's final-body path owns collected and transformed Bytes
+    // separately. Neither may linger into committed/log/transport waits.
+    let native_at = h1
+        .find("let(grpc_method,grpc_headers,collected_grpc_req_body)=matchclient_request_body{")
+        .unwrap();
+    let native = &h1[native_at..];
+    let marker = "matchfinal_body_result{";
+    let at = native.find(marker).unwrap();
+    let (outcome, _) = source_group(native, at + marker.len() - 1).unwrap();
+    let marker = "reject@PluginResult::Reject{..}|reject@PluginResult::RejectBinary{..}=>{";
+    let at = outcome.find(marker).unwrap();
+    let (rejected, _) = source_group(outcome, at + marker.len() - 1).unwrap();
+    let retire = "retain_charged_request_metadata_on_rejection(&mutctx,collected_grpc_req_body);";
+    assert!(direct_source_statement(rejected, "drop(grpc_req_body);"));
+    assert!(direct_source_statement(rejected, retire));
+    assert!(rejected.find("drop(grpc_req_body);").unwrap() < rejected.find(retire).unwrap());
+    assert!(
+        rejected.find(retire).unwrap() < rejected.find("boxed_finalize_reject_response(").unwrap()
+    );
+
+    // H1/H2 handoff moves the existing admission to the existing snapshot. It
+    // must never manufacture another raw copy or reserve while already full.
+    let handoff = function_body(
+        &h1,
+        "pub(crate)fnretain_request_metadata_charge_on_rejection(",
+    );
+    assert!(handoff.contains("ctx.request_body_bytes=Some(permit.into_charged_view(body));"));
+    assert!(!handoff.contains("reserve") && !handoff.contains("copy_from_slice"));
+    assert!(!handoff.contains(".clone()") && !handoff.contains(".to_vec()"));
+}

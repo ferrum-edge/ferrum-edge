@@ -14,8 +14,8 @@ use ferrum_edge::_test_support::{
     capture_early_route_upload_bound_for_test, capture_route_upload_bound_for_test,
     collect_h3_early_route_upload_for_test, early_upload_unresolved_result_for_test,
     finalize_plugin_rejection_for_test, gateway_deadline_response_selected_for_test,
-    mark_early_upload_terminal_for_test, set_grpc_deadline_budget_for_test,
-    set_request_credential_deadline_for_test,
+    mark_early_upload_terminal_for_test, retain_native_grpc_rejection_metadata_for_test,
+    set_grpc_deadline_budget_for_test, set_request_credential_deadline_for_test,
 };
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginScope};
@@ -1681,5 +1681,45 @@ async fn h3_replacements_use_grpc_and_grpc_web_ceilings_including_route_caps() {
             }
             assert_eq!(budget.available_bytes(), total);
         }
+    }
+}
+
+/// Both H1/H2 rejection handoffs preserve the existing snapshot's identity
+/// and admission through every clone, without reserving under saturation.
+#[tokio::test]
+async fn completed_h1_rejection_snapshot_keeps_admission_until_its_last_owner() {
+    for native_grpc_final in [false, true] {
+        let budget = RequestBufferBudgetProbe::new(UNIT, UNIT);
+        let permit = budget.try_reserve(UNIT).expect("collector admission");
+        let mut ctx = request();
+        ctx.request_body_bytes = Some(Bytes::from(vec![0xff; 32]));
+        let pointer = ctx.request_body_bytes.as_ref().unwrap().as_ptr();
+        if native_grpc_final {
+            let collected = permit.into_charged_bytes(vec![0xff; 32]);
+            retain_native_grpc_rejection_metadata_for_test(&mut ctx, collected);
+        } else {
+            permit.retain_rejection_metadata(&mut ctx);
+        }
+        let final_owner = ctx.request_body_bytes.as_ref().unwrap().clone();
+        assert_eq!(final_owner.as_ptr(), pointer);
+        assert_eq!(budget.available_bytes(), 0);
+        finalize_plugin_rejection_for_test(
+            &[],
+            &mut ctx,
+            PluginResult::RejectBinary {
+                status_code: 400,
+                body: Bytes::new(),
+                headers: HashMap::new(),
+            },
+        )
+        .await;
+        assert!(ctx.request_body_bytes.is_none());
+        assert_eq!(
+            budget.available_bytes(),
+            0,
+            "the external snapshot still owns its charge"
+        );
+        drop(final_owner);
+        assert_eq!(budget.available_bytes(), UNIT);
     }
 }

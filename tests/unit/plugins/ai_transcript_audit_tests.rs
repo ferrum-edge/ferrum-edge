@@ -12598,6 +12598,310 @@ async fn grpc_non_utf8_request_stages_and_captures_on_a_before_proxy_short_circu
     );
 }
 
+struct ChargedShortCircuitWitness {
+    budget: Arc<ferrum_edge::_test_support::RequestBufferBudgetProbe>,
+    request_ptr: usize,
+}
+
+#[async_trait]
+impl Plugin for ChargedShortCircuitWitness {
+    fn name(&self) -> &str {
+        "charged_short_circuit_witness"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _status: u16,
+        _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        assert_eq!(self.budget.available_bytes(), 0);
+        let body = ctx.request_body_bytes.as_ref().expect("capture snapshot");
+        assert_eq!(body.as_ptr() as usize, self.request_ptr);
+        assert!(std::str::from_utf8(body).is_err());
+        PluginResult::Continue
+    }
+}
+
+struct PeerRequestTextRewrite {
+    body: String,
+}
+
+#[async_trait]
+impl Plugin for PeerRequestTextRewrite {
+    fn name(&self) -> &str {
+        "peer_request_text_rewrite"
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        ctx.metadata.insert("request_body".into(), self.body.clone());
+        PluginResult::Continue
+    }
+}
+
+struct ShortCircuitCommitWitness {
+    budget: Arc<ferrum_edge::_test_support::RequestBufferBudgetProbe>,
+    audit: Arc<AiTranscriptAudit>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Plugin for ShortCircuitCommitWitness {
+    fn name(&self) -> &str {
+        "short_circuit_commit_witness"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        status: u16,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        use ferrum_edge::_test_support::RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT;
+
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("grpc-status").map(String::as_str),
+            Some("14")
+        );
+        assert_eq!(self.audit.capture_counters(), (1, 0));
+        assert!(ctx.request_body_bytes.is_none());
+        assert!(!ctx.metadata.contains_key("request_body"));
+        assert_eq!(self.budget.available_bytes(), UNIT);
+        // Admission for the next upload must succeed while this observer is
+        // still stalled. Merely clearing metadata after the await is too late.
+        let next_upload = self.budget.try_reserve(UNIT).expect("next upload admission");
+        drop(next_upload);
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
+/// Drive the production before_proxy/reject/committed seams, including the
+/// native-H3 collector and its deferred committed runner. The live audit sink
+/// must receive an exact decoded excerpt while the observer is still blocked.
+/// Both header-map branches and a peer's final text rewrite are covered.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_short_circuit_capture_releases_upload_ownership_before_committed_wait() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
+        RetainedRequestOutcomeForTest, apply_replaceable_after_proxy_hooks_to_rejection_for_test,
+        finalize_native_grpc_rejection_for_test, h3_run_reject_committed_hooks_for_test,
+        run_before_proxy_hooks_for_test, run_h3_reject_response_committed_hooks,
+        set_grpc_deadline_budget_for_test,
+    };
+    use ferrum_edge::plugins::fault_injection::FaultInjectionPlugin;
+    use std::time::Duration;
+
+    const OBSERVER_WAIT: Duration = Duration::from_secs(2);
+    const HASH_SECRET: &str = "short-circuit-capture-ownership-proof";
+
+    for frontend in ["h1_h2", "native_h3", "h3_bridge"] {
+        let native_h3 = frontend != "h1_h2";
+        for cloned_headers in [false, true] {
+            for peer_redacted in [false, true] {
+                let server = mock_sink().await;
+                let endpoint = format!("{}/ingest", server.uri());
+                let mut overrides = grpc_audit_overrides();
+                overrides["redaction"]["hash_secret"] = json!(HASH_SECRET);
+                let audit = Arc::new(
+                    AiTranscriptAudit::new(
+                        &config_with_sink(&endpoint, overrides),
+                        loopback_http_client(),
+                    )
+                    .unwrap(),
+                );
+                audit.start_background_tasks().unwrap();
+                audit.commit_background_tasks();
+                let budget = Arc::new(RequestBufferBudgetProbe::new(UNIT, UNIT));
+                let payload = hello_request_bytes_with_age("binary-safe-subject", -1);
+                let request = Bytes::from(grpc_frame(&payload));
+                let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+                if cloned_headers {
+                    // Exercise owned observer contexts as well as the borrowed
+                    // unbounded path. Neither may retain the completed upload.
+                    set_grpc_deadline_budget_for_test(&mut ctx, Some(30_000));
+                }
+                let h1_permit = if native_h3 {
+                    let chunks = futures_util::stream::iter([Ok(request)]);
+                    let collected = budget
+                        .collect_retained_chunks(chunks, 0)
+                        .await
+                        .expect("actual retained collector");
+                    let RetainedRequestOutcomeForTest::Collected(body) = collected else {
+                        panic!("retained collector refused the binary fixture");
+                    };
+                    ctx.request_body_bytes = Some(body);
+                    None
+                } else {
+                    let permit = budget.try_reserve(UNIT).expect("H1/H2 collector admission");
+                    ctx.request_body_bytes = Some(request);
+                    Some(permit)
+                };
+                let request_ptr = ctx.request_body_bytes.as_ref().unwrap().as_ptr() as usize;
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                let mut plugins: Vec<Arc<dyn Plugin>> = vec![
+                    Arc::new(ChargedShortCircuitWitness {
+                        budget: Arc::clone(&budget),
+                        request_ptr,
+                    }),
+                    audit.clone(),
+                    Arc::new(
+                        FaultInjectionPlugin::new(&json!({
+                            "abort": {"status_code": 503, "grpc_status": 14, "percentage": 100.0}
+                        }))
+                        .unwrap(),
+                    ),
+                    Arc::new(ShortCircuitCommitWitness {
+                        budget: Arc::clone(&budget),
+                        audit: Arc::clone(&audit),
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    }),
+                ];
+                if peer_redacted {
+                    // The peer runs after audit staging and before the real
+                    // fault. Capture must prefer its final provider-visible
+                    // text over the retained original binary snapshot.
+                    let payload = hello_request_bytes_with_age("peer-redacted", 0);
+                    plugins.insert(
+                        2,
+                        Arc::new(PeerRequestTextRewrite {
+                            body: String::from_utf8(grpc_frame(&payload)).unwrap(),
+                        }),
+                    );
+                }
+                let mut headers = if cloned_headers {
+                    ctx.headers.clone()
+                } else {
+                    std::mem::take(&mut ctx.headers)
+                };
+                let reject =
+                    run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+                if !cloned_headers {
+                    ctx.headers = headers;
+                }
+                assert_eq!(
+                    audit.capture_counters(),
+                    (0, 0),
+                    "staging must defer capture"
+                );
+                if let Some(permit) = h1_permit {
+                    permit.retain_rejection_metadata(&mut ctx);
+                }
+                let PluginResult::Reject {
+                    mut status_code,
+                    body,
+                    mut headers,
+                } = reject
+                else {
+                    panic!("100% fault must reject before backend dispatch: {reject:?}");
+                };
+                let mut body = Bytes::from(body);
+                let observed_budget = Arc::clone(&budget);
+                let task = tokio::spawn(async move {
+                    if frontend == "h3_bridge" {
+                        apply_replaceable_after_proxy_hooks_to_rejection_for_test(
+                            &plugins,
+                            &mut ctx,
+                            &mut status_code,
+                            &mut body,
+                            &mut headers,
+                        )
+                        .await;
+                        assert_eq!(audit.capture_counters(), (1, 0));
+                        h3_run_reject_committed_hooks_for_test(
+                            &plugins,
+                            &mut ctx,
+                            &headers,
+                            false,
+                        )
+                        .await;
+                        return ctx;
+                    }
+                    finalize_native_grpc_rejection_for_test(
+                        &plugins,
+                        &mut ctx,
+                        &mut status_code,
+                        &mut headers,
+                        &mut body,
+                        !native_h3,
+                    )
+                    .await;
+                    if native_h3 {
+                        assert!(ctx.request_body_bytes.is_none());
+                        assert!(!ctx.metadata.contains_key("request_body"));
+                        assert_eq!(budget.available_bytes(), UNIT);
+                        run_h3_reject_response_committed_hooks(
+                            &plugins,
+                            &mut ctx,
+                            ferrum_edge::HttpFlavor::Grpc,
+                            None,
+                            http::StatusCode::from_u16(status_code).unwrap(),
+                            body,
+                            &headers,
+                        )
+                        .await;
+                    }
+                    ctx
+                });
+                tokio::time::timeout(OBSERVER_WAIT, entered.notified())
+                    .await
+                    .expect("observer must reach the post-capture ownership boundary");
+                let records = wait_for_records(&server).await;
+                assert_eq!(records.len(), 1, "one committed audit record: {records:?}");
+                assert!(records[0].get("request_body_omitted_reason").is_none());
+                let excerpt: Value = serde_json::from_str(
+                    records[0]["request_body"]
+                        .as_str()
+                        .expect("nonempty request excerpt"),
+                )
+                .unwrap();
+                assert_eq!(excerpt["grpc_method"], "/test.Greeter/SayHello");
+                assert_eq!(excerpt["messages"].as_array().unwrap().len(), 1);
+                let (expected_name, expected_age) = match peer_redacted {
+                    true => ("peer-redacted", 0),
+                    false => ("binary-safe-subject", -1),
+                };
+                assert_eq!(excerpt["messages"][0]["fields"]["name"], expected_name);
+                let expected_payload = hello_request_bytes_with_age(expected_name, expected_age);
+                let expected_hash = keyed_reference(HASH_SECRET)
+                    .keyed_hash_hex(&grpc_frame(&expected_payload));
+                assert_eq!(records[0]["request_hash"], expected_hash);
+                assert_eq!(observed_budget.available_bytes(), UNIT);
+                if peer_redacted {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                } else {
+                    release.notify_one();
+                    let ctx = tokio::time::timeout(OBSERVER_WAIT, task)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(ctx.request_body_bytes.is_none());
+                    assert!(!ctx.metadata.contains_key("request_body"));
+                }
+                assert_eq!(observed_budget.available_bytes(), UNIT);
+            }
+        }
+    }
+}
+
 /// On a `before_proxy` short-circuit there is no finalized hook header map, and
 /// `ctx.headers` is a lightweight clone that can be missing the authoritative
 /// `grpc-encoding`. Framing must come from the witness recorded while the

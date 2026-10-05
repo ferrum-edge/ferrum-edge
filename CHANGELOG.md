@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uploads retained for retries. Memoized-false producers and JSON transformers
   with a proven non-JSON outbound type require no replacement window; unknown
   types and undecided triggers retain conservative admission.
+  Completed short-circuit uploads remain available through existing audit
+  capture hooks, including non-UTF-8 native gRPC and peer-redacted request views.
+  Their retained admission is released before committed observers, logging or
+  terminal transport waits; H1/H2 and H3 share that lifecycle boundary.
   ferrum-contracts parity is required for the next qualified release.
 
 ## [0.9.11] - 2026-10-04

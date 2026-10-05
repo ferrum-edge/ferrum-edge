@@ -3839,6 +3839,71 @@ struct BufferedClientRequestBody {
     budget: Option<response_buffer_budget::RequestBufferPermit>,
 }
 
+/// Retire the transport buffer while preserving the request view that terminal
+/// response hooks still need. The shared reject finalizer drops that view after
+/// capture, before committed observers can clone it or wait on external work.
+fn retire_client_request_body_for_rejection(
+    body: &mut ClientRequestBody,
+    ctx: &mut RequestContext,
+) {
+    // This helper is terminal-only. Replacing the representation also drops
+    // an unread streaming request before any response observer or log can wait.
+    let retired = std::mem::replace(
+        body,
+        ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
+            method: hyper::Method::GET,
+            headers: hyper::HeaderMap::new(),
+            body: Vec::new(),
+            trailers: None,
+            budget: None,
+        })),
+    );
+    if let ClientRequestBody::Buffered(mut buffered) = retired {
+        buffered.body = Vec::new();
+        retain_request_metadata_charge_on_rejection(
+            ctx,
+            buffered.budget.take(),
+        );
+    }
+}
+
+pub(crate) fn retain_request_metadata_charge_on_rejection(
+    ctx: &mut RequestContext,
+    permit: Option<response_buffer_budget::RequestBufferPermit>,
+) {
+    if let Some(permit) = permit
+        && let Some(body) = ctx.request_body_bytes.take()
+    {
+        ctx.request_body_bytes = Some(permit.into_charged_view(body));
+    }
+    // UTF-8 plugin views retain their existing separate allocation contract.
+    // With no binary snapshot there is no collector allocation left to own.
+}
+
+/// Native gRPC's split path has already published its collector permit onto
+/// Bytes. Keep that existing owner behind the existing metadata view until
+/// capture, without another copy/reservation or changing the view's contents.
+pub(crate) fn retain_charged_request_metadata_on_rejection(
+    ctx: &mut RequestContext,
+    charged_body: Bytes,
+) {
+    struct Owner {
+        data: Bytes,
+        _charged_body: Bytes,
+    }
+    impl AsRef<[u8]> for Owner {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+    if let Some(data) = ctx.request_body_bytes.take() {
+        ctx.request_body_bytes = Some(Bytes::from_owner(Owner {
+            data,
+            _charged_body: charged_body,
+        }));
+    }
+}
+
 enum RequestBodyBufferError {
     EarlyPolicy(early_upload::UploadExpiry),
     TooLarge,
@@ -26428,6 +26493,14 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     enforce_final_client_visible_response_header_policy(plugins, ctx, status, headers, body, false)
         .await;
 
+    // Synthetic body hooks and reject-path after_proxy have now captured the
+    // authoritative request (including peer-redacted text or binary protobuf).
+    // Committed observers consume their bounded staged result, never the raw
+    // upload. Retire all request views before an observer can wait, detach a
+    // context clone, log, or hand the response to a stalled transport. This also
+    // applies when H3/gRPC-Web defer committed hooks to their wire normalizer.
+    ctx.discard_retained_request_metadata();
+
     // A failed WebSocket handshake is still an ordinary HTTP response, but its
     // transport-owned fields must come only from a successful H1 Upgrade or
     // Extended CONNECT builder. Run this boundary after every ordered reject
@@ -30722,6 +30795,7 @@ async fn run_backend_path_plugins_or_build_reject(
     original_request_path: &str,
     is_grpc_request: bool,
     grpc_web_response_content_type: Option<&str>,
+    client_request_body: &mut ClientRequestBody,
 ) -> Option<Response<ProxyBody>> {
     let phase_start = Instant::now();
     for plugin in backend_path_plugins {
@@ -30735,6 +30809,7 @@ async fn run_backend_path_plugins_or_build_reject(
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                retire_client_request_body_for_rejection(client_request_body, ctx);
                 *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!(
@@ -34636,8 +34711,7 @@ async fn handle_proxy_request_inner(
         )
         .await
         {
-            drop(client_request_body);
-            ctx.discard_retained_request_metadata();
+            retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
             plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
             let reject = boxed_finalize_reject_response(
                 &plugins,
@@ -34861,8 +34935,7 @@ async fn handle_proxy_request_inner(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
-                    drop(client_request_body);
-                    ctx.discard_retained_request_metadata();
+                    retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
                     crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
                     let plugin_reject = plugin_result_into_reject_parts(reject)
                         .expect("reject result should convert to rejection parts");
@@ -35176,6 +35249,7 @@ async fn handle_proxy_request_inner(
             }
         }
         if let Some((reject, reject_phase)) = rejected {
+            retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
             let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                 error!(
                     phase = reject_phase,
@@ -35258,8 +35332,7 @@ async fn handle_proxy_request_inner(
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                drop(client_request_body);
-                ctx.discard_retained_request_metadata();
+                retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!("before_proxy rejection could not be normalized");
                     record_request(&state, 500);
@@ -35323,8 +35396,7 @@ async fn handle_proxy_request_inner(
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                drop(client_request_body);
-                ctx.discard_retained_request_metadata();
+                retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!("before_proxy rejection could not be normalized");
                     ctx.headers = tmp_headers;
@@ -35491,6 +35563,7 @@ async fn handle_proxy_request_inner(
         max_forwards::MaxForwardsDecision::Forward
         | max_forwards::MaxForwardsDecision::Decremented => {}
         max_forwards::MaxForwardsDecision::Terminal(terminal) => {
+            retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
             let reject = boxed_finalize_reject_response(
                 &plugins,
                 &mut ctx,
@@ -35667,6 +35740,7 @@ async fn handle_proxy_request_inner(
             &original_request_path,
             is_grpc_request,
             grpc_web_response_content_type,
+            &mut client_request_body,
         )
         .await
         {
@@ -35787,6 +35861,7 @@ async fn handle_proxy_request_inner(
         match deferred_result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     record_request(&state, 500);
                     return Ok(build_response(
@@ -36172,6 +36247,12 @@ async fn handle_proxy_request_inner(
                     }
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
+                        drop(transformed);
+                        retain_request_metadata_charge_on_rejection(
+                            &mut ctx,
+                            buffered.budget.take(),
+                        );
+                        drop(buffered);
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {
                             record_request(&state, 500);
                             return Ok(build_response(
@@ -36269,6 +36350,7 @@ async fn handle_proxy_request_inner(
         match egress.result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     record_request(&state, 500);
                     return Ok(build_response(
@@ -36352,6 +36434,7 @@ async fn handle_proxy_request_inner(
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
+                retire_client_request_body_for_rejection(&mut client_request_body, &mut ctx);
                 let mut reject = finalize_reject_response_with_after_proxy_hooks(
                     &plugins,
                     &mut ctx,
@@ -36632,6 +36715,12 @@ async fn handle_proxy_request_inner(
                     }
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
+                        drop(transformed);
+                        retain_request_metadata_charge_on_rejection(
+                            &mut ctx,
+                            buffered.budget.take(),
+                        );
+                        drop(buffered);
                         cb_probe.release_neutral();
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {
                             record_request(&state, 500);
@@ -37229,7 +37318,7 @@ async fn handle_proxy_request_inner(
         );
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
-            let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
+            let (grpc_method, grpc_headers, collected_grpc_req_body) = match client_request_body {
                 ClientRequestBody::Streaming(request) => {
                     match grpc_proxy::collect_grpc_request_body(
                         *request,
@@ -37345,7 +37434,7 @@ async fn handle_proxy_request_inner(
             };
 
             // Store body metadata for plugins that read via ctx.metadata
-            let request_body_size_bytes = grpc_req_body.len().to_string();
+            let request_body_size_bytes = collected_grpc_req_body.len().to_string();
             ctx.metadata.insert(
                 "request_body_size_bytes".to_string(),
                 request_body_size_bytes.clone(),
@@ -37362,7 +37451,7 @@ async fn handle_proxy_request_inner(
             // path too. `fetch_max` preserves the first-attempt count across
             // plugin-driven body rewrites.
             ctx.bytes_sent_observed.fetch_max(
-                grpc_req_body.len() as u64,
+                collected_grpc_req_body.len() as u64,
                 std::sync::atomic::Ordering::Release,
             );
 
@@ -37378,7 +37467,7 @@ async fn handle_proxy_request_inner(
                     deferred_body_hook_ctx.as_mut(),
                     grpc_deadline_at,
                     &hook_headers,
-                    grpc_req_body.to_vec(),
+                    collected_grpc_req_body.to_vec(),
                 )
                 .await,
             );
@@ -37456,6 +37545,8 @@ async fn handle_proxy_request_inner(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
+                    drop(grpc_req_body);
+                    retain_charged_request_metadata_on_rejection(&mut ctx, collected_grpc_req_body);
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         warn!("reject plugin result could not be converted to response parts");
                         record_request(&state, StatusCode::INTERNAL_SERVER_ERROR.as_u16());

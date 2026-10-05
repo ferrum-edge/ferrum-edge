@@ -1052,7 +1052,6 @@ where
                 PluginResult::Continue => Some(transformed),
                 reject => {
                     drop(transformed);
-                    ctx.discard_retained_request_metadata();
                     // This is a client/request-body policy outcome before any
                     // backend dispatch. Release a HALF_OPEN probe neutrally so
                     // a client-fault rejection cannot wedge the breaker.
@@ -11999,6 +11998,8 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
     normalized: &mut crate::proxy::NormalizedRejectResponse,
     translated: &mut Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) -> bool {
+    // The reject after_proxy chain already captured the final request view.
+    ctx.discard_retained_request_metadata();
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
             continue;
@@ -12650,6 +12651,7 @@ where
         bytes_sent,
     } = accounting;
     let Some(mut parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+        ctx.discard_retained_request_metadata();
         warn!("final body reject helper received a non-reject plugin result");
         return if matches!(flavor, HttpFlavor::Grpc) {
             write_grpc_error_for_request(

@@ -4497,10 +4497,40 @@ fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch
     let start = outcome.find(reject_marker).expect("H3 refused final body");
     let (rejected, _) = source_group(outcome, start + reject_marker.len() - 1).unwrap();
     assert!(direct_source_statement(rejected, "drop(transformed);"));
-    assert!(direct_source_statement(
+    assert!(!direct_source_statement(
         rejected,
         "ctx.discard_retained_request_metadata();"
     ));
+    let capture = "crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(\
+                   &plugins,&mutctx,&mutreject.status_code,&mutheaders,&mutreject.body,\
+                   matches!(http_flavor,HttpFlavor::Grpc),false).await;";
+    assert!(direct_source_statement(rejected, capture));
+    let committed = "run_h3_reject_response_committed_hooks(&plugins,&mutctx,http_flavor,\
+                     grpc_web_response_content_type,http_status,\
+                     reject.body.clone(),&headers).await;";
+    assert!(direct_source_statement(rejected, committed));
+    assert!(rejected.find("drop(transformed);").unwrap() < rejected.find(capture).unwrap());
+    assert!(rejected.find(capture).unwrap() < rejected.find(committed).unwrap());
+    // The malformed conversion fallback skips capture and must release before
+    // its direct transport write. This is a different lifecycle from the valid
+    // plugin rejection whose request metadata is still needed by audit hooks.
+    let fallback_marker = "letSome(mutreject)=plugin_result_into_reject_parts(reject)else{";
+    let fallback_at = rejected.find(fallback_marker).unwrap();
+    let (fallback, _) = source_group(
+        rejected,
+        fallback_at + fallback_marker.len() - 1,
+    )
+    .unwrap();
+    assert!(direct_source_statement(
+        fallback,
+        "ctx.discard_retained_request_metadata();"
+    ));
+    assert!(
+        fallback
+            .find("ctx.discard_retained_request_metadata();")
+            .unwrap()
+            < fallback.find("send_h3_reject_flavor_aware(").unwrap()
+    );
     assert!(direct_source_statement(rejected, "returnOk(());"));
     assert!(rejected.ends_with(".await?;returnOk(());"));
 

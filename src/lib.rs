@@ -3566,6 +3566,35 @@ pub mod _test_support {
         }
     }
 
+    pub fn retain_native_grpc_rejection_metadata_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        charged_body: bytes::Bytes,
+    ) {
+        crate::proxy::retain_charged_request_metadata_on_rejection(ctx, charged_body);
+    }
+
+    /// Native gRPC uses the shared reject finalizer with protocol normalization
+    /// enabled; H3 defers its committed observers until after that normalization.
+    pub async fn finalize_native_grpc_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status: &mut u16,
+        headers: &mut HashMap<String, String>,
+        body: &mut bytes::Bytes,
+        invoke_response_committed: bool,
+    ) {
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            status,
+            headers,
+            body,
+            true,
+            invoke_response_committed,
+        )
+        .await;
+    }
+
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
     }
@@ -14823,6 +14852,15 @@ pub mod _test_support {
         /// (issue #4231).
         pub fn into_charged_bytes(self, data: Vec<u8>) -> bytes::Bytes {
             self.0.into_charged_bytes(data)
+        }
+
+        /// The H1/H2 terminal handoff after its transport Vec has been retired.
+        /// Transfers the existing claim without allocating/copying a raw body.
+        pub fn retain_rejection_metadata(self, ctx: &mut crate::plugins::RequestContext) {
+            crate::proxy::retain_request_metadata_charge_on_rejection(
+                ctx,
+                Some(self.0),
+            );
         }
     }
 
