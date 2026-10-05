@@ -223,6 +223,10 @@ impl IpRestriction {
 
 #[async_trait]
 impl Plugin for IpRestriction {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ip_restriction"
     }

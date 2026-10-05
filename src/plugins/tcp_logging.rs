@@ -276,6 +276,10 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
 
 #[async_trait]
 impl Plugin for TcpLogging {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "tcp_logging"
     }

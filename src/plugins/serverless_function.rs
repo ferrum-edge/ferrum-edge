@@ -3067,6 +3067,10 @@ pub mod test_helpers {
 
 #[async_trait]
 impl Plugin for ServerlessFunction {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "serverless_function"
     }

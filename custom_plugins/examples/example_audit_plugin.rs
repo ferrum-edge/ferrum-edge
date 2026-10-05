@@ -816,6 +816,10 @@ impl Drop for ExampleAuditPlugin {
 
 #[async_trait]
 impl Plugin for ExampleAuditPlugin {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         PLUGIN_NAME
     }

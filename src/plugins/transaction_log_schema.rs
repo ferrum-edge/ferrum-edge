@@ -268,6 +268,10 @@ pub(crate) fn validate_config_graph(
 
 #[async_trait]
 impl Plugin for TransactionLogSchema {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "transaction_log_schema"
     }

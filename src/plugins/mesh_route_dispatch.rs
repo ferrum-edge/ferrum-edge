@@ -2059,6 +2059,10 @@ fn compile_header_matchers(
 
 #[async_trait]
 impl Plugin for MeshRouteDispatch {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn early_route_total_participant(&self) -> bool {
         true
     }

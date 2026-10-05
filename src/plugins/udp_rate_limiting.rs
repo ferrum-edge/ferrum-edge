@@ -464,6 +464,10 @@ impl UdpRateLimiting {
 
 #[async_trait]
 impl Plugin for UdpRateLimiting {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "udp_rate_limiting"
     }

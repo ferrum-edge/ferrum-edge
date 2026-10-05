@@ -1552,6 +1552,10 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
 
 #[async_trait]
 impl Plugin for GraphqlPlugin {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "graphql"
     }

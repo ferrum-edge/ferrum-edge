@@ -78,6 +78,10 @@ impl SizeLimiter for RequestSizeLimiting {
 
 #[async_trait]
 impl Plugin for RequestSizeLimiting {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "request_size_limiting"
     }

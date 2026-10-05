@@ -1872,6 +1872,10 @@ fn is_system_prompt_role(role: &str, aliases: &HashSet<String>) -> bool {
 
 #[async_trait]
 impl Plugin for AiRequestGuard {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ai_request_guard"
     }

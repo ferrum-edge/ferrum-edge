@@ -366,6 +366,10 @@ fn parse_bool(
 
 #[async_trait]
 impl Plugin for AccessControl {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "access_control"
     }

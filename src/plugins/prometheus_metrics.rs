@@ -6293,6 +6293,10 @@ impl PrometheusMetrics {
 
 #[async_trait]
 impl Plugin for PrometheusMetrics {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "prometheus_metrics"
     }

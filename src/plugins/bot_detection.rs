@@ -275,6 +275,10 @@ pub const BOT_DETECTION_PRIORITY: u16 = super::priority::BOT_DETECTION;
 
 #[async_trait]
 impl Plugin for BotDetection {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "bot_detection"
     }

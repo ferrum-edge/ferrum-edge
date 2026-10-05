@@ -1132,6 +1132,10 @@ fn status_class(status: u16) -> String {
 
 #[async_trait]
 impl Plugin for LokiLogging {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "loki_logging"
     }

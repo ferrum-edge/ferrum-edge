@@ -3439,6 +3439,10 @@ fn missing_idempotency_body(header_name: &str) -> String {
 
 #[async_trait]
 impl Plugin for RequestDeduplication {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "request_deduplication"
     }

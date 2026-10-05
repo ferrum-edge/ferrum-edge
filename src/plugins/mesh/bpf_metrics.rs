@@ -386,6 +386,10 @@ fn parse_config(config: &Value) -> Result<BpfMetricsConfig, String> {
 
 #[async_trait]
 impl Plugin for MeshBpfMetrics {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         PLUGIN_NAME
     }

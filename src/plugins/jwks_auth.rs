@@ -1686,6 +1686,10 @@ fn stage_original_token_stripping(attempt: &mut AuthenticationAttempt, provider:
 
 #[async_trait]
 impl super::Plugin for JwksAuth {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "jwks_auth"
     }

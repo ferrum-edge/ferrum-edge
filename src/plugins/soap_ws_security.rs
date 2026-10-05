@@ -5260,6 +5260,10 @@ pub fn validate_composition(
 
 #[async_trait]
 impl Plugin for SoapWsSecurity {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "soap_ws_security"
     }

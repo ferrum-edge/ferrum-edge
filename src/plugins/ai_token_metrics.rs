@@ -469,6 +469,10 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 
 #[async_trait]
 impl Plugin for AiTokenMetrics {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ai_token_metrics"
     }

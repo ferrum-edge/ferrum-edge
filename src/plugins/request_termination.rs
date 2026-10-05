@@ -498,6 +498,10 @@ fn header_trigger_matches(ctx: &RequestContext, header: &str, expected: &str) ->
 
 #[async_trait]
 impl Plugin for RequestTermination {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "request_termination"
     }

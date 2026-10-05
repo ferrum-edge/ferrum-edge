@@ -2,6 +2,14 @@
 
 Ferrum Edge executes plugins in a deterministic order based on two dimensions: **lifecycle phases** and **priority within each phase**.
 
+The approved rejection-preparation contract is undergoing implementation.
+`Plugin::terminal_declaration()` and finite manifest/ledger primitives are staged;
+the current rejection and charged-terminal runners still use the existing async
+hooks. No new synchronous terminal phase or raw-retirement guarantee is active
+yet. See the [exact implementation status](rejection_preparation_implementation.md),
+including the remaining audit, limiter, cursor and admission migrations. Ordinary
+successful-backend hooks and WebSocket handshake decorators retain their lifecycle.
+
 `transaction_log_schema` is a config-only exception to runtime ordering. Full
 and delta cache builds construct its global instances first to stage named
 schemas, then discard those instances after the registry owns the compiled

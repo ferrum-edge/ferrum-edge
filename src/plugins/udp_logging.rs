@@ -635,6 +635,10 @@ pub(crate) fn should_replace_sender_on_resolve(
 
 #[async_trait]
 impl Plugin for UdpLogging {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "udp_logging"
     }

@@ -2780,6 +2780,10 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
 
 #[async_trait]
 impl Plugin for MeshAuthz {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn may_publish_route_authorization(&self) -> bool {
         // Computed while constructing this immutable generation. No policy
         // evaluation or authorization stamp is published by the early selector.

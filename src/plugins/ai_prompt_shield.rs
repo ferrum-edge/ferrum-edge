@@ -1909,6 +1909,10 @@ fn mcp_progress_tokens_round_trip(body: &str) -> bool {
 
 #[async_trait]
 impl Plugin for AiPromptShield {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ai_prompt_shield"
     }

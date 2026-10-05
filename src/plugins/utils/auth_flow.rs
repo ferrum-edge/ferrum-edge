@@ -550,6 +550,12 @@ macro_rules! impl_auth_plugin {
     ) => {
         #[async_trait::async_trait]
         impl crate::plugins::Plugin for $ty {
+            fn terminal_declaration(
+                &self,
+            ) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+                crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+            }
+
             fn name(&self) -> &str {
                 $name
             }

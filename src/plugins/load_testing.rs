@@ -897,6 +897,10 @@ fn try_reserve_process_body_bytes(count: u64) -> bool {
 
 #[async_trait]
 impl Plugin for LoadTesting {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "load_testing"
     }

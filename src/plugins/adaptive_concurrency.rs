@@ -70,6 +70,10 @@ pub(crate) fn parse_config_value(config: &Value) -> Result<AdaptiveConcurrencyCo
 }
 
 impl Plugin for AdaptiveConcurrency {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "adaptive_concurrency"
     }

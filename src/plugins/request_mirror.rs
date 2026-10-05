@@ -2372,6 +2372,10 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
 
 #[async_trait]
 impl Plugin for RequestMirror {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "request_mirror"
     }

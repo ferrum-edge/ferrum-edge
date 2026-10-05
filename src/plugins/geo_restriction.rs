@@ -540,6 +540,10 @@ fn lookup_failure_action(config: &Value) -> Result<LookupFailureAction, String> 
 
 #[async_trait]
 impl Plugin for GeoRestriction {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "geo_restriction"
     }

@@ -437,6 +437,10 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
 
 #[async_trait]
 impl Plugin for WsRateLimiting {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ws_rate_limiting"
     }

@@ -77,7 +77,7 @@ fn record(size: usize) {
 }
 
 /// Allocation requests made by `body` on THIS thread: `(count, bytes)`.
-fn measure<T>(body: impl FnOnce() -> T) -> ((usize, usize), T) {
+pub(super) fn measure<T>(body: impl FnOnce() -> T) -> ((usize, usize), T) {
     let count_before = ALLOC_COUNT.with(Cell::get);
     let bytes_before = ALLOC_BYTES.with(Cell::get);
     let value = body();

@@ -1315,6 +1315,10 @@ impl Write for BoundedWriter {
 
 #[async_trait]
 impl Plugin for AiPromptCompressor {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ai_prompt_compressor"
     }

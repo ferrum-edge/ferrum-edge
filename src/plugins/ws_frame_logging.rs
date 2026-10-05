@@ -612,6 +612,10 @@ macro_rules! emit_ws_disconnect_log {
 
 #[async_trait]
 impl Plugin for WsFrameLogging {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ws_frame_logging"
     }

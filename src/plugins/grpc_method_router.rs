@@ -615,6 +615,10 @@ fn grpc_json_error_body(message: String) -> String {
 
 #[async_trait]
 impl Plugin for GrpcMethodRouter {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "grpc_method_router"
     }

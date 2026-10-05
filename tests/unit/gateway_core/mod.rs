@@ -210,6 +210,7 @@ mod stream_plugin_namespace_lookup_tests;
 mod streaming_size_limit_commit_tests;
 mod tcp_accept_loop_supervision_tests;
 mod tcp_proxy_tests;
+mod terminal_preparation_tests;
 mod tls_offload_tests;
 mod tls_tests;
 mod udp_amplification_tests;

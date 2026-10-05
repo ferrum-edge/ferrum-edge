@@ -421,6 +421,16 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 
 ### Capability Methods
 
+The staged rejection-preparation API adds `terminal_declaration()`, defaulting
+to `TerminalDeclaration::Undeclared` even when `after_proxy` is inherited.
+`PureNoop` explicitly describes an implementation with no terminal action;
+`Prepared` describes finite C/O/W and typed preparation/cursor dependencies.
+A declaration does not authorize an adapter calling the old async hook, nor
+prove raw-free operation ownership. Runtime terminal admission and the custom
+prepared-operation/result API remain incomplete; the ordinary lifecycle below
+still executes through the existing hooks. See the exact
+[implementation status](docs/rejection_preparation_implementation.md).
+
 | Method | Default | Description |
 |--------|---------|-------------|
 | `fn priority(&self) -> u16` | `5000` | Execution order (lower = earlier). See priority bands below. |

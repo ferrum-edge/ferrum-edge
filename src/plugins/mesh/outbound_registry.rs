@@ -519,6 +519,10 @@ fn is_host_any_port_entry(entry: &str) -> bool {
 
 #[async_trait]
 impl Plugin for OutboundRegistry {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "mesh_outbound_registry"
     }

@@ -297,6 +297,10 @@ fn parse_optional_u64(
 
 #[async_trait]
 impl Plugin for TcpConnectionThrottle {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "tcp_connection_throttle"
     }

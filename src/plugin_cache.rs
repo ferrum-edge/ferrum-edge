@@ -1038,6 +1038,10 @@ pub(crate) fn validate_correlation_id_composition(
 
 #[async_trait]
 impl Plugin for PluginInstanceWrapper {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        self.inner.terminal_declaration()
+    }
+
     fn early_route_total_participant(&self) -> bool {
         self.inner.early_route_total_participant()
     }

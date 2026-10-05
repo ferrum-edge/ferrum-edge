@@ -123,6 +123,7 @@ pub mod statsd_logging;
 pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod tcp_logging;
+pub mod terminal_preparation;
 pub mod transaction_debugger;
 pub mod transaction_log_schema;
 pub mod trigger;
@@ -10927,6 +10928,16 @@ pub trait Plugin: Send + Sync {
     /// (for example, non-JSON requests on an AI policy plugin).
     fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
         self.requires_request_body_buffering()
+    }
+
+    /// Explicit terminal declaration of this actual implementation.
+    ///
+    /// The default is deliberately undeclared even for an inherited no-op:
+    /// an opaque override cannot inherit a trusted terminal contract. This
+    /// declaration does not authorize an adapter to the async `after_proxy`.
+    /// Runtime terminal admission/execution is still pending migration.
+    fn terminal_declaration(&self) -> terminal_preparation::TerminalDeclaration {
+        terminal_preparation::TerminalDeclaration::Undeclared
     }
 
     /// Called after the response is received from the backend.

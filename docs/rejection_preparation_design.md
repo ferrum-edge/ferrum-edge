@@ -1,5 +1,10 @@
 # P2 rejection preparation: internal design for owner decision
 
+Historical design: the approved 883-line round-17 contract supersedes this
+earlier proposal. See [implementation status](rejection_preparation_implementation.md)
+for the exact implemented primitives, remaining migration and dependency
+boundary. Owner approval has been obtained; runtime qualification remains pending.
+
 Status: investigation only for #6008/#6009 and PR #6011. **P2 remains open.**
 This document does not change the supported plugin contract. The source inventory
 was inspected at `669d02009dc8bccdfebf757b6b215a38a91ff15a`; symbol names below

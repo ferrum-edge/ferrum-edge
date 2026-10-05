@@ -106,6 +106,10 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
 }
 
 impl Plugin for WsMessageSizeLimiting {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ws_message_size_limiting"
     }

@@ -1443,6 +1443,10 @@ impl FormBodyExt for reqwest::RequestBuilder {
 
 #[async_trait]
 impl super::Plugin for Oauth2Introspection {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "oauth2_introspection"
     }

@@ -982,6 +982,10 @@ fn non_event_outcome_needs_commit(
 
 #[async_trait]
 impl Plugin for ProxyAlerts {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "proxy_alerts"
     }

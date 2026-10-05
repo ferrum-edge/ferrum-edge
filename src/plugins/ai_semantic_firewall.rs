@@ -2125,6 +2125,10 @@ impl FirewallEngine {
 
 #[async_trait]
 impl Plugin for AiSemanticFirewall {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "ai_semantic_firewall"
     }

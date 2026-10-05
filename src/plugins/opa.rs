@@ -537,6 +537,10 @@ impl Opa {
 
 #[async_trait]
 impl Plugin for Opa {
+    fn terminal_declaration(&self) -> crate::plugins::terminal_preparation::TerminalDeclaration {
+        crate::plugins::terminal_preparation::TerminalDeclaration::PureNoop
+    }
+
     fn name(&self) -> &str {
         "opa"
     }
