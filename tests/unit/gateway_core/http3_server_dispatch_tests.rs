@@ -125,8 +125,9 @@ fn h3_plain_dispatcher_is_boxed_off_the_cross_protocol_run_stack() {
         .expect("bounded entry factory");
     assert!(
         source.contains("#[inline(never)]\npub(crate) fn run<'a, S>(")
-            && entry.contains("Box::pin(run_inner(request))"),
-        "the enclosing bridge future must leave the H3 request frame before mesh dispatch is polled"
+            && entry.contains("Box::pin(async move { run_inner(request).await })")
+            && !entry.contains("Box::pin(run_inner(request))"),
+        "the enlarged enclosing bridge must be constructed inside a heap-resident trampoline"
     );
     let run = source
         .split("async fn run_inner<S>(")
@@ -5970,6 +5971,7 @@ fn h3_request_handler_boxes_its_largest_dispatch_relays() {
     for name in [
         "boxed_dispatch_grpc_native_h3",
         "boxed_proxy_to_backend_h3_streaming",
+        "boxed_finalize_h3_early_policy_rejection",
     ] {
         let relay = name.strip_prefix("boxed_").expect("factory naming");
         let relay_call = format!("{relay}(");
@@ -6004,10 +6006,21 @@ fn h3_request_handler_boxes_its_largest_dispatch_relays() {
             .next()
             .expect("boxing factory must be bounded");
         assert!(
-            body.contains("Box::pin(async move {"),
+            body.contains("Box::pin(async move {")
+                && body.contains(relay_call.as_str())
+                && body.contains(".await")
+                && !body.contains(format!("Box::pin({relay}(").as_str()),
             "{name} must box an async trampoline, not a directly built relay future"
         );
     }
+
+    assert_eq!(
+        handler
+            .matches("boxed_finalize_h3_early_policy_rejection(")
+            .count(),
+        7,
+        "all seven retained collector policy refusals must keep the new lifecycle off the handler"
+    );
 
     // The streaming gRPC bridge is awaited from `handle_h3_request` as well;
     // its factory lives beside the bridge in `cross_protocol.rs`.

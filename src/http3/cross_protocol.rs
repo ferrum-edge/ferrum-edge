@@ -943,9 +943,13 @@ where
     // mesh traffic. Keep it out of handle_h3_request's poll frame before that
     // frame calls through dispatch_plain -> mesh retry -> mTLS send/collect.
     // A box around dispatch_plain alone does not cut this enclosing edge.
-    // This factory returns before polling; stream ownership, cancellation,
-    // admission permits and retry accounting all remain in the same task.
-    Box::pin(run_inner(request))
+    // Box a thin trampoline: constructing run_inner here would still put its
+    // concrete future on the request poll stack before moving it to the heap.
+    // Retained-upload preparation enlarged that future (#6008/#6009). Build it
+    // only when the heap-resident trampoline is polled, after this factory has
+    // returned. Stream ownership, cancellation, admission permits and retry
+    // accounting all remain in the same task.
+    Box::pin(async move { run_inner(request).await })
 }
 
 async fn run_inner<S>(

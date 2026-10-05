@@ -3936,7 +3936,7 @@ async fn handle_h3_request(
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Policy(expiry)) => {
-                finalize_h3_early_policy_rejection(
+                boxed_finalize_h3_early_policy_rejection(
                     &mut stream,
                     &state,
                     &plugins,
@@ -4176,7 +4176,7 @@ async fn handle_h3_request(
                     return Ok(());
                 }
                 Err(H3RequestBodyReadError::Policy(expiry)) => {
-                    finalize_h3_early_policy_rejection(
+                    boxed_finalize_h3_early_policy_rejection(
                         &mut stream,
                         &state,
                         &plugins,
@@ -4494,7 +4494,7 @@ async fn handle_h3_request(
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Policy(expiry)) => {
-                finalize_h3_early_policy_rejection(
+                boxed_finalize_h3_early_policy_rejection(
                     &mut stream,
                     &state,
                     &plugins,
@@ -5749,7 +5749,7 @@ async fn handle_h3_request(
                     return Ok(());
                 }
                 Err(H3RequestBodyReadError::Policy(expiry)) => {
-                    finalize_h3_early_policy_rejection(
+                    boxed_finalize_h3_early_policy_rejection(
                         &mut stream,
                         &state,
                         &plugins,
@@ -6360,7 +6360,7 @@ async fn handle_h3_request(
                 Err(H3RequestBodyReadError::Policy(expiry)) => {
                     cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
-                    finalize_h3_early_policy_rejection(
+                    boxed_finalize_h3_early_policy_rejection(
                         &mut stream,
                         &state,
                         &plugins,
@@ -7171,7 +7171,7 @@ async fn handle_h3_request(
                         Err(H3RequestBodyReadError::Policy(expiry)) => {
                             cb_probe.release_neutral();
                             drop(preacquired_backend_admission.take_if_acquired());
-                            finalize_h3_early_policy_rejection(
+                            boxed_finalize_h3_early_policy_rejection(
                                 &mut stream,
                                 &state,
                                 &plugins,
@@ -8929,7 +8929,7 @@ async fn handle_h3_request(
             Err(H3RequestBodyReadError::Policy(expiry)) => {
                 cb_probe.release_neutral();
                 drop(preacquired_backend_admission.take_if_acquired());
-                finalize_h3_early_policy_rejection(
+                boxed_finalize_h3_early_policy_rejection(
                     &mut stream,
                     &state,
                     &plugins,
@@ -18411,6 +18411,46 @@ async fn send_h3_retained_capacity_rejection(
         false,
     )
     .await
+}
+
+type BoxedH3EarlyPolicyRejectionFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>;
+
+/// Keep the new retained-upload policy terminal off the shared H3 request
+/// frame (#6008/#6009). Seven collector refusal arms enter this lifecycle,
+/// which includes synthetic body policy, committed observers and logging as
+/// well as the deadline terminal. At opt-level 0, awaiting those concrete
+/// futures inline enlarges every request, including a healthy plain bridge.
+/// The factory must return before that lifecycle is constructed or polled:
+/// Box::pin(finalize_h3_early_policy_rejection(..)) still builds a stack temporary.
+/// The same task retains the stream/context borrows and all terminal ordering.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_h3_early_policy_rejection<'a>(
+    stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &'a ProxyState,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    flavor: HttpFlavor,
+    grpc_web: Option<&'a str>,
+    start_time: std::time::Instant,
+    plugin_execution_ns: u64,
+    expiry: crate::proxy::early_upload::UploadExpiry,
+) -> BoxedH3EarlyPolicyRejectionFuture<'a> {
+    Box::pin(async move {
+        finalize_h3_early_policy_rejection(
+            stream,
+            state,
+            plugins,
+            ctx,
+            flavor,
+            grpc_web,
+            start_time,
+            plugin_execution_ns,
+            expiry,
+        )
+        .await
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
