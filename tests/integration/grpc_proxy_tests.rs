@@ -5551,6 +5551,14 @@ impl ferrum_edge::plugins::Plugin for ExpiringCredentialResponseHookProbe {
         ferrum_edge::plugins::HTTP_GRPC_PROTOCOLS
     }
 
+    // The probe never rewrites the body. Without this declaration the default
+    // `Undeclared` contract makes the normalize phase refuse the out-of-tree
+    // plugin with the RESOURCE_EXHAUSTED capacity terminal before
+    // `on_response_body` runs, so the credential would never expire.
+    fn response_body_production(&self) -> ferrum_edge::plugins::ResponseBodyProduction {
+        ferrum_edge::plugins::ResponseBodyProduction::Never
+    }
+
     async fn on_request_received(
         &self,
         ctx: &mut ferrum_edge::plugins::RequestContext,
