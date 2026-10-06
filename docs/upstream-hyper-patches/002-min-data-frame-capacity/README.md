@@ -104,13 +104,16 @@ FERRUM_EDGE_TEST_BIN=target/debug/ferrum-edge \
 Retire patches 002 and 004 together when Ferrum adopts an equivalent upstream
 HTTP/2 request-body write-stall bound that preserves progress for every positive
 assigned capacity, or when Ferrum's HTTP/2 client moves off Hyper. Both entries
-belong to the `hyper-h2-body-progress-and-timeout` co-retirement group. Upstream
-already permits positive-capacity progress in its ordinary body pipe; merely
-adopting that behavior does not replace Ferrum's pending-body timeout path.
+belong to the `hyper-h2-body-progress-and-timeout` co-retirement group, with
+[patch 005](../005-h2-small-window-coalescing/README.md), which rewrites the
+same pending-body loop to coalesce small window increments. Upstream already
+permits positive-capacity progress in its ordinary body pipe; merely adopting
+that behavior does not replace Ferrum's pending-body timeout path.
 
 Before retirement, hosted tests must verify the 512-byte stream window, final
 connection byte, empty end-of-stream handling and write-stall timeout behavior
-against the proposed replacement. Keep the gateway behavioral regressions and
+against the proposed replacement, plus patch 005's trickling-window and
+lockstep-window regressions. Keep the gateway behavioral regressions and
 regenerate any remaining patch stack. No compatible replacement release has
 been selected or tested. The fixed 1 KiB behavior must not be restored.
 

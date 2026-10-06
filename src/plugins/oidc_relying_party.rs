@@ -4669,6 +4669,20 @@ pub(crate) mod refresh_flight_test_seams {
 
 #[cfg(test)]
 mod tests {
+
+    /// A per-process session secret for these tests. Published literals are
+    /// refused by `reject_published_session_secret`, so tests never use one.
+    fn test_session_secret() -> String {
+        static SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        SECRET
+            .get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_nanos());
+                format!("t{nanos:032x}{:08x}", std::process::id())
+            })
+            .clone()
+    }
     use super::*;
     use crate::consumer_index::ConsumerIndex;
     use crate::plugins::Plugin;
@@ -4900,7 +4914,7 @@ mod tests {
                 "client_auth": {"client_secret": "shhh"}
             }],
             "session": {
-                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"
+                "encryption_secret": test_session_secret()
             }
         })
     }
@@ -5060,7 +5074,7 @@ mod tests {
                 "id_token_clock_skew_secs": 60
             }],
             "session": {
-                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
+                "encryption_secret": test_session_secret(),
                 "encryption_secret_previous": null,
                 "store": "cookie",
                 "ttl_secs": 3600,
@@ -5268,7 +5282,7 @@ mod tests {
                     "required_scopes": required_scopes
                 }],
                 "session": {
-                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
+                    "encryption_secret": test_session_secret(),
                     "ttl_secs": 3600,
                     "idle_ttl_secs": 1800
                 }
@@ -5293,7 +5307,7 @@ mod tests {
                     "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
                 }],
                 "session": {
-                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
+                    "encryption_secret": test_session_secret(),
                     "ttl_secs": 3600,
                     "idle_ttl_secs": 1800
                 }
@@ -5503,7 +5517,7 @@ mod tests {
                 "client_auth": {"method": "client_secret_basic", "client_secret": "secret"}
             }],
             "session": {
-                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"
+                "encryption_secret": test_session_secret()
             }
         })
     }
@@ -5949,7 +5963,7 @@ mod tests {
                     "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
                 }],
                 "session": {
-                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"
+                    "encryption_secret": test_session_secret()
                 }
             }),
             PluginHttpClient::default(),
@@ -6052,7 +6066,7 @@ mod tests {
                     "claim_headers": {"email": "X-User-Email"}
                 }],
                 "session": {
-                    "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
+                    "encryption_secret": test_session_secret(),
                     "ttl_secs": 3600,
                     "idle_ttl_secs": 1800
                 }
@@ -6366,7 +6380,7 @@ mod tests {
                         "post_logout_redirect_uri": bad,
                         "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
                     }],
-                    "session": {"encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"}
+                    "session": {"encryption_secret": test_session_secret()}
                 }),
                 PluginHttpClient::default(),
             );
@@ -6394,7 +6408,7 @@ mod tests {
                     "post_logout_redirect_uri": "https://app.example.com/goodbye",
                     "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
                 }],
-                "session": {"encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab"}
+                "session": {"encryption_secret": test_session_secret()}
             }),
             PluginHttpClient::default(),
         );

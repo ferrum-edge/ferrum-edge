@@ -19,6 +19,8 @@ do not duplicate them in this directory.
 
 Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet.
 The shared launcher pins `gpt-6-astra`.
+It selects `service_tier="fast"` and `features.fast_mode=true` only with `--fast`; standard mode
+uses `service_tier="default"`.
 
 Read the canonical skill before dispatch for effort selection, preflight, isolation, failure
 handling, and verification. For implementer mode, read

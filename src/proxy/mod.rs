@@ -14811,6 +14811,9 @@ async fn handle_connection(
     }
     builder
         .http2()
+        // Bounds the response body pipe's small-window coalescing wait
+        // (hyper patch 005, issue #6033).
+        .timer(hyper_util::rt::TokioTimer::new())
         .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
@@ -23765,6 +23768,9 @@ async fn handle_tls_connection(
     }
     builder
         .http2()
+        // Bounds the response body pipe's small-window coalescing wait
+        // (hyper patch 005, issue #6033).
+        .timer(hyper_util::rt::TokioTimer::new())
         .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
