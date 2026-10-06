@@ -413,14 +413,15 @@ impl http_body::Body for GrpcBody {
                         if let Some(accounting) = request_bytes.as_mut() {
                             accounting.publish(*bytes_seen as u64);
                         }
-                        // Hyper treats inbound H2 CANCEL/NO_ERROR as body EOF,
-                        // but h2's receive state still distinguishes a reset
-                        // from END_STREAM. The authenticated pump checks that
+                        // hyper 1.10 surfaces an inbound H2 CANCEL as a body
+                        // error, but still reports RST_STREAM(NO_ERROR) as body
+                        // EOF; h2's receive state distinguishes that reset from
+                        // END_STREAM. The authenticated pump checks that
                         // original receive state before converting EOF into its
                         // own terminal; this check covers the bare Incoming.
                         if *require_end_stream && !incoming.is_end_stream() {
-                            let reset = h2::Error::from(h2::Reason::CANCEL);
-                            return Poll::Ready(Some(Err(reset.into())));
+                            let reset = crate::proxy::body::h2_upload_reset_error();
+                            return Poll::Ready(Some(Err(reset)));
                         }
                         // Clean source EOF: h2 may still hold queued upload DATA.
                         Poll::Ready(None)
@@ -2592,12 +2593,13 @@ pub enum GrpcProxyError {
         kind: GrpcTimeoutKind,
         message: String,
     },
-    /// The client RPC deadline expired before the current attempt acquired an
-    /// HTTP/2 request stream (including connection acquisition and retry
-    /// backoff). No request from that attempt reached the backend, so health,
-    /// circuit-breaker, and adaptive-concurrency accounting must treat this as
+    /// The client RPC deadline expired. [`GrpcDeadlinePhase`] records where:
+    /// before the current attempt's request was handed to the backend
+    /// (connection acquisition, the handoff gate, or retry backoff), or after
+    /// it was sent (response headers or a buffered response body). Health,
+    /// circuit-breaker, and adaptive-concurrency accounting treat it as
     /// neutral while the client still receives DEADLINE_EXCEEDED.
-    ClientDeadlineExceeded(String),
+    ClientDeadlineExceeded(GrpcDeadlinePhase),
     /// The CLIENT request payload exceeded the configured maximum (detected
     /// before the backend produced response headers). Client-side — the
     /// circuit breaker treats this as neutral, like an HTTP client disconnect.
@@ -2704,10 +2706,7 @@ impl GrpcProxyError {
             Self::AuthorizationExpired {
                 handed_to_backend, ..
             } => !handed_to_backend,
-            Self::ClientDeadlineExceeded(message) => {
-                message == GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE
-                    || message == GRPC_DEADLINE_HANDOFF_MESSAGE
-            }
+            Self::ClientDeadlineExceeded(phase) => phase.is_before_handoff(),
             _ => false,
         }
     }
@@ -2718,38 +2717,74 @@ impl GrpcProxyError {
     /// then, so proxy core charges the expiry to it when the deadline in force
     /// was the matched rule's per-attempt budget rather than the client's.
     pub(crate) fn is_deadline_after_request_sent(&self) -> bool {
-        matches!(
-            self,
-            Self::ClientDeadlineExceeded(message)
-                if message == GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE
-                    || message == GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE
-                    || message == GRPC_DEADLINE_RESPONSE_BODY_MESSAGE
-        )
+        matches!(self, Self::ClientDeadlineExceeded(phase) if phase.is_after_request_sent())
     }
 }
 
-/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
-/// while a streaming-upload RPC waited for its response headers.
-const GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE: &str =
-    "gRPC deadline exceeded waiting for streaming RPC response headers";
-/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
-/// while a buffered-upload RPC waited for its response headers.
-const GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE: &str =
-    "gRPC deadline exceeded waiting for backend response headers";
-/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the deadline expired
-/// while the buffered response body was being collected.
-const GRPC_DEADLINE_RESPONSE_BODY_MESSAGE: &str =
-    "gRPC deadline exceeded while collecting response body";
+/// Where a client RPC deadline ended a native gRPC attempt
+/// ([`GrpcProxyError::ClientDeadlineExceeded`]). Typed so the dispatch-outcome
+/// records and the per-attempt deadline attribution read the phase directly
+/// instead of matching diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrpcDeadlinePhase {
+    /// The sender acquisition (pool wait, dial, TLS and HTTP/2 handshakes).
+    /// Pre-wire.
+    ConnectionAcquisition,
+    /// The handoff gate, immediately before the request is handed over.
+    /// Pre-wire.
+    Handoff,
+    /// The backoff between two retry attempts. No attempt is in flight.
+    RetryBackoff,
+    /// A streaming-upload RPC waiting for its response headers.
+    StreamingResponseHeaders,
+    /// A buffered-upload RPC waiting for its response headers.
+    ResponseHeaders,
+    /// Collecting the buffered response body.
+    ResponseBody,
+}
+
+impl GrpcDeadlinePhase {
+    /// The diagnostic message for a deadline that expired in this phase.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ConnectionAcquisition => {
+                "gRPC deadline exceeded during backend connection acquisition"
+            }
+            Self::Handoff => "gRPC deadline exceeded before the request was handed to the backend",
+            Self::RetryBackoff => "gRPC deadline exceeded during retry backoff",
+            Self::StreamingResponseHeaders => {
+                "gRPC deadline exceeded waiting for streaming RPC response headers"
+            }
+            Self::ResponseHeaders => "gRPC deadline exceeded waiting for backend response headers",
+            Self::ResponseBody => "gRPC deadline exceeded while collecting response body",
+        }
+    }
+
+    /// Whether the gateway refused the attempt before its request was handed
+    /// to the backend connection, so it never reached the wire.
+    pub fn is_before_handoff(self) -> bool {
+        matches!(self, Self::ConnectionAcquisition | Self::Handoff)
+    }
+
+    /// Whether the request had been sent to the backend when the deadline
+    /// expired: while its response headers or buffered body were awaited.
+    pub fn is_after_request_sent(self) -> bool {
+        matches!(
+            self,
+            Self::StreamingResponseHeaders | Self::ResponseHeaders | Self::ResponseBody
+        )
+    }
+}
 
 impl std::fmt::Display for GrpcProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BackendUnavailable { message, .. }
-            | Self::ClientDeadlineExceeded(message)
             | Self::ResourceExhausted(message)
             | Self::ResponseTooLarge(message)
             | Self::ResponseBufferCapacity(message)
             | Self::Internal(message) => write!(f, "{}", message),
+            Self::ClientDeadlineExceeded(phase) => f.write_str(phase.message()),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
             Self::AuthorizationExpired { termination, .. } => {
                 f.write_str(termination.grpc_message())
@@ -2873,6 +2908,14 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
                 error_class,
                 None,
             ),
+            // Always `ClientDisconnect`, which the class-driven arm below would
+            // also map through `from_error_class`.
+            Self::ClientDeadlineExceeded(phase) => SharedPoolCreateError::new(
+                phase.message(),
+                SharedPoolCreateKind::from_error_class(error_class),
+                error_class,
+                None,
+            ),
             // Preserve the over-cap refusal as a STRUCTURAL kind so coalesced
             // waiters rebuild the same typed variant. Its ErrorClass alone
             // (`ConnectionPoolError`) is shared with unrelated pool faults and
@@ -2888,7 +2931,6 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
                 None,
             ),
             Self::BackendUnavailable { message, .. }
-            | Self::ClientDeadlineExceeded(message)
             | Self::ResourceExhausted(message)
             | Self::ResponseTooLarge(message)
             | Self::ResponseBufferCapacity(message) => {
@@ -5422,28 +5464,6 @@ fn grpc_backend_write_timeout_error(write_timeout_ms: u64) -> GrpcProxyError {
     }
 }
 
-/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the client RPC deadline
-/// expired while the backend sender was being acquired. Pre-wire, so it is
-/// never charged to the backend.
-const GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE: &str =
-    "gRPC deadline exceeded during backend connection acquisition";
-
-/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the client RPC deadline
-/// had expired when the request was about to be handed to the acquired
-/// sender, so the handoff gate refused it. Pre-wire, so it is never charged to
-/// the backend.
-const GRPC_DEADLINE_HANDOFF_MESSAGE: &str =
-    "gRPC deadline exceeded before the request was handed to the backend";
-
-/// Which pre-handoff phase of a native gRPC dispatch a composed bound ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GrpcHandoffPhase {
-    /// The sender acquisition (pool wait, dial, TLS and HTTP/2 handshakes).
-    Acquisition,
-    /// The handoff gate, immediately before the request is handed over.
-    Handoff,
-}
-
 /// The bounds one native gRPC dispatch attempt is held to before its request
 /// is handed to the connection (GHSA-xcg4-wj3x-gjj2): the client RPC deadline
 /// composed with the admitted request's authorization lifetime.
@@ -5493,7 +5513,7 @@ impl GrpcDispatchBounds {
     {
         let bounded = super::await_backend_handoff_bound(self.handoff, acquisition);
         futures_util::FutureExt::map(bounded, move |bounded| {
-            let phase = GrpcHandoffPhase::Acquisition;
+            let phase = GrpcDeadlinePhase::ConnectionAcquisition;
             match bounded {
                 // A completed error has no following handoff gate. Recheck only
                 // this cold arm: a late connect error cannot bypass the bound.
@@ -5510,11 +5530,12 @@ impl GrpcDispatchBounds {
     ///
     /// hyper enqueues a request on its connection task as soon as its
     /// `send_request` is called, before any wait on the response. Every
-    /// dispatch therefore runs this synchronously, immediately before it
-    /// builds the send future, with nothing awaited in between. A bound that
-    /// elapsed while the sender was acquired refuses the request with nothing
-    /// handed to the connection. One clock read, and none when no bound
-    /// applies.
+    /// dispatch therefore runs this synchronously before it builds the send
+    /// future, with nothing awaited in between: the streaming dispatch through
+    /// [`Self::admit_upload_handoff`], before it builds the outbound request
+    /// around its frontend upload. A bound that elapsed while the sender was
+    /// acquired refuses the request with nothing handed to the connection. One
+    /// clock read, and none when no bound applies.
     #[inline]
     pub(crate) fn admit_handoff(
         self,
@@ -5522,7 +5543,30 @@ impl GrpcDispatchBounds {
     ) -> Result<(), GrpcProxyError> {
         match self.handoff.elapsed() {
             None => Ok(()),
-            Some(source) => Err(self.expired(source, auth, GrpcHandoffPhase::Handoff)),
+            Some(source) => Err(self.expired(source, auth, GrpcDeadlinePhase::Handoff)),
+        }
+    }
+
+    /// The handoff gate ([`Self::admit_handoff`]) for a dispatch that owns an
+    /// unreplayable frontend upload. Run BEFORE the upload is moved into the
+    /// outbound request: a refusal is pre-wire, so it returns the unread upload
+    /// through `held_frontend_upload` exactly as a failed acquisition does, and
+    /// the caller still controls its termination relative to the synthesized
+    /// Trailers-Only response (#2057). An admitted upload is handed back
+    /// unchanged.
+    #[inline]
+    pub(crate) fn admit_upload_handoff(
+        self,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        upload: GrpcBody,
+        held_frontend_upload: &mut Option<GrpcBody>,
+    ) -> Result<GrpcBody, GrpcProxyError> {
+        match self.admit_handoff(auth) {
+            Ok(()) => Ok(upload),
+            Err(error) => {
+                *held_frontend_upload = Some(upload);
+                Err(error)
+            }
         }
     }
 
@@ -5536,16 +5580,12 @@ impl GrpcDispatchBounds {
         self,
         source: crate::proxy::BackendHandoffBoundSource,
         auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
-        phase: GrpcHandoffPhase,
+        phase: GrpcDeadlinePhase,
     ) -> GrpcProxyError {
         if source == crate::proxy::BackendHandoffBoundSource::Authorization {
             return grpc_dispatch_authorization_expired(self.dispatch, auth, false);
         }
-        let message = match phase {
-            GrpcHandoffPhase::Acquisition => GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE,
-            GrpcHandoffPhase::Handoff => GRPC_DEADLINE_HANDOFF_MESSAGE,
-        };
-        GrpcProxyError::ClientDeadlineExceeded(message.to_string())
+        GrpcProxyError::ClientDeadlineExceeded(phase)
     }
 }
 
@@ -5669,9 +5709,7 @@ fn grpc_dispatch_authorization_expired(
             handed_to_backend,
         },
         // Without a plan, authorization cannot have won the composition.
-        None => GrpcProxyError::ClientDeadlineExceeded(
-            GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE.to_string(),
-        ),
+        None => GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ConnectionAcquisition),
     }
 }
 
@@ -5802,6 +5840,16 @@ async fn proxy_grpc_streaming_dispatch(
         apply_remaining_grpc_timeout_header(&mut headers, deadline);
     }
 
+    // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2), and before the
+    // unread frontend upload is moved into the outbound request, so a refusal
+    // returns it to the caller like a failed acquisition (#2057). hyper
+    // enqueues the request on its connection task as soon as `send_request` is
+    // called. Everything between this gate and that call below is synchronous,
+    // with nothing awaited in between, whether or not the dispatch adapter
+    // defers the call to its first poll. A client RPC deadline or
+    // authorization lifetime that elapsed while the sender was acquired is
+    // therefore refused here, with nothing handed over.
+    let grpc_body = dispatch_bounds.admit_upload_handoff(auth, grpc_body, held_frontend_upload)?;
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
@@ -5830,14 +5878,7 @@ async fn proxy_grpc_streaming_dispatch(
     let header_auth_bound = grpc_header_wait_authorization_bound(auth, header_phase_at);
     let handed_to_backend = AtomicBool::new(false);
     let protocol_send_wait = async {
-        // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2). hyper enqueues
-        // the request on its connection task as soon as `send_request` is
-        // called, so the gate runs first and the send future is built only
-        // after it, with nothing awaited in between, whether or not the
-        // dispatch adapter defers the call to its first poll. A client RPC
-        // deadline or authorization lifetime that elapsed while the sender was
-        // acquired is therefore refused here, with nothing handed over.
-        dispatch_bounds.admit_handoff(auth)?;
+        // Gated above, before the upload was moved into `backend_req`.
         let send_fut = sender.send_request(backend_req, &handed_to_backend);
         let send_result = if let Some(deadline) = grpc_deadline_at {
             tokio::time::timeout_at(deadline, send_fut)
@@ -5847,7 +5888,7 @@ async fn proxy_grpc_streaming_dispatch(
                         "gRPC deadline exceeded waiting for streaming RPC response headers"
                     );
                     GrpcProxyError::ClientDeadlineExceeded(
-                        GRPC_DEADLINE_STREAMING_RESPONSE_HEADERS_MESSAGE.to_string(),
+                        GrpcDeadlinePhase::StreamingResponseHeaders,
                     )
                 })?
         } else if let Some(timeout_ms) = effective_timeout_ms {
@@ -6375,9 +6416,7 @@ pub(crate) async fn proxy_grpc_request_core(
                         warn_sampled!(
                             "gRPC client deadline exceeded waiting for backend response headers"
                         );
-                        GrpcProxyError::ClientDeadlineExceeded(
-                            GRPC_DEADLINE_RESPONSE_HEADERS_MESSAGE.to_string(),
-                        )
+                        GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ResponseHeaders)
                     } else {
                         warn_sampled!(
                             "gRPC: read timeout ({}ms, end-to-end) waiting for backend response",
@@ -6591,9 +6630,7 @@ pub(crate) async fn proxy_grpc_request_core(
                         warn_sampled!(
                             "gRPC client deadline exceeded while collecting response body"
                         );
-                        GrpcProxyError::ClientDeadlineExceeded(
-                            GRPC_DEADLINE_RESPONSE_BODY_MESSAGE.to_string(),
-                        )
+                        GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ResponseBody)
                     } else {
                         warn_sampled!(
                             "gRPC: read timeout ({}ms, end-to-end) while collecting response body",

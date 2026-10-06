@@ -17604,7 +17604,7 @@ pub(crate) fn rewrite_backend_url_authority_host(
 /// reqwest derives the rustls server name from the request URL's host and
 /// exposes no per-request server-name hook — the vendored connector builds
 /// `ServerName::try_from(dst.host())`
-/// (`vendor/reqwest-0.13.3-ferrum-patched/src/connect.rs`). So the only way to
+/// (`vendor/reqwest-0.13.4-ferrum-patched/src/connect.rs`). So the only way to
 /// present an overridden server name on the reqwest path is to put the override
 /// in the URL authority. The socket must nevertheless land on the
 /// load-balanced target, which is what the returned proxy's `dns_override`
@@ -30616,6 +30616,7 @@ async fn finalize_terminal_request_body_read_rejection(
     ctx: &mut RequestContext,
     status: StatusCode,
     body: &[u8],
+    headers: HashMap<String, String>,
     is_grpc_request: bool,
     start_time: Instant,
     plugin_execution_ns: u64,
@@ -30630,7 +30631,7 @@ async fn finalize_terminal_request_body_read_rejection(
         ctx,
         status,
         Bytes::copy_from_slice(body),
-        HashMap::new(),
+        headers,
         is_grpc_request,
     )
     .await;
@@ -35646,6 +35647,7 @@ async fn handle_proxy_request_inner(
                             &mut ctx,
                             StatusCode::PAYLOAD_TOO_LARGE,
                             br#"{"error":"Request body exceeds maximum size"}"#,
+                            HashMap::new(),
                             is_grpc_request,
                             start_time,
                             plugin_execution_ns,
@@ -35667,6 +35669,7 @@ async fn handle_proxy_request_inner(
                             &mut ctx,
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             br#"{"error":"Client disconnected"}"#,
+                            HashMap::new(),
                             is_grpc_request,
                             start_time,
                             plugin_execution_ns,
@@ -35684,6 +35687,7 @@ async fn handle_proxy_request_inner(
                             )
                             .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
                             response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY.as_bytes(),
+                            request_buffer_capacity_reject_headers(is_grpc_request),
                             is_grpc_request,
                             start_time,
                             plugin_execution_ns,
@@ -35698,6 +35702,7 @@ async fn handle_proxy_request_inner(
                             &mut ctx,
                             StatusCode::REQUEST_TIMEOUT,
                             br#"{"error":"Request body read timed out"}"#,
+                            HashMap::new(),
                             is_grpc_request,
                             start_time,
                             plugin_execution_ns,
@@ -37805,7 +37810,7 @@ async fn handle_proxy_request_inner(
                         .is_err()
                     {
                         grpc_result = Err(GrpcProxyError::ClientDeadlineExceeded(
-                            "gRPC deadline exceeded during retry backoff".to_string(),
+                            grpc_proxy::GrpcDeadlinePhase::RetryBackoff,
                         ));
                         break;
                     }
@@ -52654,6 +52659,28 @@ fn build_request_body_too_large_response(
     )
 }
 
+/// Reject headers for a request-buffer capacity refusal that runs the shared
+/// reject pipeline. A gRPC request carries the explicit `RESOURCE_EXHAUSTED`
+/// terminal, as [`build_request_buffer_capacity_response`] and the native H3
+/// refusal do, rather than the `UNAVAILABLE` its `503` would otherwise map to.
+/// Plain HTTP gets an empty map, so no gRPC metadata reaches its response.
+pub(crate) fn request_buffer_capacity_reject_headers(
+    is_grpc_request: bool,
+) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if is_grpc_request {
+        headers.insert(
+            "grpc-status".to_string(),
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
+        );
+        headers.insert(
+            "grpc-message".to_string(),
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+        );
+    }
+    headers
+}
+
 /// Client-visible terminal for a buffered upload the aggregate request-buffer
 /// budget could not admit (issue #4153).
 ///
@@ -59826,6 +59853,11 @@ async fn proxy_to_backend_http2(
 
     // Build hyper request
     let (mut parts, body) = original_req.into_parts();
+    // An HTTP/2 client's upload EOF must be its own END_STREAM: hyper reports
+    // an inbound RST_STREAM(NO_ERROR) as a clean end of body, which must reach
+    // the backend as a reset, never as a complete request (issue #6022). Never
+    // for HTTP/1.1, whose valid chunked EOF need not update `is_end_stream()`.
+    let require_end_stream = parts.version == hyper::Version::HTTP_2;
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let effective_max_request_body_size_bytes =
         effective_request_body_limit(state.max_request_body_size_bytes, route_request_body_limit);
@@ -59897,7 +59929,8 @@ async fn proxy_to_backend_http2(
                 Arc::clone(ctx_bytes_sent_observed),
                 completion_tx,
                 cancel_rx,
-            );
+            )
+            .with_h2_end_stream_required(require_end_stream);
             if let Some(tap) = observe_grpc {
                 body = body.with_grpc_message_tap(tap);
             }
@@ -59929,6 +59962,7 @@ async fn proxy_to_backend_http2(
                 Arc::clone(ctx_bytes_sent_observed),
             )
             .with_cancel(cancel_rx)
+            .with_h2_end_stream_required(require_end_stream)
             .with_grpc_message_tap(tap);
             // No auth plan on this arm, but a live `backend_write_timeout_ms`
             // still needs its watermark (issue #4055): the adapter exists
@@ -59977,6 +60011,7 @@ async fn proxy_to_backend_http2(
                     observed: Arc::clone(ctx_bytes_sent_observed),
                     published: false,
                     latch,
+                    require_end_stream,
                 },
                 None,
                 None,

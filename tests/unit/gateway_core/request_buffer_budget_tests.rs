@@ -25,6 +25,7 @@ use ferrum_edge::_test_support::{
     RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
     buffered_request_body_ceiling_for_test, effective_request_body_limit_for_test,
     error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    normalize_reject_response, request_buffer_capacity_reject_headers_for_test,
 };
 use ferrum_edge::retry::ErrorClass;
 
@@ -227,6 +228,37 @@ fn exhaustion_is_a_gateway_local_transient_capacity_terminal() {
     assert_eq!(
         REQUEST_BUFFER_OVERLOAD_BODY,
         r#"{"error":"Request buffering capacity exceeded"}"#
+    );
+}
+
+#[test]
+fn terminal_drain_refusal_is_resource_exhausted_for_grpc() {
+    // Issue #6022: the H1/H2 terminal-drain refusal runs the shared reject
+    // pipeline, where a bare 503 maps to UNAVAILABLE. It carries the explicit
+    // RESOURCE_EXHAUSTED terminal instead, like every other request-buffer
+    // capacity refusal, the native H3 one included.
+    let status = hyper::StatusCode::SERVICE_UNAVAILABLE;
+    let body = REQUEST_BUFFER_OVERLOAD_BODY.as_bytes();
+    let headers = request_buffer_capacity_reject_headers_for_test(true);
+    let grpc = normalize_reject_response(status, body, &headers, true);
+    assert_eq!(grpc.grpc_status, Some(REQUEST_BUFFER_OVERLOAD_GRPC_STATUS));
+    assert_eq!(
+        grpc.grpc_message.as_deref(),
+        Some("Request buffering capacity exceeded")
+    );
+
+    // Plain HTTP keeps the 503 and carries no gRPC metadata.
+    let headers = request_buffer_capacity_reject_headers_for_test(false);
+    assert!(headers.is_empty());
+    let http = normalize_reject_response(status, body, &headers, false);
+    assert_eq!(http.http_status.as_u16(), REQUEST_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(http.grpc_status, None);
+    assert!(!http.headers.contains_key("grpc-status"));
+
+    let proxy_source = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy_source.contains("request_buffer_capacity_reject_headers(is_grpc_request),"),
+        "the H1/H2 terminal-drain refusal must hand these headers to the reject pipeline"
     );
 }
 

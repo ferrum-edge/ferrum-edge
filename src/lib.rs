@@ -11854,6 +11854,19 @@ pub mod _test_support {
         Ok(enqueue())
     }
 
+    /// Run the production handoff gate that the fully-streamed native gRPC
+    /// dispatch runs before it moves its unreplayable frontend upload into the
+    /// outbound request (#6022). `Ok` hands the admitted upload back; a
+    /// refusal returns it through `held_frontend_upload`.
+    pub fn native_grpc_upload_handoff_gate_for_test(
+        bounds: &NativeGrpcDispatchBoundsForTest,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        upload: crate::proxy::grpc_proxy::GrpcBody,
+        held_frontend_upload: &mut Option<crate::proxy::grpc_proxy::GrpcBody>,
+    ) -> Result<crate::proxy::grpc_proxy::GrpcBody, crate::proxy::grpc_proxy::GrpcProxyError> {
+        bounds.0.admit_upload_handoff(auth, upload, held_frontend_upload)
+    }
+
     /// Await a controlled native gRPC response-header wait under the
     /// production authorization bound (GHSA-xcg4-wj3x-gjj2).
     /// `phase_bound_after_ms` is the wait's own client/operator bound,
@@ -12013,7 +12026,8 @@ pub mod _test_support {
                 receiver,
                 released: std::sync::Arc::clone(&released),
             };
-            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, Some(plan), 0);
+            let (source, join) =
+                crate::proxy::upload_pump::spawn_upload_pump(body, Some(plan), 0, false);
             Self {
                 feed: Some(feed),
                 source: Some(source),
@@ -12033,7 +12047,7 @@ pub mod _test_support {
                 released: std::sync::Arc::clone(&released),
             };
             let (source, join) =
-                crate::proxy::upload_pump::spawn_upload_pump(body, None, write_timeout_ms);
+                crate::proxy::upload_pump::spawn_upload_pump(body, None, write_timeout_ms, false);
             Self {
                 feed: Some(feed),
                 source: Some(source),
@@ -14478,7 +14492,7 @@ pub mod _test_support {
         // `plan = None` / `write_timeout_ms = 0`: no authorization deadline and
         // no write watermark, so the pump is a plain bounded bridge and the only
         // behaviour under test is the trailer boundary.
-        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, None, 0);
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, None, 0, false);
         let mut source = crate::proxy::body::UploadSource::Pumped(source);
         let mut forwarded_data = Vec::new();
         let mut forwarded_trailers = Vec::new();
@@ -14628,6 +14642,14 @@ pub mod _test_support {
     /// Telemetry/retry class every request path uses for the same refusal.
     pub const REQUEST_BUFFER_OVERLOAD_ERROR_CLASS: crate::retry::ErrorClass =
         crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS;
+
+    /// The reject headers the H1/H2 terminal-drain request-buffer capacity
+    /// refusal hands the shared reject pipeline.
+    pub fn request_buffer_capacity_reject_headers_for_test(
+        is_grpc_request: bool,
+    ) -> HashMap<String, String> {
+        crate::proxy::request_buffer_capacity_reject_headers(is_grpc_request)
+    }
 
     /// An isolated aggregate buffered-REQUEST budget built from the SAME
     /// [`crate::proxy::response_buffer_budget`] code the process-global one

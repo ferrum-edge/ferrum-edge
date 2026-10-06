@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Direct-H2 uploads no longer relay a client reset as a complete body**
+  (#6022). hyper reports an HTTP/2 client's `RST_STREAM(NO_ERROR)` as a clean
+  end of the request body. A non-gRPC upload relayed through the direct HTTP/2
+  pool (the unlimited passthrough body, the size-limited body, and its upload
+  pump) now requires the client's own `END_STREAM` before it ends the backend
+  upload, so a reset client reaches the backend as `RST_STREAM(CANCEL)` instead
+  of a truncated request that looks complete. Native gRPC already applied this
+  check. HTTP/1.1 frontends are unaffected.
+- **A refused streamed-gRPC handoff keeps the client upload** (#6022). When
+  the client RPC deadline or authorization lifetime elapsed while a
+  fully-streamed native gRPC dispatch acquired its backend sender, the handoff
+  gate refused the request after the unread upload had already been moved into
+  the outbound request, so the upload was dropped before the gateway sent its
+  Trailers-Only terminal. The gate now runs before that move, and a refusal
+  returns the upload to the caller exactly as a failed acquisition does.
+- **gRPC request-buffer capacity refusal is `RESOURCE_EXHAUSTED` on the
+  HTTP/1.1 and HTTP/2 terminal drain** (#6022). The terminal final-body drain
+  answered an exhausted `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` budget with a
+  `503` that the gRPC reject pipeline mapped to `UNAVAILABLE` (14). It now
+  carries `RESOURCE_EXHAUSTED` (8), like every other request-buffer capacity
+  refusal, the native HTTP/3 ones included.
+
+### Changed
+
+- `GrpcProxyError::ClientDeadlineExceeded` carries a typed
+  `GrpcDeadlinePhase` instead of a message string (#6022), so the
+  pre-handoff and post-send deadline classifications no longer compare
+  diagnostic text. Client-visible messages and statuses are unchanged.
+
 ## [0.9.13] - 2026-10-06
 
 Release prepared on **2026-10-06 UTC** from main

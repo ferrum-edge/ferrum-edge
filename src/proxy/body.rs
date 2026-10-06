@@ -2757,8 +2757,9 @@ impl UploadSource {
         &mut self,
         plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
+        require_end_stream: bool,
     ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
-        self.install_pump_with_write_start(plan, write_timeout_ms, false, false)
+        self.install_pump_with_write_start(plan, write_timeout_ms, false, require_end_stream)
     }
 
     fn install_pump_with_write_start(
@@ -2781,7 +2782,12 @@ impl UploadSource {
                         require_end_stream,
                     )
                 } else {
-                    crate::proxy::upload_pump::spawn_upload_pump(incoming, plan, write_timeout_ms)
+                    crate::proxy::upload_pump::spawn_upload_pump(
+                        incoming,
+                        plan,
+                        write_timeout_ms,
+                        require_end_stream,
+                    )
                 };
                 *self = UploadSource::Pumped(source);
                 Some(join)
@@ -2859,6 +2865,21 @@ pub struct SizeLimitedIncoming {
     /// Absolute authorization lifetime of the admitted stream, or `None` for an
     /// unauthenticated request (no timer is registered at all).
     auth_deadline: Option<UploadAuthDeadline>,
+    /// A frontend HTTP/2 upload's EOF must be backed by the client's own
+    /// END_STREAM. See [`SizeLimitedIncoming::with_h2_end_stream_required`].
+    require_end_stream: bool,
+}
+
+/// The error a frontend HTTP/2 upload yields when its EOF is not backed by the
+/// client's own END_STREAM (issue #6022). hyper reports an inbound
+/// `RST_STREAM(NO_ERROR)` as a clean end of body, but h2's receive state still
+/// tells that reset apart from END_STREAM. Returning this error makes the
+/// backend transport reset its stream, so the backend never sees the truncated
+/// upload as a complete request. Out of line: only a reset client reaches it.
+#[cold]
+#[inline(never)]
+pub(crate) fn h2_upload_reset_error() -> BoxError {
+    h2::Error::from(h2::Reason::CANCEL).into()
 }
 
 /// Outcome to report when the adapter is dropped without having reached a
@@ -2934,6 +2955,7 @@ impl SizeLimitedIncoming {
             grpc_messages: None,
             grpc_scanner: None,
             auth_deadline: None,
+            require_end_stream: false,
         }
     }
 
@@ -2963,6 +2985,7 @@ impl SizeLimitedIncoming {
             grpc_messages: None,
             grpc_scanner: None,
             auth_deadline: None,
+            require_end_stream: false,
         }
     }
 
@@ -3026,8 +3049,21 @@ impl SizeLimitedIncoming {
         plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
-        let join = self.inner.install_pump(plan, write_timeout_ms);
+        let join = self.inner.install_pump(plan, write_timeout_ms, self.require_end_stream);
         (self, join)
+    }
+
+    /// Require a frontend HTTP/2 upload's EOF to be backed by the client's own
+    /// END_STREAM (issue #6022). hyper reports an inbound
+    /// `RST_STREAM(NO_ERROR)` as a clean end of body; with this set, that reset
+    /// reaches the backend as [`h2_upload_reset_error`] instead of a complete
+    /// request. Set it BEFORE [`Self::with_gateway_upload_pump`], which hands
+    /// the requirement to the pump that then owns the client body. Never set
+    /// for HTTP/1.1: a valid chunked EOF need not update `is_end_stream()`.
+    #[must_use]
+    pub(crate) fn with_h2_end_stream_required(mut self, required: bool) -> Self {
+        self.require_end_stream = required;
+        self
     }
 
     /// Enable authoritative gRPC length-prefixed message counting while
@@ -3284,6 +3320,9 @@ pub enum DirectH2RequestBody {
         /// Signaled from the same publication as `observed` so a summary
         /// built after an early backend response can wait for the real tally.
         latch: Arc<DirectH2BytesLatch>,
+        /// The frontend is HTTP/2, so EOF must be backed by the client's own
+        /// END_STREAM (issue #6022); see [`h2_upload_reset_error`].
+        require_end_stream: bool,
     },
     /// Boxed so the enum stays the size of the passthrough arm: that arm is
     /// the common unlimited-upload path and is moved into hyper's detached
@@ -3329,6 +3368,7 @@ impl http_body::Body for DirectH2RequestBody {
                 observed,
                 published,
                 latch,
+                require_end_stream,
             } => {
                 if poll_upload_cancel(cancel, cx) == UploadCancelSignal::Cancelled {
                     publish_passthrough_request_bytes(observed, *seen, published, latch);
@@ -3357,6 +3397,9 @@ impl http_body::Body for DirectH2RequestBody {
                     }
                     Poll::Ready(None) => {
                         publish_passthrough_request_bytes(observed, *seen, published, latch);
+                        if *require_end_stream && !http_body::Body::is_end_stream(&*inner) {
+                            return Poll::Ready(Some(Err(h2_upload_reset_error())));
+                        }
                         Poll::Ready(None)
                     }
                     Poll::Pending => Poll::Pending,
@@ -3532,6 +3575,13 @@ impl http_body::Body for SizeLimitedIncoming {
                 this.signal_completion(RequestBodyOutcome::Errored);
                 Poll::Ready(Some(Err(e)))
             }
+            // See `with_h2_end_stream_required` (issue #6022). A pumped source
+            // already ran this check against the original client body, and
+            // reports end of stream once it ended cleanly.
+            Poll::Ready(None) if this.require_end_stream && !this.inner.is_end_stream() => {
+                this.signal_completion(RequestBodyOutcome::Errored);
+                Poll::Ready(Some(Err(h2_upload_reset_error())))
+            }
             Poll::Ready(None) => {
                 this.signal_completion(RequestBodyOutcome::Completed);
                 Poll::Ready(None)
@@ -3635,7 +3685,7 @@ impl CountingIncoming {
         plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
-        let join = self.inner.install_pump(plan, write_timeout_ms);
+        let join = self.inner.install_pump(plan, write_timeout_ms, false);
         (self, join)
     }
 
