@@ -5526,3 +5526,176 @@ fn grpc_retry_header_map_clone_preserves_duplicates_and_opaque_bytes() {
     assert_eq!(md[1].as_bytes(), b"b");
     assert_eq!(cloned.get("x-bin").unwrap().as_bytes(), &[0xff, 0xfe, 0x80]);
 }
+
+// --- Buffered gRPC final authorization check ordering (#5993 / #5995) ---
+
+/// Authenticates the request with a far credential deadline, then ends that
+/// credential from inside the buffered `on_response_body` hook, recording every
+/// committed observation and transaction summary the request produces.
+///
+/// The expiry does not race real time: dispatch and collection cannot outlive a
+/// deadline five minutes out, and the hook shortens it to an instant that has
+/// already elapsed, so the expiry lands in the response-hook phase on every run.
+struct ExpiringCredentialResponseHookProbe {
+    committed_grpc_statuses: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    summaries: Arc<std::sync::Mutex<Vec<ferrum_edge::plugins::TransactionSummary>>>,
+}
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for ExpiringCredentialResponseHookProbe {
+    fn name(&self) -> &str {
+        "test_expiring_credential_response_hook_probe"
+    }
+
+    fn supported_protocols(&self) -> &'static [ferrum_edge::plugins::ProxyProtocol] {
+        ferrum_edge::plugins::HTTP_GRPC_PROTOCOLS
+    }
+
+    // The probe never rewrites the body. Without this declaration the default
+    // `Undeclared` contract makes the normalize phase refuse the out-of-tree
+    // plugin with the RESOURCE_EXHAUSTED capacity terminal before
+    // `on_response_body` runs, so the credential would never expire.
+    fn response_body_production(&self) -> ferrum_edge::plugins::ResponseBodyProduction {
+        ferrum_edge::plugins::ResponseBodyProduction::Never
+    }
+
+    async fn on_request_received(
+        &self,
+        ctx: &mut ferrum_edge::plugins::RequestContext,
+    ) -> ferrum_edge::plugins::PluginResult {
+        ctx.authenticated_identity = Some("expiring-principal".to_string());
+        let credential_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        ctx.observe_credential_deadline(Some(credential_deadline));
+        ferrum_edge::plugins::PluginResult::Continue
+    }
+
+    async fn on_response_body(
+        &self,
+        ctx: &mut ferrum_edge::plugins::RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        // The credential ends now, while the response hooks are running.
+        ctx.observe_credential_deadline(Some(tokio::time::Instant::now()));
+        ferrum_edge::plugins::PluginResult::Continue
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut ferrum_edge::plugins::RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.committed_grpc_statuses
+            .lock()
+            .unwrap()
+            .push(response_headers.get("grpc-status").cloned());
+    }
+
+    async fn log(&self, summary: &ferrum_edge::plugins::TransactionSummary) {
+        self.summaries.lock().unwrap().push(summary.clone());
+    }
+}
+
+/// A credential that expires while the buffered gRPC response hooks run ends
+/// with exactly ONE transaction summary, carrying the `grpc-status: 16`
+/// terminal the client receives. The final authorization check used to run
+/// after the access log, so the request logged the protected response and then
+/// a second rejection summary, and the committed observers could see a
+/// response that was never sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn buffered_grpc_expiry_during_response_hooks_logs_one_unauthenticated_summary() {
+    let (backend_addr, _backend_handle) =
+        start_streaming_grpc_backend(1, 32, Duration::ZERO, false).await;
+
+    let proxy_id = "grpc-buffered-precommit-expiry";
+    let mut proxy = create_grpc_proxy(proxy_id, "/grpc", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    let namespace = proxy.namespace.clone();
+    let state = create_test_proxy_state(vec![proxy]);
+
+    let committed_grpc_statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let summaries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The credential outlives backend dispatch and collection, then expires
+    // inside `on_response_body`.
+    let probe = ExpiringCredentialResponseHookProbe {
+        committed_grpc_statuses: Arc::clone(&committed_grpc_statuses),
+        summaries: Arc::clone(&summaries),
+    };
+    ferrum_edge::_test_support::prepend_proxy_plugin_for_test(
+        &state.plugin_cache,
+        &namespace,
+        proxy_id,
+        Arc::new(probe),
+    )
+    .expect("attach the expiring-credential probe");
+    state
+        .request_epoch
+        .republish_from_runtime_parts_for_test(
+            (*state.config.load_full()).clone(),
+            &state.plugin_cache,
+            &state.consumer_index,
+            &state.load_balancer_cache,
+        )
+        .expect("publish the probe into the request epoch");
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let path = "/grpc/my.Service/Unary";
+    let response = send_grpc_request(gateway_addr, path, &[], &[]).await;
+    let (status, headers, body) = response.expect("buffered gRPC request");
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("16"),
+        "the client receives the fixed pre-commitment authorization terminal"
+    );
+    assert!(
+        body.is_empty(),
+        "no protected response bytes may reach the client"
+    );
+
+    // An authenticated request hands its summary to bounded detached delivery,
+    // so wait for it. A second summary needs no extra wait: the old ordering
+    // wrote both synchronously before the client saw the response.
+    let wait_until = tokio::time::Instant::now() + Duration::from_secs(5);
+    while summaries.lock().unwrap().is_empty() && tokio::time::Instant::now() < wait_until {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let summaries = summaries.lock().unwrap().clone();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "exactly one transaction summary describes the request"
+    );
+    let summary = &summaries[0];
+    assert_eq!(summary.response_status_code, 200);
+    assert_eq!(
+        summary.metadata.get("grpc_status").map(String::as_str),
+        Some("16"),
+        "the single summary records the terminal the client received"
+    );
+    assert_eq!(
+        summary
+            .metadata
+            .get("authorization.termination_reason")
+            .map(String::as_str),
+        Some("credential_expired")
+    );
+    assert!(
+        !summary.metadata.contains_key("rejection_phase"),
+        "the terminal replaced the buffered response; it is not a second rejection record"
+    );
+
+    let committed = committed_grpc_statuses.lock().unwrap().clone();
+    let unauthenticated = Some("16".to_string());
+    assert!(
+        committed.iter().all(|status| *status == unauthenticated),
+        "committed observers must never see the protected response: {committed:?}"
+    );
+}

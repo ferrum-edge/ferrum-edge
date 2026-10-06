@@ -37949,12 +37949,16 @@ async fn handle_proxy_request_inner(
             });
         }
 
-        // Record final dispatch errors to the circuit breaker once here and
-        // disarm the neutral-release guard. Buffered gRPC responses settle after
-        // their precommit authorization gate, so expiry stays health-neutral.
-        // Streaming responses defer to the streaming arm so it can sample the
-        // request-body flag at response-header time and arm the post-header
-        // probe guard before response hooks run.
+        // Record non-streaming final backend outcomes to the circuit breaker
+        // once, here, and disarm the neutral-release guard. A buffered response
+        // reaching this point was collected within the authorization lifetime
+        // (an expiry by then became the neutral `AuthorizationExpired` above),
+        // so its real outcome is recorded before any response hook or logging:
+        // a later client disconnect or pre-commitment authorization terminal
+        // must not release it as neutral. Streaming responses defer to the
+        // streaming arm so it can sample the request-body flag at
+        // response-header time and arm the post-header probe guard before
+        // response hooks run.
         //
         // Previously the gRPC path recorded nothing here, so the breaker never
         // saw gRPC successes (could not recover from HALF_OPEN) or non-connect
@@ -37963,10 +37967,7 @@ async fn handle_proxy_request_inner(
         // failures (and disarmed the guard) for rotated targets, and
         // grpc_skip_final_cb_record marks the case where a rotated retry's
         // breaker rejected (already recorded for the prior target).
-        if !grpc_skip_final_cb_record
-            && !matches!(&grpc_result, Ok(GrpcResponseKind::Buffered(_)))
-            && let Some(cb_config) = &proxy.circuit_breaker
-        {
+        if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
             let cb = state.circuit_breaker_cache.get_or_create(
                 &proxy.namespace,
                 &proxy.id,
@@ -37980,8 +37981,8 @@ async fn handle_proxy_request_inner(
                 // (neutral arm below); streaming responses defer to the
                 // streaming arm, where HALF_OPEN fast-path probes can
                 // neutralize late upload overflows via the deferred recorder.
-                Ok(GrpcResponseKind::Buffered(_)) => {
-                    // Defer until the final authorization gate, after hooks/logging.
+                Ok(GrpcResponseKind::Buffered(r)) => {
+                    record_grpc_backend_status_outcome(&cb, r.status, cb_probe.take_slot());
                 }
                 Ok(GrpcResponseKind::Streaming(_)) => {
                     // Defer: the streaming arm finalizes via
@@ -39052,6 +39053,42 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                     response_status,
                 );
+                // Settle backend admission, passive health, and least-connections
+                // accounting with the real outcome before any response hook runs,
+                // as the breaker was above: a client disconnect during the hooks or
+                // a later pre-commitment authorization terminal is the gateway's
+                // side of the exchange and must not erase what the backend did.
+                if let Some(permits) = backend_admission_permits.take() {
+                    // gRPC application failures ride in the `grpc-status` trailer
+                    // (or header, for trailers-only) under HTTP 200, so the HTTP
+                    // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
+                    // healthy success. Map the effective non-OK gRPC status to HTTP
+                    // so a server-side failure surfaces as 5xx and shrinks the limit,
+                    // while client-side statuses stay <500 (healthy). The backend's
+                    // trailers are still intact here — plugin-view merge and wire
+                    // writeback happen below.
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: grpc_backend_dispatch_status,
+                        connection_error: false,
+                        error_class: None,
+                        backend_elapsed: grpc_backend_admission_elapsed,
+                    });
+                }
+                if !grpc_skip_final_cb_record {
+                    record_grpc_backend_dispatch_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        grpc_final_upstream_target.as_ref(),
+                        grpc_final_cb_key.as_deref(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                        grpc_backend_admission_elapsed,
+                    );
+                }
+                drop(grpc_lb_connection_guard.take());
 
                 // Plugins historically saw a merged header+trailer map on the
                 // buffered gRPC path because trailers were inserted into
@@ -39621,6 +39658,41 @@ async fn handle_proxy_request_inner(
                     );
                 }
 
+                // Resolve the summary's backend address before the authorization
+                // gates below: nothing after the authoritative gate may await on a
+                // request that carries an authorization plan (#3815).
+                let grpc_resolved_ip = if plugins.is_empty() {
+                    None
+                } else {
+                    let resolve = state.dns_cache.resolve(
+                        &proxy.backend_host,
+                        proxy.dns_override.as_deref(),
+                        proxy.dns_cache_ttl_seconds,
+                    );
+                    match crate::plugins::await_grpc_deadline(ctx.grpc_deadline_at(), resolve).await
+                    {
+                        Ok(result) => result.ok().map(|ip| ip.to_string()),
+                        Err(()) => None,
+                    }
+                };
+
+                // ── Pre-commitment authorization gate (#3815) ──────────────────
+                //
+                // Every response phase above may have consumed the remaining
+                // lifetime. Replace the response with the fixed `grpc-status: 16`
+                // terminal IN PLACE, before the committed observers run, so they
+                // observe the response the client will actually receive.
+                apply_buffered_grpc_precommit_authorization_terminal(
+                    &mut ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                    grpc_web_response_content_type,
+                    &mut response_status,
+                    &mut response_headers,
+                    &mut response_trailers,
+                    &mut response_body,
+                    initial_response_header_policy_plugins.as_ref(),
+                );
+
                 if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
                     let phase_start = Instant::now();
                     if run_deadline_bounded_response_committed_hooks(
@@ -39638,6 +39710,24 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
+                // Authoritative pre-log gate, as on the H1/H2 path. The committed
+                // observers are bounded by the same plan and replace the response
+                // themselves when it ends during them; this re-check closes the
+                // remaining window, so the ONE transaction summary built below
+                // describes the client-visible response (`grpc-status: 16` and the
+                // bounded termination class on expiry). Idempotent with the gate
+                // above. Nothing after it awaits on a request with a plan.
+                apply_buffered_grpc_precommit_authorization_terminal(
+                    &mut ctx,
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                    grpc_web_response_content_type,
+                    &mut response_status,
+                    &mut response_headers,
+                    &mut response_trailers,
+                    &mut response_body,
+                    initial_response_header_policy_plugins.as_ref(),
+                );
+
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
                 let plugin_external_io_ms =
@@ -39648,18 +39738,6 @@ async fn handle_proxy_request_inner(
 
                 // Log only after committed exporters write their final metadata.
                 if !plugins.is_empty() {
-                    let resolve = state.dns_cache.resolve(
-                        &proxy.backend_host,
-                        proxy.dns_override.as_deref(),
-                        proxy.dns_cache_ttl_seconds,
-                    );
-                    let grpc_resolved_ip =
-                        match crate::plugins::await_grpc_deadline(ctx.grpc_deadline_at(), resolve)
-                            .await
-                        {
-                            Ok(result) => result.ok().map(|ip| ip.to_string()),
-                            Err(()) => None,
-                        };
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
@@ -39701,78 +39779,26 @@ async fn handle_proxy_request_inner(
                         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
                         ..TransactionSummary::default()
                     };
-                    crate::plugins::log_with_mirror_before_buffered_response(
-                        &plugins, summary, &ctx,
-                    )
-                    .await;
+                    // An authenticated request hands its single summary to bounded
+                    // detached delivery instead of awaiting it, exactly as the H1/H2
+                    // buffered terminal does: awaiting a logging plugin here would
+                    // let the credential expire after the gate decided the response.
+                    // A request with no plan keeps the awaited logging contract.
+                    let has_authorization_plan =
+                        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+                            &ctx,
+                            state.env_config.authenticated_stream_max_lifetime_seconds,
+                        )
+                        .is_some();
+                    if has_authorization_plan {
+                        crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                    } else {
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
+                    }
                 }
-
-                // Hooks and logging may have consumed the remaining lifetime.
-                // This is the final gate before constructing the client head.
-                if let Some(termination) = request_authorization_termination(
-                    &ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                ) {
-                    cb_probe.release_neutral();
-                    drop(backend_admission_permits.take());
-                    drop(grpc_lb_connection_guard.take());
-                    let response = boxed_finalize_authorization_expired_rejection(
-                        &plugins,
-                        &mut ctx,
-                        &state,
-                        start_time,
-                        "authorization_expired_grpc_precommit",
-                        plugin_execution_ns,
-                        Some(&original_request_path),
-                        grpc_web_response_content_type,
-                        termination,
-                    )
-                    .await;
-                    return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
-                        response,
-                        held_frontend_grpc_upload.take(),
-                    ));
-                }
-                if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
-                    let cb = state.circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        &proxy.id,
-                        grpc_final_cb_key.as_deref(),
-                        cb_config,
-                    );
-                    record_grpc_backend_status_outcome(&cb, grpc_resp.status, cb_probe.take_slot());
-                }
-                if let Some(permits) = backend_admission_permits.take() {
-                    // gRPC application failures ride in the `grpc-status` trailer
-                    // (or header, for trailers-only) under HTTP 200, so the HTTP
-                    // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
-                    // healthy success. Map the effective non-OK gRPC status to HTTP
-                    // so a server-side failure surfaces as 5xx and shrinks the limit,
-                    // while client-side statuses stay <500 (healthy). The backend's
-                    // trailers are still intact here — plugin-view merge and wire
-                    // writeback happen below.
-                    permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: grpc_backend_dispatch_status,
-                        connection_error: false,
-                        error_class: None,
-                        backend_elapsed: grpc_backend_admission_elapsed,
-                    });
-                }
-                if !grpc_skip_final_cb_record {
-                    record_grpc_backend_dispatch_outcome(
-                        &state,
-                        &proxy,
-                        &epoch.load_balancer,
-                        upstream_balancer.as_ref(),
-                        grpc_final_upstream_target.as_ref(),
-                        grpc_final_cb_key.as_deref(),
-                        grpc_backend_dispatch_status,
-                        false,
-                        None,
-                        grpc_backend_admission_elapsed,
-                    );
-                }
-                drop(grpc_lb_connection_guard.take());
 
                 record_request(&state, response_status);
 
@@ -54903,6 +54929,50 @@ pub(crate) fn apply_precommit_authorization_terminal(
     // its classification.
     ctx.latch_authorization_termination(termination);
     Some(termination)
+}
+
+/// Decide and APPLY the fixed pre-commitment authorization terminal to a
+/// buffered native-gRPC or gRPC-Web response, in place and out of line
+/// (issue #3815).
+///
+/// The buffered-gRPC counterpart of [`apply_precommit_authorization_terminal`]:
+/// the wire maps are already split into HEADERS and TRAILERS here, so the
+/// terminal is written through
+/// [`replace_buffered_response_with_authorization_terminal`] — the builder the
+/// response-committed observers use — and the backend's trailers are dropped.
+/// The single transaction summary built afterwards therefore carries
+/// `grpc-status: 16` and the bounded termination class, instead of a second
+/// rejection summary following one for the protected response.
+///
+/// Fail closed and idempotent: the shared latch is consulted first, an elapsed
+/// plan is recorded exactly once, and a latched termination re-selects the same
+/// terminal. An unauthenticated request has no plan and is untouched. Backend
+/// accounting is not touched either; it was settled when the response was
+/// collected.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn apply_buffered_grpc_precommit_authorization_terminal(
+    ctx: &mut RequestContext,
+    max_lifetime_seconds: u64,
+    grpc_web_response_content_type: Option<&str>,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    let Some(termination) = request_authorization_termination(ctx, max_lifetime_seconds) else {
+        return;
+    };
+    *response_status = replace_buffered_response_with_authorization_terminal(
+        ctx,
+        termination,
+        grpc_web_response_content_type,
+        response_headers,
+        response_body,
+        initial_response_header_policy_plugins,
+    );
+    response_trailers.clear();
 }
 
 /// Install the admitted stream's authorization lifetime on a CLIENT-VISIBLE
