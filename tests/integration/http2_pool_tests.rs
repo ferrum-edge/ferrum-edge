@@ -2424,8 +2424,16 @@ async fn test_grpc_pool_cross_frontend_reuses_ready_sibling_while_its_shard_dial
     assert_eq!(started.elapsed(), Duration::ZERO, "no added latency");
     tokio::time::resume();
     assert_eq!(pool.shard_fills_in_flight(), 1, "one coalesced fill");
-    assert_eq!(accepted.load(Ordering::Relaxed), 1, "second frontend reused the ready socket");
-    assert_eq!(pool.pool_size(), 1, "borrowed sender does not alias a new shard");
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "second frontend reused the ready socket"
+    );
+    assert_eq!(
+        pool.pool_size(),
+        1,
+        "borrowed sender does not alias a new shard"
+    );
 
     // The single background create reaches the backend and completes once the
     // backend answers; the shard then serves its own connection's calls.

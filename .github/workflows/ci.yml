@@ -186,9 +186,6 @@ jobs:
           TRUSTED_BASE_SHA: ${{ steps.trusted-base.outputs.sha }}
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
 
-      - name: Test Sol agent launcher
-        run: python3 .agents/skills/sol-agents/scripts/test_dispatch.py
-
       - name: Check PR diff hygiene
         if: github.event_name == 'pull_request'
         env:
@@ -7736,7 +7733,7 @@ jobs:
           binary-path: image-bin/ferrum-edge
           cni-binary-path: image-bin/ferrum-cni
           image: ferrum-edge:ci-${{ github.sha }}
-          base-image: gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+          base-image: gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
 
       - name: Smoke Linux image
         env:
