@@ -1,7 +1,7 @@
 //! Tests for retry logic module
 
 use ferrum_edge::config::types::{BackoffStrategy, RetryConfig};
-use ferrum_edge::proxy::grpc_proxy::{GrpcProxyError, GrpcTimeoutKind};
+use ferrum_edge::proxy::grpc_proxy::{GrpcDeadlinePhase, GrpcProxyError, GrpcTimeoutKind};
 use ferrum_edge::retry::{
     BackendResponse, ErrorClass, ResponseBody, WS_MESH_BACKEND_REQUEST_TARGET_INVALID,
     classify_body_error, classify_boxed_error, classify_boxed_setup_error,
@@ -530,9 +530,7 @@ fn test_grpc_read_timeout_classified() {
 
 #[test]
 fn test_grpc_client_deadline_before_dispatch_is_neutral() {
-    let err = GrpcProxyError::ClientDeadlineExceeded(
-        "gRPC deadline exceeded during backend connection acquisition".into(),
-    );
+    let err = GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ConnectionAcquisition);
     assert_eq!(
         classify_grpc_proxy_error(&err),
         ErrorClass::ClientDisconnect

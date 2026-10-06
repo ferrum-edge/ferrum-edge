@@ -4336,6 +4336,169 @@ async fn direct_h2_rejects_streaming_oversized_request_under_nonzero_limits() {
     }
 }
 
+/// Issue #6022: hyper reports an inbound `RST_STREAM(NO_ERROR)` as a clean end
+/// of the client body. A non-gRPC upload relayed through the direct-H2 pool
+/// must still reach the backend as a reset, never as a complete request, on
+/// both the unlimited passthrough arm and the size-limited arm. An explicit
+/// client CANCEL is reset the same way.
+///
+/// `write_timeout_ms > 0` additionally installs the consumer-armed upload pump
+/// on the size-limited arm, proving the pump forwards the frontend body's
+/// `require_end_stream` gate. With `0` the body is polled in place and no pump
+/// exists.
+///
+/// The backend answers before the upload ends. A client reset that arrived
+/// earlier would cancel the gateway's pending backend send, which resets the
+/// backend stream on its own; after the backend answered, only the relayed
+/// upload itself can carry the client's reset to the backend.
+async fn direct_h2_client_reset_reaches_backend_as_reset(
+    size_limited: bool,
+    write_timeout_ms: u64,
+) {
+    const CANCEL: u32 = 0x8;
+    let ca = TestCa::new("h2-upload-client-reset").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::ReadRequestData)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H2Step::ExpectRequestReset(Duration::from_secs(10)))
+        .spawn()
+        .expect("spawn backend");
+
+    // With write_timeout_ms == 0 there is no write watermark, so no upload
+    // pump: the direct-H2 request body polls the frontend body in place. A
+    // non-zero value installs the pump and forwards `require_end_stream` into
+    // it on the size-limited arm.
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+            "backend_write_timeout_ms": write_timeout_ms,
+        }),
+    );
+    let max_request_body_bytes = if size_limited { "1048576" } else { "0" };
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("warn")
+        .capture_output()
+        .pool_warmup_enabled(true)
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", max_request_body_bytes)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    let port = reqwest::Url::parse(harness.proxy_base_url())
+        .expect("frontend URL")
+        .port()
+        .expect("frontend port");
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("h2c socket");
+    let (client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+    let driver = tokio::spawn(connection);
+    let resets = [h2::Reason::NO_ERROR, h2::Reason::CANCEL];
+    for (index, reason) in resets.into_iter().enumerate() {
+        let mut client = client.clone().ready().await.expect("client ready");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost:{port}/api/upload"))
+            .header("content-type", "application/octet-stream")
+            .body(())
+            .expect("request");
+        let (response, mut upload) = client.send_request(request, false).expect("open upload");
+        upload
+            .send_data(Bytes::from_static(b"partial upload"), false)
+            .expect("initial DATA");
+        if size_limited {
+            // The size-limited arm withholds the early response until the
+            // upload ends, so wait for the backend to have read the DATA it
+            // answers right after.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while backend
+                .received_streams()
+                .await
+                .get(index)
+                .is_none_or(|stream| stream.body.is_empty())
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the backend never read the relayed DATA"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            upload.send_reset(reason);
+            drop(response);
+        } else {
+            let response = tokio::time::timeout(Duration::from_secs(10), response)
+                .await
+                .expect("early response timeout")
+                .expect("early response");
+            assert_eq!(response.status(), 200);
+            upload.send_reset(reason);
+            drop(response);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backend.request_reset_codes().len() <= index {
+            let errors = backend.step_errors().await;
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| error.contains("request body ended without a reset")),
+                "a client {reason:?} reset reached the backend as END_STREAM: {errors:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the backend never saw the client {reason:?} reset: {errors:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend.request_reset_codes()[index],
+            CANCEL,
+            "the client {reason:?} reset must reach the backend as RST_STREAM(CANCEL)"
+        );
+    }
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_passthrough_client_reset_reaches_backend_as_reset() {
+    direct_h2_client_reset_reaches_backend_as_reset(false, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_size_limited_client_reset_reaches_backend_as_reset() {
+    direct_h2_client_reset_reaches_backend_as_reset(true, 0).await;
+}
+
+/// The size-limited arm with a live `backend_write_timeout_ms`, so the upload
+/// pump is installed and must forward the body's `require_end_stream` gate. A
+/// client NO_ERROR or CANCEL reset still reaches the backend as CANCEL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_size_limited_upload_pump_client_reset_reaches_backend_as_reset() {
+    direct_h2_client_reset_reaches_backend_as_reset(true, 5_000).await;
+}
+
 /// Declared backend Content-Length over the response limit must 502 on
 /// ordinary direct-H2 with ResponseBodyTooLarge semantics.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

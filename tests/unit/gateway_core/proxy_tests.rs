@@ -3976,6 +3976,59 @@ fn test_direct_h2_dispatch_uses_passthrough_body_when_unlimited() {
 }
 
 #[test]
+fn test_direct_h2_dispatch_requires_h2_end_stream_on_every_upload_arm() {
+    // Issue #6022: hyper reports an HTTP/2 client's RST_STREAM(NO_ERROR) as a
+    // clean end of body. Whichever arm relays the upload, that EOF must be
+    // proven by the client's own END_STREAM before the backend sees one.
+    // Behavioural proof: `direct_h2_*_client_reset_reaches_backend_as_reset`
+    // in `tests/functional/scripted_backend_h2_tests.rs`.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = source
+        .split("async fn proxy_to_backend_http2(")
+        .nth(1)
+        .expect("direct-H2 dispatch")
+        .split("\nstruct Http3BackendHeaderContext")
+        .next()
+        .expect("bounded direct-H2 dispatch");
+    assert!(
+        dispatch.contains("parts.version == hyper::Version::HTTP_2"),
+        "the requirement must come from the frontend request version, never HTTP/1.1"
+    );
+    assert_eq!(
+        dispatch
+            .matches(".with_h2_end_stream_required(require_end_stream)")
+            .count(),
+        2,
+        "both SizeLimitedIncoming arms must require the client's END_STREAM"
+    );
+    let passthrough = dispatch
+        .split("body::DirectH2RequestBody::Passthrough {")
+        .nth(1)
+        .expect("passthrough arm")
+        .split("},")
+        .next()
+        .expect("bounded passthrough arm");
+    assert!(
+        passthrough.contains("require_end_stream,"),
+        "the passthrough arm must require the client's END_STREAM"
+    );
+
+    let body = include_str!("../../../src/proxy/body.rs");
+    assert!(
+        body.contains("*require_end_stream && !http_body::Body::is_end_stream(&*inner)"),
+        "the passthrough arm must check the client's receive state at EOF"
+    );
+    assert!(
+        body.contains("this.require_end_stream && !this.inner.is_end_stream()"),
+        "SizeLimitedIncoming must check the client's receive state at EOF"
+    );
+    assert!(
+        body.contains("write_timeout_ms, self.require_end_stream)"),
+        "a pumped size-limited upload must hand the requirement to its pump"
+    );
+}
+
+#[test]
 fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
     // Ordinary and SNI routes share the same body-compat gate; body-size
     // limits no longer fork the predicate.

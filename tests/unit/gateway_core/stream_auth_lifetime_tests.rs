@@ -5003,7 +5003,7 @@ fn only_streaming_uploads_pay_the_bridged_relay() {
         .expect("bounded streaming upload-source installer");
     assert!(
         streaming_installer.contains("spawn_upload_pump_with_deferred_write(")
-            && streaming_installer.contains("spawn_upload_pump(incoming, plan, write_timeout_ms)"),
+            && streaming_installer.contains("upload_pump::spawn_upload_pump("),
         "the streaming client body must keep the gateway-owned relay"
     );
 
