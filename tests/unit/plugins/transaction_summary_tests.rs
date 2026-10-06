@@ -154,6 +154,7 @@ fn test_backend_response_carries_resolved_ip() {
         connection_error: false,
         backend_resolved_ip: Some("10.244.1.42".to_string()),
         error_class: None,
+        request_on_wire: true,
         buffered_trailers: None,
     };
 
@@ -177,6 +178,7 @@ fn test_backend_response_none_ip_on_connection_failure() {
         connection_error: true,
         backend_resolved_ip: None,
         error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionRefused),
+        request_on_wire: false,
         buffered_trailers: None,
     };
 
@@ -507,6 +509,7 @@ fn test_backend_response_carries_error_class() {
         connection_error: true,
         backend_resolved_ip: None,
         error_class: Some(ErrorClass::ConnectionTimeout),
+        request_on_wire: false,
         buffered_trailers: None,
     };
 

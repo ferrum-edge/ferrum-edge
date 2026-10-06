@@ -1190,18 +1190,48 @@ fn h3_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
     // helper (not an inline strip). Pin both the call site and the geo arm so a
     // refactor cannot drop the reserved assertion from either side.
     let h3_client = include_str!("../../../src/http3/client.rs");
-    let trailer_recv = h3_client
+    let relay_start = h3_client
+        .find("async fn do_request_streaming_body(")
+        .expect("native H3 request-body relay");
+    let relay = &h3_client[relay_start..];
+    let relay_end = relay
+        .find("\n    }\n")
+        .expect("bounded native H3 request-body relay");
+    let relay = &relay[..relay_end];
+    let trailer_recv = relay
         .find("frontend_stream.recv_trailers().await")
         .expect("native H3 relay must read client request trailers");
-    let trailer_finish = h3_client[trailer_recv..]
-        .find("backend_stream\n            .finish()")
-        .or_else(|| h3_client[trailer_recv..].find("backend_stream.finish()"))
-        .expect("native H3 relay must finish the backend stream after trailers");
-    let trailer_block = &h3_client[trailer_recv..trailer_recv + trailer_finish];
+    let trailer_end = relay[trailer_recv..]
+        .find("upload_complete.store(true, Ordering::Release);")
+        .expect("native H3 relay must complete the upload after trailers and FIN");
+    let trailer_block = &relay[trailer_recv..trailer_recv + trailer_end];
+    let trailer_code = squeeze(trailer_block);
+    assert!(
+        trailer_code.contains(concat!(
+            "await_h3_write_under_authorization(auth,proxy.backend_write_timeout_ms,",
+            "upload.stream.send_trailers(trailers),\"sendrequesttrailers\").await?;",
+        )),
+        "native H3 request trailer writes must await their own authorization bound"
+    );
+    assert!(
+        trailer_code.contains(concat!(
+            "await_h3_write_under_authorization(auth,proxy.backend_write_timeout_ms,",
+            "upload.stream.finish(),\"finish\").await?;",
+        )),
+        "native H3 request FIN must await its own authorization bound"
+    );
     assert!(
         trailer_block.contains("sanitize_backend_request_trailers(&mut trailers)"),
         "H3 client request trailers must pass through the shared backend-trailer sanitizer"
     );
+    let sanitize = trailer_block
+        .find("sanitize_backend_request_trailers(&mut trailers)")
+        .unwrap();
+    let send = trailer_block
+        .find("upload.stream.send_trailers(trailers)")
+        .unwrap();
+    let finish = trailer_block.find("upload.stream.finish()").unwrap();
+    assert!(sanitize < send && send < finish);
 
     let headers = include_str!("../../../src/proxy/headers.rs");
     let forbidden_start = headers

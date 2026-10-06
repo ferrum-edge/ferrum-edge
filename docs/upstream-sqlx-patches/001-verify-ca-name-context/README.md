@@ -10,8 +10,9 @@ checkpoint in [dependency policy](../../dependency-policy.md).
 
 The base is the crates.io `sqlx-core` 0.8.6 source (package checksum
 `ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6`).
-Only `src/net/tls/tls_rustls.rs` and the two Cargo manifests differ from that
-source.
+This patch changes `src/net/tls/tls_rustls.rs` and the two Cargo manifests.
+The separate [typed floating-point NULL patch](../002-typed-float-null-bindings/README.md)
+changes `src/any/arguments.rs` in the same vendor copy.
 
 The manifests differ in exactly two ways. The rustls dependency floor is raised
 to 0.23.45 — the version already in Ferrum's locked graph, and the first that
@@ -105,7 +106,9 @@ store.
 
 Retire when a compatible upstream SQLx release supports both name-error
 variants (or verifies chains separately from names), treats a configured root
-CA as exclusive, and passes the same handshake controls. Remove both
+CA as exclusive, and passes the same handshake controls. Retain the vendor copy
+and its patch entries while [patch 002](../002-typed-float-null-bindings/README.md)
+still needs them. Once both patches can retire, remove both
 `[patch.crates-io]` entries (root `Cargo.toml` and
 `tests/performance/mesh/Cargo.toml`), the vendor copy, the inventory row in
 `docs/dependency-policy.md`, and the entry in

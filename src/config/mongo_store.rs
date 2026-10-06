@@ -56,9 +56,10 @@ mod inner {
         config_change_watch_backoff_after_session, next_config_change_watch_backoff_secs,
     };
     use crate::config::db_backend::{
-        ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
-        DeleteAllResourcesError, DeleteMode, FullConfigLoadPurpose, IncrementalResult,
-        MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend,
+        ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, ConditionalNamespaceRestore,
+        ConditionalNamespaceSnapshot, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
+        FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
+        MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespacePreconditionFailed,
         NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
         ProxyDeleteAtomicityUnsupported, SnapshotDataIntegrityError, SortOrder,
         TcpConnectionThrottleAttachmentConflict,
@@ -66,6 +67,10 @@ mod inner {
     use crate::config::db_loader::{
         GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash,
         format_consumer_identity_conflict, mark_row_decode_rejection, proxy_route_key_hash,
+    };
+    use crate::config::deployment_mutation::{
+        DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
+        ExternalSpecUpstreamConflict, sort_stored_rows, validate_deployment_candidate,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -554,6 +559,7 @@ mod inner {
         renew_task: Option<tokio::task::JoinHandle<()>>,
         valid: Arc<AtomicBool>,
         released: bool,
+        strict_release: bool,
         mutation_state: DurableAdmissionMutationState,
         // A guarded operation borrows the outer admission guard and must never
         // delete it when the individual batch finishes.
@@ -664,7 +670,9 @@ mod inner {
             };
             let result = match result {
                 Ok(result) => result,
-                Err(_error) if self.mode == MongoLockMode::UntilExplicitRelease => {
+                Err(_error)
+                    if self.mode == MongoLockMode::UntilExplicitRelease && !self.strict_release =>
+                {
                     // The protected mutation is already committed at every
                     // admission call site. Report cleanup trouble loudly and
                     // let Drop retry, but do not turn durable success into a
@@ -687,7 +695,7 @@ mod inner {
                 );
             }
             if result.deleted_count != 1 {
-                if self.mode == MongoLockMode::UntilExplicitRelease {
+                if self.mode == MongoLockMode::UntilExplicitRelease && !self.strict_release {
                     error!(
                         "MongoDB {} lock {} cleanup did not match its owner after a committed \
                          operation",
@@ -2577,6 +2585,7 @@ mod inner {
                     renew_task: None,
                     valid: Arc::new(AtomicBool::new(true)),
                     released: false,
+                    strict_release: false,
                     mutation_state: DurableAdmissionMutationState::NotStarted,
                     delete_on_release: false,
                     connection_generation_guard,
@@ -2613,6 +2622,7 @@ mod inner {
                             renew_task: None,
                             valid: Arc::new(AtomicBool::new(true)),
                             released: false,
+                            strict_release: false,
                             mutation_state: DurableAdmissionMutationState::NotStarted,
                             delete_on_release: true,
                             connection_generation_guard,
@@ -2831,6 +2841,7 @@ mod inner {
                 renew_task: Some(renew_task),
                 valid,
                 released: false,
+                strict_release: false,
                 mutation_state: DurableAdmissionMutationState::NotStarted,
                 delete_on_release: true,
                 connection_generation_guard: None,
@@ -5194,13 +5205,12 @@ mod inner {
                 if let Some(doc) = external {
                     let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
-                    anyhow::bail!(
-                        "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
-                         detach it before replacing or deleting the API spec",
-                        proxy_id,
-                        upstream_id,
-                        spec_id
-                    );
+                    return Err(ExternalSpecUpstreamConflict::Proxy {
+                        proxy_id: proxy_id.to_string(),
+                        upstream_id: upstream_id.to_string(),
+                        spec_id: spec_id.to_string(),
+                    }
+                    .into());
                 }
 
                 let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
@@ -5221,14 +5231,12 @@ mod inner {
                     if let Some(upstream_id) =
                         mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
                     {
-                        anyhow::bail!(
-                            "mesh_route_dispatch plugin_config {:?} references a spec-owned \
-                             upstream {:?} from api_spec {:?}; \
-                             detach it before replacing or deleting the API spec",
-                            plugin.id,
+                        return Err(ExternalSpecUpstreamConflict::MeshRouteDispatch {
+                            plugin_config_id: plugin.id,
                             upstream_id,
-                            spec_id
-                        );
+                            spec_id: spec_id.to_string(),
+                        }
+                        .into());
                     }
                 }
             } else {
@@ -5271,13 +5279,12 @@ mod inner {
                 if let Some(doc) = external {
                     let proxy_id = doc.get_str("id").unwrap_or("<unknown>");
                     let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
-                    anyhow::bail!(
-                        "proxy {:?} references a spec-owned upstream {:?} from api_spec {:?}; \
-                         detach it before replacing or deleting the API spec",
-                        proxy_id,
-                        upstream_id,
-                        spec_id
-                    );
+                    return Err(ExternalSpecUpstreamConflict::Proxy {
+                        proxy_id: proxy_id.to_string(),
+                        upstream_id: upstream_id.to_string(),
+                        spec_id: spec_id.to_string(),
+                    }
+                    .into());
                 }
 
                 let spec_upstream_ids: HashSet<String> = upstream_ids.iter().cloned().collect();
@@ -5297,14 +5304,12 @@ mod inner {
                     if let Some(upstream_id) =
                         mesh_route_dispatch_referenced_upstream(&plugin, &spec_upstream_ids)
                     {
-                        anyhow::bail!(
-                            "mesh_route_dispatch plugin_config {:?} references a spec-owned \
-                             upstream {:?} from api_spec {:?}; \
-                             detach it before replacing or deleting the API spec",
-                            plugin.id,
+                        return Err(ExternalSpecUpstreamConflict::MeshRouteDispatch {
+                            plugin_config_id: plugin.id,
                             upstream_id,
-                            spec_id
-                        );
+                            spec_id: spec_id.to_string(),
+                        }
+                        .into());
                     }
                 }
             }
@@ -5391,6 +5396,9 @@ mod inner {
         /// returns `Err`, so application-level aborts travel as
         /// `Error::custom(AtomicBatchAbort)` and are unwrapped here.
         fn atomic_batch_transaction_error(error: mongodb::error::Error) -> anyhow::Error {
+            if error.get_custom::<NamespacePreconditionFailed>().is_some() {
+                return anyhow::Error::new(NamespacePreconditionFailed);
+            }
             match error.get_custom::<AtomicBatchAbort>().copied() {
                 Some(AtomicBatchAbort::AdmissionLeaseLost) => {
                     anyhow::Error::new(BatchAdmissionLeaseLost).context(
@@ -5419,6 +5427,829 @@ mod inner {
             Err(mongodb::error::Error::custom(abort))
         }
 
+        async fn conditional_namespace_snapshot_in_session(
+            &self,
+            session: &mut ClientSession,
+            connection: &MongoConnectionBundle,
+            namespace: &str,
+        ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+            let mut config = GatewayConfig {
+                version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+                proxies: self
+                    .load_full_proxies_opt_session(
+                        namespace,
+                        Some((connection, &mut *session)),
+                        true,
+                    )
+                    .await?,
+                consumers: self
+                    .load_full_consumers_opt_session(
+                        namespace,
+                        Some((connection, &mut *session)),
+                        true,
+                    )
+                    .await?,
+                plugin_configs: self
+                    .load_full_plugin_configs_opt_session(
+                        namespace,
+                        Some((connection, &mut *session)),
+                        true,
+                    )
+                    .await?,
+                upstreams: self
+                    .load_full_upstreams_opt_session(
+                        namespace,
+                        Some((connection, &mut *session)),
+                        true,
+                    )
+                    .await?,
+                gateway_trust_bundles: self
+                    .load_gateway_trust_bundle_opt_session(
+                        namespace,
+                        Some((connection, &mut *session)),
+                        true,
+                    )
+                    .await?,
+                ..Default::default()
+            };
+            // Conditional exports verify the stored consumer, including legacy
+            // credential whitespace and blank optional identifiers. Preserve
+            // exactly the representation `get_consumer` returns; runtime and
+            // restore admission normalization must not rewrite verification.
+            let consumers = std::mem::take(&mut config.consumers);
+            config.normalize_fields();
+            config.consumers = consumers;
+            let collection: Collection<Document> = connection.db.collection("api_specs");
+            let mut cursor = collection
+                .find(doc! { "namespace": namespace })
+                .session(&mut *session)
+                .await?;
+            let mut api_specs = Vec::new();
+            while cursor.advance(&mut *session).await? {
+                api_specs.push(doc_to_api_spec(cursor.deserialize_current()?)?);
+            }
+            let namespace_record = self
+                .get_namespace_in_session(&mut *session, namespace)
+                .await?;
+            let latest = self
+                .config_changes()
+                .find_one(doc! { "namespace": namespace })
+                .sort(doc! { "sequence": -1 })
+                .session(&mut *session)
+                .await?;
+            let retention = self
+                .config_change_counters()
+                .find_one(doc! { "_id": Self::config_change_retention_doc_id(namespace) })
+                .session(&mut *session)
+                .await?;
+            let sequence = latest
+                .as_ref()
+                .map(|doc| mongo_change_sequence_from_bson(doc.get("sequence"), "sequence"))
+                .transpose()?
+                .unwrap_or(0);
+            let retained = retention
+                .as_ref()
+                .map(|doc| {
+                    mongo_change_sequence_from_bson(
+                        doc.get("retained_sequence"),
+                        "retained_sequence",
+                    )
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok(ConditionalNamespaceSnapshot {
+                config,
+                api_specs,
+                namespace_record,
+                change_sequence: sequence.max(retained),
+            })
+        }
+
+        async fn deployment_snapshot_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+        ) -> Result<DeploymentSnapshot, anyhow::Error> {
+            let connection = self.connection();
+            let snapshot = self
+                .conditional_namespace_snapshot_in_session(session, connection.as_ref(), namespace)
+                .await?;
+            let mut stored = serde_json::Map::new();
+            // Credential representations and uniqueness hashes live on consumers;
+            // their partial unique indexes do not own separate documents.
+            for name in [
+                "proxies",
+                "consumers",
+                "upstreams",
+                "plugin_configs",
+                "api_specs",
+                "gateway_trust_bundles",
+                "consumer_identity_index",
+                "namespaces",
+            ] {
+                let collection: Collection<Document> = connection.db.collection(name);
+                let filter = if name == "namespaces" {
+                    doc! { "name": namespace }
+                } else {
+                    doc! { "namespace": namespace }
+                };
+                let mut cursor = collection.find(filter).session(&mut *session).await?;
+                let mut rows = Vec::new();
+                while cursor.advance(&mut *session).await? {
+                    let document = cursor.deserialize_current()?;
+                    if matches!(
+                        name,
+                        "proxies" | "consumers" | "upstreams" | "plugin_configs" | "api_specs"
+                    ) {
+                        let id = document.get_str("id").map_err(|_| DeploymentGraphInvalid)?;
+                        if document.get_str("_id").ok()
+                            != Some(namespaced_doc_id(namespace, id).as_str())
+                        {
+                            return Err(DeploymentGraphInvalid.into());
+                        }
+                    }
+                    // BSON bytes also fence scalar types, field order and all
+                    // unknown metadata that a typed serde decoder cannot expose.
+                    rows.push(serde_json::json!({
+                        "document": serde_json::to_value(&document)?,
+                        "bson_hex": hex::encode(mongodb::bson::to_vec(&document)?),
+                    }));
+                }
+                sort_stored_rows(&mut rows);
+                stored.insert(name.to_string(), serde_json::Value::Array(rows));
+            }
+            Ok(DeploymentSnapshot {
+                snapshot,
+                stored: serde_json::Value::Object(stored),
+            })
+        }
+
+        async fn mutate_deployment_in_session(
+            &self,
+            session: &mut ClientSession,
+            id: &str,
+            precondition: &DeploymentPrecondition<'_>,
+            replacement: Option<(&crate::admin::api_specs::ExtractedBundle, &ApiSpec)>,
+        ) -> Result<(), anyhow::Error> {
+            let namespace = precondition.namespace;
+            let generation = i64::try_from(precondition.lease.generation)?;
+            let owner = precondition.lease.owner;
+            if !self
+                .verify_namespace_config_admission_lease_in_session(
+                    session, namespace, owner, generation,
+                )
+                .await?
+            {
+                return Err(BatchAdmissionLeaseLost.into());
+            }
+            let pinned = self
+                .config_admission_locks_in_transaction()
+                .update_one(
+                    doc! { "_id": namespace, "owner": owner, "generation": generation },
+                    doc! { "$set": { "deployment_pin": Uuid::new_v4().to_string() } },
+                )
+                .session(&mut *session)
+                .await?;
+            if pinned.matched_count != 1 {
+                return Err(BatchAdmissionLeaseLost.into());
+            }
+            let snapshot = self
+                .deployment_snapshot_in_session(session, namespace)
+                .await?;
+            if snapshot.representation()? != *precondition.expected {
+                return Err(NamespacePreconditionFailed.into());
+            }
+            let plan = snapshot.removal_plan(id)?;
+            crate::config::batch_atomicity::pause_conditional_restore_for_test(namespace).await;
+            let mut candidate = snapshot.snapshot.config.clone();
+            let prior_conflicts = candidate.mtls_dns_identity_conflicts();
+            let mut changes: Vec<(&str, String, &str)> = Vec::new();
+            match replacement {
+                None => {
+                    if let Some(spec_id) = &plan.spec_id {
+                        self.ensure_no_external_spec_upstream_refs_opt_session(
+                            Some(&mut *session),
+                            namespace,
+                            spec_id,
+                            id,
+                        )
+                        .await?;
+                    }
+                    candidate.proxies.retain(|p| p.id != id);
+                    candidate
+                        .plugin_configs
+                        .retain(|p| !plan.plugins.contains(&p.id));
+                    candidate
+                        .upstreams
+                        .retain(|u| !plan.upstreams.contains(&u.id));
+                    for plugin_id in &plan.plugins {
+                        let deleted = self
+                            .plugin_configs()
+                            .delete_one(doc! {
+                                "_id": namespaced_doc_id(namespace, plugin_id),
+                                "namespace": namespace,
+                            })
+                            .session(&mut *session)
+                            .await?;
+                        if deleted.deleted_count != 1 {
+                            return Err(DeploymentGraphInvalid.into());
+                        }
+                        changes.push(("plugin_config", plugin_id.clone(), "delete"));
+                    }
+                    let deleted = self
+                        .proxies()
+                        .delete_one(doc! {
+                            "_id": namespaced_doc_id(namespace, id), "namespace": namespace,
+                        })
+                        .session(&mut *session)
+                        .await?;
+                    if deleted.deleted_count != 1 {
+                        return Err(DeploymentGraphInvalid.into());
+                    }
+                    if let Some(spec_id) = &plan.spec_id {
+                        let deleted = self
+                            .api_specs()
+                            .delete_one(doc! {
+                                "_id": namespaced_doc_id(namespace, spec_id),
+                                "namespace": namespace,
+                            })
+                            .session(&mut *session)
+                            .await?;
+                        if deleted.deleted_count != 1 {
+                            return Err(DeploymentGraphInvalid.into());
+                        }
+                    }
+                    for upstream_id in &plan.upstreams {
+                        let deleted = self
+                            .upstreams()
+                            .delete_one(doc! {
+                                "_id": namespaced_doc_id(namespace, upstream_id),
+                                "namespace": namespace,
+                            })
+                            .session(&mut *session)
+                            .await?;
+                        if deleted.deleted_count != 1 {
+                            return Err(DeploymentGraphInvalid.into());
+                        }
+                        changes.push(("upstream", upstream_id.clone(), "delete"));
+                    }
+                    changes.push(("proxy", id.to_string(), "delete"));
+                }
+                Some((bundle, spec)) => {
+                    if spec.namespace != namespace
+                        || bundle.proxy.namespace != namespace
+                        || spec.proxy_id != id
+                        || bundle.proxy.id != id
+                        || plan.spec_id.as_deref() != Some(spec.id.as_str())
+                        || bundle.plugins.iter().any(|p| {
+                            p.namespace != namespace
+                                || p.scope != PluginScope::Proxy
+                                || p.proxy_id.as_deref() != Some(id)
+                        })
+                        || bundle
+                            .upstream
+                            .as_ref()
+                            .is_some_and(|u| u.namespace != namespace)
+                    {
+                        return Err(DeploymentGraphInvalid.into());
+                    }
+                    let previous_spec = snapshot
+                        .snapshot
+                        .api_specs
+                        .iter()
+                        .find(|s| s.id == spec.id)
+                        .ok_or(DeploymentGraphInvalid)?;
+                    if snapshot.replacement_is_noop(bundle, spec)? {
+                        validate_deployment_candidate(
+                            &snapshot.snapshot.config,
+                            precondition.validation_http_client,
+                        )
+                        .await?;
+                        let old = self
+                            .api_specs()
+                            .find_one(doc! {
+                                "_id": namespaced_doc_id(namespace, &spec.id),
+                                "namespace": namespace,
+                            })
+                            .session(&mut *session)
+                            .await?
+                            .ok_or(DeploymentGraphInvalid)?;
+                        let document = merge_deployment_document(
+                            old,
+                            api_spec_to_doc(previous_spec)?,
+                            api_spec_to_doc(spec)?,
+                        );
+                        let replaced = self
+                            .api_specs()
+                            .replace_one(
+                                doc! {
+                                    "_id": namespaced_doc_id(namespace, &spec.id),
+                                    "namespace": namespace,
+                                },
+                                document,
+                            )
+                            .session(&mut *session)
+                            .await?;
+                        if replaced.matched_count != 1 {
+                            return Err(DeploymentGraphInvalid.into());
+                        }
+                        self.record_config_change_in_session(
+                            session, namespace, "proxy", id, "upsert",
+                        )
+                        .await?;
+                        if !self
+                            .renew_pinned_restore_lease_in_session(
+                                session, namespace, owner, generation,
+                            )
+                            .await?
+                        {
+                            return Err(BatchAdmissionLeaseLost.into());
+                        }
+                        let (fault, _) =
+                            crate::config::batch_atomicity::atomic_batch_test_overrides(namespace);
+                        Self::check_atomic_batch_fault_in_session(
+                            fault,
+                            AtomicBatchPhase::Commit,
+                            0,
+                        )?;
+                        return Ok(());
+                    }
+                    self.ensure_no_external_spec_upstream_refs_opt_session(
+                        Some(&mut *session),
+                        namespace,
+                        &spec.id,
+                        id,
+                    )
+                    .await?;
+                    let previous_proxy = candidate
+                        .proxies
+                        .iter()
+                        .find(|p| p.id == id)
+                        .ok_or(DeploymentGraphInvalid)?;
+                    let declared =
+                        crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
+                            previous_spec,
+                        );
+                    let old_plugins: HashSet<_> = candidate
+                        .plugin_configs
+                        .iter()
+                        .filter(|p| p.api_spec_id.as_deref() == Some(spec.id.as_str()))
+                        .map(|p| p.id.clone())
+                        .collect();
+                    let prepared = prepare_api_spec_bundle_docs(bundle, spec)?;
+                    let previous_doc = self
+                        .proxies()
+                        .find_one(doc! {
+                            "_id": namespaced_doc_id(namespace, id), "namespace": namespace,
+                        })
+                        .session(&mut *session)
+                        .await?
+                        .ok_or(DeploymentGraphInvalid)?;
+                    // Retain complete raw association objects, including their
+                    // unknown fields, whenever their identity survives.
+                    let old_associations = previous_doc
+                        .get_array("plugins")
+                        .cloned()
+                        .unwrap_or_default();
+                    let desired = bundle
+                        .proxy
+                        .plugins
+                        .iter()
+                        .map(|a| a.plugin_config_id.as_str())
+                        .collect::<HashSet<_>>();
+                    let mut associations = Vec::new();
+                    for association in &old_associations {
+                        let document = association.as_document().ok_or(DeploymentGraphInvalid)?;
+                        let plugin_id = document
+                            .get_str("plugin_config_id")
+                            .map_err(|_| DeploymentGraphInvalid)?;
+                        if desired.contains(plugin_id)
+                            || (!old_plugins.contains(plugin_id) && !declared.contains(plugin_id))
+                        {
+                            associations.push(association.clone());
+                        }
+                    }
+                    for association in &bundle.proxy.plugins {
+                        if !associations.iter().any(|a| {
+                            a.as_document()
+                                .and_then(|d| d.get_str("plugin_config_id").ok())
+                                == Some(association.plugin_config_id.as_str())
+                        }) {
+                            associations.push(mongodb::bson::to_bson(association)?);
+                        }
+                    }
+                    // Compare typed fields only after restoring hand-added
+                    // associations. Keep raw association objects for persistence,
+                    // but strip their unknown fields from the semantic comparison.
+                    let mut replacement_proxy = prepared.proxy.1;
+                    replacement_proxy.insert("plugins", associations);
+                    let effective_proxy = doc_to_proxy(replacement_proxy.clone())?;
+                    let mut proxy_doc = merge_deployment_document(
+                        previous_doc,
+                        proxy_to_doc(previous_proxy)?,
+                        proxy_to_doc(&effective_proxy)?,
+                    );
+                    proxy_doc.insert(
+                        "plugins",
+                        replacement_proxy
+                            .remove("plugins")
+                            .ok_or(DeploymentGraphInvalid)?,
+                    );
+                    candidate.proxies.retain(|p| p.id != id);
+                    candidate.proxies.push(effective_proxy);
+                    candidate
+                        .plugin_configs
+                        .retain(|p| !old_plugins.contains(&p.id));
+                    candidate
+                        .plugin_configs
+                        .extend(bundle.plugins.iter().cloned());
+                    candidate
+                        .upstreams
+                        .retain(|u| !plan.upstreams.contains(&u.id));
+                    candidate.upstreams.extend(bundle.upstream.iter().cloned());
+                    let new_plugins: HashSet<_> =
+                        bundle.plugins.iter().map(|p| p.id.as_str()).collect();
+                    for plugin_id in &old_plugins {
+                        if !new_plugins.contains(plugin_id.as_str()) {
+                            let deleted = self
+                                .plugin_configs()
+                                .delete_one(doc! {
+                                    "_id": namespaced_doc_id(namespace, plugin_id),
+                                    "namespace": namespace,
+                                })
+                                .session(&mut *session)
+                                .await?;
+                            if deleted.deleted_count != 1 {
+                                return Err(DeploymentGraphInvalid.into());
+                            }
+                            changes.push(("plugin_config", plugin_id.clone(), "delete"));
+                        }
+                    }
+                    for (plugin_id, new_doc) in prepared.plugins {
+                        let old = self
+                            .plugin_configs()
+                            .find_one(doc! {
+                                "_id": namespaced_doc_id(namespace, &plugin_id),
+                                "namespace": namespace,
+                            })
+                            .session(&mut *session)
+                            .await?;
+                        let document = match old {
+                            Some(old) => {
+                                if old.get_str("api_spec_id").ok() != Some(spec.id.as_str()) {
+                                    return Err(DeploymentGraphInvalid.into());
+                                }
+                                let known =
+                                    plugin_config_to_doc(&doc_to_plugin_config(old.clone())?)?;
+                                merge_deployment_document(old, known, new_doc)
+                            }
+                            None => new_doc,
+                        };
+                        self.plugin_configs()
+                            .replace_one(
+                                doc! {
+                                    "_id": namespaced_doc_id(namespace, &plugin_id),
+                                    "namespace": namespace,
+                                },
+                                document,
+                            )
+                            .upsert(true)
+                            .session(&mut *session)
+                            .await?;
+                        changes.push(("plugin_config", plugin_id, "upsert"));
+                    }
+                    for upstream_id in &plan.upstreams {
+                        if bundle
+                            .upstream
+                            .as_ref()
+                            .is_none_or(|u| u.id != *upstream_id)
+                        {
+                            let deleted = self
+                                .upstreams()
+                                .delete_one(doc! {
+                                    "_id": namespaced_doc_id(namespace, upstream_id),
+                                    "namespace": namespace,
+                                })
+                                .session(&mut *session)
+                                .await?;
+                            if deleted.deleted_count != 1 {
+                                return Err(DeploymentGraphInvalid.into());
+                            }
+                            changes.push(("upstream", upstream_id.clone(), "delete"));
+                        }
+                    }
+                    if let Some((upstream_id, new_doc)) = prepared.upstream {
+                        let old = self
+                            .upstreams()
+                            .find_one(doc! {
+                                "_id": namespaced_doc_id(namespace, &upstream_id),
+                                "namespace": namespace,
+                            })
+                            .session(&mut *session)
+                            .await?;
+                        let document = match old {
+                            Some(old) => {
+                                if old.get_str("api_spec_id").ok() != Some(spec.id.as_str()) {
+                                    return Err(DeploymentGraphInvalid.into());
+                                }
+                                let known = upstream_to_doc(&doc_to_upstream(old.clone())?)?;
+                                merge_deployment_document(old, known, new_doc)
+                            }
+                            None => new_doc,
+                        };
+                        self.upstreams()
+                            .replace_one(
+                                doc! {
+                                    "_id": namespaced_doc_id(namespace, &upstream_id),
+                                    "namespace": namespace,
+                                },
+                                document,
+                            )
+                            .upsert(true)
+                            .session(&mut *session)
+                            .await?;
+                        changes.push(("upstream", upstream_id, "upsert"));
+                    }
+                    let old_spec_doc = self
+                        .api_specs()
+                        .find_one(doc! {
+                            "_id": namespaced_doc_id(namespace, &spec.id), "namespace": namespace,
+                        })
+                        .session(&mut *session)
+                        .await?
+                        .ok_or(DeploymentGraphInvalid)?;
+                    let spec_doc = merge_deployment_document(
+                        old_spec_doc,
+                        api_spec_to_doc(previous_spec)?,
+                        prepared.spec,
+                    );
+                    let replaced = self
+                        .api_specs()
+                        .replace_one(
+                            doc! {
+                                "_id": namespaced_doc_id(namespace, &spec.id),
+                                "namespace": namespace,
+                            },
+                            spec_doc,
+                        )
+                        .session(&mut *session)
+                        .await?;
+                    if replaced.matched_count != 1 {
+                        return Err(DeploymentGraphInvalid.into());
+                    }
+                    let replaced = self
+                        .proxies()
+                        .replace_one(
+                            doc! {
+                                "_id": namespaced_doc_id(namespace, id), "namespace": namespace,
+                            },
+                            proxy_doc,
+                        )
+                        .session(&mut *session)
+                        .await?;
+                    if replaced.matched_count != 1 {
+                        return Err(DeploymentGraphInvalid.into());
+                    }
+                    changes.push(("proxy", id.to_string(), "upsert"));
+                }
+            }
+            validate_deployment_candidate(&candidate, precondition.validation_http_client).await?;
+            if candidate.has_effective_mtls_dns_identity_policy() {
+                if replacement.is_some() {
+                    candidate
+                        .validate_unique_mtls_dns_identities()
+                        .map_err(|_| DeploymentGraphInvalid)?;
+                } else if candidate.introduces_new_mtls_dns_identity_conflict(&prior_conflicts) {
+                    return Err(DeploymentGraphInvalid.into());
+                }
+            }
+            for (resource, id, operation) in changes {
+                self.record_config_change_in_session(session, namespace, resource, &id, operation)
+                    .await?;
+            }
+            if !self
+                .renew_pinned_restore_lease_in_session(session, namespace, owner, generation)
+                .await?
+            {
+                return Err(BatchAdmissionLeaseLost.into());
+            }
+            let (fault, _) = crate::config::batch_atomicity::atomic_batch_test_overrides(namespace);
+            Self::check_atomic_batch_fault_in_session(fault, AtomicBatchPhase::Commit, 0)?;
+            Ok(())
+        }
+
+        async fn mutate_deployment(
+            &self,
+            id: &str,
+            precondition: &DeploymentPrecondition<'_>,
+            replacement: Option<(&crate::admin::api_specs::ExtractedBundle, &ApiSpec)>,
+        ) -> Result<(), anyhow::Error> {
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
+            }
+            if let Some((_, spec)) = replacement {
+                let encoded = mongodb::bson::to_vec(&api_spec_to_doc(spec)?)?;
+                if encoded.len() > 15 * 1024 * 1024 {
+                    return Err(DeploymentGraphInvalid.into());
+                }
+            }
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases([precondition.namespace])
+                .await?;
+            // The mTLS admission guard owns the connection-generation pin.
+            // Avoid acquiring that fair RwLock recursively around a reconnect.
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
+            }
+            for lease in &mut mtls_leases {
+                lease.strict_release = true;
+            }
+            let connection = self.connection();
+            Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                let mut session = connection.client.start_session().await?;
+                session
+                    .start_transaction()
+                    .read_concern(ReadConcern::snapshot())
+                    .write_concern(WriteConcern::majority())
+                    .and_run(
+                        (self, id, precondition, replacement),
+                        |session, (this, id, precondition, replacement)| {
+                            Box::pin(async move {
+                                this.mutate_deployment_in_session(
+                                    session,
+                                    id,
+                                    precondition,
+                                    *replacement,
+                                )
+                                .await
+                                .map_err(mongodb::error::Error::custom)
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        if let Some(inner) = error.get_custom::<anyhow::Error>() {
+                            if inner.chain().any(|e| e.is::<NamespacePreconditionFailed>()) {
+                                return anyhow::Error::new(NamespacePreconditionFailed);
+                            }
+                            if inner.chain().any(|e| e.is::<DeploymentGraphInvalid>()) {
+                                return anyhow::Error::new(DeploymentGraphInvalid);
+                            }
+                            if let Some(conflict) = inner
+                                .chain()
+                                .find_map(|e| e.downcast_ref::<ExternalSpecUpstreamConflict>())
+                            {
+                                return anyhow::Error::new(conflict.clone());
+                            }
+                            if inner.chain().any(|e| e.is::<BatchAdmissionLeaseLost>()) {
+                                return anyhow::Error::new(BatchAdmissionLeaseLost);
+                            }
+                        }
+                        anyhow::Error::new(error)
+                    })?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+            // The transaction is confirmed committed. Cleanup cannot reclassify
+            // that durable result as a failed or uncertain mutation.
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
+            Ok(())
+        }
+
+        async fn write_conditional_namespace(
+            &self,
+            restore: &ConditionalNamespaceRestore<'_>,
+            mode: &BatchConfigWriteMode,
+        ) -> Result<(), anyhow::Error> {
+            let graph = &restore.graph;
+            let _generation_pin = self.connection_generation.clone().read_owned().await;
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
+            }
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases_for_mode([graph.namespace], mode)
+                .await?;
+            let (fault, chunk_size) =
+                crate::config::batch_atomicity::atomic_batch_test_overrides(graph.namespace);
+            let chunk_size = chunk_size.unwrap_or(MONGO_ATOMIC_BATCH_CHUNK_SIZE).max(1);
+            let spec_docs = restore
+                .api_specs
+                .iter()
+                .map(api_spec_to_doc)
+                .collect::<Result<Vec<_>, _>>()?;
+            for doc in &spec_docs {
+                if mongodb::bson::to_vec(doc)?.len() > 15 * 1024 * 1024 {
+                    anyhow::bail!("MongoDB API spec document exceeds restore limit");
+                }
+            }
+            let replacement = MongoConditionalRestorePlan {
+                expected: restore.expected.clone(),
+                spec_docs,
+                trust: restore
+                    .gateway_trust_bundles
+                    .map(|records| records.to_vec()),
+            };
+            let plan =
+                Self::prepare_atomic_batch_plan(graph, chunk_size, fault, Some(replacement))?;
+            Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                session
+                    .start_transaction()
+                    .read_concern(ReadConcern::snapshot())
+                    .write_concern(WriteConcern::majority())
+                    .and_run((self, &plan), |session, (this, plan)| {
+                        Box::pin(async move {
+                            this.write_atomic_batch_graph_in_session(session, plan)
+                                .await
+                        })
+                    })
+                    .await
+                    .map_err(Self::atomic_batch_transaction_error)?;
+                self.compact_config_changes_best_effort(graph.namespace)
+                    .await;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
+            Ok(())
+        }
+
+        fn prepare_atomic_batch_plan(
+            graph: &AtomicBatchGraph<'_>,
+            chunk_size: usize,
+            fault: Option<AtomicBatchFault>,
+            replacement: Option<MongoConditionalRestorePlan>,
+        ) -> Result<MongoAtomicBatchPlan, anyhow::Error> {
+            let admission_lease = match graph.admission_lease {
+                Some(lease) => {
+                    let generation = i64::try_from(lease.generation).map_err(|_| {
+                        anyhow::anyhow!("namespace config admission generation is out of range")
+                    })?;
+                    Some((lease.owner.to_string(), generation))
+                }
+                None => None,
+            };
+            Ok(MongoAtomicBatchPlan {
+                consumer_docs: graph
+                    .consumers
+                    .iter()
+                    .map(consumer_to_doc)
+                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
+                consumer_identity_docs: graph
+                    .consumers
+                    .iter()
+                    .flat_map(|consumer| {
+                        consumer_identity_index_docs(
+                            &consumer.namespace,
+                            &consumer.id,
+                            &consumer_identity_values(consumer),
+                        )
+                    })
+                    .collect(),
+                consumer_changes: graph
+                    .consumers
+                    .iter()
+                    .map(|item| (item.namespace.clone(), item.id.clone()))
+                    .collect(),
+                upstream_docs: graph
+                    .upstreams
+                    .iter()
+                    .map(upstream_to_doc)
+                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
+                upstream_changes: graph
+                    .upstreams
+                    .iter()
+                    .map(|item| (item.namespace.clone(), item.id.clone()))
+                    .collect(),
+                proxy_docs: graph
+                    .proxies
+                    .iter()
+                    .map(proxy_to_doc)
+                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
+                proxy_changes: graph
+                    .proxies
+                    .iter()
+                    .map(|item| (item.namespace.clone(), item.id.clone()))
+                    .collect(),
+                plugin_config_docs: graph
+                    .plugin_configs
+                    .iter()
+                    .map(plugin_config_to_doc)
+                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
+                plugin_config_changes: graph
+                    .plugin_configs
+                    .iter()
+                    .map(|item| (item.namespace.clone(), item.id.clone()))
+                    .collect(),
+                chunk_size,
+                fault,
+                lease_namespace: graph.namespace.to_string(),
+                admission_lease,
+                replacement,
+            })
+        }
+
         /// Write the whole batch graph inside one transaction session.
         ///
         /// Runs the dependency phases in order and re-verifies the namespace
@@ -5430,6 +6261,67 @@ mod inner {
             session: &mut ClientSession,
             plan: &MongoAtomicBatchPlan,
         ) -> mongodb::error::Result<()> {
+            if let Some(replacement) = &plan.replacement {
+                let Some((owner, generation)) = &plan.admission_lease else {
+                    return Err(mongodb::error::Error::custom(
+                        AtomicBatchAbort::AdmissionLeaseLost,
+                    ));
+                };
+                // A real write enlists the live lease in this transaction's
+                // write set before the resource snapshot. Renewal and takeover
+                // cannot change it until commit/abort. Every driver retry must
+                // prove live ownership anew; a prior attempt's pin is not proof.
+                if !self
+                    .verify_namespace_config_admission_lease_in_session(
+                        &mut *session,
+                        &plan.lease_namespace,
+                        owner,
+                        *generation,
+                    )
+                    .await?
+                {
+                    return Err(mongodb::error::Error::custom(
+                        AtomicBatchAbort::AdmissionLeaseLost,
+                    ));
+                }
+                // Force a changed value even when the preceding server-time
+                // touch lands in the same millisecond as acquisition. A no-op
+                // update is not sufficient to retain a document write fence.
+                self.config_admission_locks_in_transaction()
+                    .update_one(
+                        doc! {
+                            "_id": &plan.lease_namespace,
+                            "owner": owner,
+                            "generation": *generation,
+                        },
+                        doc! { "$set": { "restore_pin": Uuid::new_v4().to_string() } },
+                    )
+                    .session(&mut *session)
+                    .await?;
+                let connection = self.connection();
+                let current = self
+                    .conditional_namespace_snapshot_in_session(
+                        &mut *session,
+                        connection.as_ref(),
+                        &plan.lease_namespace,
+                    )
+                    .await
+                    .map_err(|_| {
+                        mongodb::error::Error::custom("Conditional namespace snapshot failed")
+                    })?;
+                let representation = current.representation().map_err(|_| {
+                    mongodb::error::Error::custom("Conditional snapshot serialization failed")
+                })?;
+                if representation != replacement.expected {
+                    return Err(mongodb::error::Error::custom(NamespacePreconditionFailed));
+                }
+                crate::config::batch_atomicity::pause_conditional_restore_for_test(
+                    &plan.lease_namespace,
+                )
+                .await;
+                self.delete_all_namespace_resources_in_session(session, &plan.lease_namespace)
+                    .await?;
+            }
             Self::check_atomic_batch_fault_in_session(plan.fault, AtomicBatchPhase::Consumers, 0)?;
             if !plan.consumer_docs.is_empty() {
                 // Reserve the merged identity keyspace for the whole batch
@@ -5556,18 +6448,82 @@ mod inner {
                 0,
             )?;
 
-            if let Some((owner, generation)) = &plan.admission_lease
-                && !self
-                    .verify_namespace_config_admission_lease_in_session(
+            if let Some(replacement) = &plan.replacement {
+                for chunk in replacement.spec_docs.chunks(plan.chunk_size) {
+                    self.api_specs()
+                        .insert_many(chunk.to_vec())
+                        .session(&mut *session)
+                        .await?;
+                }
+                if let Some(records) = &replacement.trust {
+                    let filter = doc! {
+                        "_id": &plan.lease_namespace,
+                        "namespace": &plan.lease_namespace,
+                    };
+                    let current = self
+                        .gateway_trust_bundles()
+                        .find_one(filter.clone())
+                        .session(&mut *session)
+                        .await?;
+                    if let Some(current) = current {
+                        let id = current.get_str("id").map_err(|_| {
+                            mongodb::error::Error::custom("Invalid stored trust identity")
+                        })?;
+                        self.gateway_trust_bundles()
+                            .delete_one(filter)
+                            .session(&mut *session)
+                            .await?;
+                        self.record_config_change_in_session(
+                            &mut *session,
+                            &plan.lease_namespace,
+                            GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                            id,
+                            "delete",
+                        )
+                        .await?;
+                    }
+                    for record in records {
+                        let revision = self
+                            .record_config_change_in_session_returning_sequence(
+                                &mut *session,
+                                &plan.lease_namespace,
+                                GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE,
+                                &record.id,
+                                "upsert",
+                            )
+                            .await?;
+                        let doc = gateway_trust_bundle_to_doc(record, revision)
+                            .map_err(|_| mongodb::error::Error::custom("Invalid trust record"))?;
+                        self.gateway_trust_bundles()
+                            .insert_one(doc)
+                            .session(&mut *session)
+                            .await?;
+                    }
+                }
+            }
+
+            if let Some((owner, generation)) = &plan.admission_lease {
+                let held = if plan.replacement.is_some() {
+                    self.renew_pinned_restore_lease_in_session(
+                        &mut *session,
+                        &plan.lease_namespace,
+                        owner,
+                        *generation,
+                    )
+                    .await?
+                } else {
+                    self.verify_namespace_config_admission_lease_in_session(
                         &mut *session,
                         plan.lease_namespace.as_str(),
                         owner.as_str(),
                         *generation,
                     )
                     .await?
-            {
-                let abort = AtomicBatchAbort::AdmissionLeaseLost;
-                return Err(mongodb::error::Error::custom(abort));
+                };
+                if !held {
+                    let abort = AtomicBatchAbort::AdmissionLeaseLost;
+                    return Err(mongodb::error::Error::custom(abort));
+                }
             }
 
             Self::check_atomic_batch_fault_in_session(plan.fault, AtomicBatchPhase::Commit, 0)?;
@@ -5636,6 +6592,29 @@ mod inner {
                 }
                 result => result,
             }?;
+            Ok(result.matched_count == 1)
+        }
+
+        /// Renew only a lease already written and verified live by this restore
+        /// attempt. The transaction's write conflict fence prevents takeover
+        /// throughout the import, even beyond the original TTL. Unsupported
+        /// server-time pipeline updates fail closed rather than using a client
+        /// clock or weakening the transaction fence.
+        async fn renew_pinned_restore_lease_in_session(
+            &self,
+            session: &mut ClientSession,
+            key: &str,
+            owner: &str,
+            generation: i64,
+        ) -> mongodb::error::Result<bool> {
+            let result = self
+                .config_admission_locks_in_transaction()
+                .update_one(
+                    doc! { "_id": key, "owner": owner, "generation": generation },
+                    Self::server_time_lease_renew_pipeline(CONFIG_ADMISSION_LEASE_DURATION_MILLIS),
+                )
+                .session(&mut *session)
+                .await?;
             Ok(result.matched_count == 1)
         }
 
@@ -6823,6 +7802,35 @@ mod inner {
         }
     }
 
+    /// Replace known fields while retaining fields outside the typed schema.
+    fn merge_deployment_document(
+        mut stored: Document,
+        mut known: Document,
+        replacement: Document,
+    ) -> Document {
+        let mut new_known = replacement.clone();
+        for document in [&mut known, &mut new_known] {
+            document.remove("created_at");
+            document.remove("updated_at");
+        }
+        if known == new_known {
+            return stored;
+        }
+        let created_at = stored.get("created_at").cloned();
+        for key in known.keys() {
+            if !replacement.contains_key(key) {
+                stored.remove(key);
+            }
+        }
+        for (key, value) in replacement {
+            stored.insert(key, value);
+        }
+        if let Some(created_at) = created_at {
+            stored.insert("created_at", created_at);
+        }
+        stored
+    }
+
     /// An application-level reason to abort a namespace registry transaction.
     ///
     /// MongoDB's convenient-transaction runner only aborts when the callback
@@ -6884,6 +7892,13 @@ mod inner {
         /// timestamp precomputed into this plan would be stale by the time a
         /// long — or retried — transaction reaches that gate.
         admission_lease: Option<(String, i64)>,
+        replacement: Option<MongoConditionalRestorePlan>,
+    }
+
+    struct MongoConditionalRestorePlan {
+        expected: serde_json::Value,
+        spec_docs: Vec<Document>,
+        trust: Option<Vec<GatewayTrustBundleRecord>>,
     }
 
     // -----------------------------------------------------------------------
@@ -8336,6 +9351,72 @@ mod inner {
             }
 
             Ok(config)
+        }
+
+        async fn load_deployment_snapshot(
+            &self,
+            namespace: &str,
+        ) -> Result<DeploymentSnapshot, anyhow::Error> {
+            let _generation_pin = self.connection_generation.clone().read_owned().await;
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
+            }
+            let connection = self.connection();
+            let mut session = connection.client.start_session().await?;
+            session
+                .start_transaction()
+                .read_concern(ReadConcern::snapshot())
+                .write_concern(WriteConcern::majority())
+                .await?;
+            let snapshot = self
+                .deployment_snapshot_in_session(&mut session, namespace)
+                .await?;
+            session.commit_transaction().await?;
+            Ok(snapshot)
+        }
+
+        async fn remove_deployment_conditionally(
+            &self,
+            id: &str,
+            precondition: &DeploymentPrecondition<'_>,
+        ) -> Result<(), anyhow::Error> {
+            self.mutate_deployment(id, precondition, None).await
+        }
+
+        async fn replace_deployment_conditionally(
+            &self,
+            bundle: &crate::admin::api_specs::ExtractedBundle,
+            spec: &ApiSpec,
+            precondition: &DeploymentPrecondition<'_>,
+        ) -> Result<(), anyhow::Error> {
+            self.mutate_deployment(&spec.proxy_id, precondition, Some((bundle, spec)))
+                .await
+        }
+
+        async fn load_conditional_namespace_snapshot(
+            &self,
+            namespace: &str,
+        ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+            let _generation_pin = self.connection_generation.clone().read_owned().await;
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
+            }
+            let connection = self.connection();
+            let mut session = connection.client.start_session().await?;
+            session
+                .start_transaction()
+                .read_concern(ReadConcern::snapshot())
+                .write_concern(WriteConcern::majority())
+                .await?;
+            let snapshot = self
+                .conditional_namespace_snapshot_in_session(
+                    &mut session,
+                    connection.as_ref(),
+                    namespace,
+                )
+                .await?;
+            session.commit_transaction().await?;
+            Ok(snapshot)
         }
 
         async fn load_namespace_snapshot(
@@ -12260,72 +13341,7 @@ mod inner {
                 }
             }
 
-            let admission_lease = match graph.admission_lease {
-                Some(lease) => {
-                    let generation = i64::try_from(lease.generation).map_err(|_| {
-                        anyhow::anyhow!("namespace config admission generation is out of range")
-                    })?;
-                    Some((lease.owner.to_string(), generation))
-                }
-                None => None,
-            };
-            let plan = MongoAtomicBatchPlan {
-                consumer_docs: graph
-                    .consumers
-                    .iter()
-                    .map(consumer_to_doc)
-                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
-                consumer_identity_docs: graph
-                    .consumers
-                    .iter()
-                    .flat_map(|consumer| {
-                        consumer_identity_index_docs(
-                            &consumer.namespace,
-                            &consumer.id,
-                            &consumer_identity_values(consumer),
-                        )
-                    })
-                    .collect(),
-                consumer_changes: graph
-                    .consumers
-                    .iter()
-                    .map(|item| (item.namespace.clone(), item.id.clone()))
-                    .collect(),
-                upstream_docs: graph
-                    .upstreams
-                    .iter()
-                    .map(upstream_to_doc)
-                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
-                upstream_changes: graph
-                    .upstreams
-                    .iter()
-                    .map(|item| (item.namespace.clone(), item.id.clone()))
-                    .collect(),
-                proxy_docs: graph
-                    .proxies
-                    .iter()
-                    .map(proxy_to_doc)
-                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
-                proxy_changes: graph
-                    .proxies
-                    .iter()
-                    .map(|item| (item.namespace.clone(), item.id.clone()))
-                    .collect(),
-                plugin_config_docs: graph
-                    .plugin_configs
-                    .iter()
-                    .map(plugin_config_to_doc)
-                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
-                plugin_config_changes: graph
-                    .plugin_configs
-                    .iter()
-                    .map(|item| (item.namespace.clone(), item.id.clone()))
-                    .collect(),
-                chunk_size,
-                fault,
-                lease_namespace: graph.namespace.to_string(),
-                admission_lease,
-            };
+            let plan = Self::prepare_atomic_batch_plan(graph, chunk_size, fault, None)?;
 
             let counts = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
                 let connection = self.connection();
@@ -12353,6 +13369,15 @@ mod inner {
             .await?;
             Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(counts)
+        }
+
+        async fn restore_namespace_conditionally(
+            &self,
+            restore: &ConditionalNamespaceRestore<'_>,
+            mode: &BatchConfigWriteMode,
+        ) -> Result<(), anyhow::Error> {
+            restore.validate_scope()?;
+            self.write_conditional_namespace(restore, mode).await
         }
 
         async fn batch_create_proxies(

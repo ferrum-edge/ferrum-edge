@@ -1142,23 +1142,32 @@ async fn grpc_deadline_after_partial_data_resets_stream_and_preserves_backend_he
         let reservation = reserve_port().await.expect("reserve port");
         let backend_port = reservation.port;
         let partial_message = Bytes::from_static(b"partial");
-        let builder = ScriptedGrpcBackend::builder_plain(reservation.into_listener());
-        let builder = if bidi {
-            builder.step(GrpcStep::AcceptStreamingRpc(MatchRpc::method(method)))
+        let accept = if bidi {
+            GrpcStep::AcceptStreamingRpc(MatchRpc::method(method))
         } else {
-            builder.step(GrpcStep::AcceptRpc(MatchRpc::method(method)))
+            GrpcStep::AcceptRpc(MatchRpc::method(method))
         };
-        let backend = builder
-            .step(GrpcStep::SendInitialHeaders)
-            .step(GrpcStep::RespondMessage(partial_message.clone()))
-            .step(GrpcStep::ExpectReset(Duration::from_secs(4)))
-            .step(GrpcStep::AcceptRpc(MatchRpc::method("/ferrum.Echo/Health")))
-            .step(GrpcStep::SendInitialHeaders)
-            .step(GrpcStep::RespondMessage(Bytes::from_static(b"healthy")))
-            .step(GrpcStep::RespondStatus {
-                code: 0,
-                message: "",
-            })
+        // Health uses a new frontend connection and may select another backend
+        // shard. Its response must not depend on reusing the reset connection.
+        let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+            .rpc_scripts([
+                vec![
+                    accept,
+                    GrpcStep::SendInitialHeaders,
+                    GrpcStep::RespondMessage(partial_message.clone()),
+                    GrpcStep::ExpectReset(Duration::from_secs(4)),
+                ],
+                vec![
+                    GrpcStep::AcceptRpc(MatchRpc::method("/ferrum.Echo/Health")),
+                    GrpcStep::SendInitialHeaders,
+                    GrpcStep::RespondMessage(Bytes::from_static(b"healthy")),
+                    GrpcStep::RespondStatus {
+                        code: 0,
+                        message: "",
+                    },
+                ],
+            ])
+            .expect("method-routed RPC scripts")
             .spawn()
             .expect("spawn backend");
         let harness = GatewayHarness::builder()
@@ -1232,12 +1241,16 @@ async fn grpc_deadline_after_partial_data_resets_stream_and_preserves_backend_he
             .unwrap_or_else(|error| panic!("{case}: health RPC failed: {error}"));
         assert_eq!(health.grpc_status(), Some(0), "{case}: health RPC");
         assert_eq!(
+            health.messages,
+            vec![Bytes::from_static(b"healthy")],
+            "{case}: health RPC must receive its own response"
+        );
+        assert_eq!(
             backend.received_stream_count(),
             2,
             "{case}: client deadline must not trip the one-failure circuit breaker"
         );
-        backend.assert_no_matcher_mismatches().await;
-        backend.assert_no_step_errors().await;
+        assert_grpc_backend_rpc_paths(&backend, &[method, "/ferrum.Echo/Health"], case).await;
     }
 }
 
@@ -1685,26 +1698,64 @@ async fn native_grpc_builders_write_the_gateway_owned_error_token() {
     }
 }
 
+/// Prove each method reached the backend once, without assuming a connection
+/// count or allowing a retry to hide a wrong fixture response.
+async fn assert_grpc_backend_rpc_paths(backend: &ScriptedGrpcBackend, paths: &[&str], case: &str) {
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), paths.len(), "{case}: {streams:?}");
+    assert_eq!(
+        backend.received_stream_count() as usize,
+        paths.len(),
+        "{case}: {streams:?}"
+    );
+    for path in paths {
+        assert_eq!(
+            streams
+                .iter()
+                .filter(|stream| stream.method == "POST" && stream.path == *path)
+                .count(),
+            1,
+            "{case}: expected one backend RPC for {path}: {streams:?}"
+        );
+    }
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
 async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
+    const SUCCESS: &str = "/ferrum.Echo/Success";
+    const FAILURE: &str = "/ferrum.Echo/Failure";
+    const MALFORMED: &str = "/ferrum.Echo/Malformed";
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
-    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondMessage(Bytes::from_static(b"ok")))
-        .step(GrpcStep::RespondStatus {
-            code: 0,
-            message: "",
-        })
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondStatus {
-            code: 4,
-            message: "deadline exceeded",
-        })
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondRawStatus { value: "malformed" })
+    // /grpc is stripped by grpc_file_config_with_log_config. Each unary call
+    // opens a frontend connection, so route by the rewritten backend method.
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .rpc_scripts([
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(SUCCESS)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondMessage(Bytes::from_static(b"ok")),
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+            ],
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(FAILURE)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 4,
+                    message: "deadline exceeded",
+                },
+            ],
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(MALFORMED)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondRawStatus { value: "malformed" },
+            ],
+        ])
+        .expect("method-routed RPC scripts")
         .spawn()
         .expect("spawn backend");
     let yaml = grpc_file_config_with_log_config(
@@ -1741,6 +1792,29 @@ async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
         .await
         .expect("malformed-status RPC response");
     assert_eq!(malformed.grpc_status(), None, "{case}: {malformed:?}");
+    assert_eq!(success.messages, vec![Bytes::from_static(b"ok")], "{case}");
+    for (response, status) in [(&success, "0"), (&failure, "4"), (&malformed, "malformed")] {
+        assert_eq!(response.http_status, 200, "{case}: {response:?}");
+        assert!(response.stream_error.is_none(), "{case}: {response:?}");
+        assert!(!response.initial_headers_end_stream, "{case}: {response:?}");
+        assert!(
+            !response.headers.contains_key("grpc-status"),
+            "{case}: {response:?}"
+        );
+        assert_eq!(
+            response
+                .trailers
+                .as_ref()
+                .and_then(|trailers| trailers.get("grpc-status"))
+                .and_then(|value| value.to_str().ok()),
+            Some(status),
+            "{case}: terminal wire status must be preserved: {response:?}"
+        );
+    }
+    for response in [&failure, &malformed] {
+        assert!(response.raw_body_frames.is_empty(), "{case}: {response:?}");
+    }
+    assert_grpc_backend_rpc_paths(&backend, &[SUCCESS, FAILURE, MALFORMED], case).await;
 
     let logs = harness
         .wait_for_log_contains(
@@ -1798,21 +1872,32 @@ async fn stdout_errors_only_covers_streamed_and_buffered_h2_grpc_status() {
 }
 
 async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case: &str) {
+    const SUCCESS: &str = "/echo.Echo/Success";
+    const FAILURE: &str = "/echo.Echo/Failure";
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
-    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondStatus {
-            code: 0,
-            message: "",
-        })
-        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
-        .step(GrpcStep::RespondStatus {
-            code: 14,
-            message: "unavailable",
-        })
+    // grpc_chargeback_file_config strips /grpc. A connection-local sequence
+    // would return status 0 again if /Failure selects another backend shard.
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .rpc_scripts([
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(SUCCESS)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+            ],
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::method(FAILURE)),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 14,
+                    message: "unavailable",
+                },
+            ],
+        ])
+        .expect("method-routed RPC scripts")
         .spawn()
         .expect("spawn backend");
     let harness = GatewayHarness::builder()
@@ -1842,6 +1927,25 @@ async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case:
         .expect("failed-status RPC response");
     assert_eq!(failure.http_status, 200, "{case}: {failure:?}");
     assert_eq!(failure.grpc_status(), Some(14), "{case}: {failure:?}");
+    for (response, status) in [(&success, "0"), (&failure, "14")] {
+        assert!(response.stream_error.is_none(), "{case}: {response:?}");
+        assert!(response.raw_body_frames.is_empty(), "{case}: {response:?}");
+        assert!(!response.initial_headers_end_stream, "{case}: {response:?}");
+        assert!(
+            !response.headers.contains_key("grpc-status"),
+            "{case}: {response:?}"
+        );
+        assert_eq!(
+            response
+                .trailers
+                .as_ref()
+                .and_then(|trailers| trailers.get("grpc-status"))
+                .and_then(|value| value.to_str().ok()),
+            Some(status),
+            "{case}: terminal wire status must be preserved: {response:?}"
+        );
+    }
+    assert_grpc_backend_rpc_paths(&backend, &[SUCCESS, FAILURE], case).await;
 
     let charges = wait_for_chargeback_statuses(
         &harness,
@@ -2163,6 +2267,65 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
     );
 }
 
+// hyperium/hyper#4212: an HTTP/2 peer may advertise any positive stream
+// window. Ferrum's former 1 KiB minimum-capacity patch waited forever when a
+// backend advertised 512 bytes, even though releasing each received frame
+// would have allowed the complete upload to proceed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_upload_progresses_with_512_byte_backend_stream_window() {
+    const MESSAGE_LEN: usize = 2043;
+
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+        .with_initial_window_size(512)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(&[0, 0, 0, 0, 2, b'o', b'k']),
+            end_stream: false,
+        })
+        .step(H2Step::RespondTrailers(vec![("grpc-status", "0".into())]))
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = spawn_grpc_harness(grpc_file_config(backend_port, Value::Null)).await;
+    let gateway_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gateway_port}"));
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.unary(
+            "/grpc/ferrum.Echo/Upload",
+            Bytes::from(vec![b'x'; MESSAGE_LEN]),
+        ),
+    )
+    .await
+    .expect("a legal 512-byte backend stream window must not stall the upload")
+    .expect("gateway returns a gRPC response");
+    assert_eq!(response.grpc_status(), Some(0));
+
+    let streams = backend.received_streams().await;
+    let body = &streams.first().expect("one backend stream").body;
+    assert_eq!(body.len(), MESSAGE_LEN + 5);
+    assert_eq!(body[0], 0, "gRPC compression flag");
+    assert_eq!(
+        u32::from_be_bytes(body[1..5].try_into().unwrap()),
+        MESSAGE_LEN as u32
+    );
+    assert!(body[5..].iter().all(|byte| *byte == b'x'));
+    backend.assert_no_step_errors().await;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 6b — direct-H2 buffered response body stalls are bounded by
 //            `backend_read_timeout_ms`.
@@ -2253,12 +2416,11 @@ async fn h2_buffered_response_body_stall_triggers_backend_read_timeout() {
 // single h2 connection at the backend. If every request opens a fresh TCP
 // connection, the pool isn't reusing, which is a regression.
 //
-// Observable: `backend.accepted_connections() == 1` after both requests.
-//
-// NOTE: on h2c the gateway's gRPC pool opens a connection on first use
-// and holds it; when this test was authored the pool was sharded but
-// reuse-on-hit. If the sharding policy changes, this test may need
-// tuning (e.g. pin to shard 0 via a request header).
+// Observable: one backend TCP accept and H2 handshake, with two completed
+// RPCs returning distinct scripted messages. Keep one frontend H2 connection
+// alive: gRPC affinity deliberately creates a missing shard for a new frontend,
+// even when a sibling shard is ready. GrpcClient::unary opens a new frontend
+// per call, so it cannot establish this same-connection reuse invariant.
 //
 // Migrated to `HarnessMode::InProcess` — the assertion is on
 // `backend.accepted_connections()` and `backend.received_streams()`,
@@ -2287,6 +2449,8 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
             code: 0,
             message: "",
         })
+        // Keep the backend connection alive through all reuse assertions.
+        .step(GrpcStep::AwaitTestSignal)
         .spawn()
         .expect("spawn backend");
 
@@ -2305,38 +2469,76 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .expect("gateway port");
-    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
-
-    let r1 = client
-        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+    let (client, connection) = tokio::time::timeout(Duration::from_secs(5), async {
+        let socket = tokio::net::TcpStream::connect(("127.0.0.1", gw_port))
+            .await
+            .expect("connect frontend");
+        h2::client::handshake(socket).await.expect("frontend h2")
+    })
+    .await
+    .expect("bounded frontend connection");
+    // JoinSet owns the driver even if an RPC assertion panics or times out.
+    // Retain the sender until backend inspection, then close and join it.
+    let mut frontend_driver = tokio::task::JoinSet::new();
+    frontend_driver.spawn(connection);
+    let mut stream_ids = Vec::new();
+    for expected in [b"\0\0\0\0\x03one", b"\0\0\0\0\x03two"] {
+        let stream_id = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut sender = client.clone().ready().await.expect("frontend ready");
+            let request = http::Request::builder()
+                .method("POST")
+                .uri(format!("http://127.0.0.1:{gw_port}/grpc/ferrum.Echo/Ping"))
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(())
+                .expect("unary request");
+            let (response, mut request_body) = sender
+                .send_request(request, false)
+                .expect("send unary request");
+            let stream_id = request_body.stream_id();
+            request_body
+                .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+                .expect("send empty gRPC message");
+            let response = response.await.expect("unary response");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut response_body = response.into_body();
+            let mut framed_message = Vec::new();
+            while let Some(chunk) = response_body.data().await {
+                let chunk = chunk.expect("response DATA");
+                response_body
+                    .flow_control()
+                    .release_capacity(chunk.len())
+                    .expect("release response capacity");
+                framed_message.extend_from_slice(&chunk);
+            }
+            let trailers = response_body
+                .trailers()
+                .await
+                .expect("response trailers")
+                .expect("successful RPC has trailers");
+            assert_eq!(trailers["grpc-status"], "0", "RPC succeeded");
+            assert_eq!(
+                framed_message.as_slice(),
+                expected.as_slice(),
+                "complete scripted gRPC message on stream {stream_id:?}"
+            );
+            stream_id
+        })
         .await
-        .expect("first response");
-    assert_eq!(r1.grpc_status(), Some(0), "first RPC succeeded");
-    assert!(
-        r1.messages.iter().any(|m| m.as_ref() == b"one"),
-        "first message missing from {:?}",
-        r1.messages
+        .expect("bounded complete unary RPC");
+        stream_ids.push(stream_id);
+    }
+    assert_ne!(
+        stream_ids[0], stream_ids[1],
+        "two distinct frontend streams"
     );
+    wait_for_backend_awaiting_test_signal(&backend, Duration::from_secs(5)).await;
 
-    let r2 = client
-        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
-        .await
-        .expect("second response");
-    assert_eq!(r2.grpc_status(), Some(0), "second RPC succeeded");
-    assert!(
-        r2.messages.iter().any(|m| m.as_ref() == b"two"),
-        "second message missing from {:?}",
-        r2.messages
-    );
-
-    // Give the pool a moment to settle its accepted-connection counter.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Accept/handshake and stream recording precede the scripted replies.
+    // Receipt of both complete bodies/trailers is the counter barrier.
     let backend_streams = backend.received_streams().await;
-    assert!(
-        backend_streams.len() >= 2,
-        "expected at least 2 streams, got {}",
-        backend_streams.len()
-    );
+    assert_eq!(backend_streams.len(), 2, "two actual backend RPC streams");
+    assert_eq!(backend.handshakes_completed(), 1);
     // The critical observation: only one TCP connection was accepted.
     // If the pool opened a fresh connection for the second request, this
     // would be >= 2.
@@ -2347,6 +2549,21 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
          expected connection reuse (each RPC should have ridden the same \
          h2 connection)"
     );
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+    assert!(
+        frontend_driver.try_join_next().is_none(),
+        "frontend connection must stay alive through reuse inspection"
+    );
+
+    backend.release_test_signal();
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), frontend_driver.join_next())
+        .await
+        .expect("bounded frontend cleanup")
+        .expect("owned frontend driver")
+        .expect("join frontend driver")
+        .expect("frontend closed cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4981,4 +5198,873 @@ async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload()
         1,
         "the exchange must complete on a single backend stream, not a retry"
     );
+}
+
+// A raw backend keeps the receive half alive after sending a Trailers-Only
+// response. Raw frontend send handles likewise keep each upload open, so
+// sequentially draining responses cannot disguise concurrent backend streams.
+async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: bool) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpStream;
+
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let listener = reservation.into_listener();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task_accepted = Arc::clone(&accepted);
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel();
+    let backend = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            let id = task_accepted.fetch_add(1, Ordering::Relaxed);
+            let ended_tx = ended_tx.clone();
+            connections.spawn(async move {
+                let mut connection = h2::server::handshake(socket).await.expect("backend h2");
+                let mut uploads = tokio::task::JoinSet::new();
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    let upload_id = request
+                        .headers()
+                        .get("x-upload-id")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<usize>().ok());
+                    if authenticated && upload_id.is_some() {
+                        assert_eq!(
+                            request.headers()["x-consumer-username"],
+                            "affinity-consumer"
+                        );
+                    }
+                    let ended_tx = ended_tx.clone();
+                    uploads.spawn(async move {
+                        let mut body = request.into_body();
+                        let mut received = Vec::new();
+                        if upload_id.is_some_and(|upload_id| upload_id != 82) {
+                            // Prove the initial message reached the backend before
+                            // answering. The frontend keeps the upload open until
+                            // it has drained this terminal response. The H1
+                            // chunked case (82) sends its complete body up front.
+                            while received.len() < 6 {
+                                let data = body
+                                    .data()
+                                    .await
+                                    .expect("initial upload DATA")
+                                    .expect("initial upload DATA result");
+                                received.extend_from_slice(&data);
+                                body.flow_control()
+                                    .release_capacity(data.len())
+                                    .expect("release initial upload credit");
+                            }
+                            assert_eq!(received, [0, 0, 0, 0, 1, b'x']);
+                            assert!(!body.is_end_stream(), "upload remains open at response");
+                        }
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "0")
+                            .header("x-backend-connection", id.to_string())
+                            .body(())
+                            .expect("early terminal response");
+                        respond.send_response(response, true).expect("respond");
+                        let mut reset = None;
+                        while let Some(data) = body.data().await {
+                            match data {
+                                Ok(data) => {
+                                    received.extend_from_slice(&data);
+                                    body.flow_control()
+                                        .release_capacity(data.len())
+                                        .expect("release upload credit");
+                                }
+                                Err(error) => {
+                                    assert!(error.is_reset(), "unexpected upload error: {error}");
+                                    reset = error.reason();
+                                    assert_eq!(
+                                        reset,
+                                        Some(h2::Reason::CANCEL),
+                                        "upload {upload_id:?} preserves frontend cancellation"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(upload_id) = upload_id {
+                            if reset.is_some() {
+                                assert_eq!(
+                                    received,
+                                    [0, 0, 0, 0, 1, b'x'],
+                                    "a reset upload forwards no further DATA"
+                                );
+                                assert!(!body.is_end_stream(), "reset must not become END_STREAM");
+                                let error = body
+                                    .data()
+                                    .await
+                                    .expect("reset remains a DATA error")
+                                    .expect_err("no DATA or clean EOF after reset");
+                                assert_eq!(error.reason(), Some(h2::Reason::CANCEL));
+                                let error = body
+                                    .trailers()
+                                    .await
+                                    .expect_err("no terminal trailers after reset");
+                                assert_eq!(error.reason(), Some(h2::Reason::CANCEL));
+                            } else {
+                                let trailers = body.trailers().await.expect("upload trailers");
+                                if upload_id % 4 == 0 {
+                                    let trailers = trailers.expect("native request trailers");
+                                    assert_eq!(trailers["x-client-trailer"], "end");
+                                    assert_eq!(trailers.len(), 1, "one terminal metadata block");
+                                    assert_eq!(received, [0, 0, 0, 0, 1, b'x']);
+                                } else {
+                                    assert!(trailers.is_none(), "DATA EOF has no trailers");
+                                    if upload_id % 8 == 6 {
+                                        assert_eq!(received, [0, 0, 0, 0, 1, b'x']);
+                                    } else {
+                                        assert_eq!(
+                                            received,
+                                            [0, 0, 0, 0, 1, b'x', 0, 0, 0, 0, 1, b'y']
+                                        );
+                                    }
+                                }
+                                assert!(body.is_end_stream(), "backend received END_STREAM");
+                            }
+                            ended_tx
+                                .send((upload_id, reset))
+                                .expect("report upload termination");
+                        }
+                    });
+                }
+            });
+        }
+    });
+    let mut yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_write_timeout_ms": 0,
+            "backend_read_timeout_ms": 30_000,
+        }),
+    );
+    const JWT_SECRET: &str = "grpc-affinity-auth-lifetime-hmac-secret-2026";
+    if authenticated {
+        let mut config: Value = serde_yaml::from_str(&yaml).expect("affinity config");
+        config["proxies"][0]["plugins"] = json!([{
+            "plugin_config_id": "affinity-auth-lifetime-jwt"
+        }]);
+        config["consumers"] = json!([{
+            "id": "affinity-consumer",
+            "username": "affinity-consumer",
+            "credentials": {"jwt": [{"secret": JWT_SECRET}]},
+        }]);
+        config["plugin_configs"] = json!([{
+            "id": "affinity-auth-lifetime-jwt",
+            "plugin_name": "jwt_auth",
+            "scope": "proxy",
+            "proxy_id": "scripted",
+            "enabled": true,
+            "config": {
+                "token_lookup": "header:Authorization",
+                "consumer_claim_field": "sub",
+            },
+        }]);
+        yaml = to_file_mode_yaml(&config);
+    }
+    let scratch = tempfile::tempdir().expect("frontend certificates");
+    let ca = TestCa::new("affinity-frontend").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let cert_path = scratch.path().join("frontend.crt");
+    let key_path = scratch.path().join("frontend.key");
+    std::fs::write(&cert_path, cert).expect("write cert");
+    std::fs::write(&key_path, key).expect("write key");
+    let mut builder = GatewayHarness::builder()
+        .file_config(yaml)
+        .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "4");
+    let tls_port = if tls_frontend {
+        let reservation = reserve_port().await.expect("frontend TLS port");
+        let port = reservation.drop_and_take_port();
+        builder = builder
+            .env("FERRUM_PROXY_HTTPS_PORT", port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path.to_string_lossy())
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path.to_string_lossy());
+        Some(port)
+    } else {
+        None
+    };
+    let harness = builder.spawn().await.expect("gateway");
+    let authorization = authenticated.then(|| {
+        let now = chrono::Utc::now().timestamp();
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &json!({"sub": "affinity-consumer", "iat": now, "exp": now + 600}),
+            &jsonwebtoken::EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+        )
+        .expect("consumer JWT with active authorization lifetime");
+        format!("Bearer {token}")
+    });
+    if let Some(port) = tls_port {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes()) {
+            roots.add(cert.expect("CA certificate")).expect("root");
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let socket = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("TLS socket");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("SNI");
+        let socket = connector
+            .connect(name, socket)
+            .await
+            .expect("TLS handshake");
+        assert_eq!(socket.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        exercise_grpc_retained_uploads(
+            socket,
+            port,
+            "https",
+            authorization.as_deref(),
+            &mut ended_rx,
+        )
+        .await;
+    } else {
+        let port = reqwest::Url::parse(harness.proxy_base_url())
+            .expect("frontend URL")
+            .port()
+            .expect("frontend port");
+        let socket = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("h2c socket");
+        exercise_grpc_retained_uploads(
+            socket,
+            port,
+            "http",
+            authorization.as_deref(),
+            &mut ended_rx,
+        )
+        .await;
+    }
+    // H1 chunked EOF need not set Incoming::is_end_stream(). Exercise the
+    // same bare/pumped native-gRPC source without applying the H2 reset rule.
+    exercise_grpc_chunked_upload(&harness, authorization.as_deref(), &mut ended_rx).await;
+    if authenticated {
+        let metrics = harness
+            .get_admin_json("/metrics/runtime")
+            .await
+            .expect("authorization metrics");
+        assert_eq!(
+            metrics["authorization_lifetime"]["credential_expired"]["grpc"].as_u64(),
+            Some(0),
+            "the upload resets must not count as authorization expiry"
+        );
+    }
+    assert!(
+        accepted.load(Ordering::Relaxed) >= 2,
+        "heavy upload must widen the pool"
+    );
+    drop(harness);
+    backend.abort();
+    let _ = backend.await;
+}
+
+async fn exercise_grpc_retained_uploads<T>(
+    socket: T,
+    port: u16,
+    scheme: &str,
+    authorization: Option<&str>,
+    ended: &mut tokio::sync::mpsc::UnboundedReceiver<(usize, Option<h2::Reason>)>,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    const UPLOADS: usize = 40;
+    let (mut client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+    let driver = tokio::spawn(connection);
+    let mut preferred_backend = None;
+    let mut seen = [false; UPLOADS * 2];
+    // Repeat the saturation and release on the SAME frontend connection. A
+    // leaked or duplicate affinity release must not shift the spill threshold
+    // or prevent the second wave from reusing its original preferred backend.
+    for wave in 0..2 {
+        let mut uploads = Vec::new();
+        let mut backend_ids = Vec::new();
+        for index in 0..UPLOADS {
+            client = client.ready().await.expect("client ready");
+            let mut request = http::Request::builder()
+                .method("POST")
+                .uri(format!("{scheme}://localhost:{port}/api/affinity"))
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .header("x-upload-id", (wave * UPLOADS + index).to_string());
+            if let Some(authorization) = authorization {
+                request = request.header("authorization", authorization);
+            }
+            let request = request.body(()).expect("request");
+            let (response, mut upload) = client.send_request(request, false).expect("open upload");
+            upload
+                .send_data(Bytes::from_static(&[0, 0, 0, 0, 1, b'x']), false)
+                .expect("initial DATA");
+            let response = tokio::time::timeout(Duration::from_secs(5), response)
+                .await
+                .expect("early response timeout")
+                .expect("early response");
+            assert_eq!(response.headers()["grpc-status"], "0");
+            backend_ids.push(response.headers()["x-backend-connection"].clone());
+            let mut body = response.into_body();
+            assert!(body.data().await.is_none(), "terminal response has no DATA");
+            drop(body);
+            uploads.push(upload);
+        }
+        let preferred: &http::HeaderValue =
+            preferred_backend.get_or_insert_with(|| backend_ids[0].clone());
+        assert!(backend_ids[..32].iter().all(|id| id == preferred));
+        assert!(
+            backend_ids[32..].iter().any(|id| id != preferred),
+            "uploads must remain counted after their terminal responses in wave {wave}"
+        );
+        assert!(
+            ended.try_recv().is_err(),
+            "none of the retained uploads ended yet, and prior uploads terminate once"
+        );
+
+        // Empty/nonempty DATA END_STREAM, terminal trailers, and frontend
+        // CANCEL/NO_ERROR resets terminate the independent upload half. Require
+        // actual backend CANCEL for each reset; accepting an arbitrary error would hide a
+        // changed wire reason or a truncated clean upload.
+        for (index, mut upload) in uploads.into_iter().enumerate() {
+            if index % 4 == 0 {
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("x-client-trailer", http::HeaderValue::from_static("end"));
+                upload.send_trailers(trailers).expect("upload trailers");
+            } else if index % 2 == 0 {
+                let final_data = if index % 8 == 6 {
+                    Bytes::new()
+                } else {
+                    Bytes::from_static(&[0, 0, 0, 0, 1, b'y'])
+                };
+                upload.send_data(final_data, true).expect("DATA END_STREAM");
+            } else {
+                let reason = if index % 4 == 1 {
+                    h2::Reason::CANCEL
+                } else {
+                    h2::Reason::NO_ERROR
+                };
+                upload.send_reset(reason);
+            }
+        }
+        for _ in 0..UPLOADS {
+            let (index, reset) = tokio::time::timeout(Duration::from_secs(5), ended.recv())
+                .await
+                .expect("upload termination timeout")
+                .expect("upload termination");
+            assert_eq!(index / UPLOADS, wave, "termination belongs to this wave");
+            assert!(!seen[index], "upload terminates once");
+            seen[index] = true;
+            let expected = (index % 2 != 0).then_some(h2::Reason::CANCEL);
+            assert_eq!(reset, expected, "upload {index} reset versus clean EOF");
+        }
+        for _ in 0..16 {
+            client = client.ready().await.expect("client ready after releases");
+            let mut request = http::Request::builder()
+                .method("POST")
+                .uri(format!("{scheme}://localhost:{port}/api/affinity"))
+                .header("content-type", "application/grpc")
+                .header("te", "trailers");
+            if let Some(authorization) = authorization {
+                request = request.header("authorization", authorization);
+            }
+            let request = request.body(()).expect("probe request");
+            let (response, _) = client.send_request(request, true).expect("finished upload");
+            let response = tokio::time::timeout(Duration::from_secs(5), response)
+                .await
+                .expect("probe timeout")
+                .expect("probe response");
+            assert_eq!(response.headers()["grpc-status"], "0");
+            assert_eq!(response.headers()["x-backend-connection"], *preferred);
+        }
+    }
+    assert!(seen.into_iter().all(|ended| ended));
+    assert!(ended.try_recv().is_err(), "no duplicate upload terminals");
+    driver.abort();
+    let _ = driver.await;
+}
+
+async fn exercise_grpc_chunked_upload(
+    harness: &GatewayHarness,
+    authorization: Option<&str>,
+    ended: &mut tokio::sync::mpsc::UnboundedReceiver<(usize, Option<h2::Reason>)>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let port = reqwest::Url::parse(harness.proxy_base_url())
+        .expect("frontend URL")
+        .port()
+        .expect("frontend port");
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("H1 socket");
+    let mut head = format!(
+        "POST /api/affinity HTTP/1.1\r\nHost: localhost:{port}\r\n\
+         Content-Type: application/grpc\r\nTransfer-Encoding: chunked\r\n\
+         X-Upload-Id: 82\r\n"
+    );
+    if let Some(authorization) = authorization {
+        head.push_str(&format!("Authorization: {authorization}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut request = head.into_bytes();
+    request.extend_from_slice(
+        b"6\r\n\x00\x00\x00\x00\x01x\r\n6\r\n\x00\x00\x00\x00\x01y\r\n0\r\n\r\n",
+    );
+    socket.write_all(&request).await.expect("chunked upload");
+    let response_head = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 16 * 1024, "bounded response head");
+            head.push(socket.read_u8().await.expect("response head byte"));
+        }
+        String::from_utf8(head).expect("response head text")
+    })
+    .await
+    .expect("H1 response timeout");
+    assert!(response_head.starts_with("HTTP/1.1 200"), "{response_head}");
+    let terminal = tokio::time::timeout(Duration::from_secs(5), ended.recv())
+        .await
+        .expect("chunked upload completion timeout")
+        .expect("chunked upload completion");
+    assert_eq!(
+        terminal,
+        (82, None),
+        "valid H1 EOF must not reset the backend"
+    );
+    assert!(ended.try_recv().is_err(), "H1 upload terminates once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_early_response_uploads_on_plaintext_frontend() {
+    grpc_early_response_upload_affinity(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_early_response_uploads_on_tls_frontend() {
+    grpc_early_response_upload_affinity(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_authenticated_early_response_uploads_on_plaintext_frontend() {
+    grpc_early_response_upload_affinity(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_authenticated_early_response_uploads_on_tls_frontend() {
+    grpc_early_response_upload_affinity(true, true).await;
+}
+
+// The backend grants only 1 KiB, answers before consuming the upload, and
+// withholds all further credit. Each final 16 KiB DATA must keep a backend
+// stream occupied even after Hyper drops its source and the response ends.
+#[derive(Clone, Copy)]
+enum QueuedGrpcUpload {
+    Streaming,
+    RetryBuffered,
+    WebTrailers,
+    WebPumped,
+}
+
+async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpStream;
+
+    const UPLOADS: usize = 40;
+    const DATA_LEN: usize = 16 * 1024;
+    const WINDOW: usize = 1024;
+    let web = matches!(
+        mode,
+        QueuedGrpcUpload::WebTrailers | QueuedGrpcUpload::WebPumped
+    );
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let listener = reservation.into_listener();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task_accepted = Arc::clone(&accepted);
+    let (blocked_tx, mut blocked_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let backend = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            let id = task_accepted.fetch_add(1, Ordering::Relaxed);
+            let blocked_tx = blocked_tx.clone();
+            let ended_tx = ended_tx.clone();
+            let release_rx = release_rx.clone();
+            connections.spawn(async move {
+                let mut connection = h2::server::Builder::new()
+                    .initial_window_size(WINDOW as u32)
+                    .initial_connection_window_size(2 * 1024 * 1024)
+                    .max_concurrent_streams(128)
+                    .handshake::<_, Bytes>(socket)
+                    .await
+                    .expect("backend h2");
+                let mut uploads = tokio::task::JoinSet::new();
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    assert_eq!(request.headers()["content-type"], "application/grpc");
+                    let index = request
+                        .headers()
+                        .get("x-upload-id")
+                        .map(|value| value.to_str().unwrap().parse::<usize>().unwrap());
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", "0")
+                        .header("x-backend-connection", id.to_string())
+                        .body(())
+                        .expect("early terminal response");
+                    let mut send = respond.send_response(response, true).expect("respond");
+                    let Some(index) = index else {
+                        assert!(request.into_body().is_end_stream(), "probe upload is empty");
+                        continue;
+                    };
+                    let blocked_tx = blocked_tx.clone();
+                    let ended_tx = ended_tx.clone();
+                    let mut release_rx = release_rx.clone();
+                    uploads.spawn(async move {
+                        let mut body = request.into_body();
+                        let mut received = Vec::new();
+                        while received.len() < WINDOW {
+                            let data = tokio::time::timeout(Duration::from_secs(5), body.data())
+                                .await
+                                .expect("initial DATA timeout")
+                                .expect("initial DATA")
+                                .expect("initial DATA result");
+                            received.extend_from_slice(&data);
+                        }
+                        assert_eq!(received.len(), WINDOW);
+                        assert!(!body.is_end_stream(), "final DATA remains flow controlled");
+                        blocked_tx.send(index).expect("report withheld credit");
+                        while !*release_rx.borrow_and_update() {
+                            release_rx.changed().await.expect("release signal");
+                        }
+                        if index % 2 != 0 {
+                            send.send_reset(h2::Reason::CANCEL);
+                            // Drop discards unread upload bytes after the reset.
+                            drop(body);
+                            ended_tx.send((index, true)).expect("report reset");
+                            return;
+                        }
+                        body.flow_control()
+                            .release_capacity(received.len())
+                            .expect("release withheld credit");
+                        while let Some(data) = body.data().await {
+                            let data = data.expect("drained DATA");
+                            body.flow_control()
+                                .release_capacity(data.len())
+                                .expect("release drain credit");
+                            received.extend_from_slice(&data);
+                        }
+                        assert_eq!(
+                            received.len(),
+                            DATA_LEN,
+                            "complete native DATA representation"
+                        );
+                        assert_eq!(&received[..5], &[0, 0, 0, 63, 251]);
+                        assert!(received[5..].iter().all(|byte| *byte == b'x'));
+                        let trailers = body.trailers().await.expect("request trailers");
+                        if web {
+                            assert_eq!(
+                                trailers.expect("translated trailers")["x-client-trailer"],
+                                "end"
+                            );
+                        } else {
+                            assert!(trailers.is_none());
+                        }
+                        ended_tx
+                            .send((index, false))
+                            .expect("report drained upload");
+                    });
+                }
+                while let Some(result) = uploads.join_next().await {
+                    result.expect("backend upload task");
+                }
+            });
+        }
+    });
+
+    // A held refused port forces a real buffered-native retry. The successful
+    // target retains the same 1 KiB window as the other representations.
+    let refused = reserve_refused_tcp_port().expect("refused retry target");
+    let write_timeout_ms = if matches!(mode, QueuedGrpcUpload::WebPumped) {
+        30_000
+    } else {
+        0
+    };
+    let mut proxy = json!({
+        "id": "queued-grpc",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "backend_write_timeout_ms": write_timeout_ms,
+        "backend_read_timeout_ms": 30_000,
+    });
+    let mut upstreams = json!([]);
+    if matches!(mode, QueuedGrpcUpload::RetryBuffered) {
+        proxy["backend_port"] = json!(refused.port);
+        proxy["upstream_id"] = json!("retry-targets");
+        proxy["retry"] = json!({
+            "max_retries": 1,
+            "retry_on_connect_failure": true,
+            "backoff": { "fixed": { "delay_ms": 1 } },
+        });
+        upstreams = json!([{
+            "id": "retry-targets",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": refused.port, "weight": 100 },
+                { "host": "127.0.0.1", "port": backend_port, "weight": 100 },
+            ],
+        }]);
+    }
+    let plugins = if web {
+        json!([{
+            "id": "web",
+            "plugin_name": "grpc_web",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }])
+    } else {
+        json!([])
+    };
+    let yaml = to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [proxy],
+        "upstreams": upstreams,
+        "consumers": [],
+        "plugin_configs": plugins,
+    }));
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "4")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("gateway");
+    let port = reqwest::Url::parse(harness.proxy_base_url())
+        .expect("frontend URL")
+        .port()
+        .expect("frontend port");
+    let socket = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("frontend socket");
+    let (mut client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+    let driver = tokio::spawn(connection);
+    let mut data = vec![b'x'; DATA_LEN];
+    data[..5].copy_from_slice(&[0, 0, 0, 63, 251]);
+    if web {
+        let trailers = b"x-client-trailer: end\r\n";
+        data.push(0x80);
+        data.extend_from_slice(&(trailers.len() as u32).to_be_bytes());
+        data.extend_from_slice(trailers);
+    }
+    let data = Bytes::from(data);
+    let mut backend_ids = Vec::new();
+    for index in 0..UPLOADS {
+        client = client.ready().await.expect("frontend ready");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost:{port}/api/affinity"))
+            .header(
+                "content-type",
+                if web {
+                    "application/grpc-web+proto"
+                } else {
+                    "application/grpc"
+                },
+            )
+            .header("te", "trailers")
+            .header("x-upload-id", index.to_string())
+            .body(())
+            .expect("request");
+        let (response, mut upload) = client.send_request(request, false).expect("upload");
+        upload
+            .send_data(data.clone(), true)
+            .expect("final 16 KiB DATA");
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("early response timeout")
+            .expect("early response");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        if web {
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/grpc-web+proto"
+            );
+            assert!(
+                !response.headers().contains_key("x-backend-connection"),
+                "Trailers-Only application metadata belongs in the terminal DATA frame"
+            );
+        } else {
+            assert_eq!(response.headers()["grpc-status"], "0");
+            backend_ids.push(response.headers()["x-backend-connection"].clone());
+        }
+        let mut body = response.into_body();
+        let mut response_bytes = Vec::new();
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(5), body.data())
+            .await
+            .expect("terminal response timeout")
+        {
+            let chunk = chunk.expect("terminal response DATA");
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .expect("response credit");
+            response_bytes.extend_from_slice(&chunk);
+        }
+        if web {
+            // All application metadata in a native Trailers-Only response is
+            // terminal. Translation moves the connection ID with grpc-status
+            // into one 0x80 DATA frame, rather than leaving it in initial headers.
+            assert!(response_bytes.len() >= 5, "complete trailer frame header");
+            assert_eq!(response_bytes[0], 0x80, "uncompressed terminal frame");
+            let length_bytes: [u8; 4] = response_bytes[1..5].try_into().expect("trailer length");
+            let trailer_len = u32::from_be_bytes(length_bytes) as usize;
+            assert_eq!(
+                response_bytes.len(),
+                5 + trailer_len,
+                "exactly one complete terminal frame"
+            );
+            let trailers = std::str::from_utf8(&response_bytes[5..]).expect("ASCII trailers");
+            assert!(trailers.ends_with("\r\n"), "terminated trailer lines");
+            assert_eq!(
+                trailers
+                    .lines()
+                    .filter(|line| *line == "grpc-status: 0")
+                    .count(),
+                1,
+                "exactly one successful terminal status"
+            );
+            let mut connection_ids = trailers
+                .lines()
+                .filter_map(|line| line.strip_prefix("x-backend-connection: "));
+            let connection_id = connection_ids.next().expect("terminal connection ID");
+            assert!(
+                connection_ids.next().is_none(),
+                "exactly one terminal connection ID"
+            );
+            backend_ids.push(http::HeaderValue::from_str(connection_id).expect("connection ID"));
+        } else {
+            assert!(response_bytes.is_empty());
+        }
+        drop(body);
+        let blocked = tokio::time::timeout(Duration::from_secs(5), blocked_rx.recv())
+            .await
+            .expect("withheld-credit timeout")
+            .expect("withheld-credit report");
+        assert_eq!(blocked, index, "every response leaves its upload blocked");
+    }
+    assert!(backend_ids[..32].iter().all(|id| id == backend_ids[0]));
+    assert!(
+        backend_ids[32..].iter().any(|id| id != backend_ids[0]),
+        "final DATA still queued after terminal responses must force spill"
+    );
+    assert!(
+        ended_rx.try_recv().is_err(),
+        "no upload has drained or reset"
+    );
+    assert!(
+        accepted.load(Ordering::Relaxed) >= 2,
+        "spill widens the pool"
+    );
+    if matches!(mode, QueuedGrpcUpload::RetryBuffered) {
+        let logs = harness
+            .wait_for_log_contains(
+                &|logs: &str| logs.contains("Retrying gRPC backend request"),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            logs.contains("Retrying gRPC backend request"),
+            "real native retry required"
+        );
+    }
+
+    release_tx.send(true).expect("drain/reset all uploads");
+    let mut seen = [false; UPLOADS];
+    for _ in 0..UPLOADS {
+        let (index, reset) = tokio::time::timeout(Duration::from_secs(5), ended_rx.recv())
+            .await
+            .expect("upload termination timeout")
+            .expect("upload termination report");
+        assert!(!seen[index], "upload terminates exactly once");
+        seen[index] = true;
+        assert_eq!(reset, index % 2 != 0);
+    }
+    // Allow the backend driver to deliver its last RST/WINDOW_UPDATE. Every
+    // subsequent probe must regain the original preferred shard.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..16 {
+        client = client.ready().await.expect("probe ready");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost:{port}/api/affinity"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .expect("probe");
+        let (response, _) = client.send_request(request, true).expect("empty probe");
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("probe timeout")
+            .expect("probe response");
+        assert_eq!(response.headers()["x-backend-connection"], backend_ids[0]);
+        assert_eq!(response.headers()["grpc-status"], "0");
+        let mut body = response.into_body();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), body.data())
+                .await
+                .expect("probe body timeout")
+                .is_none()
+        );
+    }
+    assert!(
+        ended_rx.try_recv().is_err(),
+        "no duplicate termination report"
+    );
+    driver.abort();
+    let _ = driver.await;
+    drop(harness);
+    backend.abort();
+    let _ = backend.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_streaming_final_data_queued_after_source_eof() {
+    grpc_affinity_with_queued_final_data(QueuedGrpcUpload::Streaming).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_retry_buffered_native_final_data() {
+    grpc_affinity_with_queued_final_data(QueuedGrpcUpload::RetryBuffered).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_translated_web_data_and_trailers() {
+    grpc_affinity_with_queued_final_data(QueuedGrpcUpload::WebTrailers).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_affinity_retains_pumped_translated_web_data_and_trailers() {
+    grpc_affinity_with_queued_final_data(QueuedGrpcUpload::WebPumped).await;
 }

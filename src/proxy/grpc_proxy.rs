@@ -32,10 +32,10 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -76,11 +76,11 @@ pub(crate) const GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER: &str =
 /// Canonical serialized `grpc-status` paired with the gateway message above.
 pub(crate) const GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER: &str = "4";
 
-/// Observer fired exactly when the streaming gRPC **request upload** reaches a
+/// Observer fired exactly when the streaming gRPC **request source** reaches a
 /// terminal state — clean EOF, overflow abort, or stream drop (client/backend
 /// reset). Attached to the `GrpcBody::Streaming` request-body wrapper and
-/// invoked from its `Drop`, which hyper runs once it is done sending the
-/// request body (END_STREAM) or abandons the stream.
+/// invoked from its `Drop`, when hyper finishes polling the source or abandons
+/// it. h2 may still own queued DATA then; this is not transport completion.
 ///
 /// The gRPC transport layer stays agnostic to what the observer does. The proxy
 /// layer wires it to circuit-breaker probe accounting (`GrpcStreamingProbeRecorder`
@@ -200,6 +200,10 @@ pub enum GrpcBody {
     /// observe `bytes_seen` from another task after `into_reqwest_body()`
     /// moves ownership — `GrpcBody` has no such cross-task read path.
     Streaming {
+        /// Only H2 receive state proves END_STREAM after body EOF. A clean
+        /// H1 chunked body can yield `None` without `is_end_stream()` becoming
+        /// true, so that transport must not use this reset check.
+        require_end_stream: bool,
         /// The client body, or — for an AUTHENTICATED request — a bounded
         /// bridge fed by a gateway-owned pump task (issue #3815).
         ///
@@ -248,6 +252,8 @@ pub enum GrpcBody {
     /// exactly; only the source differs. The same `Pin<&mut Self>` exclusivity
     /// argument as `Streaming` makes the plain `usize` counter safe.
     Channel {
+        auth_deadline: Option<super::RequestAuthLifetimePlan>,
+        grpc_deadline_at: Option<tokio::time::Instant>,
         receiver: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ()>>,
         bytes_seen: usize,
         max_bytes: usize,
@@ -289,10 +295,9 @@ impl Drop for GrpcBody {
         {
             accounting.publish(*bytes_seen as u64);
         }
-        // Notify the upload-termination observer when the streaming request
-        // body is dropped. hyper drops it once the upload finishes (END_STREAM)
-        // or the stream is reset, so this is the canonical "request upload
-        // terminated" signal — independent of the response body's lifetime.
+        // Preserve the source observer for probe/accounting publication. Hyper
+        // can drop this body with final DATA still queued inside h2; backend
+        // stream affinity is owned separately by the request extension.
         let upload_observer = match self {
             GrpcBody::Streaming {
                 upload_observer, ..
@@ -337,6 +342,7 @@ impl http_body::Body for GrpcBody {
             }
             GrpcBody::Pumped(source) => source.poll_frame(cx),
             GrpcBody::Streaming {
+                require_end_stream,
                 incoming,
                 bytes_seen,
                 max_bytes,
@@ -404,16 +410,27 @@ impl http_body::Body for GrpcBody {
                         Poll::Ready(Some(Err(e)))
                     }
                     Poll::Ready(None) => {
-                        // Clean END_STREAM: the whole upload is on the wire.
                         if let Some(accounting) = request_bytes.as_mut() {
                             accounting.publish(*bytes_seen as u64);
                         }
+                        // Hyper treats inbound H2 CANCEL/NO_ERROR as body EOF,
+                        // but h2's receive state still distinguishes a reset
+                        // from END_STREAM. The authenticated pump checks that
+                        // original receive state before converting EOF into its
+                        // own terminal; this check covers the bare Incoming.
+                        if *require_end_stream && !incoming.is_end_stream() {
+                            let reset = h2::Error::from(h2::Reason::CANCEL);
+                            return Poll::Ready(Some(Err(reset.into())));
+                        }
+                        // Clean source EOF: h2 may still hold queued upload DATA.
                         Poll::Ready(None)
                     }
                     Poll::Pending => Poll::Pending,
                 }
             }
             GrpcBody::Channel {
+                auth_deadline,
+                grpc_deadline_at,
                 receiver,
                 bytes_seen,
                 max_bytes,
@@ -427,6 +444,30 @@ impl http_body::Body for GrpcBody {
             } => {
                 if *cancelled_terminal {
                     return Poll::Ready(None);
+                }
+                // The H3 pump owns the expiry timer and wakes this queue on
+                // cancellation. This clock-only gate also rejects queued DATA
+                // without allocating a second timer on the ready-frame path.
+                if let Some((deadline, family, latch)) = auth_deadline {
+                    let bound = super::auth_lifetime::ComposedAuthBound::compose(
+                        *grpc_deadline_at,
+                        Some(*deadline),
+                    );
+                    if bound
+                        .deadline()
+                        .is_some_and(|at| tokio::time::Instant::now() >= at)
+                    {
+                        let message = match bound.expired_authorization() {
+                            Some(termination) => {
+                                latch.record_once(termination, *family);
+                                termination.grpc_message()
+                            }
+                            None => "gRPC client deadline exceeded",
+                        };
+                        *cancelled_terminal = true;
+                        cancelled.store(true, Ordering::Release);
+                        return Poll::Ready(Some(Err(message.into())));
+                    }
                 }
                 // Poll the queue before the cancellation acquire. This makes
                 // the acquire below the linearization point for a ready frame:
@@ -675,6 +716,100 @@ fn write_grpc_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize)
 pub struct GrpcConnectionPool {
     pool: Arc<GenericPool<GrpcPoolManager>>,
     rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// Shard keys whose affinity or spill create failed or was cancelled, with the
+    /// failure time (issue #5588). Until [`SHARD_CREATE_BACKOFF`] passes, a
+    /// missing or closed shard listed here is treated like any other missing
+    /// shard: the probe borrows a ready neighbour instead of dialling again on
+    /// every call (a DestinationRule `maxConnections` below the shard count,
+    /// or a backend refusing new connections). Consulted only when the
+    /// preferred shard is missing or closed.
+    shard_create_backoff: ShardCreateBackoff,
+}
+
+/// How long a failed affinity or spill shard create keeps that shard on the
+/// borrow path before it is dialled again.
+const SHARD_CREATE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Hard bound on retained failure keys and FIFO records. Recording one
+/// physical failure evicts at most one record; there are no full-map scans.
+const SHARD_CREATE_BACKOFF_CAPACITY: usize = 4096;
+
+struct ShardCreateBackoff {
+    failures: DashMap<Arc<str>, ShardCreateFailure>,
+    // Only physical failed/cancelled creates take this lock. Warm requests
+    // never consult the backoff cache, and coalesced waiters never record.
+    order: Mutex<VecDeque<(Arc<str>, usize)>>,
+    recorded: AtomicUsize,
+    evicted: AtomicUsize,
+}
+
+struct ShardCreateFailure {
+    at: tokio::time::Instant,
+    generation: usize,
+}
+
+impl ShardCreateBackoff {
+    fn new(shards: usize) -> Self {
+        Self {
+            failures: DashMap::with_shard_amount(shards),
+            order: Mutex::new(VecDeque::with_capacity(SHARD_CREATE_BACKOFF_CAPACITY)),
+            recorded: AtomicUsize::new(0),
+            evicted: AtomicUsize::new(0),
+        }
+    }
+
+    fn backed_off(&self, key: &str) -> bool {
+        let failed_at = match self.failures.get(key) {
+            Some(entry) => entry.at,
+            None => return false,
+        };
+        if failed_at.elapsed() < SHARD_CREATE_BACKOFF {
+            return true;
+        }
+        self.failures.remove_if(key, |_, failure| {
+            failure.at.elapsed() >= SHARD_CREATE_BACKOFF
+        });
+        false
+    }
+
+    fn record(&self, key: String) {
+        // Recover the bounded bookkeeping after a panic without dropping the
+        // cancellation cooldown. No user work runs while this lock is held.
+        let mut order = self.order.lock().unwrap_or_else(|err| err.into_inner());
+        if order.len() == SHARD_CREATE_BACKOFF_CAPACITY
+            && let Some((old_key, old_generation)) = order.pop_front()
+        {
+            self.failures.remove_if(old_key.as_ref(), |_, failure| {
+                failure.generation == old_generation
+            });
+            self.evicted.fetch_add(1, Ordering::Relaxed);
+        }
+        let key: Arc<str> = key.into();
+        let generation = self.recorded.fetch_add(1, Ordering::Relaxed);
+        self.failures.insert(
+            Arc::clone(&key),
+            ShardCreateFailure {
+                at: tokio::time::Instant::now(),
+                generation,
+            },
+        );
+        order.push_back((key, generation));
+    }
+}
+
+/// Lives inside the elected physical creator, so cancellation records the
+/// cooldown before GenericPool wakes waiters to elect the next creator.
+struct ShardCreateGuard<'a> {
+    backoff: &'a ShardCreateBackoff,
+    key: Option<String>,
+}
+
+impl Drop for ShardCreateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.backoff.record(key);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -770,6 +905,7 @@ impl GrpcConnectionPool {
         Self {
             pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
             rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
+            shard_create_backoff: ShardCreateBackoff::new(shards),
         }
     }
 
@@ -982,6 +1118,56 @@ impl GrpcConnectionPool {
         self.rr_counters.len()
     }
 
+    /// Shard keys currently backed off after a failed affinity or spill
+    /// create.
+    #[allow(dead_code)] // exercised from integration tests
+    pub fn shard_create_backoff_len(&self) -> usize {
+        self.shard_create_backoff.failures.len()
+    }
+
+    /// Physical failure records and bounded FIFO eviction operations. Exposed
+    /// for outage/fanout regression coverage, not logical request counts.
+    #[doc(hidden)]
+    pub fn shard_create_backoff_work(&self) -> (usize, usize) {
+        (
+            self.shard_create_backoff.recorded.load(Ordering::Relaxed),
+            self.shard_create_backoff.evicted.load(Ordering::Relaxed),
+        )
+    }
+
+    fn shard_create_backed_off(&self, key: &str) -> bool {
+        self.shard_create_backoff.backed_off(key)
+    }
+
+    fn ready_sibling(
+        &self,
+        key: &str,
+        base_len: usize,
+        start: usize,
+        shards: usize,
+    ) -> Option<GrpcPooledSender> {
+        // Cold creator recheck only. Reuse the thread-local key buffer rather
+        // than allocating one key per sibling, and never alias the borrowed
+        // sender into the failed shard's cache entry.
+        GRPC_POOL_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.push_str(&key[..base_len]);
+            for offset in 1..shards {
+                Self::write_shard_key_inplace(&mut buf, base_len, (start + offset) % shards);
+                if let Some(mut sender) = self.pool.cached(&buf)
+                    && matches!(
+                        futures_util::FutureExt::now_or_never(sender.ready()),
+                        Some(Ok(()))
+                    )
+                {
+                    return Some(sender);
+                }
+            }
+            None
+        })
+    }
+
     #[allow(dead_code)] // exercised from unit tests
     pub fn contains_rr_counter(&self, key: &str) -> bool {
         self.rr_counters.contains_key(key)
@@ -1063,8 +1249,9 @@ impl GrpcConnectionPool {
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
         // Phase 1 (synchronous): build the pool key in the thread-local
-        // buffer, pick a starting shard via the per-host RR counter, and
-        // probe every shard for an immediately-ready sender. On a cache hit
+        // buffer, pick a starting shard (the frontend connection's affinity
+        // shard, or the per-host RR counter), and probe the shards for an
+        // immediately-ready sender. On a cache hit
         // we return early without ever cloning the key. On a miss we clone
         // the buffer once into `selected_key` so the await below has an
         // owned String to hand to `create_or_get_existing_owned`.
@@ -1077,20 +1264,37 @@ impl GrpcConnectionPool {
             self.with_pool_key(proxy, svid_generation, |key_buf| -> GrpcPhase1 {
                 let base_len = key_buf.len();
 
+                // Where the probe starts (issue #5588, `frontend_affinity`): an
+                // HTTP/2 frontend connection under its affinity bound goes to its
+                // own shard, and one over it spills to the round-robin shard;
+                // both create their shard when it is missing or closed rather
+                // than borrowing a neighbour, so the pool still widens. A call
+                // with no frontend connection in scope keeps the original
+                // round-robin probe below.
+                //
                 // Round-robin counter is per-host, but on FIRST access we seed it
                 // with a thread-local PRNG offset so a burst of concurrent
                 // requests on a cold pool does not land all on shard 0 before
                 // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
                 // Relaxed)` is wait-free after the seed — the seed only matters
                 // for the first `shard_count` picks per host on this gateway.
-                let start = crate::profile_pool_sync!(Rr, {
-                    let rr = crate::proxy::http2_pool::get_or_seed_rr_counter(
-                        &self.rr_counters,
-                        &key_buf[..base_len],
-                        svid_generation,
-                        &self.pool.manager().backend_svid_generation,
-                    );
-                    rr.fetch_add(1, Ordering::Relaxed) % shard_count
+                let (start, create_if_missing) = crate::profile_pool_sync!(Rr, {
+                    use crate::proxy::frontend_affinity::{ShardStart, shard_start};
+                    match shard_start(shard_count) {
+                        ShardStart::Affinity(shard) => (shard, true),
+                        preference => {
+                            let rr = crate::proxy::http2_pool::get_or_seed_rr_counter(
+                                &self.rr_counters,
+                                &key_buf[..base_len],
+                                svid_generation,
+                                &self.pool.manager().backend_svid_generation,
+                            );
+                            (
+                                rr.fetch_add(1, Ordering::Relaxed) % shard_count,
+                                preference == ShardStart::Spill,
+                            )
+                        }
+                    }
                 });
 
                 // Cheap probe pass — any shard whose cached sender is
@@ -1103,9 +1307,8 @@ impl GrpcConnectionPool {
                     Self::write_shard_key_inplace(key_buf, base_len, shard);
 
                     crate::profile_pool_event!(Probe);
-                    if let Some(mut sender) =
-                        crate::profile_pool_sync!(Probe, self.pool.cached(key_buf))
-                    {
+                    let cached = crate::profile_pool_sync!(Probe, self.pool.cached(key_buf));
+                    if let Some(mut sender) = cached {
                         match crate::profile_pool_ready!(futures_util::FutureExt::now_or_never(
                             sender.ready()
                         )) {
@@ -1115,18 +1318,25 @@ impl GrpcConnectionPool {
                             }
                             Some(Err(_)) => {
                                 self.pool.invalidate(key_buf);
+                                // A closed preferred shard is recreated, as a
+                                // missing one is below.
+                                if offset == 0
+                                    && create_if_missing
+                                    && !self.shard_create_backed_off(key_buf)
+                                {
+                                    break;
+                                }
                             }
-                            // Shard exists but is mid-send. Skip — `now_or_never`
-                            // only wins on an immediately-ready sender, so a
-                            // busy-but-healthy shard falls through to phase 2.
-                            // There `create_or_get_existing_owned` checks
-                            // `cached()` first; the existing sender is still
-                            // healthy (`!is_closed()`), so the create closure
-                            // never runs and the pool does NOT grow beyond the
-                            // shard ring. Callers queue on H2 readiness /
-                            // stream-cap backpressure instead of spawning a fresh
-                            // connection. This immediate probe is intentional —
-                            // there is no operator-configurable wait on this path.
+                            // Not ready yet. A hyper HTTP/2 sender reports
+                            // ready whenever its connection is open, however
+                            // many streams it carries, so this arm is not a
+                            // load signal (the affinity bound above is what
+                            // limits one client's share of a shard). Skip — it
+                            // falls through to phase 2, where
+                            // `create_or_get_existing_owned` checks `cached()`
+                            // first; the existing sender is still healthy
+                            // (`!is_closed()`), so the create closure never runs
+                            // and the pool does NOT grow beyond the shard ring.
                             None => {
                                 #[cfg(feature = "bench-pool-profile")]
                                 {
@@ -1134,6 +1344,15 @@ impl GrpcConnectionPool {
                                 }
                             }
                         }
+                    } else if offset == 0
+                        && create_if_missing
+                        && !self.shard_create_backed_off(key_buf)
+                    {
+                        // The preferred shard does not exist yet: create it
+                        // rather than borrow a neighbour (coalesced per key, so
+                        // at most one connection per shard). A shard whose
+                        // create failed recently is borrowed around instead.
+                        break;
                     }
                 }
 
@@ -1150,11 +1369,12 @@ impl GrpcConnectionPool {
                     selected_key: key_buf.clone(),
                     base_len,
                     start,
+                    create_if_missing,
                 }
             })
         });
 
-        let (selected_key, base_len, start) = match phase1 {
+        let (selected_key, base_len, start, create_if_missing) = match phase1 {
             GrpcPhase1::Hit(sender) => {
                 crate::plugins::otel_tracing::note_backend_connection_reused();
                 return Ok(sender);
@@ -1163,18 +1383,29 @@ impl GrpcConnectionPool {
                 selected_key,
                 base_len,
                 start,
-            } => (selected_key, base_len, start),
+                create_if_missing,
+            } => (selected_key, base_len, start, create_if_missing),
         };
 
         crate::profile_pool_event!(Fallback);
         let manager = Arc::clone(self.pool.manager());
         let acquired = crate::profile_pool_future!(FallbackPoll, {
-            self.pool.create_or_get_existing_owned_with_attempt(
+            self.pool.create_or_get_existing_owned_with_recovery(
                 selected_key,
                 |attempt| note_grpc_establishment_join(attempt, purpose),
                 |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
+                |key| {
+                    if create_if_missing && self.shard_create_backed_off(key) {
+                        self.ready_sibling(key, base_len, start, shard_count)
+                    } else {
+                        None
+                    }
+                },
                 |key, attempt| async move {
-                    let _ = key;
+                    let mut guard = ShardCreateGuard {
+                        backoff: &self.shard_create_backoff,
+                        key: create_if_missing.then_some(key),
+                    };
                     // Only the creator runs this closure, so the connection
                     // this attempt waits on is one it set up (issue #5864).
                     let setup_started =
@@ -1183,6 +1414,7 @@ impl GrpcConnectionPool {
                         .create_connection(proxy, svid_generation, purpose, Some(attempt))
                         .await;
                     if created.is_ok() {
+                        guard.key = None;
                         crate::plugins::otel_tracing::note_backend_connection_established_since(
                             setup_started,
                         );
@@ -1233,6 +1465,9 @@ enum GrpcPhase1 {
     /// `start` so the post-await error fallback can reconstruct shard
     /// keys without recomputing them.
     Miss {
+        /// Whether the start shard is an affinity or spill target, whose
+        /// failed create is backed off.
+        create_if_missing: bool,
         selected_key: String,
         base_len: usize,
         start: usize,
@@ -2054,6 +2289,22 @@ pub enum GrpcProxyError {
     /// so it trips no circuit breaker and dings no passive health.
     ResponseBufferCapacity(String),
     Internal(String),
+    /// The admitted request's authorization lifetime elapsed before the backend
+    /// response head reached the gateway: while the sender was being acquired,
+    /// at the request handoff, or while the response headers were awaited
+    /// (GHSA-xcg4-wj3x-gjj2). This is the gateway's own security decision. It
+    /// has already been latched and counted exactly once for the request, it
+    /// is never retried, and it is neutral to backend health
+    /// ([`crate::retry::ErrorClass::ClientDisconnect`]). The caller answers it
+    /// with the fixed pre-commitment authorization terminal
+    /// (`grpc-status: 16`), never with `DEADLINE_EXCEEDED`.
+    AuthorizationExpired {
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        /// Whether the request had passed the handoff gate, and so may have
+        /// reached the backend. `false` for an expiry during the sender
+        /// acquisition or at the gate: nothing was handed to the connection.
+        handed_to_backend: bool,
+    },
 }
 
 /// Failure while collecting a buffered client gRPC request before dispatch.
@@ -2116,6 +2367,24 @@ impl GrpcProxyError {
         }
     }
 
+    /// Whether the gateway itself ended this attempt before its request was
+    /// handed to the backend connection (GHSA-xcg4-wj3x-gjj2): an
+    /// authorization expiry during the sender acquisition or at the handoff
+    /// gate, or a client RPC deadline that elapsed there. Such a request never
+    /// reached the wire.
+    pub(crate) fn refused_before_handoff(&self) -> bool {
+        match self {
+            Self::AuthorizationExpired {
+                handed_to_backend, ..
+            } => !handed_to_backend,
+            Self::ClientDeadlineExceeded(message) => {
+                message == GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE
+                    || message == GRPC_DEADLINE_HANDOFF_MESSAGE
+            }
+            _ => false,
+        }
+    }
+
     /// Whether this is an RPC-deadline expiry raised after the request was
     /// sent to the backend: while waiting for its response headers, or while
     /// collecting its buffered response body. The backend held the attempt
@@ -2155,6 +2424,9 @@ impl std::fmt::Display for GrpcProxyError {
             | Self::ResponseBufferCapacity(message)
             | Self::Internal(message) => write!(f, "{}", message),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
+            Self::AuthorizationExpired { termination, .. } => {
+                f.write_str(termination.grpc_message())
+            }
         }
     }
 }
@@ -2263,6 +2535,14 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
             Self::Internal(message) => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::Internal,
+                error_class,
+                None,
+            ),
+            // Raised by the dispatch, never by a pool create; mapped for
+            // exhaustiveness only.
+            Self::AuthorizationExpired { termination, .. } => SharedPoolCreateError::new(
+                termination.grpc_message(),
+                SharedPoolCreateKind::from_error_class(error_class),
                 error_class,
                 None,
             ),
@@ -2576,6 +2856,7 @@ pub fn grpc_request_body_too_large_backend_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -4227,13 +4508,22 @@ impl GrpcDispatchSender {
     /// post-wire hyper error.
     async fn send_request(
         &mut self,
-        request: Request<GrpcBody>,
+        mut request: Request<GrpcBody>,
+        handed_to_backend: &AtomicBool,
     ) -> Result<hyper::Response<Incoming>, GrpcDispatchSendError> {
+        // Cover every body representation and retry at the common transport
+        // seam. The source observer remains independent of h2 queued DATA.
+        if let Some(lifetime) = super::frontend_affinity::retain_backend_stream() {
+            request.extensions_mut().insert(lifetime);
+        }
         match self {
-            Self::H2(sender) => sender
-                .send_request(request)
-                .await
-                .map_err(GrpcDispatchSendError::Hyper),
+            Self::H2(sender) => {
+                handed_to_backend.store(true, Ordering::Relaxed);
+                sender
+                    .send_request(request)
+                    .await
+                    .map_err(GrpcDispatchSendError::Hyper)
+            }
             Self::MeshMtls(sender) => {
                 let (parts, body) = request.into_parts();
                 let request = Request::from_parts(
@@ -4242,7 +4532,10 @@ impl GrpcDispatchSender {
                 );
                 match sender.send_request(request) {
                     Err(_) => Err(GrpcDispatchSendError::TrustWithdrawn),
-                    Ok(fut) => fut.await.map_err(GrpcDispatchSendError::Hyper),
+                    Ok(fut) => {
+                        handed_to_backend.store(true, Ordering::Relaxed);
+                        fut.await.map_err(GrpcDispatchSendError::Hyper)
+                    }
                 }
             }
         }
@@ -4561,6 +4854,7 @@ pub async fn proxy_grpc_request_from_bytes(
     stream_response: bool,
     max_response_body_size_bytes: usize,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     proxy_grpc_request_core(
         method,
@@ -4575,6 +4869,7 @@ pub async fn proxy_grpc_request_from_bytes(
         stream_response,
         max_response_body_size_bytes,
         grpc_deadline_at,
+        auth,
     )
     .await
 }
@@ -4644,16 +4939,19 @@ pub async fn proxy_grpc_request_streaming(
     // transport body plus `UploadPumpSource` abort guard own upload teardown.
     // An upload with no authorization lifetime needs no pump: hyper's HTTP/2
     // pipe bounds the write itself (issue #5588).
+    let require_end_stream = parts.version == hyper::Version::HTTP_2;
     let (body, upload_pump, body_write_timeout) =
         crate::proxy::body::UploadSource::for_streaming_grpc_upload(
             body,
             auth,
             proxy.backend_write_timeout_ms,
+            require_end_stream,
         );
     let auth_deadline = auth.map(|(deadline, family, latch)| {
         crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
     });
     let grpc_body = GrpcBody::Streaming {
+        require_end_stream,
         incoming: body,
         auth_deadline,
         bytes_seen: 0,
@@ -4683,6 +4981,7 @@ pub async fn proxy_grpc_request_streaming(
         held_frontend_upload,
         upload_pump,
         body_write_timeout,
+        auth,
     )
     .await
 }
@@ -4718,6 +5017,7 @@ pub async fn proxy_grpc_request_streaming_channel(
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
     grpc_request_messages: Option<Arc<AtomicU64>>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (grpc_messages, grpc_scanner) = match grpc_request_messages {
         Some(messages) => (
@@ -4727,6 +5027,8 @@ pub async fn proxy_grpc_request_streaming_channel(
         None => (None, None),
     };
     let grpc_body = GrpcBody::Channel {
+        auth_deadline: auth.cloned(),
+        grpc_deadline_at,
         receiver,
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
@@ -4752,6 +5054,7 @@ pub async fn proxy_grpc_request_streaming_channel(
         held_frontend_upload,
         None,
         None,
+        auth,
     )
     .await
 }
@@ -4765,6 +5068,259 @@ fn grpc_backend_write_timeout_error(write_timeout_ms: u64) -> GrpcProxyError {
         message: format!(
             "gRPC backend request body write timeout after {}ms",
             write_timeout_ms
+        ),
+    }
+}
+
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the client RPC deadline
+/// expired while the backend sender was being acquired. Pre-wire, so it is
+/// never charged to the backend.
+const GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE: &str =
+    "gRPC deadline exceeded during backend connection acquisition";
+
+/// [`GrpcProxyError::ClientDeadlineExceeded`] message: the client RPC deadline
+/// had expired when the request was about to be handed to the acquired
+/// sender, so the handoff gate refused it. Pre-wire, so it is never charged to
+/// the backend.
+const GRPC_DEADLINE_HANDOFF_MESSAGE: &str =
+    "gRPC deadline exceeded before the request was handed to the backend";
+
+/// Which pre-handoff phase of a native gRPC dispatch a composed bound ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrpcHandoffPhase {
+    /// The sender acquisition (pool wait, dial, TLS and HTTP/2 handshakes).
+    Acquisition,
+    /// The handoff gate, immediately before the request is handed over.
+    Handoff,
+}
+
+/// The bounds one native gRPC dispatch attempt is held to before its request
+/// is handed to the connection (GHSA-xcg4-wj3x-gjj2): the client RPC deadline
+/// composed with the admitted request's authorization lifetime.
+///
+/// Composed ONCE per attempt, BEFORE the sender is acquired, from absolute
+/// instants. A retry composes the same instants again, so it never re-arms
+/// either one. The winning source is decided here and never re-derived from
+/// the clock. An unauthenticated request composes the client deadline alone,
+/// exactly as before.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GrpcDispatchBounds {
+    dispatch: crate::proxy::DispatchPhaseBound,
+    handoff: crate::proxy::BackendHandoffBound,
+}
+
+impl GrpcDispatchBounds {
+    #[inline]
+    pub(crate) fn compose(
+        client_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    ) -> Self {
+        let dispatch = super::compose_dispatch_phase_auth_bound(client_deadline_at, auth);
+        Self {
+            dispatch,
+            handoff: super::compose_backend_handoff_bound(None, dispatch),
+        }
+    }
+
+    /// Hold the sender acquisition (pool wait, dial, TLS and HTTP/2
+    /// handshakes) to the composed bound, through the shared backend checkout
+    /// combinator ([`super::await_backend_handoff_bound`]).
+    ///
+    /// An already-elapsed bound refuses without starting the acquisition. A
+    /// sender that is ready on its first poll completes before any timer
+    /// exists, so the authenticated success path takes no timer-wheel lock. A
+    /// sender that completes at or after the instant on a later wake is
+    /// returned, and the handoff gate ([`Self::admit_handoff`]) then refuses
+    /// it before anything is handed over.
+    #[inline]
+    pub(crate) fn acquire<F, T, E>(
+        self,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        acquisition: F,
+    ) -> impl std::future::Future<Output = Result<F::Output, GrpcProxyError>>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let bounded = super::await_backend_handoff_bound(self.handoff, acquisition);
+        futures_util::FutureExt::map(bounded, move |bounded| {
+            let phase = GrpcHandoffPhase::Acquisition;
+            match bounded {
+                // A completed error has no following handoff gate. Recheck only
+                // this cold arm: a late connect error cannot bypass the bound.
+                Ok(Err(error)) => match self.handoff.elapsed() {
+                    Some(source) => Err(self.expired(source, auth, phase)),
+                    None => Ok(Err(error)),
+                },
+                other => other.map_err(|source| self.expired(source, auth, phase)),
+            }
+        })
+    }
+
+    /// The fail-closed handoff gate.
+    ///
+    /// hyper enqueues a request on its connection task as soon as its
+    /// `send_request` is called, before any wait on the response. Every
+    /// dispatch therefore runs this synchronously, immediately before it
+    /// builds the send future, with nothing awaited in between. A bound that
+    /// elapsed while the sender was acquired refuses the request with nothing
+    /// handed to the connection. One clock read, and none when no bound
+    /// applies.
+    #[inline]
+    pub(crate) fn admit_handoff(
+        self,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    ) -> Result<(), GrpcProxyError> {
+        match self.handoff.elapsed() {
+            None => Ok(()),
+            Some(source) => Err(self.expired(source, auth, GrpcHandoffPhase::Handoff)),
+        }
+    }
+
+    /// Settle an acquisition or handoff whose composed bound elapsed. Nothing
+    /// was handed to the connection. An authorization expiry becomes the
+    /// health-neutral [`GrpcProxyError::AuthorizationExpired`]. An earlier
+    /// client RPC deadline keeps its pre-wire `DEADLINE_EXCEEDED`, which is not
+    /// charged to the backend. Out of line because it is a cold arm.
+    #[inline(never)]
+    fn expired(
+        self,
+        source: crate::proxy::BackendHandoffBoundSource,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        phase: GrpcHandoffPhase,
+    ) -> GrpcProxyError {
+        if source == crate::proxy::BackendHandoffBoundSource::Authorization {
+            return grpc_dispatch_authorization_expired(self.dispatch, auth, false);
+        }
+        let message = match phase {
+            GrpcHandoffPhase::Acquisition => GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE,
+            GrpcHandoffPhase::Handoff => GRPC_DEADLINE_HANDOFF_MESSAGE,
+        };
+        GrpcProxyError::ClientDeadlineExceeded(message.to_string())
+    }
+}
+
+/// Whether a native gRPC dispatch attempt's request may have reached the
+/// backend, for the request's dispatch-outcome and attempt records.
+///
+/// `error_class` is the attempt's already-classified error. A refusal the
+/// gateway made before the request was handed to the connection never reached
+/// it, whatever its class: a health-neutral class alone would otherwise record
+/// a refused request as an ambiguous on-the-wire failure.
+pub(crate) fn grpc_dispatch_reached_wire(
+    result: &Result<GrpcResponseKind, GrpcProxyError>,
+    error_class: Option<crate::retry::ErrorClass>,
+) -> bool {
+    match result {
+        Err(error) if error.refused_before_handoff() => false,
+        _ => error_class.is_none_or(crate::retry::request_reached_wire),
+    }
+}
+
+/// The authorization bound for a native gRPC response-header wait
+/// (GHSA-xcg4-wj3x-gjj2).
+///
+/// Bounded only for an authenticated request whose authorization lifetime
+/// expires no later than the wait's own protocol bound (`phase_at`: the client
+/// RPC deadline or the operator read bound). Composed from absolute instants,
+/// so a wait that is not observed until after both instants have passed still
+/// keeps the attribution of the bound that was actually earlier. Otherwise
+/// unbounded, which leaves the wait to its existing protocol shapes.
+#[inline]
+pub(crate) fn grpc_header_wait_authorization_bound(
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    phase_at: Option<tokio::time::Instant>,
+) -> crate::proxy::DispatchPhaseBound {
+    let bound = super::compose_dispatch_phase_auth_bound(phase_at, auth);
+    if bound.authorization_wins {
+        return bound;
+    }
+    crate::proxy::DispatchPhaseBound {
+        at: None,
+        authorization_wins: false,
+    }
+}
+
+/// Hold a native gRPC response-header wait to its authorization bound
+/// (GHSA-xcg4-wj3x-gjj2). An expiry becomes the health-neutral
+/// [`GrpcProxyError::AuthorizationExpired`], and the wait (and the request it
+/// was carrying) is dropped. The adapter's flag distinguishes a wrapper that
+/// has never polled the send from a request actually enqueued to the backend.
+#[inline]
+pub(crate) fn grpc_header_wait_under_authorization<F, T>(
+    bound: crate::proxy::DispatchPhaseBound,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    handed_to_backend: &AtomicBool,
+    wait: F,
+) -> impl std::future::Future<Output = Result<T, GrpcProxyError>>
+where
+    F: std::future::Future<Output = Result<T, GrpcProxyError>>,
+{
+    // The bound polled first on every wake: no handoff gate follows this
+    // wait, so an exact-deadline tie must go to the bound.
+    let bounded = crate::plugins::await_deadline_first(bound.at, wait);
+    futures_util::FutureExt::map(bounded, move |bounded| {
+        let expired = || {
+            grpc_dispatch_authorization_expired(
+                bound,
+                auth,
+                handed_to_backend.load(Ordering::Relaxed),
+            )
+        };
+        match bounded {
+            Ok(Err(_)) if bound.at.is_some_and(|at| tokio::time::Instant::now() >= at) => {
+                Err(expired())
+            }
+            other => other.unwrap_or_else(|()| Err(expired())),
+        }
+    })
+}
+
+/// The streaming dispatch's own response-header bound as one absolute instant:
+/// the client RPC deadline, or else the operator fallback timeout armed from
+/// now, matching the wait's protocol shapes. Only an authenticated request
+/// needs it, so an unauthenticated one pays no clock read.
+fn streaming_header_wait_protocol_at(
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    effective_timeout_ms: Option<u64>,
+) -> Option<tokio::time::Instant> {
+    auth?;
+    if grpc_deadline_at.is_some() {
+        return grpc_deadline_at;
+    }
+    let timeout_ms = effective_timeout_ms?;
+    tokio::time::Instant::now().checked_add(Duration::from_millis(timeout_ms))
+}
+
+/// Attribute a native gRPC dispatch phase whose composed bound was won by the
+/// admitted request's authorization lifetime (GHSA-xcg4-wj3x-gjj2).
+///
+/// The termination is latched and counted exactly once for the request
+/// through its shared latch. First writer wins, so an upload pump that fired
+/// first keeps its classification. Out of line because it is a cold arm.
+#[inline(never)]
+fn grpc_dispatch_authorization_expired(
+    bound: crate::proxy::DispatchPhaseBound,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    handed_to_backend: bool,
+) -> GrpcProxyError {
+    // An authorization-won bound fires only once its plan has elapsed, so the
+    // fallback is not reached in practice. If it were, it fails closed on the
+    // plan's own class, and still counts the expiry exactly once.
+    let termination =
+        crate::proxy::dispatch_phase_authorization_expiry(bound, auth).or_else(|| {
+            let (plan, family, latch) = auth?;
+            latch.record_once(plan.termination, *family);
+            Some(plan.termination)
+        });
+    match termination {
+        Some(termination) => GrpcProxyError::AuthorizationExpired {
+            termination,
+            handed_to_backend,
+        },
+        // Without a plan, authorization cannot have won the composition.
+        None => GrpcProxyError::ClientDeadlineExceeded(
+            GRPC_DEADLINE_CONNECTION_ACQUISITION_MESSAGE.to_string(),
         ),
     }
 }
@@ -4793,6 +5349,7 @@ async fn proxy_grpc_streaming_dispatch(
     held_frontend_upload: &mut Option<GrpcBody>,
     mut upload_pump: Option<crate::proxy::upload_pump::UploadPumpJoin>,
     body_write_timeout: Option<hyper::ext::Http2BodyWriteTimeout>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     // Build headers: merge plugin/proxy headers on top of the inbound
     // request's headers, then run the gRPC-specific strip on the union.
@@ -4867,32 +5424,25 @@ async fn proxy_grpc_streaming_dispatch(
         None
     };
 
+    // The admitted request's authorization lifetime, composed ONCE and BEFORE
+    // sender acquisition with the client RPC deadline (GHSA-xcg4-wj3x-gjj2).
+    let dispatch_bounds = GrpcDispatchBounds::compose(grpc_deadline_at, auth);
+
     // Acquire the backend sender BEFORE moving the frontend upload into the
     // outbound request. A connect/handshake failure (accept-then-RST) must
     // return the unread Incoming/Channel body so the caller owns termination:
     // H2 retains it with the response as defense-in-depth, while H3 must defer
     // channel drop/STOP_SENDING until after Trailers-Only HEADERS+FIN (#2057).
-    let mut sender = if let Some(deadline) = grpc_deadline_at {
-        match tokio::time::timeout_at(deadline, transport.get_sender(proxy)).await {
-            Err(_) => {
-                *held_frontend_upload = Some(grpc_body);
-                return Err(GrpcProxyError::ClientDeadlineExceeded(
-                    "gRPC deadline exceeded during backend connection acquisition".to_string(),
-                ));
-            }
-            Ok(Err(e)) => {
-                *held_frontend_upload = Some(grpc_body);
-                return Err(e);
-            }
-            Ok(Ok(sender)) => sender,
-        }
-    } else {
-        match transport.get_sender(proxy).await {
-            Ok(sender) => sender,
-            Err(e) => {
-                *held_frontend_upload = Some(grpc_body);
-                return Err(e);
-            }
+    // An expiry of the composed bound is pre-wire too, so it returns the body
+    // the same way.
+    let acquired = dispatch_bounds
+        .acquire(auth, transport.get_sender(proxy))
+        .await;
+    let mut sender = match acquired {
+        Ok(Ok(sender)) => sender,
+        Ok(Err(e)) | Err(e) => {
+            *held_frontend_upload = Some(grpc_body);
+            return Err(e);
         }
     };
 
@@ -4922,8 +5472,23 @@ async fn proxy_grpc_streaming_dispatch(
         // also bounds the post-EOS drain of the local send queue (issue #4411).
         pump.bind_backend_socket(sender.backend_socket());
     }
-    let send_fut = sender.send_request(backend_req);
-    let send_wait = async {
+    // The response-header wait is held to the authorization lifetime as well
+    // (GHSA-xcg4-wj3x-gjj2) when the credential expires before the wait's own
+    // client or operator bound.
+    let header_phase_at =
+        streaming_header_wait_protocol_at(auth, grpc_deadline_at, effective_timeout_ms);
+    let header_auth_bound = grpc_header_wait_authorization_bound(auth, header_phase_at);
+    let handed_to_backend = AtomicBool::new(false);
+    let protocol_send_wait = async {
+        // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2). hyper enqueues
+        // the request on its connection task as soon as `send_request` is
+        // called, so the gate runs first and the send future is built only
+        // after it, with nothing awaited in between, whether or not the
+        // dispatch adapter defers the call to its first poll. A client RPC
+        // deadline or authorization lifetime that elapsed while the sender was
+        // acquired is therefore refused here, with nothing handed over.
+        dispatch_bounds.admit_handoff(auth)?;
+        let send_fut = sender.send_request(backend_req, &handed_to_backend);
         let send_result = if let Some(deadline) = grpc_deadline_at {
             tokio::time::timeout_at(deadline, send_fut)
                 .await
@@ -4988,6 +5553,12 @@ async fn proxy_grpc_streaming_dispatch(
             })
         })
     };
+    let send_wait = grpc_header_wait_under_authorization(
+        header_auth_bound,
+        auth,
+        &handed_to_backend,
+        protocol_send_wait,
+    );
     let response =
         match crate::proxy::await_upload_write_watermark_first(send_wait, upload_pump.as_mut())
             .await
@@ -5200,6 +5771,13 @@ pub(crate) fn buffered_grpc_request_body_with_write_watermark(
 /// not arrive as HTTP/2 trailers — today, a gRPC-Web body trailer frame. It is
 /// sent as a real TRAILERS frame after the buffered DATA, and it is passed to
 /// every attempt because a retry replays the same complete request.
+///
+/// `auth` is the admitted request's authorization-lifetime plan
+/// (GHSA-xcg4-wj3x-gjj2). It bounds the sender acquisition, the request
+/// handoff, and the response-header wait, and every attempt (a retry included)
+/// is held to the same absolute instant. `None` for an unauthenticated request
+/// and for a caller that carries no plan, which leaves those phases exactly as
+/// they were.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_grpc_request_core(
     method: hyper::Method,
@@ -5214,6 +5792,7 @@ pub(crate) async fn proxy_grpc_request_core(
     stream_response: bool,
     max_response_body_size_bytes: usize,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     // Build headers: merge plugin/proxy headers on top of the inbound
     // request's headers, then run the gRPC-specific strip on the union.
@@ -5295,21 +5874,20 @@ pub(crate) async fn proxy_grpc_request_core(
         streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0)
     };
 
-    // Pool acquisition is bounded by the end-to-end client deadline plus the
-    // pool's own backend_connect_timeout_ms. backend_read_timeout_ms starts only
-    // after a sender exists; applying it here would turn a read-stall policy
-    // into an unintended shorter connect timeout.
-    let mut sender = if let Some(client_deadline) = client_grpc_deadline_at {
-        tokio::time::timeout_at(client_deadline, transport.get_sender(proxy))
-            .await
-            .map_err(|_| {
-                GrpcProxyError::ClientDeadlineExceeded(
-                    "gRPC deadline exceeded during backend connection acquisition".to_string(),
-                )
-            })??
-    } else {
-        transport.get_sender(proxy).await?
-    };
+    // The admitted request's authorization lifetime, composed ONCE and BEFORE
+    // sender acquisition with the client deadline (GHSA-xcg4-wj3x-gjj2). The
+    // acquisition and the handoff gate are both held to these absolute
+    // instants, so a retry never re-arms them.
+    let dispatch_bounds = GrpcDispatchBounds::compose(client_grpc_deadline_at, auth);
+
+    // Pool acquisition is bounded by the end-to-end client deadline, the
+    // admitted request's authorization lifetime, and the pool's own
+    // backend_connect_timeout_ms. backend_read_timeout_ms starts only after a
+    // sender exists; applying it here would turn a read-stall policy into an
+    // unintended shorter connect timeout.
+    let mut sender = dispatch_bounds
+        .acquire(auth, transport.get_sender(proxy))
+        .await??;
 
     // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
     // acquisition. Computing it before the dial would forward a value that
@@ -5365,7 +5943,6 @@ pub(crate) async fn proxy_grpc_request_core(
         // also bounds the post-EOS drain of the local send queue (issue #4411).
         pump.bind_backend_socket(sender.backend_socket());
     }
-    let send_fut = sender.send_request(backend_req);
     let map_send_err = |e: GrpcDispatchSendError| {
         map_grpc_dispatch_send_error(e, |e| {
             // `hyper::Error::is_canceled()` is a wire-boundary proof, not a
@@ -5417,13 +5994,29 @@ pub(crate) async fn proxy_grpc_request_core(
     // preserving the prior per-read stall-guard semantics.
     let shared_response_deadline =
         response_deadline_at.map(|deadline| (response_deadline_ms.unwrap_or(1), deadline));
+    // The response-header wait is held to the authorization lifetime as well
+    // (GHSA-xcg4-wj3x-gjj2) when the credential expires before the wait's own
+    // bound: the shared response deadline, or else the operator per-phase read
+    // timeout, which arms now.
+    let header_phase_at = response_deadline_at.or(backend_read_deadline_at);
+    let header_auth_bound = grpc_header_wait_authorization_bound(auth, header_phase_at);
     // Every header-wait shape below is raced against the pump's write
     // watermark, not just one of them: the pump terminates the transport BODY
     // on expiry, and hyper's HTTP/2 pipe is parked in `poll_capacity` — polling
     // nothing — exactly when a backend accepts and stops reading. Without the
     // race, a configured `backend_write_timeout_ms` would keep surfacing as the
     // later client deadline or `backend_read_timeout_ms` (issue #4055).
-    let header_wait = async {
+    let handed_to_backend = AtomicBool::new(false);
+    let protocol_header_wait = async {
+        // Fail closed BEFORE the handoff (GHSA-xcg4-wj3x-gjj2). hyper enqueues
+        // the request on its connection task as soon as `send_request` is
+        // called, so the gate runs first and the send future is built only
+        // after it, with nothing awaited in between, whether or not the
+        // dispatch adapter defers the call to its first poll. A client
+        // deadline or authorization lifetime that elapsed while the sender was
+        // acquired is therefore refused here, with nothing handed over.
+        dispatch_bounds.admit_handoff(auth)?;
+        let send_fut = sender.send_request(backend_req, &handed_to_backend);
         if let Some((timeout_ms, deadline)) = shared_response_deadline {
             tokio::time::timeout_at(deadline, send_fut)
                 .await
@@ -5465,6 +6058,12 @@ pub(crate) async fn proxy_grpc_request_core(
             send_fut.await.map_err(map_send_err)
         }
     };
+    let header_wait = grpc_header_wait_under_authorization(
+        header_auth_bound,
+        auth,
+        &handed_to_backend,
+        protocol_header_wait,
+    );
     let response =
         match crate::proxy::await_upload_write_watermark_first(header_wait, upload_pump.as_mut())
             .await
@@ -5622,49 +6221,71 @@ pub(crate) async fn proxy_grpc_request_core(
         Ok(())
     };
 
-    if let Some((timeout_ms, deadline)) = shared_response_deadline {
-        // Same effective deadline as the header wait above — when a client
-        // deadline exists the header wait and body collection share one budget,
-        // not two.
-        tokio::time::timeout_at(deadline, body_collection)
-            .await
-            .map_err(|_| {
-                if response_deadline_is_client {
-                    warn_sampled!("gRPC client deadline exceeded while collecting response body");
-                    GrpcProxyError::ClientDeadlineExceeded(
-                        GRPC_DEADLINE_RESPONSE_BODY_MESSAGE.to_string(),
-                    )
-                } else {
+    // Collection has its own operator phase budget, but inherits the same
+    // receipt-anchored authorization lifetime as acquisition and headers.
+    let body_phase_at = response_deadline_at.or_else(|| {
+        per_phase_read_ms.and_then(|millis| {
+            tokio::time::Instant::now().checked_add(Duration::from_millis(millis))
+        })
+    });
+    let body_auth_bound = grpc_header_wait_authorization_bound(auth, body_phase_at);
+    let protocol_body_wait = async {
+        if let Some((timeout_ms, deadline)) = shared_response_deadline {
+            // Same effective deadline as the header wait above — when a client
+            // deadline exists the header wait and body collection share one budget,
+            // not two.
+            tokio::time::timeout_at(deadline, body_collection)
+                .await
+                .map_err(|_| {
+                    if response_deadline_is_client {
+                        warn_sampled!(
+                            "gRPC client deadline exceeded while collecting response body"
+                        );
+                        GrpcProxyError::ClientDeadlineExceeded(
+                            GRPC_DEADLINE_RESPONSE_BODY_MESSAGE.to_string(),
+                        )
+                    } else {
+                        warn_sampled!(
+                            "gRPC: read timeout ({}ms, end-to-end) while collecting response body",
+                            timeout_ms
+                        );
+                        GrpcProxyError::BackendTimeout {
+                            kind: GrpcTimeoutKind::Read,
+                            message: format!(
+                                "Body read timeout after {}ms (end-to-end)",
+                                timeout_ms
+                            ),
+                        }
+                    }
+                })?
+        } else if let Some(timeout_ms) = per_phase_read_ms {
+            // Operator fallback: a FRESH per-phase budget for body collection,
+            // independent of the header wait — preserves the prior per-read stall
+            // guard so a slow-but-progressing large buffered response is not newly
+            // timed out by a shared end-to-end budget.
+            tokio::time::timeout(Duration::from_millis(timeout_ms), body_collection)
+                .await
+                .map_err(|_| {
                     warn_sampled!(
-                        "gRPC: read timeout ({}ms, end-to-end) while collecting response body",
+                        "gRPC: read timeout ({}ms) while collecting response body",
                         timeout_ms
                     );
                     GrpcProxyError::BackendTimeout {
                         kind: GrpcTimeoutKind::Read,
-                        message: format!("Body read timeout after {}ms (end-to-end)", timeout_ms),
+                        message: format!("Body read timeout after {}ms", timeout_ms),
                     }
-                }
-            })??;
-    } else if let Some(timeout_ms) = per_phase_read_ms {
-        // Operator fallback: a FRESH per-phase budget for body collection,
-        // independent of the header wait — preserves the prior per-read stall
-        // guard so a slow-but-progressing large buffered response is not newly
-        // timed out by a shared end-to-end budget.
-        tokio::time::timeout(Duration::from_millis(timeout_ms), body_collection)
-            .await
-            .map_err(|_| {
-                warn_sampled!(
-                    "gRPC: read timeout ({}ms) while collecting response body",
-                    timeout_ms
-                );
-                GrpcProxyError::BackendTimeout {
-                    kind: GrpcTimeoutKind::Read,
-                    message: format!("Body read timeout after {}ms", timeout_ms),
-                }
-            })??;
-    } else {
-        body_collection.await?;
-    }
+                })?
+        } else {
+            body_collection.await
+        }
+    };
+    grpc_header_wait_under_authorization(
+        body_auth_bound,
+        auth,
+        &handed_to_backend,
+        protocol_body_wait,
+    )
+    .await?;
 
     // Hand the charge to the retained allocation. From here the permit is owned
     // by the `Bytes` (and by every cheap clone of it, exactly once), so it is
@@ -6564,9 +7185,19 @@ mod tests {
             !body.contains("grpc_deadline_at.or_else(||"),
             "must not re-parse and re-anchor grpc-timeout at dispatch time"
         );
+        // Pool acquisition is bounded by the client deadline composed with the
+        // admitted request's authorization lifetime (GHSA-xcg4-wj3x-gjj2),
+        // composed BEFORE the acquisition. The operator read timeout is not
+        // part of it.
+        let composed = body
+            .find("GrpcDispatchBounds::compose(client_grpc_deadline_at, auth)")
+            .expect("the acquisition bound must compose the client deadline and authorization");
+        let bounded_acquisition = body
+            .find(".acquire(auth, transport.get_sender(proxy))")
+            .expect("pool acquisition must be awaited under the composed bound");
         assert!(
-            body.contains("timeout_at(client_deadline, transport.get_sender(proxy))"),
-            "pool acquisition must be bounded by only the client deadline"
+            composed < bounded_acquisition,
+            "the authorization lifetime must be composed before the sender is acquired"
         );
         let sender_acquisition = body
             .find("let mut sender =")
@@ -6589,10 +7220,10 @@ mod tests {
         );
         let timeout_at = body.matches("tokio::time::timeout_at(").count();
         assert_eq!(
-            timeout_at, 3,
-            "pool acquisition must consume the client deadline while header wait \
-             and body collection consume the same response deadline; found \
-             {timeout_at} timeout_at calls."
+            timeout_at, 2,
+            "header wait and body collection must consume the same response \
+             deadline (pool acquisition uses the composed expiry-first bound); \
+             found {timeout_at} timeout_at calls."
         );
 
         // Operator backend_read_timeout Instant add must stay overflow-guarded.

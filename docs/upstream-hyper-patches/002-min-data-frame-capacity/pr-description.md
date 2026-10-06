@@ -1,22 +1,34 @@
-Closes #4211.
+> Historical final description of Hyper #4212, which closed unmerged on
+> 2026-10-04 at 08:45:54 UTC. The validation below describes the upstream
+> proposal's historical checks, not verification of Ferrum's current ordered
+> vendor stack. See [the current status and retirement plan](README.md).
 
-`PipeToSendStream` handed a polled chunk to h2 as soon as the stream held any capacity. That was usually just the 1-byte claim it reserves. h2 cuts DATA frames from whatever capacity a stream holds, so on a connection whose window was nearly used up, a 10 KB chunk went out as a 1-byte frame followed by more small frames. Since h2 0.4.16, servers charge non-final DATA frames under 256 bytes against a per-connection budget and send `GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames")` when it runs out, which fails every stream on the connection.
+The original version of this PR waited for at least 1 KiB of HTTP/2 send
+capacity before handing a body chunk to h2. Review correctly identified that
+this can hang when a peer advertises a smaller stream window.
 
-### Change
+I reproduced that failure through Ferrum Edge 0.9.10 with a standards-compliant
+h2 backend using a 512-byte stream window: request headers reached the backend,
+but the backend received zero body bytes before timeout. A fixed positive
+threshold cannot distinguish a transient connection-window sliver from all of
+the capacity a peer has made available, so Hyper must allow body progress
+whenever capacity is nonzero.
 
-- Reserve `min(len, MIN_DATA_FRAME_CAPACITY)` (1 KiB) for a polled chunk instead of 1 byte, and wait until that much is assigned before calling `send_data`.
-- The claim stays small, so the reasoning from #4003 still holds: nothing is reserved speculatively, and no stream pins more than 1 KiB while it waits. h2 still raises the request to the buffered length inside `send_data`.
-- 1 KiB is far below any stream window a real peer advertises, so this cannot hold a chunk back indefinitely.
-- Chunks shorter than 1 KiB still wait only for their own length, so the one-byte case in `h2_idle_stream_does_not_pin_connection_window` is unchanged.
+This revision removes the 1 KiB gate and adds two deterministic regression
+tests:
 
-### Test
+- a 2 KiB request body makes progress through a peer's 512-byte stream window;
+- a request uses the final available byte of connection capacity without
+  waiting for a `WINDOW_UPDATE`.
 
-`h2_chunk_waits_for_useful_capacity_instead_of_sliver_frames`:
+The receiver-side protection against excessive small DATA frames belongs in
+h2. [hyperium/h2#965](https://github.com/hyperium/h2/pull/965) updates h2's
+automatic DATA-frame budget whenever adaptive flow control changes the target
+connection window, preserving explicit budgets and outstanding charges.
 
-1. Stream A leaves exactly one byte of connection window.
-2. Stream B polls a 10 KB chunk against that byte.
-3. The server then releases stream A's capacity and records the size of stream B's first DATA frame.
+Validation:
 
-Without the fix the first frame is 1 byte and the test fails deterministically. With it the first frame is at least 1024 bytes. `cargo test --features full` passes.
+- `cargo test --features full --test client` (70 passed)
+- `cargo fmt --all -- --check`
 
-Found while running a reverse proxy (Ferrum Edge) against a hyper backend with `adaptive_window(true)`, where the pooled connection was being GOAWAY'd every few seconds.
+Related: #4211

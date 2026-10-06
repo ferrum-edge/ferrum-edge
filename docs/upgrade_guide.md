@@ -26,7 +26,231 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased
+## Upgrading to 0.9.12 (candidate)
+
+Prepared on **2026-10-05 UTC** from merged #6012 main
+`a9c758c6352765d13a7f61c4d7e3571c82a2d307`. Final candidate/main-push
+qualification and publication are pending; keep the verified published v0.9.11
+pin until actual release, canonical contracts and consumer qualification complete.
+Read the [candidate record](releases/v0.9.12.md) for source evidence and the
+future cut procedure. All previously released breaking identifiers and guidance
+below remain applicable. CP/DP must run the same build. A changed core baseline
+still requires a fresh database and the intact old database for rollback; this
+candidate provides no online schema migration or binary-only rollback promise.
+
+**Dependency-fenced partial deployment mutations (#6010 / #6012).** Capture
+`GET /deployment-snapshot` with an admin-role JWT and the intended namespace;
+keep the complete credential-bearing evidence and original quoted
+`namespace_etag`/HTTP `ETag` encrypted. Compare the full original proxy/spec,
+generated plugins, associations and external-reference evidence before sending
+that original `deployment-v1` token in exactly one `If-Match` to:
+
+```text
+DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false
+PUT /api-specs/{id}?conditional=true
+```
+
+Backup namespace tokens and row ETags cannot authorize these operations.
+The discriminator and removal cleanup value must each occur exactly once;
+only one optional `apply=sync` is allowed. Missing/duplicate/invalid authority,
+wrong-profile/weak/wildcard/list tokens, unknown modes and `apply=async` refuse.
+Ordinary profiles outside conditional mode retain their supported behavior.
+Target or unrelated namespace changes invalidate the original token (`412`).
+
+SQLite uses a writer lock; PostgreSQL refreshes READ COMMITTED evidence after
+namespace writer fences; MySQL requires REPEATABLE READ after those fences;
+MongoDB requires replica-set snapshot/majority transactions with a lease-document
+write pin (standalone is `501`). All four compare original raw evidence inside
+entry/commit fences. Missing/unavailable/undecodable state fails closed without
+cached authority. Unsupported SQL types, unsafe selected-row reinsertion and
+MongoDB top-level fields rejected by the typed schema refuse rather than
+silently dropping state. Supported unknown columns/association metadata and
+credential/config maps survive; unknown collections are not deployable resources.
+Partial writes preserve unrelated timestamps, historical credentials, trust,
+retained upstreams and surviving owners; unchanged proxy fields/row ETags survive
+plugin-only replacement.
+
+Require the expected profile/id plus `durable: "committed"`, `live: "applied"`
+and `recovery_cleanup_authorized: true` before automatic journal removal.
+This `200` acknowledgement includes applicable covering local apply, final
+security audit admission and owner-qualified lease release. Its cursor proves
+this process only. CP/unserved-namespace `200/committed/not_applicable/false`
+cannot authorize cleanup. A confirmed commit with unconfirmed apply/audit/lease
+is `503/committed/unconfirmed/false`; database/commit/transport unknown is
+`503/unknown/unconfirmed/false` when a response exists. Initial failures may be
+`not_started`; stale/typed graph refusals are `not_committed`. Missing fields,
+cancellation or no response grant no authority. Keep the original encrypted
+snapshot/token/journal; never retry recovery with a fresh token, infer rollback
+from an untyped error, or restore an entire namespace minus one graph.
+
+**Precise dependency refusal (#6010 / #6012).** Proven external references to
+spec-owned upstreams refuse resource-changing conditional PUT/DELETE with
+`409/not_committed/unconfirmed/recovery_cleanup_authorized=false`. Metadata-only
+replacement retains its shortcut before the guard. Ordinary invalid external
+owner admission remains `400` without a durable proxy row or covering change.
+Driver, commit, auxiliary lease-release and untyped failures remain uncertain;
+no conflict identifiers or driver details are returned.
+
+**SQLx Any typed NULL preservation (#6010 / #6012).** REAL NULL now binds via
+`Option<f32>` and DOUBLE NULL via `Option<f64>`. Native PostgreSQL type witnesses
+use uncast parameters and check explicit NULLs. The extended fixture finishes
+all ALTERs and reconnects once to its original durable database before authority
+capture. This does not identify the earlier PostgreSQL initial-import 500's
+cause or establish online DDL safety. Retire the float correction only after a
+compatible upstream release passes the same hosted regression; keep SQLx's vendor
+copy while the separate TLS patch needs it, and retain behavioral tests after
+both patches retire. No dependency graph/schema changes accompany preparation.
+See [consumer adoption and limitations](deployment_mutations.md) and the
+[patch retirement record](upstream-sqlx-patches/002-typed-float-null-bindings/README.md).
+No downstream adoption, packaged acceptance or advisory closure is asserted.
+
+## Upgrading to 0.9.11
+
+0.9.11 was published at **2026-10-04T21:26:11Z** at
+`c764084b3b51c3f7ffde268c039688d35e49c553`. All 14 pre-tag main-push
+workflows and all 20 release jobs succeeded; assets/checksums and all three
+image families were verified. See the [verified release](releases/v0.9.11.md)
+for exact identities and GHCR/revision-label limits. The guidance below includes
+merged dependency fix [#6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004)
+and qualified gRPC fixtures [#6007](https://github.com/ferrum-edge/ferrum-edge/pull/6007).
+The historical source evidence is distinct from final release qualification.
+
+**TLS source selectors must match their field (issue #5959; breaking).**
+Correct references whose explicit fragment, Kubernetes data key, `?kind=` hint,
+or managed/ACME collection contradicts the material the field requires. CA
+fields require CA selectors, certificate fields require certificate selectors,
+and key fields require key selectors. A leaf certificate and its chain cannot
+be selected as a CA bundle through `managed://certificates/<id>#cert`.
+Unknown managed collections, unsupported ACME collections, and unknown kind
+hints are also refused. Check proxy/upstream TLS, Gateway frontend TLS,
+DestinationRule TLS, and environment TLS settings before rollout; admission
+and material loading both enforce this rule. Fragmentless
+`managed://ca-bundles/<id>` now works in CA expiry checks (issue #5957).
+Fragmentless Kubernetes and provider CA references check CA material rather
+than the leaf certificate. See [TLS source schemes](frontend_tls.md).
+
+**OIDC session secrets require unique random material (issue #5987).**
+Enabled `oidc_relying_party` configurations now reject published example keys,
+obvious placeholders, and unresolved templates in both
+`session.encryption_secret` and `session.encryption_secret_previous`, including
+Base64 spellings of rejected key material. Replace those values with unique
+random secrets of at least 32 bytes before config load or admin mutation.
+Disabled configurations may still be saved before a key is supplied. Rotation
+through the previous-secret field remains available, but it must also contain
+acceptable material. See [OIDC relying party](plugins.md#oidc_relying_party).
+
+**Backend authorization lifetimes cover dispatch waits (issues #5990 / #5995).**
+Acquisition, final handoff, response-header waits, and retries retain the
+admitted absolute authorization deadline across direct HTTP/1.1, HTTP/2,
+native gRPC, mesh transports, and HTTP/3. Authorization expiry is not retried
+and does not penalize backend health. Native gRPC preserves HTTP 200 with
+`grpc-status: 16` before response commitment; an earlier client or operator
+bound retains its existing attribution. Review clients that depended on a
+backend wait outliving authorization. See
+[authorization lifetime during backend dispatch](request_lifetime_dispatch.md).
+
+**HTTP/2 write stalls and shard affinity (issue #5588; PRs #5991 / #6001).**
+Direct HTTP/2 uploads with request-size limits disabled now honor a nonzero
+`backend_write_timeout_ms`. Before response headers the timeout produces the
+existing `504` / `backend_timeout` result; after headers it resets the stream.
+Native gRPC write stalls retain their deadline terminal before headers and
+reset after headers. A ready chunk can progress through any positive legal
+backend window. HTTP/2 frontend gRPC calls use one backend shard while up to
+32 calls are open, then spill to siblings; unfinished uploads remain counted
+through transport completion. Setting a route's write timeout to `0` disables
+that bound for every upload path on the route, so assess the whole route.
+
+**Direct HTTP/1.1 pool and memory sizing (issue #5961).**
+`FERRUM_POOL_HTTP1_DIRECT` now defaults to `true`; setting it to `false` selects
+the reqwest path. Retry attempts and requests with pending body-plugin work
+still use reqwest. Reassess memory sizing for jemalloc's new 128 KiB thread
+cache ceiling; `_RJEM_MALLOC_CONF=tcache_max:32768` restores its former default.
+Windows is unaffected by that allocator change. CP and DP must run the same
+build; follow the [upgrade order](#upgrade-order) and the build-out database
+rebuild procedure rather than treating this patch version as mixed-build or
+in-place schema compatibility.
+
+**gRPC qualification fixtures (#6006 / #6007).** No configuration or runtime
+change is required. Buffered and streamed acquisition-expiry coverage owns a
+cold pool without a shorter startup probe, observes cancellation before any
+RPC frames, requires exactly one expiry, and proves healthy recovery on the
+same frontend through a threshold-one breaker. OTEL attempt-span and direct
+sequential-reuse coverage retain one frontend H2 connection and independently
+require one backend accept/handshake, complete bodies, and success trailers.
+Strict authorization, telemetry, physical reuse, and bounded cleanup remain
+required. Final fixture head `9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2`
+received complete root review and fresh independent whole/focused review2
+with no findings after the accepted completion finding was fixed. All 12
+hosted workflows succeeded; all 80 checks completed (49 successful and 31
+nonapplicable PR skips), all nine protected Actions contexts passed, and there
+were zero review threads. PR #6007 merged and issue #6006 closed on
+2026-10-04; the published 0.9.11 release includes the fix. The failed
+historical `5bab92a367c69ececaaa81e535fca45ba4436f38` release run and
+`66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017` main run remain failure evidence,
+not candidates for blind reruns. The final #6005 reviewed head, actual
+merge/push gates and published distribution subsequently qualified separately.
+See [the failure analysis](grpc_qualification_6006.md) and
+[fixture source qualification](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
+
+**Dependency security chain (#5912 / #6004).** The integrated Hyper 1.10.0
+and reqwest 0.13.4 vendor refresh retains every local patch and preserves the
+selected ordinary/FIPS crypto profiles. GCP uses the compatible GAX-internal
+0.7.14 / GAX 1.11.0 / OpenTelemetry 0.32 generation with SDK 0.32.1; root
+locks Smithy JSON 0.62.7, root/mesh lock xxhash 0.8.16, and fuzz retains xxhash
+0.8.18. The root, mesh and fuzz lockfiles came from the verified hosted Cargo
+producer; 0.9.11 preparation
+changed only their own `ferrum-edge` package version to 0.9.11. Dependency
+versions, checksums, graph inputs and producer provenance are unchanged from
+main's security fix. Hosted source qualification passed at the reviewed
+#6004 head and issue #5912 is closed; the subsequent 0.9.11 release
+qualification and distribution verification completed separately. Cloud secrets
+remain unsupported in enforcing FIPS mode. See
+[the security upgrade record](dependency-security-upgrade-5912.md) for exact
+producer provenance and patch-port risks, and the
+[completed source integration evidence](releases/v0.9.11.md#dependency-source-integration-evidence)
+for the merge and exact-head hosted proof. Those historical results do not
+qualify future release candidates or close product advisories.
+
+**Conditional admin snapshots and restore (#5992).** Use an admin-role JWT
+for `GET /consumers/{id}/verification` when checking the complete stored
+credential state. Ordinary consumer reads retain their redacted projection.
+For namespace replacement, read an unfiltered `GET /backup?conditional=true`
+and send its `ETag` (also `conditional.namespace_etag`) in `If-Match` to
+`POST /restore?confirm=true`. The per-row maps in `conditional.row_etags` are
+for individual resource `PUT`/`DELETE` operations. These are opaque keyed
+strong state tags; do not derive them from a redacted response or use a row
+tag as a namespace tag. Replicas must share `FERRUM_ADMIN_JWT_SECRET`, and
+rotating it requires fresh reads.
+
+A conditional restore returns `412` without applying the replacement when
+the namespace changed, including delete/recreate or changes later reverted.
+Re-read and re-plan against the new state before retrying. Weak tags cannot
+match; empty/malformed headers and `*` are `400` for restore. The conditional
+snapshot/restore path requires PostgreSQL, MySQL, SQLite, or replica-set
+MongoDB: standalone MongoDB is `501`, and unavailable primary state is `503`.
+Lease loss fails closed; cleanup cannot reacquire an expired identity to
+authorize another write. A long replacement uses one transaction and remains
+subject to store transaction limits. After an ambiguous MongoDB commit
+acknowledgement, read authoritative state before deciding whether to retry.
+
+Conditional exports preserve stored credential fields exactly. Repair invalid
+historical entries before restoring them through current admission rules.
+The `conditional` body member is metadata only; it does not activate a
+precondition. Omitting `If-Match` retains unconditional restore. See the
+[backup and restore contract](admin_backup_restore.md#conditional-snapshots-and-restore).
+
+**Backend egress metadata (#5994).** Control planes can read
+`GET /backend-egress-policy` with a namespace-authorized viewer, operator, or
+admin JWT to inspect the immutable loaded policy inherited by this process.
+Metrics credentials cannot read it. Require the expected `schema_version`,
+`ip_classification`, and `enforcement_scope`; CP `admission-only` metadata
+does not prove a DP's policy. `public_only_guaranteed` is false whenever an
+allow-CIDR override exists, even if that override appears harmless. The
+production default remains `both`; adopting public-only backends still
+requires explicitly configuring each serving process and restarting it.
+This discovery endpoint does not expand the existing enforcement coverage.
+See [backend egress policy](admin_api.md#backend-egress-policy) and the
+[published baseline and next contracts handoff](admin_contracts_handoff_5992_5994.md).
 
 **Dependencies**
 

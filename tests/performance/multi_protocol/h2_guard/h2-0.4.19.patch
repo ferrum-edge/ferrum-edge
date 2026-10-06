@@ -22,7 +22,15 @@
  
 --- a/src/proto/streams/counts.rs
 +++ b/src/proto/streams/counts.rs
-@@ -33,6 +33,8 @@
+@@ -31,7 +31,6 @@
+         self.max = max;
+     }
+ 
+-    #[cfg(test)]
+     fn available(&self) -> usize {
+         self.max.saturating_sub(self.spent)
+     }
+@@ -43,6 +42,8 @@
      /// inc / dec.
      peer: peer::Dyn,
  
@@ -31,19 +39,22 @@
      /// Maximum number of locally initiated streams
      max_send_streams: usize,
  
-@@ -78,7 +80,8 @@
+@@ -91,7 +92,11 @@
  impl Counts {
      /// Create a new `Counts` using the provided configuration values.
      pub fn new(peer: peer::Dyn, config: &Config) -> Self {
 -        Counts {
 +        let mut counts = Counts {
-+            observation: super::guard_observe::Observation::new(peer.is_server(), config.data_frame_budget),
++            observation: super::guard_observe::Observation::new(
++                peer.is_server(),
++                config.data_frame_budget.resolve(None),
++            ),
              peer,
              max_send_streams: config.initial_max_send_streams,
              num_send_streams: 0,
-@@ -92,6 +95,25 @@
-             num_local_error_reset_streams: 0,
-             data_frame_budget: Budget::new(config.data_frame_budget),
+@@ -106,6 +111,30 @@
+             data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
+             data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
              num_recv_empty_data_frames: 0,
 +        };
 +        counts.guard_emit(0, 0, 0);
@@ -51,10 +62,15 @@
 +    }
 +
 +    pub(super) fn guard_state(&self) -> [usize; 7] {
-+        [self.data_frame_budget.max, self.data_frame_budget.available,
-+         self.num_recv_empty_data_frames, self.num_send_streams,
-+         self.num_recv_streams, self.num_local_error_reset_streams,
-+         self.num_remote_reset_streams]
++        [
++            self.data_frame_budget.max,
++            self.data_frame_budget.available(),
++            self.num_recv_empty_data_frames,
++            self.num_send_streams,
++            self.num_recv_streams,
++            self.num_local_error_reset_streams,
++            self.num_remote_reset_streams,
++        ]
 +    }
 +
 +    pub(super) fn guard_emit(&mut self, event: u8, branch: u8, reason: u32) {
@@ -67,17 +83,17 @@
          }
      }
  
-@@ -119,9 +141,13 @@
+@@ -140,9 +169,13 @@
      /// Releases the framing overhead of a DATA frame that is no longer
      /// buffered internally.
      pub fn release_data_frame(&mut self, payload_len: usize) {
-+        let before = self.data_frame_budget.available;
++        let before = self.data_frame_budget.available();
          if payload_len != 0 && payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
              self.data_frame_budget
                  .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len);
 +        }
 +        if let Some(observation) = &mut self.observation {
-+            observation.inc(13, (self.data_frame_budget.available - before) as u64);
++            observation.inc(13, (self.data_frame_budget.available() - before) as u64);
          }
      }
  
@@ -235,27 +251,19 @@
  
  #[derive(Debug)]
  pub(crate) struct Streams<B, P>
-@@ -122,9 +190,18 @@
-         let mut me = self.inner.lock().unwrap();
-         let me = &mut *me;
- 
--        me.actions
-+        let result = me.actions
+@@ -126,6 +194,12 @@
              .recv
--            .set_target_connection_window(size, &mut me.actions.task)
-+            .set_target_connection_window(size, &mut me.actions.task);
+             .set_target_connection_window(size, &mut me.actions.task)?;
+         me.counts.set_target_connection_window_size(size);
 +        let credit = me.counts.guard_state()[1];
-+        if result.is_ok() {
-+            if let Some(observation) = &mut me.counts.observation {
-+                observation.target(size);
-+                me.actions.recv.guard_window(observation);
-+                observation.window_transition(4, credit);
-+            }
++        if let Some(observation) = &mut me.counts.observation {
++            observation.target(size);
++            me.actions.recv.guard_window(observation);
++            observation.window_transition(4, credit);
 +        }
-+        result
+         Ok(())
      }
  
-     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
 @@ -178,6 +255,8 @@
      pub fn clear_expired_reset_streams(&mut self) {
          let mut me = self.inner.lock().unwrap();
@@ -285,7 +293,7 @@
  
                  // Register the task while holding the same lock used to
                  // observe that all pending frames have been buffered. A
-@@ -256,7 +346,18 @@
+@@ -260,7 +350,18 @@
          let mut me = self.inner.lock().unwrap();
          let me = &mut *me;
  
@@ -305,7 +313,7 @@
      }
  
      pub fn send_request(
-@@ -393,7 +494,16 @@
+@@ -401,7 +502,16 @@
  
      pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
          let mut me = self.inner.lock().unwrap();
@@ -323,7 +331,7 @@
      }
  
      pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), Error> {
-@@ -447,10 +557,22 @@
+@@ -455,10 +565,22 @@
      }
  }
  
@@ -348,7 +356,7 @@
              actions: Actions {
                  recv: Recv::new(peer, &config),
                  send: Send::new(&config),
-@@ -459,7 +581,17 @@
+@@ -467,7 +589,17 @@
              },
              store: Store::new(),
              refs: 1,
@@ -367,7 +375,7 @@
      }
  
      fn recv_headers<B>(
-@@ -592,10 +724,17 @@
+@@ -600,10 +732,17 @@
          frame: frame::Data,
      ) -> Result<(), Error> {
          let id = frame.stream_id();
@@ -385,7 +393,7 @@
                  // The GOAWAY process has begun. All streams with a greater ID
                  // than specified as part of GOAWAY should be ignored.
                  if id > self.actions.recv.max_stream_id() {
-@@ -640,14 +779,31 @@
+@@ -648,14 +787,31 @@
              let sz = frame.flow_controlled_len();
              let is_end_stream = frame.is_end_stream();
              let payload_len = frame.payload().len();
@@ -418,7 +426,7 @@
              }
  
              // Any stream error after receiving a DATA frame means
-@@ -657,6 +813,11 @@
+@@ -665,6 +821,11 @@
                  actions
                      .recv
                      .release_connection_capacity(sz as WindowSize, &mut None);
@@ -430,7 +438,7 @@
              }
              actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
          })
-@@ -1518,8 +1679,16 @@
+@@ -1526,8 +1687,16 @@
              .poll_data(cx, &mut stream)
              .map(|result| match result {
                  Some(Ok(data)) => {
@@ -447,7 +455,7 @@
                      }
                      Some(Ok(data.payload))
                  }
-@@ -1561,9 +1730,13 @@
+@@ -1569,9 +1738,13 @@
  
          let mut stream = me.store.resolve(self.key);
  
@@ -464,7 +472,7 @@
      }
  
      /// Clear the receive queue and set the status to no longer receive data frames.
-@@ -1738,6 +1911,11 @@
+@@ -1746,6 +1919,11 @@
                          "locally-reset streams reached limit ({:?})",
                          counts.max_local_error_resets().unwrap(),
                      );
@@ -476,7 +484,7 @@
                      return Err(crate::proto::error::GoAway {
                          reason: Reason::ENHANCE_YOUR_CALM,
                          debug_data: "too_many_internal_resets".into(),
-@@ -1786,6 +1964,11 @@
+@@ -1794,6 +1972,11 @@
                      "reset_on_recv_stream_err; locally-reset streams reached limit ({:?})",
                      counts.max_local_error_resets().unwrap(),
                  );
@@ -488,7 +496,7 @@
                  Err(Error::library_go_away_data(
                      Reason::ENHANCE_YOUR_CALM,
                      "too_many_internal_resets",
-@@ -1837,3 +2020,7 @@
+@@ -1845,3 +2028,7 @@
          self.send.clear_queues(store, counts);
      }
  }

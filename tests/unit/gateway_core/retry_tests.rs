@@ -22,6 +22,7 @@ fn http_response(status_code: u16) -> BackendResponse {
         connection_error: false,
         backend_resolved_ip: None,
         error_class: None,
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -34,6 +35,7 @@ fn connection_failure() -> BackendResponse {
         connection_error: true,
         backend_resolved_ip: None,
         error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionRefused),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -46,6 +48,7 @@ fn post_header_body_read_failure() -> BackendResponse {
         connection_error: false,
         backend_resolved_ip: None,
         error_class: Some(ErrorClass::ConnectionReset),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -58,6 +61,7 @@ fn dispatch_policy_rejection() -> BackendResponse {
         connection_error: false,
         backend_resolved_ip: None,
         error_class: Some(ErrorClass::DispatchPolicyRejected),
+        request_on_wire: false,
         buffered_trailers: None,
     }
 }
@@ -70,6 +74,7 @@ fn terminal_gateway_error(status_code: u16, error_class: ErrorClass) -> BackendR
         connection_error: false,
         backend_resolved_ip: None,
         error_class: Some(error_class),
+        request_on_wire: true,
         buffered_trailers: None,
     }
 }
@@ -1549,6 +1554,7 @@ fn post_handshake_rustls_alerts_are_post_wire_and_do_not_replay_a_post() {
             connection_error: !ferrum_edge::retry::request_reached_wire(class),
             backend_resolved_ip: None,
             error_class: Some(class),
+            request_on_wire: ferrum_edge::retry::request_reached_wire(class),
             buffered_trailers: None,
         };
         assert!(
@@ -1574,6 +1580,7 @@ fn post_handshake_rustls_alerts_are_post_wire_and_do_not_replay_a_post() {
             connection_error: true,
             backend_resolved_ip: None,
             error_class: Some(setup_class),
+            request_on_wire: false,
             buffered_trailers: None,
         };
         assert!(

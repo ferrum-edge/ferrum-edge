@@ -854,6 +854,22 @@ fn committed_batch_graph_release_cannot_fail_the_response() {
         "no post-commit call site may propagate admission-lease cleanup failure"
     );
 
+    let deployment = mongo_method("mutate_deployment(");
+    let confirmed = deployment
+        .rfind(".await?;")
+        .expect("commit errors propagate");
+    let cleanup = deployment
+        .find("release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;")
+        .expect("conditional deployment uses infallible post-commit cleanup");
+    assert!(
+        confirmed < cleanup,
+        "cleanup follows the confirmed transaction"
+    );
+    assert!(
+        !deployment[cleanup..].contains('?'),
+        "nothing after the confirmed commit may report a failed mutation"
+    );
+
     let after_commit = mongo_method("release_mtls_dns_admission_leases_after_commit(");
     let after_commit = &after_commit[..after_commit
         .find("fn mark_mtls_dns_mutations_started")
@@ -1654,6 +1670,47 @@ fn proxy_route_lock_cleanup_uses_an_escaped_id_prefix_not_a_namespace_filter() {
     assert!(
         !MONGO_STORE_SOURCE.contains(r#""consumer_credential_index""#),
         "the MongoDB backend has no consumer_credential_index collection"
+    );
+}
+
+#[test]
+fn deployment_snapshot_covers_real_mongo_resource_and_identity_documents() {
+    let snapshot = mongo_method("deployment_snapshot_in_session(");
+    let collections: Vec<_> = snapshot
+        .split("for name in [")
+        .nth(1)
+        .expect("raw snapshot collection list")
+        .split("] {")
+        .next()
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.trim_end_matches(',').trim_matches('"'))
+        .collect();
+    assert_eq!(
+        collections,
+        [
+            "proxies",
+            "consumers",
+            "upstreams",
+            "plugin_configs",
+            "api_specs",
+            "gateway_trust_bundles",
+            "consumer_identity_index",
+            "namespaces",
+        ],
+        "Mongo credentials and uniqueness hashes belong to consumers, not a separate collection"
+    );
+    assert!(
+        snapshot.contains("cursor.deserialize_current()?")
+            && snapshot.contains("serde_json::to_value(&document)?")
+            && snapshot.contains("mongodb::bson::to_vec(&document)?"),
+        "raw consumer credential/hash and identity reservation fields must be fenced losslessly"
+    );
+    assert!(
+        !snapshot.contains("document.remove("),
+        "snapshot evidence must not strip embedded credentials or uniqueness hashes"
     );
 }
 

@@ -48,7 +48,7 @@ Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/export` also checks a present `ns` claim when enforcement is off. `/config/apply-status` is not namespace-scoped.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/export` and `/backend-egress-policy` also check a present `ns` claim when enforcement is off. `/config/apply-status` is not namespace-scoped.
 - The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, `GET /namespaces` is **filtered** to the JWT `ns` claim — a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
 - Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected: `X-Ferrum-Namespace` does not select a tenant there. Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
@@ -141,7 +141,7 @@ are never affected.
 - Every namespace-scoped route listed above (proxies, consumers and
   credentials, plugin configs, upstreams, API specs, trust bundles and
   `/gateway-trust/status`, `/batch`, `/backup`, `/restore`, `/audit`) and
-  `GET /config/export` answer `403` for a namespace outside the ceiling,
+  `GET /config/export` and `GET /backend-egress-policy` answer `403` for a namespace outside the ceiling,
   including the `ferrum` default when the header is omitted. The refusal
   depends only on the credential and the requested namespace, never on whether
   any resource exists there, so it reveals nothing about another tenant.
@@ -1209,6 +1209,20 @@ proves the whole batch live, instead of one reload per write.
 
 ## Consumers
 
+`GET /consumers/{id}/verification` requires an **admin-role JWT** and returns
+all stored credential material from the same row as its strong `ETag`.
+Operators, viewers, metrics credentials, and anonymous callers are rejected.
+It uses an authoritative database read without cached fallback and admits a
+security audit record before returning the body with `Cache-Control: no-store`.
+Basic credentials contain stored password hashes, never plaintext passwords.
+Ordinary consumer GETs retain their credential projection.
+
+For namespace-wide planning, `/backup?conditional=true` supplies complete rows,
+per-row ETags and a namespace ETag from one primary snapshot. Send that namespace
+ETag as `If-Match` to `/restore?confirm=true` for an atomic conditional
+replacement. See [Conditional snapshots and restore](admin_backup_restore.md#conditional-snapshots-and-restore)
+for topology requirements, historical credential handling, and refusal semantics.
+
 Consumer identity is one keyspace per namespace: `id`, `username`, and `custom_id` must all be mutually unique across every consumer in a namespace (a consumer whose own `custom_id` equals its own `id`/`username` is fine). Cross-field collisions — e.g. one consumer's `username` equalling another's `custom_id` — are rejected with `409 Conflict`, enforced both by the admission precheck and by a persistence-level unique constraint (`consumer_identity_index`), so concurrent writes cannot race a collision in. Consumer `id` values are scoped per namespace: the same id may exist in two namespaces.
 
 `mtls_auth` credential identities remain exact and case-sensitive for non-DNS certificate fields. When an enabled `san_dns` policy is effective, the namespace also admits those identities under one ASCII case-folded DNS keyspace. Consumer, policy, and proxy-association mutations are serialized in the persistent backend, so a concurrent case variant or policy-activation race cannot commit ambiguity; an ordinary conflicting CRUD request returns `409 Conflict`. Namespace-fence contention is backend-independent: guarded mutation endpoints return `503 Service Unavailable`, `Retry-After: 1`, and `{"error":"Namespace mutation is temporarily unavailable; retry later"}` without exposing database topology or lock-owner details. Retry after the delay; a fence intentionally retained for an uncertain write requires operator recovery before retries can succeed.
@@ -1378,7 +1392,9 @@ reverts it. `GET /proxies/{id}`, `/upstreams/{id}`, `/consumers/{id}`, and
 `/plugins/config/{id}` return a strong `ETag`; send it back as `If-Match` on
 `PUT` or `DELETE` of the same resource and the write is refused with
 `412 Precondition Failed` — writing nothing — unless the stored resource still
-has that representation.
+has the state validated by that tag. The validator covers complete stored
+state, including credentials and associations, rather than the bytes of a
+redacted or role-specific response.
 
 ```bash
 ETAG=$(curl -si -H "Authorization: Bearer $TOKEN" \
@@ -1400,25 +1416,64 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
 - **What the tag covers.** A keyed MAC over the full stored resource, bound to
   its kind, namespace, and id. It changes when any stored field changes,
   including fields redacted from the caller's view and plugin associations
-  (which are compared order-independently). It is keyed by a subkey of
+  (which are compared order-independently). An ordinary consumer GET and the
+  admin-only `GET /consumers/{id}/verification` issue the same tag for the same
+  stored row; verification returns its complete stored credentials and tag
+  together. Conditional backup row tags likewise validate the complete rows
+  in that coherent snapshot. A tag from a redacted GET alone does not let the
+  caller inspect hidden credentials. It is keyed by a subkey of
   `FERRUM_ADMIN_JWT_SECRET` so it cannot be used to test guesses of a redacted
   value; replicas sharing that secret issue identical tags, and rotating it
   invalidates outstanding tags (writes then return `412` until re-read).
-- **Strict parsing.** `*` requires only that the resource exists. Comparison
-  is strong, so a weak `W/"…"` tag never matches. A comma-separated list
+- **Strict parsing for row writes.** `*` requires only that the resource exists.
+  Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
-  treated as absent, and `If-Match` on any other mutating route (including
+  treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the
+  four resource routes above. `POST /restore` supports the separate namespace
+  precondition described below. Opt-in deployment removal and spec replacement
+  use the separate [deployment authority profile](deployment_mutations.md).
+  `If-Match` on any other mutating route (including
   `POST` creates, `/batch`, and `/gateway-trust-bundles/{id}`, which keeps its
   own body `revision` contract) is `400` rather than applied unconditionally.
   A request that would be `404` without the header is still `404`.
-- **After a `412`,** re-read the resource and reapply the intended edits to
-  the current representation. Resending the same body with the fresh tag
+- **Namespace restore precondition.** `GET /backup?conditional=true` returns
+  an `ETag` equal to `conditional.namespace_etag` for the complete coherent
+  namespace state. Send that tag as `If-Match` to `POST /restore?confirm=true`
+  on the same namespace. The store compares the expected snapshot and replaces
+  the namespace in one transaction, including the lease checks; a stale tag
+  returns `412` without replacement. Strong comparison and tag lists apply,
+  but `*`, malformed and empty headers return `400`. A row tag cannot authorize
+  this namespace replacement, and body `conditional` metadata alone does not
+  make restore conditional. An unsupported topology returns `501`; unavailable
+  authoritative state or admission lease returns `503`. See
+  [Conditional snapshots and restore](admin_backup_restore.md#conditional-snapshots-and-restore).
+- **After a `412`,** re-read the resource, or take another conditional namespace
+  backup for restore, and reapply the intended edits to the current state.
+  Resending the same body with the fresh tag
   would revert the change that caused the refusal.
 - **Write responses carry no tag.** Re-read to obtain the tag for the accepted
   state. The cached-config `GET` fallback (`X-Data-Source: cached`) also
   carries none, because it may lag the database.
 - **Unconditional writes are unchanged.** Omitting `If-Match` keeps today's
-  last-writer-wins behavior.
+  last-writer-wins behavior, including unconditional restore.
+
+## Dependency-fenced deployment recovery (#6010)
+
+Use admin-only `GET /deployment-snapshot` for complete original spec/plugin and
+raw dependency evidence. Send its original deployment token to
+`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
+`PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
+partially mutate inside one owner-fenced transaction on all four supported
+stores (MongoDB requires a replica set). Stale evidence is `412`; invalid modes
+or headers refuse without fallback. Ordinary row deletion, spec replacement,
+backup and restore profiles retain their supported behavior.
+
+Only an acknowledgement with `durable: "committed"`, `live: "applied"` and
+`recovery_cleanup_authorized: true` authorizes automatic journal removal.
+Durable-only CP/unserved results explicitly return `false`. Preserve the original
+encrypted journal after every refusal or uncertain outcome. See the
+[consumer adoption guide](deployment_mutations.md) for exact evidence, query,
+ownership, preservation and acknowledgement rules.
 
 ## Plugin Configs
 
@@ -2557,6 +2612,133 @@ Deletes the spec and cascades:
 | `dp`, `file`, `mesh` | 403 (read-only) | 503 (no database) |
 
 For the full extension contract, supported versions, validation rules, and worked examples, see [docs/api_specs.md](api_specs.md).
+
+## Backend Egress Policy
+
+### `GET /backend-egress-policy`
+
+Returns bounded metadata about the **loaded backend address policy** used by
+this process. `viewer`, `operator`, and `admin` JWTs may read it, including
+viewer-key JWTs, on writable and read-only admin listeners. Metrics tokens,
+metrics CIDR allowlists, and anonymous requests receive `401`; policy metadata
+is not added to `/health`, `/status`, or metrics.
+
+`X-Ferrum-Namespace` selects the authorization namespace (absent means `ferrum`).
+Invalid headers return `400`. The viewer-key namespace ceiling always applies,
+and a present JWT `ns` claim must include the selected namespace even when
+`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is off. With claim enforcement enabled,
+including on a multi-namespace CP, a missing `ns` claim returns `403`. Denials
+return no policy fields. The namespace need not already have stored resources.
+
+```bash
+curl -H "Authorization: Bearer $VIEWER_TOKEN" \
+  -H "X-Ferrum-Namespace: ferrum" \
+  http://localhost:9000/backend-egress-policy
+```
+
+A default serving gateway for `ferrum` responds with `Cache-Control: no-store`:
+
+```json
+{
+  "schema_version": 1,
+  "ip_classification": "ferrum-private-reserved-v1",
+  "namespace": "ferrum",
+  "policy_scope": "process",
+  "enforcement_scope": "local-data-plane",
+  "mode": "both",
+  "mode_allowed_ip_classes": ["public", "private-reserved"],
+  "mode_blocked_ip_classes": [],
+  "dangerous_ranges_blocked": true,
+  "allow_cidr_overrides_present": false,
+  "deny_cidr_overrides_present": false,
+  "evaluation_order": ["allow-cidrs", "deny-cidrs", "dangerous-ranges", "ip-mode"],
+  "public_only_guaranteed": false
+}
+```
+
+The snapshot comes from the immutable `BackendEgressPolicy` in `ProxyState` on
+a serving process, or the loaded admin admission policy when there is no local
+proxy. It does not reread environment strings, expose CIDRs, address lists,
+entry counts, secrets, or backend names, or perform a DNS probe. Config reloads
+do not change this process policy; changing it requires a process restart.
+
+`policy_scope=process` means the same policy applies across namespaces.
+`enforcement_scope` limits what the response proves:
+
+| Value | Meaning |
+| --- | --- |
+| `local-data-plane` | A local `ProxyState` serves the requested namespace; metadata describes its backend address policy. |
+| `unserved-namespace` | A local data plane exists but serves another namespace. |
+| `admission-only` | CP with no local proxy; the response describes its configuration admission policy, without attesting any DP. |
+| `no-data-plane` | No local proxy or CP admission scope (for example `node_agent`). |
+
+Mode class lists describe the **mode stage**, after overlays and the baseline:
+
+| `mode` | `mode_allowed_ip_classes` | `mode_blocked_ip_classes` |
+| --- | --- | --- |
+| `both` (production default) | `["public", "private-reserved"]` | `[]` |
+| `public` | `["public"]` | `["private-reserved"]` |
+| `private` | `["private-reserved"]` | `["public"]` |
+
+For `ip_classification=ferrum-private-reserved-v1`, `private-reserved` is the
+existing Edge `is_private_ip` classification and `public` is its complement.
+These are fixed Edge categories, not a promise to track a changing external
+registry. The v1 classifier includes:
+
+- IPv4 loopback, RFC1918, link-local, `0.0.0.0/8`, CGNAT `100.64.0.0/10`,
+  `192.0.0.0/24` except globally reachable `192.0.0.9` and `192.0.0.10`,
+  documentation `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, deprecated
+  6to4 relay `192.88.99.0/24`, benchmarking `198.18.0.0/15`, multicast
+  `224.0.0.0/4`, and reserved/broadcast `240.0.0.0/4`.
+- IPv6 unspecified/loopback, discard-only `100::/64`, dummy `100:0:0:1::/64`,
+  documentation `2001:db8::/32`, deprecated 6to4 `2002::/16`, ULA `fc00::/7`,
+  link-local `fe80::/10`, multicast `ff00::/8`, and `2001::/23` except the
+  globally reachable `2001:1::1`, `2001:1::2`, `2001:1::3`, `2001:3::/32`,
+  `2001:4:112::/48`, `2001:20::/28`, and `2001:30::/28` assignments.
+- IPv4-mapped and compatible IPv6 use the embedded IPv4 classification.
+  Well-known NAT64 `64:ff9b::/96` uses its embedded IPv4 classification; local-use
+  NAT64 `64:ff9b:1::/48` is private/reserved as a whole.
+
+`evaluation_order` is fixed: explicit allow CIDRs, explicit deny CIDRs, dangerous
+baseline, then mode (first match wins). CIDR rules also consider recognized
+embedded IPv4 addresses. An ambiguous local-use NAT64 address must pass the
+full policy for both contiguous and RFC 6052 /48 IPv4 decodings, then the policy
+for the original IPv6 address. An allow on one decoding cannot excuse a denied
+other decoding. The endpoint reports the existing evaluator; it does not
+implement a second classifier or change connection behavior.
+
+`dangerous_ranges_blocked=true` (production default) blocks IPv4 link-local,
+`0.0.0.0/8`, multicast, limited broadcast, and the Alibaba metadata host
+`100.100.100.200`; IPv6 unspecified, link-local, multicast, and the AWS metadata
+host `fd00:ec2::254`; and recognized embedded equivalents. Ordinary loopback and
+RFC1918/ULA remain reachable under the default `both` mode. Explicit allow CIDRs
+override the baseline and mode, so baseline-on **does not mean public-only**.
+The two override-presence booleans disclose only whether parsed lists are
+nonempty; operators' network topology stays private.
+
+`public_only_guaranteed` is true exactly for `mode=public` with no allow CIDR
+overrides. Deny overrides only restrict and do not invalidate this guarantee.
+Even a wholly public allow list yields false: the endpoint conservatively
+refuses to certify undisclosed overrides. False does not prove that a private
+address is reachable (for example, a deny list might block everything).
+
+A control plane requiring public-only upstreams must check the serving gateway
+for its namespace, recognize schema version 1 and the complete v1 vocabulary,
+require `enforcement_scope=local-data-plane`, and require
+`public_only_guaranteed=true`. Missing endpoints/fields, unknown versions or
+labels, authorization failures, unserved namespaces, CP-only metadata, and
+weaker policies must block publication. Recheck every serving DP and after
+gateway replacement/restart; a CP's policy is not distributed as proof of a
+DP's environment. Consumers allowing private upstreams must explicitly define
+which known modes/overrides they accept rather than treating an unknown value
+as permissive.
+
+This is a policy snapshot, not DNS validation or a socket-connect test. It
+does not attest external firewall rules or add enforcement to outbound paths.
+Existing backend enforcement and its documented path limitations remain
+unchanged; see [Backend egress / SSRF protection](configuration.md#backend-egress--ssrf-protection).
+The response and classification identifiers are contract vocabulary; changing
+their meaning requires a versioned contract update in `ferrum-contracts`.
 
 ## Backend Capability Registry
 

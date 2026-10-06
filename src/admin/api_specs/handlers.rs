@@ -2952,6 +2952,21 @@ pub async fn handle_put_api_spec(
     namespace: &str,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let deployment_original = match crate::admin::deployment_mutations::parse_request(
+        req.uri().query(),
+        req.headers(),
+        false,
+    ) {
+        Ok(value) => value,
+        Err(message) => return Ok(crate::admin::deployment_mutations::refusal(message)),
+    };
+    if deployment_original.is_some()
+        && actor.allowed_namespaces.is_present()
+        && let Some(response) =
+            crate::admin::enforce_namespace_claim(actor, namespace, req.uri().path())
+    {
+        return Ok(response);
+    }
     let apply_mode = match crate::admin::parse_live_apply_mode_query(req.uri().query()) {
         Ok(mode) => mode,
         Err(message) => {
@@ -2974,10 +2989,12 @@ pub async fn handle_put_api_spec(
     // Preserve the endpoint's early not-found behavior before collecting a
     // potentially large body. The spec is re-read under the namespace
     // admission guard below before any prospective validation uses it.
-    match db.get_api_spec(namespace, id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
-        Err(e) => return Ok(error_response(classify_db_error(e))),
+    if deployment_original.is_none() {
+        match db.get_api_spec(namespace, id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+            Err(e) => return Ok(error_response(classify_db_error(e))),
+        }
     }
 
     let provisioner = match crate::admin::provisioning::provisioner(req.headers()) {
@@ -3019,9 +3036,27 @@ pub async fn handle_put_api_spec(
                 )));
             }
         };
+    let deployment_expected = if let Some(original) = &deployment_original {
+        match crate::admin::deployment_mutations::expected(state, db.as_ref(), namespace, original)
+            .await
+        {
+            Ok(value) => Some(value),
+            Err(response) => return Ok(response),
+        }
+    } else {
+        None
+    };
     let existing_spec = match db.get_api_spec(namespace, id).await {
         Ok(Some(spec)) => spec,
+        Ok(None) if deployment_expected.is_some() => {
+            return Ok(crate::admin::deployment_mutations::store_error(
+                &crate::config::deployment_mutation::DeploymentGraphInvalid.into(),
+            ));
+        }
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+        Err(e) if deployment_expected.is_some() => {
+            return Ok(crate::admin::deployment_mutations::store_error(&e));
+        }
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
@@ -3090,6 +3125,11 @@ pub async fn handle_put_api_spec(
             upstream: existing_spec_upstream.clone(),
             plugins: existing_spec_plugins,
         },
+        None if deployment_expected.is_some() => {
+            return Ok(crate::admin::deployment_mutations::store_error(
+                &crate::config::deployment_mutation::DeploymentGraphInvalid.into(),
+            ));
+        }
         None => {
             return Ok(error_response(ApiSpecError::Internal(format!(
                 "API spec '{}' references missing proxy '{}'",
@@ -3136,6 +3176,42 @@ pub async fn handle_put_api_spec(
     };
     // Preserve original created_at
     spec.created_at = existing_spec.created_at;
+
+    if let Some(expected) = deployment_expected {
+        if !crate::admin::deployment_mutations::admit_mutation_audit(
+            state,
+            actor,
+            namespace,
+            id,
+            "deployment_replace",
+        )
+        .await
+        {
+            return Ok(crate::admin::deployment_mutations::unavailable(
+                "not_started",
+            ));
+        }
+        return Ok(
+            match audit::spawn_with_request_slot(crate::admin::deployment_mutations::finish_boxed(
+                state.clone(),
+                actor.clone(),
+                db.clone(),
+                namespace.to_string(),
+                id.to_string(),
+                _namespace_config_admission_guard,
+                _write_permit,
+                expected,
+                Some((bundle, spec)),
+            ))
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => crate::admin::deployment_mutations::store_error(&anyhow::anyhow!(
+                    "Persistence outcome unknown"
+                )),
+            },
+        );
+    }
 
     let settlement_db = db.clone();
     let persistence_db = db.clone();

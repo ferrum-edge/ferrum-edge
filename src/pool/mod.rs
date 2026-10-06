@@ -120,7 +120,16 @@ impl SharedPoolCreateKind {
     }
 }
 
-#[derive(Debug)]
+/// Factual timing of one failed connection creation, independent of the
+/// request lifetimes of its creator and coalesced waiters.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoolCreateFailureTiming {
+    pub(crate) occurred_at: tokio::time::Instant,
+    /// A transport deadline that selected the captured timeout, if any.
+    pub(crate) deadline_at: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug, Clone)]
 struct SharedPoolCreateErrorInner {
     message: String,
     kind: SharedPoolCreateKind,
@@ -134,6 +143,9 @@ struct SharedPoolCreateErrorInner {
     /// Not included in [`Display`]; pool-key TLS material must be redacted by
     /// the typed error's own Display if logged.
     detail: Option<String>,
+    /// Opt-in transport facts for a waiter that observes the failure late.
+    /// Never contains the creator's authorization or client deadline.
+    failure_timing: Option<PoolCreateFailureTiming>,
 }
 
 /// Cloneable create-failure payload shared with every waiter for one coalesced
@@ -165,6 +177,7 @@ impl SharedPoolCreateError {
                 kind,
                 error_class,
                 detail,
+                failure_timing: None,
             }),
         }
     }
@@ -218,6 +231,15 @@ impl SharedPoolCreateError {
 
     pub fn detail(&self) -> Option<&str> {
         self.inner.detail.as_deref()
+    }
+
+    pub(crate) fn with_failure_timing(mut self, timing: PoolCreateFailureTiming) -> Self {
+        Arc::make_mut(&mut self.inner).failure_timing = Some(timing);
+        self
+    }
+
+    pub(crate) fn failure_timing(&self) -> Option<PoolCreateFailureTiming> {
+        self.inner.failure_timing
     }
 }
 
@@ -279,13 +301,8 @@ impl ShareablePoolCreateError for anyhow::Error {
 
 impl ShareablePoolCreateError for SharedPoolCreateError {
     fn to_shared(&self) -> SharedPoolCreateError {
-        // Preserve kind/class/detail for a re-broadcast of the same payload.
-        SharedPoolCreateError::new(
-            self.message().to_string(),
-            self.kind(),
-            self.error_class(),
-            self.detail().map(str::to_string),
-        )
+        // Preserve all captured facts for a re-broadcast of the same payload.
+        self.clone()
     }
 }
 
@@ -813,6 +830,15 @@ impl<M: PoolManager> GenericPool<M> {
         self.entries.len()
     }
 
+    /// Pending creations and available permits for cold-path lifecycle tests.
+    #[doc(hidden)]
+    pub fn creation_state_for_test(&self) -> (usize, usize) {
+        (
+            self.pending_creations.len(),
+            self.inflight.available_permits(),
+        )
+    }
+
     pub fn stats(&self) -> PoolStats {
         PoolStats {
             size: self.entries.len(),
@@ -961,8 +987,8 @@ impl<M: PoolManager> GenericPool<M> {
     pub async fn create_or_get_existing_owned_with_attempt<C, Fut, E, J, W>(
         &self,
         key: String,
-        mut on_join: J,
-        mut on_waiter_failure: W,
+        on_join: J,
+        on_waiter_failure: W,
         create: C,
     ) -> std::result::Result<M::Connection, E>
     where
@@ -971,6 +997,37 @@ impl<M: PoolManager> GenericPool<M> {
         E: ShareablePoolCreateError + From<SharedPoolCreateError>,
         J: FnMut(&CoalescedCreateAttempt),
         W: FnMut(&CoalescedCreateAttempt),
+    {
+        self.create_or_get_existing_owned_with_recovery(
+            key,
+            on_join,
+            on_waiter_failure,
+            |_| None,
+            create,
+        )
+        .await
+    }
+
+    /// Recheck a caller's recovery policy at the physical creator boundary,
+    /// after acquiring the creation permit and checking the cache again.
+    /// A recovered connection is returned without publishing it under `key`:
+    /// it can belong to a different shard. Cancellation re-election repeats
+    /// this check before another physical attempt can start.
+    pub(crate) async fn create_or_get_existing_owned_with_recovery<C, Fut, E, J, W, R>(
+        &self,
+        key: String,
+        mut on_join: J,
+        mut on_waiter_failure: W,
+        recover: R,
+        create: C,
+    ) -> std::result::Result<M::Connection, E>
+    where
+        C: FnOnce(String, CoalescedCreateAttempt) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
+        E: ShareablePoolCreateError + From<SharedPoolCreateError>,
+        J: FnMut(&CoalescedCreateAttempt),
+        W: FnMut(&CoalescedCreateAttempt),
+        R: Fn(&str) -> Option<M::Connection>,
     {
         let mut create = Some(create);
 
@@ -1001,7 +1058,7 @@ impl<M: PoolManager> GenericPool<M> {
             crate::profile_pool_event!(CreateOwner);
             let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
-                .create_after_recheck(key.clone(), {
+                .create_after_recheck(key.clone(), &recover, {
                     let create = create
                         .take()
                         .expect("create closure should only be consumed by the creator");
@@ -1060,14 +1117,16 @@ impl<M: PoolManager> GenericPool<M> {
         pending.finish_failed(err);
     }
 
-    async fn create_after_recheck<C, Fut, E>(
+    async fn create_after_recheck<C, Fut, E, R>(
         &self,
         key: String,
+        recover: R,
         create: C,
     ) -> std::result::Result<M::Connection, E>
     where
         C: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
+        R: FnOnce(&str) -> Option<M::Connection>,
     {
         let _permit = self
             .inflight
@@ -1077,6 +1136,10 @@ impl<M: PoolManager> GenericPool<M> {
             .expect("pool creation semaphore should remain open while the pool is alive");
 
         if let Some(conn) = self.cached(&key) {
+            return Ok(conn);
+        }
+
+        if let Some(conn) = recover(&key) {
             return Ok(conn);
         }
 

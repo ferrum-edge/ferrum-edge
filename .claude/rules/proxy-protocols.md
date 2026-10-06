@@ -15,7 +15,7 @@ paths:
   - "src/tls_offload.rs"
   - "src/adaptive_buffer.rs"
   - "src/lazy_timeout.rs"
-  - "vendor/reqwest-0.13.3-ferrum-patched/**"
+  - "vendor/reqwest-0.13.4-ferrum-patched/**"
   - "vendor/h3-0.0.8-ferrum-patched/**"
   - "docs/http3.md"
   - "docs/tcp_udp_proxy.md"
@@ -128,7 +128,7 @@ paths:
 - Exclude request-only policy fields that dispatch can apply per request (connect/read timeouts). Exclude `max_idle_per_host` from the reqwest key by deliberate global-only tradeoff (per-proxy values would over-fragment). Direct-H2/gRPC may still document first-materializer tradeoffs for remaining builder settings that are not in those keys (for example keepalive), but `pool_http2_max_concurrent_streams` is keyed.
 - Subset must partition pools so DestinationRule subset TLS overlays cannot share connections accidentally.
 - Request-only policy fields are applied per request. Shared reqwest clients must not leak request timeouts across proxies; client-baked settings are isolated by the `rcfg` key segment instead.
-- Per-request `connect_timeout` depends on the vendored reqwest patch at `vendor/reqwest-0.13.3-ferrum-patched/` (`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`). Do not change pool sharing or timeout semantics without preserving that request-scoped override behavior.
+- Per-request `connect_timeout` depends on the vendored reqwest patch at `vendor/reqwest-0.13.4-ferrum-patched/` (`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`). Do not change pool sharing or timeout semantics without preserving that request-scoped override behavior.
 - Every production `reqwest::Client::builder()` must install `DnsCacheResolver` from the shared DNS cache.
 - DNS cache is shared, prewarmed, native-TTL by default, floored by `FERRUM_DNS_MIN_TTL_SECONDS`, stale-while-revalidate, and supports TCP fallback for truncated UDP.
 

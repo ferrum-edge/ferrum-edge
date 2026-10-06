@@ -2330,81 +2330,77 @@ fn the_direct_h2_upload_join_reports_authorization_rather_than_an_indeterminate_
 
 #[test]
 fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
-    // The definition, six composed header waits (the reqwest initial attempt,
-    // the reqwest retry attempt, the direct HTTP/1.1 pool (#5588), mesh mTLS,
-    // HBONE, and the Unix-socket pool), and the shared buffered-RESPONSE
-    // collect composer. Direct-H2 composes
-    // through `authorization_bounded_header_deadline` instead, because it
-    // carries a typed bound source.
-    //
-    // Plus five connection-checkout / request-handoff compositions
-    // (GHSA-xcg4-wj3x-gjj2): the Unix-socket checkout bound, the HBONE inner
-    // lease open's two attribution arms (first lease and idle-race replay),
-    // the direct-H2 sender acquisition's attribution, and the direct-H2
-    // handoff gate. The direct-H2 sender bound itself composes the bare
-    // instant through `compose_dispatch_phase_auth_bound_at`, and the direct
-    // HTTP/1.1 pool reuses its one header-wait composition for its checkout,
-    // replay, and handoff gate, so neither adds one here.
-    assert_eq!(
-        PROXY_SOURCE
-            .matches("compose_dispatch_phase_auth_bound(")
-            .count(),
-        13,
-        "an H1/H2 response-header wait or backend checkout lost its authorization bound"
+    // Follow actual implementation boundaries, including the split mesh/HBONE
+    // children and sidecar readiness checkout. Global counts could let a new
+    // site hide the loss of an old one, or count unrelated H3 terminals.
+    for (anchor, compositions, attributions, placeholders, wrappers) in [
+        ("async fn proxy_to_backend_retry(", 1, 1, 3, 0),
+        ("async fn proxy_to_backend(", 1, 1, 0, 6),
+        ("async fn proxy_to_backend_direct_h1(", 1, 0, 0, 1),
+        ("fn direct_h1_handoff_bound_expired(", 0, 1, 0, 1),
+        ("async fn proxy_to_backend_hbone(", 1, 0, 0, 0),
+        ("async fn proxy_to_backend_hbone_after_ready(", 2, 1, 2, 0),
+        ("async fn proxy_to_backend_unix(", 2, 1, 2, 0),
+        ("async fn proxy_to_backend_mesh_mtls(", 1, 0, 0, 0),
+        (
+            "async fn proxy_to_backend_mesh_mtls_after_ready(",
+            1,
+            2,
+            3,
+            0,
+        ),
+        ("async fn proxy_to_backend_http2(", 0, 2, 4, 0),
+        ("async fn proxy_to_backend_http3(", 0, 0, 4, 0),
+        ("async fn proxy_to_backend_http3_retry(", 0, 0, 2, 0),
+        (
+            "async fn drain_h3_response_under_authorization(",
+            0,
+            0,
+            1,
+            0,
+        ),
+        ("fn direct_h2_handoff_refusal(", 1, 0, 0, 0),
+        ("fn direct_h2_sender_bound_expired(", 1, 1, 0, 1),
+        ("fn direct_h2_handoff_bound_expired(", 0, 1, 1, 0),
+        ("fn mesh_h1_handoff_bound_expired(", 0, 1, 1, 0),
+        (
+            "async fn collect_response_under_authorization<F>(",
+            1,
+            1,
+            0,
+            0,
+        ),
+    ] {
+        let body = source_region(PROXY_SOURCE, anchor, "\n}\n");
+        for (callee, expected) in [
+            ("compose_dispatch_phase_auth_bound(", compositions),
+            ("dispatch_phase_authorization_expiry(", attributions),
+            ("authorization_expired_dispatch_placeholder(", placeholders),
+            ("authorization_expired_backend_dispatch(", wrappers),
+        ] {
+            assert_eq!(
+                body.matches(callee).count(),
+                expected,
+                "{anchor} lost a bound, attribution, or health-neutral exit: {callee}"
+            );
+        }
+    }
+    let h2 = source_region(PROXY_SOURCE, "async fn proxy_to_backend_http2(", "\n}\n");
+    assert!(h2.contains("authorization_bounded_header_deadline("));
+    assert!(h2.contains("ResponseHeaderDeadlineSource::Authorization => {"));
+    let neutral = source_region(
+        PROXY_SOURCE,
+        "fn authorization_expired_dispatch_placeholder(",
+        "\n}\n",
     );
-    assert!(PROXY_SOURCE.contains("authorization_bounded_header_deadline("));
-    assert!(PROXY_SOURCE.contains("ResponseHeaderDeadlineSource::Authorization => {"));
-    // The definition plus nine attributions: those six waits, the direct-H2
-    // header wait, the direct-H2 early-response upload join, and the shared
-    // buffered-response collect composer. Each attributes the fired bound, so an
-    // authorization expiry is never reported as a backend timeout or a client
-    // RPC deadline. The direct HTTP/1.1 pool's one attribution now lives in its
-    // out-of-line `direct_h1_handoff_bound_expired`, shared by its checkout,
-    // replay checkout, handoff gate, and header wait.
-    //
-    // Plus three checkout / handoff attributions (GHSA-xcg4-wj3x-gjj2): the
-    // HBONE / Unix-socket settle helper, the direct-H2 sender acquisition, and
-    // the direct-H2 handoff gate.
-    assert_eq!(
-        PROXY_SOURCE
-            .matches("dispatch_phase_authorization_expiry(")
-            .count(),
-        13,
-        "an H1/H2 dispatch phase lost its authorization attribution"
+    assert!(neutral.contains("connection_error: false"));
+    assert!(neutral.contains("error_class: Some(retry::ErrorClass::ClientDisconnect)"));
+    let wrapper = source_region(
+        PROXY_SOURCE,
+        "fn authorization_expired_backend_dispatch(",
+        "\n}\n",
     );
-    // Every one of those exits returns the health-neutral placeholder. Eighteen
-    // references name it directly: the definition, the out-of-line wrapper's own
-    // single use, the three `proxy_to_backend_retry` returns, the eleven
-    // tuple-returning exits across HBONE, Unix, mesh mTLS, direct-H2, and the
-    // native-H3 backend, and the two checkout / handoff settle helpers
-    // (GHSA-xcg4-wj3x-gjj2: HBONE / Unix-socket, and the direct-H2 handoff
-    // gate). The six `proxy_to_backend` exits reach the same value through that
-    // wrapper.
-    //
-    // Issue #4153 retired one reference on each of these two counts, and only
-    // one: giving the buffered uploads a fail-closed retained ceiling folded the
-    // native-H3 bridge's "unlimited" arm and the reqwest dispatcher's
-    // "unlimited" arm into their bounded twins. Neither exit changed shape — two
-    // identical exits became one — which the structural backstop below is what
-    // actually proves.
-    assert_eq!(
-        PROXY_SOURCE
-            .matches("authorization_expired_dispatch_placeholder(")
-            .count(),
-        18,
-        "an H1/H2 authorization exit stopped being health-neutral"
-    );
-    // The wrapper's definition plus its six `proxy_to_backend` call sites, the
-    // direct HTTP/1.1 pool's two (#5588: the shared checkout / handoff /
-    // header-wait settle helper and the buffered collect), and the direct-H2
-    // sender acquisition's (GHSA-xcg4-wj3x-gjj2).
-    assert_eq!(
-        PROXY_SOURCE
-            .matches("authorization_expired_backend_dispatch(")
-            .count(),
-        10,
-        "a reqwest-dispatch authorization exit stopped being health-neutral"
-    );
+    assert!(wrapper.contains("authorization_expired_dispatch_placeholder("));
     // The counts above are a tripwire for a LOST exit; this is the check that
     // survives a legitimate one being folded away. Whatever the count, every
     // buffered-upload authorization arm still in the file must resolve to one of
@@ -2419,9 +2415,12 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         .split("Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {")
         .skip(1)
     {
-        // Bounded at the start of the next match arm; the helper call is the
-        // arm's first statement, so this window always contains it.
-        let branch = arm.split("=> {").next().unwrap_or(arm);
+        // These arms contain only a return through a health-neutral helper.
+        // Require their closing brace so a sibling cannot supply that helper.
+        let end = arm
+            .find('}')
+            .expect("bounded buffered-upload authorization arm");
+        let branch = &arm[..end];
         assert!(
             branch.contains("authorization_expired_dispatch_placeholder(")
                 || branch.contains("authorization_expired_backend_dispatch("),
@@ -2432,13 +2431,14 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
 
 /// The slice of `source` from the first `start` to the next `end` after it.
 fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    source
-        .split(start)
-        .nth(1)
-        .unwrap_or_else(|| panic!("missing region start {start:?}"))
-        .split(end)
-        .next()
-        .unwrap_or_else(|| panic!("missing region end {end:?}"))
+    let start_at = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing region start {start:?}"));
+    let tail = &source[start_at + start.len()..];
+    let end_at = tail
+        .find(end)
+        .unwrap_or_else(|| panic!("missing region end {end:?}"));
+    &tail[..end_at]
 }
 
 /// Code outside `//` comments with every whitespace character removed, so a
@@ -2743,25 +2743,40 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
 /// `backend_read_timeout_ms`, which `0` disables outright.
 #[test]
 fn every_buffered_response_collect_is_authorization_bounded() {
-    // Eleven call sites, one per buffered response arm: two reqwest retry arms,
-    // four reqwest first-attempt arms, direct-H2, the direct HTTP/1.1 pool
-    // (#5588), HBONE, the Unix-socket pool, and the mesh-mTLS gRPC-Web arm.
-    // (The generic definition itself carries a `<F>` and is not counted.)
-    assert_eq!(
-        PROXY_SOURCE
-            .matches("collect_response_under_authorization(")
-            .count(),
-        11,
-        "a buffered response collect lost its authorization bound"
-    );
+    // Pin every real collector's scope, including the added retained H3
+    // response drain. Neither another protocol nor a duplicate site can mask
+    // an unbounded original arm.
+    for (anchor, expected) in [
+        ("async fn proxy_to_backend_retry(", 2),
+        ("async fn proxy_to_backend(", 4),
+        ("async fn proxy_to_backend_direct_h1(", 1),
+        ("async fn proxy_to_backend_hbone_after_ready(", 1),
+        ("async fn proxy_to_backend_unix(", 1),
+        ("async fn proxy_to_backend_mesh_mtls_after_ready(", 1),
+        ("async fn proxy_to_backend_http2(", 1),
+        ("async fn drain_h3_response_under_authorization(", 1),
+    ] {
+        let body = source_region(PROXY_SOURCE, anchor, "\n}\n");
+        assert_eq!(
+            body.matches("collect_response_under_authorization(")
+                .count(),
+            expected
+        );
+        assert_eq!(
+            body.matches("Err(ResponseCollectBound::AuthorizationExpired) => {")
+                .count(),
+            expected,
+            "{anchor} must settle every buffered collect's authorization terminal"
+        );
+    }
     for arm in PROXY_SOURCE
         .split("Err(ResponseCollectBound::AuthorizationExpired) => {")
         .skip(1)
     {
-        let branch = arm
-            .split("\n        };")
-            .next()
-            .expect("bounded authorization arm");
+        let end = arm
+            .find('}')
+            .expect("bounded response-collect authorization arm");
+        let branch = &arm[..end];
         assert!(
             branch.contains("authorization_expired_dispatch_placeholder(")
                 || branch.contains("authorization_expired_backend_dispatch("),
@@ -4582,20 +4597,18 @@ async fn an_empty_buffered_grpc_upload_with_no_trailers_installs_no_pump() {
 #[test]
 fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermark() {
     let source = include_str!("../../../src/proxy/grpc_proxy.rs");
-    let core = source
-        .split("pub(crate) async fn proxy_grpc_request_core(")
-        .nth(1)
-        .expect("buffered gRPC dispatch core")
-        .split("// Extract response status and headers through the shared collector")
-        .next()
-        .expect("bounded buffered gRPC dispatch core");
+    let core = source_region(
+        source,
+        "pub(crate) async fn proxy_grpc_request_core(",
+        "// Extract response status and headers through the shared collector",
+    );
 
     assert!(
         core.contains("buffered_grpc_request_body_with_write_watermark("),
         "the buffered gRPC body must be built through the shared write-watermark selection"
     );
     let sender_acquired = core
-        .find("transport.get_sender(proxy).await?")
+        .find("transport.get_sender(proxy)")
         .expect("buffered gRPC sender acquisition");
     let pump_installed = core
         .find("buffered_grpc_request_body_with_write_watermark(")
@@ -4604,7 +4617,7 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
         .find("pump.arm_write_watermark();")
         .expect("buffered gRPC write-watermark arm");
     let request_sent = core
-        .find("sender.send_request(backend_req)")
+        .find("sender.send_request(backend_req, &handed_to_backend)")
         .expect("buffered gRPC dispatch");
     assert!(
         sender_acquired < pump_installed
@@ -4630,17 +4643,29 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
             "every header-wait shape must stay inside the raced future ({shape})"
         );
     }
+    let protocol_wait = source_region(
+        core,
+        "let protocol_header_wait = async {",
+        "let header_wait = grpc_header_wait_under_authorization(",
+    );
+    let gate = protocol_wait
+        .find("dispatch_bounds.admit_handoff(auth)?;")
+        .expect("handoff gate");
+    let send = protocol_wait
+        .find("sender.send_request(backend_req, &handed_to_backend)")
+        .expect("gated send");
+    assert!(gate < send);
+    assert!(!protocol_wait[gate..send].contains(".await"));
+    assert!(core.contains("await_upload_write_watermark_first(header_wait, upload_pump.as_mut())"));
     assert!(
         core.contains("pump.cancel_and_join().await;"),
         "a won watermark must cancel and join the gateway-owned pump"
     );
-    let write_timeout_error = GRPC_PROXY_SOURCE
-        .split("fn grpc_backend_write_timeout_error(")
-        .nth(1)
-        .expect("shared gRPC write-timeout terminal")
-        .split("\n}\n")
-        .next()
-        .expect("bounded gRPC write-timeout terminal");
+    let write_timeout_error = source_region(
+        GRPC_PROXY_SOURCE,
+        "fn grpc_backend_write_timeout_error(",
+        "\n}\n",
+    );
     assert!(
         core.contains("grpc_backend_write_timeout_error(")
             && write_timeout_error.contains("kind: GrpcTimeoutKind::Read,")
@@ -4815,11 +4840,17 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         .find("if auth.is_some() {")
         .expect("authorization lifetimes keep the pump");
     let pump_install = grpc_installer
-        .find("Self::for_streaming_upload_with_deferred_write(incoming, auth, write_timeout_ms)")
+        .find("Self::for_streaming_upload_with_deferred_write(")
         .expect("the authenticated branch installs the pump");
     assert!(
         auth_branch < pump_install && grpc_installer.contains("Http2BodyWriteTimeout::new("),
         "native gRPC must keep the pump for authorization lifetimes and bound the write otherwise"
+    );
+    assert!(
+        GRPC_PROXY_SOURCE
+            .contains("let require_end_stream = parts.version == hyper::Version::HTTP_2;")
+            && grpc_installer[pump_install..].contains("require_end_stream,"),
+        "the authenticated pump must receive the original frontend protocol's EOF policy"
     );
     let native_grpc_poll = GRPC_PROXY_SOURCE
         .split("impl http_body::Body for GrpcBody")
@@ -5259,10 +5290,10 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
         ("authorization_expired_backend_dispatch(", 9),
     ] {
         let definition = format!("fn {callee}");
-        let before_definition = PROXY_SOURCE
-            .split(definition.as_str())
-            .next()
+        let definition_at = PROXY_SOURCE
+            .find(definition.as_str())
             .expect("the out-of-line helper must remain present");
+        let before_definition = &PROXY_SOURCE[..definition_at];
         assert!(
             // A visibility modifier may sit between the attribute and `fn`; the
             // attribute itself is what must stay attached.
@@ -5285,13 +5316,11 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
     // moment one of its cold arms builds the `retry::BackendResponse` inline
     // again, that coroutine's `poll` frame gets the fixed slot back — for a
     // plain unauthenticated request that can reach none of those arms.
-    let reqwest_dispatch = PROXY_SOURCE
-        .split("\nasync fn proxy_to_backend(")
-        .nth(1)
-        .expect("the reqwest dispatcher must remain present")
-        .split("\nfn is_streaming_content_type(")
-        .next()
-        .expect("the reqwest dispatcher must remain bounded");
+    let reqwest_dispatch = source_region(
+        PROXY_SOURCE,
+        "\nasync fn proxy_to_backend(",
+        "\nfn is_streaming_content_type(",
+    );
     assert!(
         !reqwest_dispatch.contains("authorization_expired_dispatch_placeholder("),
         "a `proxy_to_backend` authorization exit builds its terminal inline again \
@@ -5306,28 +5335,36 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
     // shared latch is still consulted first, an unlatched-but-elapsed plan is
     // still recorded exactly once through it, and the only terminal selectable
     // is still the fixed, redacted pre-commitment one.
-    let applier = PROXY_SOURCE
-        .split("fn apply_precommit_authorization_terminal(")
-        .nth(1)
-        .expect("the out-of-line applier body")
-        .split("\n}\n")
-        .next()
-        .expect("bounded applier body");
-    assert!(applier.contains("ctx.authorization_termination_latch.observed()"));
-    assert!(applier.contains("expired_authorization("));
-    assert!(applier.contains("record_once(elapsed, family)"));
+    let applier = source_region(
+        PROXY_SOURCE,
+        "fn apply_precommit_authorization_terminal(",
+        "\n}\n",
+    );
+    assert!(applier.contains("request_authorization_termination(ctx, max_lifetime_seconds)?"));
+    let decision = source_region(
+        PROXY_SOURCE,
+        "fn request_authorization_termination(",
+        "\n}\n",
+    );
+    assert!(decision.contains("ctx.authorization_termination_latch.observed()"));
+    assert!(decision.contains("expired_authorization(plan)?"));
+    assert!(decision.contains("record_once(elapsed, family)"));
+    let observed = decision
+        .find("ctx.authorization_termination_latch.observed()")
+        .unwrap();
+    let expiry = decision.find("expired_authorization(plan)?").unwrap();
+    let record = decision.find("record_once(elapsed, family)").unwrap();
+    assert!(observed < expiry && expiry < record);
     assert!(applier.contains("authorization_expired_pre_commitment_response("));
     assert!(applier.contains("ctx.latch_authorization_termination(termination);"));
 
     // The response funnels keep the family selection and the shared latch/closer
     // wiring they had inline.
-    let installer = PROXY_SOURCE
-        .split("fn install_response_authorization_deadline(")
-        .nth(1)
-        .expect("the out-of-line response installer body")
-        .split("\n}\n")
-        .next()
-        .expect("bounded installer body");
+    let installer = source_region(
+        PROXY_SOURCE,
+        "fn install_response_authorization_deadline(",
+        "\n}\n",
+    );
     assert!(installer.contains("effective_request_auth_deadline("));
     assert!(installer.contains("StreamAuthProtocolFamily::GrpcWeb"));
     assert!(installer.contains("StreamAuthProtocolFamily::Grpc"));
@@ -5773,33 +5810,27 @@ fn native_h3_grpc_dispatch_phases_compose_the_authorization_lifetime() {
         precommit.contains("let dispatch_deadline_at = dispatch_bound.deadline();"),
         "the awaited instant must be a projection of the captured composition"
     );
-    // Both phases check authorization FIRST, so a policy expiry is never
-    // reported as a backend timeout and never downgrades the H3 capability.
-    assert_eq!(
-        dispatch
-            .matches("Some(termination) => Err(termination),")
-            .count(),
-        2,
-        "a native-H3 gRPC dispatch phase lost its authorization attribution"
-    );
-    // ...and both attribute from the CAPTURED composition. Re-reading the clock
-    // after the timeout returns would report the security decision for a phase
-    // a strictly earlier client `grpc-timeout` actually bounded, whenever this
-    // task was not scheduled again until after the later authorization deadline
-    // had also passed.
+    // Opening now receives a typed pool outcome: its post-DNS cold-connect
+    // deadline can beat the outer lifetime on a late wake. The header race
+    // still attributes from the captured dispatch composition.
+    assert!(precommit.contains("let open_auth = crate::http3::client::H3Authorization::new("));
+    assert_eq!(precommit.matches("open_auth,").count(), 2);
+    assert!(precommit.contains("error.authorization_expiry()"));
+    assert!(precommit.contains("attempt_span.scope(open_fut).await"));
+    assert!(!precommit.contains("await_deadline_first(dispatch_deadline_at,"));
     assert_eq!(
         dispatch
             .matches("Err(()) => match dispatch_bound.expired_authorization() {")
             .count(),
-        2,
-        "a native-H3 gRPC dispatch phase re-derives its owner from the clock"
+        1,
+        "the header race must retain its captured owner"
     );
     assert_eq!(
         dispatch
             .matches("await_deadline_first(dispatch_deadline_at,")
             .count(),
-        2,
-        "both pre-commitment native-H3 gRPC waits must use the shared expiry-first primitive"
+        1,
+        "the header race must remain expiry-first"
     );
     assert!(
         !dispatch.contains("timeout_at(at, open_fut)")

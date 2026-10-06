@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::config::types::{Consumer, PluginConfig, Proxy, Upstream};
 
@@ -368,4 +368,50 @@ pub fn atomic_batch_test_overrides(namespace: &str) -> (Option<AtomicBatchFault>
     let fault = overrides.faults.get(namespace).copied();
     let chunk_size = overrides.chunk_sizes.get(namespace).copied();
     (fault, chunk_size)
+}
+
+/// Pause a conditional restore after its fenced snapshot comparison, before
+/// mutation. Hosted store regressions can cross the real keeper interval and
+/// lease TTL without relying on the size or speed of an imported graph.
+#[derive(Default)]
+pub struct ConditionalRestoreTestPause {
+    pub entered: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
+}
+
+static ANY_RESTORE_PAUSE: AtomicBool = AtomicBool::new(false);
+static RESTORE_PAUSES: OnceLock<Mutex<HashMap<String, Arc<ConditionalRestoreTestPause>>>> =
+    OnceLock::new();
+
+pub fn set_conditional_restore_pause(
+    namespace: &str,
+    pause: Option<Arc<ConditionalRestoreTestPause>>,
+) {
+    let mut pauses = RESTORE_PAUSES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pause) = pause {
+        pauses.insert(namespace.to_string(), pause);
+    } else {
+        pauses.remove(namespace);
+    }
+    ANY_RESTORE_PAUSE.store(!pauses.is_empty(), Ordering::Release);
+}
+
+pub(crate) async fn pause_conditional_restore_for_test(namespace: &str) {
+    if !ANY_RESTORE_PAUSE.load(Ordering::Acquire) {
+        return;
+    }
+    let pause = RESTORE_PAUSES.get().and_then(|pauses| {
+        pauses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(namespace)
+            .cloned()
+    });
+    if let Some(pause) = pause {
+        pause.entered.notify_one();
+        pause.resume.notified().await;
+    }
 }

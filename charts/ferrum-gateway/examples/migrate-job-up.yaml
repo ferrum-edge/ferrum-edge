@@ -1,9 +1,9 @@
 # Explicit migrate mode: apply pending database schema migrations, then exit.
 #
 # Neither ferrum-gateway nor ferrum-mesh deploys FERRUM_MODE=migrate. Use this
-# Job as a pre-deploy / operator-controlled step. database and cp chart installs
-# still auto-apply pending core schema migrations on startup; this Job is for
-# explicit control (and pairs with status / dry-run examples).
+# Job to initialize a fresh database under the build-out baseline policy. A
+# changed V001 baseline requires a fresh database and logical import; this Job
+# does not provide an online schema upgrade. Keep the old database for rollback.
 #
 # Prerequisites (same Secrets as examples/database-values.yaml):
 #   kubectl -n ferrum create secret generic ferrum-gateway-db \
@@ -44,7 +44,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ferrum-edge
-          image: ferrumedge/ferrum-edge:0.9.10  # pin the same published tag as the gateway Deployment
+          image: ferrumedge/ferrum-edge:0.9.12  # candidate; use only after verified publication
           imagePullPolicy: IfNotPresent
           args: ["run"]
           securityContext:
