@@ -14,7 +14,7 @@ sudo cp target/release/ferrum-edge /usr/local/bin/
 # Pin an immutable semver tag (vX.Y.Z from the Releases page). Do not rely on a moving
 # "latest" channel: GitHub /releases/latest skips prerelease tags.
 set -euo pipefail
-TAG=v0.9.12  # candidate: use only after verified publication; v0.9.11 is published
+TAG=v0.9.13
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"
@@ -446,10 +446,10 @@ ferrum-edge version [OPTIONS]
 
 ```bash
 $ ferrum-edge version
-ferrum-edge 0.9.12 (aarch64-apple-darwin)
+ferrum-edge 0.9.13 (aarch64-apple-darwin)
 
 $ ferrum-edge version --json
-{"version":"0.9.12","target":"aarch64-apple-darwin"}
+{"version":"0.9.13","target":"aarch64-apple-darwin"}
 ```
 
 ## ambient-udp-preflight

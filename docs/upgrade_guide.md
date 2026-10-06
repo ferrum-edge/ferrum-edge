@@ -26,7 +26,26 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Unreleased changes after 0.9.12
+## Upgrading to 0.9.13
+
+0.9.13 (2026-10-06 UTC) is cut from main
+`fd02c5f45bb9dee86a52bc612fcefd0223d6157b`. All previously released breaking
+identifiers and guidance below remain applicable. CP/DP must run the same
+build. 0.9.13 adds no core schema change; a changed baseline in any later release still requires a fresh
+database with the old database kept intact for rollback.
+
+Before rolling out, check:
+
+- admin automation that stores namespace backup tags or `deployment-v1-` tokens
+  (they must be re-read after upgrading, and conditional paths can return `507`);
+- consumers of `GET /deployment-snapshot` (digest-only spec evidence plus the new
+  `api_spec_contents` array) and `GET /backend-egress-policy` (`schema_version: 2`);
+- native HTTP/3 routes that buffer uploads (`503` / `RESOURCE_EXHAUSTED` when the
+  shared request-buffer budget is exhausted);
+- routes with HTTP route total deadlines that collect bodies before
+  authentication, and custom plugins that rewrite request inputs before proxying;
+- gRPC backends' connection limits (affinity can open more backend connections);
+- local development stacks started from the sample Compose files.
 
 **Native HTTP/3 buffered uploads take retained-request admission (#6009).**
 An H3 upload the gateway buffers (for a body-inspecting plugin, a protocol
@@ -97,7 +116,18 @@ than `DELETE /proxies/{id}` and `PUT /api-specs/{id}`, including
 `POST /restore`. Drop stray `If-Match` headers from ordinary spec replacement and
 never reuse a deployment token on another route.
 
-## Development Compose fixtures (unreleased)
+**gRPC affinity backend connection count (#5991 follow-up).** A missing or
+closed affinity shard no longer makes a call wait for a fresh dial while a
+sibling is ready; the shard is created in the background instead. A backend
+connection now pins at most `min(32, SETTINGS_MAX_CONCURRENT_STREAMS)` calls
+before spilling to a sibling. Clients that open many short-lived HTTP/2
+connections can therefore see up to `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`
+backend connections per backend host from each gateway. Size backend connection
+limits (and DestinationRule `maxConnections`) for that width, or lower
+`FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`; see
+[connection pooling](connection_pooling.md#grpc-pool-saturation).
+
+### Development Compose fixtures
 
 These changes affect only the sample `docker-compose.yml`, the SQL TLS test
 stack (`docker-compose.tls-test.yml`, `scripts/setup_db_tls.sh`) and local
@@ -195,17 +225,16 @@ The SQL TLS functional tests now read `connections.env` from
 hard-coded `test-password` for ports 15432 or 13306 must read that file instead.
 Tear down with `./scripts/setup_db_tls.sh --cleanup [dir]`.
 
-## Upgrading to 0.9.12 (candidate)
+## Upgrading to 0.9.12
 
-Prepared on **2026-10-05 UTC** from merged #6012 main
-`a9c758c6352765d13a7f61c4d7e3571c82a2d307`. Final candidate/main-push
-qualification and publication are pending; keep the verified published v0.9.11
-pin until actual release, canonical contracts and consumer qualification complete.
-Read the [candidate record](releases/v0.9.12.md) for source evidence and the
-future cut procedure. All previously released breaking identifiers and guidance
-below remain applicable. CP/DP must run the same build. A changed core baseline
-still requires a fresh database and the intact old database for rollback; this
-candidate provides no online schema migration or binary-only rollback promise.
+0.9.12 was published at **2026-10-05T12:33:02Z** at release merge
+`0d917701b63ef38210c49df830f48cf0457cbc7d`, whose second parent is reviewed
+#6013 head `b277bbb1fc20ed7fb5d785165c7ced5650957a89`. Read the
+[0.9.12 record](releases/v0.9.12.md) for source evidence. All previously
+released breaking identifiers and guidance below remain applicable. CP/DP must
+run the same build. A changed core baseline still requires a fresh database and
+the intact old database for rollback; this release provides no online schema
+migration or binary-only rollback promise.
 
 **Dependency-fenced partial deployment mutations (#6010 / #6012).** Capture
 `GET /deployment-snapshot` with an admin-role JWT and the intended namespace;
@@ -268,10 +297,9 @@ capture. This does not identify the earlier PostgreSQL initial-import 500's
 cause or establish online DDL safety. Retire the float correction only after a
 compatible upstream release passes the same hosted regression; keep SQLx's vendor
 copy while the separate TLS patch needs it, and retain behavioral tests after
-both patches retire. No dependency graph/schema changes accompany preparation.
+both patches retire. 0.9.12 made no dependency graph or schema changes.
 See [consumer adoption and limitations](deployment_mutations.md) and the
 [patch retirement record](upstream-sqlx-patches/002-typed-float-null-bindings/README.md).
-No downstream adoption, packaged acceptance or advisory closure is asserted.
 
 ## Upgrading to 0.9.11
 

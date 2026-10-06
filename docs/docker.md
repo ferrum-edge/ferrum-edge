@@ -99,11 +99,10 @@ and [arm64 layer](https://gcr.io/v2/distroless/cc-debian13/blobs/sha256:9e203bbc
 records source package `openssl`, with `libssl3t64` moving from
 `3.5.7-1~deb13u2` to `3.5.7-1~deb13u3` on both architectures.
 
-This refresh describes unreleased source inputs. Published release assets and
-image digests, including v0.9.12, retain their own immutable release-head
-evidence. Required hosted checks and trusted-base policy must qualify the new
-PR head before merge; input hashes alone establish neither GNU ABI
-compatibility, FIPS qualification, nor datapath correctness.
+This refresh (#6014) first ships in v0.9.13; v0.9.12 and earlier release
+assets and image digests retain their own immutable release-head evidence.
+Input hashes alone establish neither GNU ABI compatibility, FIPS
+qualification, nor datapath correctness.
 
 ### Image Details
 
@@ -315,7 +314,7 @@ docker compose --profile mongodb up -d mongodb ferrum-mongodb
 docker compose ps   # STATUS column shows healthy/unhealthy
 ```
 
-Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. The Mongo container refuses to start with a missing, short, or non-URL-safe `MONGO_PASSWORD`, and port `27017` is not published to the host. `MONGO_PASSWORD` only seeds a new volume; to change the password of an existing volume (including one created with the old `dev-password-change-in-production` default), follow [the upgrade guide](upgrade_guide.md#development-compose-fixtures-unreleased). See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, primary-consistent reads, and managed service configuration.
+Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. The Mongo container refuses to start with a missing, short, or non-URL-safe `MONGO_PASSWORD`, and port `27017` is not published to the host. `MONGO_PASSWORD` only seeds a new volume; to change the password of an existing volume (including one created with the old `dev-password-change-in-production` default), follow [the upgrade guide](upgrade_guide.md#development-compose-fixtures). See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, primary-consistent reads, and managed service configuration.
 
 **Key differences from SQL**:
 - Indexes created automatically instead of SQL migrations
