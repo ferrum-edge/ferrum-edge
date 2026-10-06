@@ -5479,6 +5479,31 @@ pub mod _test_support {
         plugin.redis_quarantine_dial_permits_for_tests()
     }
 
+    pub fn ai_semantic_cache_redis_quarantine_hold_all_dials_for_test<'a>(
+        plugin: &'a crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> Vec<tokio::sync::SemaphorePermit<'a>> {
+        plugin.redis_quarantine_hold_all_dials_for_tests()
+    }
+
+    pub async fn ai_semantic_cache_quarantine_invalid_redis_entry_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        redis: &RedisRateLimitClient,
+        redis_key: &str,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        observed_value: &[u8],
+    ) {
+        plugin
+            .quarantine_invalid_redis_entry_for_tests(
+                redis,
+                redis_key,
+                cache_key,
+                fingerprint,
+                observed_value,
+            )
+            .await;
+    }
+
     // ── plugins/response_caching ─────────────────────────────────────────────
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all

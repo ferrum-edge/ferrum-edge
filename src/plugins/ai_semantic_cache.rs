@@ -840,6 +840,16 @@ impl RedisQuarantineSuppressor {
     /// outcome handler clears it on success or a proven mismatch and keeps it
     /// (refreshed) on failure.
     fn try_claim(&self, cache_key: &str, fingerprint: [u8; 32], now: Instant) -> bool {
+        // Fast path: an unexpired marker for the same poison is contention, not
+        // a claim. Return before allocating the key `String` that `upsert`
+        // needs for its map entry. The later `upsert` re-checks atomically, so
+        // a racing insert cannot turn this into a double claim.
+        let contended = self.entries.get(cache_key).is_some_and(|existing| {
+            existing.expires_at > now && existing.fingerprint == fingerprint
+        });
+        if contended {
+            return false;
+        }
         let marker = RedisQuarantineMarker {
             fingerprint,
             expires_at: now + self.ttl,
@@ -2633,6 +2643,41 @@ impl AiSemanticCache {
     #[allow(dead_code)]
     pub(crate) fn redis_quarantine_dial_permits_for_tests(&self) -> usize {
         self.redis_quarantine_dials.available_permits()
+    }
+
+    /// Hold every dedicated quarantine dial permit for the caller's scope so a
+    /// test can drive the exhaustion path. Permits release when the returned
+    /// vector drops.
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_hold_all_dials_for_tests(
+        &self,
+    ) -> Vec<tokio::sync::SemaphorePermit<'_>> {
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_REDIS_QUARANTINE_DIALS);
+        while let Ok(permit) = self.redis_quarantine_dials.try_acquire() {
+            held.push(permit);
+        }
+        held
+    }
+
+    /// Exercise the production quarantine path (permit gate included) without a
+    /// real Redis read.
+    #[allow(dead_code)]
+    pub(crate) async fn quarantine_invalid_redis_entry_for_tests(
+        &self,
+        redis: &RedisRateLimitClient,
+        redis_key: &str,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        observed_value: &[u8],
+    ) {
+        self.quarantine_invalid_redis_entry(
+            redis,
+            redis_key,
+            cache_key,
+            fingerprint,
+            observed_value,
+        )
+        .await;
     }
 }
 

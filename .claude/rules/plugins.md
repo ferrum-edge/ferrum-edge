@@ -953,9 +953,13 @@ on a native-gRPC request.
 - `ai_semantic_cache` quarantine claims a per-key in-flight marker
   (`RedisQuarantineSuppressor::try_claim`) before it dials, bounds concurrent
   dedicated dials per instance with a `try_acquire`-only semaphore (requests
-  never wait), and dials through `get_quarantine_connection`, so a refused or
-  timed-out extra socket never marks the shared client unavailable. A proven
-  mismatch returns `Ok(false)` without `UNWATCH`.
+  never wait), and dials through `get_quarantine_connection` with
+  `DedicatedDialPurpose::OptionalMaintenance`, so a refused or timed-out
+  TCP/handshake connect or an `INFO CLUSTER` probe that did not complete on that
+  extra socket never marks the shared client unavailable. DNS, egress, and
+  client-construction failures still keep the ordinary policy, and a proven
+  Cluster topology stays terminal. A proven mismatch returns `Ok(false)` without
+  `UNWATCH`.
 - Redis Cluster is NOT supported and is screened, not assumed: `INFO CLUSTER`
   at connect plus `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN` reactively.
   The proactive probe is bounded by `redis_connect_timeout_seconds` (no new

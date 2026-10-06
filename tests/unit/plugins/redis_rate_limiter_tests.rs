@@ -843,7 +843,7 @@ fn connect_timeout_is_installed_into_redis_connection_config_above_and_below_one
         source.contains(rearm),
         "a screened connection must be re-armed with a bounded command deadline"
     );
-    let screened_sites = source.matches("self.screen_and_arm(&mut conn)").count();
+    let screened_sites = source.matches("self.screen_and_arm(&mut conn,").count();
     assert_eq!(
         screened_sites, 2,
         "both the pooled and the dedicated connect paths must screen and re-arm"
@@ -5099,10 +5099,7 @@ fn the_server_clock_rides_inside_the_charge_transaction_and_is_probed_first() {
 
     // The probe is STANDALONE and runs on every screened connection, before the
     // socket may carry a policy command.
-    let screen = method_body(
-        redis,
-        "async fn screen_and_arm(&self, conn: &mut redis::aio::MultiplexedConnection) -> bool {",
-    );
+    let screen = method_body(redis, "async fn screen_and_arm(");
     assert!(
         screen.contains("self.probe_server_time(conn).await"),
         "every established connection must re-probe TIME; an ACL can change under \
@@ -5921,6 +5918,82 @@ fn optional_quarantine_dial_failures_retain_backend_availability() {
     );
     assert!(bounded.contains("self.get_quarantine_connection().await"));
     assert!(!bounded.contains("get_dedicated_connection()"));
+}
+
+/// Behavioral cover for the availability carve-out: a listener that accepts the
+/// extra quarantine socket, answers the server connection-limit error, and
+/// closes must leave the shared client available (issue #6018, review L2). The
+/// pooled path never needs to succeed first because only the optional dial is
+/// exercised.
+#[tokio::test]
+async fn refused_quarantine_dial_keeps_the_shared_client_available() {
+    use ferrum_edge::_test_support::redis_client_without_server_clock_for_test;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let _ = stream
+                .write_all(b"-ERR max number of clients reached\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let client = redis_client_without_server_clock_for_test(keyspace_config(port));
+    assert!(
+        client.is_available(),
+        "a fresh operational client starts available"
+    );
+
+    let result = client
+        .delete_if_value_matches_bounded("ferrum:test:poisoned", b"{}")
+        .await;
+    assert!(
+        result.is_err(),
+        "a refused quarantine dial must surface as an optional-maintenance failure"
+    );
+    assert!(
+        client.is_available(),
+        "a refused quarantine dial must not take the shared client out of service"
+    );
+
+    server.abort();
+}
+
+/// A topology screen that does not complete on the extra quarantine socket is
+/// local to that socket: it must not mark the shared client unavailable, while
+/// a proven Cluster topology is still terminal (issue #6018, review L1).
+#[test]
+fn quarantine_topology_screen_failure_retains_availability_but_cluster_is_terminal() {
+    let source = compact_source(include_str!(
+        "../../../src/plugins/utils/redis_rate_limiter.rs"
+    ));
+    let screen = source_region(
+        &source,
+        "asyncfnscreen_topology(",
+        "asyncfnscreen_memory_policy(",
+    );
+    let optional = source_region(
+        screen,
+        "TopologyScreen::ProbeFailed=>{",
+        "ifself.classification_only(){",
+    );
+    assert!(
+        optional.contains("ifpurpose==DedicatedDialPurpose::OptionalMaintenance")
+            && optional.contains("returnfalse")
+            && !optional.contains("mark_unavailable")
+            && !optional.contains("note_command_failure"),
+        "an incompletely screened quarantine socket must not change availability"
+    );
+    assert!(
+        screen.contains("TopologyScreen::ClusterProven=>{")
+            && screen.contains("mark_endpoint_terminal("),
+        "a proven Cluster topology must stay terminal regardless of purpose"
+    );
+    // The pooled path and the dedicated policy path both screen as `Policy`.
+    assert!(source.contains("screen_and_arm(&mutconn,DedicatedDialPurpose::Policy)"));
+    assert!(source.contains("screen_and_arm(&mutconn,purpose)"));
 }
 
 /// Deduplication ownership release keeps its released command profile; only
@@ -8324,7 +8397,7 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
         .find("match self.connect_multiplexed(client).await {")
         .expect("pooled establishment site");
     let screen = source[establish..publish]
-        .find("self.screen_and_arm(&mut conn)")
+        .find("self.screen_and_arm(&mut conn, DedicatedDialPurpose::Policy)")
         .expect("pooled path must screen topology before publishing");
     assert!(
         screen > 0,

@@ -6715,6 +6715,67 @@ fn redis_quarantine_dial_permits_are_bounded_per_instance() {
     );
 }
 
+/// With every dedicated dial permit taken, a request that reaches quarantine
+/// must not wait: it leaves its in-flight claim in place and stays a
+/// suppressed miss (issue #6018, review L2).
+#[tokio::test]
+async fn redis_quarantine_without_a_dial_permit_never_waits() {
+    use ferrum_edge::_test_support::{
+        RedisConfig, ai_semantic_cache_quarantine_invalid_redis_entry_for_test,
+        ai_semantic_cache_redis_quarantine_hold_all_dials_for_test,
+        redis_client_without_server_clock_for_test,
+    };
+
+    let plugin = make_plugin(json!({}));
+    let cache_key = "permit-exhausted-key";
+    let fingerprint = quarantine_fp("permit-exhausted");
+    assert!(ai_semantic_cache_redis_quarantine_try_claim_for_test(
+        &plugin, cache_key, fingerprint
+    ));
+
+    let held = ai_semantic_cache_redis_quarantine_hold_all_dials_for_test(&plugin);
+    assert_eq!(held.len(), 4, "the test must hold every dial permit");
+
+    // An unroutable client proves the dial is never attempted: if it were, the
+    // call would wait on the connect timeout instead of returning at once.
+    let redis = redis_client_without_server_clock_for_test(RedisConfig {
+        url: "redis://127.0.0.1:1/0".to_string(),
+        tls: false,
+        key_prefix: "ferrum:test".to_string(),
+        pool_size: 1,
+        connect_timeout_seconds: 5,
+        health_check_interval_seconds: 3600,
+        username: None,
+        password: None,
+    });
+
+    let started = std::time::Instant::now();
+    ai_semantic_cache_quarantine_invalid_redis_entry_for_test(
+        &plugin,
+        &redis,
+        "ferrum:test:redis-key",
+        cache_key,
+        fingerprint,
+        b"{}",
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a request without a dial permit must not wait"
+    );
+    assert!(
+        ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, cache_key),
+        "the in-flight claim must stay in place when no permit is available"
+    );
+
+    drop(held);
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_dial_permits_for_test(&plugin),
+        4,
+        "permits return when the holder drops"
+    );
+}
+
 /// Source text with every whitespace run removed and trailing commas before a
 /// closing delimiter dropped, so structural source pins compare tokens rather
 /// than rustfmt layout (issue #6018).

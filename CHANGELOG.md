@@ -18,11 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marker is cleared on success or a proven mismatch and kept, bounded by the
   30s marker TTL, on failure. Each plugin instance also runs at most 4 dedicated
   quarantine connections at once, and requests never wait for one. A refused
-  or timed-out quarantine dial (other than proven Cluster topology), or a
-  `max number of clients reached` reply on the quarantine connection, keeps the
-  local marker and leaves an otherwise healthy client available. A proven
-  mismatch now returns without `UNWATCH`, so `UNWATCH` is no longer part of
-  the semantic cache's Redis command profile.
+  or timed-out quarantine TCP/handshake connect, an `INFO CLUSTER` topology
+  probe that did not complete on that extra socket, or a `max number of clients
+  reached` reply on the quarantine connection, keeps the local marker and leaves
+  an otherwise healthy client available. A proven Cluster topology stays
+  terminal, and DNS-resolution, egress, and client-construction failures keep the
+  ordinary availability policy. A proven mismatch now returns without `UNWATCH`,
+  so `UNWATCH` is no longer part of the semantic cache's Redis command profile.
 - **Deduplication Redis compare-and-delete / compare-and-set keep writes
   inside the watched transaction** (issue #6018). The ownership-release and
   result-publication helpers pipelined `MULTI` with the `DEL`/`SET`, so a Redis

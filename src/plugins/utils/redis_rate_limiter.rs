@@ -1443,9 +1443,10 @@ enum DedicatedDialPurpose {
     /// Optional cache-quarantine maintenance. The shared client just served
     /// the read that triggered it, so a refused or timed-out *extra* socket
     /// (most often a server connection limit) is local to that connection and
-    /// must not mark the shared client unavailable. Proven Cluster topology,
-    /// egress denials, and DNS failures still apply, and every command on an
-    /// established connection keeps the ordinary classification.
+    /// must not mark the shared client unavailable. A topology screen that does
+    /// not complete on the extra socket is likewise local to it. Proven Cluster
+    /// topology, egress denials, and DNS failures still apply, and every
+    /// command on an established connection keeps the ordinary classification.
     OptionalMaintenance,
 }
 
@@ -4055,7 +4056,7 @@ impl RedisRateLimitClient {
                 // no-eviction memory policy) before the connection is published
                 // to the hot path: a Cluster endpoint or an evicting Redis must
                 // never serve a policy operation.
-                if !self.screen_and_arm(&mut conn).await {
+                if !self.screen_and_arm(&mut conn, DedicatedDialPurpose::Policy).await {
                     return None;
                 }
                 // Re-check at the publication boundary: another task may have
@@ -4176,7 +4177,7 @@ impl RedisRateLimitClient {
             Ok(mut conn) => {
                 // Screen topology (and replay no-eviction policy) before any
                 // WATCH/MULTI sequence runs on it.
-                if !self.screen_and_arm(&mut conn).await {
+                if !self.screen_and_arm(&mut conn, purpose).await {
                     return None;
                 }
                 // Same publication boundary as the pooled path: a concurrent
@@ -4347,7 +4348,17 @@ impl RedisRateLimitClient {
     /// Reject a freshly established connection whose server reports Cluster
     /// topology, or one that could not be screened at all. Returns `true` only
     /// when the connection may be used.
-    async fn screen_topology(&self, conn: &mut impl redis::aio::ConnectionLike) -> bool {
+    ///
+    /// `purpose` decides only what an incomplete screen means: for
+    /// [`DedicatedDialPurpose::Policy`] it is an ordinary retryable outage, and
+    /// for [`DedicatedDialPurpose::OptionalMaintenance`] it is local to the
+    /// optional extra socket and leaves the shared client available. A proven
+    /// Cluster is terminal either way.
+    async fn screen_topology(
+        &self,
+        conn: &mut impl redis::aio::ConnectionLike,
+        purpose: DedicatedDialPurpose,
+    ) -> bool {
         match screen_connection_topology(conn, self.connect_timeout()).await {
             TopologyScreen::Usable => true,
             TopologyScreen::ClusterProven => {
@@ -4358,6 +4369,21 @@ impl RedisRateLimitClient {
                 false
             }
             TopologyScreen::ProbeFailed => {
+                // The extra quarantine socket is optional maintenance: the
+                // pooled client just served the read that triggered it, so a
+                // screen that did not complete over that socket is local to it
+                // and must not take the shared client out of service. A proven
+                // Cluster (`ClusterProven`) is still terminal. Bounded by the
+                // configured connect timeout; the unscreened connection is
+                // dropped and never carries a command.
+                if purpose == DedicatedDialPurpose::OptionalMaintenance {
+                    warn_sampled!(
+                        operation = "quarantine connect",
+                        classification = "screen_failed",
+                        "Redis quarantine topology screen did not complete; suppressing the entry locally, retaining backend availability"
+                    );
+                    return false;
+                }
                 // Bounded by the configured connect timeout. Never proof of
                 // Cluster topology, and never a licence to run a policy command
                 // on the unscreened connection — an ordinary retryable outage.
@@ -4438,8 +4464,9 @@ impl RedisRateLimitClient {
     async fn screen_established_connection(
         &self,
         conn: &mut impl redis::aio::ConnectionLike,
+        purpose: DedicatedDialPurpose,
     ) -> bool {
-        self.screen_topology(conn).await && self.screen_memory_policy(conn).await
+        self.screen_topology(conn, purpose).await && self.screen_memory_policy(conn).await
     }
 
     /// Screen a freshly established connection and, when it is usable, install
@@ -4459,8 +4486,12 @@ impl RedisRateLimitClient {
     /// admission orders a shared ladder on the server's clock, so requiring the
     /// command of a replay, idempotency, cache, or token-accounting client
     /// would take a deployment out of service over a command it never sends.
-    async fn screen_and_arm(&self, conn: &mut redis::aio::MultiplexedConnection) -> bool {
-        if !self.screen_established_connection(conn).await {
+    async fn screen_and_arm(
+        &self,
+        conn: &mut redis::aio::MultiplexedConnection,
+        purpose: DedicatedDialPurpose,
+    ) -> bool {
+        if !self.screen_established_connection(conn, purpose).await {
             return false;
         }
         conn.set_response_timeout(SCREENED_COMMAND_RESPONSE_TIMEOUT);
@@ -5746,10 +5777,11 @@ impl RedisRateLimitClient {
     /// Quarantine is optional maintenance. A permission denial (including one
     /// nested in an EXECABORT) or a server connection limit returns Err so the
     /// caller suppresses the key locally until its marker expires, without
-    /// changing Redis availability; so does any non-topology failure to dial
-    /// the extra connection (`DedicatedDialPurpose::OptionalMaintenance`).
-    /// Transport/protocol failures on the established connection and
-    /// unsupported topology retain the ordinary availability policy.
+    /// changing Redis availability; so does any failure to dial or screen the
+    /// extra connection that does not prove Cluster topology
+    /// (`DedicatedDialPurpose::OptionalMaintenance`). Transport/protocol
+    /// failures on the established connection and proven unsupported topology
+    /// retain the ordinary availability policy.
     ///
     /// A proven mismatch returns `Ok(false)` without `UNWATCH`: every exit
     /// drops the dedicated connection, which discards its `WATCH` state, so an
