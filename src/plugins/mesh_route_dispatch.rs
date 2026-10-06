@@ -1801,8 +1801,8 @@ fn rule_reads_changing_input(rule: &RouteRule, facts: EarlyRouteTotalFacts<'_>) 
 /// total is armed, so it adds no candidate (issue #6008): a redirect, a fault
 /// that always aborts, or a node-waypoint veto the request's authorization
 /// metadata already decides. A rule fault stands down when an earlier
-/// `fault_injection` already injected, so its abort is certain only when no
-/// such instance runs ahead of this one.
+/// `fault_injection` instance, or an earlier instance's rule fault, already
+/// injected, so its abort is certain only when neither runs ahead of this one.
 fn rule_answers_before_dispatch(
     ctx: &RequestContext,
     rule: &RouteRule,
@@ -2239,6 +2239,10 @@ impl Plugin for MeshRouteDispatch {
             return Some(step.or_skipped());
         }
         Some(step)
+    }
+
+    fn may_inject_route_fault(&self) -> bool {
+        self.config.rules.iter().any(|rule| rule.fault.is_some())
     }
 
     async fn before_proxy(

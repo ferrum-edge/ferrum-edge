@@ -27,7 +27,7 @@ use crate::config::types::{
     BackendScheme, CountryMmdbLoadSession, CountryMmdbSnapshot, GatewayConfig,
     MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES, PluginScope, Proxy,
 };
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
@@ -36,6 +36,7 @@ use crate::adaptive_concurrency::{
 use crate::config::types::PluginConfig;
 use crate::plugins::early_route_total::{
     EarlyRouteTotalFacts, EarlyRouteTotalPlan, EarlyRouteTotalStep,
+    undeclared_plugin_disabling_early_route_bound,
 };
 use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
 use crate::plugins::utils::jwks_cache::{JwksRefreshRequirement, retain_active_requirements};
@@ -1071,6 +1072,9 @@ impl Plugin for PluginInstanceWrapper {
             },
             None => step.or_skipped(),
         })
+    }
+    fn may_inject_route_fault(&self) -> bool {
+        self.inner.may_inject_route_fault()
     }
     fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
         self.inner.country_mmdb_snapshot()
@@ -5264,6 +5268,21 @@ const ALL_PROXY_PROTOCOLS: [ProxyProtocol; 5] = [
     ProxyProtocol::Udp,
 ];
 
+/// Tell the operator, once per proxy chain built, that an undeclared custom
+/// plugin turns off the early `mesh_route_dispatch` route bound (issue #6008).
+fn log_undeclared_early_route_bound_plugin(proxy_id: Option<&str>, plugins: &[Arc<dyn Plugin>]) {
+    let Some(plugin) = undeclared_plugin_disabling_early_route_bound(plugins) else {
+        return;
+    };
+    info!(
+        scope = %crate::startup::sanitize_startup_scalar(proxy_id.unwrap_or("global")),
+        plugin = %crate::startup::sanitize_startup_scalar(plugin),
+        "Custom plugin does not declare its request input mutations \
+         (`declares_request_input_mutations`); bodies collected before `before_proxy` \
+         on this chain get no early `mesh_route_dispatch` route bound"
+    );
+}
+
 fn build_protocol_entry(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> ProtocolEntry {
     let filtered = filter_for_protocol(plugins, proto);
     let phase = build_phase_data(&filtered);
@@ -5325,12 +5344,14 @@ fn build_protocol_snapshot(
         }
         proxy.insert(proxy_id.clone(), inner);
         grpc_web_proxy.insert(proxy_id.clone(), build_grpc_web_protocol_entry(plugins));
+        log_undeclared_early_route_bound_plugin(Some(proxy_id.as_str()), plugins);
     }
 
     let mut global = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
     for &proto in &ALL_PROXY_PROTOCOLS {
         global.insert(proto, build_protocol_entry(globals, proto));
     }
+    log_undeclared_early_route_bound_plugin(None, globals);
 
     let grpc_web_global = build_grpc_web_protocol_entry(globals);
 
@@ -7603,6 +7624,7 @@ impl PluginCache {
                     inner.insert(proto, build_protocol_entry(plugins, proto));
                 }
                 new_proxy_proto.insert(proxy_key.clone(), inner);
+                log_undeclared_early_route_bound_plugin(Some(proxy_key.as_str()), plugins);
                 new_grpc_web_proxy.insert(proxy_key, build_grpc_web_protocol_entry(plugins));
             }
         }
@@ -7611,6 +7633,7 @@ impl PluginCache {
             for &proto in &ALL_PROXY_PROTOCOLS {
                 g.insert(proto, build_protocol_entry(&new_globals, proto));
             }
+            log_undeclared_early_route_bound_plugin(None, &new_globals);
             g
         } else {
             current.protocol_snapshot.global.clone()

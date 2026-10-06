@@ -9262,12 +9262,17 @@ is the `before_dispatch` `504` above, and gRPC folds the total into
   it runs ahead of the instance. Every custom plugin counts whatever its
   priority, and one that does not return `true` from
   `declares_request_input_mutations()` is treated as able to rewrite any input
-  (see `CUSTOM_PLUGINS.md`).
+  (see `CUSTOM_PLUGINS.md`). The gateway logs this at `info` once per proxy
+  chain at startup and reload when that chain also runs `mesh_route_dispatch`
+  and collects a body before `before_proxy`. `key_auth` with
+  `hide_credentials` and a `query:` location counts as rewriting the query.
 - Plugins that always write a fixed set of headers declare those names
   (`correlation_id` its `header_name`, `otel_tracing` `traceparent` /
-  `tracestate`, `rate_limiting` its `x-ratelimit-*` set, `grpc_deadline`
-  `grpc-timeout`, `sse` `accept-encoding` / `last-event-id`, `compression` the
-  `accept-encoding` / `content-encoding` / `content-length` set), so a rule on
+  `tracestate`, `rate_limiting` its `x-ratelimit-*` set and
+  `x-ratelimit-identity`, `grpc_deadline` `grpc-timeout`, `sse`
+  `accept-encoding` / `last-event-id`, `compression` the `accept-encoding` /
+  `cache-control` / `content-encoding` / `content-length` /
+  `x-ferrum-original-content-encoding` set), so a rule on
   any other header stays decided alongside them.
 - An instance whose trigger reads an identity that is not yet established, or
   any input that may still change, may or may not run. So may an instance a
@@ -9275,7 +9280,8 @@ is the `before_dispatch` `504` above, and gRPC folds the total into
 - The early bound is then the **largest** total among the rules that could
   still be selected. An outcome answered without dispatch arms no total and
   adds no candidate: a redirect, a fault that always aborts (unless a
-  `fault_injection` instance runs ahead and may inject first), a waypoint veto
+  `fault_injection` instance, or an earlier `mesh_route_dispatch` instance with
+  a rule fault, runs ahead and may inject first), a waypoint veto
   the request's authorization metadata already decides, and the `404` the
   cache's finalizer returns when no instance of a `reject_unmatched` chain
   matched. If any candidate is untimed (including "no rule matches" without

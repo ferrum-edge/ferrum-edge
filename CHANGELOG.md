@@ -85,10 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declare the headers they write, so a rule on any other header stays
   decided. The bound for an undetermined rule is the largest total among the
   rules that could still be selected. A request that would be answered
-  without dispatch adds no candidate: a redirect, a fault that always aborts,
-  a decided waypoint veto, or the deferred unmatched `404` of a
+  without dispatch adds no candidate: a redirect, a fault that always aborts
+  (unless `fault_injection` or an earlier instance's rule fault may inject
+  first), a decided waypoint veto, or the deferred unmatched `404` of a
   `reject_unmatched` chain. If any candidate is untimed, the read/RPC bounds
-  apply as before; set a finite `backend_read_timeout_ms` on such routes. A
+  apply as before; set a finite `backend_read_timeout_ms` on such routes. An
+  undeclared custom plugin that disables the early bound on a proxy is logged
+  at `info` once per proxy chain on startup and reload. A
   completed early body and its buffer charge are released before
   authentication or authorization rejection hooks run. **Known limitation:**
   an instance with an execution trigger stays undetermined whenever any

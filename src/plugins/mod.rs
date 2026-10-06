@@ -10851,6 +10851,14 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Whether a matched rule of this instance may inject a fault, which marks
+    /// the request `fault_injected` so a later instance's rule fault stands
+    /// down. Consulted only by the early route-total preview (issue #6008).
+    #[doc(hidden)]
+    fn may_inject_route_fault(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin participates in target-aware backend
     /// admission after load balancing and before backend dispatch.
     fn is_backend_admission_plugin(&self) -> bool {

@@ -88,8 +88,9 @@ pub struct EarlyRouteTotalFacts<'a> {
     pub destination_may_change: bool,
     /// An earlier undecided instance may have rewritten the forwarded Host.
     pub host_unknown: bool,
-    /// A `fault_injection` instance runs ahead of this one. When it injects,
-    /// a route rule's own fault stands down, so no rule's abort is certain.
+    /// A `fault_injection` instance, or an earlier instance with a rule
+    /// fault, runs ahead of this one. When it injects, a route rule's own
+    /// fault stands down, so no rule's abort is certain.
     pub route_faults_may_be_preempted: bool,
 }
 
@@ -225,6 +226,32 @@ fn rewrites_inputs_before_before_proxy(plugin: &dyn Plugin) -> bool {
         || plugin.normalizes_buffered_request_body_before_before_proxy()
 }
 
+/// The first custom plugin in `plugins` that has not declared its request
+/// input mutations, when the chain also runs a `mesh_route_dispatch` instance
+/// and collects a body before `before_proxy`. Such a plugin may rewrite any
+/// routing input, so that body gets no early route bound.
+pub(crate) fn undeclared_plugin_disabling_early_route_bound(
+    plugins: &[Arc<dyn Plugin>],
+) -> Option<&str> {
+    let dispatches = plugins
+        .iter()
+        .any(|plugin| plugin.name() == MESH_ROUTE_DISPATCH);
+    let collects_early = plugins.iter().any(|plugin| {
+        plugin.requires_request_body_before_before_proxy()
+            || plugin.requires_request_body_before_authenticate()
+            || plugin.requires_request_body_before_authorize()
+    });
+    if !dispatches || !collects_early {
+        return None;
+    }
+    plugins
+        .iter()
+        .find(|plugin| {
+            !is_builtin_plugin_name(plugin.name()) && !plugin.declares_request_input_mutations()
+        })
+        .map(|plugin| plugin.name())
+}
+
 /// Whether the request may still be unmatched by every instance so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unmatched {
@@ -281,6 +308,10 @@ impl EarlyRouteTotalPlan {
                     changes: changes.clone(),
                     route_faults_may_be_preempted,
                 });
+                // A fault this instance's matched rule injects (a delay, or a
+                // partial abort) marks the request, so a later instance's
+                // rule fault stands down.
+                route_faults_may_be_preempted |= plugin.may_inject_route_fault();
                 continue;
             }
             changes.record(plugin.as_ref());

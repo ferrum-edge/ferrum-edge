@@ -434,6 +434,34 @@ async fn the_request_decompression_normalizer_counts_whatever_its_priority() {
 }
 
 #[tokio::test]
+async fn a_hidden_query_credential_undecides_query_rules() {
+    let rules = json!([
+        rule(json!({"query_params": {"api_key": "batch"}}), Some(9000)),
+        path_rule("/", Some(1000)),
+    ]);
+    let hidden = json!({"key_location": "query:api_key", "hide_credentials": true});
+    let plugins = [built_in("key_auth", hidden), dispatch(rules.clone())];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(9000),
+        "`key_auth` strips the credential from the forwarded query in `authenticate`"
+    );
+    let shown = json!({"key_location": "query:api_key"});
+    let plugins = [built_in("key_auth", shown), dispatch(rules)];
+    assert_eq!(preview(&plugins, &request("/soap", &[])), Some(1000));
+}
+
+#[tokio::test]
+async fn compression_declares_its_no_transform_merge() {
+    let compression = built_in("compression", json!({"decompress_request": true}));
+    let names = compression
+        .modified_request_header_names()
+        .expect("a fixed header set");
+    let declared = names.iter().any(|name| name == "cache-control");
+    assert!(declared, "{names:?}");
+}
+
+#[tokio::test]
 async fn fixed_header_writers_undecide_only_the_headers_they_write() {
     let plugins = [
         built_in("correlation_id", json!({})),
@@ -494,6 +522,43 @@ async fn a_certain_fault_abort_adds_no_candidate() {
         Some(700),
         "an earlier `fault_injection` may inject first, and the rule's fault then stands down"
     );
+}
+
+#[tokio::test]
+async fn an_earlier_instance_rule_fault_preempts_a_later_certain_abort() {
+    // Instance A's matched rule delays, which marks the request
+    // `fault_injected`, so instance B's 100% abort stands down and B
+    // publishes its untimed override instead.
+    let first = json!([{
+        "match": {"uri": {"prefix": "/"}},
+        "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+        "request_timeout_ms": 60000,
+        "fault": {"delay": {"duration_ms": 1, "percentage": 100.0}}
+    }]);
+    let second = json!([
+        {
+            "match": {"headers": {"x-tenant": "gold"}},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+        },
+        path_rule("/soap", Some(2000)),
+    ]);
+    let plugins = [header_mutator(), dispatch(first), dispatch(second)];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        None,
+        "`x-tenant` may still change, and the abort it selects may stand down untimed"
+    );
+
+    // The chain once the mutator wrote `x-tenant: gold`: no total is armed,
+    // so a 2s early bound would have been stricter than the eventual route.
+    let mut ctx = request("/soap", &[("x-tenant", "gold")]);
+    let mut headers = ctx.headers.clone();
+    for plugin in &plugins[1..] {
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    }
+    assert_eq!(ctx.route_override_request_timeout_ms, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +744,72 @@ async fn the_cached_preview_agrees_with_the_before_proxy_chain() {
         let published = published_total(&cache, build()).await;
         assert_eq!(previewed, published, "{method} {path}?{query} drifted");
         assert_eq!(previewed, expected, "{method} {path}?{query}");
+    }
+}
+
+#[tokio::test]
+async fn the_cached_preview_agrees_with_fault_and_veto_outcomes() {
+    const AUTHORIZED_UPSTREAM: &str = "mesh_authz.node_waypoint_authorized_upstream_id";
+    let faults = json!({ "rules": [
+        {
+            "match": {"uri": {"prefix": "/abort"}},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "request_timeout_ms": 700,
+            "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+        },
+        {
+            "match": {"uri": {"prefix": "/delay"}},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "request_timeout_ms": 600,
+            "fault": {"delay": {"duration_ms": 1, "percentage": 100.0}}
+        },
+        path_rule("/soap", Some(1500)),
+    ]});
+    let single = cached(vec![mesh_config("route", faults)]);
+    let delay_all = json!({ "rules": [{
+        "match": {"uri": {"prefix": "/"}},
+        "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+        "request_timeout_ms": 60000,
+        "fault": {"delay": {"duration_ms": 1, "percentage": 100.0}}
+    }]});
+    let abort_soap = json!({ "rules": [{
+        "match": {"uri": {"prefix": "/soap"}},
+        "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+        "request_timeout_ms": 2000,
+        "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+    }]});
+    // Explicit order: the delaying instance runs first.
+    let mut second = mesh_config("route-b", abort_soap);
+    second.priority_override = Some(2996);
+    let multi = cached(vec![mesh_config("route-a", delay_all), second]);
+
+    // (chain, path, waypoint-authorized upstream, total the chain arms)
+    let fixtures: [(&PluginCache, &str, Option<&str>, Option<u64>); 6] = [
+        // A certain abort answers before any total.
+        (&single, "/abort", None, None),
+        // A delay still dispatches under the rule's total.
+        (&single, "/delay", None, Some(600)),
+        (&single, "/soap", None, Some(1500)),
+        // The waypoint authorized another destination: a decided veto.
+        (&single, "/soap", Some("stable"), None),
+        // The earlier instance's rule delay marks the request injected, so
+        // the later instance's certain abort stands down and dispatches.
+        (&multi, "/soap", None, Some(2000)),
+        (&multi, "/rest", None, Some(60000)),
+    ];
+    for (cache, path, authorized, expected) in fixtures {
+        let build = || {
+            let mut ctx = request(path, &[]);
+            if let Some(upstream) = authorized {
+                ctx.metadata
+                    .insert(AUTHORIZED_UPSTREAM.to_string(), upstream.to_string());
+            }
+            ctx
+        };
+        let previewed = cached_preview(cache, &build());
+        let published = published_total(cache, build()).await;
+        assert_eq!(previewed, published, "{path} ({authorized:?}) drifted");
+        assert_eq!(previewed, expected, "{path} ({authorized:?})");
     }
 }
 
