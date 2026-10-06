@@ -986,7 +986,24 @@ fn all_grouped_paths_carry_the_authorization_plan_to_their_actual_boundaries() {
         "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
         "Err(GrpcProxyError::AuthorizationExpired",
     );
-    assert!(native.contains("authorization_expired_grpc_precommit"));
+    // The buffered final check rewrites the collected response in place before
+    // the committed observers and the single transaction summary; it never
+    // logs a second rejection summary after the protected one.
+    assert!(!native.contains("authorization_expired_grpc_precommit"));
+    assert!(!native.contains("boxed_finalize_authorization_expired_rejection("));
+    let gate = "apply_buffered_grpc_precommit_authorization_terminal(";
+    assert_eq!(native.matches(gate).count(), 2);
+    let committed = offset_of(native, "run_deadline_bounded_response_committed_hooks(");
+    let summary = offset_of(native, "let summary = TransactionSummary {");
+    assert!(offset_of(native, gate) < committed);
+    let last_gate = native.rfind(gate).expect("authoritative pre-log gate");
+    assert!(committed < last_gate && last_gate < summary);
+    // The collected response is real backend evidence: health and admission
+    // settle before any response hook can run or the client can disconnect.
+    let hooks = offset_of(native, "run_after_proxy_hooks(");
+    assert!(offset_of(native, "permits.record_backend_outcome(") < hooks);
+    assert!(offset_of(native, "record_grpc_backend_dispatch_outcome(") < hooks);
+    assert!(!native.contains("cb_probe.release_neutral()"));
     let sidecar = source_region(
         PROXY_SOURCE,
         "async fn proxy_to_backend_mesh_mtls(",

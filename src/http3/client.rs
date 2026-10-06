@@ -1312,6 +1312,12 @@ impl<'a> H3Authorization<'a> {
         }
     }
 
+    /// No authorization plan and no client deadline: only the operator's own
+    /// protocol timeouts bound this request.
+    fn is_unbounded(self) -> bool {
+        self.plan.is_none() && self.client_deadline_at.is_none()
+    }
+
     fn compose(
         self,
         protocol_at: Option<tokio::time::Instant>,
@@ -1485,7 +1491,12 @@ where
     let bound = compose_h3_connection_checkout_bound(connect_at.get().copied(), dispatch);
     // Only the creator has a connect instant. Pool waiters keep their own
     // admitted lifetime; they do not inherit another request's authorization.
-    if (connect_at.get().is_some() || !matches!(&result, Ok(Ok(_))))
+    // A connection that WAS established is never reclassified here: a late
+    // scheduler wake past the connect instant must not report a successful
+    // dial as `ConnectionTimeout` (tripping the breaker or marking the backend
+    // H3-unsupported). Its authorization lifetime is still enforced by the
+    // per-poll gate on the request send that follows.
+    if !matches!(&result, Ok(Ok(_)))
         && let Some(source) = bound.elapsed()
     {
         return Err(match source {
@@ -1640,6 +1651,13 @@ async fn recv_h3_response_under_authorization(
     read_timeout_ms: u64,
     auth: H3Authorization<'_>,
 ) -> H3PoolResult<http::Response<()>> {
+    // With no authorization plan and no client deadline there is nothing to
+    // compose with the read timeout `recv_h3_response_with_timeout` already
+    // applies, so an unauthenticated request skips the outer bound and its
+    // second timer.
+    if auth.is_unbounded() {
+        return recv_h3_response_with_timeout(stream, read_timeout_ms).await;
+    }
     let protocol_at = if read_timeout_ms > 0 {
         tokio::time::Instant::now().checked_add(Duration::from_millis(read_timeout_ms))
     } else {
