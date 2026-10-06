@@ -1355,7 +1355,8 @@ mod h2_reset_origin_classification {
     enum UploadEnd {
         Reset(h2::Reason),
         EndStream,
-        Other(String),
+        // Only read through `Debug` in assertion messages.
+        Other(#[allow(dead_code)] String),
     }
 
     /// Serve one HTTP/2 stream on `io` that never answers: read the first
