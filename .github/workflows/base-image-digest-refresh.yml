@@ -3,7 +3,9 @@
 # `verify_ci_runtime_cache.py` (`check_dockerfile_image_pins`) requires every
 # `FROM` and `ARG` image reference in the four Dockerfiles to carry an immutable
 # digest. A pin that nothing refreshes ages silently: base-image CVE fixes never
-# arrive. Dependabot's docker ecosystem reads `FROM` lines only, so the
+# arrive. The separately frozen Cross inventory job below reports drift for
+# trusted-policy rotation; it never rewrites the admitted Cross pin. Dependabot's
+# docker ecosystem reads `FROM` lines only, so the
 # `ARG <NAME>=<image>:<tag>@sha256:...` defaults — which is every input of
 # `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile` — need
 # this job.
@@ -130,4 +132,41 @@ jobs:
               --title "deps: refresh container base image digests" \
               --body "${PR_BODY}" \
               --label dependencies
+          fi
+
+  cross-image-drift:
+    name: Inspect the admitted Cross image pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Production build-input inventory: refresh by trusted policy rotation only.
+      CROSS_IMAGE_PIN: ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5@sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c
+    steps:
+      - name: Resolve Cross 0.2.5 without changing the admitted pin
+        run: |
+          set -euo pipefail
+          tagged="${CROSS_IMAGE_PIN%@*}"
+          admitted="${CROSS_IMAGE_PIN##*@}"
+          resolved="$(docker buildx imagetools inspect "$tagged" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          if [[ ! "$resolved" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Cross registry did not return a complete OCI digest"
+            exit 1
+          fi
+          {
+            echo '### Production Cross image inventory'
+            echo "Tag: $tagged"
+            echo "Admitted OCI index: $admitted"
+            echo "Published OCI index: $resolved"
+            echo 'Host platform: linux/amd64; target: aarch64-unknown-linux-gnu'
+            echo 'A changed index requires independent platform/input review and trusted-base policy admission.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$resolved" != "$admitted" ]; then
+            echo "::error::Cross tag drift: prepare a reviewed trusted-policy rotation; do not remove or auto-replace the pin"
+            exit 1
           fi
