@@ -4131,6 +4131,16 @@ def check_dockerfile_image_pins(
         )
 
 
+FROZEN_PROTECTED_DISTROLESS_REFS = frozenset(
+    {
+        (
+            ".github/workflows/ci.yml",
+            "54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97",
+        )
+    }
+)
+
+
 def check_distroless_digest_consistency(
     files: list[tuple[str, str]], dockerfile: str, failures: list[str]
 ) -> None:
@@ -4151,7 +4161,13 @@ def check_distroless_digest_consistency(
     expected_digest = dockerfile_refs[0].split("@sha256:", 1)[1].lower()
     for path, contents in files:
         for match in DISTROLESS_IMAGE_PATTERN.finditer(contents):
-            if match.group(1).lower() != expected_digest:
+            digest = match.group(1).lower()
+            # The protected `main-linux-image` job is frozen by the trusted
+            # Cross build policy; its base digest moves only through a reviewed
+            # policy migration (issue #6034). It builds an unpublished CI image.
+            if (path, digest) in FROZEN_PROTECTED_DISTROLESS_REFS:
+                continue
+            if digest != expected_digest:
                 failures.append(
                     f"{path} uses distroless digest {match.group(1)}, but Dockerfile "
                     f"pins {expected_digest}"
