@@ -1082,17 +1082,33 @@ async fn capability_probe_failure_does_not_fail_a_joined_grpc_request() {
     let (sent_tx, sent_rx) = oneshot::channel();
     let rpc = tokio::spawn(send_probe_join_rpc(authority, sent_tx));
     sent_rx.await.expect("the gRPC request was sent");
-    // Let the request reach the pool and join the probe's pending setup.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let probe = *backend.stalled().last().expect("probe setup");
+    wait_for_request_in_flight(&harness).await;
+    // Give the in-flight request time to reach the pool.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The request is in flight but has not dialled: the backend accepted no
+    // setup besides the probe's, and the probe's is still open. With no
+    // plugins and a literal backend IP, the only place it can wait is the
+    // probe's pending pool create, so it joined that setup.
+    let stalled = backend.stalled();
+    let probe_open = stalled
+        .iter()
+        .any(|setup| setup.accepted_at == probe_accepted_at && setup.closed_at.is_none());
+    let request_dialled = stalled
+        .iter()
+        .any(|setup| setup.accepted_at > probe_accepted_at);
     assert!(
-        probe.accepted_at == probe_accepted_at && probe.closed_at.is_none(),
-        "the probe's setup must still be in flight, and the request must not have dialled \
-         its own stalled setup; logs:\n{}",
+        probe_open && !request_dialled,
+        "the request must be waiting on the probe's in-flight setup, not on its own dial; \
+         logs:\n{}",
         harness.captured_combined().unwrap_or_default()
+    );
+    assert!(
+        Instant::now().duration_since(probe_accepted_at) < Duration::from_secs(4),
+        "the probe's connect budget must still be running when its setup is dropped"
     );
 
     backend.serve();
+    let dropped_at = Instant::now();
     backend.drop_stalled();
     let (http_status, grpc_status) = tokio::time::timeout(Duration::from_secs(15), rpc)
         .await
@@ -1105,16 +1121,48 @@ async fn capability_probe_failure_does_not_fail_a_joined_grpc_request() {
          returning the probe's failure; logs:\n{}",
         harness.captured_combined().unwrap_or_default()
     );
+    let served = backend.served_accepts();
     assert_eq!(
-        backend.served_accepts().len(),
+        served.len(),
         1,
         "the joined request dials once after the probe's setup fails"
     );
+    assert!(
+        served[0] >= dropped_at,
+        "the request dialled only after the probe's setup failed"
+    );
+}
+
+/// Wait until the gateway counts a request in flight (authenticated
+/// `/overload`).
+async fn wait_for_request_in_flight(harness: &GatewayHarness) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let active = harness
+            .get_admin_json("/overload")
+            .await
+            .ok()
+            .and_then(|body| body.get("active_requests").and_then(Value::as_u64))
+            .unwrap_or(0);
+        if active >= 1 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gateway never counted the gRPC request in flight"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// The issue #6032 shape: the probe's setup stalls until its 5 s budget runs
 /// out. The joined request must outlive that budget and succeed on its own
 /// dial, inside its 30 s route connect budget.
+///
+/// Against the old code this fails only when the probe's inner connect timer
+/// fires before its outer probe timeout (the usual case, as both land on the
+/// same timer tick). The test above and the unit tests are the deterministic
+/// gates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn grpc_request_joining_the_startup_probe_keeps_its_route_connect_budget() {

@@ -2276,10 +2276,12 @@ impl GrpcPoolManager {
 /// live gRPC outage. Request-time dials keep the existing WARN/ERROR surface.
 ///
 /// Coalesced creates share one [`crate::pool::CoalescedCreateAttempt`]: if any live request
-/// participates in a failing attempt, request-time WARN/ERROR dominates even
-/// when a capability probe is the creator. Probe-only expected h2c misses stay
-/// DEBUG. A request that joins after a probe-only DEBUG may upgrade that one
-/// diagnostic once; waiters do not each emit.
+/// participates in a failing attempt, request-time WARN/ERROR dominates.
+/// Probe-only expected h2c misses stay DEBUG. A request that joins after a
+/// probe-only DEBUG may upgrade that one diagnostic once; waiters do not each
+/// emit. A create a capability probe owns keeps the probe's severity even when
+/// requests joined it: its failure is not theirs, and they re-dial and log
+/// their own outcome (issue #6032).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrpcEstablishmentPurpose {
     /// Live request-time gRPC dispatch, pool create, or any other production dial.
@@ -2392,7 +2394,10 @@ pub fn log_grpc_coalesced_establishment_failure(
     note_grpc_establishment_join(attempt, purpose);
     let last_addr = last_addr.to_string();
     attempt.store_log_context(host, &last_addr, error.to_string());
-    let effective = if attempt.request_participant() {
+    // Requests that joined a probe-owned create re-dial instead of returning
+    // this failure (issue #6032), and their own attempt logs at request
+    // severity. Upgrading here too would log one outage twice.
+    let effective = if attempt.request_participant() && !attempt.probe_owned() {
         GrpcEstablishmentPurpose::Request
     } else {
         purpose
@@ -2404,7 +2409,13 @@ pub fn log_grpc_coalesced_establishment_failure(
 }
 
 /// Late live-request upgrade of a probe-only DEBUG on the same attempt.
+///
+/// A probe-owned attempt is never upgraded: its failure is not delivered to
+/// request waiters, which re-dial under their own budget (issue #6032).
 pub fn upgrade_grpc_coalesced_establishment_log(attempt: &CoalescedCreateAttempt) {
+    if attempt.probe_owned() {
+        return;
+    }
     let Some((host, last_addr, error)) = attempt.log_context() else {
         return;
     };

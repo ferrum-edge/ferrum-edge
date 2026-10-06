@@ -448,6 +448,23 @@ impl CoalescedCreateAttempt {
         }
     }
 
+    /// Isolated attempt owned by a capability probe, for tests that drive log
+    /// ranking without a pool.
+    pub fn new_probe_owned() -> Self {
+        let pending = PendingCreation::owned_by(PoolCreateCaller::CapabilityProbe);
+        Self {
+            inner: Arc::new(pending),
+        }
+    }
+
+    /// A capability probe owns this create. Its failure is never a joined
+    /// request's outcome: request waiters re-elect and dial under their own
+    /// budget (issue #6032).
+    #[inline]
+    pub fn probe_owned(&self) -> bool {
+        self.inner.probe_owned
+    }
+
     /// Mark that a live request is participating in this create.
     #[inline]
     pub fn mark_request_participant(&self) {
