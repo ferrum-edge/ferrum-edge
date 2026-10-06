@@ -2378,10 +2378,8 @@ impl Http3ConnectionPool {
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let create = async {
-            boxed_h3_future(|| {
-                self.create_connection(proxy, &tls_config, Some(&h3_config), None)
-            })
-            .await
+            boxed_h3_future(|| self.create_connection(proxy, &tls_config, Some(&h3_config), None))
+                .await
         };
         self.create_or_get_sender_as(key, None, PoolCreateCaller::CapabilityProbe, create)
             .await
