@@ -5179,11 +5179,10 @@ impl Plugin for AiSemanticCache {
                     }
                     Ok(BoundedRedisValue::Empty) => {
                         let fingerprint = redis_quarantine_fingerprint_empty();
-                        if !self.redis_quarantine.try_claim(
-                            &cache_key,
-                            fingerprint,
-                            Instant::now(),
-                        ) {
+                        if !self
+                            .redis_quarantine
+                            .try_claim(&cache_key, fingerprint, Instant::now())
+                        {
                             self.redis_quarantine.note_suppression();
                         } else {
                             debug!("ai_semantic_cache: quarantining empty Redis entry");

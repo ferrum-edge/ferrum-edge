@@ -5850,8 +5850,14 @@ fn connection_limit_requires_the_exact_server_reply() {
         (b"-ERR max number of clients reached\r\n".as_slice(), true),
         (b"-ERR Max Number Of Clients Reached\r\n".as_slice(), true),
         (b"-ERR unknown command 'max'\r\n".as_slice(), false),
-        (b"-NOPERM max number of clients reached\r\n".as_slice(), false),
-        (b"-ERR value is max number of clients reached\r\n".as_slice(), false),
+        (
+            b"-NOPERM max number of clients reached\r\n".as_slice(),
+            false,
+        ),
+        (
+            b"-ERR value is max number of clients reached\r\n".as_slice(),
+            false,
+        ),
         (b"-MOVED 1 127.0.0.1:6379\r\n".as_slice(), false),
     ] {
         let error = redis::parse_redis_value(reply)
