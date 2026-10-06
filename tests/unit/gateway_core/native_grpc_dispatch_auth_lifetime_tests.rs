@@ -1787,12 +1787,7 @@ async fn native_h3_cold_checkout_success_woken_after_connect_instant_is_not_a_ti
 
     // The task wakes 100ms in: past every connect instant below, and past
     // the authorization instant only where one is 60ms.
-    for (connect_ms, auth_ms) in [
-        (40, None),
-        (40, Some(500)),
-        (40, Some(60)),
-        (80, Some(60)),
-    ] {
+    for (connect_ms, auth_ms) in [(40, None), (40, Some(500)), (40, Some(60)), (80, Some(60))] {
         let started = tokio::time::Instant::now();
         let plan = auth_ms.map(|ms| plan_after(Duration::from_millis(ms)));
         let connect_instant = started + Duration::from_millis(connect_ms);
