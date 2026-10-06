@@ -31,13 +31,13 @@ use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use ferrum_edge::PluginCache;
 use ferrum_edge::_test_support::{
     EarlyBodyCollectOutcomeForTest as Outcome, H3UploadWaitOutcomeForTest,
     buffer_early_request_body_for_test, collect_h3_upload_under_authorization_for_test,
     early_route_total_ms_for_test, early_upload_deadlines_for_test,
     plugin_cache_early_route_total_ms_for_test,
 };
+use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, create_plugin};
@@ -640,7 +640,13 @@ async fn the_cached_preview_agrees_with_the_before_proxy_chain() {
     let cache = cached(vec![mesh_config("route-a", first), second, triggered]);
 
     // (method, path, headers, query, total the chain arms)
-    type Fixture<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], &'a str, Option<u64>);
+    type Fixture<'a> = (
+        &'a str,
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        &'a str,
+        Option<u64>,
+    );
     let fixtures: [Fixture; 7] = [
         // Authority rewrite feeds the next instance.
         ("GET", "/soap/x", &[], "", Some(2500)),
