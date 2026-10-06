@@ -29,7 +29,8 @@ use crate::config::db_backend::{
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
-    ExternalSpecUpstreamConflict, sort_stored_rows, validate_deployment_candidate,
+    ExternalSpecUpstreamConflict, StoredEvidence, deployment_known_columns,
+    validate_deployment_candidate,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
@@ -2955,6 +2956,9 @@ impl DatabaseStore {
             .iter()
             .map(row_to_api_spec)
             .collect::<Result<Vec<_>, _>>()?;
+        // Release the driver copy of every stored spec document now that each
+        // is decoded, rather than holding both until the snapshot returns.
+        drop(rows);
         let namespace_record = self.get_namespace_tx(tx, namespace).await?;
         let row = sqlx::query(&self.q(
             "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM config_changes WHERE namespace = ?",
@@ -3004,10 +3008,13 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
+        use futures_util::TryStreamExt;
+
         let snapshot = self
             .conditional_namespace_snapshot_tx(tx, namespace)
             .await?;
-        let mut stored = serde_json::Map::new();
+        // Refuses an over-bound typed snapshot before any raw row is read.
+        let mut stored = StoredEvidence::for_snapshot(&snapshot)?;
         for table in [
             "proxies",
             "consumers",
@@ -3025,21 +3032,17 @@ impl DatabaseStore {
             } else {
                 "namespace"
             };
-            let rows = sqlx::query(&self.q(&format!("SELECT * FROM {table} WHERE {column} = ?")))
-                .bind(namespace)
-                .fetch_all(&mut **tx)
-                .await?;
-            let mut rows = rows
-                .iter()
-                .map(deployment_raw_sql_row)
-                .collect::<Result<Vec<_>, _>>()?;
-            sort_stored_rows(&mut rows);
-            stored.insert(table.to_string(), serde_json::Value::Array(rows));
+            let query = self.q(&format!("SELECT * FROM {table} WHERE {column} = ?"));
+            // Stream rows so each is converted and charged against the
+            // representation bound before the next one is fetched.
+            let mut rows = sqlx::query(&query).bind(namespace).fetch(&mut **tx);
+            while let Some(row) = rows.try_next().await? {
+                stored.push(deployment_raw_sql_row(&row)?)?;
+            }
+            drop(rows);
+            stored.end_table(table)?;
         }
-        Ok(DeploymentSnapshot {
-            snapshot,
-            stored: serde_json::Value::Object(stored),
-        })
+        Ok(stored.finish(snapshot))
     }
 
     async fn load_deployment_snapshot_inner(
@@ -3088,7 +3091,7 @@ impl DatabaseStore {
         let snapshot = self
             .deployment_snapshot_tx(tx, precondition.namespace)
             .await?;
-        if snapshot.representation()? != *precondition.expected {
+        if snapshot.digest()? != precondition.expected {
             return Err(NamespacePreconditionFailed.into());
         }
         crate::config::batch_atomicity::pause_conditional_restore_for_test(precondition.namespace)
@@ -7928,7 +7931,7 @@ impl DatabaseStore {
             let current = self
                 .conditional_namespace_snapshot_tx(&mut tx, graph.namespace)
                 .await?;
-            if current.representation()? != *restore.expected {
+            if current.digest()? != restore.expected {
                 return Err(anyhow::Error::new(NamespacePreconditionFailed));
             }
             crate::config::batch_atomicity::pause_conditional_restore_for_test(graph.namespace)
@@ -10945,105 +10948,8 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         use sqlx::Column;
         use sqlx::any::AnyTypeInfoKind;
-        let known: &[&str] = match table {
-            "proxies" => &[
-                "labels",
-                "id",
-                "namespace",
-                "name",
-                "hosts",
-                "listen_path",
-                "backend_scheme",
-                "backend_host",
-                "backend_port",
-                "backend_path",
-                "strip_listen_path",
-                "preserve_host_header",
-                "backend_connect_timeout_ms",
-                "backend_read_timeout_ms",
-                "backend_write_timeout_ms",
-                "backend_tls_client_cert_path",
-                "backend_tls_client_key_path",
-                "backend_tls_verify_server_cert",
-                "backend_tls_server_ca_cert_path",
-                "dns_override",
-                "dns_cache_ttl_seconds",
-                "auth_mode",
-                "upstream_id",
-                "upstream_subset",
-                "circuit_breaker",
-                "retry",
-                "response_body_mode",
-                "pool_idle_timeout_seconds",
-                "pool_enable_http_keep_alive",
-                "pool_enable_http2",
-                "pool_tcp_keepalive_seconds",
-                "pool_http2_keep_alive_interval_seconds",
-                "pool_http2_keep_alive_timeout_seconds",
-                "pool_http2_initial_stream_window_size",
-                "pool_http2_initial_connection_window_size",
-                "pool_http2_adaptive_window",
-                "pool_http2_max_frame_size",
-                "pool_http2_max_concurrent_streams",
-                "pool_http3_connections_per_backend",
-                "pool_max_requests_per_connection",
-                "listen_port",
-                "frontend_tls",
-                "passthrough",
-                "udp_idle_timeout_seconds",
-                "tcp_idle_timeout_seconds",
-                "websocket_idle_timeout_seconds",
-                "websocket_permessage_deflate",
-                "allow_path_parameters",
-                "allowed_methods",
-                "allowed_ws_origins",
-                "udp_max_response_amplification_factor",
-                "stream_proxy_protocol",
-                "backend_proxy_protocol",
-                "stream_match",
-                "api_spec_id",
-                "created_at",
-                "updated_at",
-            ],
-            "upstreams" => &[
-                "labels",
-                "id",
-                "namespace",
-                "name",
-                "targets",
-                "algorithm",
-                "hash_on",
-                "hash_on_cookie_config",
-                "health_checks",
-                "service_discovery",
-                "subsets",
-                "backend_tls_client_cert_path",
-                "backend_tls_client_key_path",
-                "backend_tls_verify_server_cert",
-                "backend_tls_server_ca_cert_path",
-                "backend_tls_sni",
-                "backend_tls_san_allow_list",
-                "api_spec_id",
-                "created_at",
-                "updated_at",
-            ],
-            "plugin_configs" => &[
-                "labels",
-                "id",
-                "namespace",
-                "plugin_name",
-                "config",
-                "scope",
-                "proxy_id",
-                "enabled",
-                "priority_override",
-                "trigger_json",
-                "api_spec_id",
-                "created_at",
-                "updated_at",
-            ],
-            "proxy_plugins" => &["namespace", "proxy_id", "plugin_config_id"],
-            _ => anyhow::bail!("Unsupported deployment resource table"),
+        let Some(known) = deployment_known_columns(table) else {
+            anyhow::bail!("Unsupported deployment resource table");
         };
         let predicate = if table == "proxy_plugins" {
             "namespace = ? AND proxy_id = ? AND plugin_config_id = ?"
@@ -14255,8 +14161,10 @@ fn deployment_raw_sql_row(row: &AnyRow) -> Result<serde_json::Value, anyhow::Err
             DeploymentSqlScalar::Real(value) => serde_json::json!({"bits": value.to_bits()}),
             DeploymentSqlScalar::Double(value) => serde_json::json!({"bits": value.to_bits()}),
             DeploymentSqlScalar::Text(value) => serde_json::json!(value),
+            // Digest and length only: a stored spec document must not be
+            // copied into the snapshot evidence.
             DeploymentSqlScalar::Blob(value) => {
-                serde_json::json!({"bytes_hex": hex::encode(value)})
+                crate::config::db_backend::stored_bytes_digest(&value)
             }
         };
         fields.insert(

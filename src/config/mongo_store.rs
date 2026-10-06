@@ -60,9 +60,10 @@ mod inner {
         ConditionalNamespaceSnapshot, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
         FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
         MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespacePreconditionFailed,
-        NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
-        ProxyDeleteAtomicityUnsupported, SnapshotDataIntegrityError, SortOrder,
-        TcpConnectionThrottleAttachmentConflict,
+        NamespaceResourceCounts, NamespaceSnapshotTooLarge, NamespacedResourceId,
+        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, ProxyDeleteAtomicityUnsupported,
+        SnapshotDataIntegrityError, SnapshotDigest, SortOrder,
+        TcpConnectionThrottleAttachmentConflict, is_namespace_snapshot_too_large,
     };
     use crate::config::db_loader::{
         GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash,
@@ -70,7 +71,7 @@ mod inner {
     };
     use crate::config::deployment_mutation::{
         DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
-        ExternalSpecUpstreamConflict, sort_stored_rows, validate_deployment_candidate,
+        ExternalSpecUpstreamConflict, StoredEvidence, validate_deployment_candidate,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -5399,6 +5400,9 @@ mod inner {
             if error.get_custom::<NamespacePreconditionFailed>().is_some() {
                 return anyhow::Error::new(NamespacePreconditionFailed);
             }
+            if error.get_custom::<NamespaceSnapshotTooLarge>().is_some() {
+                return anyhow::Error::new(NamespaceSnapshotTooLarge);
+            }
             match error.get_custom::<AtomicBatchAbort>().copied() {
                 Some(AtomicBatchAbort::AdmissionLeaseLost) => {
                     anyhow::Error::new(BatchAdmissionLeaseLost).context(
@@ -5534,7 +5538,9 @@ mod inner {
             let snapshot = self
                 .conditional_namespace_snapshot_in_session(session, connection.as_ref(), namespace)
                 .await?;
-            let mut stored = serde_json::Map::new();
+            // Refuses an over-bound typed snapshot before any raw document is
+            // read; each document is charged as it is converted.
+            let mut stored = StoredEvidence::for_snapshot(&snapshot)?;
             // Credential representations and uniqueness hashes live on consumers;
             // their partial unique indexes do not own separate documents.
             for name in [
@@ -5554,7 +5560,6 @@ mod inner {
                     doc! { "namespace": namespace }
                 };
                 let mut cursor = collection.find(filter).session(&mut *session).await?;
-                let mut rows = Vec::new();
                 while cursor.advance(&mut *session).await? {
                     let document = cursor.deserialize_current()?;
                     if matches!(
@@ -5568,20 +5573,23 @@ mod inner {
                             return Err(DeploymentGraphInvalid.into());
                         }
                     }
-                    // BSON bytes also fence scalar types, field order and all
-                    // unknown metadata that a typed serde decoder cannot expose.
-                    rows.push(serde_json::json!({
-                        "document": serde_json::to_value(&document)?,
-                        "bson_hex": hex::encode(mongodb::bson::to_vec(&document)?),
-                    }));
+                    // The BSON digest also fences scalar types, field order and
+                    // all unknown metadata that a typed serde decoder cannot
+                    // expose. Binary values (stored spec documents) appear only
+                    // as digest and length, never as their bytes.
+                    let bson = mongodb::bson::to_vec(&document)?;
+                    let bson_sha256 = hex::encode(crate::fips::approved::Sha256::digest(&bson));
+                    drop(bson);
+                    stored.push(serde_json::json!({
+                        "document": serde_json::to_value(deployment_evidence_bson(
+                            &Bson::Document(document),
+                        ))?,
+                        "bson_sha256": bson_sha256,
+                    }))?;
                 }
-                sort_stored_rows(&mut rows);
-                stored.insert(name.to_string(), serde_json::Value::Array(rows));
+                stored.end_table(name)?;
             }
-            Ok(DeploymentSnapshot {
-                snapshot,
-                stored: serde_json::Value::Object(stored),
-            })
+            Ok(stored.finish(snapshot))
         }
 
         async fn mutate_deployment_in_session(
@@ -5616,7 +5624,7 @@ mod inner {
             let snapshot = self
                 .deployment_snapshot_in_session(session, namespace)
                 .await?;
-            if snapshot.representation()? != *precondition.expected {
+            if snapshot.digest()? != precondition.expected {
                 return Err(NamespacePreconditionFailed.into());
             }
             let plan = snapshot.removal_plan(id)?;
@@ -6092,6 +6100,9 @@ mod inner {
                             if inner.chain().any(|e| e.is::<NamespacePreconditionFailed>()) {
                                 return anyhow::Error::new(NamespacePreconditionFailed);
                             }
+                            if is_namespace_snapshot_too_large(inner) {
+                                return anyhow::Error::new(NamespaceSnapshotTooLarge);
+                            }
                             if inner.chain().any(|e| e.is::<DeploymentGraphInvalid>()) {
                                 return anyhow::Error::new(DeploymentGraphInvalid);
                             }
@@ -6143,7 +6154,7 @@ mod inner {
                 }
             }
             let replacement = MongoConditionalRestorePlan {
-                expected: restore.expected.clone(),
+                expected: restore.expected,
                 spec_docs,
                 trust: restore
                     .gateway_trust_bundles
@@ -6309,10 +6320,15 @@ mod inner {
                     .map_err(|_| {
                         mongodb::error::Error::custom("Conditional namespace snapshot failed")
                     })?;
-                let representation = current.representation().map_err(|_| {
-                    mongodb::error::Error::custom("Conditional snapshot serialization failed")
+                let digest = current.digest().map_err(|error| {
+                    if is_namespace_snapshot_too_large(&error) {
+                        mongodb::error::Error::custom(NamespaceSnapshotTooLarge)
+                    } else {
+                        mongodb::error::Error::custom("Conditional snapshot serialization failed")
+                    }
                 })?;
-                if representation != replacement.expected {
+                drop(current);
+                if digest != replacement.expected {
                     return Err(mongodb::error::Error::custom(NamespacePreconditionFailed));
                 }
                 crate::config::batch_atomicity::pause_conditional_restore_for_test(
@@ -7895,8 +7911,28 @@ mod inner {
         replacement: Option<MongoConditionalRestorePlan>,
     }
 
+    /// Deployment evidence view of a stored BSON value: every binary value is
+    /// replaced by its SHA-256, length and subtype, recursively.
+    fn deployment_evidence_bson(value: &Bson) -> Bson {
+        match value {
+            Bson::Binary(binary) => Bson::Document(doc! {
+                "binary_sha256": hex::encode(crate::fips::approved::Sha256::digest(&binary.bytes)),
+                "len": i64::try_from(binary.bytes.len()).unwrap_or(i64::MAX),
+                "subtype": i32::from(u8::from(binary.subtype)),
+            }),
+            Bson::Document(document) => Bson::Document(
+                document
+                    .iter()
+                    .map(|(key, value)| (key.clone(), deployment_evidence_bson(value)))
+                    .collect(),
+            ),
+            Bson::Array(items) => Bson::Array(items.iter().map(deployment_evidence_bson).collect()),
+            other => other.clone(),
+        }
+    }
+
     struct MongoConditionalRestorePlan {
-        expected: serde_json::Value,
+        expected: SnapshotDigest,
         spec_docs: Vec<Document>,
         trust: Option<Vec<GatewayTrustBundleRecord>>,
     }

@@ -19,16 +19,30 @@ Read `GET /deployment-snapshot` with an admin-role JWT and the intended
 - `profile`: exactly `deployment-v1`.
 - `namespace_etag`: the same quoted token as the HTTP `ETag`.
 - `proxies`, `upstreams`, `plugin_configs`, `api_specs`: typed inspection data
-  from the same primary snapshot. Specs include the complete gzip bytes in
-  `spec_content` (a JSON byte array), content/hash/ownership metadata, and any
-  stored external-reference snapshot and digest.
+  from the same primary snapshot. Specs carry content/hash/ownership metadata;
+  the stored gzip document (`spec_content`) and any stored external-reference
+  snapshot appear as `{"sha256": "<hex of stored bytes>", "len": <bytes>}`.
+  `api_specs` is sorted by `id` in byte order and equals
+  `evidence.resources[5]`, whatever order or collation the store returns.
+- `api_spec_contents`: the stored bytes from the same snapshot, in the same
+  order as `api_specs`. Each entry is `{"id", "spec_content_base64",
+  "external_ref_snapshot_base64"}`, with `external_ref_snapshot_base64` `null`
+  when no external-reference snapshot is stored. Each value decodes to the
+  exact stored bytes whose `sha256`/`len` the evidence fences. Verify them
+  against `api_specs`. This is the only copy of the bytes in the response. It
+  sits outside `evidence`, so it is not part of the token's digest, but its
+  digest and length are, so one read recovers the original documents. Together
+  the base64 values are bounded at **256 MiB**. A namespace past that returns
+  `507` with `durable: "not_started"` and discloses nothing.
 - `evidence`: the complete comparison representation. It binds all namespace
-  resources, full specs, associations, trust, namespace metadata, the durable
-  change watermark, and raw stored rows/documents. SQL includes every column of
-  the resource and association tables, including credential indexes, with each
-  column's SQLx type, runtime value type and lossless scalar evidence (float bits
-  and blob bytes). Typed nulls retain their column type. MongoDB includes raw
-  documents and their BSON bytes, including embedded association metadata.
+  resources, spec metadata and stored-document digests, associations, trust,
+  namespace metadata, the durable change watermark, and raw stored
+  rows/documents. SQL includes every column of the resource and association
+  tables, including credential indexes, with each column's SQLx type, runtime
+  value type and lossless scalar evidence (float bits; blobs as `sha256`/`len`).
+  Typed nulls retain their column type. MongoDB includes raw documents (binary
+  values as `binary_sha256`/`len`/`subtype`) and the SHA-256 of their BSON
+  bytes (`bson_sha256`), covering embedded association metadata.
   MongoDB credential representations and uniqueness hashes are stored on
   `consumers` and covered by those raw documents; `consumer_identity_index`
   is the separate identity reservation collection. Lease maintenance and audit
@@ -39,8 +53,24 @@ spec/plugin material. Security-audit admission is mandatory before disclosure,
 independent of ordinary audit enablement. Keep the response and original token
 in encrypted recovery storage; do not put evidence or tokens in routine logs.
 A token uses a distinct `deployment-v1-` prefix and keyed HMAC under the admin
-JWT secret. Replicas must share that secret. A backup/restore namespace token or
-individual row token is not deployment authority.
+JWT secret over a bounded SHA-256 of the canonical evidence. Replicas must share
+that secret. A backup/restore namespace token or individual row token is not
+deployment authority. Stores compare that digest, not a retained copy of the
+evidence, inside the mutation transaction. A namespace whose canonical evidence
+would exceed **64 MiB** returns `507` with no token. Stores count typed
+resources against that bound before reading raw rows/documents, then count each
+raw row/document as they convert it. An over-bound namespace is therefore
+refused before the rest of its evidence is built. A snapshot read or the
+pre-transaction check of a mutation reports `durable: "not_started"`. A refusal
+raised inside the mutation transaction, which rolls back, reports
+`durable: "not_committed"`. A `507` is deterministic for unchanged namespace
+state, so do not retry it. Stored spec documents count only as their digest
+toward the 64 MiB bound, but every stored spec of the namespace is still loaded
+in full to compute it.
+Tokens issued before stored bytes were digested (v0.9.12) keep the
+`deployment-v1-` shape but no longer match: they fail closed with `412`.
+Finish or abandon in-flight recoveries before upgrading, then capture new
+authority; never refresh authority to retry a refused recovery.
 
 Snapshots require PostgreSQL, MySQL, SQLite or replica-set MongoDB. Standalone
 MongoDB returns `501`. Missing stores or unavailable/undecodable coherent state
@@ -136,6 +166,7 @@ body echoes. A confirmed response has `profile: "deployment-v1"`, `id`,
 | Commit confirmed but local apply, final audit, cursor capture or namespace admission lease release cannot be confirmed | 503 | `unconfirmed` | `false` |
 | Transport/store acknowledgement uncertain | 503 if a response is available | `unconfirmed` | `false`; durable state `unknown` |
 | Precondition/graph refusal | 412/409 | `unconfirmed` | `false`; durable state `not_committed` |
+| Namespace too large inside the mutation transaction | 507 | `unconfirmed` | `false`; durable state `not_committed` |
 
 Initial mode/evidence/admission failures may report `durable: "not_started"`.
 Legacy validation/authentication errors need not contain these acknowledgement
