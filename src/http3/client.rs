@@ -1312,6 +1312,12 @@ impl<'a> H3Authorization<'a> {
         }
     }
 
+    /// No authorization plan and no client deadline: only the operator's own
+    /// protocol timeouts bound this request.
+    fn is_unbounded(self) -> bool {
+        self.plan.is_none() && self.client_deadline_at.is_none()
+    }
+
     fn compose(
         self,
         protocol_at: Option<tokio::time::Instant>,
@@ -1485,7 +1491,12 @@ where
     let bound = compose_h3_connection_checkout_bound(connect_at.get().copied(), dispatch);
     // Only the creator has a connect instant. Pool waiters keep their own
     // admitted lifetime; they do not inherit another request's authorization.
-    if (connect_at.get().is_some() || !matches!(&result, Ok(Ok(_))))
+    // A connection that WAS established is never reclassified here: a late
+    // scheduler wake past the connect instant must not report a successful
+    // dial as `ConnectionTimeout` (tripping the breaker or marking the backend
+    // H3-unsupported). Its authorization lifetime is still enforced by the
+    // per-poll gate on the request send that follows.
+    if !matches!(&result, Ok(Ok(_)))
         && let Some(source) = bound.elapsed()
     {
         return Err(match source {
@@ -1640,18 +1651,52 @@ async fn recv_h3_response_under_authorization(
     read_timeout_ms: u64,
     auth: H3Authorization<'_>,
 ) -> H3PoolResult<http::Response<()>> {
+    await_h3_response_header_wait(
+        auth,
+        read_timeout_ms,
+        recv_h3_response_with_timeout(stream, read_timeout_ms),
+    )
+    .await
+}
+
+/// Bound a response-header receive that already applies `read_timeout_ms`
+/// itself by the request's authorization plan and client deadline.
+async fn await_h3_response_header_wait<F, T>(
+    auth: H3Authorization<'_>,
+    read_timeout_ms: u64,
+    recv: F,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = H3PoolResult<T>>,
+{
+    // With no authorization plan and no client deadline there is nothing to
+    // compose with the read timeout `recv_h3_response_with_timeout` already
+    // applies, so an unauthenticated request skips the outer bound and its
+    // second timer.
+    if auth.is_unbounded() {
+        return recv.await;
+    }
     let protocol_at = if read_timeout_ms > 0 {
         tokio::time::Instant::now().checked_add(Duration::from_millis(read_timeout_ms))
     } else {
         None
     };
-    await_h3_dispatch(
-        auth,
-        true,
-        protocol_at,
-        recv_h3_response_with_timeout(stream, read_timeout_ms),
-    )
-    .await
+    await_h3_dispatch(auth, true, protocol_at, recv).await
+}
+
+/// Controlled clock/receive access to the production response-header wait.
+#[doc(hidden)]
+pub async fn await_h3_response_header_wait_for_test<F, T>(
+    client_at: Option<tokio::time::Instant>,
+    plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    read_timeout_ms: u64,
+    recv: F,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = H3PoolResult<T>>,
+{
+    let auth = H3Authorization::new(client_at, plan);
+    await_h3_response_header_wait(auth, read_timeout_ms, recv).await
 }
 
 /// Collect a retained response under the same admitted lifetime as checkout,
