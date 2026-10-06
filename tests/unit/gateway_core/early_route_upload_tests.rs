@@ -40,13 +40,17 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
-use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, create_plugin};
+use ferrum_edge::plugins::{
+    BUILTIN_PLUGIN_REGISTRATIONS, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    create_plugin,
+};
 use ferrum_edge::proxy::auth_lifetime::{
     ComposedAuthBound, StreamAuthDeadline, StreamAuthTermination,
 };
 
 use crate::unit::plugins::plugin_utils::{
-    basic_auth_test_secret_guard, make_plugin_config_with_json, make_proxy, minimal_plugin_config,
+    basic_auth_test_secret_guard, log_schema_registry_guard, make_plugin_config_with_json,
+    make_proxy, minimal_plugin_config,
 };
 
 // ---------------------------------------------------------------------------
@@ -597,10 +601,17 @@ async fn token_auth_plugins_declare_the_headers_they_strip_and_own() {
 
 /// Every built-in auth plugin that may change request headers names them, so
 /// a route matching on any other header (Host included) stays decidable.
+///
+/// Every registration must build from its test config, so the check can never
+/// pass while silently skipping a plugin that failed to construct (issue
+/// #6022).
 #[tokio::test]
 async fn every_header_writing_auth_plugin_names_its_headers() {
+    // Same guards and lock order as the plugin doc-parity tests, which prove
+    // every built-in constructs from `minimal_plugin_config` under them.
     let _secret = basic_auth_test_secret_guard();
-    for name in [
+    let _registry = log_schema_registry_guard();
+    const AUTH_PLUGINS: [&str; 10] = [
         "basic_auth",
         "hmac_auth",
         "jwks_auth",
@@ -611,15 +622,26 @@ async fn every_header_writing_auth_plugin_names_its_headers() {
         "oauth2_introspection",
         "oidc_relying_party",
         "soap_ws_security",
-    ] {
-        let Ok(Some(plugin)) = create_plugin(name, &minimal_plugin_config(name)) else {
-            continue;
-        };
-        if !plugin.modifies_request_headers() {
-            continue;
+    ];
+    let mut registered = Vec::new();
+    for registration in BUILTIN_PLUGIN_REGISTRATIONS {
+        let name = registration.name;
+        registered.push(name);
+        let plugin = create_plugin(name, &minimal_plugin_config(name))
+            .unwrap_or_else(|e| panic!("create_plugin({name}) failed: {e}"))
+            .unwrap_or_else(|| panic!("create_plugin({name}) returned None"));
+        let listed = AUTH_PLUGINS.contains(&name);
+        assert!(
+            listed || !plugin.is_auth_plugin(),
+            "{name} is an auth plugin missing from this test's inventory"
+        );
+        if listed && plugin.modifies_request_headers() {
+            let names = plugin.modified_request_header_names();
+            assert!(names.is_some(), "{name} must declare the headers it writes");
         }
-        let names = plugin.modified_request_header_names();
-        assert!(names.is_some(), "{name} must declare the headers it writes");
+    }
+    for name in AUTH_PLUGINS {
+        assert!(registered.contains(&name), "{name} is not a registered built-in");
     }
 }
 

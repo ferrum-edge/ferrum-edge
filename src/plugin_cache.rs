@@ -539,6 +539,14 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
     Ok(())
 }
 
+/// Whether `plugin` is the built-in plugin `name`. Trust follows the type the
+/// plugin was registered with, so a custom plugin reporting a built-in name
+/// neither selects nor is exempted from that built-in's composition rules
+/// (issue #6022).
+fn is_builtin_named(plugin: &Arc<dyn Plugin>, name: &str) -> bool {
+    plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())
+}
+
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
 pub(crate) fn validate_plugin_security_composition(
@@ -569,7 +577,7 @@ pub(crate) fn validate_plugin_security_composition(
             .iter()
             .filter(|plugin| {
                 plugin.supported_protocols().contains(&protocol)
-                    && plugin.name() == "soap_ws_security"
+                    && is_builtin_named(plugin, "soap_ws_security")
                     && plugin.is_auth_plugin()
             })
             .count();
@@ -593,7 +601,7 @@ pub(crate) fn validate_plugin_security_composition(
         let has_hmac = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
-            .any(|plugin| plugin.name() == "hmac_auth");
+            .any(|plugin| is_builtin_named(plugin, "hmac_auth"));
         if has_hmac
             && let Some(transformer) = plugins
                 .iter()
@@ -671,11 +679,11 @@ pub(crate) fn validate_plugin_security_composition(
 
         for deduplication in plugins.iter().filter(|plugin| {
             plugin.supported_protocols().contains(&protocol)
-                && plugin.name() == "request_deduplication"
+                && is_builtin_named(plugin, "request_deduplication")
         }) {
             if let Some(transformer) = plugins.iter().find(|plugin| {
                 plugin.supported_protocols().contains(&protocol)
-                    && plugin.name() != "request_deduplication"
+                    && !is_builtin_named(plugin, "request_deduplication")
                     && plugin.modifies_request_body()
                     && !plugin.final_request_body_matches_pre_before_proxy_normalization()
             }) {
@@ -691,7 +699,7 @@ pub(crate) fn validate_plugin_security_composition(
 
             if let Some(later_mutator) = plugins.iter().find(|plugin| {
                 plugin.supported_protocols().contains(&protocol)
-                    && plugin.name() != "request_deduplication"
+                    && !is_builtin_named(plugin, "request_deduplication")
                     && plugin.priority() >= deduplication.priority()
                     && (plugin.modifies_request_headers()
                         || plugin.modifies_request_query()
@@ -717,7 +725,7 @@ pub(crate) fn validate_plugin_security_composition(
             // operation keyed on headers the backend never receives.
             if let Some(final_header_policy) = plugins.iter().find(|plugin| {
                 plugin.supported_protocols().contains(&protocol)
-                    && plugin.name() != "request_deduplication"
+                    && !is_builtin_named(plugin, "request_deduplication")
                     && plugin.enforces_final_backend_header_policy()
             }) {
                 return Err(format!(
@@ -733,16 +741,17 @@ pub(crate) fn validate_plugin_security_composition(
         }
 
         for response_cache in plugins.iter().filter(|plugin| {
-            plugin.supported_protocols().contains(&protocol) && plugin.name() == "response_caching"
+            plugin.supported_protocols().contains(&protocol)
+                && is_builtin_named(plugin, "response_caching")
         }) {
             if let Some(transformer) = plugins.iter().find(|plugin| {
                 plugin.supported_protocols().contains(&protocol)
-                    && plugin.name() != "response_caching"
+                    && !is_builtin_named(plugin, "response_caching")
                     // gRPC-Web body translation is owned only for its
                     // content-types (normally POST). Response caching admits
                     // only GET/HEAD and additionally requires an observed empty
                     // upload, so the two request-time populations are disjoint.
-                    && plugin.name() != "grpc_web"
+                    && !is_builtin_named(plugin, "grpc_web")
                     && plugin.modifies_request_body()
                     && !plugin.final_request_body_matches_pre_before_proxy_normalization()
             }) {
@@ -758,13 +767,13 @@ pub(crate) fn validate_plugin_security_composition(
 
             if let Some(later_mutator) = plugins.iter().find(|plugin| {
                 plugin.supported_protocols().contains(&protocol)
-                    && plugin.name() != "response_caching"
+                    && !is_builtin_named(plugin, "response_caching")
                     // Compression's later header projection is a deterministic
                     // removal/normalization of fields already bound by the
                     // cache key; it cannot introduce an unbound origin-visible
                     // dimension. Response caching intentionally composes with
                     // compression to retain final encoded representations.
-                    && plugin.name() != "compression"
+                    && !is_builtin_named(plugin, "compression")
                     && plugin.priority() >= response_cache.priority()
                     && (plugin.modifies_request_headers()
                         || plugin.modifies_request_query()
@@ -797,7 +806,7 @@ pub(crate) fn validate_plugin_security_composition(
         }) {
             if let Some(deduplication) = plugins.iter().find(|plugin| {
                 plugin.supported_protocols().contains(&protocol)
-                    && plugin.name() == "request_deduplication"
+                    && is_builtin_named(plugin, "request_deduplication")
                     && plugin.priority() >= side_effecting_plugin.priority()
             }) {
                 return Err(format!(
@@ -812,11 +821,11 @@ pub(crate) fn validate_plugin_security_composition(
 
         for audit in plugins.iter().filter(|plugin| {
             plugin.supported_protocols().contains(&protocol)
-                && plugin.name() == "ai_transcript_audit"
+                && is_builtin_named(plugin, "ai_transcript_audit")
         }) {
             if let Some(deduplication) = plugins.iter().find(|plugin| {
                 plugin.supported_protocols().contains(&protocol)
-                    && plugin.name() == "request_deduplication"
+                    && is_builtin_named(plugin, "request_deduplication")
                     && plugin.priority() <= audit.priority()
             }) {
                 return Err(format!(

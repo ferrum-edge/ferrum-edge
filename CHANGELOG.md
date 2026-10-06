@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finalizers the plugin cache inserts are built-in types and are now trusted,
   which can change compression and response-buffering decisions on chains
   with several CORS instances. `Plugin` now has `Any` as a supertrait.
+- **Security-composition ordering checks key built-in trust on type** (#6022).
+  The plugin-cache composition checks for `request_deduplication`,
+  `response_caching`, `hmac_auth`, identity-establishing `soap_ws_security`,
+  and `ai_transcript_audit`, and the `compression` and `grpc_web` exemptions
+  from the response-caching checks, matched on the name a plugin reports. A
+  custom plugin reporting `request_deduplication`, `response_caching`,
+  `compression`, or `grpc_web` was exempt from the checks that refuse a later
+  header, query, destination, or body mutator. These checks now use the
+  concrete built-in type (`plugins::is_builtin_plugin`), as #6039 did for the
+  other trust sites. Such a custom plugin is checked like any other plugin,
+  and it no longer imposes the named built-in's ordering rules on the chain.
 - **H3 dispatch-stage `413` refusals and both bridge drain refusals run the
   reject hooks and the transaction log** (#6022). The native buffered,
   cross-protocol, and native dispatch drains answered an oversized upload with
@@ -128,6 +139,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (library API) — test-only HTTP/3 pool entry points** (#6022).
+  `Http3ConnectionPool::request_streaming`, `request_with_target_streaming`,
+  `request_streaming_incoming_body`, and
+  `request_with_target_streaming_incoming_body` are removed, and the buffered
+  `request` and `request_with_target` are now crate-private. None of them
+  carried an authorization lifetime and production called none of them; it
+  dispatches through the crate-private `_under_authorization` entry points.
+  The pool's own tests reach the buffered paths through `_test_support`.
+  Proxy behavior is unchanged.
+- **Functional coverage for HTTP/3 drain refusals** (#6022). Real-binary
+  tests check that the cross-protocol, native-H3, and gRPC bridge drain
+  refusals run the reject-path hooks and write the transaction log, and that a
+  buffered native-H3 request returns its request-buffer charge before its
+  response streams.
 - **BREAKING (library API) — `GrpcProxyError::ClientDeadlineExceeded`
   payload** (issue #6022). The variant carries a typed `GrpcDeadlinePhase`
   (ConnectionAcquisition / Handoff / RetryBackoff / StreamingResponseHeaders /
