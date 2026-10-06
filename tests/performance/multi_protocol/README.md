@@ -30,8 +30,53 @@ cd tests/performance/multi_protocol
 
 Protocols: `http1`, `http1-tls`, `http2`, `http3`, `ws`, `grpc`, `tcp`,
 `tcp-tls`, `udp`, `udp-dtls`, `all`. Options: `--duration` (default 30),
-`--concurrency` (default 100), `--payload-size` (default 64 bytes), `--json`,
-`--skip-build` (reuse existing binaries), `--envoy`.
+`--concurrency` (default 100), `--payload-size` (default 10240 bytes; UDP and
+UDP+DTLS legs cap at 2048), `--json`, `--skip-build` (reuse existing binaries),
+`--envoy`.
+
+Every protocol runs a gateway leg and a direct leg with the **same client
+protocol** (HTTP/1.1+TLS compares against the backend's HTTPS/1.1 listener on
+3447, TCP+TLS against 3444, UDP+DTLS against 3006). Standard mode also honours:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BENCH_ORDER` | `gateway-first` | `direct-first` swaps the legs; alternate across repeated runs so thermal drift does not always penalise one leg. |
+| `BENCH_COOLDOWN` | `0` | Idle seconds before each measured leg. |
+| `BENCH_CPU_OUT` | unset | Append one JSON line per gateway leg with the gateway process's CPU seconds for that leg. |
+
+## Publishing Numbers
+
+Use `run_published_benchmark.sh` for any number that will be quoted (README,
+website, release notes). It builds once in release mode, records a provenance
+`manifest.json` (commit, version, toolchain, OS, CPU, memory, load average,
+arguments), runs every protocol `--runs` times with alternating leg order, and
+writes `summary.md` / `summary.json` with medians, min/max, coefficient of
+variation, errors, and validity flags.
+
+```bash
+cd tests/performance/multi_protocol
+./run_published_benchmark.sh                    # 3 runs, 15 s legs, c=200, 64 B + 10 KB, latency suite
+./run_published_benchmark.sh --runs 5 --protocols "http1 grpc" --payload-sizes 64
+```
+
+Suites in the result directory:
+
+- `throughput_<N>b` — closed-loop throughput at `--concurrency` (default 200)
+  for each `--payload-sizes` entry.
+- `latency_64b` — one connection, 64 B: the per-hop latency the gateway adds
+  when it is not saturated (`Added p50`).
+
+Reading the summary:
+
+- **Overhead** (1 − gateway RPS ÷ direct RPS) is measured on one host, where
+  the gateway competes with `proto_bench` and `proto_backend` for the same
+  cores. It is an upper bound on what an extra hop costs, not the gateway's
+  capacity on dedicated hardware.
+- **Gateway CPU/req** is gateway process CPU time ÷ requests served in the leg
+  (warmup and drain included in both). It is the most portable efficiency
+  figure: multiply by your target RPS to estimate the cores the gateway needs.
+- Rows flagged `noisy-*` (CV above 10%), `errors`, or `incomplete-runs` should
+  not be published as headline numbers.
 
 ## Port conflicts and cleanup ownership
 

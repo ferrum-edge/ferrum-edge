@@ -2,9 +2,15 @@
 //!
 //! This test progressively adds proxies (with key_auth + access_control plugins
 //! and unique consumers) in batches of 3,000 up to 30,000 total. After each
-//! batch it runs a 30-second load test hitting all proxies with their consumer
-//! API keys and records latency/throughput metrics. Resources continue to be
-//! added mid-test to verify gateway resiliency during config updates.
+//! batch it runs a 30-second load test (after a discarded warmup) hitting all
+//! proxies with their consumer API keys and records latency, throughput, and
+//! gateway CPU per request. Each new batch is provisioned through the admin API
+//! while the gateway process keeps running, and must converge (hot config swap,
+//! no restart) before the next window is measured. Load is not applied while a
+//! batch is being provisioned.
+//!
+//! Set `FERRUM_SCALE_RESULTS_JSON=<path>` to also write every batch result as
+//! JSON for publishing.
 //!
 //! Three variants:
 //!   - SQLite (always available, no external DB required)
@@ -49,6 +55,9 @@ use crate::common::scheduled_scaling::{
 const BATCH_SIZE: usize = 3_000;
 const TOTAL_PROXIES: usize = 30_000;
 const PERF_TEST_DURATION_SECS: u64 = 30;
+/// Traffic sent before each window and discarded: connections, route caches,
+/// and consumer lookups for the new generation are warm when measuring starts.
+const PERF_WARMUP_SECS: u64 = 5;
 const CONCURRENCY: usize = 50;
 /// Number of resources to send in each batch API call
 const API_BATCH_CHUNK: usize = 100;
@@ -506,7 +515,7 @@ async fn create_batch(
 }
 
 /// Perf test results for a single run
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct PerfResult {
     total_proxies: usize,
     total_requests: u64,
@@ -514,7 +523,10 @@ struct PerfResult {
     failed_requests: u64,
     not_found_requests: u64,
     duration_secs: f64,
+    /// Successful requests per second over the measured window.
     rps: f64,
+    /// Gateway process CPU time (user + system) consumed during the window.
+    gateway_cpu_seconds: Option<f64>,
     avg_latency_us: f64,
     p50_latency_us: f64,
     p95_latency_us: f64,
@@ -522,16 +534,50 @@ struct PerfResult {
     max_latency_us: f64,
 }
 
-/// Run a load test against all known proxies for the specified duration.
-/// Sends requests round-robin across all proxy paths with their API keys.
+/// Cumulative user + system CPU seconds of a process (all threads).
+fn process_cpu_seconds(pid: u32) -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        let ticks = fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
+        // SAFETY: sysconf has no preconditions.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (hz > 0).then(|| ticks / hz as f64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS/BSD: `[[DD-]HH:]MM:SS.ss`, 10 ms resolution.
+        let output = Command::new("ps")
+            .args(["-o", "cputime=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        let raw = String::from_utf8(output.stdout).ok()?;
+        let raw = raw.trim();
+        let (days, clock) = raw.split_once('-').unwrap_or(("0", raw));
+        let mut seconds = 0.0;
+        for part in clock.split(':') {
+            seconds = seconds * 60.0 + part.parse::<f64>().ok()?;
+        }
+        Some(seconds + days.parse::<f64>().ok()? * 86_400.0)
+    }
+}
+
+/// Run a load test against all known proxies: `warmup_secs` of discarded
+/// traffic, then a `duration_secs` measured window. Sends requests round-robin
+/// across all proxy paths with their API keys. Only requests that complete
+/// inside the window count; latency percentiles cover successful requests.
 async fn run_perf_test(
     proxy_base_url: &str,
     entries: &[(String, String)],
+    warmup_secs: u64,
     duration_secs: u64,
     concurrency: usize,
+    gateway_pid: Option<u32>,
 ) -> Result<PerfResult, Box<dyn std::error::Error>> {
     let total_proxies = entries.len();
     let stop = Arc::new(AtomicBool::new(false));
+    let measuring = Arc::new(AtomicBool::new(false));
     let total_requests = Arc::new(AtomicU64::new(0));
     let successful_requests = Arc::new(AtomicU64::new(0));
     let failed_requests = Arc::new(AtomicU64::new(0));
@@ -543,11 +589,11 @@ async fn run_perf_test(
         Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(100_000)));
 
     let entries = Arc::new(entries.to_vec());
-    let start = Instant::now();
 
     let mut handles = Vec::with_capacity(concurrency);
     for worker_id in 0..concurrency {
         let stop = stop.clone();
+        let measuring = measuring.clone();
         let total_requests = total_requests.clone();
         let successful_requests = successful_requests.clone();
         let failed_requests = failed_requests.clone();
@@ -578,21 +624,31 @@ async fn run_perf_test(
                     .send()
                     .await;
                 let latency_us = req_start.elapsed().as_micros() as u64;
-                local_latencies.push(latency_us);
+                // Warmup completions and requests finishing after the window
+                // closed are not samples.
+                let in_window = measuring.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed);
 
-                total_requests.fetch_add(1, Ordering::Relaxed);
                 match result {
                     Ok(r) if r.status().is_success() => {
-                        successful_requests.fetch_add(1, Ordering::Relaxed);
+                        if in_window {
+                            total_requests.fetch_add(1, Ordering::Relaxed);
+                            successful_requests.fetch_add(1, Ordering::Relaxed);
+                            local_latencies.push(latency_us);
+                        }
                     }
                     Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                        // A route miss is a convergence signal in warmup too.
+                        total_requests.fetch_add(1, Ordering::Relaxed);
                         failed_requests.fetch_add(1, Ordering::Relaxed);
                         not_found_requests.fetch_add(1, Ordering::Relaxed);
                         stop.store(true, Ordering::Relaxed);
                         convergence_interruption.notify_one();
                     }
                     _ => {
-                        failed_requests.fetch_add(1, Ordering::Relaxed);
+                        if in_window {
+                            total_requests.fetch_add(1, Ordering::Relaxed);
+                            failed_requests.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
 
@@ -612,17 +668,27 @@ async fn run_perf_test(
     // A route-miss 404 is the observable data-plane signal that convergence
     // changed after the pre-window gate. End this attempt immediately so its
     // partial traffic can be discarded rather than reported as throughput.
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_secs(duration_secs)) => {}
-        _ = convergence_interruption.notified() => {}
+    let interrupted = tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(warmup_secs)) => false,
+        _ = convergence_interruption.notified() => true,
+    };
+    let cpu_start = gateway_pid.and_then(process_cpu_seconds);
+    let window_start = Instant::now();
+    if !interrupted {
+        measuring.store(true, Ordering::Relaxed);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(duration_secs)) => {}
+            _ = convergence_interruption.notified() => {}
+        }
     }
     stop.store(true, Ordering::Relaxed);
+    let elapsed = window_start.elapsed().as_secs_f64();
+    let cpu_end = gateway_pid.and_then(process_cpu_seconds);
 
-    // Wait for all workers to finish
+    // Wait for all workers to finish their in-flight request
     for h in handles {
         let _ = h.await;
     }
-    let elapsed = start.elapsed().as_secs_f64();
 
     let total = total_requests.load(Ordering::Relaxed);
     let success = successful_requests.load(Ordering::Relaxed);
@@ -651,13 +717,24 @@ async fn run_perf_test(
         failed_requests: fail,
         not_found_requests: not_found,
         duration_secs: elapsed,
-        rps: total as f64 / elapsed,
+        rps: if elapsed > 0.0 {
+            success as f64 / elapsed
+        } else {
+            0.0
+        },
+        gateway_cpu_seconds: cpu_start.zip(cpu_end).map(|(start, end)| end - start),
         avg_latency_us: avg,
         p50_latency_us: p50,
         p95_latency_us: p95,
         p99_latency_us: p99,
         max_latency_us: max,
     })
+}
+
+fn gateway_cpu_us_per_request(r: &PerfResult) -> Option<f64> {
+    r.gateway_cpu_seconds
+        .filter(|_| r.successful_requests > 0)
+        .map(|cpu| cpu * 1e6 / r.successful_requests as f64)
 }
 
 fn print_perf_result(r: &PerfResult) {
@@ -683,6 +760,12 @@ fn print_perf_result(r: &PerfResult) {
         "│  RPS:                 {:>10.1}                       │",
         r.rps
     );
+    if let Some(cpu_us) = gateway_cpu_us_per_request(r) {
+        println!(
+            "│  Gateway CPU/req:     {:>8.1} µs                       │",
+            cpu_us
+        );
+    }
     println!("├─────────────────────────────────────────────────────────┤");
     println!(
         "│  Avg latency:       {:>8.0} µs ({:>6.1} ms)            │",
@@ -882,8 +965,9 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
         let result = loop {
             measurement_attempt += 1;
             println!(
-                "\n  Running {}-second perf test against {} proxies (concurrency={}, window {}/{})...",
+                "\n  Running {}-second perf test (+{}s warmup) against {} proxies (concurrency={}, window {}/{})...",
                 PERF_TEST_DURATION_SECS,
+                PERF_WARMUP_SECS,
                 all_entries.len(),
                 CONCURRENCY,
                 measurement_attempt,
@@ -892,8 +976,10 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
             let candidate = run_perf_test(
                 &harness.proxy_base_url,
                 &all_entries,
+                PERF_WARMUP_SECS,
                 PERF_TEST_DURATION_SECS,
                 CONCURRENCY,
+                harness.gateway_process.as_ref().map(Child::id),
             )
             .await
             .expect("Perf test failed");
@@ -955,8 +1041,8 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
     println!("  SCALE PERFORMANCE SUMMARY ({})", harness.db_label);
     println!("======================================================================");
     println!(
-        "{:<10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "Proxies", "RPS", "Avg(ms)", "P50(ms)", "P95(ms)", "P99(ms)", "Max(ms)"
+        "{:<10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12}",
+        "Proxies", "RPS", "Avg(ms)", "P50(ms)", "P95(ms)", "P99(ms)", "Max(ms)", "CPU/req(µs)"
     );
     println!("----------------------------------------------------------------------");
 
@@ -964,8 +1050,11 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
 
     for r in &results {
         let rps_pct = (r.rps / baseline_rps) * 100.0;
+        let cpu = gateway_cpu_us_per_request(r)
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "n/a".to_string());
         println!(
-            "{:<10} {:>9.0} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1}  ({:.0}% of baseline)",
+            "{:<10} {:>9.0} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>12}  ({:.0}% of baseline)",
             r.total_proxies,
             r.rps,
             r.avg_latency_us / 1000.0,
@@ -973,6 +1062,7 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
             r.p95_latency_us / 1000.0,
             r.p99_latency_us / 1000.0,
             r.max_latency_us / 1000.0,
+            cpu,
             rps_pct,
         );
     }
@@ -997,10 +1087,54 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
         }
     }
 
+    if let Ok(path) = std::env::var("FERRUM_SCALE_RESULTS_JSON") {
+        write_results_json(&path, &harness.db_label, &results);
+    }
+
     println!(
         "\n=== Scale Performance Test ({}) Complete ===\n",
         harness.db_label
     );
+}
+
+/// Machine-readable copy of the batch results with the run's parameters.
+fn write_results_json(path: &str, db_label: &str, results: &[PerfResult]) {
+    let commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+    let batches: Vec<_> = results
+        .iter()
+        .map(|r| {
+            let mut value = serde_json::to_value(r).unwrap_or_default();
+            value["gateway_cpu_us_per_request"] = json!(gateway_cpu_us_per_request(r));
+            value
+        })
+        .collect();
+    let document = json!({
+        "test": "tests/functional/functional_scale_perf_test.rs",
+        "database": db_label,
+        "finished_utc": Utc::now().to_rfc3339(),
+        "git_commit": commit,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
+        "batch_size": BATCH_SIZE,
+        "total_proxies": TOTAL_PROXIES,
+        "warmup_secs": PERF_WARMUP_SECS,
+        "window_secs": PERF_TEST_DURATION_SECS,
+        "concurrency": CONCURRENCY,
+        "batches": batches,
+    });
+    match serde_json::to_string_pretty(&document) {
+        Ok(text) => match std::fs::write(path, text + "\n") {
+            Ok(()) => println!("Wrote scale results to {path}"),
+            Err(error) => eprintln!("Could not write {path}: {error}"),
+        },
+        Err(error) => eprintln!("Could not serialize scale results: {error}"),
+    }
 }
 
 /// Check if a Docker container is running.

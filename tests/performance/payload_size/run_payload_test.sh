@@ -377,7 +377,7 @@ start_gateway() {
     FERRUM_MAX_QUERY_PARAMS=0 \
     FERRUM_FRONTEND_TLS_CERT_PATH="$SCRIPT_DIR/certs/cert.pem" \
     FERRUM_FRONTEND_TLS_KEY_PATH="$SCRIPT_DIR/certs/key.pem" \
-        "$GATEWAY_BIN" > /dev/null 2>&1 &
+        "$GATEWAY_BIN" run > /dev/null 2>&1 &
     GATEWAY_PID=$!
     wait_for_health "http://127.0.0.1:9000/health" "Gateway"
     echo "[server] Gateway ready (PID: $GATEWAY_PID)"
