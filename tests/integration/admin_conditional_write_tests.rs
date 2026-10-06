@@ -2500,6 +2500,7 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
     use ferrum_edge::config::types::Consumer;
 
     assert_deployment_external_dependencies_refused(db.clone()).await;
+    assert_issued_deployment_evidence_authorizes_the_transaction(db.clone()).await;
 
     let validation_http_client = ferrum_edge::plugins::PluginHttpClient::default();
     let namespace = format!("deployment-{}", uuid::Uuid::new_v4());
@@ -3114,6 +3115,90 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             .unwrap()
             .unwrap(),
         trust_before
+    );
+}
+
+/// The evidence issued by `GET /deployment-snapshot` digests to exactly what
+/// the store recomputes inside its mutation transaction, so issued authority
+/// is spendable at the transaction boundary itself, not only via a fresh read.
+async fn assert_issued_deployment_evidence_authorizes_the_transaction(
+    db: Arc<dyn DatabaseBackend>,
+) {
+    use ferrum_edge::config::db_backend::{NamespaceConfigAdmissionLeaseRef, SnapshotDigest};
+    use ferrum_edge::config::deployment_mutation::DeploymentPrecondition;
+
+    let validation_http_client = ferrum_edge::plugins::PluginHttpClient::default();
+    let namespace = format!("issued-{}", uuid::Uuid::new_v4());
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    let document = json!({
+        "openapi": "3.0.3", "info": {"title": "Issued", "version": "1"},
+        "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": "issued", "listen_path": "/issued",
+            "backend_host": "backend.example.com", "backend_port": 8080}
+    });
+    let imported = send_ns(
+        Method::POST,
+        &base,
+        "/api-specs",
+        &admin_token(),
+        None,
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(imported.status, 201, "{}", imported.body);
+    let spec_id = imported.body["id"].as_str().unwrap().to_string();
+
+    let issued = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    assert_eq!(issued.status, 200, "{}", issued.body);
+    let expected = SnapshotDigest::of_representation(&issued.body["evidence"]).unwrap();
+    // The issued evidence and the streamed store digest are one computation.
+    assert_eq!(
+        db.load_deployment_snapshot(&namespace)
+            .await
+            .unwrap()
+            .digest()
+            .unwrap(),
+        expected
+    );
+    // Reissuing an unchanged namespace yields the same authority.
+    assert_eq!(
+        get_ns(&base, "/deployment-snapshot", &namespace).await.etag,
+        issued.etag
+    );
+
+    let owner = uuid::Uuid::new_v4().to_string();
+    let generation = db
+        .try_acquire_namespace_config_admission_lease(&namespace, &owner)
+        .await
+        .unwrap()
+        .unwrap();
+    let precondition = DeploymentPrecondition {
+        namespace: &namespace,
+        expected,
+        validation_http_client: &validation_http_client,
+        lease: NamespaceConfigAdmissionLeaseRef {
+            owner: &owner,
+            generation,
+        },
+    };
+    db.remove_deployment_conditionally("issued", &precondition)
+        .await
+        .unwrap();
+    db.release_namespace_config_admission_lease(&namespace, &owner)
+        .await
+        .unwrap();
+    assert!(
+        db.get_proxy_for_write(&namespace, "issued")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.get_api_spec(&namespace, &spec_id)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
