@@ -120,7 +120,16 @@ impl SharedPoolCreateKind {
     }
 }
 
-#[derive(Debug)]
+/// Factual timing of one failed connection creation, independent of the
+/// request lifetimes of its creator and coalesced waiters.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoolCreateFailureTiming {
+    pub(crate) occurred_at: tokio::time::Instant,
+    /// A transport deadline that selected the captured timeout, if any.
+    pub(crate) deadline_at: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug, Clone)]
 struct SharedPoolCreateErrorInner {
     message: String,
     kind: SharedPoolCreateKind,
@@ -134,6 +143,9 @@ struct SharedPoolCreateErrorInner {
     /// Not included in [`Display`]; pool-key TLS material must be redacted by
     /// the typed error's own Display if logged.
     detail: Option<String>,
+    /// Opt-in transport facts for a waiter that observes the failure late.
+    /// Never contains the creator's authorization or client deadline.
+    failure_timing: Option<PoolCreateFailureTiming>,
 }
 
 /// Cloneable create-failure payload shared with every waiter for one coalesced
@@ -165,6 +177,7 @@ impl SharedPoolCreateError {
                 kind,
                 error_class,
                 detail,
+                failure_timing: None,
             }),
         }
     }
@@ -218,6 +231,15 @@ impl SharedPoolCreateError {
 
     pub fn detail(&self) -> Option<&str> {
         self.inner.detail.as_deref()
+    }
+
+    pub(crate) fn with_failure_timing(mut self, timing: PoolCreateFailureTiming) -> Self {
+        Arc::make_mut(&mut self.inner).failure_timing = Some(timing);
+        self
+    }
+
+    pub(crate) fn failure_timing(&self) -> Option<PoolCreateFailureTiming> {
+        self.inner.failure_timing
     }
 }
 
@@ -279,13 +301,8 @@ impl ShareablePoolCreateError for anyhow::Error {
 
 impl ShareablePoolCreateError for SharedPoolCreateError {
     fn to_shared(&self) -> SharedPoolCreateError {
-        // Preserve kind/class/detail for a re-broadcast of the same payload.
-        SharedPoolCreateError::new(
-            self.message().to_string(),
-            self.kind(),
-            self.error_class(),
-            self.detail().map(str::to_string),
-        )
+        // Preserve all captured facts for a re-broadcast of the same payload.
+        self.clone()
     }
 }
 
@@ -811,6 +828,15 @@ impl<M: PoolManager> GenericPool<M> {
 
     pub fn pool_size(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Pending creations and available permits for cold-path lifecycle tests.
+    #[doc(hidden)]
+    pub fn creation_state_for_test(&self) -> (usize, usize) {
+        (
+            self.pending_creations.len(),
+            self.inflight.available_permits(),
+        )
     }
 
     pub fn stats(&self) -> PoolStats {

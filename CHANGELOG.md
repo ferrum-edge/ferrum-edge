@@ -7,7 +7,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.12] - Unreleased
+
+Candidate prepared on **2026-10-05 UTC** from post-#6012 main
+`a9c758c6352765d13a7f61c4d7e3571c82a2d307`. This is preparation, not a cut
+or publication date. Main-push qualification, final release-head review/CI,
+tag and distribution remain pending. See the [candidate record](docs/releases/v0.9.12.md).
+
+### Added
+
+- **Dependency-fenced partial deployment mutations** (#6010 / #6012).
+  Admin-only `GET /deployment-snapshot` supplies `deployment-v1` evidence and
+  an original quoted namespace token for opt-in proxy cascade DELETE with
+  `conditional=true&cleanup_orphaned_upstream=false` and API-spec PUT with
+  `conditional=true`. Backup namespace tags and row ETags are not authority.
+  Compare full raw namespace/dependency evidence inside entry/commit fences
+  on SQLite, PostgreSQL, MySQL (REPEATABLE READ) and replica-set MongoDB;
+  unsupported topology and unavailable/undecodable state fail closed.
+  Partial writes retain unrelated/unknown supported fields, historical
+  credentials, timestamps, trust revisions and surviving association owners.
+  An unchanged proxy in a plugin-only replacement retains its complete raw
+  fields and row ETag. Ordinary endpoint profiles remain supported.
+  Cleanup requires confirmed `durable: committed`, applicable local
+  `live: applied`, final security audit, owner-qualified lease release and
+  `recovery_cleanup_authorized: true`. CP durable-only and committed-but-not-live
+  responses do not authorize cleanup; driver/commit unknown stays uncertain.
+  Retain the original encrypted journal after refusal, cancellation or ambiguity;
+  no retry or refreshed token supplies cleanup authority. See
+  [consumer adoption](docs/deployment_mutations.md). Canonical publication,
+  downstream adoption and packaged/advisory qualification are not asserted.
+
+### Fixed
+
+- **Preserve typed external-dependency refusals** (#6010 / #6012).
+  Proven references to spec-owned upstreams return
+  `409/not_committed/unconfirmed/recovery_cleanup_authorized=false` before
+  resource-changing conditional PUT/DELETE writes. Metadata-only replacement
+  keeps its shortcut; untyped database/commit/lease failures remain uncertain.
+  Ordinary invalid external-owner proxy admission still returns `400` without
+  a durable row or covering change. No driver details or conflict IDs are exposed.
+- **Correct SQLx Any floating-point NULL parameter types** (#6010 / #6012).
+  REAL NULL binds through `Option<f32>` and DOUBLE NULL through `Option<f64>`.
+  Hosted PostgreSQL checks native uncast parameter types and explicit NULLs.
+  The stable extended-schema fixture reconnects once after all ALTERs; it proves
+  neither the original PostgreSQL initial-import 500's cause nor online DDL safety.
+  No dependency graph/version changes are made. Preserve the hosted regression
+  after patch retirement and retain the vendor copy while the separate TLS patch
+  still requires it; see [retirement rules](docs/upstream-sqlx-patches/002-typed-float-null-bindings/README.md).
+
+## [0.9.11] - 2026-10-04
+
+Published at **2026-10-04T21:26:11Z** at immutable release merge
+`c764084b3b51c3f7ffde268c039688d35e49c553`, with reviewed #6005 head
+`ff0a9d5152dc3cf2fd240158cbdf5551f511212e` as second parent. All 14 pre-tag
+main-push workflows and all 20 release jobs succeeded; root verified all 14
+assets/checksums, three Docker Hub indexes and six platform/config pairs.
+See the [verified 0.9.11 record](docs/releases/v0.9.11.md) for exact identities,
+authenticated GHCR proof and revision-label limits. This does not qualify 0.9.12.
+
 ### Security
+
+- **Upgrade the dependency security chain** (#5912,
+  GHSA-w9wp-h8wv-79jx, GHSA-8ffr-xgwf-xj56, GHSA-6g2r-675j-hx59).
+  Rebase all retained Hyper patches onto published 1.10.0 and reqwest patches
+  onto published 0.13.4, constrain the compatible GCP/OpenTelemetry and fixed
+  Smithy/xxhash versions, and add an optional hosted lockfile producer.
+  Import real root/mesh/fuzz lockfiles from the verified hosted Cargo artifact;
+  they resolve SDK 0.32.1, Smithy JSON 0.62.7 and fixed xxhash with one patched
+  Hyper/reqwest pair per production graph. The source fix was merged through
+  [PR #6004](https://github.com/ferrum-edge/ferrum-edge/pull/6004) at
+  `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; issue #5912 is closed. Its
+  exact-head hosted checks passed, followed by the separately verified 0.9.11
+  release qualification and publication. Advisory disposition remains separate.
+  See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
+  and [completed source integration evidence](docs/releases/v0.9.11.md#dependency-source-integration-evidence).
+
+- **Conditional admin reads and restores use authoritative strong state tags**
+  (#5992). Admin-only `GET /consumers/{id}/verification` returns the complete
+  stored credential row with the same keyed ETag as ordinary consumer reads,
+  after security-audit admission and with `Cache-Control: no-store`.
+  `GET /backup?conditional=true` exports complete rows, per-row tags, and a
+  namespace tag from one primary transaction. `If-Match` on restore checks that
+  namespace state and replaces it in one transaction, including empty payloads,
+  API-spec ownership, trust bundles, and the admission lease. Stale state is
+  `412`; unsupported standalone MongoDB is `501`; unavailable authoritative
+  state fails closed without a cached fallback. Namespace tags also cover the
+  durable change watermark, so delete/recreate and reverted mutations invalidate
+  them. Stored historical credentials are preserved exactly for verification
+  and may need repair before restore admission.
+- **Restore admission leases cannot be revived by late keeper work** (#5992).
+  Renewal only extends a live matching owner/generation. Owner-qualified release
+  stops and joins the local keeper; bounded cleanup leaves expiry recovery when
+  it cannot settle. The
+  conditional restore transaction takes over lease renewal, verifies and pins
+  live ownership before reading state, and checks the fence at commit. Losing
+  the lease aborts the replacement rather than authorizing a later write under
+  an expired identity.
+- **JWT-authenticated backend egress discovery exposes the inherited loaded
+  process policy** (#5994). `GET /backend-egress-policy` reports the existing
+  address classifier, mode, overlay presence, evaluation order, and enforcement
+  scope under namespace authorization. It conservatively reports
+  `public_only_guaranteed` only for public mode without allow-CIDR overrides.
+  CP admission metadata does not attest a DP's enforcement. The endpoint adds
+  no DNS probes, exposes no CIDRs or credentials, and preserves the existing
+  default mode and connect-time policy.
 
 - **Pin the iproute2 runtime base to the production distroless digest**
   (GHSA-c3r8-6276-9678). `Dockerfile.iproute2-layer` now defaults
@@ -33,35 +136,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `400` naming the field. Disabled configs may still be saved before an operator
   supplies a key. Generate a unique random secret of at least 32 bytes and
   rotate through `session.encryption_secret_previous`.
-- **Backend connection checkout and request handoff are held to the
-  authorization lifetime** (GHSA-xcg4-wj3x-gjj2; regression from the direct
-  HTTP/1.1 pool, #5961). The direct HTTP/1.1 pool checked out its connection
-  (pool wait, dial, TLS handshake) under the response-header and client RPC
-  deadlines only, and composed the request's authorization lifetime only
-  after the checkout. A credential that expired while the checkout was
-  stalled therefore did not end the request, and because hyper enqueues the
-  request on its connection task synchronously, before any wait on the
-  response is polled, a request whose credential had already expired could
-  be handed to the connection and reach the backend. The plan is now composed
-  before the first checkout and bounds the checkout and its idle-race replay
-  at the same absolute instant, and it is re-checked immediately before the
-  request is enqueued, so an expired request is refused with nothing sent.
-  The expiry is reported as the gateway's own health-neutral authorization
-  decision (the fixed pre-commitment terminal and one `credential_expired` /
-  `authenticated_stream_max_lifetime` count), never as a `504` or a client
-  RPC deadline; an earlier client or operator bound keeps its own terminal,
-  and an exact tie with the response-header read bound is a `504`, as on the
-  reqwest path. The same checkout bound and handoff gate now also cover the
-  Unix-socket HTTP/1.1 pool, the HBONE inner HTTP/1.1 lease (CONNECT and inner
-  handshake), and the direct-H2 sender acquisition. A checkout that is ready
-  on its first poll (a pooled connection or live HTTP/2 sender) never arms a
-  timer. Unauthenticated requests are unchanged. **Still unbounded**, tracked
-  in #5990: sender acquisition and handoff on sidecar mesh-mTLS dispatch
-  (including the Unix-socket h2c carrier), native gRPC dispatch, and possibly
-  the native HTTP/3 backend.
+- **Backend dispatch acquisition, handoff, and response-header waits are held
+  to the admitted request's authorization lifetime** (GHSA-xcg4-wj3x-gjj2,
+  including #5961 and #5990). The composed absolute plan bounds the direct
+  HTTP/1.1 pool, its Unix-socket and HBONE inner-pool variants, direct-H2,
+  sidecar mesh mTLS and its Unix-socket h2c carrier, both native gRPC dispatch
+  shapes and their retries, the H3 cross-protocol gRPC bridge, and native H3
+  backend dispatch. It covers connection or sender acquisition, the final
+  handoff check, and the applicable response-header wait; buffered bridge
+  drains and streamed uploads also retain the same plan. A retry cannot extend
+  the captured instant. Existing attribution keeps the winning authorization,
+  client, or operator bound even when observed late. Authorization expiry is
+  latched and counted once, is never retried, and remains neutral to circuit
+  breakers, passive health, and backend admission. Each protocol keeps its
+  existing pre-commitment terminal; for native gRPC this is HTTP 200 with
+  `grpc-status: 16` (`UNAUTHENTICATED`), while an earlier client deadline or
+  operator read bound keeps its existing terminal. The native H3 pool exposes
+  its wire marker at HEADERS completion; a pending send poll may already have
+  offered partial HEADERS, so the marker does not identify the exact first
+  wire submission. Lifetime errors suppress replay regardless of that marker.
+  An immediately ready sender still takes the timer-free fast path, and an
+  unauthenticated dispatch still avoids the authorization clock read.
+  Unauthenticated requests retain their existing behavior. See
+  [request lifetime dispatch](docs/request_lifetime_dispatch.md).
 
 ### Fixed
 
+- **gRPC qualification fixtures prove acquisition expiry and physical reuse**
+  (#6006). Isolate buffered and streamed acquisition from the binary startup
+  probe's shorter coalesced connect budget; observe preface, socket closure,
+  absence of RPC frames, exactly one expiry, and successful pool/breaker recovery
+  without a sleep-based settlement. Retain one frontend H2 connection for both
+  live OTEL RPCs and prove one backend accept/handshake while preserving cold
+  setup timings, genuine reuse without setup attributes, attempt parentage, and
+  three connect-failure retry spans. Repair the exact-main sequential reuse
+  fixture with one owned frontend, distinct stream IDs, complete exact
+  `"one"` / `"two"` bodies and success trailers, and exactly two backend streams
+  on one accept/handshake; hold the script open through inspection and join
+  frontend cleanup under a bound. Completed responses replace its counter
+  settlement sleep. Bound OTEL RPC readiness, send, complete body, and trailers
+  under one watchdog; own its frontend driver through inspection and release
+  the scripted backend gate on shutdown/unwind. Acquisition and recovery
+  watchdogs also include terminal body/trailer completion. Production lifetime
+  and pool semantics are unchanged. Final fixture head
+  `9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2` received complete root review
+  and fresh independent whole/focused review2 with no findings after the
+  accepted completion finding was fixed. All 12 hosted workflows succeeded;
+  all 80 checks completed (49 successful, 31 nonapplicable PR skips), all nine
+  protected Actions contexts passed, and there were zero review threads.
+  PR #6007 merged at `3ce21ad101f164f70cb7f7f77fb033db828b9518` and
+  issue #6006 closed on 2026-10-04. The verified 0.9.11 release includes
+  that fix; historical failing runs remain distinct from final qualification.
+  See [the root-cause record](docs/grpc_qualification_6006.md) and
+  [completed fixture source evidence](docs/releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
+
+- **H1/H2 listener dispatch keeps large child futures out of enclosing poll
+  frames** (#5993). The frontend boxes its concrete handler rather than an
+  async trampoline, and routing/backend dispatch boxes its selected child
+  futures through synchronous out-of-line factories. This adds one frontend
+  allocation per request beyond the existing routing box and one box per
+  backend attempt. Generic HBONE, sidecar mTLS, H3, direct-H2, and direct-H1
+  dispatch also box the selected transport. Polling and cancellation stay in
+  the request's task, preserving affinity scopes and request/body/backend
+  ownership. Ordinary
+  hosted tests cover concrete future-size budgets and real H1/H2 listener
+  traffic on default worker stacks.
+
+- Conditional restore CI now pins the PostgreSQL 16 Alpine, MySQL 8, and
+  MongoDB 7 OCI indexes and confines the new fixtures to runner loopback.
+  Readiness authenticates over the published SQL TCP endpoints with the test
+  database and credentials, then verifies MongoDB's writable replica-set
+  primary. Startup and cleanup are bounded; generated credentials are masked
+  and passed through environment variables. All three live regressions remain
+  mandatory with ignored tests enabled and serial execution.
 - **Redis semantic-cache quarantine now compares the observed value atomically** (#5986). Invalid
   bounded values are deleted only if their raw bytes still match the value read, preserving a
   concurrent replacement. The dedicated watched comparison transfers at most the observed
@@ -70,6 +217,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marker suppresses repeated processing without counting an unattempted delete as a failure.
   The required Redis-backed CI gate exercises plugin admission, quarantine races, and bounded
   transfer regressions.
+
+- **HTTP/2 and gRPC uploads progress through small legal backend windows**
+  (#6001). The vendored Hyper body pipe previously waited for at least 1 KiB
+  of send capacity, so a backend advertising a 512-byte stream window could
+  receive headers but no body bytes before timeout. A pending non-empty chunk
+  now progresses whenever any capacity is assigned, including the final byte
+  of connection capacity; an empty end-of-stream chunk needs none. The existing
+  request-body write-stall bound still applies while a ready chunk cannot be
+  written, without treating a slow client as a backend write stall.
+- **Adaptive HTTP/2 receive windows keep their automatic small-DATA-frame
+  budget in sync** (#6001; hyperium/h2#965). The budget now follows runtime
+  target connection-window changes, preventing valid small DATA frames within
+  a grown advertised window from exhausting the initial budget and closing the
+  connection with `ENHANCE_YOUR_CALM`. Explicit budgets and outstanding framing
+  charges are preserved, including across window shrinkage. The lifetime limit
+  for empty non-final DATA frames is unchanged.
 
 - **gRPC shard affinity now accounts for cancelled creates and unfinished
   uploads** (#5991). Failed or cancelled physical shard creates record one
@@ -6459,7 +6622,9 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.11...HEAD
+[0.9.12]: docs/releases/v0.9.12.md
+[0.9.11]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.7...v0.9.8

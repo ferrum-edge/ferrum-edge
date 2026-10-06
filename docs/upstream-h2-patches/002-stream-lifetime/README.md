@@ -7,8 +7,8 @@ Deliberate fork, unfiled upstream, governed by the
 
 ## Ownership boundary
 
-Hyper's source-body pipe queues an entire final DATA buffer after acquiring only
-`min(chunk length, 1 KiB)` capacity, then drops the source. A 16 KiB final chunk
+Hyper's source-body pipe queues an entire final DATA buffer after acquiring any
+positive flow-control capacity, then drops the source. A 16 KiB final chunk
 against a 1 KiB backend window leaves 15 KiB owned by h2. An early terminal
 response can therefore complete while the backend stream still occupies h2's
 concurrent-stream budget. Source Drop cannot release Ferrum's affinity count.
@@ -47,15 +47,22 @@ owner only decrements an atomic counter and drops its frontend connection Arc.
 ## Reproduction and integrity
 
 Apply `001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch` first,
+then `002-runtime-data-frame-budget/h2-runtime-data-frame-budget.patch`,
 then [`h2-stream-lifetime.patch`](h2-stream-lifetime.patch), to the published
 h2 0.4.19 archive (SHA-256
 `ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16`,
 upstream revision `d57d1b852fec9dda6d42d3454502006d52104da8`).
+The lifetime artifact is generated against the complete coalescing and
+runtime-budget baseline. Its hunk positions and context must match that baseline
+exactly, without offsets or fuzz: offset application can create `.orig` backups
+under `src/`, which the strict source inventory rejects. Refreshing this artifact
+leaves shipped source bytes and observer pre/postimage hashes unchanged.
+
 All reconstructed `src/` files must match the shipped crate and
-`vendor/VENDOR_INTEGRITY.sha256`. This change's four manifest entries were
+`vendor/VENDOR_INTEGRITY.sha256`. The merged manifest entries were
 updated using ordinary SHA-256 reads; no project tooling ran locally.
 
-The hosted H2 guard preparation applies both patches before its diagnostic
+The hosted H2 guard preparation applies all three patches before its diagnostic
 observer. Its patch and source pre/postimage hashes were refreshed without
 changing the observer or the shipping Admin API.
 
@@ -84,6 +91,6 @@ Hosted CI is the execution/format/lint gate; these tests were not run locally.
 
 Retire when h2 offers an equivalent owned stream-completion hook, or Ferrum
 stops using this backend transport. Remove this patch and move the dispatcher
-to the upstream hook. Retain the lifetime regressions. Patch 001 must also be
-retired before removing the vendored crate; a coalescing release alone is not
-enough. Upstream filing is still required under the deliberate-fork policy.
+to the upstream hook. Retain the lifetime regressions. The coalescing and
+runtime-budget patches must also be retired before removing the vendored
+crate; a coalescing release alone is not enough. Upstream filing is still required under the deliberate-fork policy.

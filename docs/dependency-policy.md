@@ -30,6 +30,11 @@ tool when:
 Vendoring without a retirement plan is not allowed. Prefer a dependency bump, a
 feature flag, or a gateway-side workaround first.
 
+The [Hyper patch stack](upstream-hyper-patches/README.md) is reconstructed in
+hosted CI from the checksum-pinned published 1.10.0 crate plus complete ordered
+patches 001–004. Every shipped file must match the vendor bytes and integrity
+manifest; syntax-only patch parsing does not establish reproducibility.
+
 ## Direct pins of otherwise-transitive crates
 
 Some crates are already pulled in transitively but are also listed directly in
@@ -57,10 +62,11 @@ surface drifts.
 | Lifecycle ID | Crate | Vendored ver. | Patch | Upstream issue / PR | Owner | Reason | Removal trigger | Docs |
 |---|---|---|---|---|---|---|---|---|
 | `sqlx-core-001-verify-ca-name-context` | `sqlx-core` | 0.8.6 | Exclusive configured root CA, provider-pinned verify-ca verifier, and rustls context-bearing hostname errors | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | PostgreSQL and MySQL verify-ca otherwise reject trusted chains on hostname mismatch (#5534); upstream also UNIONS the configured CA with the bundled public roots, so a name-waived verify-ca would trust any public certificate | A compatible SQLx release treats a configured root CA as exclusive and handles both rustls hostname-error variants while retaining chain and signature verification | [Patch and retirement plan](upstream-sqlx-patches/001-verify-ca-name-context/README.md) |
-| `reqwest-001-per-request-connect-timeout` | `reqwest` | 0.13.3 | Per-request `RequestBuilder::connect_timeout` | [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (OPEN) | Ferrum Edge maintainers | Pool keys exclude request-only connect/read timeouts, so sibling proxies can share one client; without per-request connect timeout the first proxy's timeout leaks to all | PR #3017 merges and ships in a release we consume | [docs/upstream-reqwest-patches/001-…](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) |
-| `reqwest-002-selectable-rustls-provider` | `reqwest` | 0.13.3 | Selectable Ring/AWS-LC rustls fallback | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | Library/test reqwest clients run before binary bootstrap; upstream's only built-in fallback hard-wires AWS-LC and cannot preserve Ferrum's mutually exclusive backend pair | Reqwest ships a provider-neutral selectable fallback, or the vendored crate is retired | [docs/upstream-reqwest-patches/002-…](upstream-reqwest-patches/002-selectable-rustls-provider/README.md) |
-| `reqwest-003-connection-admission-hook` | `reqwest` | 0.13.3 | `ClientBuilder::connection_admission` physical-connection admission hook | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | DestinationRule `connectionPool.tcp.maxConnections` is a physical-connection ceiling; reqwest owns its socket pool and exposes no connection-lifetime hook, so no public API can admit a new socket and release on its close | Reqwest exposes a connection-lifecycle/admission hook (or a non-sealed connector connection type a `connector_layer` can wrap), or the vendored crate is retired | [docs/upstream-reqwest-patches/003-…](upstream-reqwest-patches/003-connection-admission-hook/README.md) |
-| `reqwest-004-connection-established-fd` | `reqwest` | 0.13.3 | Additive, defaulted `ConnectionAdmission::established(token, fd)` reporting a newly dialed connection's socket | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | `backend_write_timeout_ms` bounds the post-end-of-stream drain of the backend socket's send queue (issue #4411), which needs the socket; reqwest's connector returns a sealed `Conn` and `connector_layer` sees the same sealed type, so no public API exposes the connection's `TcpStream` | Reqwest exposes a connection-lifecycle hook carrying the connection socket (or un-seals the connector connection type); co-retires with `reqwest-003-connection-admission-hook` | [docs/upstream-reqwest-patches/004-…](upstream-reqwest-patches/004-connection-established-fd/README.md) |
+| `sqlx-core-002-typed-float-null-bindings` | `sqlx-core` | 0.8.6 | Any REAL NULL binds through `Option<f32>`, DOUBLE NULL through `Option<f64>` | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | Upstream 0.8.6 reverses the native parameter types for these typed NULLs (#6010); no stored-value loss is established | A compatible SQLx release preserves native REAL/DOUBLE typed-NULL parameter types and passes the hosted PostgreSQL regression; retain the vendor while patch 001 remains | [Patch and retirement plan](upstream-sqlx-patches/002-typed-float-null-bindings/README.md) |
+| `reqwest-001-per-request-connect-timeout` | `reqwest` | 0.13.4 | Per-request `RequestBuilder::connect_timeout` | [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (OPEN) | Ferrum Edge maintainers | Pool keys exclude request-only connect/read timeouts, so sibling proxies can share one client; without per-request connect timeout the first proxy's timeout leaks to all | PR #3017 merges and ships in a release we consume | [docs/upstream-reqwest-patches/001-…](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) |
+| `reqwest-002-selectable-rustls-provider` | `reqwest` | 0.13.4 | Selectable Ring/AWS-LC rustls fallback | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | Library/test reqwest clients run before binary bootstrap; upstream's only built-in fallback hard-wires AWS-LC and cannot preserve Ferrum's mutually exclusive backend pair | Reqwest ships a provider-neutral selectable fallback, or the vendored crate is retired | [docs/upstream-reqwest-patches/002-…](upstream-reqwest-patches/002-selectable-rustls-provider/README.md) |
+| `reqwest-003-connection-admission-hook` | `reqwest` | 0.13.4 | `ClientBuilder::connection_admission` physical-connection admission hook | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | DestinationRule `connectionPool.tcp.maxConnections` is a physical-connection ceiling; reqwest owns its socket pool and exposes no connection-lifetime hook, so no public API can admit a new socket and release on its close | Reqwest exposes a connection-lifecycle/admission hook (or a non-sealed connector connection type a `connector_layer` can wrap), or the vendored crate is retired | [docs/upstream-reqwest-patches/003-…](upstream-reqwest-patches/003-connection-admission-hook/README.md) |
+| `reqwest-004-connection-established-fd` | `reqwest` | 0.13.4 | Additive, defaulted `ConnectionAdmission::established(token, fd)` reporting a newly dialed connection's socket | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | `backend_write_timeout_ms` bounds the post-end-of-stream drain of the backend socket's send queue (issue #4411), which needs the socket; reqwest's connector returns a sealed `Conn` and `connector_layer` sees the same sealed type, so no public API exposes the connection's `TcpStream` | Reqwest exposes a connection-lifecycle hook carrying the connection socket (or un-seals the connector connection type); co-retires with `reqwest-003-connection-admission-hook` | [docs/upstream-reqwest-patches/004-…](upstream-reqwest-patches/004-connection-established-fd/README.md) |
 | `h3-001-recv-frame-drain-on-quic-close` | `h3` | 0.0.8 | Drain buffered frames before propagating QUIC `CONNECTION_CLOSE` | issue [hyperium/h3#338](https://github.com/hyperium/h3/issues/338), PR [hyperium/h3#339](https://github.com/hyperium/h3/pull/339) | Ferrum Edge maintainers | io_uring batching of `STREAM(FIN)` + `CONNECTION_CLOSE(H3_NO_ERROR)` dropped a buffered HEADERS frame → false 502 on graceful close | Fix ships in an `h3` release **and** patches 002/003/004/005 are also retired | [docs/upstream-h3-patches/001-…](upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md) |
 | `h3-002-extended-connect-websocket-protocol` | `h3` | 0.0.8 | Add `Protocol::WEB_SOCKET` (RFC 9220 Extended CONNECT) | **Deliberate fork** — unfiled upstream; no published fork ref yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 rejects `:protocol=websocket` at the HEADERS layer, making WebSocket-over-HTTP/3 unreachable | Upstream files + merges the variant **and** patches 001/003/004/005 are also retired | [docs/upstream-h3-patches/002-…](upstream-h3-patches/002-extended-connect-websocket-protocol/README.md) |
 | `h3-003-peek-buffered-trailers-before-fin` | `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **Deliberate fork** — unfiled upstream; no published fork ref yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002/004/005 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
@@ -77,12 +83,13 @@ surface drifts.
 | `tokio-tungstenite-004-fragment-accounting-delegator` | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `dimpl-001-certificate-chain-and-key-zeroization` | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
 | `hyper-util-001-release-h1-sender-on-dispatch-close` | `hyper-util` | 0.1.21 | Legacy client releases an HTTP/1 connection's only request sender once its dispatcher stops reading, so a request stranded by a close during enqueue fails as unsent | **Deliberate fork** — no upstream PR; upstream issue [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) (hyper-util has issues disabled; filed on hyper, where the stranding dispatcher lives) ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio's unbounded `send` checks for closure and publishes in two steps; a backend RST/FIN on the pooled connection between them strands the request in a channel nobody reads, and hyper-util holds the last sender, so reqwest's `send()` hung until `backend_read_timeout_ms` (504) instead of failing fast (#5714) | A hyper-util release stops holding the only HTTP/1 sender after its dispatcher closes, or a hyper release stops stranding a racing send | [docs/upstream-hyper-util-patches/001-…](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md) |
-| `hyper-001-upgraded-h2-connect-error-reset` | `hyper` | 1.9.0 | `Upgraded::reset_with_connect_error()` resets an upgraded HTTP/2 `CONNECT` stream with `RST_STREAM(CONNECT_ERROR)` in place of the clean `END_STREAM` | issue [hyperium/hyper#4209](https://github.com/hyperium/hyper/issues/4209), PR [hyperium/hyper#4210](https://github.com/hyperium/hyper/pull/4210) (filed 2026-09-28) | Ferrum Edge maintainers | hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends `END_STREAM`, so an HBONE relay that ended on a socket error looked like a normal close to the peer; RFC 9113 §8.5 names `CONNECT_ERROR` for a failed tunnel (#5781). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.9.0 manually | A hyper release containing PR #4210 (or an equivalent API that resets an upgraded HTTP/2 stream with a chosen error code) is adopted | [docs/upstream-hyper-patches/001-…](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md) |
-| `hyper-002-min-data-frame-capacity` | `hyper` | 1.9.0 | HTTP/2 body pipe hands a chunk to h2 only once `min(len, 1 KiB)` capacity is assigned, instead of on its 1-byte claim | issue [hyperium/hyper#4211](https://github.com/hyperium/hyper/issues/4211), PR [hyperium/hyper#4212](https://github.com/hyperium/hyper/pull/4212) (filed 2026-09-30) | Ferrum Edge maintainers | On a nearly spent connection window a request body left as 1-byte DATA frames; h2 >= 0.4.16 peers answer with `GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames")`, failing every stream on the pooled connection (#5588) | A hyper release containing PR #4212 (or an equivalent fix) is adopted | [docs/upstream-hyper-patches/002-…](upstream-hyper-patches/002-min-data-frame-capacity/README.md) |
-| `hyper-003-greedy-h1-read` | `hyper` | 1.9.0 | HTTP/1 `Buffered::poll_read_from_io` keeps reading into its buffer after a full-TLS-record read while the transport has more ready; the HTTP/1 upgrade handoff (`Rewind`/`Upgraded`) also carries a read error met during that read-ahead into the tunnel, after the buffered bytes | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio-rustls returns one decrypted record per read, so bulk HTTP/1 bodies crossed hyper's dispatcher 16 KiB at a time; the per-chunk path cost Ferrum 14–20% CPU per request on large HTTPS/1.1 responses against Envoy (#5588). A reset met during read-ahead is kept for the next read, so an upgrade must hand it to the tunnel, or a WebSocket or TCP relay sees a clean EOF instead (#5911) | hyper or tokio-rustls hands over every readable record per read, or the vendored hyper is retired | [docs/upstream-hyper-patches/003-…](upstream-hyper-patches/003-greedy-h1-read/README.md) |
-| `hyper-004-h2-body-write-timeout` | `hyper` | 1.9.0 | New request extension `hyper::ext::Http2BodyWriteTimeout`: the HTTP/2 client's body pipe runs a timer only while it holds a chunk it cannot yet write (window exhausted or send buffer full), re-arms it on every chunk written, and resets the stream with `CANCEL` when it fires; with the extension the pipe polls the body before waiting for capacity | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | hyper's pipe parks on flow control without polling the body, so `backend_write_timeout_ms` needed a gateway-owned upload pump (a task boundary and channel per frame, about 3.5% gateway CPU on 10 KiB gRPC), and direct-H2 passthrough enforced no write bound at all (#5588). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.9.0 manually | hyper offers an equivalent per-request HTTP/2 body write-stall bound, or the vendored hyper is retired | [docs/upstream-hyper-patches/004-…](upstream-hyper-patches/004-h2-body-write-timeout/README.md) |
-| `h2-001-coalesce-data-frame-writes` | `h2` | 0.4.19 | `FramedWrite` copies DATA payloads into its write buffer while it stays within about 64 KiB, instead of chaining one DATA frame at a time, so the frames staged in one `Prioritize` pass leave in one write; a grown buffer is dropped when the connection has nothing more to write | issue [hyperium/h2#902](https://github.com/hyperium/h2/issues/902), PR [hyperium/h2#903](https://github.com/hyperium/h2/pull/903) (third-party, open since 2026-05-05; queues frames instead of copying) | Ferrum Edge maintainers | Every DATA frame cost its own `writev` and peer wakeup, and over TLS a second, 9-byte record for each maximum-size frame; coalesced writes made HTTP/2 through Ferrum 8–24% faster (gRPC 5–7%) on the protocol benchmark (#5588). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `h2` advisories against 0.4.19 manually | An h2 release containing PR #903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2; patch 002 must also retire before dropping the crate | [docs/upstream-h2-patches/001-…](upstream-h2-patches/001-coalesce-data-frame-writes/README.md) |
-| `h2-002-stream-lifetime` | `h2` | 0.4.19 | Owned `h2::ext::StreamLifetime` request extension released at h2's queued-frame drain/reset boundary | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | Hyper source Drop can precede queued final DATA drainage after an early response; every gRPC body representation and retry must retain affinity until backend stream ownership ends (#5991) | h2 offers an equivalent owned stream-completion hook, or Ferrum stops using this backend transport; patch 001 must also retire before dropping the crate | [Patch and retirement plan](upstream-h2-patches/002-stream-lifetime/README.md) |
+| `hyper-001-upgraded-h2-connect-error-reset` | `hyper` | 1.10.0 | `Upgraded::reset_with_connect_error()` resets an upgraded HTTP/2 `CONNECT` stream with `RST_STREAM(CONNECT_ERROR)` in place of the clean `END_STREAM` | issue [hyperium/hyper#4209](https://github.com/hyperium/hyper/issues/4209), PR [hyperium/hyper#4210](https://github.com/hyperium/hyper/pull/4210) (filed 2026-09-28) | Ferrum Edge maintainers | hyper's upgraded HTTP/2 stream is private and dropping or shutting it down always sends `END_STREAM`, so an HBONE relay that ended on a socket error looked like a normal close to the peer; RFC 9113 §8.5 names `CONNECT_ERROR` for a failed tunnel (#5781). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.10.0 manually | A hyper release containing PR #4210 (or an equivalent API that resets an upgraded HTTP/2 stream with a chosen error code) is adopted | [docs/upstream-hyper-patches/001-…](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md) |
+| `hyper-002-min-data-frame-capacity` | `hyper` | 1.10.0 | A pending HTTP/2 body chunk makes progress with every positive amount of assigned capacity; no fixed minimum is imposed | **Deliberate fork** — current pending-body path unfiled; historical issue [hyperium/hyper#4211](https://github.com/hyperium/hyper/issues/4211), PR [hyperium/hyper#4212](https://github.com/hyperium/hyper/pull/4212) **closed unmerged 2026-10-04** ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | The former 1 KiB minimum could deadlock a legal 512-byte peer stream window; this was reproduced through the Ferrum Edge 0.9.10 release with headers received but zero body bytes. The pending-body path used by patch 004 must preserve Hyper's progress invariant for every legal peer window | Co-retire with patch 004 after adopting an equivalent upstream write-stall bound preserving positive-capacity progress, or moving the HTTP/2 client off Hyper; hosted replacement regressions must pass | [docs/upstream-hyper-patches/002-…](upstream-hyper-patches/002-min-data-frame-capacity/README.md) |
+| `hyper-003-greedy-h1-read` | `hyper` | 1.10.0 | HTTP/1 `Buffered::poll_read_from_io` keeps reading into its buffer after a full-TLS-record read while the transport has more ready; the HTTP/1 upgrade handoff (`Rewind`/`Upgraded`) also carries a read error met during that read-ahead into the tunnel, after the buffered bytes | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | tokio-rustls returns one decrypted record per read, so bulk HTTP/1 bodies crossed hyper's dispatcher 16 KiB at a time; the per-chunk path cost Ferrum 14–20% CPU per request on large HTTPS/1.1 responses against Envoy (#5588). A reset met during read-ahead is kept for the next read, so an upgrade must hand it to the tunnel, or a WebSocket or TCP relay sees a clean EOF instead (#5911) | hyper or tokio-rustls hands over every readable record per read, or the vendored hyper is retired | [docs/upstream-hyper-patches/003-…](upstream-hyper-patches/003-greedy-h1-read/README.md) |
+| `hyper-004-h2-body-write-timeout` | `hyper` | 1.10.0 | New request extension `hyper::ext::Http2BodyWriteTimeout`: the HTTP/2 client's body pipe runs a timer only while it holds a chunk it cannot yet write (window exhausted or send buffer full), re-arms it on every chunk written, and resets the stream with `CANCEL` when it fires; with the extension the pipe polls the body before waiting for capacity | **Deliberate fork** — no upstream filing yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | hyper's pipe parks on flow control without polling the body, so `backend_write_timeout_ms` needed a gateway-owned upload pump (a task boundary and channel per frame, about 3.5% gateway CPU on 10 KiB gRPC), and direct-H2 passthrough enforced no write bound at all (#5588). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `hyper` advisories against 1.10.0 manually | Co-retire with patch 002 after adopting an equivalent upstream write-stall bound preserving positive-capacity progress, or moving the HTTP/2 client off Hyper; hosted replacement regressions must pass | [docs/upstream-hyper-patches/004-…](upstream-hyper-patches/004-h2-body-write-timeout/README.md) |
+| `h2-001-coalesce-data-frame-writes` | `h2` | 0.4.19 | `FramedWrite` copies DATA payloads into its write buffer while it stays within about 64 KiB, instead of chaining one DATA frame at a time, so the frames staged in one `Prioritize` pass leave in one write; a grown buffer is dropped when the connection has nothing more to write | issue [hyperium/h2#902](https://github.com/hyperium/h2/issues/902), PR [hyperium/h2#903](https://github.com/hyperium/h2/pull/903) (third-party, open since 2026-05-05; queues frames instead of copying) | Ferrum Edge maintainers | Every DATA frame cost its own `writev` and peer wakeup, and over TLS a second, 9-byte record for each maximum-size frame; coalesced writes made HTTP/2 through Ferrum 8–24% faster (gRPC 5–7%) on the protocol benchmark (#5588). Path-sourced, so `cargo deny` advisory matching may skip it: check RUSTSEC `h2` advisories against 0.4.19 manually | An h2 release containing PR #903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2; the runtime-budget and stream-lifetime patches must also retire before dropping the crate | [docs/upstream-h2-patches/001-…](upstream-h2-patches/001-coalesce-data-frame-writes/README.md) |
+| `h2-002-runtime-data-frame-budget` | `h2` | 0.4.19 | Automatic small-DATA-frame budgets follow runtime target connection-window changes while explicit budgets and outstanding charges remain intact | PR [hyperium/h2#965](https://github.com/hyperium/h2/pull/965) (filed 2026-10-04), prompted by review in [hyperium/hyper#4211](https://github.com/hyperium/hyper/issues/4211#issuecomment-5961792097) | Ferrum Edge maintainers | Adaptive flow control can grow the target receive window after connection setup, but h2 resolved its automatic frame-overhead budget only from the initial target. A large advertised window could therefore reject valid small DATA frames with `ENHANCE_YOUR_CALM`; raising Hyper's minimum outbound frame size instead deadlocks smaller legal peer windows | An h2 release containing PR #965 (or an equivalent runtime budget update) is adopted | [docs/upstream-h2-patches/002-…](upstream-h2-patches/002-runtime-data-frame-budget/README.md) |
+| `h2-002-stream-lifetime` | `h2` | 0.4.19 | Owned `h2::ext::StreamLifetime` request extension released at h2's queued-frame drain/reset boundary | **Deliberate fork** — unfiled upstream | Ferrum Edge maintainers | Hyper source Drop can precede queued final DATA drainage after an early response; every gRPC body representation and retry must retain affinity until backend stream ownership ends (#5991) | h2 offers an equivalent owned stream-completion hook, or Ferrum stops using this backend transport; the coalescing and runtime-budget patches must also retire before dropping the crate | [Patch and retirement plan](upstream-h2-patches/002-stream-lifetime/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
@@ -95,18 +102,29 @@ surface drifts.
 
 ### Deliberate fork policy and SLA
 
-Five patches ride an **open upstream PR** (reqwest #3017, h3 #339,
-tungstenite #556 / tokio-tungstenite #380, hyper #4210); the weekly
+As of 2026-10-04, seven patches ride an **open upstream PR** (reqwest #3017,
+h3 #339, tungstenite #556 / tokio-tungstenite #380, hyper #4210, and h2 #903 /
+#965); the weekly
 `scripts/check_vendored_patch_status.sh` (backed by
 `docs/vendored-patch-lifecycle.json`) polls those and goes red when one
 merges. Every other row in the inventory table is marked **Deliberate fork**
 (`upstream.filing: deliberate_fork_unfiled` in the lifecycle JSON), including
 sqlx-core, reqwest 002–004, h3 002–005, both h3-quinn patches, the tungstenite /
-tokio-tungstenite extensions other than lossless takeover, dimpl, and
-hyper-util (which has upstream issue
+tokio-tungstenite extensions other than lossless takeover, dimpl,
+Hyper 002/003/004, and hyper-util (which has upstream issue
 [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) but no
 upstream PR). These are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
+
+Hyper #4212 closed **unmerged** on 2026-10-04 at 08:45:54 UTC. Hyper patch
+002's current pending-body path is therefore recorded as a deliberate fork,
+with the old issue/PR retained as history in its README. It co-retires with
+patch 004 after an equivalent progress-preserving timeout implementation is
+adopted and tested, or the HTTP/2 client moves off Hyper. No replacement
+release or dated owner reaffirmation is recorded for either patch; the owner
+must file a current equivalent proposal or record matching dated reaffirmations
+before the stable-release checkpoint below. h2 #965 remains an independent
+open proposal with its own release-adoption trigger.
 
 - **Owner.** The dependency-governance owner in
   [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`) — the same
@@ -348,6 +366,12 @@ of the vendor copy and must keep passing after retirement:
   `tests/unit/config/env_config_tests.rs`. Upstream ADDS the configured CA to
   the bundled public roots, which combined with the `verify-ca` hostname waiver
   accepts any publicly-trusted certificate for any name.
+- Native REAL/DOUBLE typed-NULL parameter types through SQLx Any —
+  `tests/integration/admin_conditional_write_tests.rs`
+  (`postgres_conditional_restore_checks_state_and_lease_in_transaction`, via
+  `assert_postgres_any_float_null_parameter_types`) in the existing hosted
+  **Integration Tests (conditional-live-stores)** gate. `pg_typeof` observes
+  uncast parameters and both `IS NULL` witnesses must pass.
 - Per-request connect timeout across shared pool keys —
   `tests/integration/connection_pool_tests.rs`
   (`test_connect_timeout_does_not_fragment_pool`,
@@ -405,7 +429,7 @@ of the vendor copy and must keep passing after retirement:
   including to the tunnel of an upgraded client or server connection
   (issues #5588, #5911) — the vendored hyper regressions
   `proto::h1::io::tests::ferrum_greedy_read_*`, run with
-  `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read`.
+  `cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read`.
 - HTTP/2 DATA frames staged together leave in one write, byte-exact and in
   order with interleaved control frames, while the write buffer stays within
   about 64 KiB; a larger payload is still chained without a copy, partial
@@ -419,16 +443,23 @@ of the vendor copy and must keep passing after retirement:
   never trips it, steady progress re-arms it, and a request carrying it on a
   connection without a timer fails (issue #5588) — the vendored hyper
   regressions `proto::h2::ferrum_body_write_timeout_tests`, run with
-  `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout`.
-- An HTTP/2 request body is never cut into sliver DATA frames from a 1-byte
-  capacity claim (issue #5588, hyperium/hyper#4211) — the vendored hyper
-  regression `proto::h2::ferrum_min_data_frame_capacity_tests`, run with
-  `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_min_data_frame_capacity`.
+  `cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout`.
+- An HTTP/2 request body makes progress with a legal 512-byte peer stream
+  window and with the final byte of connection capacity
+  (hyperium/hyper#4211/#4212) — the vendored Hyper regressions
+  `proto::h2::ferrum_h2_flow_control_progress_tests`, run with
+  `cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_h2_flow_control_progress`, plus
+  `grpc_upload_progresses_with_512_byte_backend_stream_window` in
+  `tests/functional/scripted_backend_h2_tests.rs`.
+- h2's automatic small-DATA-frame budget follows runtime target-window
+  changes, while configured budgets and outstanding charges remain intact
+  (hyperium/h2#965) — the vendored h2 budget regressions, run with
+  `cargo test --manifest-path vendor/h2-0.4.19-ferrum-patched/Cargo.toml --lib budget`.
 - An HBONE relay that ends on a socket error resets its CONNECT stream with
   `RST_STREAM(CONNECT_ERROR)`, while a normal close still ends it with
   `END_STREAM` (issue #5781) — the vendored hyper regressions
   (`proto::h2::upgrade::ferrum_connect_error_reset_tests`), run with
-  `cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset`,
+  `cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset`,
   plus the gateway tests in `tests/integration/mesh_hbone_tests.rs`
   (`hbone_relay_backend_reset_sends_rst_stream_connect_error`,
   `hbone_relay_backend_close_still_ends_stream_cleanly`,
@@ -551,10 +582,11 @@ Every registry image reference in `Dockerfile`, `Dockerfile.release`,
 `Dockerfile.test`, `Dockerfile.ebpf-tools-layer`, and
 `Dockerfile.iproute2-layer` — both `FROM <ref>` and the `ARG <NAME>=<ref>`
 defaults those `FROM ${VAR}` lines expand — carries an `@sha256:` digest.
-`Dockerfile.iproute2-layer`'s default `BASE_IMAGE` matches the verified
-production runtime reference
-`gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97`;
-an explicit caller override remains supported. `scratch` is the only
+`Dockerfile.iproute2-layer`'s default `BASE_IMAGE` matches the source runtime
+pin in `Dockerfile` and `Dockerfile.release`; the
+[reviewed input record](docker.md#base-image-pinning) distinguishes its
+provenance from published-release qualification. An explicit caller override
+remains supported. `scratch` is the only
 admissible digest-less base, and a `FROM` naming an earlier `AS` alias is an
 internal stage edge, not an input.
 
@@ -584,14 +616,31 @@ of `Dockerfile.ebpf-tools-layer` and both runtime bases of `Dockerfile`.
   rewrites the digest in place, re-runs the pin verifier, and opens or updates a
   single pull request on the fixed branch `deps/base-image-digests`. It is
   digest-preserving by construction: it substitutes a digest and never removes
-  one, never changes an image or tag. The PR carries no gates of its own — normal
-  required CI (multi-arch build, FIPS, eBPF, GNU ABI scan, chart smoke) is what
-  proves a new base before merge.
+  one, never changes an image or tag. Required CI (multi-arch build, FIPS, eBPF,
+  GNU ABI scan, chart smoke) and `Trusted Cross Build Policy` must qualify the
+  latest reviewed PR head before merge.
   The shared resolution/staging inventory also includes `Dockerfile.iproute2-layer`,
   so the NodeWaypoint live image uses the same refreshed Debian tooling base. Its
-  default `BASE_IMAGE` matches the verified production runtime digest; an
+  default `BASE_IMAGE` matches the same source runtime pin; an
   explicit caller override remains supported. The refresh workflow already
   included this Dockerfile and updates its digest-pinned image references.
+
+The refresh workflow uses `GH_TOKEN: ${{ github.token }}` to create or update
+the PR. [GitHub's event rules](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs)
+allow token-created `pull_request` events (`opened`, `synchronize`, `reopened`)
+to create approval-required runs; other events, including `pull_request_target`,
+remain suppressed. Approving those PR runs does not create the missing
+`Trusted Cross Build Policy` check: `cross-build-policy.yml` uses
+`pull_request_target` for PRs and has no `workflow_dispatch` trigger.
+
+After reviewing the proposed inputs and completing meaningful necessary source
+or provenance changes, a maintainer must make an ordinary human-authenticated,
+fast-forward push to the existing PR branch. That fresh `synchronize` event
+allows both the trusted-base policy and fresh-head PR workflows to run. Verify
+both against the actual new head; earlier-head successes cannot qualify it.
+Re-running an existing PR workflow cannot create the absent trusted workflow.
+Do not substitute an admin bypass, fabricated check/status, protected-policy
+change, or empty/dummy commit for this reviewed update and its required checks.
 
 Emergency procedure (a base-image CVE that cannot wait for Monday): resolve the
 fixed tag's manifest-list digest by hand, bump the `@sha256:` value and the

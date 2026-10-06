@@ -1,7 +1,7 @@
 # hyper: keep reading an HTTP/1 transport past one TLS record while more is ready
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/hyper-1.9.0-ferrum-patched/` must regenerate the
+> Any change to `vendor/hyper-1.10.0-ferrum-patched/` must regenerate the
 > drift manifest (`scripts/update_vendor_integrity.sh`).
 
 ## Status
@@ -33,12 +33,14 @@ across that per-chunk path.
 
 ## Patch
 
+Apply [the complete ordered stack](../README.md) for reproducible vendor source.
+
 The read-ahead lives in `src/proto/h1/io.rs`; the upgrade handoff below also
 touches `src/common/io/rewind.rs`, `src/upgrade.rs`, `src/proto/h1/conn.rs`,
 `src/proto/h1/dispatch.rs`, and the HTTP/1 client and server connections
 (`src/client/conn/http1.rs`, `src/server/conn/http1.rs`). The unified diff is
 [`hyper-greedy-h1-read.patch`](hyper-greedy-h1-read.patch), taken against
-hyper 1.9.0 with patches 001 and 002 applied (001 also touches `rewind.rs`
+the published hyper 1.10.0 crate with patches 001 and 002 applied (001 also touches `rewind.rs`
 and `upgrade.rs`).
 
 After a successful read, if that read returned at least `GREEDY_READ_MIN`
@@ -115,7 +117,7 @@ module imports `Compat`, which hyper builds only with `http2`.
 The `Vendored Patch Regressions` CI job runs them with
 
 ```bash
-cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
+cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_greedy_read
 ```
 
 ## Retirement plan

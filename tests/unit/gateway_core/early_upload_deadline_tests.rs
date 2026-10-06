@@ -362,6 +362,16 @@ fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
 #[test]
 fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
+    // Scope the upload to the buffered gRPC implementation, not the earlier
+    // plain bridge's prebuffer match.
+    let dispatch = source
+        .find("async fn dispatch_grpc<S>(")
+        .expect("buffered H3-to-gRPC dispatch");
+    let source = &source[dispatch..];
+    let dispatch_end = source
+        .find("\n}\n")
+        .expect("buffered H3-to-gRPC dispatch end");
+    let source = &source[..dispatch_end];
     let start = source
         .find("let body = if let Some(buffered) = prebuffered_body")
         .expect("bridge buffered body match");
@@ -369,7 +379,8 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
         .find("let bytes_sent = if body_was_prebuffered")
         .expect("bridge body match must remain bounded");
     let bridge = &source[start..start + end];
-    assert!(bridge.contains("collect_h3_request_body_with_deadline("));
+    assert!(bridge.contains("collect_h3_request_body_under_authorization("));
+    assert!(bridge.contains("upload_bound,"));
     assert!(bridge.contains("drain_h3_body("));
     // Too-large and read rely on write_grpc_error_for_request (HEADERS then
     // halt). Pre-write STOP_SENDING would reverse that order and duplicate the
@@ -384,13 +395,14 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
     assert!(bridge.contains("write_grpc_error_for_request_with_recv_halt("));
     assert!(bridge.contains("write_final_body_reject("));
 
-    let timed_out = bridge
-        .split("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
-        .nth(1)
-        .expect("timed-out bridge arm")
-        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {")
-        .next()
+    let timed_out_start = bridge
+        .find("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
+        .expect("timed-out bridge arm");
+    let timed_out = &bridge[timed_out_start..];
+    let timed_out_end = timed_out
+        .find("H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {")
         .expect("bounded timed-out bridge arm");
+    let timed_out = &timed_out[..timed_out_end];
     assert!(
         timed_out.contains("halt_request_body(stream)"),
         "timed-out bridge arm must halt after the bounded terminal write"
@@ -404,10 +416,25 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
         timed_out.contains("await_post_deadline_terminal_response_write("),
         "timed-out bridge arm must bound the terminal write with the shared grace"
     );
+    let authorization_start = bridge
+        .find("H3RequestBodyReadError::DeadlineExceeded(Some(termination))) => {")
+        .expect("authorization bridge arm");
+    let authorization = &bridge[authorization_start..];
+    let authorization_end = authorization
+        .find("H3RequestBodyReadError::DeadlineExceeded(None)) => {")
+        .expect("bounded authorization bridge arm");
+    let authorization = &authorization[..authorization_end];
+    assert!(authorization.contains("record_authorization_termination_once("));
+    assert!(authorization.contains("write_grpc_authorization_expired_terminal("));
+    assert!(!authorization.contains("halt_request_body(stream)"));
     let deadline = bridge
-        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded(_)) => {")
+        .split("H3RequestBodyReadError::DeadlineExceeded(None)) => {")
         .nth(1)
         .expect("deadline bridge arm");
+    let deadline_end = deadline
+        .find("\n            }\n")
+        .expect("bounded deadline bridge arm");
+    let deadline = &deadline[..deadline_end];
     assert!(
         !deadline.contains("halt_request_body(stream)"),
         "deadline bridge arm must delegate the post-write halt to its finalizer"

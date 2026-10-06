@@ -278,6 +278,61 @@ fn concatenate_grpc_scripts(scripts: Vec<Vec<GrpcStep>>) -> Vec<GrpcStep> {
     scripts.into_iter().flatten().collect()
 }
 
+async fn spawn_primary_rpc_backend(scripts: Vec<Vec<GrpcStep>>) -> (u16, ScriptedGrpcBackend) {
+    let reservation = reserve_port().await.expect("port");
+    let port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .rpc_scripts(scripts)
+        .expect("primary RPC scripts")
+        .spawn()
+        .expect("spawn primary grpc backend");
+    (port, backend)
+}
+
+async fn assert_streaming_primary_rpcs(primary: &ScriptedGrpcBackend, multi_frame: &Bytes) {
+    let observed = primary.received_streams().await;
+    assert_eq!(observed.len(), 3, "primary RPCs={observed:?}");
+    for path in [CLIENT_STREAM_PATH, SERVER_STREAM_PATH, BIDI_PATH] {
+        let matching: Vec<_> = observed
+            .iter()
+            .filter(|stream| stream.path == path)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected one primary RPC for {path}: {observed:?}"
+        );
+        assert_mirror_grpc_headers(matching[0], path);
+        if path == CLIENT_STREAM_PATH {
+            assert_eq!(matching[0].body.as_slice(), multi_frame.as_ref());
+        }
+    }
+    primary.assert_no_matcher_mismatches().await;
+    primary.assert_no_step_errors().await;
+}
+
+fn assert_streaming_primary_responses(
+    client_stream: &GrpcResponse,
+    server_stream: &GrpcResponse,
+    bidi: &GrpcResponse,
+) {
+    assert_eq!(client_stream.http_status, 200);
+    assert_eq!(server_stream.http_status, 200);
+    assert_eq!(bidi.http_status, 200);
+    assert_eq!(
+        client_stream.messages,
+        vec![Bytes::from_static(b"primary-client-stream-ok")]
+    );
+    assert_eq!(
+        server_stream.messages,
+        vec![
+            Bytes::from_static(b"feature-1"),
+            Bytes::from_static(b"feature-2"),
+        ]
+    );
+    assert_eq!(bidi.messages, vec![Bytes::from_static(b"bidi-note")]);
+}
+
 async fn spawn_tls_backend(steps: Vec<GrpcStep>) -> (u16, ScriptedGrpcBackend, TestCa) {
     let ca = TestCa::new("request-mirror-grpc-tls").expect("ca");
     let (cert_pem, key_pem) = ca.valid().expect("leaf");
@@ -505,10 +560,10 @@ async fn request_mirror_grpc_h2c_streaming_shapes_and_multiframe_body() {
         },
     ];
 
-    // Ferrum's primary gRPC pool reuses one HTTP/2 connection across these
-    // sequential RPCs, so the fixture must expose one sequential stream script.
-    let (primary_port, _primary) =
-        spawn_plain_backend(concatenate_grpc_scripts(primary_scripts)).await;
+    // Each client helper opens a fresh frontend connection. Affinity may send
+    // those RPCs to different backend connections; route by method on either
+    // a reused or a new connection, preserving the half-open bidi request.
+    let (primary_port, primary) = spawn_primary_rpc_backend(primary_scripts).await;
     let (mirror_port, mirror) = spawn_plain_backend(mirror_steps).await;
 
     let harness = GatewayHarness::builder()
@@ -558,6 +613,8 @@ async fn request_mirror_grpc_h2c_streaming_shapes_and_multiframe_body() {
         .expect("bidi rpc");
     assert_eq!(bidi.grpc_status(), Some(0), "response={bidi:?}");
 
+    assert_streaming_primary_responses(&client_stream, &server_stream, &bidi);
+    assert_streaming_primary_rpcs(&primary, &multi_frame).await;
     let observed = wait_for_mirror_streams(&mirror, 3).await;
     let client_stream = mirror_stream_for_path(&observed, CLIENT_STREAM_PATH);
     let server_stream = mirror_stream_for_path(&observed, SERVER_STREAM_PATH);
@@ -638,10 +695,10 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
         },
     ];
 
-    // Ferrum's primary gRPC pool reuses one HTTP/2 connection across these
-    // sequential RPCs, so the fixture must expose one sequential stream script.
-    let (primary_port, _primary) =
-        spawn_plain_backend(concatenate_grpc_scripts(primary_scripts)).await;
+    // Each client helper opens a fresh frontend connection. Affinity may send
+    // those RPCs to different backend connections; route by method on either
+    // a reused or a new connection, preserving the half-open bidi request.
+    let (primary_port, primary) = spawn_primary_rpc_backend(primary_scripts).await;
     let (mirror_port, mirror, _ca) = spawn_tls_backend(mirror_steps).await;
 
     let harness = GatewayHarness::builder()
@@ -681,6 +738,10 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
         Some(0),
         "response={server_stream:?}"
     );
+    assert!(
+        server_stream.messages.len() >= 2,
+        "primary server-stream must deliver multiple messages: {server_stream:?}"
+    );
 
     let bidi = client
         .bidi_with_headers(BIDI_PATH, Bytes::from_static(b"note-1"), &[])
@@ -688,6 +749,8 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
         .expect("tls bidi rpc");
     assert_eq!(bidi.grpc_status(), Some(0), "response={bidi:?}");
 
+    assert_streaming_primary_responses(&client_stream, &server_stream, &bidi);
+    assert_streaming_primary_rpcs(&primary, &multi_frame).await;
     let observed = wait_for_mirror_streams(&mirror, 3).await;
     let client_stream = mirror_stream_for_path(&observed, CLIENT_STREAM_PATH);
     let server_stream = mirror_stream_for_path(&observed, SERVER_STREAM_PATH);

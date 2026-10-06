@@ -1,50 +1,61 @@
 diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
-index 9d4826152..9292b3524 100644
 --- a/src/proto/h2/mod.rs
 +++ b/src/proto/h2/mod.rs
-@@ -88,11 +88,24 @@ pin_project! {
+@@ -88,19 +88,12 @@
      {
          body_tx: SendStream<SendBuf<S::Data>>,
          data_done: bool,
+-        // A data chunk that has been polled from the body but is still waiting
+-        // for stream-level capacity before it can be shipped. Stored here so
+-        // it survives across `Poll::Pending` returns from `poll_capacity`; if
+-        // we left the chunk in a local, it would be dropped on every repoll.
+-        buffered_data: Option<Peeked<S::Data>>,
 +        // FERRUM PATCH 002: a polled DATA chunk (and its end-of-stream flag)
-+        // waiting for enough assigned capacity to avoid a sliver frame.
++        // waiting for any positive assigned capacity (empty DATA needs none).
 +        pending_data: Option<(S::Data, bool)>,
          #[pin]
          stream: S,
      }
+-}
+-
+-struct Peeked<D> {
+-    data: D,
+-    is_eos: bool,
  }
  
-+/// FERRUM PATCH 002: smallest DATA frame worth cutting while more of the
-+/// chunk is still waiting for capacity. h2 cuts a frame from whatever capacity
-+/// a stream holds, so on a connection whose window is nearly spent a chunk can
-+/// leave as a run of 1-byte frames (silly-window syndrome). h2 >= 0.4.16 peers
-+/// charge every DATA frame under 256 bytes to a small per-connection budget and
-+/// answer its exhaustion with GOAWAY(ENHANCE_YOUR_CALM, "too_many_data_frames"),
-+/// failing every stream on the connection. Kept at 1 KiB so no peer window a
-+/// real server advertises can hold a chunk back indefinitely.
-+const MIN_DATA_FRAME_CAPACITY: usize = 1024;
-+
  impl<S> PipeToSendStream<S>
- where
-     S: Body,
-@@ -101,6 +114,7 @@ where
+@@ -111,7 +104,7 @@
          PipeToSendStream {
              body_tx: tx,
              data_done: false,
+-            buffered_data: None,
 +            pending_data: None,
              stream,
          }
      }
-@@ -121,6 +135,37 @@ where
-     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-         let mut me = self.project();
-         loop {
-+            // FERRUM PATCH 002: a chunk already polled from the body is sent
-+            // only once it holds `min(len, MIN_DATA_FRAME_CAPACITY)` capacity.
+@@ -144,78 +137,55 @@
+                 return Poll::Ready(Err(crate::Error::new_body_write(::h2::Error::from(reason))));
+             }
+ 
+-            // If a previously-polled chunk is still waiting for stream-level
+-            // send capacity, drive that to completion before touching the
+-            // body again.
+-            if me.buffered_data.is_some() {
+-                while me.body_tx.capacity() == 0 {
+-                    match ready!(me.body_tx.poll_capacity(cx)) {
+-                        Some(Ok(0)) => {}
+-                        Some(Ok(_)) => break,
+-                        Some(Err(e)) => return Poll::Ready(Err(crate::Error::new_body_write(e))),
+-                        None => {
+-                            // None means the stream is no longer in a
+-                            // streaming state, we either finished it
+-                            // somehow, or the remote reset us.
++            // FERRUM PATCH 002: a ready chunk must make progress with every
++            // legal peer window. Waiting for a fixed minimum can deadlock when
++            // the peer advertises a smaller stream window or only one byte of
++            // connection capacity remains.
 +            if let Some((chunk, is_eos)) = me.pending_data.take() {
-+                let len = chunk.remaining();
-+                let needed = len.min(MIN_DATA_FRAME_CAPACITY);
-+                while me.body_tx.capacity() < needed {
++                while chunk.has_remaining() && me.body_tx.capacity() == 0 {
 +                    match me.body_tx.poll_capacity(cx) {
 +                        Poll::Pending => {
 +                            *me.pending_data = Some((chunk, is_eos));
@@ -55,78 +66,161 @@ index 9d4826152..9292b3524 100644
 +                            return Poll::Ready(Err(crate::Error::new_body_write(e)))
 +                        }
 +                        Poll::Ready(None) => {
-+                            return Poll::Ready(Err(crate::Error::new_body_write(
-+                                "send stream capacity unexpectedly closed",
-+                            )));
-+                        }
-+                    }
-+                }
-+                me.body_tx
-+                    .send_data(SendBuf::Buf(chunk), is_eos)
-+                    .map_err(crate::Error::new_body_write)?;
-+                if is_eos {
-+                    return Poll::Ready(Ok(()));
-+                }
-+                continue;
-+            }
-+
-             // we don't have the next chunk of data yet, so just reserve 1 byte to make
-             // sure there's some capacity available. h2 will handle the capacity management
-             // for the actual body chunk.
-@@ -162,14 +207,17 @@ where
-                             is_eos,
-                         );
- 
--                        let buf = SendBuf::Buf(chunk);
--                        me.body_tx
--                            .send_data(buf, is_eos)
--                            .map_err(crate::Error::new_body_write)?;
--
--                        if is_eos {
--                            return Poll::Ready(Ok(()));
-+                        // FERRUM PATCH 002: raise the claim to what a useful
-+                        // first frame needs (still small, per hyper#4003), and
-+                        // let the top of the loop send the chunk once that
-+                        // much is assigned. An empty END_STREAM chunk needs none.
-+                        let len = chunk.remaining();
-+                        if len > 1 {
-+                            me.body_tx
-+                                .reserve_capacity(len.min(MIN_DATA_FRAME_CAPACITY));
+                             return Poll::Ready(Err(crate::Error::new_body_write(
+                                 "send stream capacity unexpectedly closed",
+                             )));
                          }
+                     }
+                 }
+-
+-                let peeked = me.buffered_data.take().expect("checked is_some above");
+-                let buf = SendBuf::Buf(peeked.data);
+                 me.body_tx
+-                    .send_data(buf, peeked.is_eos)
++                    .send_data(SendBuf::Buf(chunk), is_eos)
+                     .map_err(crate::Error::new_body_write)?;
+-
+-                if peeked.is_eos {
++                if is_eos {
+                     return Poll::Ready(Ok(()));
+                 }
+                 continue;
+             }
+ 
+-            // Poll for the next body frame *before* reserving any connection
+-            // flow-control capacity. Reserving capacity speculatively (even a
+-            // single byte) pins that capacity on the connection-level window,
+-            // which can deadlock a second stream when talking to peers that
+-            // only emit WINDOW_UPDATE once their receive window is fully
+-            // exhausted. See #4003.
++            // Hyper 1.10: poll the body before reserving capacity. An idle
++            // body must not pin connection window needed by another stream.
+             match ready!(me.stream.as_mut().poll_frame(cx)) {
+                 Some(Ok(frame)) => {
+                     if frame.is_data() {
+                         let chunk = frame.into_data().unwrap_or_else(|_| unreachable!());
+                         let is_eos = me.stream.is_end_stream();
+-                        let len = chunk.remaining();
+-                        trace!("send body chunk: {} bytes, eos={}", len, is_eos);
+-
+-                        if len == 0 {
+-                            // Zero-length data frames need no capacity; send
+-                            // them straight through so trailing empty frames
+-                            // (e.g. an explicit end-of-stream marker) are
+-                            // delivered.
+-                            let buf = SendBuf::Buf(chunk);
+-                            me.body_tx
+-                                .send_data(buf, is_eos)
+-                                .map_err(crate::Error::new_body_write)?;
+-
+-                            if is_eos {
+-                                return Poll::Ready(Ok(()));
+-                            }
+-                            continue;
+-                        }
+-
+-                        // Reserve exactly the chunk size so we never pin more
+-                        // connection-level flow-control window than we are
+-                        // about to consume. Stash the chunk in `self` so it
+-                        // survives the upcoming `poll_capacity` wait even if
+-                        // it returns `Poll::Pending`.
+-                        me.body_tx.reserve_capacity(len);
+-                        *me.buffered_data = Some(Peeked {
+-                            data: chunk,
++                        trace!(
++                            "send body chunk: {} bytes, eos={}",
++                            chunk.remaining(),
+                             is_eos,
+-                        });
++                        );
++
++                        // Reserve only real DATA, preserving Hyper 1.10
++                        // idle-stream fairness and positive-window progress.
++                        me.body_tx.reserve_capacity(chunk.remaining());
 +                        *me.pending_data = Some((chunk, is_eos));
 +                        continue;
                      } else if frame.is_trailers() {
                          // no more DATA, so give any capacity back
                          me.body_tx.reserve_capacity(0);
-@@ -262,3 +310,96 @@ impl<B: Buf> Buf for SendBuf<B> {
+@@ -308,3 +278,142 @@
          }
      }
  }
 +
 +#[cfg(test)]
-+mod ferrum_min_data_frame_capacity_tests {
-+    //! FERRUM PATCH 002 regression (hyperium/hyper#4211): a chunk polled while
-+    //! its stream holds a sliver of capacity must not leave as a sliver frame.
++mod ferrum_h2_flow_control_progress_tests {
++    //! FERRUM PATCH 002 regressions (hyperium/hyper#4212): every positive
++    //! amount of assigned send capacity must allow a ready body to progress.
 +    use bytes::Bytes;
 +    use http_body_util::Full;
 +
 +    use super::{PipeToSendStream, SendBuf};
 +
 +    #[tokio::test]
-+    async fn chunk_waits_for_useful_capacity_instead_of_sliver_frames() {
++    async fn body_progresses_with_a_peer_window_below_one_kibibyte() {
++        const PEER_STREAM_WINDOW: u32 = 512;
++        const BODY_LEN: usize = 2048;
++
++        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
++        let (received_tx, received_rx) = tokio::sync::oneshot::channel::<usize>();
++
++        tokio::spawn(async move {
++            let mut builder = h2::server::Builder::new();
++            builder.initial_window_size(PEER_STREAM_WINDOW);
++            let mut conn = builder
++                .handshake::<_, Bytes>(server_io)
++                .await
++                .expect("server handshake");
++            let (request, response) = conn.accept().await.unwrap().unwrap();
++            tokio::spawn(async move { while conn.accept().await.is_some() {} });
++
++            let _response = response;
++            let mut body = request.into_body();
++            let mut received = 0;
++            while let Some(frame) = body.data().await {
++                let data = frame.expect("request DATA");
++                received += data.len();
++                body.flow_control()
++                    .release_capacity(data.len())
++                    .expect("release receive capacity");
++            }
++            let _ = received_tx.send(received);
++        });
++
++        let (mut client, conn) = h2::client::Builder::new()
++            .handshake::<_, SendBuf<Bytes>>(client_io)
++            .await
++            .expect("client handshake");
++        tokio::spawn(async move {
++            let _ = conn.await;
++        });
++
++        let (_response, send) = client
++            .send_request(http::Request::post("http://t/body").body(()).unwrap(), false)
++            .unwrap();
++        let pipe = PipeToSendStream::new(Full::new(Bytes::from(vec![b'B'; BODY_LEN])), send);
++        tokio::spawn(pipe);
++
++        let received = tokio::time::timeout(std::time::Duration::from_secs(5), received_rx)
++            .await
++            .expect("body must make progress with a 512-byte peer stream window")
++            .expect("received_rx");
++        assert_eq!(received, BODY_LEN);
++    }
++
++    #[tokio::test]
++    async fn body_uses_the_last_byte_of_connection_capacity() {
 +        // Leave exactly one byte of the 65535-byte initial connection window.
 +        const STREAM_A_LEN: usize = 65534;
 +        const STREAM_B_LEN: usize = 10_000;
 +
 +        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
-+        let (release_a_tx, release_a_rx) = tokio::sync::oneshot::channel::<()>();
++        let (stream_a_full_tx, stream_a_full_rx) = tokio::sync::oneshot::channel::<()>();
 +        let (first_b_tx, first_b_rx) = tokio::sync::oneshot::channel::<usize>();
 +
 +        tokio::spawn(async move {
 +            let mut conn = h2::server::handshake(server_io).await.expect("server handshake");
 +            let (req_a, respond_a) = conn.accept().await.unwrap().unwrap();
-+            // Stream A: take its burst without releasing capacity until the
-+            // test says so, then release all of it (a WINDOW_UPDATE).
 +            tokio::spawn(async move {
 +                let _respond_a = respond_a;
 +                let mut body_a = req_a.into_body();
@@ -137,8 +231,7 @@ index 9d4826152..9292b3524 100644
 +                        _ => return,
 +                    }
 +                }
-+                let _ = release_a_rx.await;
-+                let _ = body_a.flow_control().release_capacity(received);
++                let _ = stream_a_full_tx.send(());
 +                std::future::pending::<()>().await;
 +            });
 +            let (req_b, _respond_b) = conn.accept().await.unwrap().unwrap();
@@ -172,7 +265,10 @@ index 9d4826152..9292b3524 100644
 +                .unwrap();
 +            sent += take;
 +        }
-+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        tokio::time::timeout(std::time::Duration::from_secs(5), stream_a_full_rx)
++            .await
++            .expect("stream A must consume all but one byte of connection capacity")
++            .expect("stream_a_full_rx");
 +
 +        // Stream B pipes a 10 KB body against that one byte.
 +        let mut client = client.ready().await.expect("client ready");
@@ -182,16 +278,10 @@ index 9d4826152..9292b3524 100644
 +        let pipe = PipeToSendStream::new(Full::new(Bytes::from(vec![b'B'; STREAM_B_LEN])), send_b);
 +        tokio::spawn(pipe);
 +
-+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-+        let _ = release_a_tx.send(());
-+
 +        let first_b = tokio::time::timeout(std::time::Duration::from_secs(5), first_b_rx)
 +            .await
-+            .expect("stream B reaches the server once the window is released")
++            .expect("stream B must use the remaining connection capacity")
 +            .expect("first_b_rx");
-+        assert!(
-+            first_b >= 1024,
-+            "stream B's first DATA frame was {first_b} bytes: cut from a sliver of capacity"
-+        );
++        assert_eq!(first_b, 1);
 +    }
 +}

@@ -1,7 +1,7 @@
 # hyper: reset an upgraded HTTP/2 CONNECT stream with `CONNECT_ERROR`
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/hyper-1.9.0-ferrum-patched/` must regenerate the
+> Any change to `vendor/hyper-1.10.0-ferrum-patched/` must regenerate the
 > drift manifest (`scripts/update_vendor_integrity.sh`).
 
 ## Status
@@ -33,8 +33,8 @@ same either way: the stream has already ended. Edge does not need the change
 for correctness: its only caller, `end_hbone_connect_stream` in
 `src/proxy/hbone_proxy.rs`, uses the return value only to decide whether to
 log a debug line, then drops the stream. The vendored copy is left as is, so
-the drift manifest does not change; the next re-vendor (or the retirement)
-picks up the upstream form.
+the 1.10.0 security rebase retains that local behavior. Adopting the
+upstream form remains a separate reviewed behavior change at retirement.
 
 ## The problem
 
@@ -44,7 +44,7 @@ it from hyper as `hyper::upgrade::Upgraded` and relays it to a TCP backend
 relay ends, the gateway drops the `Upgraded`, or the byte-stream copy shuts
 it down after the backend's FIN.
 
-In hyper 1.9.0 (`src/proto/h2/upgrade.rs`), both paths end the stream with a
+In hyper 1.10.0 (`src/proto/h2/upgrade.rs`), both paths end the stream with a
 clean `END_STREAM`:
 
 - `H2Upgraded` holds only an mpsc sender. The `h2::SendStream` belongs to a
@@ -65,11 +65,13 @@ hyper `master` (1.11.1 when this was written) has the same limitation.
 
 ## Patch
 
-The base is the crates.io `hyper` 1.9.0 source (package checksum
-`6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca`, upstream
-commit `0d6c7d5469baa09e2fb127ee3758a79b3271a4f0`). Only three files under
+The base is the crates.io `hyper` 1.10.0 source (package checksum
+`eb92f162bf56536459fc83c79b974bb12837acfed43d6bc370a7916d0ae15ecc`, upstream
+commit `79dbab620bf14b96cd5d53a60ca35d7fe2ddbaf1`). Only three files under
 `src/` differ; the unified diff is
 [`hyper-upgraded-h2-connect-error-reset.patch`](hyper-upgraded-h2-connect-error-reset.patch).
+It is patch 001 of [the complete ordered stack](../README.md), based on the
+published Hyper 1.10.0 crate archive.
 The crate's `Cargo.lock`, `Cargo.toml.orig` and `.cargo_vcs_info.json` are not
 vendored.
 
@@ -143,7 +145,7 @@ In the vendored crate:
 The `Vendored Patch Regressions` CI job runs them with
 
 ```bash
-cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
+cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_connect_error_reset
 ```
 
 End to end, `tests/integration/mesh_hbone_tests.rs` drives real HBONE
@@ -166,7 +168,7 @@ error code (the API in hyperium/hyper#4210, whose text is in
    upstream API.
 2. Remove the `hyper` line from `[patch.crates-io]` in `Cargo.toml`,
    `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`.
-3. `git rm -r vendor/hyper-1.9.0-ferrum-patched/`, and restore the registry
+3. `git rm -r vendor/hyper-1.10.0-ferrum-patched/`, and restore the registry
    `source`/`checksum` lines in `Cargo.lock`, `fuzz/Cargo.lock` and
    `tests/performance/mesh/Cargo.lock` with a normal lockfile update.
 4. Remove the inventory row and the lifecycle entry, drop the CI step, and

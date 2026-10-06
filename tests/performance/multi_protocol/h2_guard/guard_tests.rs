@@ -1,6 +1,7 @@
 //! Injected only into the verified h2 crate's private streams test module.
 //! These call upstream recv_data/poll_data/clear_recv_buffer, not a guard model.
 use super::*;
+use crate::proto::DataFrameBudget;
 use crate::proto::streams::guard_observe::{admit, Limit, TARGET};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Barrier};
@@ -104,7 +105,7 @@ fn connection_with_budget(budget: usize) -> ConnectionFixture {
         remote_init_window_sz: 65535,
         remote_max_initiated: Some(1000),
         local_max_error_reset_streams: Some(1000),
-        data_frame_budget: budget,
+        data_frame_budget: DataFrameBudget::Configured(budget),
     }))
 }
 

@@ -78,7 +78,9 @@ info:
     rejected with `403 Forbidden`. A control plane serving multiple namespaces
     (`FERRUM_CP_NAMESPACES` names more than one namespace or `*`) engages this
     enforcement automatically. With the flag unset and no multi-namespace CP
-    scope, any valid admin JWT may address any namespace. The `/namespaces` registry is not
+    scope, any valid admin JWT may address any namespace; read-only
+    `/config/export` and `/backend-egress-policy` still enforce a present ns
+    claim. The `/namespaces` registry is not
     selected by `X-Ferrum-Namespace`: list results are filtered to claimed
     names (a token with no `ns` claim sees an empty list), and
     create/get/rename/delete of a specific name return `403` when the token
@@ -216,6 +218,8 @@ tags:
     description: CP/DP cluster status and operational introspection
   - name: Backend Capabilities
     description: Inspect and force-refresh the per-backend-target protocol classification cache (H1/H2/H3/h2c/gRPC)
+  - name: Backend Egress Policy
+    description: Read the loaded backend address enforcement policy without exposing address lists
   - name: Diagnostics
     description: Resolve opaque gateway diagnostic references (X-Ferrum-Diagnostic-Ref) to scoped, operator-only detail
   - name: Node-Waypoint
@@ -2445,6 +2449,82 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /backend-egress-policy:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: getBackendEgressPolicy
+      summary: Read the effective backend address policy
+      description: |
+        JWT-only read metadata for viewer, operator, and admin roles, including
+        viewer-key JWTs. Metrics tokens and metrics CIDR allowlists grant no
+        access. Namespace read authorization applies: a present ns claim must
+        include X-Ferrum-Namespace even when optional claim enforcement is off;
+        the viewer-key namespace ceiling always applies. A missing ns claim is
+        refused when claim enforcement is enabled (including multi-namespace CP).
+
+        Describes the immutable loaded BackendEgressPolicy, using ProxyState's
+        actual policy on serving processes. Never rereads raw environment values,
+        reveals CIDRs/addresses/counts/secrets, or performs DNS validation.
+        Available on read-only admin listeners as well as writable ones.
+
+        The policy is process-wide. enforcement_scope distinguishes a local
+        data plane serving the selected namespace from an unserved namespace,
+        CP admission-only policy, or a process without a data plane. CP metadata
+        does not attest its DPs: check every serving gateway independently.
+
+        Mode class lists describe the last evaluation stage, not unconditional
+        effective permissions: allow CIDRs override deny CIDRs, the dangerous
+        baseline, and mode. public_only_guaranteed is conservative and true only
+        for public mode with no allow overrides. It describes the loaded policy,
+        not external firewalls, DNS ownership, or successful socket connections.
+        The ordinary runtime enforcement remains authoritative; this endpoint
+        does not add enforcement to any outbound path.
+
+        Consumers requiring public-only backends must fail closed on missing or
+        unknown schema/classification/labels, unexpected namespace, an enforcement
+        scope other than local-data-plane, or public_only_guaranteed=false.
+        See docs/admin_api.md#backend-egress-policy for exact v1 classifications,
+        embedded IPv4 handling, precedence, defaults, and integration guidance.
+      tags: [Backend Egress Policy]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Loaded policy metadata (Cache-Control no-store)
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackendEgressPolicyResponse"
+              examples:
+                defaultControlPlane:
+                  summary: Production default; admission policy only on a CP
+                  value:
+                    schema_version: 1
+                    ip_classification: ferrum-private-reserved-v1
+                    namespace: ferrum
+                    policy_scope: process
+                    enforcement_scope: admission-only
+                    mode: both
+                    mode_allowed_ip_classes: [public, private-reserved]
+                    mode_blocked_ip_classes: []
+                    dangerous_ranges_blocked: true
+                    allow_cidr_overrides_present: false
+                    deny_cidr_overrides_present: false
+                    evaluation_order: [allow-cidrs, deny-cidrs, dangerous-ranges, ip-mode]
+                    public_only_guaranteed: false
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   # ── Backend Capabilities ────────────────────────────────────────────
   /backend-capabilities:
@@ -4848,6 +4928,51 @@ paths:
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Backup & Restore ────────────────────────────────────────────────
+  /deployment-snapshot:
+    parameters:
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: deploymentSnapshot
+      summary: Read complete coherent deployment authority
+      description: |
+        Admin-only, unfiltered primary snapshot for the deployment-v1 partial
+        mutation profile. Contains complete proxy/plugin/association dependencies,
+        full gzip spec bytes and external-reference snapshots, raw store fields,
+        historical credentials, trust, registry metadata and the change watermark.
+        Security audit admission is mandatory before disclosure. No queries or
+        cached fallback are supported. Unknown/unrepresentable resource shapes
+        refuse authority rather than being erased. MongoDB requires a replica set.
+        Retain the original encrypted response and ETag; never refresh authority
+        to retry a refused or uncertain recovery mutation. See
+        docs/deployment_mutations.md for consumer adoption and limitations.
+      tags: [Backup & Restore]
+      responses:
+        "200":
+          description: Coherent original evidence; contains unredacted sensitive data
+          headers:
+            ETag:
+              description: Exactly one quoted deployment-v1 token for this snapshot
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentSnapshot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "501":
+          description: Store topology cannot provide atomic deployment authority
+        "503":
+          description: Coherent state or security audit admission unavailable
+
   /backup:
     parameters:
       - $ref: "#/components/parameters/XFerrumNamespace"
@@ -4855,6 +4980,16 @@ paths:
       operationId: backupConfig
       summary: Export full gateway configuration
       description: |
+        Opt in with `?conditional=true` for complete stored rows and per-row
+        strong ETags plus a namespace ETag from ONE primary database snapshot.
+        This requires an unfiltered export and snapshot transactions (SQL or
+        replica-set MongoDB); it never falls back to cached data. The namespace
+        token covers all resources, associations, API-spec documents, trust,
+        registry metadata and the durable namespace change watermark. Send it
+        as `If-Match` to `POST /restore?confirm=true` on this same namespace.
+        Consumer credentials on this path are copied exactly, including older
+        stored fields, rather than canonicalized for archival restoration.
+
         Returns the complete gateway configuration as a single JSON document
         suitable for archival or later restoration via `POST /restore`.
 
@@ -4941,12 +5076,25 @@ paths:
           schema:
             type: string
             example: "proxies,upstreams"
+        - name: conditional
+          in: query
+          description: |
+            Explicit opt-in to the coherent, credential-complete conditional
+            snapshot contract. Only true/false are accepted; duplicate values
+            or a resources filter combined with true return 400.
+          schema:
+            type: boolean
+            default: false
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
           description: Full configuration backup
           headers:
+            ETag:
+              description: Strong namespace revision; emitted only for conditional=true.
+              schema:
+                type: string
             Content-Disposition:
               schema:
                 type: string
@@ -4964,6 +5112,12 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "501":
+          description: Conditional snapshots require a transaction-capable MongoDB deployment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4974,6 +5128,15 @@ paths:
       operationId: restoreConfig
       summary: Replace all configuration from a backup
       description: |
+        With `If-Match` from `/backup?conditional=true`, the namespace revision
+        comparison and the ENTIRE replacement commit in one transaction.
+        Concurrent changes yield 412 without mutation. Unsupported MongoDB
+        topology yields 501 before mutation; the path never degrades to the
+        legacy independently committed clear/import flow. A weak tag cannot
+        match, malformed headers and `*` return 400. Missing If-Match preserves
+        the existing unconditional restore behavior. Body metadata is accepted
+        and ignored; only the header establishes a precondition.
+
         **Replacement operation** — snapshots the current namespace, deletes
         all existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
@@ -5065,6 +5228,7 @@ paths:
         (generated via `GET /backup?resources=proxies`, etc.).
       tags: [Backup & Restore]
       parameters:
+        - $ref: "#/components/parameters/NamespaceIfMatch"
         - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: confirm
@@ -5092,6 +5256,18 @@ paths:
             schema:
               $ref: "#/components/schemas/RestoreRequest"
       responses:
+        "412":
+          description: Namespace changed; nothing from the conditional restore was applied.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: Conditional restore requires a transaction-capable MongoDB deployment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
@@ -5479,12 +5655,34 @@ paths:
         multi-document compensation writes. It also refuses direct deletion of
         an API-spec-owned proxy with `501` before the first ownership-graph
         mutation; configure a replica set and retry.
+        Opt in with conditional=true and cleanup_orphaned_upstream=false to
+        compare the ORIGINAL GET /deployment-snapshot token inside the owning
+        entry/commit transaction fences. This mode refuses missing, weak,
+        wildcard, list, duplicate, wrong-profile or ambiguous authority/modes
+        with 400 and stale evidence with 412. It removes only the selected
+        cascade, retains hand-owned upstreams and shared association owners,
+        and never runs whole-namespace restore or late compensation. Success
+        uses the DeploymentMutationAcknowledgement body (200, not 204).
+        Require durable=committed, live=applied and recovery_cleanup_authorized=true
+        before automatic journal removal. CP/unserved durable-only 200 responses
+        explicitly set cleanup authorization false. Any uncertainty, audit/lease
+        failure or committed-not-live result forbids cleanup and replay.
       tags: [Proxies]
       parameters:
+        - $ref: "#/components/parameters/ConditionalDeployment"
         - $ref: "#/components/parameters/LiveApplyMode"
         - $ref: "#/components/parameters/IfMatch"
         - $ref: "#/components/parameters/CleanupOrphanedUpstream"
       responses:
+        "200":
+          description: Conditional deployment acknowledgement; inspect durable and live fields
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
@@ -5495,11 +5693,19 @@ paths:
             X-Ferrum-Namespace-Unserved:
               $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
+          description: |
+            Deletion would leave an invalid plugin-composition graph, or an
+            API-spec-owned proxy has foreign/missing ownership metadata or a
+            restore-snapshot shape that atomic compensation cannot reproduce
+            safely, or `cleanup_orphaned_upstream` was duplicated or was not
+            exactly `true` or `false`. Conditional mode also refuses invalid
+            query parameters or original deployment authority without mutation.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5507,9 +5713,21 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "412":
-          $ref: "#/components/responses/PreconditionFailed"
+          description: Row precondition failed, or original deployment authority is stale
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: Admission conflict or inconsistent deployment dependency ownership
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "501":
           description: |
             Standalone MongoDB cannot atomically delete the proxy, scoped
@@ -5519,9 +5737,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProxyDeleteAtomicityFailureResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/ProxyDeleteAtomicityFailureResponse"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "503":
-          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+          $ref: "#/components/responses/DeploymentMutationUnavailable"
 
   /proxies/{id}/mcp/tools:
     parameters:
@@ -5692,6 +5912,44 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+
+  /consumers/{id}/verification:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+      - $ref: "#/components/parameters/XFerrumNamespace"
+    get:
+      operationId: verifyCompleteConsumer
+      summary: Read the complete stored consumer with its strong ETag
+      description: |
+        Requires an admin-role JWT and the same namespace authorization as
+        consumer CRUD. Operators, viewers, metrics credentials and anonymous
+        callers cannot read this endpoint. Returns every stored credential
+        field (Basic authentication uses password_hash, never plaintext) and
+        the SAME ETag as GET /consumers/{id}, bound to this exact full row.
+        Never uses cached fallback. A security audit record must be admitted
+        before the credential-bearing response is released. Audit metadata
+        contains no credential values or tokens. Responses use no-store.
+      tags: [Consumers]
+      responses:
+        "200":
+          description: Complete stored consumer
+          headers:
+            ETag:
+              $ref: "#/components/headers/ResourceETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConsumerVerification"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /consumers/{id}:
     parameters:
@@ -7812,8 +8070,25 @@ paths:
         to `POST /api-specs`.
 
         This mutation requires the `admin` role.
+        Opt in with conditional=true and exactly one original deployment-v1
+        If-Match from GET /deployment-snapshot for dependency-fenced replacement.
+        Row/backup tags, absent/duplicate/list/weak/wildcard preconditions,
+        invalid/missing modes and apply=async are refused with 400. Stale
+        namespace/spec/plugin/hosts authority is 412 before mutation. The
+        original evidence is compared again inside the atomic entry/commit
+        admission fences on all stores (MongoDB requires a replica set).
+        This partial profile preserves unrelated rows and metadata without
+        namespace restore preparation or late compensation. A conditional 200
+        uses DeploymentMutationAcknowledgement and authorizes automatic journal
+        removal only when durable=committed, live=applied and
+        recovery_cleanup_authorized=true. CP/unserved results are durable-only
+        and set authorization false. No uncertain outcome authorizes replay.
+        Conditional metadata-only replacement also records a covering proxy
+        change; ordinary resource-hash short-circuit behavior is unchanged.
       tags: [API Specs]
       parameters:
+        - $ref: "#/components/parameters/ConditionalDeployment"
+        - $ref: "#/components/parameters/DeploymentIfMatch"
         - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
         - name: X-Ferrum-Namespace
@@ -7855,17 +8130,22 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiSpecCreateResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/ApiSpecCreateResponse"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "400":
           description: |
             New spec is structurally invalid (bad JSON/YAML, unrecognised
             OpenAPI/Swagger version, or missing/malformed `x-ferrum-*`
             extension). See `ApiSpecParseError.code` for which structural
-            problem fired.
+            problem fired. Conditional mode also refuses invalid query
+            parameters or original deployment authority without mutation.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiSpecParseError"
+                anyOf:
+                  - $ref: "#/components/schemas/ApiSpecParseError"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7875,11 +8155,30 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle, or the replacement would make mTLS DNS identities ambiguous
+          description: |
+            A resource name / listen_path in the new spec conflicts with an
+            existing resource outside this bundle, or the replacement would
+            make mTLS DNS identities ambiguous. Conditional mode also refuses
+            missing or inconsistent deployment dependencies or ownership
+            before mutation.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
+        "412":
+          description: Original deployment snapshot is stale; nothing was modified
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
+        "501":
+          description: Store topology cannot provide atomic dependency authority; nothing was modified
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "413":
           description: Request body exceeds the configured size limit
           content:
@@ -7906,7 +8205,7 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
-          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+          $ref: "#/components/responses/DeploymentMutationUnavailable"
 
     delete:
       operationId: deleteApiSpec
@@ -8174,6 +8473,46 @@ components:
 
   # ── Reusable parameters ────────────────────────────────────────────
   parameters:
+    ConditionalDeployment:
+      name: conditional
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: ["true"]
+      description: |
+        Opt into deployment-v1 partial mutation. Exactly one conditional=true
+        and one original quoted deployment token are required in this profile.
+        Proxy removal also requires cleanup_orphaned_upstream=false. Invalid,
+        repeated or ambiguous mode values refuse; absence retains ordinary
+        semantics unless a deployment token was supplied without its mode.
+    DeploymentIfMatch:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+        pattern: '^"deployment-v1-[0-9a-f]{32}"$'
+      description: |
+        Required with conditional=true. Exactly one original strong token from
+        GET /deployment-snapshot on this namespace. Lists, weak tags, wildcard,
+        duplicate fields, row/backup tokens and missing evidence are 400. Stale
+        authority is 412. Never refresh the token to retry uncertain recovery.
+        Ordinary API-spec replacement refuses If-Match without this mode.
+    NamespaceIfMatch:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+      description: |
+        The strong namespace ETag from GET /backup?conditional=true on the same
+        X-Ferrum-Namespace. Comparison and all replacement writes are atomic.
+        Weak tags fail with 412, malformed/empty headers and * return 400.
+        A comma-separated tag list matches when any strong member matches.
+        Omission preserves unconditional restore behavior. Shared admin JWT
+        secrets are required for tags to agree between replicas.
+
     IfMatch:
       name: If-Match
       in: header
@@ -8181,6 +8520,13 @@ components:
       schema:
         type: string
       description: |
+        For DELETE /proxies/{id}?conditional=true, this must instead be exactly
+        one original quoted deployment-v1 token from GET /deployment-snapshot.
+        That profile rejects weak/wildcard/list/duplicate or missing evidence
+        with 400, requires cleanup_orphaned_upstream=false, and compares the
+        complete dependencies inside the selected mutation transaction.
+        The following row-tag rules apply to ordinary mode only.
+
         Makes this full-replacement write conditional (RFC 9110 §13.1.1). Send
         the `ETag` from `GET` on the same resource; the write is refused with
         `412` unless the stored resource still has that representation, so a
@@ -8198,7 +8544,8 @@ components:
         Omitting the header keeps the write unconditional. A malformed or
         empty header is `400`, never treated as absent. `If-Match` is only
         evaluated on `PUT`/`DELETE` of `/proxies/{id}`, `/upstreams/{id}`,
-        `/consumers/{id}`, and `/plugins/config/{id}`; any other `POST`,
+        `/consumers/{id}`, and `/plugins/config/{id}`. `POST /restore` uses
+        the separate NamespaceIfMatch contract; any other `POST`,
         `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
         than applied unconditionally. As RFC 9110 §13.2.1 requires, a request
         that would otherwise be `404` is `404` regardless of the precondition.
@@ -8619,6 +8966,50 @@ components:
             $ref: "#/components/schemas/Error"
           example:
             error: Namespace mutation is temporarily unavailable; retry later
+    DeploymentMutationUnavailable:
+      description: |
+        Ordinary mutations retain the NamespaceAdmissionUnavailable contract:
+        namespace contention or a definitively aborted admission/serialization
+        transaction applies nothing, uses a redacted Error body without an
+        `applied` field, and may carry `Retry-After: 1`. A retained uncertain
+        namespace fence requires operator recovery before retries can succeed.
+        Admission/transaction aborts carry `rollback: not_needed`; driver
+        messages are withheld. Uniqueness and name conflicts use 409 instead.
+        A committed ordinary mutation that is not live has `applied: false`
+        and a closed `reason` (`config_rejected`, `reload_timeout`, or
+        `sequence_unavailable`), without Retry-After. Only that committed
+        family may carry the optional X-Ferrum-Config-Cursor; pre-commit
+        failures never carry it. The covering sequence is bound to the pinned
+        topology epoch; reconnect/failover invalidates the old cursor rather
+        than comparing it with a replacement database's watermark.
+
+        Conditional deployment mutations instead use
+        DeploymentMutationAcknowledgement. Admission/evidence failures report
+        `durable: not_started`; a transaction acknowledgement that cannot be
+        confirmed reports `durable: unknown`; a confirmed commit whose live,
+        audit or namespace-lease acknowledgement fails reports
+        `durable: committed`. All have `live: unconfirmed` and
+        `recovery_cleanup_authorized: false`. This family does not promise a
+        cursor or Retry-After. Retain the original encrypted journal; no 503
+        authorizes automatic replay or journal removal.
+      headers:
+        Retry-After:
+          required: false
+          description: >-
+            Minimum delay in seconds before retrying; present for
+            namespace-admission contention.
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+        X-Ferrum-Config-Cursor:
+          $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
     NamespaceRegistryAtomicityUnsupported:
       description: >-
         The configured database deployment cannot commit a namespace registry
@@ -8662,6 +9053,73 @@ components:
 
   # ── Schemas ─────────────────────────────────────────────────────────
   schemas:
+    DeploymentMutationAcknowledgement:
+      type: object
+      required: [durable, live, recovery_cleanup_authorized]
+      properties:
+        profile:
+          type: string
+          enum: [deployment-v1]
+        id:
+          type: string
+        error:
+          type: string
+        durable:
+          type: string
+          enum: [not_started, not_committed, committed, unknown]
+        live:
+          type: string
+          enum: [unconfirmed, not_applicable, applied]
+        recovery_cleanup_authorized:
+          type: boolean
+          description: True only after confirmed commit, applicable local live proof, audit admission and lease release
+      description: |
+        Missing fields, non-200 results or authorization=false cannot authorize
+        journal removal, dependent cleanup or replay. An uncertain/cancelled
+        transport may have committed; retain the encrypted original journal.
+        A local applied result does not prove all remote data planes applied.
+    DeploymentSnapshot:
+      type: object
+      required: [profile, namespace, namespace_etag, evidence, proxies, upstreams, plugin_configs, api_specs]
+      properties:
+        profile:
+          type: string
+          enum: [deployment-v1]
+        namespace:
+          type: string
+        namespace_etag:
+          type: string
+          pattern: '^"deployment-v1-[0-9a-f]{32}"$'
+        evidence:
+          type: object
+          additionalProperties: true
+          description: |
+            Complete secret-bearing typed and raw stored identity; retain with the
+            original token. SQL column evidence includes column_type, value_type
+            and a lossless value (float bits or blob bytes where applicable);
+            null values retain their column type. MongoDB includes raw documents
+            and BSON bytes. Treat the complete evidence as the comparison basis.
+        proxies:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        upstreams:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        plugin_configs:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        api_specs:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            description: Full spec metadata, numeric gzip byte array and external-reference evidence
     Namespace:
       type: object
       required: [name, created_at, updated_at]
@@ -10962,6 +11420,21 @@ components:
           properties:
             credentials:
               $ref: "#/components/schemas/ConsumerCredentialsUpdateInput"
+
+    ConsumerVerification:
+      description: |
+        Exact stored consumer credential representation for admin verification.
+        Unlike archival ConsumerBackup, historical credential shapes and fields
+        are preserved so the complete row and its strong ETag can be verified.
+        Such historical values may require repair before restore accepts them.
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/ConsumerBase"
+        - type: object
+          properties:
+            credentials:
+              type: object
+              additionalProperties: true
 
     ConsumerBackup:
       description: >-
@@ -18905,6 +19378,10 @@ components:
         persist `api_specs` or `gateway_trust_bundles` — use `POST /restore`
         or the dedicated endpoints.
       properties:
+        conditional:
+          type: object
+          additionalProperties: true
+          description: Backup metadata, accepted and ignored. Use If-Match for conditional restore.
         proxies:
           type: array
           items:
@@ -19188,10 +19665,59 @@ components:
           minItems: 1
       additionalProperties: false
 
+    ConditionalBackupMetadata:
+      type: object
+      required: [namespace_etag, row_etags]
+      additionalProperties: false
+      description: |
+        Present only for conditional=true; every token is derived from the
+        same complete primary snapshot as the exported rows. Tokens are keyed
+        HMACs, never unkeyed credential digests. Read timestamps and audit events
+        do not advance the namespace revision. Real resource mutations, including
+        delete/recreate, do. Namespace registry metadata is covered but not exported.
+      properties:
+        namespace_etag:
+          type: string
+          description: Quoted strong ETag for If-Match on POST /restore.
+        row_etags:
+          type: object
+          required: [proxies, consumers, upstreams, plugin_configs]
+          additionalProperties: false
+          properties:
+            proxies:
+              $ref: "#/components/schemas/ResourceETagMap"
+            consumers:
+              $ref: "#/components/schemas/ResourceETagMap"
+            upstreams:
+              $ref: "#/components/schemas/ResourceETagMap"
+            plugin_configs:
+              $ref: "#/components/schemas/ResourceETagMap"
+
+    ResourceETagMap:
+      type: object
+      description: Resource id to quoted strong ETag accepted by conditional CRUD.
+      additionalProperties:
+        type: string
+
     BackupResponse:
       type: object
       required: [version, ferrum_version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
+      allOf:
+        - if:
+            required: [conditional]
+          then:
+            properties:
+              consumers:
+                items:
+                  $ref: "#/components/schemas/ConsumerVerification"
+          else:
+            properties:
+              consumers:
+                items:
+                  $ref: "#/components/schemas/ConsumerBackup"
       properties:
+        conditional:
+          $ref: "#/components/schemas/ConditionalBackupMetadata"
         version:
           type: string
           description: Configuration schema version
@@ -19238,8 +19764,6 @@ components:
             $ref: "#/components/schemas/Proxy"
         consumers:
           type: array
-          items:
-            $ref: "#/components/schemas/ConsumerBackup"
         plugin_configs:
           type: array
           items:
@@ -19468,6 +19992,10 @@ components:
         backup artifact round-trips.
       additionalProperties: false
       properties:
+        conditional:
+          type: object
+          additionalProperties: true
+          description: Backup metadata, accepted and ignored. Use If-Match for conditional restore.
         version:
           type: string
           description: |
@@ -38794,6 +39322,121 @@ components:
         message:
           type: string
           description: Informational message
+
+    BackendEgressPolicyResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - ip_classification
+        - namespace
+        - policy_scope
+        - enforcement_scope
+        - mode
+        - mode_allowed_ip_classes
+        - mode_blocked_ip_classes
+        - dangerous_ranges_blocked
+        - allow_cidr_overrides_present
+        - deny_cidr_overrides_present
+        - evaluation_order
+        - public_only_guaranteed
+      properties:
+        schema_version:
+          type: integer
+          enum: [1]
+          description: Version of this response vocabulary; unknown versions must fail closed
+        ip_classification:
+          type: string
+          enum: [ferrum-private-reserved-v1]
+          description: |
+            Versioned Edge is_private_ip classification, not a DNS lookup or an
+            external registry. public is its complement. private-reserved
+            includes loopback, RFC1918/ULA, link-local, CGNAT, metadata,
+            documentation, benchmarking, multicast, unspecified, reserved and
+            non-global special-purpose addresses, including recognized IPv4
+            embeddings. The exact v1 ranges and globally reachable IETF
+            exceptions are documented in docs/admin_api.md#backend-egress-policy.
+        namespace:
+          type: string
+          description: Authorized request namespace; absent header selects ferrum
+        policy_scope:
+          type: string
+          enum: [process]
+          description: The policy is process-wide, not a per-namespace override
+        enforcement_scope:
+          type: string
+          enum: [local-data-plane, unserved-namespace, admission-only, no-data-plane]
+          description: |
+            local-data-plane means this process has a ProxyState serving the
+            requested namespace. unserved-namespace means its local data plane
+            serves another namespace. admission-only is CP without a local
+            proxy; no-data-plane covers node_agent and other non-serving states.
+            Neither admission-only nor no-data-plane attests remote DP policy.
+        mode:
+          type: string
+          enum: [both, public, private]
+          description: Loaded mode; the production default is both
+        mode_allowed_ip_classes:
+          type: array
+          uniqueItems: true
+          maxItems: 2
+          items:
+            type: string
+            enum: [public, private-reserved]
+          description: |
+            Classes allowed by mode before overlays/baseline: both has
+            [public, private-reserved], public has [public], private has
+            [private-reserved]. These are not unconditional effective allows.
+        mode_blocked_ip_classes:
+          type: array
+          uniqueItems: true
+          maxItems: 1
+          items:
+            type: string
+            enum: [public, private-reserved]
+          description: |
+            both has [], public has [private-reserved], private has [public].
+            Allow CIDR overrides can bypass these blocks.
+        dangerous_ranges_blocked:
+          type: boolean
+          description: |
+            Loaded dangerous-range baseline (production default true). It
+            blocks metadata/link-local, multicast, unspecified/this-host and
+            limited broadcast, unless an explicit allow override applies.
+            It permits ordinary loopback and RFC1918/ULA under both mode;
+            baseline-on alone never proves public-only egress.
+        allow_cidr_overrides_present:
+          type: boolean
+          description: Any loaded explicit allow CIDRs; entries and counts are withheld
+        deny_cidr_overrides_present:
+          type: boolean
+          description: Any loaded explicit deny CIDRs; entries and counts are withheld
+        evaluation_order:
+          type: array
+          minItems: 4
+          maxItems: 4
+          prefixItems:
+            - type: string
+              const: allow-cidrs
+            - type: string
+              const: deny-cidrs
+            - type: string
+              const: dangerous-ranges
+            - type: string
+              const: ip-mode
+          items: false
+          description: |
+            First-match precedence for an address and each recognized embedded
+            IPv4 candidate. Ambiguous NAT64 local-use embeddings must pass both
+            decoded candidates and then the literal IPv6 policy; see v1 docs.
+        public_only_guaranteed:
+          type: boolean
+          description: |
+            True exactly when mode=public and allow_cidr_overrides_present=false.
+            Deny overrides only restrict. False is conservative: even a wholly
+            public allow list prevents certification, since CIDRs are withheld.
+            This policy guarantee requires enforcement_scope=local-data-plane
+            before it is usable as evidence about a serving gateway.
 
     # ── Backend Capabilities ─────────────────────────────────────────
     ProtocolSupport:

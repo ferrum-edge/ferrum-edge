@@ -3,10 +3,13 @@
 pub mod api_specs;
 pub mod audit;
 pub mod audit_spool;
+mod backend_egress_policy;
 mod backup;
+mod conditional_snapshots;
 pub mod config_export;
 pub mod conn_limit;
 pub(crate) mod crud;
+mod deployment_mutations;
 pub mod jwt_auth;
 mod mcp_tool_catalog;
 pub mod mesh_config_drift;
@@ -2317,6 +2320,10 @@ fn namespace_scoped_resource_kind(segments: &[&str]) -> Option<&'static str> {
         "api-specs" => "api-specs",
         "batch" => "batch",
         "backup" => "backup",
+        "deployment-snapshot" => "deployment-snapshot",
+        // Process policy applicable to this tenant, disclosed only through
+        // namespace read authorization (including the viewer-key ceiling).
+        "backend-egress-policy" if segments.len() == 1 => "backend-egress-policy",
         // Only the export: `/config/apply-status` is a process-topology
         // surface, not a tenant-addressed resource.
         "config" if segments.get(1) == Some(&"export") => "config-export",
@@ -3982,7 +3989,75 @@ async fn handle_admin_request_inner(
         drop(req.into_body());
         return Ok(resp);
     }
+    let deployment_write_route = matches!(
+        (method.clone(), segments_peek.as_slice()),
+        (Method::DELETE, ["proxies", _]) | (Method::PUT, ["api-specs", _])
+    );
+    if deployment_mutations::requested(req.uri().query(), req.headers())
+        && matches!(
+            method,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        )
+        && !deployment_write_route
+    {
+        let role = if matches!(segments_peek.as_slice(), ["api-specs", ..]) {
+            Some(AdminRole::Admin)
+        } else {
+            body_consuming_route_role(&method, segments_peek.as_slice()).flatten()
+        };
+        if let Some(role) = role
+            && let Some(response) = require_admin_role(&auth, role)
+        {
+            return Ok(response);
+        }
+        return Ok(deployment_mutations::refusal(
+            "Deployment conditional mode is unsupported on this mutation route",
+        ));
+    }
+
     match (method.clone(), segments_peek.as_slice()) {
+        (Method::GET, ["backend-egress-policy"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Viewer) {
+                return Ok(resp);
+            }
+            // Like /config/export, a present ns claim always constrains this
+            // read, including when optional claim enforcement is disabled.
+            if auth.allowed_namespaces.is_present()
+                && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
+            {
+                return Ok(resp);
+            }
+            drop(req.into_body());
+            return Ok(backend_egress_policy::handle_get(&state, &namespace));
+        }
+        (Method::DELETE, ["proxies", id])
+            if deployment_mutations::requested(req.uri().query(), req.headers()) =>
+        {
+            if let Some(response) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(response);
+            }
+            if auth.allowed_namespaces.is_present()
+                && let Some(response) = enforce_namespace_claim(&auth, &namespace, &path)
+            {
+                return Ok(response);
+            }
+            if crate::config::types::validate_resource_id(id).is_err() {
+                return Ok(deployment_mutations::refusal(
+                    "Invalid deployment target id",
+                ));
+            }
+            let original =
+                match deployment_mutations::parse_request(req.uri().query(), req.headers(), true) {
+                    Ok(Some(original)) => original,
+                    _ => {
+                        return Ok(deployment_mutations::refusal(
+                            "Invalid deployment mode or precondition",
+                        ));
+                    }
+                };
+            drop(req.into_body());
+            return Ok(deployment_mutations::remove(&state, &auth, &namespace, id, original).await);
+        }
         (Method::POST, ["api-specs"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
@@ -4359,6 +4434,19 @@ async fn handle_admin_request_inner(
         (Method::GET, ["consumers", id]) => {
             crud::handle_get::<Consumer>(&state, id, auth.role, &namespace).await
         }
+        (Method::GET, ["consumers", id, "verification"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            conditional_snapshots::consumer_verification(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                &audit_request_ctx,
+            )
+            .await
+        }
         (Method::PUT, ["consumers", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
@@ -4701,6 +4789,22 @@ async fn handle_admin_request_inner(
         }
 
         // Backup & Restore
+        (Method::GET, ["deployment-snapshot"]) => {
+            if let Some(response) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(response);
+            }
+            if uri.query().is_some() {
+                return Ok(deployment_mutations::refusal(
+                    "Deployment snapshot requires an unfiltered read",
+                ));
+            }
+            if auth.allowed_namespaces.is_present()
+                && let Some(response) = enforce_namespace_claim(&auth, &namespace, &path)
+            {
+                return Ok(response);
+            }
+            Ok(deployment_mutations::snapshot(&state, &auth, &namespace, &audit_request_ctx).await)
+        }
         (Method::GET, ["backup"]) => {
             // Backup returns unredacted credentials and consul tokens — Admin only.
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -4753,6 +4857,7 @@ async fn handle_admin_request_inner(
                 query.as_deref(),
                 &namespace,
                 provisioner.as_deref(),
+                route_if_match!(),
             )
             .await
         }
@@ -6606,6 +6711,7 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
         _exported_at: None,
         _source: None,
         _counts: None,
+        _conditional: None,
     }
 }
 
@@ -6651,6 +6757,7 @@ impl RestoreSnapshot {
             _exported_at: None,
             _source: None,
             _counts: None,
+            _conditional: None,
         };
         if !self.api_specs.is_empty() || self.payload.api_specs.is_some() {
             payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&self.api_specs));
@@ -6695,11 +6802,15 @@ struct PersistCounts {
 
 const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
 pub(crate) const IF_MATCH_UNSUPPORTED_MESSAGE: &str = "If-Match is only supported on PUT and \
-     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, and /plugins/config/{id}";
+     DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, /plugins/config/{id}, \
+     and POST /restore";
 
 /// Routes that evaluate `If-Match` (see `preconditions`). Every other mutating
 /// route refuses the header instead of ignoring it.
 fn if_match_route(method: &Method, segments: &[&str]) -> bool {
+    if method == Method::POST && segments == ["restore"] {
+        return true;
+    }
     (method == Method::PUT || method == Method::DELETE)
         && matches!(
             segments,
@@ -7129,6 +7240,7 @@ fn snapshot_resources_missing_after_intervening_write(
         _exported_at: None,
         _source: None,
         _counts: None,
+        _conditional: None,
     }
 }
 
@@ -9729,6 +9841,7 @@ fn serialize_backup_payload(
         upstreams,
         gateway_trust_bundles,
         api_specs: api_specs_section,
+        conditional: None,
     };
 
     let body_bytes = serde_json::to_vec(&backup).unwrap_or_else(|_| b"{}".to_vec());
@@ -9884,6 +9997,36 @@ async fn handle_backup(
             StatusCode::BAD_REQUEST,
             &json!({"error": BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR}),
         ));
+    }
+
+    match conditional_snapshots::parse_backup_opt_in(query) {
+        Ok(true) => {
+            return conditional_snapshots::backup(
+                state,
+                actor,
+                namespace,
+                request_ctx,
+                resource_filter.as_ref(),
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(message) => {
+            audit_backup_failure(
+                state,
+                actor,
+                namespace,
+                request_ctx,
+                resource_filter.as_ref(),
+                audit::failure_category::VALIDATION_FAILED,
+                audit::outcome::VALIDATION_FAILED,
+            )
+            .await;
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": message}),
+            ));
+        }
     }
 
     let include_api_specs = backup_resource_includes(resource_filter.as_ref(), "api_specs");
@@ -10182,6 +10325,7 @@ async fn handle_restore(
     query: Option<&str>,
     namespace: &str,
     provisioner: Option<&str>,
+    if_match: Option<&preconditions::IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let apply_mode = match parse_live_apply_mode_query(query) {
         Ok(mode) => mode,
@@ -10212,6 +10356,17 @@ async fn handle_restore(
                 "error": "Restore is a destructive operation that replaces all existing configuration. Pass ?confirm=true to proceed."
             }),
         ));
+    }
+    if let Some(if_match) = if_match {
+        if matches!(if_match, preconditions::IfMatch::Any) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Conditional restore requires a strong namespace ETag; '*' is not accepted"}),
+            ));
+        }
+        if let Err(unsupported) = db.ensure_atomic_batch_supported() {
+            return Ok(atomic_batch_unsupported_response(&unsupported));
+        }
     }
     let mut namespace_config_admission_guard = match crud::lock_namespace_config_admission(
         db.clone(),
@@ -10643,6 +10798,38 @@ async fn handle_restore(
     let restore_mode = BatchConfigWriteMode::GuardedAdmission {
         guard_owner: restore_guard.guard_owner().to_string(),
     };
+
+    if let Some(if_match) = if_match {
+        let response = conditional_snapshots::restore(
+            state,
+            actor,
+            db.as_ref(),
+            namespace,
+            &payload,
+            if_match,
+            &restore_mode,
+            &mut namespace_config_admission_guard,
+        )
+        .await;
+        if restore_guard.release().await.is_err() {
+            error_persistence_failure_redacted("conditional_restore_guard_release");
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "Conditional restore outcome requires verification; admission guard release failed"}),
+            ));
+        }
+        if response.status().is_success() {
+            return Ok(state
+                .complete_live_config_mutation_after_commit_boxed(
+                    namespace,
+                    (namespace_config_admission_guard, _write_permit),
+                    response,
+                    apply_mode,
+                )
+                .await);
+        }
+        return Ok(response);
+    }
 
     // Snapshot the namespace before deletion so a failure in any independently
     // committed import chunk (or a partial clear) can be compensated on every
@@ -12291,14 +12478,6 @@ pub(crate) fn error_persistence_failure_redacted(surface: &'static str) {
         detail_withheld = true,
         "Persistence failure in admin API; error detail withheld (may contain \
          credential-derived index values, schema names, or connection strings)"
-    );
-}
-
-pub(crate) fn debug_persistence_failure_redacted(surface: &'static str) {
-    debug!(
-        surface = surface,
-        detail_withheld = true,
-        "Persistence failure in admin API; error detail withheld"
     );
 }
 

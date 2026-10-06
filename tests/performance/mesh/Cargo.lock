@@ -1435,7 +1435,7 @@ version = "0.3.0"
 
 [[package]]
 name = "ferrum-edge"
-version = "0.9.10"
+version = "0.9.12"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1523,6 +1523,7 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.7",
  "x509-parser",
+ "xxhash-rust",
  "zeroize",
  "zstd",
 ]
@@ -2110,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -4194,7 +4195,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.4"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6411,9 +6412,9 @@ dependencies = [
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.15"
+version = "0.8.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
+checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
 
 [[package]]
 name = "yasna"

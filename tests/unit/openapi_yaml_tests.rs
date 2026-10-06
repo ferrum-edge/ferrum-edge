@@ -1340,10 +1340,72 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         Some(&json!(false)),
         "POST /batch envelope must reject unknown top-level keys"
     );
+    let backup = &spec["components"]["schemas"]["BackupResponse"];
+    let backup_modes = backup["allOf"].as_array().expect("backup credential modes");
+    assert_eq!(backup_modes.len(), 1);
+    assert_eq!(backup_modes[0]["if"], json!({"required": ["conditional"]}));
     assert_eq!(
-        spec.pointer("/components/schemas/BackupResponse/properties/consumers/items/$ref"),
-        Some(&json!("#/components/schemas/ConsumerBackup"))
+        backup_modes[0].pointer("/then/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerVerification")),
+        "only conditional exports may carry exact historical credential shapes"
     );
+    assert_eq!(
+        backup_modes[0].pointer("/else/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerBackup")),
+        "ordinary exports must retain the archival credential contract"
+    );
+    assert!(backup["properties"]["consumers"].get("items").is_none());
+    assert_eq!(
+        backup["properties"]["conditional"]["$ref"],
+        json!("#/components/schemas/ConditionalBackupMetadata")
+    );
+    assert_eq!(
+        paths["/consumers/{id}/verification"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        json!("#/components/schemas/ConsumerVerification")
+    );
+    let verification = &spec["components"]["schemas"]["ConsumerVerification"];
+    assert_eq!(verification["unevaluatedProperties"], false);
+    assert_eq!(
+        verification["allOf"][0]["$ref"],
+        json!("#/components/schemas/ConsumerBase")
+    );
+    assert_eq!(
+        verification["allOf"][1]["properties"]["credentials"],
+        json!({"type": "object", "additionalProperties": true})
+    );
+    assert_component_validity(&spec, "ConsumerVerification", &stored_value, true);
+    let legacy_value = serde_json::to_value(&legacy_consumer).unwrap();
+    assert_component_validity(&spec, "ConsumerVerification", &legacy_value, true);
+    assert_component_validity(&spec, "Consumer", &legacy_value, false);
+    for rejected in [
+        json!({"username": "alice", "unknown_top_level": true}),
+        json!({"username": "alice", "credentials": []}),
+        json!({"username": "alice", "credentials": "not-an-object"}),
+    ] {
+        assert_component_validity(&spec, "ConsumerVerification", &rejected, false);
+    }
+    let mut export = json!({
+        "version": "1",
+        "ferrum_version": "0.9.9",
+        "exported_at": "2026-10-04T00:00:00Z",
+        "source": "database",
+        "counts": {
+            "proxies": 0, "consumers": 1, "upstreams": 0, "plugin_configs": 0,
+            "api_specs": 0, "gateway_trust_bundles": 0
+        },
+        "proxies": [], "consumers": [stored_value], "upstreams": [], "plugin_configs": []
+    });
+    assert_component_validity(&spec, "BackupResponse", &export, true);
+    export["consumers"] = json!([legacy_value]);
+    assert_component_validity(&spec, "BackupResponse", &export, false);
+    export["conditional"] = json!({
+        "namespace_etag": "\"namespace-tag\"",
+        "row_etags": {"proxies": {}, "consumers": {}, "upstreams": {}, "plugin_configs": {}}
+    });
+    assert_component_validity(&spec, "BackupResponse", &export, true);
+    export["conditional"] = json!({});
+    assert_component_validity(&spec, "BackupResponse", &export, false);
     assert_eq!(
         spec.pointer("/components/schemas/RestoreRequest/properties/consumers/items/$ref"),
         Some(&json!("#/components/schemas/ConsumerRestoreItem"))
@@ -13183,16 +13245,25 @@ fn plugin_graph_delete_rejections_have_openapi_parity() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
-    for pointer in [
-        "/paths/~1proxies~1{id}/delete/responses/400",
-        "/paths/~1plugins~1config~1{id}/delete/responses/400",
+    for (pointer, expected_schema) in [
+        (
+            "/paths/~1proxies~1{id}/delete/responses/400",
+            json!({"anyOf": [
+                {"$ref": "#/components/schemas/Error"},
+                {"$ref": "#/components/schemas/DeploymentMutationAcknowledgement"},
+            ]}),
+        ),
+        (
+            "/paths/~1plugins~1config~1{id}/delete/responses/400",
+            json!({"$ref": "#/components/schemas/Error"}),
+        ),
     ] {
         let response = spec
             .pointer(pointer)
             .unwrap_or_else(|| panic!("plugin-graph DELETE is missing 400 response: {pointer}"));
         assert_eq!(
-            response["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/Error"
+            response["content"]["application/json"]["schema"], expected_schema,
+            "plugin-composition Error must remain an exact response member: {pointer}"
         );
         assert!(
             response["description"]
@@ -13253,11 +13324,16 @@ fn namespace_admission_contention_is_documented_as_retryable() {
         "/paths/~1namespaces~1{name}/put/responses/503",
         "/paths/~1namespaces~1{name}/delete/responses/503",
     ] {
+        let expected_ref = match pointer {
+            "/paths/~1proxies~1{id}/delete/responses/503"
+            | "/paths/~1api-specs~1{id}/put/responses/503" => {
+                "#/components/responses/DeploymentMutationUnavailable"
+            }
+            _ => "#/components/responses/NamespaceAdmissionUnavailable",
+        };
         assert_eq!(
-            spec.pointer(pointer)
-                .and_then(|value| value.get("$ref"))
-                .and_then(serde_json::Value::as_str),
-            Some("#/components/responses/NamespaceAdmissionUnavailable"),
+            spec.pointer(pointer),
+            Some(&json!({"$ref": expected_ref})),
             "namespace mutation is missing retryable 503 response: {pointer}"
         );
     }
@@ -13277,6 +13353,29 @@ fn namespace_admission_contention_is_documented_as_retryable() {
     assert_eq!(
         response["content"]["application/json"]["example"]["error"],
         "Namespace mutation is temporarily unavailable; retry later"
+    );
+
+    let deployment = spec
+        .pointer("/components/responses/DeploymentMutationUnavailable")
+        .expect("combined ordinary/conditional deployment 503 response");
+    assert_eq!(
+        deployment["headers"], response["headers"],
+        "conditional routes must preserve every ordinary retry/cursor header"
+    );
+    assert_eq!(
+        deployment["content"]["application/json"]["schema"],
+        json!({"anyOf": [
+            {"$ref": "#/components/schemas/Error"},
+            {"$ref": "#/components/schemas/DeploymentMutationAcknowledgement"},
+        ]}),
+        "503 must preserve the ordinary Error and conditional acknowledgement without loose branches"
+    );
+    let pre_commit = spec
+        .pointer("/components/responses/NamespaceAdmissionPreCommitUnavailable")
+        .expect("pre-commit namespace admission response");
+    assert!(
+        !response_declares_config_cursor_header(&spec, pre_commit),
+        "pre-commit admission failures must remain cursor-free"
     );
 }
 
@@ -13348,13 +13447,75 @@ fn proxy_delete_documents_atomicity_refusal_for_standalone_mongodb() {
         .pointer("/paths/~1proxies~1{id}/delete/responses/501")
         .expect("proxy DELETE is missing standalone MongoDB atomicity refusal");
     assert_eq!(
-        response["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/ProxyDeleteAtomicityFailureResponse"
+        response["content"]["application/json"]["schema"],
+        json!({"anyOf": [
+            {"$ref": "#/components/schemas/ProxyDeleteAtomicityFailureResponse"},
+            {"$ref": "#/components/schemas/DeploymentMutationAcknowledgement"},
+        ]})
     );
     let schema = spec
         .pointer("/components/schemas/ProxyDeleteAtomicityFailureResponse")
         .expect("proxy delete atomicity refusal schema");
     assert_eq!(schema["required"], json!(["error", "detail"]));
+    assert_eq!(schema["properties"]["error"]["type"], "string");
+    assert_eq!(schema["properties"]["detail"]["type"], "string");
+}
+
+#[test]
+fn conditional_deployment_refusals_preserve_exact_status_and_schema_members() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for pointer in [
+        "/paths/~1proxies~1{id}/delete/responses/409",
+        "/paths/~1proxies~1{id}/delete/responses/412",
+        "/paths/~1api-specs~1{id}/put/responses/409",
+    ] {
+        let response = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("deployment refusal is missing its status: {pointer}"));
+        assert_eq!(
+            response["content"]["application/json"]["schema"],
+            json!({"anyOf": [
+                {"$ref": "#/components/schemas/Error"},
+                {"$ref": "#/components/schemas/DeploymentMutationAcknowledgement"},
+            ]}),
+            "ordinary errors and conditional graph/stale refusals must both remain: {pointer}"
+        );
+    }
+    let (_, _, replacement) = openapi_operation_by_id(&spec, "replaceApiSpec");
+    let responses = &replacement["responses"];
+    for status in ["412", "501"] {
+        assert_eq!(
+            responses[status]["content"]["application/json"]["schema"],
+            json!({"$ref": "#/components/schemas/DeploymentMutationAcknowledgement"}),
+            "conditional-only spec refusal must keep its typed acknowledgement: {status}"
+        );
+    }
+    assert_eq!(
+        responses["400"]["content"]["application/json"]["schema"],
+        json!({"anyOf": [
+            {"$ref": "#/components/schemas/ApiSpecParseError"},
+            {"$ref": "#/components/schemas/DeploymentMutationAcknowledgement"},
+        ]}),
+        "ordinary spec parse and conditional mode errors must both remain"
+    );
+    let acknowledgement = &spec["components"]["schemas"]["DeploymentMutationAcknowledgement"];
+    assert_eq!(
+        acknowledgement["required"],
+        json!(["durable", "live", "recovery_cleanup_authorized"])
+    );
+    assert_eq!(
+        acknowledgement["properties"]["durable"]["enum"],
+        json!(["not_started", "not_committed", "committed", "unknown"])
+    );
+    assert_eq!(
+        acknowledgement["properties"]["live"]["enum"],
+        json!(["unconfirmed", "not_applicable", "applied"])
+    );
+    assert_eq!(
+        acknowledgement["properties"]["recovery_cleanup_authorized"]["type"],
+        "boolean"
+    );
 }
 
 #[test]
@@ -16084,7 +16245,8 @@ fn observability_sink_endpoint_schemas_document_credential_redaction() {
 /// `AdminState::complete_live_config_mutation_after_commit` after a durable
 /// commit. Mapped from the boxed helper call sites (CRUD, credentials, batch,
 /// restore, API specs) plus `complete_namespace_registry_mutation` (served
-/// rename / cascade delete). `createNamespace` is excluded: it writes no
+/// rename / cascade delete) and conditional deployment completion.
+/// `createNamespace` is excluded: it writes no
 /// `config_changes` row and never waits. Namespace mutations stay on the
 /// synchronous path and do not accept `?apply=async`.
 ///
@@ -16094,7 +16256,7 @@ const LIVE_APPLIED_CONFIG_MUTATIONS: &[(&str, &[&str], bool)] = &[
     ("restoreConfig", &["200"], true),
     ("createProxy", &["201"], true),
     ("updateProxy", &["200"], true),
-    ("deleteProxy", &["204"], true),
+    ("deleteProxy", &["200", "204"], true),
     ("createConsumer", &["201"], true),
     ("updateConsumer", &["200"], true),
     ("deleteConsumer", &["204"], true),
@@ -18382,6 +18544,10 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         ("exported_at", json!("2026-09-16T00:00:00Z")),
         ("source", json!("database")),
         ("counts", json!({})),
+        (
+            "conditional",
+            json!({"namespace_etag": "\"tag\"", "row_etags": {}}),
+        ),
     ]);
 
     let published: BTreeSet<&str> = restore["properties"]
@@ -18428,6 +18594,20 @@ fn restore_request_publishes_the_complete_closed_envelope() {
     ferrum_edge::_test_support::restore_envelope_admission_for_test(whole.to_string().as_bytes())
         .unwrap();
     assert_component_validity(&spec, "RestoreRequest", &whole, true);
+    assert_eq!(
+        restore["properties"]["conditional"]["type"],
+        json!("object")
+    );
+    assert_eq!(
+        restore["properties"]["conditional"]["additionalProperties"],
+        true
+    );
+    let future_metadata = json!({"conditional": {"future_metadata": [1, "opaque"]}});
+    ferrum_edge::_test_support::restore_envelope_admission_for_test(
+        future_metadata.to_string().as_bytes(),
+    )
+    .unwrap();
+    assert_component_validity(&spec, "RestoreRequest", &future_metadata, true);
 
     // Closed on both axes, in the schema and in the runtime alike.
     for rejected in [
@@ -18440,6 +18620,10 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         json!({"counts": 5}),
         json!({"counts": "3"}),
         json!({"counts": true}),
+        json!({"conditional": []}),
+        json!({"conditional": 5}),
+        json!({"conditional": "tag"}),
+        json!({"conditional": true}),
         json!([]),
         json!(["1", [], [], [], []]),
         json!("a string"),
@@ -18549,6 +18733,10 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         ("exported_at", json!("2026-09-16T00:00:00Z")),
         ("source", json!("database")),
         ("counts", json!({})),
+        (
+            "conditional",
+            json!({"namespace_etag": "\"tag\"", "row_etags": {}}),
+        ),
         ("api_specs", json!({"section_version": "2", "items": []})),
         ("gateway_trust_bundles", json!([])),
     ]);
@@ -18592,6 +18780,16 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         "a complete GET /backup artifact must still round-trip through POST /batch"
     );
     assert_component_validity(&spec, "BatchCreateRequest", &whole, true);
+    assert_eq!(batch["properties"]["conditional"]["type"], json!("object"));
+    assert_eq!(
+        batch["properties"]["conditional"]["additionalProperties"],
+        true
+    );
+    let future_metadata = json!({"conditional": {"future_metadata": [1, "opaque"]}});
+    assert!(ferrum_edge::_test_support::batch_envelope_admits_for_test(
+        future_metadata.to_string().as_bytes(),
+    ));
+    assert_component_validity(&spec, "BatchCreateRequest", &future_metadata, true);
 
     // Schema-invalid metadata is a `400` on POST /batch, same parse restore
     // uses: non-object `counts`, an array `api_specs`, a non-array
@@ -18607,6 +18805,10 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         json!({"gateway_trust_bundles": {}}),
         json!({"gateway_trust_bundles": "not-an-array"}),
         json!({"gateway_trust_bundles": 1}),
+        json!({"conditional": []}),
+        json!({"conditional": 5}),
+        json!({"conditional": "tag"}),
+        json!({"conditional": true}),
         json!({"proxise": []}),
         json!({"proxies": [], "unknown_top_level": true}),
         json!([]),

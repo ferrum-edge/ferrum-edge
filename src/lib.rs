@@ -3167,6 +3167,18 @@ pub mod _test_support {
     pub struct TestNamespaceConfigAdmissionGuard(crate::admin::crud::NamespaceConfigAdmissionGuard);
 
     impl TestNamespaceConfigAdmissionGuard {
+        /// Exercise the production keeper-to-transaction handoff.
+        pub async fn hand_off_to_restore_transaction(&mut self) -> Result<(), String> {
+            self.0
+                .hand_off_to_restore_transaction()
+                .await
+                .map_err(|_| "namespace config admission handoff refused".to_string())
+        }
+
+        pub fn lease_ref(&self) -> crate::config::db_backend::NamespaceConfigAdmissionLeaseRef<'_> {
+            self.0.lease_ref()
+        }
+
         /// Force the lease into the lost state without waiting for TTL/renewal.
         pub fn force_lose(&self) {
             self.0.force_lose_for_test();
@@ -11575,6 +11587,303 @@ pub mod _test_support {
         ))
     }
 
+    /// The bounds one native gRPC dispatch attempt is held to before its
+    /// request is handed to the connection (GHSA-xcg4-wj3x-gjj2).
+    #[derive(Clone, Copy, Debug)]
+    pub struct NativeGrpcDispatchBoundsForTest(crate::proxy::grpc_proxy::GrpcDispatchBounds);
+
+    /// Compose the production native gRPC dispatch bounds from a client RPC
+    /// deadline `client_deadline_after_ms` from now (`None`: no `grpc-timeout`)
+    /// and the admitted request's authorization plan (GHSA-xcg4-wj3x-gjj2).
+    pub fn compose_native_grpc_dispatch_bounds_for_test(
+        client_deadline_after_ms: Option<u64>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> NativeGrpcDispatchBoundsForTest {
+        let client_deadline_at = client_deadline_after_ms.and_then(|millis| {
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(millis))
+        });
+        NativeGrpcDispatchBoundsForTest(crate::proxy::grpc_proxy::GrpcDispatchBounds::compose(
+            client_deadline_at,
+            auth,
+        ))
+    }
+
+    /// Await a controlled sender acquisition under the production native gRPC
+    /// acquisition bound (GHSA-xcg4-wj3x-gjj2). `Err` is the production
+    /// dispatch error, and the acquisition future has then been dropped.
+    pub async fn await_native_grpc_acquisition_for_test<F>(
+        bounds: &NativeGrpcDispatchBoundsForTest,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+        acquisition: F,
+    ) -> Result<F::Output, crate::proxy::grpc_proxy::GrpcProxyError>
+    where
+        F: std::future::Future,
+    {
+        bounds
+            .0
+            .acquire(auth, async {
+                Ok::<_, std::convert::Infallible>(acquisition.await)
+            })
+            .await
+            .map(|result| match result {
+                Ok(value) => value,
+                Err(never) => match never {},
+            })
+    }
+
+    /// Result-bearing acquisition through the same production cold-error gate.
+    pub async fn await_native_grpc_acquisition_result_for_test<F, T>(
+        bounds: &NativeGrpcDispatchBoundsForTest,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        acquisition: F,
+    ) -> Result<T, crate::proxy::grpc_proxy::GrpcProxyError>
+    where
+        F: std::future::Future<Output = Result<T, crate::proxy::grpc_proxy::GrpcProxyError>>,
+    {
+        bounds.0.acquire(auth, acquisition).await?
+    }
+
+    /// The admitted plan used by dispatch and transport guards.
+    pub type RequestAuthLifetimePlanForTest = (
+        crate::proxy::auth_lifetime::StreamAuthDeadline,
+        crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+        crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    );
+
+    /// Compose before first poll and observe the adapter's actual handoff flag.
+    pub fn native_grpc_header_wait_with_handoff_for_test<F, T>(
+        protocol_at: Option<tokio::time::Instant>,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        handed_to_backend: &std::sync::atomic::AtomicBool,
+        wait: F,
+    ) -> impl std::future::Future<Output = Result<T, crate::proxy::grpc_proxy::GrpcProxyError>>
+    where
+        F: std::future::Future<Output = Result<T, crate::proxy::grpc_proxy::GrpcProxyError>>,
+    {
+        let bound =
+            crate::proxy::grpc_proxy::grpc_header_wait_authorization_bound(auth, protocol_at);
+        crate::proxy::grpc_proxy::grpc_header_wait_under_authorization(
+            bound,
+            auth,
+            handed_to_backend,
+            wait,
+        )
+    }
+
+    /// Drive the sidecar's result-bearing checkout/readiness combinator.
+    pub async fn await_backend_checkout_result_for_test<F, T, E>(
+        bound: &ComposedBackendHandoffBoundForTest,
+        checkout: F,
+    ) -> Result<Result<T, E>, BackendHandoffBoundSourceForTest>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        crate::proxy::await_backend_handoff_result(bound.0, checkout)
+            .await
+            .map_err(backend_handoff_source_for_test)
+    }
+
+    /// A native H3 lifetime failure's termination, wire state, and client flag.
+    pub type H3LifetimeErrorForTest = (
+        Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+        bool,
+        bool,
+    );
+
+    /// Native H3 acquisition: termination, wire state, and client-deadline flag.
+    pub async fn await_native_h3_checkout_for_test<F, T>(
+        client_at: Option<tokio::time::Instant>,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        checkout: F,
+    ) -> Result<T, H3LifetimeErrorForTest>
+    where
+        F: std::future::Future<Output = Result<T, anyhow::Error>>,
+    {
+        crate::http3::client::await_h3_checkout(
+            crate::http3::client::H3Authorization::new(client_at, auth),
+            checkout,
+        )
+        .await
+        .map_err(|error| {
+            (
+                error.authorization_expiry(),
+                error.request_on_wire(),
+                error.client_deadline_expired(),
+            )
+        })
+    }
+
+    /// Native H3 stream-open/upload/header wait, including the per-poll gate.
+    pub async fn await_native_h3_dispatch_for_test<F, T>(
+        protocol_at: Option<tokio::time::Instant>,
+        auth: Option<&RequestAuthLifetimePlanForTest>,
+        handed_to_backend: bool,
+        wait: F,
+    ) -> Result<T, H3LifetimeErrorForTest>
+    where
+        F: std::future::Future<Output = Result<T, crate::http3::client::H3PoolError>>,
+    {
+        crate::http3::client::await_h3_dispatch(
+            crate::http3::client::H3Authorization::new(None, auth),
+            handed_to_backend,
+            protocol_at,
+            wait,
+        )
+        .await
+        .map_err(|error| {
+            (
+                error.authorization_expiry(),
+                error.request_on_wire(),
+                error.client_deadline_expired(),
+            )
+        })
+    }
+
+    /// Exercise the production native-H3 pool with a captured plan and a
+    /// controlled TLS-config checkout, including the explicit-target path.
+    /// Supply finalized backend headers, including Host: the pool uses a
+    /// path-only URI, just as it does for production dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn native_h3_pooled_dispatch_for_test<F>(
+        pool: &crate::http3::client::Http3ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        auth: &RequestAuthLifetimePlanForTest,
+        explicit_target: bool,
+        tls_config: F,
+    ) -> Result<crate::http3::client::H3StreamingResponse, H3LifetimeErrorForTest>
+    where
+        F: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        let bound = crate::http3::client::H3Authorization::new(None, Some(auth));
+        let result = if explicit_target {
+            pool.request_with_target_streaming_under_authorization(
+                proxy,
+                &proxy.backend_host,
+                proxy.backend_port,
+                proxy.backend_port,
+                "POST",
+                url,
+                headers,
+                body,
+                bound,
+                || tls_config,
+            )
+            .await
+        } else {
+            pool.request_streaming_under_authorization(
+                proxy,
+                "POST",
+                url,
+                headers,
+                body,
+                bound,
+                || tls_config,
+            )
+            .await
+        };
+        result.map_err(|error| {
+            (
+                error.authorization_expiry(),
+                error.request_on_wire(),
+                error.client_deadline_expired(),
+            )
+        })
+    }
+
+    /// The sidecar readiness terminal chosen from the captured connect winner.
+    pub fn sidecar_readiness_connect_terminal_for_test() -> (u16, Option<String>, bool) {
+        let response = crate::proxy::sidecar_readiness_connect_timeout_response(true, None);
+        (
+            response.status_code,
+            response.headers.get("grpc-status").cloned(),
+            response.request_on_wire,
+        )
+    }
+
+    /// Health classification stays neutral at both authorization boundaries;
+    /// dispatch diagnostics retain the explicit request handoff state.
+    pub fn authorization_dispatch_provenance_for_test(
+        request_on_wire: bool,
+    ) -> (bool, bool, Option<crate::retry::ErrorClass>, &'static str) {
+        let response =
+            crate::proxy::authorization_expired_dispatch_placeholder(None, request_on_wire);
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/".to_string(),
+        );
+        ctx.record_backend_dispatch_outcome(response.error_class, response.request_on_wire);
+        let state = match ctx.backend_dispatch_state() {
+            crate::plugins::BackendDispatchState::PreWireFailure => "pre_wire",
+            crate::plugins::BackendDispatchState::AmbiguousFailure => "ambiguous",
+            _ => "unexpected",
+        };
+        (
+            response.connection_error,
+            response.request_on_wire,
+            response.error_class,
+            state,
+        )
+    }
+
+    /// Run the production fail-closed native gRPC handoff gate in front of a
+    /// fake send adapter (GHSA-xcg4-wj3x-gjj2). `enqueue` stands in for the
+    /// first poll of the dispatch send future, where hyper enqueues the
+    /// request, and is called only when the gate admits the handoff.
+    pub fn native_grpc_handoff_gate_for_test<R>(
+        bounds: &NativeGrpcDispatchBoundsForTest,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+        enqueue: impl FnOnce() -> R,
+    ) -> Result<R, crate::proxy::grpc_proxy::GrpcProxyError> {
+        bounds.0.admit_handoff(auth)?;
+        Ok(enqueue())
+    }
+
+    /// Await a controlled native gRPC response-header wait under the
+    /// production authorization bound (GHSA-xcg4-wj3x-gjj2).
+    /// `phase_bound_after_ms` is the wait's own client/operator bound,
+    /// relative to now; `wait` models that protocol shape itself.
+    pub async fn await_native_grpc_header_wait_for_test<F, T>(
+        phase_bound_after_ms: Option<u64>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+        wait: F,
+    ) -> Result<T, crate::proxy::grpc_proxy::GrpcProxyError>
+    where
+        F: std::future::Future<Output = Result<T, crate::proxy::grpc_proxy::GrpcProxyError>>,
+    {
+        let phase_at = phase_bound_after_ms.and_then(|millis| {
+            tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(millis))
+        });
+        let bound = crate::proxy::grpc_proxy::grpc_header_wait_authorization_bound(auth, phase_at);
+        let handed_to_backend = std::sync::atomic::AtomicBool::new(true);
+        crate::proxy::grpc_proxy::grpc_header_wait_under_authorization(
+            bound,
+            auth,
+            &handed_to_backend,
+            wait,
+        )
+        .await
+    }
+
     /// Attribute an ALREADY-COMPOSED dispatch-phase bound whose winning source
     /// is the admitted stream's authorization lifetime (issue #3815). This is
     /// the shape the typed composers (`authorization_bounded_header_deadline`,
@@ -12713,8 +13022,10 @@ pub mod _test_support {
     /// `(status, body_bytes, connection_error, error_class_label)`.
     pub fn authorization_expired_dispatch_placeholder_for_test()
     -> (u16, Vec<u8>, bool, Option<&'static str>) {
-        let response =
-            crate::proxy::authorization_expired_dispatch_placeholder(Some("10.0.0.9".to_string()));
+        let response = crate::proxy::authorization_expired_dispatch_placeholder(
+            Some("10.0.0.9".to_string()),
+            true,
+        );
         let bytes = match &response.body {
             crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
             _ => panic!("the authorization placeholder is always a buffered body"),

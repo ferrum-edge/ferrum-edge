@@ -1,7 +1,7 @@
 # Vendored reqwest patch: report an established connection's socket
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/reqwest-0.13.3-ferrum-patched/` must regenerate the drift
+> Any change to `vendor/reqwest-0.13.4-ferrum-patched/` must regenerate the drift
 > manifest (`scripts/update_vendor_integrity.sh`).
 
 ## What this patches
@@ -90,8 +90,8 @@ lifetime.
 
 ## Vendored crate
 
-- Path: `vendor/reqwest-0.13.3-ferrum-patched/`
-- Base release: reqwest **v0.13.3**
+- Path: `vendor/reqwest-0.13.4-ferrum-patched/`
+- Base release: reqwest **v0.13.4**
 - Wired in via `[patch.crates-io]` in the workspace `Cargo.toml` (unchanged)
 - Files touched: `src/connect.rs`
 

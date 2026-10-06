@@ -1,7 +1,7 @@
 # hyper: bound how long an HTTP/2 request body may wait to be written
 
 > Governance: tracked in [docs/dependency-policy.md](../../dependency-policy.md).
-> Any change to `vendor/hyper-1.9.0-ferrum-patched/` must regenerate the
+> Any change to `vendor/hyper-1.10.0-ferrum-patched/` must regenerate the
 > drift manifest (`scripts/update_vendor_integrity.sh`).
 
 ## Status
@@ -40,7 +40,10 @@ default).
 
 The unified diff is
 [`hyper-h2-body-write-timeout.patch`](hyper-h2-body-write-timeout.patch),
-against hyper 1.9.0 with patches 001–003 applied.
+against the published hyper 1.10.0 crate with patches 001–003 applied.
+Apply [the complete ordered stack](../README.md); patch 002 supplies the
+pending-body foundation and permits progress at every positive capacity.
+Patch 004 never requires or restores the former fixed 1 KiB threshold.
 
 - **`hyper::ext::Http2BodyWriteTimeout`** (new, `src/ext/h2_body_write_timeout.rs`)
   is a request extension. It holds a duration and a shared `expired` flag that
@@ -63,11 +66,12 @@ against hyper 1.9.0 with patches 001–003 applied.
   for real, the pipe sets the flag, sends
   `RST_STREAM(CANCEL)` and fails the body. Dropping the pipe releases the
   request body.
-- **With a bound configured, the pipe polls the body before waiting for
-  capacity**, so time spent waiting for the client to send more is never
-  counted as a write stall. It holds at most one chunk, as stock hyper already
-  does when a 1-byte claim admits a whole chunk. Without the extension the pipe
-  behaves exactly as before.
+- **The pipe polls the body before waiting for capacity**, preserving Hyper
+  1.10's scheduling with or without the extension. Time spent waiting for the
+  client to send more is never counted as a write stall. It holds at most one
+  chunk and reserves only that chunk's actual length; an idle body cannot claim
+  connection window needed by another stream. Without the extension, the
+  pending DATA and positive-capacity behavior remain, with no write-stall timer.
 
 Ferrum attaches the extension instead of installing the pump on two paths:
 
@@ -157,7 +161,7 @@ real `hyper::client::conn::http2` connection against an in-process h2 server.
 Run them with:
 
 ```bash
-cargo test --manifest-path vendor/hyper-1.9.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
+cargo test --manifest-path vendor/hyper-1.10.0-ferrum-patched/Cargo.toml --features full --lib ferrum_body_write_timeout
 ```
 
 They cover five cases:
@@ -200,7 +204,16 @@ Before proposing this to hyper:
 
 ## Retirement
 
-Retire when hyper offers an equivalent per-request bound on HTTP/2 body write
-stalls, or when Ferrum's HTTP/2 client moves off hyper. Until then the
-extension is Ferrum-only API, so it should be filed upstream (hyper or h2)
-before the deliberate-fork deadline.
+Retire together with [patch 002](../002-min-data-frame-capacity/README.md#retirement-plan)
+when Ferrum adopts an equivalent upstream per-request HTTP/2 body write-stall
+bound that preserves progress at every positive assigned capacity, or when
+Ferrum's HTTP/2 client moves off hyper. The shared pending-body implementation
+belongs to the `hyper-h2-body-progress-and-timeout` co-retirement group.
+Hosted replacement tests must cover small legal windows, the final connection
+byte, empty end-of-stream handling and write-stall bounds. No compatible
+replacement release has been selected or tested.
+
+Hyper #4212 closed unmerged; it is not an adoption path for this extension.
+Until a replacement is adopted, the extension is Ferrum-only API. The owner
+must file a current upstream proposal or record a dated reaffirmation in this
+README and the lifecycle inventory before the deliberate-fork checkpoint.

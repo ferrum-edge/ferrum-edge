@@ -717,7 +717,7 @@ class GuardObservationTests(unittest.TestCase):
                 path.write_text("drift")
             with self.assertRaises(ValueError):
                 patch_source(source, provenance)
-            # Ferrum's vendored h2 patch must apply without fuzz and reproduce
+            # Ferrum's vendored h2 patches must apply without fuzz and reproduce
             # the drift-manifest sources exactly; anything else fails closed.
             with self.assertRaises(ValueError):
                 apply_ferrum_patch(source, ROOT.parents[2])
@@ -727,10 +727,18 @@ class GuardObservationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
             shutil.copytree(repo / "vendor/h2-0.4.19-ferrum-patched/src", source / "src")
-            patch = (repo / "docs/upstream-h2-patches/001-coalesce-data-frame-writes"
-                     / "h2-coalesce-data-frame-writes.patch").read_bytes()
-            subprocess.run(["patch", "--batch", "--fuzz=0", "-R", "-p1"], input=patch,
-                           cwd=source, check=True, capture_output=True)
+            patches = (
+                repo / "docs/upstream-h2-patches/001-coalesce-data-frame-writes"
+                / "h2-coalesce-data-frame-writes.patch",
+                repo / "docs/upstream-h2-patches/002-runtime-data-frame-budget"
+                / "h2-runtime-data-frame-budget.patch",
+                repo / "docs/upstream-h2-patches/002-stream-lifetime"
+                / "h2-stream-lifetime.patch",
+            )
+            for patch in reversed(patches):
+                subprocess.run(["patch", "--batch", "--fuzz=0", "-R", "-p1"],
+                               input=patch.read_bytes(), cwd=source, check=True,
+                               capture_output=True)
             (source / "src/extra.rs").write_text("// not in the vendored crate\n")
             with self.assertRaisesRegex(ValueError, "differs from the vendored"):
                 apply_ferrum_patch(source, repo)

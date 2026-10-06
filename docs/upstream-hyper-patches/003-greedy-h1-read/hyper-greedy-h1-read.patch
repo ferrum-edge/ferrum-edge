@@ -1,8 +1,7 @@
 diff --git a/src/client/conn/http1.rs b/src/client/conn/http1.rs
-index 85c1fdc..1013609 100644
 --- a/src/client/conn/http1.rs
 +++ b/src/client/conn/http1.rs
-@@ -69,7 +69,12 @@ where
+@@ -76,7 +76,12 @@
      ///
      /// Only works for HTTP/1 connections. HTTP/2 connections will panic.
      pub fn into_parts(self) -> Parts<T> {
@@ -16,25 +15,37 @@ index 85c1fdc..1013609 100644
          Parts { io, read_buf }
      }
  
-@@ -600,8 +605,11 @@ mod upgrades {
-             match ready!(Pin::new(&mut self.inner.as_mut().unwrap().inner).poll(cx)) {
-                 Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
-                 Ok(proto::Dispatched::Upgrade(pending)) => {
--                    let Parts { io, read_buf } = self.inner.take().unwrap().into_parts();
+@@ -591,7 +596,7 @@
+ }
+ 
+ mod upgrades {
+-    use super::{Connection, Context, Future, Parts, Pin, Poll, Read, StdError, Write};
++    use super::{Connection, Context, Future, Pin, Poll, Read, StdError, Write};
+     use crate::body::Body;
+     use crate::proto::Dispatched;
+     use crate::upgrade::Upgraded;
+@@ -631,12 +636,14 @@
+             {
+                 Ok(Dispatched::Shutdown) => Poll::Ready(Ok(())),
+                 Ok(Dispatched::Upgrade(pending)) => {
+-                    let Parts { io, read_buf } = self
++                    // FERRUM PATCH 003: preserve the read-ahead error on upgrade.
++                    let (io, read_buf, read_error, _) = self
+                         .inner
+                         .take()
+                         .expect("upgradeable client connection missing after upgrade")
+-                        .into_parts();
 -                    pending.fulfill(Upgraded::new(io, read_buf));
-+                    // FERRUM PATCH 003: carry a pending read-ahead error
-+                    // into the tunnel (ferrum-edge issue #5911).
-+                    let (io, read_buf, read_error, _) =
-+                        self.inner.take().unwrap().inner.into_inner();
++                        .inner
++                        .into_inner();
 +                    pending.fulfill(Upgraded::new_with_read_error(io, read_buf, read_error));
                      Poll::Ready(Ok(()))
                  }
                  Err(e) => Poll::Ready(Err(e)),
 diff --git a/src/common/io/rewind.rs b/src/common/io/rewind.rs
-index 533a85a..83c0188 100644
 --- a/src/common/io/rewind.rs
 +++ b/src/common/io/rewind.rs
-@@ -10,6 +10,9 @@ use crate::rt::{Read, ReadBufCursor, Write};
+@@ -10,6 +10,9 @@
  #[derive(Debug)]
  pub(crate) struct Rewind<T> {
      pre: Option<Bytes>,
@@ -44,7 +55,7 @@ index 533a85a..83c0188 100644
      inner: T,
  }
  
-@@ -22,6 +25,7 @@ impl<T> Rewind<T> {
+@@ -22,6 +25,7 @@
      pub(crate) fn new(io: T) -> Self {
          Rewind {
              pre: None,
@@ -52,26 +63,24 @@ index 533a85a..83c0188 100644
              inner: io,
          }
      }
-@@ -29,10 +33,18 @@ impl<T> Rewind<T> {
+@@ -29,8 +33,16 @@
      pub(crate) fn new_buffered(io: T, buf: Bytes) -> Self {
          Rewind {
              pre: Some(buf),
 +            read_error: None,
              inner: io,
          }
-     }
- 
++    }
++
 +    /// FERRUM PATCH 003: return `error` from the first read after the
 +    /// buffered bytes, before reading `inner` again.
 +    pub(crate) fn with_read_error(mut self, error: Option<io::Error>) -> Self {
 +        self.read_error = error;
 +        self
-+    }
-+
+     }
+ 
      #[cfg(all(
-         test,
-         any(feature = "client", feature = "server"),
-@@ -43,8 +55,8 @@ impl<T> Rewind<T> {
+@@ -43,8 +55,8 @@
          self.pre = Some(bs);
      }
  
@@ -82,21 +91,20 @@ index 533a85a..83c0188 100644
      }
  
      #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
-@@ -77,6 +89,9 @@ where
+@@ -76,6 +88,9 @@
+ 
                  return Poll::Ready(Ok(()));
              }
-         }
++        }
 +        if let Some(error) = self.read_error.take() {
 +            return Poll::Ready(Err(error));
-+        }
+         }
          Pin::new(&mut self.inner).poll_read(cx, buf)
      }
- }
 diff --git a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
-index 3373021..55ef168 100644
 --- a/src/proto/h1/conn.rs
 +++ b/src/proto/h1/conn.rs
-@@ -156,7 +156,7 @@ where
+@@ -156,7 +156,7 @@
          self.state.date_header = false;
      }
  
@@ -106,10 +114,9 @@ index 3373021..55ef168 100644
      }
  
 diff --git a/src/proto/h1/dispatch.rs b/src/proto/h1/dispatch.rs
-index 5daeb5e..012d571 100644
 --- a/src/proto/h1/dispatch.rs
 +++ b/src/proto/h1/dispatch.rs
-@@ -99,9 +99,9 @@ where
+@@ -99,9 +99,9 @@
          }
      }
  
@@ -123,10 +130,9 @@ index 5daeb5e..012d571 100644
  
      /// Run this dispatcher until HTTP says this connection is done,
 diff --git a/src/proto/h1/io.rs b/src/proto/h1/io.rs
-index 6a30d73..73d1343 100644
 --- a/src/proto/h1/io.rs
 +++ b/src/proto/h1/io.rs
-@@ -33,6 +33,7 @@ pub(crate) struct Buffered<T, B> {
+@@ -33,6 +33,7 @@
      flush_pipeline: bool,
      io: T,
      partial_len: Option<usize>,
@@ -134,20 +140,20 @@ index 6a30d73..73d1343 100644
      read_blocked: bool,
      read_buf: BytesMut,
      read_buf_strategy: ReadStrategy,
-@@ -51,6 +52,12 @@ where
+@@ -50,6 +51,12 @@
+             .finish()
      }
  }
- 
++
 +/// FERRUM PATCH 003: a read at least this large (one maximum TLS record's
 +/// plaintext) suggests more is ready behind it.
 +const GREEDY_READ_MIN: usize = 16 * 1024;
 +/// FERRUM PATCH 003: bound on extra reads per `poll_read_from_io`.
 +const GREEDY_READ_MAX_ROUNDS: usize = 16;
-+
+ 
  impl<T, B> Buffered<T, B>
  where
-     T: Read + Write + Unpin,
-@@ -67,6 +74,7 @@ where
+@@ -67,6 +74,7 @@
              flush_pipeline: false,
              io,
              partial_len: None,
@@ -155,7 +161,7 @@ index 6a30d73..73d1343 100644
              read_blocked: false,
              read_buf: BytesMut::with_capacity(0),
              read_buf_strategy: ReadStrategy::default(),
-@@ -222,6 +230,9 @@ where
+@@ -222,6 +230,9 @@
  
      pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
          self.read_blocked = false;
@@ -165,7 +171,7 @@ index 6a30d73..73d1343 100644
          let next = self.read_buf_strategy.next();
          if self.read_buf_remaining_mut() < next {
              self.read_buf.reserve(next);
-@@ -233,6 +244,33 @@ where
+@@ -233,6 +244,33 @@
          let mut buf = ReadBuf::uninit(dst);
          match Pin::new(&mut self.io).poll_read(cx, buf.unfilled()) {
              Poll::Ready(Ok(_)) => {
@@ -199,7 +205,7 @@ index 6a30d73..73d1343 100644
                  let n = buf.filled().len();
                  trace!("received {} bytes", n);
                  unsafe {
-@@ -252,8 +290,11 @@ where
+@@ -252,8 +290,11 @@
          }
      }
  
@@ -213,7 +219,7 @@ index 6a30d73..73d1343 100644
      }
  
      pub(crate) fn io_mut(&mut self) -> &mut T {
-@@ -682,6 +723,341 @@ mod tests {
+@@ -682,6 +723,341 @@
          // io_buf.flush().await.expect("should short-circuit flush");
      }
  
@@ -556,10 +562,9 @@ index 6a30d73..73d1343 100644
      #[tokio::test]
      async fn parse_reads_until_blocked() {
 diff --git a/src/server/conn/http1.rs b/src/server/conn/http1.rs
-index a2fa5e1..50834a2 100644
 --- a/src/server/conn/http1.rs
 +++ b/src/server/conn/http1.rs
-@@ -148,7 +148,12 @@ where
+@@ -148,7 +148,12 @@
      /// # Panics
      /// This method will panic if this connection is using an h2 protocol.
      pub fn into_parts(self) -> Parts<I, S> {
@@ -573,24 +578,27 @@ index a2fa5e1..50834a2 100644
          Parts {
              io,
              read_buf,
-@@ -545,8 +550,10 @@ where
+@@ -552,13 +557,14 @@
              match ready!(Pin::new(&mut conn.conn).poll(cx)) {
                  Ok(proto::Dispatched::Shutdown) => Poll::Ready(Ok(())),
                  Ok(proto::Dispatched::Upgrade(pending)) => {
--                    let (io, buf, _) = self.inner.take().unwrap().conn.into_inner();
+-                    let (io, buf, _) = self
++                    // FERRUM PATCH 003: preserve the read-ahead error on upgrade.
++                    let (io, buf, read_error, _) = self
+                         .inner
+                         .take()
+                         .expect("upgradeable server connection missing after upgrade")
+                         .conn
+                         .into_inner();
 -                    pending.fulfill(Upgraded::new(io, buf));
-+                    // FERRUM PATCH 003: carry a pending read-ahead error
-+                    // into the tunnel (ferrum-edge issue #5911).
-+                    let (io, buf, read_error, _) = self.inner.take().unwrap().conn.into_inner();
 +                    pending.fulfill(Upgraded::new_with_read_error(io, buf, read_error));
                      Poll::Ready(Ok(()))
                  }
                  Err(e) => Poll::Ready(Err(e)),
 diff --git a/src/upgrade.rs b/src/upgrade.rs
-index 27a1f9c..273c394 100644
 --- a/src/upgrade.rs
 +++ b/src/upgrade.rs
-@@ -144,19 +144,43 @@ impl Upgraded {
+@@ -145,19 +145,43 @@
          }
      }
  
