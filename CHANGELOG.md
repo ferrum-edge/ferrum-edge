@@ -44,6 +44,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches the variant must build the phase; use `phase.message()` or
   `to_string()` for the text. Client-visible messages and statuses are
   unchanged.
+### Changed
+
+- **Deployment mutations separate `not_started` from `not_committed`**
+  (issue #6021). A conditional `DELETE /proxies/{id}` or `PUT /api-specs/{id}`
+  whose store failed before commit was attempted returned `503` with
+  `durable: "unknown"`. A failure ahead of the mutation transaction (a read, a
+  transaction start, or a MongoDB mTLS admission refusal) now reports
+  `durable: "not_started"`, and a failure inside the rolled-back transaction (a
+  lost namespace admission lease, or a statement, admission or validation
+  failure) reports `durable: "not_committed"`. Only a failed commit or commit
+  acknowledgement, or a settlement task that never reports, still reports
+  `"unknown"`. No outcome authorizes cleanup or replay.
+
+### Performance
+
+- **Deployment mutations render the typed snapshot once inside the
+  transaction** (issue #6021). The pass that charges the typed namespace
+  snapshot against the 64 MiB evidence budget now also hashes it, so the
+  digest compared under the namespace locks no longer renders the typed
+  snapshot a second time.
+
+### Documentation
+
+- **Deployment and backup token limits** (issue #6021).
+  `docs/deployment_mutations.md` and `openapi.yaml` state that a
+  `deployment-v1` token fences the whole namespace: any consumer, credential,
+  trust or other write in the namespace makes it stale, so steady unrelated
+  writes can block recovery until those writers pause. They also give the
+  peak server memory of `GET /deployment-snapshot`'s `api_spec_contents` (about
+  twice its 256 MiB bound plus the stored bytes). The conditional
+  `GET /backup` `ETag` is documented as a namespace state token for restore
+  `If-Match`, not a validator of the response bytes. The internal contracts
+  handoff page was removed; its user-facing pointers now link the published
+  ferrum-contracts records.
 ### Added
 
 - **Control-plane attestation of data-plane backend egress policy** (issue

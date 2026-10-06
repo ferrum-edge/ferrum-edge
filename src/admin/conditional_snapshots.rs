@@ -40,6 +40,11 @@ pub(super) fn parse_backup_opt_in(query: Option<&str>) -> Result<bool, &'static 
 /// match and fail closed with `412`.
 const NAMESPACE_SNAPSHOT_TAG_KIND: &str = "namespace_snapshot.v2";
 
+/// Keyed state token for one namespace snapshot. It identifies the stored
+/// namespace state, not any response body: the conditional backup carries it
+/// as its `ETag` although two exports of unchanged state differ in bytes
+/// (`exported_at`), so it is only a `POST /restore` `If-Match` precondition,
+/// never a cache validator.
 fn namespace_tag(
     state: &AdminState,
     namespace: &str,
@@ -269,6 +274,7 @@ pub(super) async fn backup(
     }
     .await;
     match result {
+        // The `ETag` here is the namespace state token, not a body validator.
         Ok((response, tag)) => Ok(if response.status().is_success() {
             with_tag(response, &tag)
         } else {

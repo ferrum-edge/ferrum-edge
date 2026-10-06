@@ -110,6 +110,21 @@ impl SnapshotDigestWriter {
         }
     }
 
+    /// Continue a digest whose first `written` canonical bytes `hasher` has
+    /// already absorbed. Those bytes still count against `limit`.
+    pub(crate) fn resume(
+        hasher: crate::fips::approved::Sha256,
+        written: usize,
+        limit: usize,
+    ) -> Self {
+        Self {
+            hasher,
+            written,
+            limit,
+            exceeded: written > limit,
+        }
+    }
+
     /// Finish after the caller's last write, reporting an exceeded bound as
     /// [`NamespaceSnapshotTooLarge`] rather than as the I/O error it surfaced as.
     pub(crate) fn finish(
