@@ -1573,6 +1573,7 @@ async fn test_cp_rejects_token_missing_required_claims() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
 
     let result = client.subscribe(request).await;
@@ -1663,6 +1664,7 @@ async fn test_cp_accepts_token_with_matching_issuer() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
 
     let result = client.subscribe(request).await;
@@ -1695,6 +1697,7 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
             config_sync_build: config_sync_build_identity().to_string(),
             namespace: "ferrum".to_string(),
             real_ip_header: advertised.map(str::to_string),
+            backend_egress_policy: None,
         });
         let status = client.subscribe(request).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -1724,6 +1727,7 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
                 config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some("CF-CONNECTING-IP".to_string()),
+                backend_egress_policy: None,
             },
         ))
         .await;
@@ -1756,6 +1760,7 @@ async fn test_cp_treats_explicitly_empty_real_ip_header_as_unset() {
                 config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: None,
+                backend_egress_policy: None,
             },
         ))
         .await
@@ -1771,6 +1776,7 @@ async fn test_cp_treats_explicitly_empty_real_ip_header_as_unset() {
                 config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some(String::new()),
+                backend_egress_policy: None,
             },
         ))
         .await;
@@ -1821,6 +1827,7 @@ async fn test_cp_rejects_token_with_wrong_issuer() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
 
     let result = client.subscribe(request).await;
@@ -1920,6 +1927,7 @@ async fn test_cp_rejects_token_with_no_issuer_claim() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
 
     let result = client.subscribe(request).await;
@@ -1961,6 +1969,7 @@ async fn test_cp_still_rejects_token_signed_with_wrong_secret() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
 
     let result = client.subscribe(request).await;
@@ -2020,6 +2029,7 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     assert!(
         good_client.subscribe(good_req).await.is_ok(),
@@ -2038,6 +2048,7 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let stale_result = stale_client.subscribe(stale_req).await;
     assert!(
@@ -2049,6 +2060,224 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         tonic::Code::Unauthenticated
     );
 
+    server_handle.abort();
+}
+
+/// Subscribe a raw same-build client as `node_id`, sending `report` as its
+/// backend egress policy, and keep the stream open.
+async fn subscribe_with_egress_report(
+    bound_addr: SocketAddr,
+    node_id: &str,
+    report: Option<ferrum_edge::grpc::proto::BackendEgressPolicyReport>,
+) -> tonic::Streaming<ferrum_edge::grpc::proto::ConfigUpdate> {
+    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, node_id).unwrap();
+    let mut client = connect_client_with_token!(bound_addr, token);
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: node_id.to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        config_sync_build: config_sync_build_identity().to_string(),
+        namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
+        backend_egress_policy: report,
+    });
+    client.subscribe(request).await.unwrap().into_inner()
+}
+
+/// A real DP reports its loaded backend egress policy on Subscribe and the CP
+/// records it per connected node. A same-build subscriber that sends no
+/// report, or an unspecified/unrecognised mode, is recorded as unknown, and
+/// the CP never treats the connected set as public-only while one is
+/// connected (issue #6020).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_records_dp_backend_egress_policy_attestation() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    use ferrum_edge::grpc::backend_egress_attestation::{
+        DataPlaneEgressSummary, EgressMode, ReportedEgressPolicy,
+    };
+    use ferrum_edge::grpc::cp_server::DpNodeRegistry;
+    use ferrum_edge::grpc::proto::BackendEgressPolicyReport;
+
+    let registry = Arc::new(DpNodeRegistry::new());
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_config(0))));
+    let server = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
+        .registry(registry.clone())
+        .build();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    // A real DP whose loaded policy is public-only with a deny overlay. The
+    // overlay's CIDR is never carried; only its presence is.
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Public, "", "10.0.0.0/8", true);
+    let mut env_config = create_test_env_config();
+    env_config.backend_allow_ips = policy.unwrap();
+    let (proxy_state, _health_checks) = ProxyState::new(
+        GatewayConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .unwrap();
+    let cp_url = format!("http://127.0.0.1:{}", bound_addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "egress-dp", &ps, None, "ferrum")
+            .await
+    });
+    let reported = ReportedEgressPolicy {
+        mode: EgressMode::Public,
+        dangerous_ranges_blocked: true,
+        allow_cidr_overrides_present: false,
+        deny_cidr_overrides_present: true,
+    };
+    let recorded = timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = registry.snapshot();
+            if let Some(node) = snapshot.iter().find(|node| node.node_id == "egress-dp") {
+                return node.backend_egress_policy;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("DP should register within 5s");
+    assert_eq!(recorded, Some(reported));
+    let snapshot = registry.snapshot();
+    let reports = snapshot.iter().map(|node| node.backend_egress_policy);
+    let summary = DataPlaneEgressSummary::from_reports(reports);
+    assert!(summary.weakest_policy_complete);
+    assert!(summary.all_connected_public_only_guaranteed);
+
+    // Absent report, UNSPECIFIED mode, and an out-of-vocabulary mode.
+    let unspecified = BackendEgressPolicyReport {
+        mode: 0,
+        ..reported.to_report()
+    };
+    let unrecognised = BackendEgressPolicyReport {
+        mode: 99,
+        ..reported.to_report()
+    };
+    let silent = subscribe_with_egress_report(bound_addr, "silent-dp", None).await;
+    let zero = subscribe_with_egress_report(bound_addr, "unspecified-dp", Some(unspecified)).await;
+    let bogus = subscribe_with_egress_report(bound_addr, "bogus-dp", Some(unrecognised)).await;
+    let snapshot = registry.snapshot();
+    for node_id in ["silent-dp", "unspecified-dp", "bogus-dp"] {
+        let node = snapshot
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .unwrap_or_else(|| panic!("{node_id} should be registered"));
+        assert_eq!(node.backend_egress_policy, None, "{node_id}");
+    }
+    let reports = snapshot.iter().map(|node| node.backend_egress_policy);
+    let summary = DataPlaneEgressSummary::from_reports(reports);
+    assert_eq!(summary.connected_data_planes, 4);
+    assert_eq!(summary.reporting_data_planes, 1);
+    assert_eq!(summary.unknown_data_planes, 3);
+    assert_eq!(summary.weakest_policy, Some(reported));
+    assert!(!summary.weakest_policy_complete);
+    assert!(!summary.all_connected_public_only_guaranteed);
+
+    // Once the unknown subscribers disconnect, the reporting DP alone is
+    // attested again.
+    drop((silent, zero, bogus));
+    let attested = timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = registry.snapshot();
+            if snapshot.len() == 1 {
+                let reports = snapshot.iter().map(|node| node.backend_egress_policy);
+                return DataPlaneEgressSummary::from_reports(reports);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unknown subscribers should deregister within 5s");
+    assert!(attested.all_connected_public_only_guaranteed);
+
+    client_handle.abort();
+    server_handle.abort();
+}
+
+/// Every live Subscribe stream is attested on its own, even when several share
+/// one node id: a newer stream never hides an older one, and dropping the
+/// newer stream first leaves the older one attested (issue #6020).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_attests_every_live_stream_of_one_node_id() {
+    use ferrum_edge::grpc::backend_egress_attestation::{
+        DataPlaneEgressSummary, EgressMode, ReportedEgressPolicy,
+    };
+    use ferrum_edge::grpc::cp_server::DpNodeRegistry;
+
+    let registry = Arc::new(DpNodeRegistry::new());
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_config(0))));
+    let server = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
+        .registry(registry.clone())
+        .build();
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let policy = |mode: EgressMode| ReportedEgressPolicy {
+        mode,
+        dangerous_ranges_blocked: true,
+        allow_cidr_overrides_present: false,
+        deny_cidr_overrides_present: false,
+    };
+    let summary = || {
+        let snapshot = registry.snapshot();
+        let reports = snapshot.iter().map(|node| node.backend_egress_policy);
+        DataPlaneEgressSummary::from_reports(reports)
+    };
+
+    // The old stream still serves `both` while a replacement stream for the
+    // same node id reports `public`.
+    let both = Some(policy(EgressMode::Both).to_report());
+    let public = Some(policy(EgressMode::Public).to_report());
+    let older = subscribe_with_egress_report(bound_addr, "shared-dp", both).await;
+    let newer = subscribe_with_egress_report(bound_addr, "shared-dp", public).await;
+    let attested = summary();
+    assert_eq!(attested.connected_data_planes, 2);
+    assert_eq!(attested.reporting_data_planes, 2);
+    assert_eq!(attested.weakest_policy, Some(policy(EgressMode::Both)));
+    assert!(attested.weakest_policy_complete);
+    assert!(!attested.all_connected_public_only_guaranteed);
+
+    // The newer stream drops first: the older stream stays attested.
+    drop(newer);
+    let remaining = timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.len() == 1 {
+                return summary();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the newer stream should deregister within 5s");
+    assert_eq!(remaining.connected_data_planes, 1);
+    assert_eq!(remaining.weakest_policy, Some(policy(EgressMode::Both)));
+    assert!(!remaining.all_connected_public_only_guaranteed);
+
+    drop(older);
     server_handle.abort();
 }
 
@@ -3313,6 +3542,7 @@ async fn test_cp_rejects_dp_with_different_build() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
         config_sync_build: other_build.clone(),
     });
 
@@ -3364,6 +3594,7 @@ async fn test_cp_rejects_dp_with_different_build() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
         config_sync_build: config_sync_build_identity().to_string(),
     });
 
@@ -3425,6 +3656,7 @@ async fn test_cp_rejects_dp_without_build_identity() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
         config_sync_build: String::new(),
     });
 
@@ -4218,6 +4450,7 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "staging".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
 
     let result = client.subscribe(request).await;
@@ -4276,6 +4509,7 @@ async fn test_multi_region_ha_doc_cross_region_cp_failover_rejected() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "us-east".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
 
     let result = client.subscribe(request).await;
@@ -4485,6 +4719,7 @@ async fn test_cp_accepts_dp_with_matching_namespace() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "production".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
 
     let mut stream = client
@@ -5664,6 +5899,7 @@ async fn cp_initial_subscribe_update_is_a_full_snapshot_not_a_heartbeat() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let mut stream = client.subscribe(request).await.unwrap().into_inner();
     let initial = timeout(Duration::from_secs(5), stream.message())
@@ -5875,6 +6111,7 @@ async fn request_native_admission(
                         config_sync_build: config_sync_build_identity().to_string(),
                         namespace: "ferrum".to_string(),
                         real_ip_header: Some(String::new()),
+                        backend_egress_policy: None,
                     },
                 ))
                 .await
@@ -5933,6 +6170,7 @@ async fn open_configsync_stream_with_token(
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     request.metadata_mut().insert(
         "authorization",
@@ -6475,6 +6713,7 @@ async fn native_configsync_rejects_unsafe_node_id_before_allocation() {
                 config_sync_build: config_sync_build_identity().to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some(String::new()),
+                backend_egress_policy: None,
             },
         ))
         .await
@@ -7321,6 +7560,7 @@ mod configsync_identity_binding {
             config_sync_build: config_sync_build_identity().to_string(),
             namespace: "ferrum".to_string(),
             real_ip_header: Some(String::new()),
+            backend_egress_policy: None,
         });
         request
             .metadata_mut()
@@ -7448,6 +7688,7 @@ mod configsync_size_bounds {
             config_sync_build: config_sync_build_identity().to_string(),
             namespace: "ferrum".to_string(),
             real_ip_header: Some(String::new()),
+            backend_egress_policy: None,
         })
     }
 
@@ -7467,6 +7708,7 @@ mod configsync_size_bounds {
             config_sync_build: config_sync_build_identity().to_string(),
             namespace: namespace.to_string(),
             real_ip_header: Some(String::new()),
+            backend_egress_policy: None,
         });
         request
             .metadata_mut()
@@ -7568,13 +7810,17 @@ mod configsync_size_bounds {
         let mut rx = tx.subscribe();
         let registry = DpNodeRegistry::new();
         let before = Utc::now() - chrono::Duration::seconds(60);
-        registry.insert(DpNodeInfo {
-            node_id: "size-bound-dp".to_string(),
-            version: ferrum_edge::FERRUM_VERSION.to_string(),
-            namespace: "ferrum".to_string(),
-            connected_at: before,
-            last_update_at: before,
-        });
+        registry.register_stream(
+            "size-bound-dp",
+            DpNodeInfo {
+                node_id: "size-bound-dp".to_string(),
+                version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                connected_at: before,
+                last_update_at: before,
+                backend_egress_policy: None,
+            },
+        );
         let logs = CapturedLogs::default();
         tracing::subscriber::with_default(logs.subscriber(), || {
             CpGrpcServer::broadcast_namespace_update(

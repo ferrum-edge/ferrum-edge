@@ -55,6 +55,20 @@ The OpenAPI handoff must verify these exact locations in `openapi.yaml`:
   `ResourceETagMap`, `BackupResponse`, `RestoreRequest`, and
   `BackendEgressPolicyResponse`.
 
+## Follow-up: data-plane attestation (#6020)
+
+[Issue #6020](https://github.com/ferrum-edge/ferrum-edge/issues/6020) closes the
+"no DP attestation by CP" gap above for CP/DP deployments. On a CP,
+`GET /backend-egress-policy` gains the optional `data_plane_attestation` object
+(`components.schemas.DataPlaneEgressAttestation`, `DataPlaneEgressSummary`,
+`DataPlaneEgressEntry`, `DataPlaneEgressAttestationStatus`,
+`DataPlaneEgressPolicy` in `openapi.yaml`), and `GET /cluster` gains per-DP
+reports plus `data_plane_backend_egress_policy`. The object is additive and
+CP-only, so `schema_version` stays `2`; the published contract schema must add
+it as an optional property and fixtures for the reported/unknown/empty cases.
+The source of truth is `src/grpc/backend_egress_attestation.rs` and
+`src/admin/backend_egress_policy.rs`. Nexus GHSA-93rq Part B consumes it.
+
 ## ferrum-contracts publication work
 
 The immutable published v0.9.11 tag above contains
