@@ -19,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   custom-plugin treatment: it may rewrite any routing input before
   `before_proxy`, no later response header is assumed absent behind it, and
   its response-body production stays `Undeclared` unless it declares one.
-  `Plugin` now has `Any` as a supertrait.
+  Every custom plugin now marks route faults as possibly pre-empted, even
+  when it declares its changes (conservative). The CORS and mesh-dispatch
+  finalizers the plugin cache inserts are built-in types and are now trusted,
+  which can change compression and response-buffering decisions on chains
+  with several CORS instances. `Plugin` now has `Any` as a supertrait.
 - **H3 dispatch-stage `413` refusals and both bridge drain refusals run the
   reject hooks and the transaction log** (#6022). The native buffered,
   cross-protocol, and native dispatch drains answered an oversized upload with
