@@ -19,12 +19,61 @@ const CANONICAL_TAIL: &[u8] = b"}";
 /// Raw rows/documents retain unknown fields, credentials and association metadata;
 /// binary values (stored spec documents included) are carried as a SHA-256
 /// digest and length, never as the bytes themselves.
+///
+/// A snapshot assembled by [`StoredEvidence`] keeps the SHA-256 state of its
+/// canonical head and typed snapshot, so [`Self::digest`] does not render the
+/// typed snapshot again. Treat both fields as read-only once assembled.
 pub struct DeploymentSnapshot {
     pub snapshot: ConditionalNamespaceSnapshot,
     pub stored: Value,
+    typed_prefix: Option<CanonicalPrefix>,
+}
+
+/// SHA-256 state after the canonical head and typed snapshot, and how many
+/// canonical bytes it absorbed.
+struct CanonicalPrefix {
+    hasher: crate::fips::approved::Sha256,
+    len: usize,
+}
+
+impl CanonicalPrefix {
+    fn absorb(&mut self, buf: &[u8]) {
+        self.hasher.update(buf);
+        self.len = self.len.saturating_add(buf.len());
+    }
+}
+
+/// Charges each canonical byte against the evidence budget, then hashes it.
+struct ChargedPrefix<'a> {
+    budget: &'a mut SnapshotByteBudget,
+    prefix: &'a mut CanonicalPrefix,
+}
+
+impl std::io::Write for ChargedPrefix<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Err(exceeded) = self.budget.charge(buf.len()) {
+            return Err(std::io::Error::other(exceeded));
+        }
+        self.prefix.absorb(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl DeploymentSnapshot {
+    /// A snapshot with no precomputed canonical prefix; [`Self::digest`]
+    /// renders the whole representation.
+    pub fn new(snapshot: ConditionalNamespaceSnapshot, stored: Value) -> Self {
+        Self {
+            snapshot,
+            stored,
+            typed_prefix: None,
+        }
+    }
+
     /// `{"profile": "deployment-v1", "resources": <namespace representation>,
     /// "stored": <raw evidence>}`. Materialize it only after [`Self::digest`]
     /// has accepted the snapshot within the representation bound.
@@ -57,6 +106,14 @@ impl DeploymentSnapshot {
 
     /// [`Self::digest`] with an explicit canonical-byte bound.
     pub fn digest_within(&self, limit: usize) -> Result<SnapshotDigest, anyhow::Error> {
+        // Resume after the typed snapshot hashed during evidence assembly
+        // rather than rendering it a second time. The bound still covers it.
+        if let Some(prefix) = &self.typed_prefix {
+            let hasher = prefix.hasher.clone();
+            let mut writer = SnapshotDigestWriter::resume(hasher, prefix.len, limit);
+            let written = self.write_stored(&mut writer);
+            return writer.finish(written);
+        }
         let mut writer = SnapshotDigestWriter::new(limit);
         let written = self.write_canonical(&mut writer);
         writer.finish(written)
@@ -65,6 +122,11 @@ impl DeploymentSnapshot {
     fn write_canonical<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
         out.write_all(CANONICAL_HEAD)?;
         self.snapshot.write_canonical(out)?;
+        self.write_stored(out)
+    }
+
+    /// The canonical bytes after the typed snapshot.
+    fn write_stored<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
         out.write_all(CANONICAL_STORED)?;
         crate::admin::preconditions::write_canonical_json_to(&self.stored, out)?;
         out.write_all(CANONICAL_TAIL)
@@ -386,6 +448,37 @@ impl std::fmt::Display for DeploymentGraphInvalid {
 
 impl std::error::Error for DeploymentGraphInvalid {}
 
+/// The deployment mutation transaction's commit, or its acknowledgement,
+/// failed: the store may have applied it. Every other deployment store error
+/// is raised before commit is attempted and leaves nothing committed.
+#[derive(Debug, Clone, Copy)]
+pub struct DeploymentCommitOutcomeUnknown;
+
+impl std::fmt::Display for DeploymentCommitOutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Deployment mutation commit outcome is unknown")
+    }
+}
+
+impl std::error::Error for DeploymentCommitOutcomeUnknown {}
+
+/// Tag a failed deployment commit with [`DeploymentCommitOutcomeUnknown`],
+/// retaining the driver error as its source.
+pub fn deployment_commit_unknown<E>(error: E) -> anyhow::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    anyhow::Error::new(error)
+        .context(DeploymentCommitOutcomeUnknown)
+}
+
+/// Whether `error` reports a deployment commit whose outcome is unknown.
+pub fn is_deployment_commit_outcome_unknown(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DeploymentCommitOutcomeUnknown>()
+        .is_some()
+}
+
 /// A proven external reference that refuses removal of a spec-owned upstream.
 /// Driver, decoding and transaction failures must retain their own error types.
 #[derive(Debug, Clone)]
@@ -464,8 +557,13 @@ pub(crate) async fn validate_deployment_candidate(
 /// sum to exactly the canonical length of the finished
 /// [`DeploymentSnapshot`]'s representation, so this refuses precisely what
 /// [`DeploymentSnapshot::digest_within`] would refuse at the same bound.
+///
+/// The pass that charges the typed snapshot also hashes it, so the snapshot
+/// is rendered once per assembly; inside a mutation transaction that keeps a
+/// second full rendering off the time namespace locks are held.
 pub struct StoredEvidence {
     budget: SnapshotByteBudget,
+    prefix: CanonicalPrefix,
     stored: serde_json::Map<String, Value>,
     rows: Vec<(String, Value)>,
 }
@@ -485,10 +583,20 @@ impl StoredEvidence {
         // The framing, including the braces of the `stored` object.
         let framing = CANONICAL_HEAD.len() + CANONICAL_STORED.len() + CANONICAL_TAIL.len() + 2;
         budget.charge(framing)?;
-        let written = snapshot.write_canonical(&mut budget);
+        let mut prefix = CanonicalPrefix {
+            hasher: crate::fips::approved::Sha256::new(),
+            len: 0,
+        };
+        // The head is already charged as part of the framing.
+        prefix.absorb(CANONICAL_HEAD);
+        let written = snapshot.write_canonical(&mut ChargedPrefix {
+            budget: &mut budget,
+            prefix: &mut prefix,
+        });
         budget.settle(written)?;
         Ok(Self {
             budget,
+            prefix,
             stored: serde_json::Map::new(),
             rows: Vec::new(),
         })
@@ -521,10 +629,13 @@ impl StoredEvidence {
         Ok(())
     }
 
+    /// `snapshot` must be the one passed to [`Self::for_snapshot`]: its
+    /// canonical prefix was hashed there.
     pub fn finish(self, snapshot: ConditionalNamespaceSnapshot) -> DeploymentSnapshot {
         DeploymentSnapshot {
             snapshot,
             stored: Value::Object(self.stored),
+            typed_prefix: Some(self.prefix),
         }
     }
 }

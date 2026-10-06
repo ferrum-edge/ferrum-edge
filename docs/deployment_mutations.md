@@ -33,7 +33,12 @@ Read `GET /deployment-snapshot` with an admin-role JWT and the intended
   sits outside `evidence`, so it is not part of the token's digest, but its
   digest and length are, so one read recovers the original documents. Together
   the base64 values are bounded at **256 MiB**. A namespace past that returns
-  `507` with `durable: "not_started"` and discloses nothing.
+  `507` with `durable: "not_started"` and discloses nothing. While the response
+  is built, the base64 strings and the serialized body coexist, so this member
+  needs about twice its size in server memory (up to roughly 512 MiB at the
+  bound), on top of the stored gzip bytes (up to about 192 MiB) the snapshot
+  already loaded. Size admin processes for that peak or keep stored specs well
+  below the bound.
 - `evidence`: the complete comparison representation. It binds all namespace
   resources, spec metadata and stored-document digests, associations, trust,
   namespace metadata, the durable change watermark, and raw stored
@@ -119,6 +124,20 @@ All selected dependency reads remain protected through commit. MongoDB uses snap
 transactions with a changed lease-document write pin. Driver transaction retries
 retain the original expected representation and cannot substitute fresh authority.
 
+**The fence is namespace-wide.** A token covers the whole namespace, not only
+the target's dependency graph, because the evidence also carries the
+namespace-wide inputs to uniqueness and admission (names, listen paths, hosts,
+credential identities, trust). Any consumer, credential, trust,
+registry-metadata or other resource write in the namespace therefore
+invalidates every outstanding deployment token, including routine consumer
+provisioning and credential rotation that never touch the target. A `412` ends
+that recovery attempt, and a fresh token must not be used to replay it, so under
+steady unrelated write traffic recovery can be refused indefinitely. Pause other
+writers to the namespace (consumer provisioning, credential rotation, trust
+updates) from capturing the snapshot until the acknowledgement arrives, or
+resolve the recovery manually. Writes to other namespaces, lease maintenance and
+audit records do not invalidate the token.
+
 Removal deletes only the selected proxy, owner spec, its cascade plugins,
 selected associations and generated upstreams. A last-referenced hand-owned
 upstream is retained. A shared group plugin, its other owners and their fields
@@ -144,8 +163,14 @@ owners of a plugin the cascade would delete return `409` before selected writes.
 Proven external references to spec-owned upstreams use the same typed
 `409/not_committed/unconfirmed/recovery_cleanup_authorized=false` refusal on
 resource-changing PUT/DELETE. Metadata-only replacement keeps its shortcut before
-that guard. Database/commit/lease-release and other untyped failures remain
-uncertain; driver messages cannot prove rollback. Ordinary invalid external-owner
+that guard. A store failure raised before commit is attempted reports `503` with
+`durable: "not_committed"`: a read, transaction start or MongoDB mTLS admission
+refusal ahead of the transaction, a lost namespace admission lease, or a
+statement, admission or validation failure inside the transaction, which rolls
+it back. Only a failed commit or commit acknowledgement (for example a dropped
+connection or MongoDB `UnknownTransactionCommitResult`/write-concern failure at
+commit), or a settlement task that never reports, leaves `durable: "unknown"`.
+Driver messages are never returned. Ordinary invalid external-owner
 proxy admission still returns `400` without a durable row or covering change.
 Composition, named-schema, TCP-throttle and mTLS policy admission still apply
 to the fenced candidate using the configured validation client. Invalid
@@ -164,7 +189,8 @@ body echoes. A confirmed response has `profile: "deployment-v1"`, `id`,
 | Commit and covering local generation applied; final audit and namespace admission lease release acknowledged | 200 | `applied` | `true` |
 | Commit in CP mode, an unserved namespace, or a process without a serving coordinator | 200 | `not_applicable` | `false` |
 | Commit confirmed but local apply, final audit, cursor capture or namespace admission lease release cannot be confirmed | 503 | `unconfirmed` | `false` |
-| Transport/store acknowledgement uncertain | 503 if a response is available | `unconfirmed` | `false`; durable state `unknown` |
+| Commit or commit acknowledgement failed, or the settlement task was lost | 503 if a response is available | `unconfirmed` | `false`; durable state `unknown` |
+| Store, lease or admission failure before commit was attempted | 503 | `unconfirmed` | `false`; durable state `not_committed` |
 | Precondition/graph refusal | 412/409 | `unconfirmed` | `false`; durable state `not_committed` |
 | Namespace too large inside the mutation transaction | 507 | `unconfirmed` | `false`; durable state `not_committed` |
 

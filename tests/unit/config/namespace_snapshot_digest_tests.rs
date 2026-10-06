@@ -7,7 +7,10 @@ use ferrum_edge::config::db_backend::{
     ConditionalNamespaceSnapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES, SnapshotDigest,
     is_namespace_snapshot_too_large,
 };
-use ferrum_edge::config::deployment_mutation::{DeploymentSnapshot, StoredEvidence};
+use ferrum_edge::config::deployment_mutation::{
+    DeploymentCommitOutcomeUnknown, DeploymentSnapshot, StoredEvidence, deployment_commit_unknown,
+    is_deployment_commit_outcome_unknown,
+};
 use ferrum_edge::config::types::{ApiSpec, GatewayConfig, SpecFormat};
 use serde_json::json;
 
@@ -124,13 +127,13 @@ fn over_bound_representations_are_refused_with_a_typed_error() {
 
 #[test]
 fn deployment_digest_streams_the_same_canonical_evidence() {
-    let deployment = DeploymentSnapshot {
-        snapshot: snapshot(vec![spec("a", vec![9; 2048])]),
-        stored: json!({
+    let deployment = DeploymentSnapshot::new(
+        snapshot(vec![spec("a", vec![9; 2048])]),
+        json!({
             "api_specs": [{"spec_content": {"value": {"sha256": "00", "len": 2048}}}],
             "proxies": [],
         }),
-    };
+    );
     let representation = deployment.representation().unwrap();
     assert_eq!(representation["profile"], "deployment-v1");
     assert_eq!(
@@ -192,6 +195,14 @@ fn stored_evidence_charges_exactly_the_canonical_deployment_representation() {
         deployment.digest().unwrap(),
         SnapshotDigest::of_representation(&representation).unwrap()
     );
+    // Resuming from the typed prefix hashed during assembly matches a full
+    // rendering of the same evidence.
+    let rendered = DeploymentSnapshot::new(typed(), deployment.stored.clone());
+    assert_eq!(rendered.digest().unwrap(), deployment.digest().unwrap());
+    assert_eq!(
+        rendered.digest_within(exact).unwrap(),
+        deployment.digest_within(exact).unwrap()
+    );
     // The running budget refuses exactly what the bounded digest refuses.
     let at_bound = assemble(typed(), exact).unwrap();
     assert_eq!(
@@ -203,6 +214,25 @@ fn stored_evidence_charges_exactly_the_canonical_deployment_representation() {
     assert!(is_namespace_snapshot_too_large(
         &deployment.digest_within(exact - 1).unwrap_err()
     ));
+    // A bound below the already-hashed typed prefix still refuses.
+    assert!(is_namespace_snapshot_too_large(
+        &deployment.digest_within(16).unwrap_err()
+    ));
+}
+
+#[test]
+fn only_a_tagged_commit_failure_has_an_unknown_deployment_outcome() {
+    let statement = anyhow::Error::new(std::io::Error::other("statement failed"));
+    assert!(!is_deployment_commit_outcome_unknown(&statement));
+    let commit = deployment_commit_unknown(std::io::Error::other("commit failed"));
+    assert!(is_deployment_commit_outcome_unknown(&commit));
+    // The driver error stays in the chain, and outer context keeps the tag.
+    assert!(commit.chain().any(|cause| cause.is::<std::io::Error>()));
+    assert!(is_deployment_commit_outcome_unknown(
+        &commit.context("outer")
+    ));
+    let bare = anyhow::Error::new(DeploymentCommitOutcomeUnknown);
+    assert!(is_deployment_commit_outcome_unknown(&bare));
 }
 
 #[test]

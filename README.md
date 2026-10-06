@@ -606,8 +606,7 @@ deployment snapshot tags move to `v2` MAC domains, deployment snapshots add
 can return `507`, and `GET /backend-egress-policy` reports `schema_version: 2`.
 Consumer pins to `contracts-edge-0.9.12` or earlier predate these changes; move
 them only to a ferrum-contracts tag published for Edge 0.9.13. See the
-[upgrade guide](docs/upgrade_guide.md#upgrading-to-0913) and
-[contracts handoff](docs/admin_contracts_handoff_5992_5994.md).
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0913).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the

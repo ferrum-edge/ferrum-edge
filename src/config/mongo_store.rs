@@ -71,7 +71,8 @@ mod inner {
     };
     use crate::config::deployment_mutation::{
         DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
-        ExternalSpecUpstreamConflict, StoredEvidence, validate_deployment_candidate,
+        ExternalSpecUpstreamConflict, StoredEvidence, deployment_commit_unknown,
+        validate_deployment_candidate,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -6115,6 +6116,11 @@ mod inner {
                             if inner.chain().any(|e| e.is::<BatchAdmissionLeaseLost>()) {
                                 return anyhow::Error::new(BatchAdmissionLeaseLost);
                             }
+                        }
+                        // Callback failures are custom errors and abort the
+                        // transaction; only a commit can leave it uncertain.
+                        if mongo_error_outcome_is_uncertain(&error) {
+                            return deployment_commit_unknown(error);
                         }
                         anyhow::Error::new(error)
                     })?;

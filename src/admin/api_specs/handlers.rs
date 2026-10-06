@@ -3206,9 +3206,7 @@ pub async fn handle_put_api_spec(
             .await
             {
                 Ok(response) => response,
-                Err(_) => crate::admin::deployment_mutations::store_error(&anyhow::anyhow!(
-                    "Persistence outcome unknown"
-                )),
+                Err(_) => crate::admin::deployment_mutations::unavailable("unknown"),
             },
         );
     }

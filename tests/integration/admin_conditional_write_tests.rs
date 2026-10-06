@@ -2496,7 +2496,9 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         NamespaceConfigAdmissionLeaseRef, NamespacePreconditionFailed, SnapshotDigest,
         is_batch_admission_lease_lost,
     };
-    use ferrum_edge::config::deployment_mutation::DeploymentPrecondition;
+    use ferrum_edge::config::deployment_mutation::{
+        DeploymentPrecondition, is_deployment_commit_outcome_unknown,
+    };
     use ferrum_edge::config::types::Consumer;
 
     assert_deployment_external_dependencies_refused(db.clone()).await;
@@ -2907,11 +2909,14 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         .await
         .unwrap_err();
     assert!(is_batch_admission_lease_lost(&error));
+    // Lease loss is raised before commit: known not committed.
+    assert!(!is_deployment_commit_outcome_unknown(&error));
     let error = db
         .replace_deployment_conditionally(&bundle, spec, &precondition)
         .await
         .unwrap_err();
     assert!(is_batch_admission_lease_lost(&error));
+    assert!(!is_deployment_commit_outcome_unknown(&error));
 
     // Failure immediately before commit must roll back both operations and
     // retain the original token, without compensation or freshly read retries.
@@ -2936,16 +2941,16 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         .await;
         set_atomic_batch_fault_for_test(&namespace, None);
         assert_eq!(failed.status, 503, "{}", failed.body);
-        // An untyped persistence failure is still uncertain, even when this
-        // fixture knows that its injected pre-commit fault rolls back.
-        assert_eq!(failed.body["durable"], "unknown");
+        // A failure raised before commit is attempted rolls back: it is known
+        // not to have committed. Only a failed commit reports `unknown`.
+        assert_eq!(failed.body["durable"], "not_committed");
         assert_eq!(failed.body["live"], "unconfirmed");
         assert_eq!(failed.body["recovery_cleanup_authorized"], false);
         let unchanged = get_ns(&base, "/deployment-snapshot", &namespace).await;
         assert!(unchanged.etag == original.etag);
         assert!(
             unchanged.body == original.body,
-            "untyped persistence failure changed complete typed/raw evidence"
+            "pre-commit persistence failure changed complete typed/raw evidence"
         );
         assert_eq!(
             db.latest_change_sequence(&namespace).await.unwrap(),

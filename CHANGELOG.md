@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Deployment mutations report `not_committed` for failures before commit**
+  (issue #6021). A conditional `DELETE /proxies/{id}` or `PUT /api-specs/{id}`
+  whose store failed before commit was attempted (a lost namespace admission
+  lease, a refused MongoDB mTLS admission fence, a transaction start, or a
+  statement, admission or validation failure inside the rolled-back
+  transaction) returned `503` with `durable: "unknown"`. It now reports
+  `durable: "not_committed"`. Only a failed commit or commit acknowledgement,
+  or a settlement task that never reports, still reports `"unknown"`. Neither
+  outcome authorizes cleanup or replay.
+
+### Performance
+
+- **Deployment mutations render the typed snapshot once inside the
+  transaction** (issue #6021). The pass that charges the typed namespace
+  snapshot against the 64 MiB evidence budget now also hashes it, so the
+  digest compared under the namespace locks no longer renders the typed
+  snapshot a second time.
+
+### Documentation
+
+- **Deployment and backup token limits** (issue #6021).
+  `docs/deployment_mutations.md` and `openapi.yaml` state that a
+  `deployment-v1` token fences the whole namespace: any consumer, credential,
+  trust or other write in the namespace makes it stale, so steady unrelated
+  writes can block recovery until those writers pause. They also give the
+  peak server memory of `GET /deployment-snapshot`'s `api_spec_contents` (about
+  twice its 256 MiB bound plus the stored bytes). The conditional
+  `GET /backup` `ETag` is documented as a namespace state token for restore
+  `If-Match`, not a validator of the response bytes. The internal contracts
+  handoff page was removed; its user-facing pointers now link the published
+  ferrum-contracts records.
+
 ## [0.9.13] - 2026-10-06
 
 Release prepared on **2026-10-06 UTC** from main

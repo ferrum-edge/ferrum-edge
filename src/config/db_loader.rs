@@ -29,8 +29,8 @@ use crate::config::db_backend::{
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
-    ExternalSpecUpstreamConflict, StoredEvidence, deployment_known_columns,
-    validate_deployment_candidate,
+    ExternalSpecUpstreamConflict, StoredEvidence, deployment_commit_unknown,
+    deployment_known_columns, validate_deployment_candidate,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
@@ -3172,7 +3172,7 @@ impl DatabaseStore {
             .await?;
         let (fault, _) = crate::config::batch_atomicity::atomic_batch_test_overrides(namespace);
         Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
-        tx.commit().await?;
+        tx.commit().await.map_err(deployment_commit_unknown)?;
         Ok(())
     }
 
@@ -10478,8 +10478,10 @@ impl DatabaseStore {
                 let (fault, _) =
                     crate::config::batch_atomicity::atomic_batch_test_overrides(&spec.namespace);
                 Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
+                tx.commit().await.map_err(deployment_commit_unknown)?;
+            } else {
+                tx.commit().await?;
             }
-            tx.commit().await?;
             return Ok(());
         }
         // Resource graph mismatch — fall through to the full replace path. The
@@ -10934,8 +10936,10 @@ impl DatabaseStore {
             let (fault, _) =
                 crate::config::batch_atomicity::atomic_batch_test_overrides(&spec.namespace);
             Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
+            tx.commit().await.map_err(deployment_commit_unknown)?;
+        } else {
+            tx.commit().await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 

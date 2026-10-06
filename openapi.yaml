@@ -4944,9 +4944,18 @@ paths:
         value appear only as the SHA-256 and length of the stored bytes.
         api_spec_contents carries exactly one base64 copy of each stored spec
         document and external-reference snapshot outside the evidence, bounded
-        at 256 MiB, so one read recovers them. Security audit admission is mandatory before disclosure. No queries or
-        cached fallback are supported. Unknown/unrepresentable resource shapes
-        refuse authority rather than being erased. MongoDB requires a replica set.
+        at 256 MiB, so one read recovers them. Building it needs about twice
+        that member's size in server memory (base64 strings plus the serialized
+        body), on top of the stored bytes. Security audit admission is
+        mandatory before disclosure. No queries or cached fallback are
+        supported. Unknown/unrepresentable resource shapes refuse authority
+        rather than being erased. MongoDB requires a replica set.
+        The token fences the whole namespace, not only the target's dependency
+        graph: any consumer, credential, trust, registry-metadata or other
+        resource write in the namespace makes it stale (412), and a fresh token
+        must not replay a refused recovery. Steady unrelated writes can
+        therefore block recovery indefinitely; pause other writers to the
+        namespace while a recovery runs.
         Retain the original encrypted response and ETag; never refresh authority
         to retry a refused or uncertain recovery mutation. See
         docs/deployment_mutations.md for consumer adoption and limitations.
@@ -5101,7 +5110,14 @@ paths:
           description: Full configuration backup
           headers:
             ETag:
-              description: Strong namespace revision; emitted only for conditional=true.
+              description: >-
+                Emitted only for conditional=true. A strong namespace state
+                token equal to conditional.namespace_etag, not a validator for
+                these response bytes: it identifies the stored namespace
+                state, so two exports of unchanged state share it although
+                their bodies differ (exported_at). Use it only as If-Match on
+                POST /restore?confirm=true for this namespace, never for
+                caching or If-None-Match.
               schema:
                 type: string
             Content-Disposition:
@@ -9021,10 +9037,12 @@ components:
 
         Conditional deployment mutations instead use
         DeploymentMutationAcknowledgement. Admission/evidence failures report
-        `durable: not_started`; a transaction acknowledgement that cannot be
-        confirmed reports `durable: unknown`; a confirmed commit whose live,
-        audit or namespace-lease acknowledgement fails reports
-        `durable: committed`. All have `live: unconfirmed` and
+        `durable: not_started`; a store, lease or admission failure raised
+        before commit is attempted rolled back and reports
+        `durable: not_committed`; only a failed commit or commit
+        acknowledgement (or a lost settlement task) reports `durable: unknown`;
+        a confirmed commit whose live, audit or namespace-lease acknowledgement
+        fails reports `durable: committed`. All have `live: unconfirmed` and
         `recovery_cleanup_authorized: false`. This family does not promise a
         cursor or Retry-After. Retain the original encrypted journal; no 503
         authorizes automatic replay or journal removal.
@@ -9116,7 +9134,16 @@ components:
         A local applied result does not prove all remote data planes applied.
     DeploymentSnapshot:
       type: object
-      required: [profile, namespace, namespace_etag, evidence, proxies, upstreams, plugin_configs, api_specs, api_spec_contents]
+      required:
+        - profile
+        - namespace
+        - namespace_etag
+        - evidence
+        - proxies
+        - upstreams
+        - plugin_configs
+        - api_specs
+        - api_spec_contents
       properties:
         profile:
           type: string
@@ -9181,6 +9208,9 @@ components:
             whose StoredContentDigest the evidence fences, so this one read
             recovers the original bytes. The base64 values together are bounded
             at 256 MiB; past that the read returns 507 and discloses nothing.
+            Peak server memory for this member is about twice its size (the
+            base64 strings and the serialized body coexist), plus the stored
+            bytes the snapshot already loaded.
             GET /api-specs/{id} is no substitute: it returns the decompressed
             (and possibly format-converted) document, which matches content_hash
             only in the stored spec_format and never spec_content.sha256.
@@ -9198,7 +9228,9 @@ components:
               external_ref_snapshot_base64:
                 type: [string, "null"]
                 format: byte
-                description: Standard padded base64 of the stored external-reference snapshot, or null when none is stored
+                description: >-
+                  Standard padded base64 of the stored external-reference
+                  snapshot, or null when none is stored
     StoredContentDigest:
       type: object
       additionalProperties: false
