@@ -219,7 +219,9 @@ fn sql_tls_base_url(key: &str) -> String {
         .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| panic!("{key} is missing from {path}; rerun scripts/setup_db_tls.sh"));
-    url.split_once('?').map_or(url, |(base, _)| base).to_string()
+    url.split_once('?')
+        .map_or(url, |(base, _)| base)
+        .to_string()
 }
 
 /// Run the full CRUD + proxy routing test suite against a running gateway.
