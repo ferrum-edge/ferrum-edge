@@ -843,7 +843,7 @@ fn connect_timeout_is_installed_into_redis_connection_config_above_and_below_one
         source.contains(rearm),
         "a screened connection must be re-armed with a bounded command deadline"
     );
-    let screened_sites = source.matches("self.screen_and_arm(&mut conn,").count();
+    let screened_sites = source.matches(".screen_and_arm(&mut conn,").count();
     assert_eq!(
         screened_sites, 2,
         "both the pooled and the dedicated connect paths must screen and re-arm"
@@ -8397,7 +8397,7 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
         .find("match self.connect_multiplexed(client).await {")
         .expect("pooled establishment site");
     let screen = source[establish..publish]
-        .find("self.screen_and_arm(&mut conn, DedicatedDialPurpose::Policy)")
+        .find(".screen_and_arm(&mut conn, DedicatedDialPurpose::Policy)")
         .expect("pooled path must screen topology before publishing");
     assert!(
         screen > 0,
