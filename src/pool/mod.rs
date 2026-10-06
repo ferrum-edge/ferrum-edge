@@ -791,7 +791,27 @@ pub struct GenericPool<M: PoolManager> {
     cfg: Arc<PoolConfig>,
     cleanup_interval: Duration,
     inflight: Arc<Semaphore>,
+    /// Budget for speculative background creates, separate from `inflight`:
+    /// a slow or blackholed background create never holds a request-path
+    /// permit or queues ahead of a request-path create.
+    background_inflight: Arc<Semaphore>,
     pending_creations: Arc<DashMap<String, Arc<PendingCreation>>>,
+}
+
+/// One permit from a pool's background-create budget
+/// ([`GenericPool::try_background_create_permit`]). Held for the whole
+/// background create, so the budget bounds how many run at once.
+pub struct BackgroundCreatePermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Which creation budget a physical create draws from.
+#[derive(Clone, Copy)]
+enum CreateBudget {
+    /// Wait for a request-path permit.
+    Request,
+    /// The caller already holds a [`BackgroundCreatePermit`].
+    Background,
 }
 
 impl<M: PoolManager> GenericPool<M> {
@@ -810,12 +830,16 @@ impl<M: PoolManager> GenericPool<M> {
         let inflight_limit = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get().clamp(4, 256))
             .unwrap_or(32);
+        // Background creates get a small budget of their own, at most a
+        // quarter of the request-path one and never more than 4.
+        let background_limit = (inflight_limit / 4).clamp(1, 4);
         let pool = Arc::new(Self {
             manager,
             entries: Arc::new(DashMap::with_shard_amount(shards)),
             cfg: Arc::new(cfg),
             cleanup_interval,
             inflight: Arc::new(Semaphore::new(inflight_limit)),
+            background_inflight: Arc::new(Semaphore::new(background_limit)),
             pending_creations: Arc::new(DashMap::with_shard_amount(shards)),
         });
         pool.clone().spawn_cleanup();
@@ -837,6 +861,26 @@ impl<M: PoolManager> GenericPool<M> {
             self.pending_creations.len(),
             self.inflight.available_permits(),
         )
+    }
+
+    /// Available request-path and background creation permits, for budget
+    /// isolation tests.
+    #[doc(hidden)]
+    pub fn creation_permits_for_test(&self) -> (usize, usize) {
+        (
+            self.inflight.available_permits(),
+            self.background_inflight.available_permits(),
+        )
+    }
+
+    /// Take a background-create permit if one is free. Never waits: a caller
+    /// that gets `None` skips its speculative create and tries again later.
+    pub fn try_background_create_permit(&self) -> Option<BackgroundCreatePermit> {
+        self.background_inflight
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| BackgroundCreatePermit { _permit: permit })
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -1016,6 +1060,70 @@ impl<M: PoolManager> GenericPool<M> {
     pub(crate) async fn create_or_get_existing_owned_with_recovery<C, Fut, E, J, W, R>(
         &self,
         key: String,
+        on_join: J,
+        on_waiter_failure: W,
+        recover: R,
+        create: C,
+    ) -> std::result::Result<M::Connection, E>
+    where
+        C: FnOnce(String, CoalescedCreateAttempt) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
+        E: ShareablePoolCreateError + From<SharedPoolCreateError>,
+        J: FnMut(&CoalescedCreateAttempt),
+        W: FnMut(&CoalescedCreateAttempt),
+        R: Fn(&str) -> Option<M::Connection>,
+    {
+        self.create_or_get_existing_owned_budgeted(
+            key,
+            CreateBudget::Request,
+            on_join,
+            on_waiter_failure,
+            recover,
+            create,
+        )
+        .await
+    }
+
+    /// As [`Self::create_or_get_existing_owned_with_recovery`], for a
+    /// speculative create that holds `permit` from the background budget
+    /// instead of waiting for a request-path permit. It still coalesces with
+    /// request-path creates of the same key: a request that joins it waits on
+    /// this attempt, and this attempt joins a request-path create in flight.
+    pub(crate) async fn create_or_get_existing_owned_in_background<C, Fut, E, J, W, R>(
+        &self,
+        key: String,
+        permit: BackgroundCreatePermit,
+        on_join: J,
+        on_waiter_failure: W,
+        recover: R,
+        create: C,
+    ) -> std::result::Result<M::Connection, E>
+    where
+        C: FnOnce(String, CoalescedCreateAttempt) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
+        E: ShareablePoolCreateError + From<SharedPoolCreateError>,
+        J: FnMut(&CoalescedCreateAttempt),
+        W: FnMut(&CoalescedCreateAttempt),
+        R: Fn(&str) -> Option<M::Connection>,
+    {
+        let result = self
+            .create_or_get_existing_owned_budgeted(
+                key,
+                CreateBudget::Background,
+                on_join,
+                on_waiter_failure,
+                recover,
+                create,
+            )
+            .await;
+        drop(permit);
+        result
+    }
+
+    async fn create_or_get_existing_owned_budgeted<C, Fut, E, J, W, R>(
+        &self,
+        key: String,
+        budget: CreateBudget,
         mut on_join: J,
         mut on_waiter_failure: W,
         recover: R,
@@ -1058,7 +1166,7 @@ impl<M: PoolManager> GenericPool<M> {
             crate::profile_pool_event!(CreateOwner);
             let pending_guard = PendingCreationGuard::new(self, key.clone(), pending);
             let result = self
-                .create_after_recheck(key.clone(), &recover, {
+                .create_after_recheck(key.clone(), budget, &recover, {
                     let create = create
                         .take()
                         .expect("create closure should only be consumed by the creator");
@@ -1117,9 +1225,18 @@ impl<M: PoolManager> GenericPool<M> {
         pending.finish_failed(err);
     }
 
+    async fn acquire_request_create_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("pool creation semaphore should remain open while the pool is alive")
+    }
+
     async fn create_after_recheck<C, Fut, E, R>(
         &self,
         key: String,
+        budget: CreateBudget,
         recover: R,
         create: C,
     ) -> std::result::Result<M::Connection, E>
@@ -1128,12 +1245,11 @@ impl<M: PoolManager> GenericPool<M> {
         Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
         R: FnOnce(&str) -> Option<M::Connection>,
     {
-        let _permit = self
-            .inflight
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("pool creation semaphore should remain open while the pool is alive");
+        let _permit = match budget {
+            CreateBudget::Request => Some(self.acquire_request_create_permit().await),
+            // The caller holds a background permit for the whole attempt.
+            CreateBudget::Background => None,
+        };
 
         if let Some(conn) = self.cached(&key) {
             return Ok(conn);

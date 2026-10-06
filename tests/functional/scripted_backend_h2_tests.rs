@@ -5203,6 +5203,85 @@ async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload()
     );
 }
 
+/// gRPC pool shards per backend host in the affinity tests.
+const AFFINITY_SHARDS: usize = 4;
+
+/// One empty native-gRPC call on `client`, returning the backend connection
+/// that served it.
+async fn grpc_affinity_probe(
+    client: &mut h2::client::SendRequest<Bytes>,
+    port: u16,
+    scheme: &str,
+    authorization: Option<&str>,
+) -> http::HeaderValue {
+    *client = client.clone().ready().await.expect("probe ready");
+    let mut request = http::Request::builder()
+        .method("POST")
+        .uri(format!("{scheme}://localhost:{port}/api/affinity"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+    if let Some(authorization) = authorization {
+        request = request.header("authorization", authorization);
+    }
+    let request = request.body(()).expect("probe request");
+    let (response, _) = client.send_request(request, true).expect("empty probe");
+    let response = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .expect("probe timeout")
+        .expect("probe response");
+    assert_eq!(response.headers()["grpc-status"], "0");
+    let backend = response.headers()["x-backend-connection"].clone();
+    let mut body = response.into_body();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), body.data())
+            .await
+            .expect("probe body timeout")
+            .is_none()
+    );
+    backend
+}
+
+/// Warm one HTTP/2 frontend connection per pool shard until each serves its
+/// calls from its own shard, and return the first connection's backend
+/// connection.
+///
+/// File mode's startup capability probe may already own a random shard, so a
+/// connection's first call can borrow that connection while its own shard is
+/// created in the background. The connections take one affinity slot each on
+/// their first calls, so they cover every shard. A call whose shard is not
+/// pooled yet borrows a ready sibling, and the sibling's own connection then
+/// reports the same backend connection, unless it was called earlier in the
+/// round, before its shard existed (the first connection called can only
+/// borrow from a later one). One sequential round that reports a distinct
+/// backend connection per frontend connection therefore proves no call
+/// borrowed.
+async fn warm_grpc_affinity_shards(
+    clients: &mut [h2::client::SendRequest<Bytes>],
+    port: u16,
+    scheme: &str,
+    authorization: Option<&str>,
+) -> http::HeaderValue {
+    assert_eq!(clients.len(), AFFINITY_SHARDS);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut backends = Vec::with_capacity(clients.len());
+            for client in clients.iter_mut() {
+                backends.push(grpc_affinity_probe(client, port, scheme, authorization).await);
+            }
+            let distinct = backends
+                .iter()
+                .enumerate()
+                .all(|(index, backend)| !backends[..index].contains(backend));
+            if distinct {
+                return backends.swap_remove(0);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every frontend connection's own shard is pooled")
+}
+
 // A raw backend keeps the receive half alive after sending a Trailers-Only
 // response. Raw frontend send handles likewise keep each upload open, so
 // sequentially draining responses cannot disguise concurrent backend streams.
@@ -5377,7 +5456,10 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
     std::fs::write(&key_path, key).expect("write key");
     let mut builder = GatewayHarness::builder()
         .file_config(yaml)
-        .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "4");
+        .env(
+            "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST",
+            AFFINITY_SHARDS.to_string(),
+        );
     let tls_port = if tls_frontend {
         let reservation = reserve_port().await.expect("frontend TLS port");
         let port = reservation.drop_and_take_port();
@@ -5415,18 +5497,22 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
             .with_root_certificates(roots)
             .with_no_client_auth();
         config.alpn_protocols = vec![b"h2".to_vec()];
-        let socket = TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("TLS socket");
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let name = rustls::pki_types::ServerName::try_from("localhost").expect("SNI");
-        let socket = connector
-            .connect(name, socket)
-            .await
-            .expect("TLS handshake");
-        assert_eq!(socket.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        let mut sockets = Vec::with_capacity(AFFINITY_SHARDS);
+        for _ in 0..AFFINITY_SHARDS {
+            let socket = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("TLS socket");
+            let name = rustls::pki_types::ServerName::try_from("localhost").expect("SNI");
+            let socket = connector
+                .connect(name, socket)
+                .await
+                .expect("TLS handshake");
+            assert_eq!(socket.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+            sockets.push(socket);
+        }
         exercise_grpc_retained_uploads(
-            socket,
+            sockets,
             port,
             "https",
             authorization.as_deref(),
@@ -5438,11 +5524,15 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
             .expect("frontend URL")
             .port()
             .expect("frontend port");
-        let socket = TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("h2c socket");
+        let mut sockets = Vec::with_capacity(AFFINITY_SHARDS);
+        for _ in 0..AFFINITY_SHARDS {
+            let socket = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("h2c socket");
+            sockets.push(socket);
+        }
         exercise_grpc_retained_uploads(
-            socket,
+            sockets,
             port,
             "http",
             authorization.as_deref(),
@@ -5474,7 +5564,7 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
 }
 
 async fn exercise_grpc_retained_uploads<T>(
-    socket: T,
+    sockets: Vec<T>,
     port: u16,
     scheme: &str,
     authorization: Option<&str>,
@@ -5483,9 +5573,17 @@ async fn exercise_grpc_retained_uploads<T>(
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     const UPLOADS: usize = 40;
-    let (mut client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
-    let driver = tokio::spawn(connection);
-    let mut preferred_backend = None;
+    let mut clients = Vec::with_capacity(sockets.len());
+    let mut drivers = Vec::with_capacity(sockets.len());
+    for socket in sockets {
+        let (client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+        clients.push(client);
+        drivers.push(tokio::spawn(connection));
+    }
+    // The uploads run on the first connection, once it is known to call its
+    // own shard; the other connections only fill the remaining shards.
+    let preferred = warm_grpc_affinity_shards(&mut clients, port, scheme, authorization).await;
+    let mut client = clients[0].clone();
     let mut seen = [false; UPLOADS * 2];
     // Repeat the saturation and release on the SAME frontend connection. A
     // leaked or duplicate affinity release must not shift the spill threshold
@@ -5520,13 +5618,11 @@ async fn exercise_grpc_retained_uploads<T>(
             drop(body);
             uploads.push(upload);
         }
-        let preferred: &http::HeaderValue =
-            preferred_backend.get_or_insert_with(|| backend_ids[0].clone());
         // A stream counts for affinity until its response terminates. Each
         // terminal response was drained, so the uploads it left open no longer
         // count and every call stays on the connection's own shard.
         assert!(
-            backend_ids.iter().all(|id| id == preferred),
+            backend_ids.iter().all(|id| *id == preferred),
             "uploads stop counting once their terminal responses end in wave {wave}"
         );
         assert!(
@@ -5587,13 +5683,15 @@ async fn exercise_grpc_retained_uploads<T>(
                 .expect("probe timeout")
                 .expect("probe response");
             assert_eq!(response.headers()["grpc-status"], "0");
-            assert_eq!(response.headers()["x-backend-connection"], *preferred);
+            assert_eq!(response.headers()["x-backend-connection"], preferred);
         }
     }
     assert!(seen.into_iter().all(|ended| ended));
     assert!(ended.try_recv().is_err(), "no duplicate upload terminals");
-    driver.abort();
-    let _ = driver.await;
+    for driver in drivers {
+        driver.abort();
+        let _ = driver.await;
+    }
 }
 
 async fn exercise_grpc_chunked_upload(
@@ -5858,7 +5956,10 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
     }));
     let harness = GatewayHarness::builder()
         .file_config(yaml)
-        .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "4")
+        .env(
+            "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST",
+            AFFINITY_SHARDS.to_string(),
+        )
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .log_level("info")
         .capture_output()
@@ -5869,11 +5970,20 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
         .expect("frontend URL")
         .port()
         .expect("frontend port");
-    let socket = TcpStream::connect(("127.0.0.1", port))
-        .await
-        .expect("frontend socket");
-    let (mut client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
-    let driver = tokio::spawn(connection);
+    let mut clients = Vec::with_capacity(AFFINITY_SHARDS);
+    let mut drivers = Vec::with_capacity(AFFINITY_SHARDS);
+    for _ in 0..AFFINITY_SHARDS {
+        let socket = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("frontend socket");
+        let (client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+        clients.push(client);
+        drivers.push(tokio::spawn(connection));
+    }
+    // The uploads run on the first connection, once it is known to call its
+    // own shard; the other connections only fill the remaining shards.
+    let preferred = warm_grpc_affinity_shards(&mut clients, port, "http", None).await;
+    let mut client = clients[0].clone();
     let mut data = vec![b'x'; DATA_LEN];
     data[..5].copy_from_slice(&[0, 0, 0, 63, 251]);
     if web {
@@ -5978,7 +6088,7 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
         assert_eq!(blocked, index, "every response leaves its upload blocked");
     }
     assert!(
-        backend_ids.iter().all(|id| id == backend_ids[0]),
+        backend_ids.iter().all(|id| *id == preferred),
         "affinity releases a call when its response ends, not when h2 drains its upload"
     );
     assert!(
@@ -6030,7 +6140,7 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
             .await
             .expect("probe timeout")
             .expect("probe response");
-        assert_eq!(response.headers()["x-backend-connection"], backend_ids[0]);
+        assert_eq!(response.headers()["x-backend-connection"], preferred);
         assert_eq!(response.headers()["grpc-status"], "0");
         let mut body = response.into_body();
         assert!(
@@ -6044,8 +6154,10 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
         ended_rx.try_recv().is_err(),
         "no duplicate termination report"
     );
-    driver.abort();
-    let _ = driver.await;
+    for driver in drivers {
+        driver.abort();
+        let _ = driver.await;
+    }
     drop(harness);
     backend.abort();
     let _ = backend.await;

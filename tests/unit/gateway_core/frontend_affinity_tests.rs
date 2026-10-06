@@ -196,7 +196,7 @@ fn the_affinity_bound_follows_the_backend_stream_limit() {
     assert_eq!(affinity_stream_limit(max), max);
     assert_eq!(affinity_stream_limit(4), 4);
     assert_eq!(affinity_stream_limit(1), 1);
-    assert_eq!(affinity_stream_limit(0), 1, "zero still allows one");
+    assert_eq!(affinity_stream_limit(0), 0, "a backend allowing none pins none");
 }
 
 #[tokio::test]

@@ -17,26 +17,36 @@
 //! connections stay spread evenly however many short-lived ones come and go.
 //! Each stream counts until its response terminates: [`FrontendStream`] rides
 //! in the response body and runs with the connection in a task-local. The
-//! count is gateway-side only; an upload h2 still holds after an early
-//! terminal response is no longer counted, which can only make the soft bound
-//! below admit a few more affinity calls. The gRPC pool reads it through
-//! [`shard_start`]:
+//! count is gateway-side only. An upload h2 still holds after an early
+//! terminal response is not counted, by this bound or by the backend-limit
+//! bound below, yet it still occupies one of the backend connection's
+//! concurrent streams. A backend that answers early but neither reads nor
+//! resets the upload can therefore collect such streams on a connection's
+//! shard, up to the frontend connection's own stream limit, and later pinned
+//! calls queue inside h2 behind them while other shards sit idle. Mainstream
+//! gRPC servers reset the unread half, so this takes an unusual backend. The
+//! gRPC pool reads the count through [`shard_start`]:
 //!
 //! - While the connection has at most [`AFFINITY_MAX_OPEN_STREAMS`] open
-//!   streams, and no more than its shard's backend allows
-//!   ([`affinity_stream_limit`]), a call goes to the connection's own shard
-//!   (`slot % shards`).
+//!   streams (the new call included), and no more than its shard's backend
+//!   allows ([`affinity_stream_limit`]), a call goes to the connection's own
+//!   shard (`slot % shards`).
 //! - Beyond that, the connection is heavy enough that one backend connection
 //!   should not carry it alone: further calls spill to the round-robin shard.
 //!   A heavy connection therefore pins at most that many of its calls to its
 //!   own shard; the rest are spread round-robin over all shards (its own
 //!   included).
+//! - A shard whose backend currently allows no streams (a draining
+//!   `SETTINGS_MAX_CONCURRENT_STREAMS` of 0) is skipped while a sibling is
+//!   ready, for pinned, spilled and round-robin calls alike.
 //! - When the affinity or spill shard does not exist yet, or has closed, and a
 //!   ready sibling exists, the call is served by the sibling at once and the
 //!   preferred shard is created in the background (one detached create per
 //!   shard), so the pool still widens to its configured width as connections
-//!   arrive without a new connection waiting on a dial. Only a pool with no
-//!   ready shard dials on the request path.
+//!   arrive without a new connection waiting on a dial. Background creates
+//!   draw on a small budget of their own (at most 4 per pool) and never wait
+//!   for it; a call that finds it spent just borrows, and a later call starts
+//!   the create. Only a pool with no ready shard dials on the request path.
 //! - A failed or cancelled affinity/spill create puts the shard on a short
 //!   borrow cooldown. A cold pool can retry immediately. The bounded cache
 //!   records only physical attempts, never coalesced waiters, and does at most
@@ -48,9 +58,9 @@
 //! carries, so the pool cannot see a busy backend connection from the sender.
 //! The connection driver samples the backend's
 //! `SETTINGS_MAX_CONCURRENT_STREAMS` from hyper's
-//! `Connection::current_max_send_streams()` after every poll, and the pool
-//! caps a connection's pinned streams at the smaller of that and
-//! [`AFFINITY_MAX_OPEN_STREAMS`]. The bound is per frontend connection, not
+//! `Connection::current_max_send_streams()` (after each of its first polls,
+//! then once every 64 polls), and the pool caps a connection's pinned streams
+//! at the smaller of that and [`AFFINITY_MAX_OPEN_STREAMS`]. The bound is per frontend connection, not
 //! per shard: several busy connections whose slots share a shard still share
 //! its backend connection, each within its own bound, so a backend that allows
 //! very few concurrent streams can still queue calls that round-robin would
@@ -85,9 +95,11 @@ pub const SLOTS: usize = 64;
 pub const AFFINITY_MAX_OPEN_STREAMS: usize = 32;
 
 /// Open streams a frontend connection may pin to a shard whose backend
-/// currently allows `peer_max_streams` concurrent streams.
+/// currently allows `peer_max_streams` concurrent streams. A backend allowing
+/// none (a draining `SETTINGS_MAX_CONCURRENT_STREAMS` of 0) pins none: the
+/// pool skips that shard while a sibling is ready.
 pub fn affinity_stream_limit(peer_max_streams: usize) -> usize {
-    AFFINITY_MAX_OPEN_STREAMS.min(peer_max_streams.max(1))
+    AFFINITY_MAX_OPEN_STREAMS.min(peer_max_streams)
 }
 
 /// Live frontend connections per slot. One table per gRPC pool, shared by
