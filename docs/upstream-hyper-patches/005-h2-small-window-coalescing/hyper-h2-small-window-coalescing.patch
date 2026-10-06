@@ -35,7 +35,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
  
  pub(crate) mod ping;
  pub(crate) mod upgrade;
-@@ -93,11 +95,94 @@ pin_project! {
+@@ -93,11 +95,102 @@ pin_project! {
          pending_data: Option<(S::Data, bool)>,
          // FERRUM PATCH 004: bound a ready chunk waiting for send capacity.
          write_timeout: Option<WriteTimeout>,
@@ -122,6 +122,14 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
 +    }
 +
 +    /// The held chunk was handed to h2: the hold, if any, is over.
++    ///
++    /// A hold that ends before its deadline leaves the sleep armed, so the
++    /// task can be woken once more at that deadline and find nothing to do.
++    /// That is deliberate. The next hold moves the deadline later, which
++    /// tokio does in place without the timer driver; disarming here would
++    /// make every next hold move it earlier, a timer-wheel update per hold.
++    /// Only a pause between holds longer than the rest of the wait costs the
++    /// spurious wake.
 +    fn release(&mut self) {
 +        self.deadline = None;
 +    }
@@ -130,7 +138,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
  /// FERRUM PATCH 004: the running state of an `Http2BodyWriteTimeout`.
  ///
  /// A window-limited upload stalls many times per request (each wait for a
-@@ -177,10 +262,25 @@ where
+@@ -177,10 +270,25 @@ where
              data_done: false,
              pending_data: None,
              write_timeout: None,
@@ -156,7 +164,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
      /// FERRUM PATCH 004: bound how long a polled chunk may wait to be written.
      #[cfg(feature = "client")]
      pub(crate) fn with_write_timeout(mut self, write_timeout: WriteTimeout) -> Self {
-@@ -220,26 +320,39 @@ where
+@@ -220,26 +328,39 @@ where
              // legal peer window. Waiting for a fixed minimum can deadlock when
              // the peer advertises a smaller stream window or only one byte of
              // connection capacity remains.
@@ -207,7 +215,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
                          Poll::Ready(Some(Err(e))) => {
                              return Poll::Ready(Err(crate::Error::new_body_write(e)))
                          }
-@@ -250,6 +363,23 @@ where
+@@ -250,6 +371,23 @@ where
                          }
                      }
                  }
@@ -231,7 +239,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
                  me.body_tx
                      .send_data(SendBuf::Buf(chunk), is_eos)
                      .map_err(crate::Error::new_body_write)?;
-@@ -334,6 +464,9 @@ enum SendBuf<B> {
+@@ -334,6 +472,9 @@ enum SendBuf<B> {
      Buf(B),
      Cursor(Cursor<Box<[u8]>>),
      None,
@@ -241,7 +249,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
  }
  
  impl<B: Buf> Buf for SendBuf<B> {
-@@ -343,6 +476,7 @@ impl<B: Buf> Buf for SendBuf<B> {
+@@ -343,6 +484,7 @@ impl<B: Buf> Buf for SendBuf<B> {
              Self::Buf(ref b) => b.remaining(),
              Self::Cursor(ref c) => Buf::remaining(c),
              Self::None => 0,
@@ -249,7 +257,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
          }
      }
  
-@@ -352,6 +486,7 @@ impl<B: Buf> Buf for SendBuf<B> {
+@@ -352,6 +494,7 @@ impl<B: Buf> Buf for SendBuf<B> {
              Self::Buf(ref b) => b.chunk(),
              Self::Cursor(ref c) => c.chunk(),
              Self::None => &[],
@@ -257,7 +265,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
          }
      }
  
-@@ -361,6 +496,7 @@ impl<B: Buf> Buf for SendBuf<B> {
+@@ -361,6 +504,7 @@ impl<B: Buf> Buf for SendBuf<B> {
              Self::Buf(ref mut b) => b.advance(cnt),
              Self::Cursor(ref mut c) => c.advance(cnt),
              Self::None => {}
@@ -265,7 +273,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
          }
      }
  
-@@ -369,6 +505,7 @@ impl<B: Buf> Buf for SendBuf<B> {
+@@ -369,6 +513,7 @@ impl<B: Buf> Buf for SendBuf<B> {
              Self::Buf(ref b) => b.chunks_vectored(dst),
              Self::Cursor(ref c) => c.chunks_vectored(dst),
              Self::None => 0,
@@ -273,7 +281,7 @@ diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
          }
      }
  }
-@@ -787,3 +924,285 @@ mod ferrum_body_write_timeout_tests {
+@@ -787,3 +932,285 @@ mod ferrum_body_write_timeout_tests {
          futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
      }
  }

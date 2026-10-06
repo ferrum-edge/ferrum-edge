@@ -916,7 +916,8 @@
       },
       "regression_tests": [
         "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_small_window_coalescing_tests)",
-        "tests/integration/http2_pool_tests.rs (test_grpc_h2c_upload_coalesces_small_connection_window_increments)"
+        "tests/integration/http2_pool_tests.rs (test_grpc_h2c_upload_coalesces_small_connection_window_increments)",
+        "tests/unit/gateway_core/frontend_h2_response_coalescing_tests.rs (h2c_response_coalesces_small_connection_window_increments, tls_h2_response_coalesces_small_connection_window_increments)"
       ]
     },
     {

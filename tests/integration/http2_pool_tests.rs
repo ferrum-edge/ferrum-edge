@@ -3177,6 +3177,9 @@ const RAW_H2_INITIAL_CONNECTION_WINDOW: usize = 65_535;
 /// every DATA frame below it against a connection-wide budget and answers an
 /// exhausted budget with `GOAWAY(ENHANCE_YOUR_CALM)`.
 const SMALL_DATA_FRAME: usize = 256;
+/// Hyper patch 005's `MAX_COALESCE_WAIT`: how long a body pipe holds capacity
+/// below `SMALL_DATA_FRAME` waiting for more.
+const COALESCE_WAIT: Duration = Duration::from_millis(2);
 
 fn raw_h2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(9 + payload.len());
@@ -3285,6 +3288,12 @@ impl WindowTricklingBackend {
 /// its hyper client with a timer, so the body pipe coalesces increments into
 /// frames of at least `SMALL_DATA_FRAME` bytes; a window that never reaches
 /// that size still completes once the pipe's bounded wait ends.
+///
+/// The clock is real here, so frame sizes depend on scheduling; the vendored
+/// hyper regressions pin them on a paused clock. What this test proves
+/// independently of machine speed is a lower bound: each lockstep increment
+/// is held for the whole bounded wait, which only a pool whose hyper client
+/// has a timer does (issue #6038).
 #[tokio::test]
 async fn test_grpc_h2c_upload_coalesces_small_connection_window_increments() {
     const INCREMENT: u32 = 32;
@@ -3316,14 +3325,17 @@ async fn test_grpc_h2c_upload_coalesces_small_connection_window_increments() {
         // Lockstep increments: each opens the window only after the bytes it
         // allowed arrived, so capacity never reaches a useful frame and only
         // the bounded wait lets the upload progress.
+        let mut waits = Vec::with_capacity(LOCKSTEP_ROUNDS);
         for _ in 0..LOCKSTEP_ROUNDS {
+            let started = Instant::now();
             let target = backend.received + INCREMENT as usize;
             backend.grant(INCREMENT).await;
             backend.read_body_until(target).await;
+            waits.push(started.elapsed());
         }
         let lockstep_frames = backend.frames.split_off(initial);
         backend.respond().await;
-        (trickle_frames, lockstep_frames, backend.received)
+        (trickle_frames, lockstep_frames, waits, backend.received)
     });
 
     // One connection: the backend accepts exactly one.
@@ -3357,17 +3369,20 @@ async fn test_grpc_h2c_upload_coalesces_small_connection_window_increments() {
         .expect("response");
     assert_eq!(response.status(), 200);
 
-    let (trickle_frames, lockstep_frames, received) = backend.await.expect("backend task");
+    let (trickle_frames, lockstep_frames, waits, received) = backend.await.expect("backend task");
     assert_eq!(received, body_len);
-    // A scheduling stall longer than the bounded wait can let one hold expire,
-    // so tolerate a few small frames; without coalescing every increment is
-    // one.
+    // Each scheduling stall longer than the bounded wait can end one hold
+    // early and cut one small frame, so on a loaded runner the count depends
+    // on how often the runner stalls, not on the gateway. Without coalescing
+    // nearly every increment is its own small frame (the vendored control
+    // regression asserts at least half), so fewer than half still separates
+    // the two without a load-dependent allowance.
     let small = trickle_frames
         .iter()
         .filter(|(len, end_stream)| !end_stream && *len < SMALL_DATA_FRAME)
         .count();
     assert!(
-        small <= TRICKLE_GRANTS / 8,
+        small < TRICKLE_GRANTS / 2,
         "{small} of {} DATA frames cut from window increments were under \
          {SMALL_DATA_FRAME} bytes: {trickle_frames:?}",
         trickle_frames.len()
@@ -3379,5 +3394,14 @@ async fn test_grpc_h2c_upload_coalesces_small_connection_window_increments() {
             .last()
             .is_some_and(|(_, end_stream)| *end_stream),
         "the last DATA frame ends the stream: {lockstep_frames:?}"
+    );
+    // A hold ends only at its deadline, so every round but the last (whose
+    // 32 bytes end the single-chunk body, which is never held) takes at
+    // least the bounded wait however fast or loaded the runner is.
+    assert!(
+        waits[..LOCKSTEP_ROUNDS - 1]
+            .iter()
+            .all(|wait| *wait >= COALESCE_WAIT),
+        "each 32-byte window must be held for the bounded wait: {waits:?}"
     );
 }
