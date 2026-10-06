@@ -26,6 +26,14 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased changes after 0.9.13
+
+**Library API:** code linking the `ferrum-edge` crate that constructs or matches
+`GrpcProxyError::ClientDeadlineExceeded` must build the new
+`GrpcDeadlinePhase` payload instead of the removed `String` (#6022); use
+`phase.message()` or `to_string()` for the diagnostic text. Gateway
+configuration, the Admin API, and metrics are unchanged.
+
 ## Upgrading to 0.9.13
 
 0.9.13 (2026-10-06 UTC) is cut from main

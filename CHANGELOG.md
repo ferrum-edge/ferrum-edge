@@ -28,15 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/1.1 and HTTP/2 terminal drain** (#6022). The terminal final-body drain
   answered an exhausted `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` budget with a
   `503` that the gRPC reject pipeline mapped to `UNAVAILABLE` (14). It now
-  carries `RESOURCE_EXHAUSTED` (8), like every other request-buffer capacity
-  refusal, the native HTTP/3 ones included.
+  carries `RESOURCE_EXHAUSTED` (8), like the other H1/H2 front-door and native
+  HTTP/3 refusals. The mesh backend-seam refusal
+  (`request_buffer_capacity_backend_response`) is unchanged and tracked in
+  #6022. Plain HTTP keeps its `503`.
 
 ### Changed
 
-- `GrpcProxyError::ClientDeadlineExceeded` carries a typed
-  `GrpcDeadlinePhase` instead of a message string (#6022), so the
+- **BREAKING (library API) — `GrpcProxyError::ClientDeadlineExceeded`
+  payload** (issue #6022). The variant carries a typed `GrpcDeadlinePhase`
+  (ConnectionAcquisition / Handoff / RetryBackoff / StreamingResponseHeaders /
+  ResponseHeaders / ResponseBody) instead of a message string, so the
   pre-handoff and post-send deadline classifications no longer compare
-  diagnostic text. Client-visible messages and statuses are unchanged.
+  diagnostic text. Code that links the `ferrum-edge` crate and constructs or
+  matches the variant must build the phase; use `phase.message()` or
+  `to_string()` for the text. Client-visible messages and statuses are
+  unchanged.
 
 ## [0.9.13] - 2026-10-06
 

@@ -4267,11 +4267,19 @@ async fn direct_h2_rejects_streaming_oversized_request_under_nonzero_limits() {
 /// both the unlimited passthrough arm and the size-limited arm. An explicit
 /// client CANCEL is reset the same way.
 ///
+/// `write_timeout_ms > 0` additionally installs the consumer-armed upload pump
+/// on the size-limited arm, proving the pump forwards the frontend body's
+/// `require_end_stream` gate. With `0` the body is polled in place and no pump
+/// exists.
+///
 /// The backend answers before the upload ends. A client reset that arrived
 /// earlier would cancel the gateway's pending backend send, which resets the
 /// backend stream on its own; after the backend answered, only the relayed
 /// upload itself can carry the client's reset to the backend.
-async fn direct_h2_client_reset_reaches_backend_as_reset(size_limited: bool) {
+async fn direct_h2_client_reset_reaches_backend_as_reset(
+    size_limited: bool,
+    write_timeout_ms: u64,
+) {
     const CANCEL: u32 = 0x8;
     let ca = TestCa::new("h2-upload-client-reset").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
@@ -4290,8 +4298,10 @@ async fn direct_h2_client_reset_reaches_backend_as_reset(size_limited: bool) {
         .spawn()
         .expect("spawn backend");
 
-    // No write watermark, so no upload pump: the direct-H2 request body polls
-    // the frontend body in place on both arms.
+    // With write_timeout_ms == 0 there is no write watermark, so no upload
+    // pump: the direct-H2 request body polls the frontend body in place. A
+    // non-zero value installs the pump and forwards `require_end_stream` into
+    // it on the size-limited arm.
     let yaml = file_mode_yaml_for_backend_with(
         backend_port,
         json!({
@@ -4299,7 +4309,7 @@ async fn direct_h2_client_reset_reaches_backend_as_reset(size_limited: bool) {
             "backend_host": "localhost",
             "backend_tls_verify_server_cert": false,
             "pool_enable_http2": true,
-            "backend_write_timeout_ms": 0,
+            "backend_write_timeout_ms": write_timeout_ms,
         }),
     );
     let max_request_body_bytes = if size_limited { "1048576" } else { "0" };
@@ -4396,13 +4406,22 @@ async fn direct_h2_client_reset_reaches_backend_as_reset(size_limited: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn direct_h2_passthrough_client_reset_reaches_backend_as_reset() {
-    direct_h2_client_reset_reaches_backend_as_reset(false).await;
+    direct_h2_client_reset_reaches_backend_as_reset(false, 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn direct_h2_size_limited_client_reset_reaches_backend_as_reset() {
-    direct_h2_client_reset_reaches_backend_as_reset(true).await;
+    direct_h2_client_reset_reaches_backend_as_reset(true, 0).await;
+}
+
+/// The size-limited arm with a live `backend_write_timeout_ms`, so the upload
+/// pump is installed and must forward the body's `require_end_stream` gate. A
+/// client NO_ERROR or CANCEL reset still reaches the backend as CANCEL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_size_limited_upload_pump_client_reset_reaches_backend_as_reset() {
+    direct_h2_client_reset_reaches_backend_as_reset(true, 5_000).await;
 }
 
 /// Declared backend Content-Length over the response limit must 502 on
