@@ -313,7 +313,7 @@
      }
  
      pub fn send_request(
-@@ -401,7 +502,16 @@
+@@ -397,7 +498,16 @@
  
      pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
          let mut me = self.inner.lock().unwrap();
@@ -331,7 +331,7 @@
      }
  
      pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), Error> {
-@@ -455,10 +565,22 @@
+@@ -451,10 +561,22 @@
      }
  }
  
@@ -356,7 +356,7 @@
              actions: Actions {
                  recv: Recv::new(peer, &config),
                  send: Send::new(&config),
-@@ -467,7 +589,17 @@
+@@ -463,7 +585,17 @@
              },
              store: Store::new(),
              refs: 1,
@@ -375,7 +375,7 @@
      }
  
      fn recv_headers<B>(
-@@ -600,10 +732,17 @@
+@@ -596,10 +728,17 @@
          frame: frame::Data,
      ) -> Result<(), Error> {
          let id = frame.stream_id();
@@ -393,7 +393,7 @@
                  // The GOAWAY process has begun. All streams with a greater ID
                  // than specified as part of GOAWAY should be ignored.
                  if id > self.actions.recv.max_stream_id() {
-@@ -648,14 +787,31 @@
+@@ -644,14 +783,31 @@
              let sz = frame.flow_controlled_len();
              let is_end_stream = frame.is_end_stream();
              let payload_len = frame.payload().len();
@@ -426,7 +426,7 @@
              }
  
              // Any stream error after receiving a DATA frame means
-@@ -665,6 +821,11 @@
+@@ -661,6 +817,11 @@
                  actions
                      .recv
                      .release_connection_capacity(sz as WindowSize, &mut None);
@@ -438,7 +438,7 @@
              }
              actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
          })
-@@ -1526,8 +1687,16 @@
+@@ -1522,8 +1683,16 @@
              .poll_data(cx, &mut stream)
              .map(|result| match result {
                  Some(Ok(data)) => {
@@ -455,7 +455,7 @@
                      }
                      Some(Ok(data.payload))
                  }
-@@ -1569,9 +1738,13 @@
+@@ -1565,9 +1734,13 @@
  
          let mut stream = me.store.resolve(self.key);
  
@@ -472,7 +472,7 @@
      }
  
      /// Clear the receive queue and set the status to no longer receive data frames.
-@@ -1746,6 +1919,11 @@
+@@ -1742,6 +1915,11 @@
                          "locally-reset streams reached limit ({:?})",
                          counts.max_local_error_resets().unwrap(),
                      );
@@ -484,7 +484,7 @@
                      return Err(crate::proto::error::GoAway {
                          reason: Reason::ENHANCE_YOUR_CALM,
                          debug_data: "too_many_internal_resets".into(),
-@@ -1794,6 +1972,11 @@
+@@ -1790,6 +1968,11 @@
                      "reset_on_recv_stream_err; locally-reset streams reached limit ({:?})",
                      counts.max_local_error_resets().unwrap(),
                  );
@@ -496,7 +496,7 @@
                  Err(Error::library_go_away_data(
                      Reason::ENHANCE_YOUR_CALM,
                      "too_many_internal_resets",
-@@ -1845,3 +2028,7 @@
+@@ -1841,3 +2024,7 @@
          self.send.clear_queues(store, counts);
      }
  }

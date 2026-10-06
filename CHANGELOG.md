@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **gRPC affinity no longer dials a missing or closed shard on the request
+  path when a ready sibling exists** (#5991 follow-up; regression since
+  0.9.11). A new HTTP/2 frontend connection mapped to a shard that did not
+  exist yet, or a connection whose shard had just closed on a backend GOAWAY,
+  waited for a fresh dial (up to `backend_connect_timeout_ms`, 5 s by default)
+  even while another backend connection was ready, and with the backend at its
+  connection cap every such call paid that wait. The ready sibling now serves
+  the call at once and the shard is created on a detached, single-flight
+  background task that honours the existing create cooldown. Only a pool with
+  no ready shard dials inline.
+- **gRPC affinity respects the backend's `SETTINGS_MAX_CONCURRENT_STREAMS`**.
+  Up to 32 of a frontend connection's streams were pinned to one backend
+  connection whatever the backend allowed, so a backend advertising a small
+  limit queued calls inside h2 while other shards sat idle. The pool's
+  connection driver now samples the backend's current limit after every poll,
+  and a connection spills once it has as many open streams as that limit (or
+  32, whichever is lower).
+- **gRPC affinity slot tables are per gateway**. The table that spreads HTTP/2
+  frontend connections over shards was process-global; it now belongs to the
+  gateway's gRPC pool, so separate in-process gateways and tests no longer
+  share balance state.
+
+### Changed
+
+- **Retired the vendored h2 stream-lifetime patch** (`h2-002-stream-lifetime`).
+  It existed only to keep a gRPC call counted for affinity until h2 drained
+  an upload's queued final DATA after an early terminal response. Affinity now
+  counts a stream until its response terminates, gateway-side; an upload h2
+  still holds after an early response no longer counts toward the soft
+  per-connection bound. The vendored h2 keeps the coalescing and runtime
+  DATA-frame-budget patches, and the duplicate `002` patch number is gone.
+- **Documented the backend connection width of gRPC affinity**. Clients that
+  open many short-lived HTTP/2 connections can see up to
+  `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` backend connections per backend
+  host from each gateway; see `docs/connection_pooling.md`.
+
 ## [0.9.12] - Unreleased
 
 Candidate prepared on **2026-10-05 UTC** from post-#6012 main

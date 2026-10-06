@@ -156,7 +156,7 @@ e8b69bda2a21338e909282b888c320e0e260711fb4869ca80ccc009889e223a4  vendor/h2-0.4.
 9e634d75a9701dfe33c77ae500e82822242567a0c5bc1d62e13f43448c40e476  vendor/h2-0.4.19-ferrum-patched/src/codec/framed_write.rs
 7cfd67434af9b3730e961b9368d304188eab37f5786d3746cb204d178ef0c6b2  vendor/h2-0.4.19-ferrum-patched/src/codec/mod.rs
 b05dc52f36a29b29b1b3e0705a3f1ecf102a89896e173356f3e5fb1165dd6090  vendor/h2-0.4.19-ferrum-patched/src/error.rs
-9d55ef1dfd7ff29932d0586ba97a778a31f052a3658eed1a0d282348b8bad88c  vendor/h2-0.4.19-ferrum-patched/src/ext.rs
+2fb968f754829fc50392b6ccb4b90cc4c8b88657a5e3a7259f53916e13dc1c91  vendor/h2-0.4.19-ferrum-patched/src/ext.rs
 8db7229fdaf0b3f750fce26a2e29a6facacb95622b6d36dfe186c42c8a2d2f73  vendor/h2-0.4.19-ferrum-patched/src/frame/data.rs
 6b3fe966ed96bb941e55e6af3352d7afa43e9bde78dc261251a38b09f5c73202  vendor/h2-0.4.19-ferrum-patched/src/frame/go_away.rs
 4073eb70a8ed9ec0ca460e18fb470fca1dbe6900c1ac08d66397ab4d75414e4c  vendor/h2-0.4.19-ferrum-patched/src/frame/head.rs
@@ -190,7 +190,7 @@ a383e4d81502945878333748e40e5a5f64da4403af886d1812027f522fc0d869  vendor/h2-0.4.
 fabf42b1b1062e361c4d45026e9bfc9c32a02a9074259c71b525e78d2113a148  vendor/h2-0.4.19-ferrum-patched/src/proto/ping_pong.rs
 0fef5d01aa0233100a0cda9c0b5080a15cfbaab16c42c991933f5ed7db06bf77  vendor/h2-0.4.19-ferrum-patched/src/proto/settings.rs
 631aa4360b7b942c3899c6fb7455e682655c3ac099a170d5c3d566af3fec8318  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/buffer.rs
-c8ddced0c2a90aa859ad722dfcf4b45a9f0b632c3ca35467300d717554a9ef50  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/counts.rs
+9c0a1326fe0edf1e0636e1664915ceeb09e762c90fa8184bc6af0ca6ad077449  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/counts.rs
 a8b3c5cd24b1f83770576ba21d5fcd555f144afd88f246f7d5dbe9e39563c74a  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/flow_control.rs
 49a9d42775813e08ae6318441314c3a4dca58a345a04b73275cd9755e348a621  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/mod.rs
 5eba6fc5c252104676fa76e13fe07459fdbb9bc55df6483b1683fa99ad6fa674  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/prioritize.rs
@@ -198,8 +198,8 @@ fed37fe0528eadc27acdbaea7f2367e1ebc88c45de1a5739b446142c610badf4  vendor/h2-0.4.
 ee355358b86ea048fd0e64642595e7be6e7f03a39d96745e74503cba2f1b08ef  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/send.rs
 486b99b293d0f874b72724e1511cb0b11b44b3906ea20eb176fae1821772794d  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/state.rs
 040005e8af13193db7bd89c20a44e28f5d18976a4b8562bf068dd8bd4a982668  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/store.rs
-15377e1fba6bc5b5265f3248161bf249f8d57c5d15c137a4ecfa005e16cd110d  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/stream.rs
-691f9ccbda00da2e7e3babe895d20aa5caf23e167ae94c672a3a8efe9d5df847  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/streams.rs
+e31a59444ba7b885040556b89c19b308321e2adeab1cdb2cce720285701d56a0  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/stream.rs
+28b74ed10ceb24d404008652af0b5b9818bb9ea3e492bb6517e6ed2c935ad33a  vendor/h2-0.4.19-ferrum-patched/src/proto/streams/streams.rs
 a567d950e49e897f844e865b945a748b3bf6226645c2d9c97af214d66118d596  vendor/h2-0.4.19-ferrum-patched/src/server.rs
 e313c11a24b649d4c9da937fb37e5c2cc7c689c53f6afd2470fd40fd030237c5  vendor/h2-0.4.19-ferrum-patched/src/share.rs
 5e7eaa0427066d620a7c0f1ca390cfec628de0eb652e275ed639c61eba26e626  vendor/h3-0.0.8-ferrum-patched/Cargo.toml

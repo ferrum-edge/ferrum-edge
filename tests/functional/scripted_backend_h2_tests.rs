@@ -2417,10 +2417,13 @@ async fn h2_buffered_response_body_stall_triggers_backend_read_timeout() {
 // connection, the pool isn't reusing, which is a regression.
 //
 // Observable: one backend TCP accept and H2 handshake, with two completed
-// RPCs returning distinct scripted messages. Keep one frontend H2 connection
-// alive: gRPC affinity deliberately creates a missing shard for a new frontend,
-// even when a sibling shard is ready. GrpcClient::unary opens a new frontend
-// per call, so it cannot establish this same-connection reuse invariant.
+// RPCs returning distinct scripted messages. This is the native gRPC pool
+// (`GrpcConnectionPool`), not the direct HTTP/2 pool. Keep one frontend H2
+// connection alive: gRPC affinity creates a missing shard for a new frontend
+// (in the background, while a ready sibling serves its call), so each new
+// frontend connection can add a backend connection. GrpcClient::unary opens a
+// new frontend per call, so it cannot establish this same-connection reuse
+// invariant.
 //
 // Migrated to `HarnessMode::InProcess` — the assertion is on
 // `backend.accepted_connections()` and `backend.received_streams()`,
@@ -2429,7 +2432,7 @@ async fn h2_buffered_response_body_stall_triggers_backend_read_timeout() {
 // of `capture_output()`, which is binary-only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn h2_direct_pool_reuses_connection_across_requests() {
+async fn grpc_pool_reuses_backend_connection_across_requests() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
@@ -5462,8 +5465,8 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
         );
     }
     assert!(
-        accepted.load(Ordering::Relaxed) >= 2,
-        "heavy upload must widen the pool"
+        accepted.load(Ordering::Relaxed) >= 1,
+        "the uploads reached the backend"
     );
     drop(harness);
     backend.abort();
@@ -5519,10 +5522,12 @@ async fn exercise_grpc_retained_uploads<T>(
         }
         let preferred: &http::HeaderValue =
             preferred_backend.get_or_insert_with(|| backend_ids[0].clone());
-        assert!(backend_ids[..32].iter().all(|id| id == preferred));
+        // A stream counts for affinity until its response terminates. Each
+        // terminal response was drained, so the uploads it left open no longer
+        // count and every call stays on the connection's own shard.
         assert!(
-            backend_ids[32..].iter().any(|id| id != preferred),
-            "uploads must remain counted after their terminal responses in wave {wave}"
+            backend_ids.iter().all(|id| id == preferred),
+            "uploads stop counting once their terminal responses end in wave {wave}"
         );
         assert!(
             ended.try_recv().is_err(),
@@ -5644,31 +5649,33 @@ async fn exercise_grpc_chunked_upload(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_affinity_retains_early_response_uploads_on_plaintext_frontend() {
+async fn grpc_affinity_releases_early_response_uploads_on_plaintext_frontend() {
     grpc_early_response_upload_affinity(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_affinity_retains_early_response_uploads_on_tls_frontend() {
+async fn grpc_affinity_releases_early_response_uploads_on_tls_frontend() {
     grpc_early_response_upload_affinity(true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_affinity_retains_authenticated_early_response_uploads_on_plaintext_frontend() {
+async fn grpc_affinity_releases_authenticated_early_response_uploads_on_plaintext_frontend() {
     grpc_early_response_upload_affinity(false, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_affinity_retains_authenticated_early_response_uploads_on_tls_frontend() {
+async fn grpc_affinity_releases_authenticated_early_response_uploads_on_tls_frontend() {
     grpc_early_response_upload_affinity(true, true).await;
 }
 
 // The backend grants only 1 KiB, answers before consuming the upload, and
-// withholds all further credit. Each final 16 KiB DATA must keep a backend
-// stream occupied even after Hyper drops its source and the response ends.
+// withholds all further credit. Each final 16 KiB DATA keeps a backend stream
+// occupied after Hyper drops its source and the response ends; affinity counts
+// only until the response ends, so the calls stay on one shard while every
+// body representation still delivers its DATA and trailers once credit returns.
 #[derive(Clone, Copy)]
 enum QueuedGrpcUpload {
     Streaming,
@@ -5970,18 +5977,17 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
             .expect("withheld-credit report");
         assert_eq!(blocked, index, "every response leaves its upload blocked");
     }
-    assert!(backend_ids[..32].iter().all(|id| id == backend_ids[0]));
     assert!(
-        backend_ids[32..].iter().any(|id| id != backend_ids[0]),
-        "final DATA still queued after terminal responses must force spill"
+        backend_ids.iter().all(|id| id == backend_ids[0]),
+        "affinity releases a call when its response ends, not when h2 drains its upload"
     );
     assert!(
         ended_rx.try_recv().is_err(),
         "no upload has drained or reset"
     );
     assert!(
-        accepted.load(Ordering::Relaxed) >= 2,
-        "spill widens the pool"
+        accepted.load(Ordering::Relaxed) >= 1,
+        "the uploads reached the backend"
     );
     if matches!(mode, QueuedGrpcUpload::RetryBuffered) {
         let logs = harness
@@ -6047,24 +6053,24 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_affinity_retains_streaming_final_data_queued_after_source_eof() {
+async fn grpc_affinity_releases_streaming_final_data_queued_after_source_eof() {
     grpc_affinity_with_queued_final_data(QueuedGrpcUpload::Streaming).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_affinity_retains_retry_buffered_native_final_data() {
+async fn grpc_affinity_releases_retry_buffered_native_final_data() {
     grpc_affinity_with_queued_final_data(QueuedGrpcUpload::RetryBuffered).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_affinity_retains_translated_web_data_and_trailers() {
+async fn grpc_affinity_releases_translated_web_data_and_trailers() {
     grpc_affinity_with_queued_final_data(QueuedGrpcUpload::WebTrailers).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn grpc_affinity_retains_pumped_translated_web_data_and_trailers() {
+async fn grpc_affinity_releases_pumped_translated_web_data_and_trailers() {
     grpc_affinity_with_queued_final_data(QueuedGrpcUpload::WebPumped).await;
 }
