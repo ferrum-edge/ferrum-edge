@@ -239,7 +239,7 @@ use crate::plugins::utils::openai_error::{
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
-    WebSocketFrameDirection, WebSocketSizeLimits, is_builtin_plugin_name,
+    WebSocketFrameDirection, WebSocketSizeLimits, is_builtin_plugin,
     mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
@@ -1744,7 +1744,7 @@ fn simulate_later_after_proxy_headers(
     let mut exact_builtin_may_add_no_transform = false;
     let mut exact_builtin_may_add_strong_etag = false;
     for plugin in plugins {
-        if !is_builtin_plugin_name(plugin.name()) {
+        if !is_builtin_plugin(plugin.as_ref()) {
             return LaterHeaderSimulation {
                 cache_control_no_transform: true,
                 strong_etag: true,
@@ -1789,7 +1789,8 @@ fn simulate_later_after_proxy_headers(
 /// `None` means the projection cannot be trusted: the remaining chain contains a
 /// plugin whose header effects the gateway cannot reproduce (any non-built-in
 /// plugin, whose `simulate_after_proxy_response_headers` is the inert default
-/// while its real `after_proxy` may rewrite anything). Callers must fall back to
+/// while its real `after_proxy` may rewrite anything). Built-in means the
+/// registered type, never the reported name (issue #6022). Callers must fall back to
 /// the conservative answer rather than treating the unmodified map as final.
 ///
 /// Pure with respect to the real request: the context is cloned, so one-shot
@@ -1805,7 +1806,7 @@ fn simulate_final_after_proxy_response_headers(
 ) -> Option<HashMap<String, String>> {
     if plugins
         .iter()
-        .any(|plugin| !is_builtin_plugin_name(plugin.name()))
+        .any(|plugin| !is_builtin_plugin(plugin.as_ref()))
     {
         return None;
     }

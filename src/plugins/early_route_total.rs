@@ -23,9 +23,17 @@
 use std::sync::Arc;
 
 use super::utils::query::{CanonicalQuery, canonical_query_for_policy};
-use super::{Plugin, RequestContext, is_builtin_plugin_name};
+use super::{Plugin, RequestContext, is_builtin_plugin};
 
 const MESH_ROUTE_DISPATCH: &str = "mesh_route_dispatch";
+const FAULT_INJECTION: &str = "fault_injection";
+
+/// Whether `plugin` is the built-in plugin `name`. The type decides trust, so
+/// a custom plugin reporting `name` is not taken for the built-in (issue
+/// #6022).
+fn is_builtin(plugin: &(dyn Plugin + 'static), name: &str) -> bool {
+    plugin.name() == name && is_builtin_plugin(plugin)
+}
 
 /// The request headers a plugin may still rewrite before one
 /// `mesh_route_dispatch` instance evaluates its rules.
@@ -194,9 +202,8 @@ struct InputChanges {
 }
 
 impl InputChanges {
-    fn record(&mut self, plugin: &dyn Plugin) {
-        let declared =
-            is_builtin_plugin_name(plugin.name()) || plugin.declares_request_input_mutations();
+    fn record(&mut self, plugin: &(dyn Plugin + 'static)) {
+        let declared = is_builtin_plugin(plugin) || plugin.declares_request_input_mutations();
         if !declared {
             // A custom plugin that has not declared its request mutations
             // may rewrite any input in any phase.
@@ -219,9 +226,9 @@ impl InputChanges {
 /// Whether `plugin` can rewrite request inputs from a hook that runs before
 /// `before_proxy` (`authenticate`, `authorize`, or the pre-`before_proxy` body
 /// normalization), and so ahead of every instance whatever its priority. Every
-/// custom plugin can.
-fn rewrites_inputs_before_before_proxy(plugin: &dyn Plugin) -> bool {
-    !is_builtin_plugin_name(plugin.name())
+/// custom plugin can, including one that reports a built-in name.
+fn rewrites_inputs_before_before_proxy(plugin: &(dyn Plugin + 'static)) -> bool {
+    !is_builtin_plugin(plugin)
         || plugin.is_auth_plugin()
         || plugin.normalizes_buffered_request_body_before_before_proxy()
 }
@@ -235,7 +242,7 @@ pub(crate) fn undeclared_plugin_disabling_early_route_bound(
 ) -> Option<&str> {
     let dispatches = plugins
         .iter()
-        .any(|plugin| plugin.name() == MESH_ROUTE_DISPATCH);
+        .any(|plugin| is_builtin(plugin.as_ref(), MESH_ROUTE_DISPATCH));
     let collects_early = plugins.iter().any(|plugin| {
         plugin.requires_request_body_before_before_proxy()
             || plugin.requires_request_body_before_authenticate()
@@ -247,7 +254,7 @@ pub(crate) fn undeclared_plugin_disabling_early_route_bound(
     plugins
         .iter()
         .find(|plugin| {
-            !is_builtin_plugin_name(plugin.name()) && !plugin.declares_request_input_mutations()
+            !is_builtin_plugin(plugin.as_ref()) && !plugin.declares_request_input_mutations()
         })
         .map(|plugin| plugin.name())
 }
@@ -302,7 +309,7 @@ impl EarlyRouteTotalPlan {
         let mut steps = Vec::new();
         let mut route_faults_may_be_preempted = false;
         for plugin in plugins {
-            if plugin.name() == MESH_ROUTE_DISPATCH {
+            if is_builtin(plugin.as_ref(), MESH_ROUTE_DISPATCH) {
                 steps.push(PlanStep {
                     plugin: Arc::clone(plugin),
                     changes: changes.clone(),
@@ -315,7 +322,10 @@ impl EarlyRouteTotalPlan {
                 continue;
             }
             changes.record(plugin.as_ref());
-            route_faults_may_be_preempted |= plugin.name() == "fault_injection";
+            // A custom plugin, whatever name it reports, may mark the request
+            // `fault_injected` like the built-in `fault_injection` does.
+            let custom = !is_builtin_plugin(plugin.as_ref());
+            route_faults_may_be_preempted |= custom || plugin.name() == FAULT_INJECTION;
         }
         let needs_query = steps
             .iter()
