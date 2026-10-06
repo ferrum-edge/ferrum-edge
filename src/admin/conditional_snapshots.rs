@@ -49,7 +49,12 @@ fn namespace_tag(
         .jwt_manager
         .resource_etag_key()
         .ok_or_else(|| anyhow::anyhow!("Namespace ETag key unavailable"))?;
-    Ok(preconditions::snapshot_etag(&key, NAMESPACE_SNAPSHOT_TAG_KIND, namespace, digest))
+    Ok(preconditions::snapshot_etag(
+        &key,
+        NAMESPACE_SNAPSHOT_TAG_KIND,
+        namespace,
+        digest,
+    ))
 }
 
 fn row_tags<R: AdminResource>(
@@ -233,13 +238,14 @@ pub(super) async fn backup(
             .load_conditional_namespace_snapshot(namespace)
             .await
             .map_err(|error| store_error(&error))?;
-        let (body_bytes, tag) = serialize_snapshot(state, namespace, &snapshot).map_err(|error| {
-            if is_namespace_snapshot_too_large(&error) {
-                snapshot_too_large()
-            } else {
-                unavailable()
-            }
-        })?;
+        let (body_bytes, tag) =
+            serialize_snapshot(state, namespace, &snapshot).map_err(|error| {
+                if is_namespace_snapshot_too_large(&error) {
+                    snapshot_too_large()
+                } else {
+                    unavailable()
+                }
+            })?;
         let config = snapshot.config;
         let response = super::finalize_backup_export(
             state,

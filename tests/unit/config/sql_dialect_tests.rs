@@ -85,12 +85,14 @@ fn deployment_known_columns_match_the_baseline_schema() {
         let listed: std::collections::BTreeSet<String> =
             known.iter().map(|column| column.to_string()).collect();
         assert_eq!(
-            listed.len(), known.len(),
+            listed.len(),
+            known.len(),
             "duplicate known column in {table}"
         );
         let variants = baseline_columns(table);
         assert_eq!(
-            variants.len(), 2,
+            variants.len(),
+            2,
             "expected MySQL and Postgres/SQLite baseline definitions of {table}"
         );
         for columns in variants {

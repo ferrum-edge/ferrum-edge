@@ -74,7 +74,10 @@ fn large_spec_documents_are_fenced_by_digest_not_materialized() {
     let specs = representation[5].as_array().unwrap();
     assert_eq!(specs[0]["id"], "a", "specs are sorted by id");
     assert_eq!(specs[0]["spec_content"]["len"], LARGE_SPEC_BYTES);
-    assert_eq!(specs[0]["spec_content"]["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        specs[0]["spec_content"]["sha256"].as_str().unwrap().len(),
+        64
+    );
     assert!(!specs[0]["spec_content"].is_array());
     assert_eq!(specs[0]["external_ref_snapshot"]["len"], 1024);
     assert_eq!(representation[7], 42);
