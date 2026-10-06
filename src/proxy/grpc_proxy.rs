@@ -48,7 +48,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
-use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolManager};
+use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolCreateCaller, PoolManager};
 use crate::proxy::hbone_pool::HbonePoolError;
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
@@ -1364,6 +1364,7 @@ impl GrpcConnectionPool {
                 .create_or_get_existing_owned_in_background(
                     key,
                     permit,
+                    purpose.pool_caller(),
                     |attempt| note_grpc_establishment_join(attempt, purpose),
                     |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
                     // A create of this shard that failed after the fill was
@@ -1631,6 +1632,7 @@ impl GrpcConnectionPool {
         let acquired = crate::profile_pool_future!(FallbackPoll, {
             self.pool.create_or_get_existing_owned_with_recovery(
                 selected_key,
+                purpose.pool_caller(),
                 |attempt| note_grpc_establishment_join(attempt, purpose),
                 |attempt| note_grpc_establishment_waiter_failure(attempt, purpose),
                 |key| {
@@ -2284,6 +2286,18 @@ pub enum GrpcEstablishmentPurpose {
     Request,
     /// Startup, SIGHUP, or periodic backend capability classification.
     CapabilityProbe,
+}
+
+impl GrpcEstablishmentPurpose {
+    /// The pool caller for this purpose. A probe dials with a capped connect
+    /// budget, so its failed create is not broadcast to request waiters
+    /// (issue #6032).
+    fn pool_caller(self) -> PoolCreateCaller {
+        match self {
+            Self::Request => PoolCreateCaller::Request,
+            Self::CapabilityProbe => PoolCreateCaller::CapabilityProbe,
+        }
+    }
 }
 
 /// Tracing severity for a gRPC protocol-establishment failure.

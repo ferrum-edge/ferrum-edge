@@ -32,8 +32,11 @@ use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 use serde_json::{Value, json};
 use std::net::UdpSocket as StdUdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{oneshot, watch};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Shared helpers
@@ -779,5 +782,389 @@ async fn mark_h3_unsupported_persists_until_periodic_refresh_succeeds() {
         entry["plain_http"]["h3"].as_str(),
         Some("supported"),
         "expected h3=supported after recovery; entry: {entry:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #6032 — a request joining the startup probe's backend setup keeps its
+// own route connect budget.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Connect timeout is request policy and is not part of the gRPC pool key, so
+// a live request can join the connection setup the startup capability probe
+// owns. The probe's connect budget is capped at 5 s. The request must not
+// inherit that cap or the probe's failure: it re-dials under its route's
+// `backend_connect_timeout_ms`.
+
+const PROBE_JOIN_GRPC_PATH: &str = "/probe.join.v1.Service/Call";
+/// The capability probe's connect budget cap
+/// (`BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP`).
+const PROBE_CONNECT_CAP: Duration = Duration::from_secs(5);
+
+fn probe_join_grpc_yaml(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "probe-join-grpc",
+            "listen_path": "/grpc",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            // Far past the probe's 5 s cap.
+            "backend_connect_timeout_ms": 30_000,
+            "backend_read_timeout_ms": 10_000,
+            "backend_write_timeout_ms": 10_000,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+/// One h2c connection whose setup the backend stalled (no peer SETTINGS).
+#[derive(Clone, Copy)]
+struct StalledSetup {
+    accepted_at: Instant,
+    closed_at: Option<Instant>,
+}
+
+/// h2c backend that stalls every connection's setup until the test switches
+/// it to serving. A stalled connection is held until the gateway closes it or
+/// the test drops it. Connections accepted after the switch are real HTTP/2
+/// servers that answer a trailers-only gRPC OK.
+struct ProbeJoinBackend {
+    serving: Arc<AtomicBool>,
+    drop_stalled: watch::Sender<bool>,
+    stalled: Arc<Mutex<Vec<StalledSetup>>>,
+    served_accepts: Arc<Mutex<Vec<Instant>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ProbeJoinBackend {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ProbeJoinBackend {
+    fn spawn(listener: TcpListener) -> Self {
+        let serving = Arc::new(AtomicBool::new(false));
+        let (drop_stalled, drop_rx) = watch::channel(false);
+        let stalled = Arc::new(Mutex::new(Vec::new()));
+        let served_accepts = Arc::new(Mutex::new(Vec::new()));
+        let task = {
+            let serving = Arc::clone(&serving);
+            let stalled = Arc::clone(&stalled);
+            let served_accepts = Arc::clone(&served_accepts);
+            tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (stream, _) = accepted.expect("probe-join backend accept");
+                            let accepted_at = Instant::now();
+                            if serving.load(Ordering::SeqCst) {
+                                served_accepts.lock().unwrap().push(accepted_at);
+                                connections.spawn(serve_grpc_ok(stream));
+                            } else {
+                                let index = {
+                                    let mut stalled = stalled.lock().unwrap();
+                                    stalled.push(StalledSetup {
+                                        accepted_at,
+                                        closed_at: None,
+                                    });
+                                    stalled.len() - 1
+                                };
+                                connections.spawn(hold_stalled_setup(
+                                    stream,
+                                    drop_rx.clone(),
+                                    Arc::clone(&stalled),
+                                    index,
+                                ));
+                            }
+                        }
+                        Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                    }
+                }
+            })
+        };
+        Self {
+            serving,
+            drop_stalled,
+            stalled,
+            served_accepts,
+            task,
+        }
+    }
+
+    /// Serve every connection accepted from now on.
+    fn serve(&self) {
+        self.serving.store(true, Ordering::SeqCst);
+    }
+
+    /// Close every stalled setup, failing its creator's h2c handshake.
+    fn drop_stalled(&self) {
+        self.drop_stalled.send_replace(true);
+    }
+
+    fn stalled(&self) -> Vec<StalledSetup> {
+        self.stalled.lock().unwrap().clone()
+    }
+
+    fn served_accepts(&self) -> Vec<Instant> {
+        self.served_accepts.lock().unwrap().clone()
+    }
+
+    /// Wait for the live gateway's startup probe to hold a stalled setup, and
+    /// return when the backend accepted it.
+    async fn wait_for_probe_setup(&self) -> Instant {
+        let deadline = Instant::now() + PROBE_CONNECT_CAP;
+        loop {
+            let open = self
+                .stalled()
+                .iter()
+                .rev()
+                .find(|setup| setup.closed_at.is_none())
+                .map(|setup| setup.accepted_at);
+            if let Some(accepted_at) = open {
+                return accepted_at;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the startup capability probe never dialled the backend"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+async fn hold_stalled_setup(
+    mut stream: TcpStream,
+    mut drop_rx: watch::Receiver<bool>,
+    stalled: Arc<Mutex<Vec<StalledSetup>>>,
+    index: usize,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let mut buffer = [0u8; 4096];
+    loop {
+        tokio::select! {
+            read = stream.read(&mut buffer) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            },
+            _ = drop_rx.wait_for(|release| *release) => break,
+        }
+    }
+    drop(stream);
+    stalled.lock().unwrap()[index].closed_at = Some(Instant::now());
+}
+
+async fn grpc_ok(
+    _request: hyper::Request<hyper::body::Incoming>,
+) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, std::convert::Infallible> {
+    let response = hyper::Response::builder()
+        .header("content-type", "application/grpc")
+        .header("grpc-status", "0")
+        .body(http_body_util::Full::new(bytes::Bytes::new()))
+        .expect("trailers-only gRPC response");
+    Ok(response)
+}
+
+async fn serve_grpc_ok(stream: TcpStream) {
+    let service = hyper::service::service_fn(grpc_ok);
+    let builder = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let _ = builder.serve_connection(io, service).await;
+}
+
+/// The terminal `grpc-status`: from a trailers-only head, or else from the
+/// trailers after the body.
+async fn probe_join_grpc_status(response: http::Response<h2::RecvStream>) -> Option<String> {
+    let (head, mut body) = response.into_parts();
+    let head_status = head
+        .headers
+        .get("grpc-status")
+        .and_then(|status| status.to_str().ok())
+        .map(str::to_owned);
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.ok()?;
+        body.flow_control().release_capacity(chunk.len()).ok()?;
+    }
+    let trailers = body.trailers().await.ok()?;
+    if let Some(status) = head_status {
+        return Some(status);
+    }
+    trailers?
+        .get("grpc-status")?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+/// Send one unary gRPC call over a fresh h2c frontend connection. `sent`
+/// receives the instant the request and its message were handed to h2.
+async fn send_probe_join_rpc(
+    authority: String,
+    sent: oneshot::Sender<Instant>,
+) -> (u16, Option<String>) {
+    let tcp = TcpStream::connect(authority.as_str())
+        .await
+        .expect("connect to the gateway plaintext port");
+    let (send_request, connection) = h2::client::handshake(tcp)
+        .await
+        .expect("h2c handshake with the gateway");
+    let driver = tokio::spawn(connection);
+    let mut send_request = send_request
+        .ready()
+        .await
+        .expect("the h2 connection must accept a new stream");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://{authority}/grpc{PROBE_JOIN_GRPC_PATH}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .expect("build gRPC request");
+    let (response, mut upload) = send_request
+        .send_request(request, false)
+        .expect("send the gRPC request");
+    // One empty, uncompressed gRPC message, then end of stream.
+    upload
+        .send_data(bytes::Bytes::from_static(&[0, 0, 0, 0, 0]), true)
+        .expect("send the gRPC message");
+    let _ = sent.send(Instant::now());
+    let response = response.await.expect("gRPC response head");
+    let http_status = response.status().as_u16();
+    let grpc_status = probe_join_grpc_status(response).await;
+    drop(send_request);
+    driver.abort();
+    (http_status, grpc_status)
+}
+
+async fn spawn_probe_join_gateway(backend_port: u16) -> GatewayHarness {
+    GatewayHarness::builder()
+        .file_config(probe_join_grpc_yaml(backend_port))
+        .log_level("info")
+        .capture_output()
+        // Warmup off: the initial capability refresh owns the probe and runs
+        // in the background once the listeners bind.
+        .pool_warmup_enabled(false)
+        // One shard, so the probe and the request select the same pool key.
+        .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "1")
+        .spawn()
+        .await
+        .expect("spawn gateway")
+}
+
+fn probe_join_authority(harness: &GatewayHarness) -> String {
+    harness
+        .proxy_base_url()
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// The probe's setup fails while a request waits on it. The request must
+/// re-dial under its own budget and succeed, not return the probe's failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn capability_probe_failure_does_not_fail_a_joined_grpc_request() {
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let backend = ProbeJoinBackend::spawn(reservation.into_listener());
+    let harness = spawn_probe_join_gateway(backend_port).await;
+    let probe_accepted_at = backend.wait_for_probe_setup().await;
+
+    let authority = probe_join_authority(&harness);
+    let (sent_tx, sent_rx) = oneshot::channel();
+    let rpc = tokio::spawn(send_probe_join_rpc(authority, sent_tx));
+    sent_rx.await.expect("the gRPC request was sent");
+    // Let the request reach the pool and join the probe's pending setup.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let probe = *backend.stalled().last().expect("probe setup");
+    assert!(
+        probe.accepted_at == probe_accepted_at && probe.closed_at.is_none(),
+        "the probe's setup must still be in flight, and the request must not have dialled \
+         its own stalled setup; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+
+    backend.serve();
+    backend.drop_stalled();
+    let (http_status, grpc_status) = tokio::time::timeout(Duration::from_secs(15), rpc)
+        .await
+        .expect("the joined gRPC request must complete")
+        .expect("join the gRPC request");
+    assert_eq!(
+        (http_status, grpc_status.as_deref()),
+        (200, Some("0")),
+        "a request that joined the probe's setup must re-dial under its own budget instead of \
+         returning the probe's failure; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+    assert_eq!(
+        backend.served_accepts().len(),
+        1,
+        "the joined request dials once after the probe's setup fails"
+    );
+}
+
+/// The issue #6032 shape: the probe's setup stalls until its 5 s budget runs
+/// out. The joined request must outlive that budget and succeed on its own
+/// dial, inside its 30 s route connect budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn grpc_request_joining_the_startup_probe_keeps_its_route_connect_budget() {
+    let reservation = reserve_port().await.expect("backend port");
+    let backend_port = reservation.port;
+    let backend = ProbeJoinBackend::spawn(reservation.into_listener());
+    let harness = spawn_probe_join_gateway(backend_port).await;
+    let probe_accepted_at = backend.wait_for_probe_setup().await;
+
+    let authority = probe_join_authority(&harness);
+    let (sent_tx, sent_rx) = oneshot::channel();
+    let rpc = tokio::spawn(send_probe_join_rpc(authority, sent_tx));
+    let sent_at = sent_rx.await.expect("the gRPC request was sent");
+    assert!(
+        sent_at.duration_since(probe_accepted_at) < Duration::from_secs(4),
+        "the request must be sent while the probe's setup is in flight"
+    );
+    // The probe's own setup stays stalled; any later dial is served.
+    backend.serve();
+
+    let budget = PROBE_CONNECT_CAP + Duration::from_secs(15);
+    let (http_status, grpc_status) = tokio::time::timeout(budget, rpc)
+        .await
+        .expect("the joined gRPC request must complete")
+        .expect("join the gRPC request");
+    let completed_at = Instant::now();
+    assert_eq!(
+        (http_status, grpc_status.as_deref()),
+        (200, Some("0")),
+        "a request that joined the probe's setup must not inherit the probe's 5 s connect \
+         budget; logs:\n{}",
+        harness.captured_combined().unwrap_or_default()
+    );
+
+    let probe = *backend.stalled().last().expect("probe setup");
+    assert_eq!(
+        probe.accepted_at, probe_accepted_at,
+        "the request must not have dialled its own stalled setup"
+    );
+    let served = backend.served_accepts();
+    assert_eq!(served.len(), 1, "the joined request dials exactly once");
+    // Not vacuous: the request waited on the probe's setup, and dialled only
+    // after the probe's budget ran out.
+    let slack = Duration::from_millis(500);
+    assert!(
+        served[0].duration_since(probe_accepted_at) >= PROBE_CONNECT_CAP - slack,
+        "the request must have joined the probe's setup rather than dialling at once"
+    );
+    assert!(
+        completed_at.duration_since(probe_accepted_at) >= PROBE_CONNECT_CAP - slack,
+        "the request outlived the probe's connect budget"
     );
 }

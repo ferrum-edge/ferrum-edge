@@ -118,7 +118,7 @@ use crate::backend_conn_limit::{PooledConnectionAdmission, SharedBackendConnecti
 use crate::config::PoolConfig;
 use crate::config::types::{GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
-use crate::pool::{GenericPool, PoolManager};
+use crate::pool::{GenericPool, PoolCreateCaller, PoolManager};
 use crate::proxy::body::{DirectH1RequestBody, DirectH2RequestBody};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
@@ -1016,7 +1016,7 @@ impl Http2ConnectionPool {
     }
 
     pub async fn get_sender(&self, proxy: &Proxy) -> Result<Http2Sender, Http2PoolError> {
-        let future = self.get_sender_unprofiled(proxy);
+        let future = self.get_sender_unprofiled(proxy, PoolCreateCaller::Request);
         #[cfg(feature = "bench-pool-profile")]
         let future = crate::pool_profile::acquisition(
             crate::pool_profile::Family::H2,
@@ -1026,12 +1026,14 @@ impl Http2ConnectionPool {
         future.await
     }
 
-    /// Same acquisition behavior with a fixed diagnostic purpose for warmup.
+    /// Same acquisition behavior with a fixed diagnostic purpose for the
+    /// capability probe. The probe's create carries its capped connect budget,
+    /// so a request that joins it re-dials on failure (issue #6032).
     pub async fn get_sender_for_capability_probe(
         &self,
         proxy: &Proxy,
     ) -> Result<Http2Sender, Http2PoolError> {
-        let future = self.get_sender_unprofiled(proxy);
+        let future = self.get_sender_unprofiled(proxy, PoolCreateCaller::CapabilityProbe);
         #[cfg(feature = "bench-pool-profile")]
         let future = crate::pool_profile::acquisition(
             crate::pool_profile::Family::H2,
@@ -1041,7 +1043,11 @@ impl Http2ConnectionPool {
         future.await
     }
 
-    async fn get_sender_unprofiled(&self, proxy: &Proxy) -> Result<Http2Sender, Http2PoolError> {
+    async fn get_sender_unprofiled(
+        &self,
+        proxy: &Proxy,
+        caller: PoolCreateCaller,
+    ) -> Result<Http2Sender, Http2PoolError> {
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -1154,7 +1160,7 @@ impl Http2ConnectionPool {
         let manager = Arc::clone(self.pool.manager());
         let acquired = crate::profile_pool_future!(FallbackPoll, {
             self.pool
-                .create_or_get_existing_owned(selected_key, |key| async move {
+                .create_or_get_existing_owned_as(selected_key, caller, |key| async move {
                     let _ = key;
                     // Only the creator runs this closure, so the connection
                     // this attempt waits on is one it set up (issue #5864).

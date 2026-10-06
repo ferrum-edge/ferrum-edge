@@ -47,6 +47,11 @@ expired credential being admitted or an authorization winner being changed
 to a timeout. Both dispatch shapes already use `GrpcDispatchBounds` for
 acquisition and the synchronous handoff gate.
 
+Issue #6032 fixes the production behavior: a failed probe-owned create is no
+longer broadcast to request waiters, which re-dial under their own route
+connect budget. The binary-mode regressions are in
+`functional_capability_registry_test.rs`.
+
 Both acquisition regressions now use the cold in-process harness, whose
 `skip_initial_capability_refresh` removes that unrelated creator. They mint
 the short JWT after frontend H2 readiness. The first backend connection reads

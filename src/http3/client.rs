@@ -29,7 +29,7 @@ use tracing::debug;
 
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
-use crate::pool::{GenericPool, PoolManager};
+use crate::pool::{GenericPool, PoolCreateCaller, PoolManager};
 use crate::proxy::headers::{
     is_backend_request_strip_header, is_backend_response_strip_header,
     parse_connection_listed_headers, sanitize_backend_request_trailers,
@@ -2271,8 +2271,22 @@ impl Http3ConnectionPool {
     where
         F: std::future::Future<Output = Result<H3PooledConnection, anyhow::Error>>,
     {
+        self.create_or_get_sender_as(key, connect_at, PoolCreateCaller::Request, create)
+            .await
+    }
+
+    async fn create_or_get_sender_as<F>(
+        &self,
+        key: String,
+        connect_at: Option<&OnceLock<tokio::time::Instant>>,
+        caller: PoolCreateCaller,
+        create: F,
+    ) -> Result<H3PooledConnection, anyhow::Error>
+    where
+        F: std::future::Future<Output = Result<H3PooledConnection, anyhow::Error>>,
+    {
         self.pool
-            .create_or_get_existing_owned(key, |_| async move {
+            .create_or_get_existing_owned_as(key, caller, |_| async move {
                 create
                     .await
                     .map_err(|error| H3ConnectionCreateError::capture(error, connect_at))
@@ -2351,6 +2365,26 @@ impl Http3ConnectionPool {
             key, proxy, tls_config, h3_config, None,
         )
         .await
+    }
+
+    /// Capability-probe create (`warmup_connection`). The probe's connect
+    /// budget is capped, so a request that joins this create re-dials under
+    /// its own route budget if it fails (issue #6032).
+    async fn create_or_get_probe_sender(
+        &self,
+        key: String,
+        proxy: &Proxy,
+        tls_config: Arc<rustls::ClientConfig>,
+        h3_config: super::config::Http3ServerConfig,
+    ) -> Result<H3PooledConnection, anyhow::Error> {
+        let create = async {
+            boxed_h3_future(|| {
+                self.create_connection(proxy, &tls_config, Some(&h3_config), None)
+            })
+            .await
+        };
+        self.create_or_get_sender_as(key, None, PoolCreateCaller::CapabilityProbe, create)
+            .await
     }
 
     async fn create_or_get_proxy_sender_with_connect_deadline(
@@ -2487,7 +2521,7 @@ impl Http3ConnectionPool {
         let primary_key = self.pool_key_with_current_generation(proxy, 0);
         if self.pool.cached(&primary_key).is_none() {
             let _ = self
-                .create_or_get_proxy_sender(
+                .create_or_get_probe_sender(
                     primary_key,
                     proxy,
                     tls_config.clone(),
@@ -2511,7 +2545,7 @@ impl Http3ConnectionPool {
                     }
 
                     if let Err(err) = self
-                        .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
+                        .create_or_get_probe_sender(key, proxy, tls_config, h3_config)
                         .await
                     {
                         debug!(
