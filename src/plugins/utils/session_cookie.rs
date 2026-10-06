@@ -154,6 +154,17 @@ pub fn reject_published_session_secret(secret: &str, field: &str) -> Result<(), 
             "oidc_relying_party: `{field}` contains an unresolved `${{NAME}}` placeholder"
         ));
     }
+    let denied = || {
+        format!(
+            "oidc_relying_party: `{field}` must not be a published or placeholder secret; \
+             generate a unique random value"
+        )
+    };
+    // Refuse a known value before the length check, so a short placeholder
+    // reports why it is refused rather than only that it is too short.
+    if is_denied_session_secret(secret) {
+        return Err(denied());
+    }
     let normalized = normalize_secret(secret)?;
     let decoded = std::str::from_utf8(&normalized).ok();
     if decoded.is_some_and(contains_unresolved_env_placeholder) {
@@ -161,11 +172,8 @@ pub fn reject_published_session_secret(secret: &str, field: &str) -> Result<(), 
             "oidc_relying_party: `{field}` contains an unresolved `${{NAME}}` placeholder"
         ));
     }
-    if is_denied_session_secret(secret) || decoded.is_some_and(is_denied_session_secret) {
-        return Err(format!(
-            "oidc_relying_party: `{field}` must not be a published or placeholder secret; \
-             generate a unique random value"
-        ));
+    if decoded.is_some_and(is_denied_session_secret) {
+        return Err(denied());
     }
     Ok(())
 }

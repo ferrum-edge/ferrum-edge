@@ -35,6 +35,20 @@ const AUTHORITY_MISMATCH_ERROR: &str =
     r#"{"error":"OIDC callback host does not match request host"}"#;
 const INVALID_AUTHORITY_ERROR: &str = r#"{"error":"OIDC missing or malformed request authority"}"#;
 
+/// A second per-process session secret for rotation and wrong-key tests.
+/// Published literals are refused by configuration validation.
+fn other_session_secret() -> String {
+    static SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            format!("o{nanos:032x}{:08x}", std::process::id())
+        })
+        .clone()
+}
+
 fn base_config() -> serde_json::Value {
     json!({
         "providers": [{
@@ -2598,7 +2612,7 @@ async fn cross_replica_callback_rejects_wrong_encryption_secret() {
     let server = MockServer::start().await;
     let (mut config, starter, _) = plugin_pair_for_server(&server).await;
     let challenge = issue_browser_challenge(&starter).await;
-    config["session"]["encryption_secret"] = json!("2d8b6f0a4c1e9375b8d2f6a0c4e19753");
+    config["session"]["encryption_secret"] = json!(other_session_secret());
     let wrong_secret = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
 
     match complete_callback(&wrong_secret, &challenge, "authorization-code").await {
@@ -2806,7 +2820,8 @@ async fn provider_authorization_code_remains_one_time_across_replicas() {
 async fn previous_encryption_secret_accepts_pending_flow_during_rotation() {
     let server = MockServer::start().await;
     let old_secret = "9f3a7c1e5b2d8406a1c9e7f3b5d20486";
-    let new_secret = "2d8b6f0a4c1e9375b8d2f6a0c4e19753";
+    let new_secret = other_session_secret();
+    let new_secret = new_secret.as_str();
     let (starter_config, starter, _) = plugin_pair_for_server(&server).await;
     assert_eq!(starter_config["session"]["encryption_secret"], old_secret);
     let mut completer_config = starter_config.clone();
