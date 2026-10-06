@@ -23,7 +23,7 @@ One 20-second watchdog includes readiness, send, body, and trailers for every
 RPC. Its frontend driver remains owned through inspection and is joined under
 a five-second cleanup bound, or aborted when an assertion unwinds.
 
-`scripted_backend_h2_tests.rs::h2_direct_pool_reuses_connection_across_requests`
+`scripted_backend_h2_tests.rs::grpc_pool_reuses_backend_connection_across_requests`
 also retains one frontend H2 sender and an owned driver. It requires distinct
 frontend stream IDs, complete exact `"one"` / `"two"` gRPC bodies and success
 trailers, exactly two backend RPC records, and one backend accept/handshake.

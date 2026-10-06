@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **gRPC affinity no longer dials a missing or closed shard on the request
+  path when a ready sibling exists** (#5991 follow-up; regression since
+  0.9.11). A new HTTP/2 frontend connection mapped to a shard that did not
+  exist yet, or a connection whose shard had just closed on a backend GOAWAY,
+  waited for a fresh dial (up to `backend_connect_timeout_ms`, 5 s by default)
+  even while another backend connection was ready, and with the backend at its
+  connection cap every such call paid that wait. The ready sibling now serves
+  the call at once and the shard is created on a detached, single-flight
+  background task that honours the existing create cooldown. Background
+  creates have their own small budget (at most 4 per pool) and never wait for
+  it or for a request-path creation permit, so slow or blackholed fills cannot
+  delay a request-path dial to another backend. Only a pool with no ready
+  shard dials inline.
+- **gRPC affinity respects the backend's `SETTINGS_MAX_CONCURRENT_STREAMS`**.
+  Up to 32 of a frontend connection's streams were pinned to one backend
+  connection whatever the backend allowed, so a backend advertising a small
+  limit queued calls inside h2 while other shards sat idle. The pool's
+  connection driver now samples the backend's current limit (on each of its
+  first 32 polls, then once every 64 polls, since each sample takes h2's
+  per-connection stream lock), and a connection pins at most `min(32, limit)`
+  of its calls; the next one spills. A backend advertising a limit of 0 is
+  skipped while a sibling is ready instead of being pinned.
+- **gRPC affinity slot tables are per gateway**. The table that spreads HTTP/2
+  frontend connections over shards was process-global; it now belongs to the
+  gateway's gRPC pool, so separate in-process gateways and tests no longer
+  share balance state.
 - **Order the buffered gRPC final authorization check before logging**
   (follow-up to #5993 / #5995). A buffered native gRPC or gRPC-Web response
   whose credential expired during the response hooks logged two transaction
@@ -41,6 +67,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   H3-unsupported) when its task wakes after the connect instant; the connect
   bound now applies only to a failed connect, and the per-poll send gate still
   enforces the authorization lifetime.
+
+### Changed
+
+- **Retired the vendored h2 stream-lifetime patch** (`h2-002-stream-lifetime`).
+  It existed only to keep a gRPC call counted for affinity until h2 drained
+  an upload's queued final DATA after an early terminal response. Affinity now
+  counts a stream until its response terminates, gateway-side. An upload h2
+  still holds after an early response no longer counts toward either the
+  per-connection bound or the backend-limit bound, though it still occupies a
+  backend stream: a backend that answers early but neither reads nor resets
+  the upload can collect such streams on one shard, and later pinned calls
+  queue in h2 behind them. Mainstream gRPC servers reset the unread half. The
+  vendored h2 keeps the coalescing and runtime DATA-frame-budget patches, and
+  the duplicate `002` patch number is gone.
+- **Documented the backend connection width of gRPC affinity**. Clients that
+  open many short-lived HTTP/2 connections can see up to
+  `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` backend connections per backend
+  host from each gateway; see `docs/connection_pooling.md`.
 
 ### Security
 
