@@ -1,16 +1,25 @@
 //! gRPC backend-shard affinity for an HTTP/2 frontend connection (issue #5588):
 //! the slot table, the per-connection open-stream bound, the shard start the
-//! gRPC pool reads, and the upload/response terminal join. The pool-level
-//! behaviour is covered against a real pool in
-//! `tests/integration/http2_pool_tests.rs`.
+//! gRPC pool reads, and how long a stream counts. The pool-level behaviour is
+//! covered against a real pool in `tests/integration/http2_pool_tests.rs`.
+
+use std::sync::Arc;
 
 use ferrum_edge::proxy::frontend_affinity::{
     AFFINITY_MAX_OPEN_STREAMS, FrontendConnectionAffinity, LazyConnectionAffinity, SLOTS,
-    ShardStart, SlotTable, shard_start,
+    ShardStart, SlotTable, affinity_stream_limit, shard_start,
 };
 
-fn table() -> &'static SlotTable {
-    Box::leak(Box::new(SlotTable::new()))
+fn table() -> Arc<SlotTable> {
+    Arc::new(SlotTable::new())
+}
+
+/// The affinity shard of a start, ignoring its open-stream count.
+fn affinity_shard(start: ShardStart) -> Option<usize> {
+    match start {
+        ShardStart::Affinity { shard, .. } => Some(shard),
+        ShardStart::Spill | ShardStart::Unscoped => None,
+    }
 }
 
 #[test]
@@ -21,7 +30,7 @@ fn without_a_frontend_stream_the_start_is_unscoped() {
 #[test]
 fn a_connection_takes_its_slot_on_its_first_stream_only() {
     let table = table();
-    let connection = FrontendConnectionAffinity::with_table(table);
+    let connection = FrontendConnectionAffinity::with_table(&table);
     assert_eq!(connection.slot(), None);
     assert_eq!(table.live(0), 0);
     let stream = connection.open_stream();
@@ -37,21 +46,24 @@ fn a_connection_takes_its_slot_on_its_first_stream_only() {
 #[tokio::test]
 async fn a_stream_starts_at_its_connection_shard_until_the_bound() {
     let table = table();
-    let _first = FrontendConnectionAffinity::with_table(table).open_stream();
-    let connection = FrontendConnectionAffinity::with_table(table);
+    let _first = FrontendConnectionAffinity::with_table(&table).open_stream();
+    let connection = FrontendConnectionAffinity::with_table(&table);
     let stream = connection.open_stream();
     assert_eq!(connection.slot(), Some(1));
     assert_eq!(
         stream.run(async { shard_start(4) }).await,
-        ShardStart::Affinity(1)
+        ShardStart::Affinity {
+            shard: 1,
+            open_streams: 1,
+        }
     );
     assert_eq!(
-        stream.run(async { shard_start(1) }).await,
-        ShardStart::Affinity(0)
+        affinity_shard(stream.run(async { shard_start(1) }).await),
+        Some(0)
     );
     assert_eq!(
-        stream.run(async { shard_start(0) }).await,
-        ShardStart::Affinity(0)
+        affinity_shard(stream.run(async { shard_start(0) }).await),
+        Some(0)
     );
 
     // Up to the bound (this stream included) the connection keeps its shard.
@@ -61,7 +73,10 @@ async fn a_stream_starts_at_its_connection_shard_until_the_bound() {
     assert_eq!(connection.open_streams(), AFFINITY_MAX_OPEN_STREAMS);
     assert_eq!(
         stream.run(async { shard_start(4) }).await,
-        ShardStart::Affinity(1)
+        ShardStart::Affinity {
+            shard: 1,
+            open_streams: AFFINITY_MAX_OPEN_STREAMS,
+        }
     );
 
     // One more open stream and its calls spill round-robin.
@@ -75,8 +90,8 @@ async fn a_stream_starts_at_its_connection_shard_until_the_bound() {
     more.pop();
     assert_eq!(connection.open_streams(), AFFINITY_MAX_OPEN_STREAMS);
     assert_eq!(
-        stream.run(async { shard_start(4) }).await,
-        ShardStart::Affinity(1)
+        affinity_shard(stream.run(async { shard_start(4) }).await),
+        Some(1)
     );
     drop(more);
     assert_eq!(connection.open_streams(), 1);
@@ -84,11 +99,11 @@ async fn a_stream_starts_at_its_connection_shard_until_the_bound() {
 
 #[tokio::test]
 async fn a_pool_wider_than_the_slot_table_spills() {
-    let connection = FrontendConnectionAffinity::with_table(table());
+    let connection = FrontendConnectionAffinity::with_table(&table());
     let stream = connection.open_stream();
     assert_eq!(
-        stream.run(async { shard_start(SLOTS) }).await,
-        ShardStart::Affinity(0)
+        affinity_shard(stream.run(async { shard_start(SLOTS) }).await),
+        Some(0)
     );
     assert_eq!(
         stream.run(async { shard_start(SLOTS + 1) }).await,
@@ -98,7 +113,7 @@ async fn a_pool_wider_than_the_slot_table_spills() {
 
 #[tokio::test]
 async fn a_cancelled_request_closes_its_stream() {
-    let connection = FrontendConnectionAffinity::with_table(table());
+    let connection = FrontendConnectionAffinity::with_table(&table());
     let stream = connection.open_stream();
     let request = tokio::spawn(async move {
         stream.run(std::future::pending::<()>()).await;
@@ -148,11 +163,73 @@ fn short_lived_connections_do_not_skew_long_lived_ones() {
 
 #[test]
 fn http1_requests_allocate_no_affinity_state() {
-    let connection = LazyConnectionAffinity::new();
+    let table = table();
+    let connection = LazyConnectionAffinity::new(Arc::clone(&table));
     assert!(connection.open_stream(hyper::Version::HTTP_11).is_none());
     assert!(connection.open_stream(hyper::Version::HTTP_10).is_none());
+    assert_eq!(table.live(0), 0, "HTTP/1.x takes no slot");
     let stream = connection.open_stream(hyper::Version::HTTP_2);
     assert!(stream.is_some());
+    assert_eq!(table.live(0), 1);
+}
+
+#[test]
+fn separate_slot_tables_do_not_share_balance_state() {
+    // Each gateway's gRPC pool owns its table, so in-process gateways (and
+    // tests) never see each other's live connections.
+    let first = table();
+    let second = table();
+    let held = LazyConnectionAffinity::new(Arc::clone(&first));
+    let _held = held.open_stream(hyper::Version::HTTP_2);
+    assert_eq!(first.live(0), 1);
+    let other = LazyConnectionAffinity::new(Arc::clone(&second));
+    let _other = other.open_stream(hyper::Version::HTTP_2);
+    assert_eq!(second.live(0), 1, "the second table starts at slot 0");
+    assert_eq!(first.live(1), 0);
+}
+
+#[test]
+fn the_affinity_bound_follows_the_backend_stream_limit() {
+    let max = AFFINITY_MAX_OPEN_STREAMS;
+    assert_eq!(affinity_stream_limit(usize::MAX), max);
+    assert_eq!(affinity_stream_limit(100), max);
+    assert_eq!(affinity_stream_limit(max), max);
+    assert_eq!(affinity_stream_limit(4), 4);
+    assert_eq!(affinity_stream_limit(1), 1);
+    assert_eq!(
+        affinity_stream_limit(0),
+        0,
+        "a backend allowing none pins none"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_counts_until_its_response_side_guard_drops() {
+    // The frontend hands the guard to the response body, so the stream counts
+    // until the response terminates, and not past it.
+    let connection = FrontendConnectionAffinity::with_table(&table());
+    let (start, response) = connection
+        .open_stream()
+        .run_request(async { shard_start(4) })
+        .await;
+    assert_eq!(affinity_shard(start), Some(0));
+    assert_eq!(connection.open_streams(), 1, "the response still owns it");
+    drop(response);
+    assert_eq!(connection.open_streams(), 0);
+}
+
+#[tokio::test]
+async fn a_cancelled_handler_closes_its_stream() {
+    let connection = FrontendConnectionAffinity::with_table(&table());
+    let stream = connection.open_stream();
+    let handler = tokio::spawn(async move {
+        stream.run_request(std::future::pending::<()>()).await;
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(connection.open_streams(), 1);
+    handler.abort();
+    let _ = handler.await;
+    assert_eq!(connection.open_streams(), 0);
 }
 
 /// Measure the concrete state machines, not just the pointer the service
@@ -177,121 +254,4 @@ fn frontend_and_backend_future_state_stays_within_the_stack_budget() {
             "{name} future is {actual} bytes, exceeding its {ceiling}-byte state budget"
         );
     }
-}
-
-#[tokio::test]
-async fn early_responses_keep_uploads_counted_until_both_halves_terminate() {
-    use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;
-
-    let connection = FrontendConnectionAffinity::with_table(table());
-    let mut uploads = Vec::new();
-    for _ in 0..AFFINITY_MAX_OPEN_STREAMS {
-        let (upload, response) = connection
-            .open_stream()
-            .run_request(async { retain_backend_stream().expect("backend owner") })
-            .await;
-        drop(response);
-        uploads.push(upload);
-    }
-    assert_eq!(connection.open_streams(), AFFINITY_MAX_OPEN_STREAMS);
-    let next = connection.open_stream();
-    assert_eq!(next.run(async { shard_start(4) }).await, ShardStart::Spill);
-    drop(next);
-
-    for upload in uploads {
-        let clone = upload.clone();
-        drop(upload);
-        drop(clone);
-    }
-    assert_eq!(connection.open_streams(), 0, "each join releases once");
-}
-
-#[tokio::test]
-async fn every_retry_attempt_and_the_response_retain_one_count() {
-    use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;
-
-    let connection = FrontendConnectionAffinity::with_table(table());
-    let ((first, retry), response) = connection
-        .open_stream()
-        .run_request(async {
-            (
-                retain_backend_stream().expect("first backend owner"),
-                retain_backend_stream().expect("retry backend owner"),
-            )
-        })
-        .await;
-    assert_eq!(connection.open_streams(), 1);
-    drop(first);
-    assert_eq!(connection.open_streams(), 1);
-    drop(response);
-    assert_eq!(connection.open_streams(), 1, "retry still owns queued DATA");
-    drop(retry);
-    assert_eq!(connection.open_streams(), 0, "all owners release once");
-
-    let (upload, response) = connection
-        .open_stream()
-        .run_request(async { retain_backend_stream().expect("backend owner") })
-        .await;
-    drop(upload);
-    assert_eq!(connection.open_streams(), 1, "response still owns the call");
-    drop(response);
-    assert_eq!(connection.open_streams(), 0);
-}
-
-#[tokio::test]
-async fn handler_cancellation_joins_the_still_owned_upload() {
-    use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;
-
-    let connection = FrontendConnectionAffinity::with_table(table());
-    let stream = connection.open_stream();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let handler = tokio::spawn(async move {
-        stream
-            .run_request(async move {
-                let upload = retain_backend_stream().expect("backend owner");
-                assert!(tx.send(upload).is_ok());
-                std::future::pending::<()>().await;
-            })
-            .await
-    });
-    let upload = rx.await.expect("registered upload");
-    handler.abort();
-    let _ = handler.await;
-    assert_eq!(connection.open_streams(), 1);
-    drop(upload);
-    assert_eq!(connection.open_streams(), 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_upload_and_response_termination_releases_each_stream_once() {
-    use ferrum_edge::proxy::frontend_affinity::retain_backend_stream;
-    use std::sync::Arc;
-
-    let connection = FrontendConnectionAffinity::with_table(table());
-    let barrier = Arc::new(tokio::sync::Barrier::new(2 * AFFINITY_MAX_OPEN_STREAMS + 1));
-    let mut tasks = tokio::task::JoinSet::new();
-    for _ in 0..AFFINITY_MAX_OPEN_STREAMS {
-        let (upload, response) = connection
-            .open_stream()
-            .run_request(async { retain_backend_stream().expect("backend owner") })
-            .await;
-        let upload_barrier = Arc::clone(&barrier);
-        tasks.spawn(async move {
-            upload_barrier.wait().await;
-            let clone = upload.clone();
-            drop(upload);
-            drop(clone);
-        });
-        let response_barrier = Arc::clone(&barrier);
-        tasks.spawn(async move {
-            response_barrier.wait().await;
-            drop(response);
-        });
-    }
-    assert_eq!(connection.open_streams(), AFFINITY_MAX_OPEN_STREAMS);
-    barrier.wait().await;
-    while let Some(result) = tasks.join_next().await {
-        result.expect("terminal task");
-    }
-    assert_eq!(connection.open_streams(), 0);
 }

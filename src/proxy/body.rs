@@ -68,9 +68,8 @@ pub struct ProxyBody {
     /// Dropped when the client-visible response body finishes, decrementing
     /// per-IP in-flight request accounting.
     _per_ip_request_guard: Option<super::PerIpRequestGuard>,
-    /// Marks response termination when dropped. A streamed gRPC upload shares
-    /// its affinity count with the backend H2 transport until queued DATA drains
-    /// or the stream resets.
+    /// Closes this response's HTTP/2 frontend stream for gRPC backend-shard
+    /// affinity when dropped, i.e. when the response terminates.
     _frontend_stream: Option<super::frontend_affinity::FrontendStream>,
     /// Dropped when a streaming backend response body reaches terminal state
     /// (EOF, error, or client disconnect), ensuring least-connections
