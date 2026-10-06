@@ -42,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2 MiB upload, alongside the existing variant that reads one DATA frame first.
 ### Fixed
 
+- **A request that joins the capability probe's backend setup keeps its own
+  connect timeout** (#6032). Connect timeout is not part of a pool key, so a
+  gRPC, direct HTTP/2, HTTP/3 or gateway-to-mesh HBONE request arriving while
+  the startup, reload or periodic capability probe was dialling the same
+  backend joined the probe's setup. The probe caps its connect budget at 5 s,
+  so the request failed when the probe did, even with a much longer
+  `backend_connect_timeout_ms` (for example `UNAVAILABLE` during startup). A
+  failed probe-owned setup is no longer shared with a joined request, including
+  when the probe's own capped budget expires inside the HBONE dial: the request
+  dials again under its own route connect timeout. The request can then wait
+  for the rest of the probe's budget plus its own full connect timeout. A gRPC
+  probe's failure keeps the probe's log level, so an expected h2c miss stays
+  DEBUG and the joined request logs only its own outcome.
 - **Direct-H2 uploads no longer relay a client reset as a complete body**
   (#6022). hyper reports an HTTP/2 client's `RST_STREAM(NO_ERROR)` as a clean
   end of the request body. A non-gRPC upload relayed through the direct HTTP/2

@@ -32,7 +32,7 @@ use crate::modes::mesh::hbone::{
     BAGGAGE_HEADER, ISTIO_HBONE_PORT, UdpSourceIdentity, baggage_header_for_source,
     baggage_header_for_udp_source,
 };
-use crate::pool::{SharedCreationRole, SharedCreationSlot};
+use crate::pool::{PoolCreateCaller, SharedCreationRole, SharedCreationSlot};
 use crate::proxy::mesh_trust_registry::{
     MESH_KEEPALIVE_FAILED_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
     MeshTrustRegistry,
@@ -1244,6 +1244,9 @@ impl HboneConnectionPool {
                 &key,
                 &pool_config,
                 Some(connect_timeout),
+                // The probe's connect budget is capped, so its setup failure
+                // is not a joined request's outcome (issue #6032).
+                PoolCreateCaller::CapabilityProbe,
             )
             .await?
         };
@@ -1580,6 +1583,7 @@ impl HboneConnectionPool {
                     &key,
                     &pool_config,
                     Some(connect_timeout),
+                    PoolCreateCaller::Request,
                 )
                 .await?
             };
@@ -1875,7 +1879,9 @@ impl HboneConnectionPool {
     /// dispatch datapath uses, or it would prove the wrong capability (codex r1
     /// P1). Like the dispatch path this dials its OWN H2 connection (no pooled
     /// `hbone`-vs-`udp` marker ambiguity); the connection is dropped with the
-    /// tunnel when the probe returns.
+    /// tunnel when the probe returns. Because it joins no creation slot, no
+    /// live request can wait on this probe's dial or inherit its failure
+    /// (issue #6032).
     #[allow(clippy::too_many_arguments)]
     pub async fn warmup_datagram_connection_via(
         &self,
@@ -1920,6 +1926,7 @@ impl HboneConnectionPool {
         key: &str,
         pool_config: &PoolConfig,
         connect_timeout_override: Option<Duration>,
+        caller: PoolCreateCaller,
     ) -> Result<MeshH2Transport, HbonePoolError> {
         self.maybe_prune_idle_entries();
         let max_entries = pool_config.http2_connections_per_host.max(1);
@@ -2028,6 +2035,7 @@ impl HboneConnectionPool {
 
         self.dial_and_publish(
             Some(&creation_lease),
+            caller,
             proxy,
             dial_host,
             app_host,
@@ -2099,6 +2107,7 @@ impl HboneConnectionPool {
         let dialed = self
             .dial_and_publish(
                 None,
+                PoolCreateCaller::Request,
                 proxy,
                 dial_host,
                 app_host,
@@ -2149,10 +2158,14 @@ impl HboneConnectionPool {
     /// then pool it if the TLS material it was built from is still current.
     /// `cohort` is the cold path's lease, whose waiters receive a dial failure
     /// (issue #5046); growth passes `None` because nobody is queued behind it.
+    /// A [`PoolCreateCaller::CapabilityProbe`] dial never publishes its
+    /// failure: the probe's connect budget is capped, so the cohort re-elects
+    /// and each waiter dials under its own budget (issue #6032).
     #[allow(clippy::too_many_arguments)]
     async fn dial_and_publish(
         &self,
         cohort: Option<&crate::pool::SharedCreationLease<'_, Arc<HbonePoolError>>>,
+        caller: PoolCreateCaller,
         proxy: &Proxy,
         dial_host: &str,
         app_host: &str,
@@ -2234,7 +2247,16 @@ impl HboneConnectionPool {
                 // can slip past the broadcast. `record_pool_failure` stays on
                 // the creator alone — one physical dial, one pool failure —
                 // while each waiter still reports its own logical outcome.
-                if let Some(cohort) = cohort {
+                //
+                // A capability probe's failure is NOT published, whether the
+                // peer failed or the probe's capped budget expired inside the
+                // dial (`ConnectTimeout`): connect timeout is not part of the
+                // pool key, so a live request may have joined this dial with a
+                // longer budget. Dropping the lease re-elects the next waiter
+                // as a fresh creator under its own deadline (issue #6032).
+                if let Some(cohort) = cohort
+                    && caller == PoolCreateCaller::Request
+                {
                     cohort.publish_failure(Arc::new(err.clone_for_broadcast()));
                 }
                 return Err(err);
@@ -4793,6 +4815,7 @@ mod tests {
                 &key,
                 &pool_config,
                 None,
+                PoolCreateCaller::Request,
             )
             .await
             .expect_err("coalesced lock wait should time out");
@@ -4857,6 +4880,7 @@ mod tests {
                 &key,
                 &pool_config,
                 Some(Duration::from_millis(25)),
+                PoolCreateCaller::Request,
             )
             .await
             .expect_err("coalesced lock wait should time out");
@@ -4872,6 +4896,124 @@ mod tests {
             }
             other => panic!("expected ConnectStream timeout, got {other:?}"),
         }
+    }
+
+    /// Issue #6032: a capability probe dials under a capped connect budget, so
+    /// its failure is never delivered to the request waiters that joined it.
+    /// They re-elect and dial under their own budget, and still coalesce among
+    /// themselves: one probe dial plus exactly one request dial.
+    #[tokio::test]
+    async fn probe_owned_dial_failure_is_not_broadcast_to_request_waiters() {
+        // Accept-and-close peer: every dial fails its TLS handshake, and the
+        // accept count is the number of physical dials.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HBONE peer");
+        let hbone_port = listener.local_addr().expect("peer addr").port();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let peer = tokio::spawn({
+            let dials = Arc::clone(&dials);
+            async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    dials.fetch_add(1, Ordering::SeqCst);
+                    drop(tcp);
+                }
+            }
+        });
+
+        let pool_config = PoolConfig {
+            idle_timeout_seconds: 60,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(HboneConnectionPool::new(
+            pool_config.clone(),
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle(b"probe-leaf"))))),
+            4,
+        ));
+        let proxy = test_proxy(5_000);
+        let key = pool_key_owned(
+            "127.0.0.1",
+            8080,
+            hbone_port,
+            None,
+            "fingerprint",
+            None,
+            None,
+            None,
+            &pool_config,
+        );
+        // Hold the key's creation lock so the probe, then both requests, queue
+        // on it before anyone dials. The lock is FIFO, so the probe creates.
+        let creation_lock = Arc::new(HboneCreationSlot::new());
+        let held = match creation_lock.join().wait().await {
+            SharedCreationRole::Creator(lease) => lease,
+            SharedCreationRole::Failed(_) => panic!("a fresh slot must elect a creator"),
+        };
+        pool.creation_locks
+            .insert(key.clone(), creation_lock.clone());
+
+        let spawn_dial = |budget: Option<Duration>, caller: PoolCreateCaller| {
+            let pool = Arc::clone(&pool);
+            let proxy = proxy.clone();
+            let key = key.clone();
+            let pool_config = pool_config.clone();
+            tokio::spawn(async move {
+                pool.get_or_create_sender(
+                    &proxy,
+                    "127.0.0.1",
+                    "127.0.0.1",
+                    8080,
+                    8080,
+                    hbone_port,
+                    None,
+                    None,
+                    None,
+                    &key,
+                    &pool_config,
+                    budget,
+                    caller,
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+        let settle = || async {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let probe = spawn_dial(
+            Some(Duration::from_secs(5)),
+            PoolCreateCaller::CapabilityProbe,
+        );
+        settle().await;
+        let first_request = spawn_dial(None, PoolCreateCaller::Request);
+        settle().await;
+        let second_request = spawn_dial(None, PoolCreateCaller::Request);
+        settle().await;
+        assert_eq!(dials.load(Ordering::SeqCst), 0, "nobody dials while queued");
+        drop(held);
+
+        let probe = probe.await.expect("probe task");
+        assert!(
+            matches!(probe, Err(HbonePoolError::TlsHandshake { .. })),
+            "the probe fails its own dial: {probe:?}"
+        );
+        for request in [first_request, second_request] {
+            let outcome = request.await.expect("request task");
+            assert!(
+                matches!(outcome, Err(HbonePoolError::TlsHandshake { .. })),
+                "each request sees a failure of a dial made under its own budget: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            2,
+            "the probe's failure must not reach the request waiters, which re-elect onto one \
+             dial of their own"
+        );
+        peer.abort();
     }
 
     #[test]
