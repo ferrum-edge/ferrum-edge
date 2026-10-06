@@ -2257,9 +2257,45 @@ DP token minting uses the node ID as `sub`; external issuers must do the same.
       "namespace": "ferrum",
       "status": "online",
       "connected_at": "2025-01-15T10:30:00Z",
-      "last_sync_at": "2025-01-15T10:35:00Z"
+      "last_sync_at": "2025-01-15T10:35:00Z",
+      "backend_egress_policy_attestation": "reported",
+      "backend_egress_policy": {
+        "mode": "public",
+        "mode_allowed_ip_classes": ["public"],
+        "mode_blocked_ip_classes": ["private-reserved"],
+        "dangerous_ranges_blocked": true,
+        "allow_cidr_overrides_present": false,
+        "deny_cidr_overrides_present": false,
+        "public_only_guaranteed": true
+      }
+    },
+    {
+      "node_id": "def-456",
+      "version": "0.9.0",
+      "namespace": "staging",
+      "status": "online",
+      "connected_at": "2025-01-15T10:31:00Z",
+      "last_sync_at": "2025-01-15T10:35:00Z",
+      "backend_egress_policy_attestation": "unknown",
+      "backend_egress_policy": null
     }
   ],
+  "data_plane_backend_egress_policy": {
+    "connected_data_planes": 2,
+    "reporting_data_planes": 1,
+    "unknown_data_planes": 1,
+    "weakest_policy": {
+      "mode": "public",
+      "mode_allowed_ip_classes": ["public"],
+      "mode_blocked_ip_classes": ["private-reserved"],
+      "dangerous_ranges_blocked": true,
+      "allow_cidr_overrides_present": false,
+      "deny_cidr_overrides_present": false,
+      "public_only_guaranteed": true
+    },
+    "weakest_policy_complete": false,
+    "all_connected_public_only_guaranteed": false
+  },
   "connected_mesh_nodes": 1,
   "mesh_nodes": [
     {
@@ -2278,6 +2314,7 @@ DP token minting uses the node ID as `sub`; external issuers must do the same.
 - **`status`** is always `online` — disconnected DPs and mesh nodes are automatically removed from their registries when their gRPC stream drops. Mesh nodes also send lightweight `MeshSubscribe` heartbeats; the CP reaps entries that stop producing stream activity for 5 minutes.
 - **`last_sync_at`** updates whenever the CP broadcasts a config update (full snapshot or delta) to that registry. DP and mesh broadcasts share the same database polling cycle, so the timestamps converge on every successful poll.
 - **`last_heartbeat_at`** is mesh-only and updates whenever the CP produces a mesh stream item for that node: the initial snapshot, a config delta/full snapshot, or a heartbeat.
+- **`backend_egress_policy_attestation`** / **`backend_egress_policy`** are DP-only: the backend egress policy metadata the DP reported on `ConfigSync.Subscribe` (`reported`), or `unknown` with a `null` policy when it sent no recognised report. **`data_plane_backend_egress_policy`** aggregates every connected DP across namespaces with the same fields and rules as `data_plane_attestation` on [`GET /backend-egress-policy`](#backend-egress-policy), which is the namespace-scoped form.
 
 ### DP Mode Response
 
@@ -2671,7 +2708,7 @@ do not change this process policy; changing it requires a process restart.
 | --- | --- |
 | `local-data-plane` | A local `ProxyState` serves the requested namespace; metadata describes its backend address policy. |
 | `unserved-namespace` | A local data plane exists but serves another namespace. |
-| `admission-only` | CP with no local proxy; the response describes its configuration admission policy, without attesting any DP. |
+| `admission-only` | CP with no local proxy; the top-level fields describe its configuration admission policy, without attesting any DP. `data_plane_attestation` separately reports its connected DPs (below). |
 | `no-data-plane` | No local proxy or CP admission scope (for example `node_agent`). |
 
 Mode class lists describe the **mode stage**, after overlays and the baseline:
@@ -2728,6 +2765,78 @@ Even a wholly public allow list yields false: the endpoint conservatively
 refuses to certify undisclosed overrides. False does not prove that a private
 address is reachable (for example, a deny list might block everything).
 
+### Data-plane attestation on a control plane
+
+On a CP (`enforcement_scope=admission-only`) the response also carries
+`data_plane_attestation`. Each data plane reports bounded metadata about its own
+loaded policy on `ConfigSync.Subscribe` (mode and the three presence flags, never
+CIDRs, addresses or counts), and the CP keeps it for as long as that Subscribe
+stream is connected. The object lists only the DPs connected for the selected
+namespace, so a namespace-scoped reader never sees another namespace's nodes:
+
+```json
+"data_plane_attestation": {
+  "source": "configsync-subscribe",
+  "connected_data_planes": 2,
+  "reporting_data_planes": 2,
+  "unknown_data_planes": 0,
+  "weakest_policy": {
+    "mode": "public",
+    "mode_allowed_ip_classes": ["public"],
+    "mode_blocked_ip_classes": ["private-reserved"],
+    "dangerous_ranges_blocked": true,
+    "allow_cidr_overrides_present": false,
+    "deny_cidr_overrides_present": false,
+    "public_only_guaranteed": true
+  },
+  "weakest_policy_complete": true,
+  "all_connected_public_only_guaranteed": true,
+  "data_planes": [
+    {
+      "node_id": "dp-a",
+      "ferrum_version": "0.9.13",
+      "connected_at": "2026-10-06T12:00:00+00:00",
+      "attestation": "reported",
+      "policy": { "mode": "public", "...": "same fields as weakest_policy" }
+    }
+  ]
+}
+```
+
+- `data_planes` is sorted by `node_id`. Each `policy` uses the top-level field
+  meanings for a local data plane: `public_only_guaranteed` is true exactly for
+  `mode=public` with no allow CIDR overrides.
+- `attestation` is `reported` for a recognised report, or `unknown` (with
+  `policy: null`) when the DP sent none or an unrecognised mode.
+- `weakest_policy` combines the reporting DPs field by field, keeping the least
+  restrictive value: the mode admitting the union of their mode-stage classes
+  (`public` + `private` is `both`), `dangerous_ranges_blocked` only if every DP
+  blocks, allow overrides if any DP has them, deny overrides only if every DP
+  has them. It is `null` when no DP reported and omits unknown DPs.
+- `weakest_policy_complete` is true only when at least one DP is connected and
+  every connected DP reported.
+- `all_connected_public_only_guaranteed` is true only when
+  `weakest_policy_complete` is true and every connected DP reports
+  `public_only_guaranteed`. An unknown DP or an empty set makes it false.
+
+The CP's own top-level fields keep their `admission-only` meaning;
+`public_only_guaranteed` there stays false. The object is optional and absent on
+every non-CP response, so `schema_version` remains `2` (a new optional property
+within a major version, per the ferrum-contracts versioning rules).
+
+The attestation has limits. Reports come from JWT-authenticated DPs that run the
+CP's exact build (the ConfigSync build identity gate), but each is the DP's
+self-description, not a cryptographic attestation of its host. The set is a
+point-in-time view of connected Subscribe streams: a DP that is partitioned
+from the CP keeps serving its cached config but is not listed, and a DP using
+another control plane is never seen. Consumers should require
+`all_connected_public_only_guaranteed=true` **and** compare
+`connected_data_planes` (or the listed `node_id`s) against their expected
+data-plane inventory. `GET /cluster` shows the same per-DP reports for every
+namespace.
+
+### Consumer guidance
+
 A control plane requiring public-only upstreams must check the serving gateway
 for its namespace, recognize schema version 2 and its complete vocabulary,
 require `enforcement_scope=local-data-plane`, and require
@@ -2735,9 +2844,12 @@ require `enforcement_scope=local-data-plane`, and require
 labels, authorization failures, unserved namespaces, CP-only metadata, and
 weaker policies must block publication. Recheck every serving DP and after
 gateway replacement/restart; a CP's policy is not distributed as proof of a
-DP's environment. Consumers allowing private upstreams must explicitly define
-which known modes/overrides they accept rather than treating an unknown value
-as permissive.
+DP's environment. In CP/DP deployments, a consumer that cannot reach every DP's
+admin API may instead read the CP's `data_plane_attestation` for the namespace
+and require `all_connected_public_only_guaranteed=true` together with the
+expected connected inventory, within the limits described above. Consumers
+allowing private upstreams must explicitly define which known modes/overrides
+they accept rather than treating an unknown value as permissive.
 
 This is a policy snapshot, not DNS validation or a socket-connect test. It
 does not attest external firewall rules or add enforcement to outbound paths.

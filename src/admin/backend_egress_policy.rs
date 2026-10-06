@@ -2,6 +2,8 @@
 //!
 //! This is metadata about the loaded enforcement policy, never a DNS probe or
 //! an assertion that a control plane's policy is installed on its data planes.
+//! On a control plane, `data_plane_attestation` additionally reports the
+//! policies its connected data planes self-reported over ConfigSync (#6020).
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -14,6 +16,13 @@ use super::{
     namespace_serving_scope,
 };
 use crate::config::BackendAllowIps;
+use crate::grpc::backend_egress_attestation::{
+    DataPlaneEgressSummary, EgressMode, ReportedEgressPolicy, attestation_label,
+};
+use crate::grpc::cp_server::DpNodeInfo;
+
+/// `data_plane_attestation.source`: reports arrive on ConfigSync Subscribe.
+const ATTESTATION_SOURCE: &str = "configsync-subscribe";
 
 #[derive(Serialize)]
 struct BackendEgressPolicyResponse<'a> {
@@ -30,6 +39,26 @@ struct BackendEgressPolicyResponse<'a> {
     deny_cidr_overrides_present: bool,
     evaluation_order: [&'static str; 4],
     public_only_guaranteed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_plane_attestation: Option<DataPlaneAttestation>,
+}
+
+/// Connected data planes of one namespace and their reported policies.
+#[derive(Serialize)]
+struct DataPlaneAttestation {
+    source: &'static str,
+    #[serde(flatten)]
+    summary: DataPlaneEgressSummary,
+    data_planes: Vec<DataPlaneEgressEntry>,
+}
+
+#[derive(Serialize)]
+struct DataPlaneEgressEntry {
+    node_id: String,
+    ferrum_version: String,
+    connected_at: String,
+    attestation: &'static str,
+    policy: Option<ReportedEgressPolicy>,
 }
 
 pub(super) fn handle_get(state: &AdminState, namespace: &str) -> Response<Full<Bytes>> {
@@ -42,12 +71,9 @@ pub(super) fn handle_get(state: &AdminState, namespace: &str) -> Response<Full<B
             &proxy.env_config.backend_allow_ips
         })
         .metadata();
-    let (mode, allowed, blocked): (&str, &[&str], &[&str]) = match policy.allow_ips {
-        BackendAllowIps::Both => ("both", &["public", "private-reserved"], &[]),
-        BackendAllowIps::Public => ("public", &["public"], &["private-reserved"]),
-        BackendAllowIps::Private => ("private", &["private-reserved"], &["public"]),
-    };
-    let enforcement_scope = match namespace_serving_scope(state) {
+    let mode = EgressMode::from_allow_ips(&policy.allow_ips);
+    let scope = namespace_serving_scope(state);
+    let enforcement_scope = match scope {
         NamespaceServingScope::SingleNamespaceDataPlane
             if active_data_plane_namespace(state) != Some(namespace) =>
         {
@@ -65,21 +91,58 @@ pub(super) fn handle_get(state: &AdminState, namespace: &str) -> Response<Full<B
     let public_only_guaranteed = enforcement_scope == "local-data-plane"
         && matches!(policy.allow_ips, BackendAllowIps::Public)
         && !policy.allow_cidr_overrides_present;
+    // The CP's own fields keep their admission-only meaning; what its data
+    // planes report is a separate, additive object.
+    let data_plane_attestation = match scope {
+        NamespaceServingScope::ControlPlane => Some(connected_data_planes(state, namespace)),
+        _ => None,
+    };
     let response = BackendEgressPolicyResponse {
-        // v2: `public_only_guaranteed` also requires local enforcement.
+        // v2: `public_only_guaranteed` also requires local enforcement. The
+        // optional CP `data_plane_attestation` object is additive within v2.
         schema_version: 2,
         ip_classification: "ferrum-private-reserved-v1",
         namespace,
         policy_scope: "process",
         enforcement_scope,
-        mode,
-        mode_allowed_ip_classes: allowed,
-        mode_blocked_ip_classes: blocked,
+        mode: mode.as_str(),
+        mode_allowed_ip_classes: mode.allowed_ip_classes(),
+        mode_blocked_ip_classes: mode.blocked_ip_classes(),
         dangerous_ranges_blocked: policy.dangerous_ranges_blocked,
         allow_cidr_overrides_present: policy.allow_cidr_overrides_present,
         deny_cidr_overrides_present: policy.deny_cidr_overrides_present,
         evaluation_order: ["allow-cidrs", "deny-cidrs", "dangerous-ranges", "ip-mode"],
         public_only_guaranteed,
+        data_plane_attestation,
     };
     json_response(StatusCode::OK, &json!(response))
+}
+
+/// Only data planes subscribed to the requested namespace serve it, and the
+/// caller is authorized for that namespace alone.
+fn connected_data_planes(state: &AdminState, namespace: &str) -> DataPlaneAttestation {
+    let mut nodes: Vec<DpNodeInfo> = state
+        .dp_registry
+        .as_ref()
+        .map(|registry| registry.snapshot())
+        .unwrap_or_default();
+    nodes.retain(|node| node.namespace == namespace);
+    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    let reports = nodes.iter().map(|node| node.backend_egress_policy);
+    let summary = DataPlaneEgressSummary::from_reports(reports);
+    let data_planes = nodes
+        .into_iter()
+        .map(|node| DataPlaneEgressEntry {
+            attestation: attestation_label(node.backend_egress_policy.as_ref()),
+            policy: node.backend_egress_policy,
+            node_id: node.node_id,
+            ferrum_version: node.version,
+            connected_at: node.connected_at.to_rfc3339(),
+        })
+        .collect();
+    DataPlaneAttestation {
+        source: ATTESTATION_SOURCE,
+        summary,
+        data_planes,
+    }
 }

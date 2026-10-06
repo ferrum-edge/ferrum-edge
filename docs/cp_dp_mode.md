@@ -290,7 +290,7 @@ The gate mirrors `plugin_cache::try_create_plugin` exactly:
 - `OptionalFailOpen` plugins are **skipped** — a serving mode omits them from the published cache with a warning rather than rejecting the generation.
 - `FailClosed`, `KeepLastKnownGood`, and unknown or retired plugin names **reject** the snapshot/delta, which the CP surfaces as `CP full config rejected: Plugin '<name>' (id=<id>): <error>` and refuses to broadcast. Admin writes stay enabled so the row can be repaired in-band.
 
-Constructors that need node-local resources (the `geo_restriction` MaxMind database, `body_validator` / `ai_response_guard` / `ai_transcript_audit` descriptor sets, `udp_logging` DTLS material, `oidc_relying_party` discovery, the `transaction_log_schema` registry) are validated shape-only, so CP admission never requires a data-plane file to exist on the CP node. Backend egress policy is deliberately **not** applied here: it is node-local environment configuration the admitting CP does not own, and the serving mode still screens it when it builds the cache.
+Constructors that need node-local resources (the `geo_restriction` MaxMind database, `body_validator` / `ai_response_guard` / `ai_transcript_audit` descriptor sets, `udp_logging` DTLS material, `oidc_relying_party` discovery, the `transaction_log_schema` registry) are validated shape-only, so CP admission never requires a data-plane file to exist on the CP node. Backend egress policy is deliberately **not** applied here: it is node-local environment configuration the admitting CP does not own, and the serving mode still screens it when it builds the cache. Each DP instead reports its own policy to the CP (see [Backend egress policy attestation](#backend-egress-policy-attestation)).
 
 `database` mode takes the opposite branch for the same defect when the plugin is `OptionalFailOpen` instrumentation: rather than refusing to start, it **quarantines** the offending row so its admin API binds and the row stays repairable. A refused `FailClosed` / `KeepLastKnownGood` plugin or an unknown plugin name still stops startup in every mode — a security control is never silently omitted. See [admin_api.md](admin_api.md).
 
@@ -1212,7 +1212,7 @@ The `GET /cluster` admin endpoint (JWT-authenticated) provides live CP/DP connec
 curl -H "Authorization: Bearer $TOKEN" http://cp-host:9000/cluster
 ```
 
-Returns all connected DP nodes and Mesh nodes (each in its own array — `data_planes` and `mesh_nodes`) with metadata: `node_id`, `version`, `namespace`, `status`, `connected_at`, and `last_sync_at`. Mesh node entries also include `last_heartbeat_at`. Disconnected nodes are automatically removed from their respective registries — only currently connected nodes appear. The `last_sync_at` timestamp updates on every config broadcast (delta or full snapshot) to that registry. MeshSubscribe streams also emit lightweight heartbeat frames; the CP reaps mesh registry entries that stop producing stream activity for 5 minutes.
+Returns all connected DP nodes and Mesh nodes (each in its own array — `data_planes` and `mesh_nodes`) with metadata: `node_id`, `version`, `namespace`, `status`, `connected_at`, and `last_sync_at`. Mesh node entries also include `last_heartbeat_at`. DP entries also include the backend egress policy each DP reported (`backend_egress_policy_attestation`, `backend_egress_policy`), and `data_plane_backend_egress_policy` aggregates them across namespaces (see [Backend egress policy attestation](#backend-egress-policy-attestation)). Disconnected nodes are automatically removed from their respective registries — only currently connected nodes appear. The `last_sync_at` timestamp updates on every config broadcast (delta or full snapshot) to that registry. MeshSubscribe streams also emit lightweight heartbeat frames; the CP reaps mesh registry entries that stop producing stream activity for 5 minutes.
 
 ### From a DP
 
@@ -1223,6 +1223,41 @@ curl -H "Authorization: Bearer $TOKEN" http://dp-host:9000/cluster
 Returns the DP's connection state to its CP: `url` (which CP it is connected to), `status` (`online`/`offline`), `is_primary` (whether this is the primary or a fallback CP), `connected_since`, `last_config_received_at`, and sticky ConfigSync divergence fields (`config_diverged`, `config_diverged_since`, `config_divergence_recoveries_total`). When the DP is disconnected and retrying, `status` is `offline` and `connected_since` is `null`.
 
 See [admin_api.md](admin_api.md#cluster-status) for full response schemas.
+
+### Backend egress policy attestation
+
+Backend egress (SSRF) policy (`FERRUM_BACKEND_ALLOW_IPS`, the allow/deny CIDR
+overlays and the dangerous-range baseline) is environment configuration of each
+DP process; the CP neither distributes nor enforces it. So that a CP can still
+attest what its DPs enforce, every DP reports bounded metadata about its loaded
+policy in `SubscribeRequest.backend_egress_policy`: the mode and the
+dangerous-range, allow-override and deny-override presence flags. CIDRs,
+addresses, list sizes and raw settings never leave the DP.
+
+The CP records the report against the connected node for the lifetime of its
+Subscribe stream and exposes it on:
+
+- `GET /backend-egress-policy` on the CP: the optional `data_plane_attestation`
+  object lists the DPs connected for the selected namespace, a field-wise
+  `weakest_policy`, `weakest_policy_complete`, and
+  `all_connected_public_only_guaranteed`.
+- `GET /cluster` on the CP: each DP's report plus a cluster-wide aggregate.
+
+A report that is absent or carries an unspecified or unrecognised mode is
+recorded as `unknown`. Because CP and DP must run the same build (the
+ConfigSync build identity gate refuses a DP from another ConfigSync protocol
+revision, and this change bumped it to `3`), a supported DP always sends a
+report; `unknown` covers non-standard clients and is never treated as
+public-only. An unknown DP, or no connected DP at all, makes the weakest
+policy incomplete and the public-only guarantee false.
+
+The report is the DP's self-description over its JWT-authenticated stream, not
+a cryptographic attestation of the host, and it covers only DPs connected to
+this CP right now. A DP that is partitioned from the CP and keeps serving its
+cached config is not listed, so consumers should compare
+`connected_data_planes` with the data-plane inventory they expect. See
+[admin_api.md](admin_api.md#data-plane-attestation-on-a-control-plane) for the
+field rules.
 
 ## DP Admin API
 

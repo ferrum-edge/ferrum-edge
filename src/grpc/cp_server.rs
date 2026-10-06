@@ -60,6 +60,7 @@ use super::auth::{
     AllowedNamespaces, AuthorizedResponseStream, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
     StreamAuthSurface, VerifiedGrpcIdentity,
 };
+use super::backend_egress_attestation::ReportedEgressPolicy;
 use super::configsync_lifecycle::{
     CONFIGSYNC_HEARTBEAT_INTERVAL_SECS, check_config_sync_build_identity,
     config_sync_build_identity,
@@ -319,6 +320,9 @@ pub struct DpNodeInfo {
     pub namespace: String,
     pub connected_at: DateTime<Utc>,
     pub last_update_at: DateTime<Utc>,
+    /// Backend egress policy metadata the DP reported on Subscribe (#6020).
+    /// `None` means unknown: the DP sent no report or an unrecognised mode.
+    pub backend_egress_policy: Option<ReportedEgressPolicy>,
 }
 
 /// Registry of connected DP nodes. Shared between the gRPC server and the
@@ -2113,6 +2117,10 @@ impl ConfigSync for CpGrpcServer {
         let node_id = inner.node_id;
         let dp_version = inner.ferrum_version;
         let dp_namespace = inner.namespace;
+        // Recorded, never enforced: an absent or unrecognised report is kept
+        // as unknown so the CP cannot attest a policy it was not told.
+        let backend_egress_policy =
+            ReportedEgressPolicy::from_report(inner.backend_egress_policy.as_ref());
 
         // CP and DP must run the same build: refuse any other build before
         // streaming config.
@@ -2248,6 +2256,7 @@ impl ConfigSync for CpGrpcServer {
             namespace: dp_namespace.clone(),
             connected_at: now,
             last_update_at: now,
+            backend_egress_policy,
         });
 
         let config_for_recovery = self.config.clone();
@@ -2546,6 +2555,7 @@ mod tests {
             namespace: "ferrum".to_string(),
             connected_at,
             last_update_at: connected_at,
+            backend_egress_policy: None,
         }
     }
 

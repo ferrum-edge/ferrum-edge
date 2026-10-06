@@ -11,6 +11,7 @@ fn make_node(id: &str) -> DpNodeInfo {
         namespace: "ferrum".to_string(),
         connected_at: now,
         last_update_at: now,
+        backend_egress_policy: None,
     }
 }
 

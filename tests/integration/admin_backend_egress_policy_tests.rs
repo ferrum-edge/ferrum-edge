@@ -10,6 +10,8 @@ use ferrum_edge::admin::{
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::grpc::backend_egress_attestation::ReportedEgressPolicy;
+use ferrum_edge::grpc::cp_server::{DpNodeInfo, DpNodeRegistry};
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -187,7 +189,34 @@ fn default_response() -> Value {
         "deny_cidr_overrides_present": false,
         "evaluation_order": ["allow-cidrs", "deny-cidrs", "dangerous-ranges", "ip-mode"],
         "public_only_guaranteed": false,
+        "data_plane_attestation": empty_attestation(),
     })
+}
+
+/// CP attestation with no DP connected for the selected namespace.
+fn empty_attestation() -> Value {
+    json!({
+        "source": "configsync-subscribe",
+        "connected_data_planes": 0,
+        "reporting_data_planes": 0,
+        "unknown_data_planes": 0,
+        "weakest_policy": null,
+        "weakest_policy_complete": false,
+        "all_connected_public_only_guaranteed": false,
+        "data_planes": [],
+    })
+}
+
+/// A local data plane's response carries no DP attestation object.
+fn serving_response() -> Value {
+    let mut expected = default_response();
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("data_plane_attestation");
+    expected["namespace"] = json!("staging");
+    expected["enforcement_scope"] = json!("local-data-plane");
+    expected
 }
 
 fn assert_no_policy(body: &Value) {
@@ -234,10 +263,12 @@ async fn default_public_and_private_policies_have_exact_versioned_representation
         let harness = AdminHarness::start(serving_state(policy)).await;
         let (status, body) = harness.get(Some(&reader), Some("staging")).await;
         assert_eq!(status, StatusCode::OK);
-        expected["namespace"] = json!("staging");
-        expected["enforcement_scope"] = json!("local-data-plane");
-        expected["public_only_guaranteed"] = json!(guaranteed);
-        assert_eq!(body, expected);
+        let mut expected_serving = serving_response();
+        for field in ["mode", "mode_allowed_ip_classes", "mode_blocked_ip_classes"] {
+            expected_serving[field] = expected[field].clone();
+        }
+        expected_serving["public_only_guaranteed"] = json!(guaranteed);
+        assert_eq!(body, expected_serving);
     }
 }
 
@@ -270,6 +301,167 @@ async fn public_only_is_never_guaranteed_without_local_enforcement() {
     assert_eq!(body["public_only_guaranteed"], true);
 }
 
+/// Register a connected DP whose Subscribe carried `policy` (None = unknown).
+fn connect_dp(
+    registry: &DpNodeRegistry,
+    node_id: &str,
+    namespace: &str,
+    policy: Option<BackendEgressPolicy>,
+) {
+    let connected_at = chrono::Utc::now();
+    registry.insert(DpNodeInfo {
+        node_id: node_id.to_string(),
+        version: "0.9.13".to_string(),
+        namespace: namespace.to_string(),
+        connected_at,
+        last_update_at: connected_at,
+        backend_egress_policy: policy.as_ref().map(ReportedEgressPolicy::from_policy),
+    });
+}
+
+fn public_policy_view() -> Value {
+    json!({
+        "mode": "public",
+        "mode_allowed_ip_classes": ["public"],
+        "mode_blocked_ip_classes": ["private-reserved"],
+        "dangerous_ranges_blocked": true,
+        "allow_cidr_overrides_present": false,
+        "deny_cidr_overrides_present": false,
+        "public_only_guaranteed": true,
+    })
+}
+
+#[tokio::test]
+async fn control_plane_attests_connected_data_planes_of_the_selected_namespace() {
+    let public = || Some(BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public));
+    let registry = Arc::new(DpNodeRegistry::new());
+    connect_dp(&registry, "dp-b", "ferrum", public());
+    connect_dp(&registry, "dp-a", "ferrum", public());
+    let both = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both);
+    connect_dp(&registry, "dp-staging", "staging", Some(both));
+    let mut state = admin_state("cp", BackendEgressPolicy::unrestricted());
+    state.dp_registry = Some(registry.clone());
+    let harness = AdminHarness::start(state).await;
+    let reader = token(PRIMARY_SECRET, json!({}));
+
+    let (status, body) = harness.get(Some(&reader), None).await;
+    assert_eq!(status, StatusCode::OK);
+    // The CP's own fields keep their admission-only meaning.
+    assert_eq!(body["enforcement_scope"], "admission-only");
+    assert_eq!(body["mode"], "both");
+    assert_eq!(body["public_only_guaranteed"], false);
+    let attestation = &body["data_plane_attestation"];
+    assert_eq!(attestation["source"], "configsync-subscribe");
+    assert_eq!(attestation["connected_data_planes"], 2);
+    assert_eq!(attestation["reporting_data_planes"], 2);
+    assert_eq!(attestation["unknown_data_planes"], 0);
+    assert_eq!(attestation["weakest_policy"], public_policy_view());
+    assert_eq!(attestation["weakest_policy_complete"], true);
+    assert_eq!(attestation["all_connected_public_only_guaranteed"], true);
+    let data_planes = attestation["data_planes"].as_array().unwrap();
+    let node_ids: Vec<&Value> = data_planes.iter().map(|dp| &dp["node_id"]).collect();
+    assert_eq!(node_ids, ["dp-a", "dp-b"]);
+    assert_eq!(data_planes[0]["attestation"], "reported");
+    assert_eq!(data_planes[0]["ferrum_version"], "0.9.13");
+    assert_eq!(data_planes[0]["policy"], public_policy_view());
+    // Another namespace's DPs are neither listed nor counted.
+    assert!(!body.to_string().contains("dp-staging"));
+
+    let (_, staging) = harness.get(Some(&reader), Some("staging")).await;
+    let attestation = &staging["data_plane_attestation"];
+    assert_eq!(attestation["connected_data_planes"], 1);
+    assert_eq!(attestation["weakest_policy"]["mode"], "both");
+    assert_eq!(attestation["weakest_policy_complete"], true);
+    assert_eq!(attestation["all_connected_public_only_guaranteed"], false);
+
+    // No connected DP is never vacuously public-only.
+    let (_, empty) = harness.get(Some(&reader), Some("prod")).await;
+    assert_eq!(empty["data_plane_attestation"], empty_attestation());
+
+    // An unknown DP voids the guarantee but keeps the reporting DPs' policy.
+    connect_dp(&registry, "dp-old", "ferrum", None);
+    let (_, body) = harness.get(Some(&reader), None).await;
+    let attestation = &body["data_plane_attestation"];
+    assert_eq!(attestation["connected_data_planes"], 3);
+    assert_eq!(attestation["reporting_data_planes"], 2);
+    assert_eq!(attestation["unknown_data_planes"], 1);
+    assert_eq!(attestation["weakest_policy"], public_policy_view());
+    assert_eq!(attestation["weakest_policy_complete"], false);
+    assert_eq!(attestation["all_connected_public_only_guaranteed"], false);
+    let unknown = &attestation["data_planes"][2];
+    assert_eq!(unknown["node_id"], "dp-old");
+    assert_eq!(unknown["attestation"], "unknown");
+    assert_eq!(unknown["policy"], Value::Null);
+
+    // A reporting DP with an allow overlay is the weakest; its CIDR is withheld.
+    let old = registry
+        .snapshot()
+        .into_iter()
+        .find(|node| node.node_id == "dp-old")
+        .unwrap();
+    registry.remove_if_stale("dp-old", old.connected_at);
+    let allow = BackendEgressPolicy::from_env(BackendAllowIps::Public, "10.45.67.89/32", "", true);
+    connect_dp(&registry, "dp-c", "ferrum", Some(allow.unwrap()));
+    let (_, body) = harness.get(Some(&reader), None).await;
+    let attestation = &body["data_plane_attestation"];
+    assert_eq!(attestation["connected_data_planes"], 3);
+    assert_eq!(attestation["weakest_policy"]["mode"], "public");
+    assert_eq!(
+        attestation["weakest_policy"]["allow_cidr_overrides_present"],
+        true
+    );
+    assert_eq!(
+        attestation["weakest_policy"]["public_only_guaranteed"],
+        false
+    );
+    assert_eq!(attestation["weakest_policy_complete"], true);
+    assert_eq!(attestation["all_connected_public_only_guaranteed"], false);
+    assert!(!body.to_string().contains("10.45.67.89"));
+}
+
+#[tokio::test]
+async fn cluster_status_lists_each_dp_policy_and_the_cluster_wide_aggregate() {
+    let registry = Arc::new(DpNodeRegistry::new());
+    let public = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public);
+    connect_dp(&registry, "dp-a", "ferrum", Some(public));
+    connect_dp(&registry, "dp-old", "staging", None);
+    let mut state = admin_state("cp", BackendEgressPolicy::unrestricted());
+    state.dp_registry = Some(registry);
+    let harness = AdminHarness::start(state).await;
+    let reader = token(PRIMARY_SECRET, json!({"role": "admin"}));
+    let body: Value = reqwest::Client::new()
+        .get(format!("{}/cluster", harness.base))
+        .bearer_auth(&reader)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["connected_data_planes"], 2);
+    let data_planes = body["data_planes"].as_array().unwrap();
+    for dp in data_planes {
+        let (attestation, policy) = if dp["node_id"] == "dp-a" {
+            ("reported", public_policy_view())
+        } else {
+            ("unknown", Value::Null)
+        };
+        assert_eq!(dp["backend_egress_policy_attestation"], attestation);
+        assert_eq!(dp["backend_egress_policy"], policy);
+    }
+    assert_eq!(
+        body["data_plane_backend_egress_policy"],
+        json!({
+            "connected_data_planes": 2,
+            "reporting_data_planes": 1,
+            "unknown_data_planes": 1,
+            "weakest_policy": public_policy_view(),
+            "weakest_policy_complete": false,
+            "all_connected_public_only_guaranteed": false,
+        })
+    );
+}
+
 #[tokio::test]
 async fn overrides_are_bounded_and_public_only_proof_is_conservative() {
     let reader = token(PRIMARY_SECRET, json!({}));
@@ -284,9 +476,7 @@ async fn overrides_are_bounded_and_public_only_proof_is_conservative() {
         let harness = AdminHarness::start(serving_state(policy)).await;
         let (status, body) = harness.get(Some(&reader), Some("staging")).await;
         assert_eq!(status, StatusCode::OK);
-        let mut expected = default_response();
-        expected["namespace"] = json!("staging");
-        expected["enforcement_scope"] = json!("local-data-plane");
+        let mut expected = serving_response();
         expected["mode"] = json!("public");
         expected["mode_allowed_ip_classes"] = json!(["public"]);
         expected["mode_blocked_ip_classes"] = json!(["private-reserved"]);
@@ -510,7 +700,9 @@ fn openapi_metadata_vocabulary_and_default_example_match_the_endpoint() {
     let expected = default_response();
     for key in expected.as_object().unwrap().keys() {
         assert!(properties.contains_key(key));
-        assert!(schema["required"].as_array().unwrap().contains(&json!(key)));
+        // The CP-only attestation object is additive within v2: optional.
+        let required = schema["required"].as_array().unwrap().contains(&json!(key));
+        assert_eq!(required, key != "data_plane_attestation", "{key}");
     }
     assert_eq!(properties.len(), expected.as_object().unwrap().len());
     assert_eq!(properties["schema_version"]["enum"], json!([2]));
@@ -531,8 +723,19 @@ fn openapi_metadata_vocabulary_and_default_example_match_the_endpoint() {
             "no-data-plane"
         ])
     );
-    let validator = jsonschema::draft202012::options().build(schema).unwrap();
+    let root = json!({
+        "$ref": "#/components/schemas/BackendEgressPolicyResponse",
+        "components": spec["components"].clone(),
+    });
+    let validator = jsonschema::draft202012::options().build(&root).unwrap();
     assert!(validator.is_valid(&expected));
+    assert!(validator.is_valid(&serving_response()));
+    let attesting = &content["examples"]["controlPlaneAttestingPublicOnlyDataPlanes"]["value"];
+    assert!(validator.is_valid(attesting));
+    assert_eq!(
+        attesting["data_plane_attestation"]["all_connected_public_only_guaranteed"],
+        true
+    );
     for (field, unknown) in [
         ("schema_version", json!(1)),
         ("schema_version", json!(3)),
@@ -552,6 +755,16 @@ fn openapi_metadata_vocabulary_and_default_example_match_the_endpoint() {
     let mut leaked = expected.clone();
     leaked["allow_cidrs"] = json!(["10.45.67.89/32"]);
     assert!(!validator.is_valid(&leaked));
+    let mut leaked = attesting.clone();
+    leaked["data_plane_attestation"]["data_planes"][0]["policy"]["allow_cidrs"] =
+        json!(["10.45.67.89/32"]);
+    assert!(!validator.is_valid(&leaked));
+    let mut leaked = attesting.clone();
+    leaked["data_plane_attestation"]["allow_cidrs"] = json!(["10.45.67.89/32"]);
+    assert!(!validator.is_valid(&leaked));
+    let mut unknown = attesting.clone();
+    unknown["data_plane_attestation"]["data_planes"][0]["attestation"] = json!("trusted");
+    assert!(!validator.is_valid(&unknown));
     let docs = include_str!("../../docs/admin_api.md");
     assert!(docs.contains("### `GET /backend-egress-policy`"));
     assert!(docs.contains("ferrum-private-reserved-v1"));
