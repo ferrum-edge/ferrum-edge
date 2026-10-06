@@ -44,6 +44,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches the variant must build the phase; use `phase.message()` or
   `to_string()` for the text. Client-visible messages and statuses are
   unchanged.
+- **Semantic cache quarantine no longer storms Redis with dials** (issue
+  #6018). Every request that read the same poisoned `ai_semantic_cache` Redis
+  value opened its own dedicated compare-and-delete connection, and a server
+  connection-limit refusal on any of them marked the shared Redis client
+  unavailable. A request now claims a per-key in-flight marker before it
+  dials, so concurrent requests on one key run a single quarantine. The
+  marker is cleared on success or a proven mismatch and kept, bounded by the
+  30s marker TTL, on failure. Each plugin instance also runs at most 4 dedicated
+  quarantine connections at once, and requests never wait for one. A refused
+  or timed-out quarantine TCP/handshake connect, an `INFO CLUSTER` topology
+  probe that did not complete on that extra socket, or a `max number of clients
+  reached` reply on the quarantine connection, keeps the local marker and leaves
+  an otherwise healthy client available. A proven Cluster topology stays
+  terminal, and DNS-resolution, egress, and client-construction failures keep the
+  ordinary availability policy. A proven mismatch now returns without `UNWATCH`,
+  so `UNWATCH` is no longer part of the semantic cache's Redis command profile.
+- **Deduplication Redis compare-and-delete / compare-and-set keep writes
+  inside the watched transaction** (issue #6018). The ownership-release and
+  result-publication helpers pipelined `MULTI` with the `DEL`/`SET`, so a Redis
+  ACL that denied `MULTI` but allowed the write let it run outside the
+  transaction, unfenced by `WATCH`. They now send `MULTI` alone and require a
+  `QUEUED` reply before `EXEC`.
 ### Changed
 
 - **Deployment mutations separate `not_started` from `not_committed`**

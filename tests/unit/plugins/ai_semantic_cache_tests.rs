@@ -13,6 +13,7 @@ use ferrum_edge::_test_support::{
     ai_semantic_cache_maintenance_staged_for_test, ai_semantic_cache_notify_cleanup_for_test,
     ai_semantic_cache_redis_quarantine_cap_for_test,
     ai_semantic_cache_redis_quarantine_delete_failures_for_test,
+    ai_semantic_cache_redis_quarantine_dial_permits_for_test,
     ai_semantic_cache_redis_quarantine_fingerprint_content_for_test,
     ai_semantic_cache_redis_quarantine_fingerprint_empty_for_test,
     ai_semantic_cache_redis_quarantine_fingerprint_oversized_for_test,
@@ -21,6 +22,7 @@ use ferrum_edge::_test_support::{
     ai_semantic_cache_redis_quarantine_matches_active_for_test,
     ai_semantic_cache_redis_quarantine_suppressed_for_test,
     ai_semantic_cache_redis_quarantine_suppressions_for_test,
+    ai_semantic_cache_redis_quarantine_try_claim_for_test,
     ai_semantic_cache_redis_quarantine_ttl_for_test, ai_semantic_cache_scope_key,
     ai_semantic_cache_set_singleflight_wait_override_for_test,
     ai_semantic_cache_set_store_post_admit_hook_for_test,
@@ -6605,16 +6607,208 @@ async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
 }
 
 #[test]
+fn redis_quarantine_in_flight_claim_collapses_concurrent_dials() {
+    let plugin = make_plugin(json!({}));
+    let key = "hot-poisoned-key";
+    let fp = quarantine_fp("poison");
+
+    assert!(ai_semantic_cache_redis_quarantine_try_claim_for_test(
+        &plugin, key, fp
+    ));
+    assert!(
+        ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, key),
+        "the claim must be visible before the compare-and-delete dials"
+    );
+    assert!(
+        !ai_semantic_cache_redis_quarantine_try_claim_for_test(&plugin, key, fp),
+        "a concurrent request on the same poisoned value must not dial again"
+    );
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin),
+        0,
+        "an in-flight claim is not a delete failure"
+    );
+
+    // A replaced (different) poisoned value may be quarantined on its own.
+    let replaced = quarantine_fp("replaced-poison");
+    assert!(ai_semantic_cache_redis_quarantine_try_claim_for_test(
+        &plugin, key, replaced
+    ));
+
+    // Success or a proven mismatch releases the claim.
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, replaced, true);
+    assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, key
+    ));
+    assert!(ai_semantic_cache_redis_quarantine_try_claim_for_test(
+        &plugin, key, fp
+    ));
+
+    // Failure keeps the marker, so no request redials until it expires.
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, false);
+    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, key
+    ));
+    assert!(!ai_semantic_cache_redis_quarantine_try_claim_for_test(
+        &plugin, key, fp
+    ));
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin),
+        1
+    );
+
+    // An expired claim (for example a cancelled request) is taken over.
+    ai_semantic_cache_expire_redis_quarantine_for_test(&plugin, key);
+    assert!(ai_semantic_cache_redis_quarantine_try_claim_for_test(
+        &plugin, key, fp
+    ));
+    assert_eq!(ai_semantic_cache_redis_quarantine_len_for_test(&plugin), 1);
+}
+
+#[test]
+fn redis_quarantine_concurrent_claims_admit_exactly_one_dial() {
+    let plugin = std::sync::Arc::new(make_plugin(json!({})));
+    let fp = quarantine_fp("hot-poison");
+    let winners = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            let plugin = std::sync::Arc::clone(&plugin);
+            let winners = &winners;
+            scope.spawn(move || {
+                if ai_semantic_cache_redis_quarantine_try_claim_for_test(&plugin, "hot-key", fp) {
+                    winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+    });
+
+    assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(ai_semantic_cache_redis_quarantine_len_for_test(&plugin), 1);
+}
+
+#[test]
+fn redis_quarantine_claims_stay_hard_capped() {
+    let plugin = make_plugin(json!({ "max_entries": 8 }));
+    let cap = ai_semantic_cache_redis_quarantine_cap_for_test(&plugin);
+    for i in 0..(cap * 4) {
+        let key = format!("claim-{i}");
+        let fp = quarantine_fp(&key);
+        assert!(ai_semantic_cache_redis_quarantine_try_claim_for_test(
+            &plugin, &key, fp
+        ));
+    }
+    assert!(ai_semantic_cache_redis_quarantine_len_for_test(&plugin) <= cap);
+}
+
+#[test]
+fn redis_quarantine_dial_permits_are_bounded_per_instance() {
+    let first = make_plugin(json!({}));
+    let second = make_plugin(json!({}));
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_dial_permits_for_test(&first),
+        4
+    );
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_dial_permits_for_test(&second),
+        4
+    );
+}
+
+/// With every dedicated dial permit taken, a request that reaches quarantine
+/// must not wait: it leaves its in-flight claim in place and stays a
+/// suppressed miss (issue #6018, review L2).
+#[tokio::test]
+async fn redis_quarantine_without_a_dial_permit_never_waits() {
+    use ferrum_edge::_test_support::{
+        RedisConfig, ai_semantic_cache_quarantine_invalid_redis_entry_for_test,
+        ai_semantic_cache_redis_quarantine_hold_all_dials_for_test,
+        redis_client_without_server_clock_for_test,
+    };
+
+    let plugin = make_plugin(json!({}));
+    let cache_key = "permit-exhausted-key";
+    let fingerprint = quarantine_fp("permit-exhausted");
+    assert!(ai_semantic_cache_redis_quarantine_try_claim_for_test(
+        &plugin,
+        cache_key,
+        fingerprint
+    ));
+
+    let held = ai_semantic_cache_redis_quarantine_hold_all_dials_for_test(&plugin);
+    assert_eq!(held.len(), 4, "the test must hold every dial permit");
+
+    // An unroutable client proves the dial is never attempted: if it were, the
+    // call would wait on the connect timeout instead of returning at once.
+    let redis = redis_client_without_server_clock_for_test(RedisConfig {
+        url: "redis://127.0.0.1:1/0".to_string(),
+        tls: false,
+        key_prefix: "ferrum:test".to_string(),
+        pool_size: 1,
+        connect_timeout_seconds: 5,
+        health_check_interval_seconds: 3600,
+        username: None,
+        password: None,
+    });
+
+    let started = std::time::Instant::now();
+    ai_semantic_cache_quarantine_invalid_redis_entry_for_test(
+        &plugin,
+        &redis,
+        "ferrum:test:redis-key",
+        cache_key,
+        fingerprint,
+        b"{}",
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a request without a dial permit must not wait"
+    );
+    assert!(
+        ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, cache_key),
+        "the in-flight claim must stay in place when no permit is available"
+    );
+
+    drop(held);
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_dial_permits_for_test(&plugin),
+        4,
+        "permits return when the holder drops"
+    );
+}
+
+/// Source text with every whitespace run removed and trailing commas before a
+/// closing delimiter dropped, so structural source pins compare tokens rather
+/// than rustfmt layout (issue #6018).
+fn compact_source(source: &str) -> String {
+    let mut compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    for (trailing, closing) in [(",)", ")"), (",]", "]"), (",}", "}")] {
+        compact = compact.replace(trailing, closing);
+    }
+    compact
+}
+
+/// The text strictly between the first `start` and the following `end`.
+fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, rest)| rest.split_once(end))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("source region {start} .. {end}"))
+}
+
+#[test]
 fn redis_quarantine_found_hit_admits_before_fingerprint() {
     // Behavioral seam that counted hash invocations would distort production;
     // pin the Found-path order in source so valid hits never pay a quarantine
     // SHA-256 pass and fingerprints run only after admission failure.
-    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
-    let found = source
-        .split_once("Ok(BoundedRedisValue::Found(data)) => {")
-        .and_then(|(_, rest)| rest.split_once("Ok(BoundedRedisValue::Oversized { length }) => {"))
-        .map(|(body, _)| body)
-        .expect("BoundedRedisValue::Found hit-path region");
+    let source = compact_source(include_str!("../../../src/plugins/ai_semantic_cache.rs"));
+    let found = source_region(
+        &source,
+        "Ok(BoundedRedisValue::Found(data))=>{",
+        "Ok(BoundedRedisValue::Oversized{length})=>{",
+    );
     let admit = found
         .find("admit_redis_hit(")
         .expect("Found path must admit before fingerprinting");
@@ -6625,11 +6819,16 @@ fn redis_quarantine_found_hit_admits_before_fingerprint() {
         admit < fingerprint,
         "valid Redis Found hits must admit/serve without a quarantine fingerprint pass"
     );
+    let after = &found[fingerprint..];
+    let claim = after
+        .find("self.redis_quarantine.try_claim(&cache_key,fingerprint,Instant::now())")
+        .expect("inadmissible Found values must claim the per-key in-flight marker");
+    let dial = after
+        .find("quarantine_invalid_redis_entry(")
+        .expect("inadmissible Found values must be quarantined");
     assert!(
-        found.contains("None => {")
-            && found[fingerprint..].contains("matches_active(")
-            && found[fingerprint..].contains("quarantine_invalid_redis_entry("),
-        "inadmissible Found values must fingerprint, then check concurrent same-poison markers before DEL"
+        found.contains("None=>{") && claim < dial,
+        "inadmissible Found values must fingerprint, then claim the key before any DEL dial"
     );
     assert!(
         !found[..admit].contains("redis_quarantine_fingerprint_content"),
@@ -6641,12 +6840,12 @@ fn redis_quarantine_found_hit_admits_before_fingerprint() {
 fn redis_quarantine_insert_avoids_full_map_expired_sweep() {
     // Sustained over-cap unique poison churn must not invoke a request-driven
     // O(capacity) expired sweep; pin constant-work victim policy in source.
-    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
-    let insert = source
-        .split_once("fn insert(&self, cache_key: &str, marker: RedisQuarantineMarker)")
-        .and_then(|(_, rest)| rest.split_once("fn release_slot(&self)"))
-        .map(|(body, _)| body)
-        .expect("RedisQuarantineSuppressor::insert region");
+    let source = compact_source(include_str!("../../../src/plugins/ai_semantic_cache.rs"));
+    let insert = source_region(
+        &source,
+        "fninsert(&self,cache_key:&str,marker:RedisQuarantineMarker)",
+        "fnrelease_slot(&self)",
+    );
     assert!(
         !insert.contains("evict_expired"),
         "insert must not call a full-map expired sweep under capacity pressure"
@@ -6656,11 +6855,11 @@ fn redis_quarantine_insert_avoids_full_map_expired_sweep() {
         "insert must not allocate a vector of cloned keys for a map-wide scan"
     );
     assert!(
-        insert.contains("entries.iter().next()") || insert.contains("self.entries.iter().next()"),
+        insert.contains("self.entries.iter().next()"),
         "over-cap insert must use constant-work arbitrary/sample victim selection"
     );
     assert!(
-        !source.contains("fn evict_expired(&self"),
+        !source.contains("fnevict_expired(&self"),
         "request-path full-map expired sweep helper must remain removed"
     );
     // Behavioral: sustained unique over-cap churn stays hard-capped.
@@ -6678,17 +6877,31 @@ fn redis_quarantine_insert_avoids_full_map_expired_sweep() {
 fn redis_quarantine_delete_outcome_handler_is_shared() {
     // Production DEL mapping and the external test seam must share one private
     // synchronous outcome handler rather than duplicating success/failure logic.
-    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
-    let production = source
-        .split_once("async fn quarantine_invalid_redis_entry(")
-        .and_then(|(_, rest)| rest.split_once("async fn build_vector_snapshot("))
-        .map(|(body, _)| body)
-        .expect("quarantine_invalid_redis_entry region");
+    let source = compact_source(include_str!("../../../src/plugins/ai_semantic_cache.rs"));
+    let production = source_region(
+        &source,
+        "asyncfnquarantine_invalid_redis_entry(",
+        "asyncfnbuild_vector_snapshot(",
+    );
+    let permit = production
+        .find("self.redis_quarantine_dials.try_acquire()")
+        .expect("dedicated quarantine dials must be bounded by a non-blocking permit");
+    let delete = production
+        .find(".delete_if_value_matches_bounded(redis_key,observed_value).await.is_ok()")
+        .expect("production must map exact observed-byte compare-delete, including false");
     assert!(
-        production.contains("apply_redis_quarantine_delete_outcome(")
-            && production.contains(".delete_if_value_matches_bounded(redis_key, observed_value)")
-            && production.contains(".await\n            .is_ok()"),
-        "production must map exact observed-byte compare-delete, including false, through the shared handler"
+        permit < delete
+            && !production[permit..delete].contains("apply_redis_quarantine_delete_outcome(")
+            && !production[permit..delete].contains(".clear("),
+        "a request without a dial permit must leave its in-flight claim in place"
+    );
+    assert!(
+        !production.contains(".acquire().await") && !production.contains(".acquire_owned("),
+        "a request must never wait for a quarantine dial permit"
+    );
+    assert!(
+        production.contains("apply_redis_quarantine_delete_outcome("),
+        "production must map the compare-delete outcome through the shared handler"
     );
     assert!(
         !production.contains("record_delete_failure(")
@@ -6699,54 +6912,58 @@ fn redis_quarantine_delete_outcome_handler_is_shared() {
         !production.contains(".delete(") && !production.contains(".get_bytes("),
         "quarantine must not delete unconditionally or re-read an unbounded value"
     );
-    let lookup = source
-        .split_once("Ok(BoundedRedisValue::Found(data)) => {")
-        .and_then(|(_, rest)| rest.split_once("Ok(BoundedRedisValue::Missing) => {"))
-        .map(|(body, _)| body)
-        .expect("Redis invalid-value lookup branches");
+    let lookup = source_region(
+        &source,
+        "Ok(BoundedRedisValue::Found(data))=>{",
+        "Ok(BoundedRedisValue::Missing)=>{",
+    );
     let (found, remaining) = lookup
-        .split_once("Ok(BoundedRedisValue::Oversized { length }) => {")
+        .split_once("Ok(BoundedRedisValue::Oversized{length})=>{")
         .expect("oversized branch");
     let (oversized, empty) = remaining
-        .split_once("Ok(BoundedRedisValue::Empty) => {")
+        .split_once("Ok(BoundedRedisValue::Empty)=>{")
         .expect("empty branch");
     assert!(
         found.contains(
-            "quarantine_invalid_redis_entry(\n                                        redis,\n                                        &redis_key,\n                                        &cache_key,\n                                        fingerprint,\n                                        &data,"
+            "quarantine_invalid_redis_entry(redis,&redis_key,&cache_key,fingerprint,&data)"
         ),
         "every deserialization/admission failure must fence deletion with the observed full bytes"
     );
     assert!(
-        empty.contains(
-            "quarantine_invalid_redis_entry(\n                                redis,\n                                &redis_key,\n                                &cache_key,\n                                fingerprint,\n                                b\"\","
-        ),
-        "empty entries must compare exactly against an empty byte string"
+        empty.contains("self.redis_quarantine.try_claim(&cache_key,fingerprint,Instant::now())")
+            && empty.contains(
+                "quarantine_invalid_redis_entry(redis,&redis_key,&cache_key,fingerprint,b\"\")"
+            ),
+        "empty entries must claim the key, then compare exactly against an empty byte string"
     );
     assert!(
         oversized.contains(
-            "self.redis_quarantine.record_suppression(\n                                &cache_key,\n                                fingerprint,\n                                Instant::now(),"
+            "self.redis_quarantine.record_suppression(&cache_key,fingerprint,Instant::now())"
         ) && !oversized.contains("quarantine_invalid_redis_entry(")
             && !oversized.contains("apply_redis_quarantine_delete_outcome(")
             && !oversized.contains(".delete"),
         "unobserved oversized values must only install a bounded marker, without DEL or delete-failure accounting"
     );
-    let suppression = source
-        .split_once("fn record_suppression(")
-        .and_then(|(_, rest)| rest.split_once("fn clear("))
-        .map(|(body, _)| body)
-        .expect("suppression handler");
+    let suppression = source_region(&source, "fnrecord_suppression(", "fnclear(");
     assert!(
-        suppression.contains("expires_at: now + self.ttl")
-            && suppression.contains("self.insert(cache_key, marker)")
+        suppression.contains("expires_at:now+self.ttl")
+            && suppression.contains("self.insert(cache_key,marker)")
             && !suppression.contains("delete_failures_total")
             && !suppression.contains("warn"),
         "oversized suppression must preserve TTL/capacity without reporting a failed delete"
     );
-    let test_seam = source
-        .split_once("fn apply_redis_quarantine_delete_outcome_for_tests(")
-        .and_then(|(_, rest)| rest.split_once("fn redis_quarantine_suppressed_for_tests("))
-        .map(|(body, _)| body)
-        .expect("apply_redis_quarantine_delete_outcome_for_tests region");
+    let claim = source_region(&source, "fntry_claim(", "fnupsert(");
+    assert!(
+        claim.contains("expires_at:now+self.ttl")
+            && claim.contains("existing.expires_at<=now||existing.fingerprint!=fingerprint")
+            && !claim.contains("delete_failures_total"),
+        "the in-flight claim must be TTL-bounded and yield only to an expired or replaced marker"
+    );
+    let test_seam = source_region(
+        &source,
+        "fnapply_redis_quarantine_delete_outcome_for_tests(",
+        "fnredis_quarantine_suppressed_for_tests(",
+    );
     assert!(
         test_seam.contains("self.apply_redis_quarantine_delete_outcome("),
         "test seam must call the same private outcome handler"
@@ -6760,41 +6977,53 @@ fn redis_quarantine_delete_outcome_handler_is_shared() {
 
 #[test]
 fn redis_quarantine_compare_delete_read_is_bounded_and_watched() {
-    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
-    let helper = source
-        .split_once("pub async fn delete_if_value_matches_bounded(")
-        .and_then(|(_, rest)| rest.split_once("/// Charge one request against EVERY"))
-        .map(|(body, _)| body)
-        .expect("compare-delete helper");
+    let source = compact_source(include_str!(
+        "../../../src/plugins/utils/redis_rate_limiter.rs"
+    ));
+    let helper = source_region(
+        &source,
+        "pubasyncfndelete_if_value_matches_bounded(",
+        "fnnote_quarantine_command_failure(",
+    );
     let checked_index = helper
         .find("redis_getrange_end_index(expected.len())")
         .unwrap();
-    let connection = helper.find("get_dedicated_connection()").unwrap();
+    let connection = helper.find("self.get_quarantine_connection()").unwrap();
     let watch = helper.find("redis::cmd(\"WATCH\")").unwrap();
     let range = helper.find(".cmd(\"GETRANGE\")").unwrap();
     let delete = helper.find("redis::cmd(\"DEL\")").unwrap();
     assert!(checked_index < connection && connection < watch && watch < range && range < delete);
     assert!(
         helper.contains("expected.len().checked_add(1)")
-            && helper.contains("if expected.is_empty() {\n            0")
-            && helper.contains(".cmd(\"EXISTS\")\n            .arg(key)")
-            && helper.contains(".cmd(\"STRLEN\")\n            .arg(key)")
-            && helper.contains(".arg(0)\n            .arg(end)")
-            && helper.contains("prefix.len() > max_prefix")
-            && helper.contains("exists == 1 && length == expected.len() && prefix == expected")
+            && helper.contains("ifexpected.is_empty(){0")
+            && helper.contains(".cmd(\"EXISTS\").arg(key)")
+            && helper.contains(".cmd(\"STRLEN\").arg(key)")
+            && helper.contains(".arg(0).arg(end)")
+            && helper.contains("prefix.len()>max_prefix")
+            && helper.contains("exists==1&&length==expected.len()&&prefix==expected")
             && helper.contains("redis::cmd(\"MULTI\")")
             && helper.contains("redis::cmd(\"EXEC\")")
-            && helper.contains("Ok(reply) if reply == \"QUEUED\" => {}"),
+            && helper.contains("Ok(reply)ifreply==\"QUEUED\"=>{}"),
         "only a full bounded byte/length match on the dedicated watched connection may authorize DEL"
     );
     let multi = helper.find("redis::cmd(\"MULTI\")").unwrap();
-    let multi_error = helper.find("if let Err(e) = multi {").unwrap();
+    let multi_error = helper.find("ifletErr(e)=multi{").unwrap();
     let exec = helper.find("redis::cmd(\"EXEC\")").unwrap();
     assert!(range < multi && multi < multi_error && multi_error < delete && delete < exec);
+    let mismatch = source_region(helper, "prefix==expected=>{}", "Err(e)=>{");
+    assert!(
+        mismatch.contains("self.note_command_success()?;returnOk(false);"),
+        "a proven mismatch must return false directly"
+    );
+    assert!(
+        !helper.contains("UNWATCH"),
+        "dropping the dedicated connection clears WATCH; UNWATCH could only turn a mismatch into an error"
+    );
     assert!(
         !helper.contains(".atomic()")
             && !helper.contains("cmd(\"GET\")")
             && !helper.contains("get_connection()")
+            && !helper.contains("get_dedicated_connection()")
             && !helper.contains(".get_bytes(")
             && !helper.contains("cmd(\"EVAL"),
         "compare-delete must remain bounded, dedicated, and RESP-compatible without Lua"
