@@ -161,7 +161,7 @@ start_gateway() {
     FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
     FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
     FERRUM_POOL_ENABLE_HTTP2=false \
-    ./target/release/ferrum-edge > "$PERF_DIR/gateway.log" 2>&1 &
+    ./target/release/ferrum-edge run > "$PERF_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
 
     # Wait for gateway to start with retry — verify it's actually our process

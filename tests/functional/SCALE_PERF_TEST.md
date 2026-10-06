@@ -10,7 +10,7 @@
 
 2. **Latency distribution at scale** -- How do p50, p95, p99, and max latencies change as config size increases?
 
-3. **Config update resiliency** -- Resources are added between perf runs while the gateway continues serving traffic. The DB poller picks up new config mid-flight, exercising the atomic config swap and incremental cache rebuild paths.
+3. **Config update resiliency** -- Resources are added between perf windows to the running gateway process (no restart). The DB poller picks up each new wave, exercising the atomic config swap and cache rebuild paths, and every wave must converge before the next window is measured. Load is not applied while a wave is being provisioned, so this test does not measure throughput *during* a reload.
 
 4. **Auth + ACL hot path at scale** -- Every request goes through key_auth (O(1) consumer index lookup) and access_control (consumer allowlist check), verifying these remain fast with 30k consumers in the index.
 
@@ -67,7 +67,7 @@ The test runs in 10 batches. Each batch:
    - All proxies route to the same echo backend
 2. Waits for the highest deferred-apply cursor to be accepted by the poller
 3. Proves end-to-end data-plane convergence across the oldest proxy and the first, middle, and last proxies in the new batch
-4. Runs a **complete 30-second load test** with 50 concurrent workers hitting all accumulated proxies round-robin, each request authenticated with the correct API key. A route-miss 404 ends and discards the partial window, re-runs the bounded convergence gate, and restarts the full window once; a second interrupted window fails as convergence instability rather than being reported as a routing-throughput regression.
+4. Sends **5 seconds of discarded warmup traffic**, then runs a **complete 30-second measured window** with 50 concurrent workers hitting all accumulated proxies round-robin, each request authenticated with the correct API key. Only requests that complete inside the window count; RPS is successful requests ÷ window, latency percentiles cover successful requests, and the gateway process's CPU time over the window is divided by the requests it served (`CPU/req`). A route-miss 404 ends and discards the partial window, re-runs the bounded convergence gate, and restarts the full window once; a second interrupted window fails as convergence instability rather than being reported as a routing-throughput regression.
 
 After all 10 batches, a summary table is printed comparing RPS and latency percentiles across each scale point (3k, 6k, 9k, ... 30k).
 
@@ -79,8 +79,13 @@ After all 10 batches, a summary table is printed comparing RPS and latency perce
 cargo build --release --bin ferrum-edge
 
 # SQLite variant (no external dependencies). `--exact` keeps the filter from
-# also matching the _postgres and _mongodb variants.
-cargo test --test functional_tests -- --ignored --nocapture \
+# also matching the _postgres and _mongodb variants. `--profile ci-release`
+# optimizes the test binary, which hosts the load generator and echo backend;
+# a debug test binary can become the bottleneck and hide gateway slowdown.
+# Use it for any number you publish (CI's regression gate uses the debug
+# profile and compares batches only against each other).
+FERRUM_SCALE_RESULTS_JSON=scale-results.json \
+cargo test --profile ci-release --test functional_tests -- --ignored --nocapture \
   --exact functional::functional_scale_perf_test::test_scale_perf_30k_proxies
 
 # PostgreSQL variant (requires the Docker container above)
@@ -91,6 +96,16 @@ cargo test --test functional_tests test_scale_perf_30k_proxies_postgres \
 cargo test --test functional_tests test_scale_perf_30k_proxies_mongodb \
   -- --ignored --nocapture
 ```
+
+Set `FERRUM_SCALE_RESULTS_JSON=/path/to/scale.json` to also write every batch
+result (RPS, latency percentiles, gateway CPU per request) plus the run
+parameters and commit as JSON.
+
+The load generator and echo backend run inside the test process on the same
+host as the gateway. On a laptop they compete with the gateway for cores, so a
+client-side ceiling can hide part of a gateway slowdown: compare `CPU/req`
+across batches as well as RPS. CPU per request is measured on the gateway
+process alone and is not capped by the client.
 
 Do not add `--all-features`: it enables both `crypto-ring` and `fips`, which is a
 compile error. `--nocapture` is needed to see the progress output and results
@@ -104,7 +119,8 @@ Constants at the top of the test file control the test parameters:
 |--------------------------|---------|--------------------------------------------------|
 | `BATCH_SIZE`             | 3,000   | Proxies/consumers/plugins created per batch       |
 | `TOTAL_PROXIES`          | 30,000  | Total proxies to create (must be multiple of batch size) |
-| `PERF_TEST_DURATION_SECS`| 30      | Seconds each load test runs                       |
+| `PERF_WARMUP_SECS`       | 5       | Discarded warmup traffic before each window       |
+| `PERF_TEST_DURATION_SECS`| 30      | Seconds each measured window runs                 |
 | `CONCURRENCY`            | 50      | Number of concurrent HTTP workers per load test   |
 | `API_BATCH_CHUNK`        | 100     | Resources per batch API call                      |
 
