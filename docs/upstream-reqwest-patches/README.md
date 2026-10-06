@@ -13,11 +13,12 @@ source/license/README file is copied from the archive unchanged. The historical
 [`reqwest-3017.patch`](001-per-request-connect-timeout/reqwest-3017.patch) is
 upstream filing evidence, not the complete reconstruction patch.
 
-The optional [security lockfile producer](../../.github/workflows/dependency-security-lockfiles.yml)
-checks the archive checksum, applies the complete delta, and compares all
-shipped source, manifest, licenses and README before Cargo runs. The ordinary
-vendor-integrity gate independently checks the committed drift manifest.
-See [#5912's evidence and remaining hosted gates](../dependency-security-upgrade-5912.md).
+The required per-PR `dependency-audit` job in
+`.github/workflows/ci.yml` checks the archive checksum, applies the complete
+delta, and compares all shipped source, manifest, licenses and README before
+Cargo runs. The same job checks the fixed security floors across every committed
+lockfile. The ordinary vendor-integrity gate independently checks the committed
+drift manifest. See [dependency policy](../dependency-policy.md#security-floor-pins).
 
 All patch retirement plans and behavioral regression requirements remain in
 their individual directories. No patch is retired by this upstream refresh.

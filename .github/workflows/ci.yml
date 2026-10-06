@@ -1726,6 +1726,42 @@ jobs:
           path: ${{ runner.temp }}/hyper-patch-stack
           retention-days: 30
 
+      - name: Reconstruct the complete pinned reqwest patch
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/reqwest-patch"
+          mkdir -p "$evidence"
+          curl --fail --location --retry 5 --silent --show-error \
+            https://static.crates.io/crates/reqwest/reqwest-0.13.4.crate \
+            --output "$evidence/reqwest-0.13.4.crate"
+          echo "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3  $evidence/reqwest-0.13.4.crate" | sha256sum --check
+          tar -xzf "$evidence/reqwest-0.13.4.crate" -C "$evidence"
+          patch_file="$PWD/docs/upstream-reqwest-patches/reqwest-ferrum.patch"
+          # RUNNER_TEMP is outside the repository, so apply from the extracted
+          # crate root; --directory only accepts a repository-relative path.
+          (cd "$evidence/reqwest-0.13.4" && git apply "$patch_file")
+          diff -r "$evidence/reqwest-0.13.4/src" \
+            vendor/reqwest-0.13.4-ferrum-patched/src
+          cmp "$evidence/reqwest-0.13.4/Cargo.toml" \
+            vendor/reqwest-0.13.4-ferrum-patched/Cargo.toml
+          cmp "$evidence/reqwest-0.13.4/LICENSE-MIT" \
+            vendor/reqwest-0.13.4-ferrum-patched/LICENSE-MIT
+          cmp "$evidence/reqwest-0.13.4/LICENSE-APACHE" \
+            vendor/reqwest-0.13.4-ferrum-patched/LICENSE-APACHE
+          cmp "$evidence/reqwest-0.13.4/README.md" \
+            vendor/reqwest-0.13.4-ferrum-patched/README.md
+
+      - name: Retain reqwest patch reconstruction evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: reqwest-patch-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/reqwest-patch
+          retention-days: 30
+
+      - name: Verify dependency security floors
+        run: python3 scripts/verify_dependency_security_chain.py
+
       - name: BoringCache Cargo
         uses: ./.github/actions/setup-boringcache
         with:

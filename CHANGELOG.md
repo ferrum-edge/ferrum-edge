@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Make reqwest patch reconstruction and dependency security floors required
+  CI** (#6019). The blocking dependency audit now reconstructs the published
+  reqwest archive and checks security floors across committed lockfiles; the
+  obsolete lockfile workflow and completed #5912 evidence page are removed.
+  The dependency policy now documents how to lift the GCP, Smithy, and xxhash
+  pins.
+
+### Fixed
+
+- **Backend HTTP/2 resets mid-response count as backend failures** (#6019).
+  A backend `RST_STREAM` or `GOAWAY` with any reason other than `NO_ERROR`
+  after response headers reached the body classifier as a hyper body error
+  whose text matched no heuristic. It was logged as
+  `body_error_class=request_error`, and circuit breakers and passive health
+  recorded the response as a success. `classify_body_error` now reads the typed
+  `h2::Error` in the source chain and classifies these as `protocol_error`,
+  which counts as a backend failure. This covers direct HTTP/2 and gRPC
+  response bodies, and any other body whose error chain carries the h2 error.
+  Only frames the backend sent, or that h2 sent
+  because the backend broke the protocol, are charged to it. A reset the
+  gateway raises itself is not. `NO_ERROR` is unchanged: hyper still ends the
+  body as an early response. Backends that reset streams mid-response can now
+  open circuit breakers and fail passive health checks where they did not
+  before. Dashboards keyed on `body_error_class` will see these responses move
+  from `request_error` to `protocol_error`.
+
+### Changed
+
+- **Test coverage for HTTP/2 early responses** (#6019). A scripted direct-H2
+  backend now answers before reading any request DATA, then drains the full
+  2 MiB upload, alongside the existing variant that reads one DATA frame first.
 ### Fixed
 
 - **HTTP/2 bodies no longer leave as one DATA frame per small window
@@ -22,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never reaches 256 bytes still progresses. The frontend HTTP/2 server now
   configures a hyper timer for this wait. Ferrum's receive-side DATA-frame
   budget fix (h2 patch 002) is unchanged.
+- **A request that joins the capability probe's backend setup keeps its own
+  connect timeout** (#6032). Connect timeout is not part of a pool key, so a
+  gRPC, direct HTTP/2, HTTP/3 or gateway-to-mesh HBONE request arriving while
+  the startup, reload or periodic capability probe was dialling the same
+  backend joined the probe's setup. The probe caps its connect budget at 5 s,
+  so the request failed when the probe did, even with a much longer
+  `backend_connect_timeout_ms` (for example `UNAVAILABLE` during startup). A
+  failed probe-owned setup is no longer shared with a joined request, including
+  when the probe's own capped budget expires inside the HBONE dial: the request
+  dials again under its own route connect timeout. The request can then wait
+  for the rest of the probe's budget plus its own full connect timeout. A gRPC
+  probe's failure keeps the probe's log level, so an expected h2c miss stays
+  DEBUG and the joined request logs only its own outcome.
 - **Direct-H2 uploads no longer relay a client reset as a complete body**
   (#6022). hyper reports an HTTP/2 client's `RST_STREAM(NO_ERROR)` as a clean
   end of the request body. A non-gRPC upload relayed through the direct HTTP/2
@@ -481,7 +527,7 @@ authenticated GHCR proof and revision-label limits.
   `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; issue #5912 is closed. Its
   exact-head hosted checks passed, followed by the separately verified 0.9.11
   release qualification and publication. Advisory disposition remains separate.
-  See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
+  See the [security-floor policy](docs/dependency-policy.md#security-floor-pins)
   and [completed source integration evidence](docs/releases/v0.9.11.md#dependency-source-integration-evidence).
 
 - **Conditional admin reads and restores use authoritative strong state tags**

@@ -52,9 +52,9 @@ Artifact-only changes and verifier changes select this job through the CI
 planner without depending on skipped Rust build artifacts, so syntax-only patch
 parsing cannot stand in for reconstruction.
 The #5912 refresh ports the complete stack to the published 1.10.0 source.
-The existing CI archive/test bindings still need the automation owner's update;
-the optional security lockfile producer uses the new pins. See
-[the security upgrade record](../dependency-security-upgrade-5912.md).
+The required `dependency-audit` job reconstructs this archive and the reqwest
+archive before Cargo runs, and checks committed lockfiles against the security
+floors. See [dependency policy](../dependency-policy.md#security-floor-pins).
 
 ## Lifecycle
 

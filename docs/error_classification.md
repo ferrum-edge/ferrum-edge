@@ -77,7 +77,7 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 | gRPC | [`classify_grpc_proxy_error`](../src/retry.rs) | `&GrpcProxyError` (typed enum with kinds) | Pattern match on `BackendUnavailable.kind: GrpcBackendUnavailableKind` → typed `is_port_exhaustion` source walk → no message substring matching |
 | WebSocket / generic boxed | [`classify_boxed_error`](../src/retry.rs) | `&dyn Error` | Typed walk: `StreamSetupError` (TCP/UDP setup) → `tokio_tungstenite::tungstenite::Error` (RFC 6455 ConnectionClosed/AlreadyClosed/Protocol) → `io::Error` → `hyper::Error` → bounded Display/Debug fallback |
 | TCP relay (stream) | [`classify_stream_error`](../src/proxy/tcp_proxy.rs) | `&anyhow::Error` | Thin wrapper over `classify_boxed_error` — same typed walk |
-| Streaming response body | [`classify_body_error`](../src/retry.rs) | `&dyn Error` | Typed walk for io/hyper, returns `(ErrorClass, client_disconnected: bool)` |
+| Streaming response body | [`classify_body_error`](../src/retry.rs) | `&dyn Error` | Typed walk for io/h2/hyper, returns `(ErrorClass, client_disconnected: bool)` |
 
 The H3 pool returns a typed [`H3PoolError`](../src/http3/client.rs) whose `request_on_wire()` flag is the **authoritative** body-on-wire signal — `connection_error` is derived directly from `!e.request_on_wire()` at H3 dispatch sites, NOT from the class. See [docs/http3.md](http3.md) for that contract.
 
@@ -218,6 +218,8 @@ The eager-buffer path (`buffered_backend_response_from_eager_collect` in [`src/p
 A pre-wire class is impossible on the eager-buffer path (response headers have already arrived, so a handshake failure cannot appear here), but one is coerced to `ConnectionReset` anyway so the documented `connection_error == !request_reached_wire(error_class)` boundary holds even if the classifier changes. Dispatch-level failures keep their classified pre-wire label so `retry_on_connect_failure` can still rotate to another target.
 
 A backend FIN (or `UnexpectedEof`) before a complete HTTP body is `ConnectionClosed`. That class is post-wire, so `BackendResponse::connection_error` stays `false` and `retry_on_connect_failure` does not replay the request; non-idempotent methods are not retried via the connect-failure path. `error_class_is_post_wire_backend_failure` includes `ConnectionClosed` (but not the `RequestError` catch-all), so a truncated body trips the circuit breaker as a backend failure even when the relayed status was 200. When the public status is already 502 and 502 is in `failure_status_codes`, the breaker already trips via status.
+
+A backend HTTP/2 `RST_STREAM` or `GOAWAY` after the response headers is `ProtocolError` when its reason is anything but `NO_ERROR`. hyper reports it as a body error whose source is the `h2::Error`, and its text matches no fallback token, so `classify_body_error` reads the typed error rather than the message. Only an error the backend sent (`is_remote()`), or one h2 raised because the backend broke the protocol (`is_library()`), is charged to the backend. A reset the gateway raises itself, or a bare `h2::Error::from(Reason)` such as the upload pump's relayed client `CANCEL`, keeps its previous class. `NO_ERROR` is not a failure: hyper ends the body cleanly on a `NO_ERROR` reset (an early response, RFC 9113 §8.1), and a `NO_ERROR` `GOAWAY` is a graceful shutdown.
 
 ## WebSocket graceful close
 
