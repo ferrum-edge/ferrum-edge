@@ -366,6 +366,7 @@ async fn back_compat_single_scope_accepts_matching_namespace() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let mut stream = client
         .subscribe(request)
@@ -406,6 +407,7 @@ async fn back_compat_single_scope_rejects_mismatched_namespace() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "staging".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let err = client
         .subscribe(request)
@@ -451,6 +453,7 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let mut prod_stream = prod_client.subscribe(prod_req).await.unwrap().into_inner();
     let prod_first = timeout(Duration::from_secs(5), prod_stream.message())
@@ -477,6 +480,7 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "staging".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let mut staging_stream = staging_client
         .subscribe(staging_req)
@@ -505,6 +509,7 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "dev".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let err = dev_client.subscribe(dev_req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
@@ -540,6 +545,7 @@ async fn multi_ns_all_scope_filters_initial_snapshot_per_subscriber() {
             config_sync_build: config_sync_build_identity().to_string(),
             namespace: ns.to_string(),
             real_ip_header: Some(String::new()),
+            backend_egress_policy: None,
         });
         let mut stream = client.subscribe(req).await.unwrap().into_inner();
         let first = timeout(Duration::from_secs(5), stream.message())
@@ -581,6 +587,7 @@ async fn multi_ns_set_scope_rejects_token_without_ns_by_default() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let err = client.subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -606,6 +613,7 @@ async fn multi_ns_rejects_malformed_ns_claim_before_snapshot() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let err = client.subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -635,6 +643,7 @@ async fn multi_ns_trust_bundles_are_not_sent_to_tenant_side_channel() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let mut stream = client.subscribe(req).await.unwrap().into_inner();
     let first = timeout(Duration::from_secs(5), stream.message())
@@ -783,6 +792,7 @@ async fn require_claim_rejects_token_without_ns() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let err = client.subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -813,6 +823,7 @@ async fn require_claim_accepts_matching_string_claim() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let mut stream = client
         .subscribe(req)
@@ -853,6 +864,7 @@ async fn array_claim_authorises_multiple_namespaces() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     assert!(
         client_prod.subscribe(req_prod).await.is_ok(),
@@ -867,6 +879,7 @@ async fn array_claim_authorises_multiple_namespaces() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "dev".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let err = client_dev.subscribe(req_dev).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -900,6 +913,7 @@ async fn claim_overrides_cp_scope_when_more_restrictive() {
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: "prod".to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     });
     let err = client.subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
