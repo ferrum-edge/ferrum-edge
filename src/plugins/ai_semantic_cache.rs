@@ -254,6 +254,11 @@ const REDIS_QUARANTINE_WARN_INTERVAL_SECS: u64 = 60;
 /// Emit an operational warning on the first failure and every N thereafter
 /// (also gated by [`REDIS_QUARANTINE_WARN_INTERVAL_SECS`]).
 const REDIS_QUARANTINE_WARN_EVERY: u64 = 100;
+/// Per-instance ceiling on concurrent dedicated quarantine connections. Each
+/// compare-and-delete dials, screens, and drives its own non-reconnecting
+/// connection, so distinct poisoned keys must not turn a request burst into a
+/// Redis connection storm. Requests that find every permit taken never wait.
+const MAX_CONCURRENT_REDIS_QUARANTINE_DIALS: usize = 4;
 
 /// Deployment-safe hard maximum for a single cached response body. Configured
 /// `max_entry_size_bytes` values above this are rejected at admission so Redis
@@ -818,23 +823,72 @@ impl RedisQuarantineSuppressor {
     }
 
     /// Insert or refresh a marker under the hard cap.
+    fn insert(&self, cache_key: &str, marker: RedisQuarantineMarker) {
+        self.upsert(cache_key, marker, |_| true);
+    }
+
+    /// Atomically claim the per-key in-flight quarantine marker for one
+    /// observed inadmissible value.
+    ///
+    /// Installed *before* the compare-and-delete dial so concurrent requests
+    /// that fetched the same poisoned bytes skip their own dial, and later
+    /// requests skip the Redis read entirely while it is in flight. Returns
+    /// `false` when an unexpired marker for the same fingerprint already
+    /// exists. An expired marker, or one for a different (replaced) value, is
+    /// taken over. The claim carries the ordinary TTL, so a cancelled or
+    /// deferred quarantine can suppress the key for at most that long. The
+    /// outcome handler clears it on success or a proven mismatch and keeps it
+    /// (refreshed) on failure.
+    fn try_claim(&self, cache_key: &str, fingerprint: [u8; 32], now: Instant) -> bool {
+        // Fast path: an unexpired marker for the same poison is contention, not
+        // a claim. Return before allocating the key `String` that `upsert`
+        // needs for its map entry. The later `upsert` re-checks atomically, so
+        // a racing insert cannot turn this into a double claim.
+        let contended = self.entries.get(cache_key).is_some_and(|existing| {
+            existing.expires_at > now && existing.fingerprint == fingerprint
+        });
+        if contended {
+            return false;
+        }
+        let marker = RedisQuarantineMarker {
+            fingerprint,
+            expires_at: now + self.ttl,
+        };
+        self.upsert(cache_key, marker, |existing| {
+            existing.expires_at <= now || existing.fingerprint != fingerprint
+        })
+    }
+
+    /// Insert `marker`, or replace an existing marker when `replace` accepts
+    /// it. Returns whether `marker` was installed.
     ///
     /// Capacity pressure uses constant-work victim selection (one arbitrary
     /// DashMap sample), never a request-driven full-map expired sweep.
     /// Expired markers are cleared lazily on lookup (`is_suppressed` /
     /// `matches_active`). Slot accounting stays exact under concurrency via
     /// `entry_count` reserve/release without a process-wide lock.
-    fn insert(&self, cache_key: &str, marker: RedisQuarantineMarker) {
+    fn upsert(
+        &self,
+        cache_key: &str,
+        marker: RedisQuarantineMarker,
+        replace: impl Fn(&RedisQuarantineMarker) -> bool,
+    ) -> bool {
         use dashmap::mapref::entry::Entry as DashEntry;
 
         let mut marker = Some(marker);
         loop {
             match self.entries.entry(cache_key.to_string()) {
                 DashEntry::Occupied(mut occupied) => {
-                    if let Some(marker) = marker.take() {
-                        occupied.insert(marker);
+                    if !replace(occupied.get()) {
+                        return false;
                     }
-                    return;
+                    return match marker.take() {
+                        Some(marker) => {
+                            occupied.insert(marker);
+                            true
+                        }
+                        None => false,
+                    };
                 }
                 DashEntry::Vacant(vacant) => {
                     let reserved = self
@@ -844,12 +898,16 @@ impl RedisQuarantineSuppressor {
                         })
                         .is_ok();
                     if reserved {
-                        if let Some(marker) = marker.take() {
-                            vacant.insert(marker);
-                        } else {
-                            self.release_slot();
-                        }
-                        return;
+                        return match marker.take() {
+                            Some(marker) => {
+                                vacant.insert(marker);
+                                true
+                            }
+                            None => {
+                                self.release_slot();
+                                false
+                            }
+                        };
                     }
                     drop(vacant);
                 }
@@ -862,7 +920,7 @@ impl RedisQuarantineSuppressor {
                 if let Some(victim) = victim {
                     self.clear(&victim);
                 } else {
-                    return;
+                    return false;
                 }
             }
         }
@@ -1023,6 +1081,10 @@ pub struct AiSemanticCache {
     /// Prevents immediate re-download/parse/delete amplification of the same
     /// inadmissible remote value. Per-instance so reload generations isolate.
     redis_quarantine: RedisQuarantineSuppressor,
+    /// Bounds concurrent dedicated quarantine compare-and-delete connections
+    /// for this instance ([`MAX_CONCURRENT_REDIS_QUARANTINE_DIALS`]). Acquired
+    /// with `try_acquire` only, so a request never waits on maintenance.
+    redis_quarantine_dials: Semaphore,
     /// HMAC key authenticating Redis envelopes. Required whenever
     /// `redis_client` is `Some`; also accepted without Redis so hit-side
     /// authenticity helpers remain unit-testable. Never logged.
@@ -1274,6 +1336,7 @@ impl AiSemanticCache {
                 Duration::from_secs(REDIS_QUARANTINE_TTL_SECONDS),
                 shard_amount,
             ),
+            redis_quarantine_dials: Semaphore::new(MAX_CONCURRENT_REDIS_QUARANTINE_DIALS),
             redis_integrity_key,
             created_at: Instant::now(),
             // Sentinel: never cleaned, so the first cleanup pass always runs.
@@ -1837,9 +1900,10 @@ impl AiSemanticCache {
     /// Apply a Redis quarantine compare-and-delete outcome (production and test
     /// seam).
     ///
-    /// Success clears any local suppressor. Failure installs a fingerprint+TTL
-    /// marker and emits a rate-limited redacted warning. Never converts a miss
-    /// into a hit; never logs key/payload material.
+    /// Success (including a proven mismatch) clears the key's local marker,
+    /// releasing the in-flight claim. Failure keeps a fingerprint+TTL marker
+    /// and emits a rate-limited redacted warning. Never converts a miss into a
+    /// hit; never logs key/payload material.
     fn apply_redis_quarantine_delete_outcome(
         &self,
         cache_key: &str,
@@ -1860,8 +1924,16 @@ impl AiSemanticCache {
     /// Quarantine an inadmissible Redis entry only if its raw bytes have not
     /// changed since lookup, then map the outcome through
     /// [`Self::apply_redis_quarantine_delete_outcome`]. Withheld maintenance
-    /// permissions install the same local marker without making Redis
-    /// unavailable; the bounded helper distinguishes them from I/O failures.
+    /// permissions or a server connection limit install the same local marker
+    /// without making Redis unavailable; the bounded helper distinguishes them
+    /// from I/O failures.
+    ///
+    /// The caller must already hold the key's in-flight claim
+    /// ([`RedisQuarantineSuppressor::try_claim`]), which collapses concurrent
+    /// requests on one poisoned key to a single dial. The dial semaphore then
+    /// bounds distinct poisoned keys. When every permit is taken this request
+    /// does not wait: it leaves the claim in place, so the key is suppressed
+    /// until the marker expires and is reconsidered afterwards.
     async fn quarantine_invalid_redis_entry(
         &self,
         redis: &RedisRateLimitClient,
@@ -1870,6 +1942,10 @@ impl AiSemanticCache {
         fingerprint: [u8; 32],
         observed_value: &[u8],
     ) {
+        let Ok(_dial_permit) = self.redis_quarantine_dials.try_acquire() else {
+            self.redis_quarantine.note_suppression();
+            return;
+        };
         // A false result means a concurrent writer changed or removed the
         // value. That is a successful race outcome: leave the replacement
         // untouched and allow a later lookup to reconsider it.
@@ -2550,6 +2626,58 @@ impl AiSemanticCache {
     #[allow(dead_code)]
     pub(crate) fn clear_redis_quarantine_for_tests(&self, cache_key: &str) {
         self.redis_quarantine.clear(cache_key);
+    }
+
+    /// Exercise the production per-key in-flight quarantine claim.
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_try_claim_for_tests(
+        &self,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+    ) -> bool {
+        self.redis_quarantine
+            .try_claim(cache_key, fingerprint, Instant::now())
+    }
+
+    /// Currently available dedicated quarantine dial permits.
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_dial_permits_for_tests(&self) -> usize {
+        self.redis_quarantine_dials.available_permits()
+    }
+
+    /// Hold every dedicated quarantine dial permit for the caller's scope so a
+    /// test can drive the exhaustion path. Permits release when the returned
+    /// vector drops.
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_hold_all_dials_for_tests(
+        &self,
+    ) -> Vec<tokio::sync::SemaphorePermit<'_>> {
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_REDIS_QUARANTINE_DIALS);
+        while let Ok(permit) = self.redis_quarantine_dials.try_acquire() {
+            held.push(permit);
+        }
+        held
+    }
+
+    /// Exercise the production quarantine path (permit gate included) without a
+    /// real Redis read.
+    #[allow(dead_code)]
+    pub(crate) async fn quarantine_invalid_redis_entry_for_tests(
+        &self,
+        redis: &RedisRateLimitClient,
+        redis_key: &str,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        observed_value: &[u8],
+    ) {
+        self.quarantine_invalid_redis_entry(
+            redis,
+            redis_key,
+            cache_key,
+            fingerprint,
+            observed_value,
+        )
+        .await;
     }
 }
 
@@ -5043,11 +5171,13 @@ impl Plugin for AiSemanticCache {
                             }
                             None => {
                                 let fingerprint = redis_quarantine_fingerprint_content(&data);
-                                // Concurrent same-poison marker (installed while
-                                // this request was fetching): skip another DEL.
-                                if self.redis_quarantine.matches_active(
+                                // Claim the per-key in-flight marker before the
+                                // dial. A concurrent same-poison claim (installed
+                                // while this request was fetching) skips another
+                                // DEL.
+                                if !self.redis_quarantine.try_claim(
                                     &cache_key,
-                                    &fingerprint,
+                                    fingerprint,
                                     Instant::now(),
                                 ) {
                                     self.redis_quarantine.note_suppression();
@@ -5094,11 +5224,10 @@ impl Plugin for AiSemanticCache {
                     }
                     Ok(BoundedRedisValue::Empty) => {
                         let fingerprint = redis_quarantine_fingerprint_empty();
-                        if self.redis_quarantine.matches_active(
-                            &cache_key,
-                            &fingerprint,
-                            Instant::now(),
-                        ) {
+                        if !self
+                            .redis_quarantine
+                            .try_claim(&cache_key, fingerprint, Instant::now())
+                        {
                             self.redis_quarantine.note_suppression();
                         } else {
                             debug!("ai_semantic_cache: quarantining empty Redis entry");
