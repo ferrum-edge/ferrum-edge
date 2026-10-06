@@ -1185,7 +1185,7 @@ async fn standalone_mongo_refuses_conditional_snapshots_and_restore_without_io()
                 generation: 1,
             }),
         },
-        expected: &expected,
+        expected,
         api_specs: &[],
         gateway_trust_bundles: None,
     };
