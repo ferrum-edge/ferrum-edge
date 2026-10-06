@@ -1736,8 +1736,10 @@ jobs:
             --output "$evidence/reqwest-0.13.4.crate"
           echo "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3  $evidence/reqwest-0.13.4.crate" | sha256sum --check
           tar -xzf "$evidence/reqwest-0.13.4.crate" -C "$evidence"
-          git apply --directory="$evidence/reqwest-0.13.4" \
-            docs/upstream-reqwest-patches/reqwest-ferrum.patch
+          patch_file="$PWD/docs/upstream-reqwest-patches/reqwest-ferrum.patch"
+          # RUNNER_TEMP is outside the repository, so apply from the extracted
+          # crate root; --directory only accepts a repository-relative path.
+          (cd "$evidence/reqwest-0.13.4" && git apply "$patch_file")
           diff -r "$evidence/reqwest-0.13.4/src" \
             vendor/reqwest-0.13.4-ferrum-patched/src
           cmp "$evidence/reqwest-0.13.4/Cargo.toml" \
