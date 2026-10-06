@@ -21,13 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   termination class is written. An authenticated request hands that summary to
   bounded detached delivery instead of awaiting it, and the summary's backend
   address is resolved before the check, so nothing awaits between the final
-  check and the client-visible response.
-- **Record the buffered gRPC backend outcome before response hooks.** Since
-  0.9.11 a buffered native gRPC response settled circuit-breaker, passive-health,
-  backend-admission, and least-connections accounting only after hooks and
-  logging, so a client disconnect during the hooks or a later authorization
-  terminal released a real backend outcome — including `UNAVAILABLE` in
-  trailers — as neutral. The outcome is recorded once the response is
+  check and the client-visible response. The expiry terminal no longer re-runs
+  the rejection-path `after_proxy` hooks, matching H1/H2 expiry during the
+  committed hooks: it keeps only gateway headers whose provenance the completed
+  hooks recorded. gRPC-Web keeps its CORS headers through that tracking, but a
+  native gRPC expiry response may omit gateway headers such as correlation IDs.
+- **Record the buffered gRPC backend outcome before response hooks.** In
+  0.9.11 and 0.9.12 (since #5993), a buffered native gRPC response settled
+  circuit-breaker, passive-health, backend-admission, and least-connections
+  accounting only after hooks and logging, so a client disconnect during the
+  hooks or a later authorization terminal released a real backend outcome —
+  including `UNAVAILABLE` in trailers — as neutral. The outcome is recorded once the response is
   collected within the lifetime; only an expiry detected by then stays neutral.
 - **Native H3 dispatch timing without an authorization plan.** An
   unauthenticated native H3 response-header wait with no client deadline no

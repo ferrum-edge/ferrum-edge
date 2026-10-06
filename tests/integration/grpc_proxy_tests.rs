@@ -5529,12 +5529,14 @@ fn grpc_retry_header_map_clone_preserves_duplicates_and_opaque_bytes() {
 
 // --- Buffered gRPC final authorization check ordering (#5993 / #5995) ---
 
-/// Authenticates the request with a short credential lifetime, then holds the
-/// buffered `on_response_body` hook past it, recording every committed
-/// observation and transaction summary the request produces.
+/// Authenticates the request with a far credential deadline, then ends that
+/// credential from inside the buffered `on_response_body` hook, recording every
+/// committed observation and transaction summary the request produces.
+///
+/// The expiry does not race real time: dispatch and collection cannot outlive a
+/// deadline five minutes out, and the hook shortens it to an instant that has
+/// already elapsed, so the expiry lands in the response-hook phase on every run.
 struct ExpiringCredentialResponseHookProbe {
-    credential_ttl: Duration,
-    response_hook_delay: Duration,
     committed_grpc_statuses: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     summaries: Arc<std::sync::Mutex<Vec<ferrum_edge::plugins::TransactionSummary>>>,
 }
@@ -5554,19 +5556,20 @@ impl ferrum_edge::plugins::Plugin for ExpiringCredentialResponseHookProbe {
         ctx: &mut ferrum_edge::plugins::RequestContext,
     ) -> ferrum_edge::plugins::PluginResult {
         ctx.authenticated_identity = Some("expiring-principal".to_string());
-        let credential_deadline = tokio::time::Instant::now() + self.credential_ttl;
+        let credential_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
         ctx.observe_credential_deadline(Some(credential_deadline));
         ferrum_edge::plugins::PluginResult::Continue
     }
 
     async fn on_response_body(
         &self,
-        _ctx: &mut ferrum_edge::plugins::RequestContext,
+        ctx: &mut ferrum_edge::plugins::RequestContext,
         _response_status: u16,
         _response_headers: &mut HashMap<String, String>,
         _body: &[u8],
     ) -> ferrum_edge::plugins::PluginResult {
-        tokio::time::sleep(self.response_hook_delay).await;
+        // The credential ends now, while the response hooks are running.
+        ctx.observe_credential_deadline(Some(tokio::time::Instant::now()));
         ferrum_edge::plugins::PluginResult::Continue
     }
 
@@ -5612,10 +5615,8 @@ async fn buffered_grpc_expiry_during_response_hooks_logs_one_unauthenticated_sum
     let committed_grpc_statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
     let summaries = Arc::new(std::sync::Mutex::new(Vec::new()));
     // The credential outlives backend dispatch and collection, then expires
-    // while `on_response_body` is still running.
+    // inside `on_response_body`.
     let probe = ExpiringCredentialResponseHookProbe {
-        credential_ttl: Duration::from_millis(1_000),
-        response_hook_delay: Duration::from_millis(1_500),
         committed_grpc_statuses: Arc::clone(&committed_grpc_statuses),
         summaries: Arc::clone(&summaries),
     };
@@ -5652,12 +5653,12 @@ async fn buffered_grpc_expiry_during_response_hooks_logs_one_unauthenticated_sum
     );
 
     // An authenticated request hands its summary to bounded detached delivery,
-    // so wait for it, then leave room for any second summary before counting.
+    // so wait for it. A second summary needs no extra wait: the old ordering
+    // wrote both synchronously before the client saw the response.
     let wait_until = tokio::time::Instant::now() + Duration::from_secs(5);
     while summaries.lock().unwrap().is_empty() && tokio::time::Instant::now() < wait_until {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    tokio::time::sleep(Duration::from_millis(250)).await;
     let summaries = summaries.lock().unwrap().clone();
     assert_eq!(
         summaries.len(),

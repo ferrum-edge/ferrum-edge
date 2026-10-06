@@ -1651,25 +1651,52 @@ async fn recv_h3_response_under_authorization(
     read_timeout_ms: u64,
     auth: H3Authorization<'_>,
 ) -> H3PoolResult<http::Response<()>> {
+    await_h3_response_header_wait(
+        auth,
+        read_timeout_ms,
+        recv_h3_response_with_timeout(stream, read_timeout_ms),
+    )
+    .await
+}
+
+/// Bound a response-header receive that already applies `read_timeout_ms`
+/// itself by the request's authorization plan and client deadline.
+async fn await_h3_response_header_wait<F, T>(
+    auth: H3Authorization<'_>,
+    read_timeout_ms: u64,
+    recv: F,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = H3PoolResult<T>>,
+{
     // With no authorization plan and no client deadline there is nothing to
     // compose with the read timeout `recv_h3_response_with_timeout` already
     // applies, so an unauthenticated request skips the outer bound and its
     // second timer.
     if auth.is_unbounded() {
-        return recv_h3_response_with_timeout(stream, read_timeout_ms).await;
+        return recv.await;
     }
     let protocol_at = if read_timeout_ms > 0 {
         tokio::time::Instant::now().checked_add(Duration::from_millis(read_timeout_ms))
     } else {
         None
     };
-    await_h3_dispatch(
-        auth,
-        true,
-        protocol_at,
-        recv_h3_response_with_timeout(stream, read_timeout_ms),
-    )
-    .await
+    await_h3_dispatch(auth, true, protocol_at, recv).await
+}
+
+/// Controlled clock/receive access to the production response-header wait.
+#[doc(hidden)]
+pub async fn await_h3_response_header_wait_for_test<F, T>(
+    client_at: Option<tokio::time::Instant>,
+    plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    read_timeout_ms: u64,
+    recv: F,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = H3PoolResult<T>>,
+{
+    let auth = H3Authorization::new(client_at, plan);
+    await_h3_response_header_wait(auth, read_timeout_ms, recv).await
 }
 
 /// Collect a retained response under the same admitted lifetime as checkout,
