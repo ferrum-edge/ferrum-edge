@@ -1704,9 +1704,12 @@ fn deployment_snapshot_covers_real_mongo_resource_and_identity_documents() {
     );
     assert!(
         snapshot.contains("cursor.deserialize_current()?")
-            && snapshot.contains("serde_json::to_value(&document)?")
-            && snapshot.contains("mongodb::bson::to_vec(&document)?"),
-        "raw consumer credential/hash and identity reservation fields must be fenced losslessly"
+            && snapshot.contains("deployment_evidence_bson(")
+            && snapshot.contains("mongodb::bson::to_vec(&document)?")
+            && snapshot.contains("Sha256::digest(&bson)")
+            && !snapshot.contains("bson_hex"),
+        "raw consumer credential/hash and identity reservation fields must be fenced losslessly \
+         by BSON digest, without copying stored binary content into the evidence"
     );
     assert!(
         !snapshot.contains("document.remove("),

@@ -71,6 +71,8 @@ pub(crate) mod charged_decode;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
+#[doc(hidden)]
+pub mod early_route_total;
 pub mod fault_injection;
 pub mod geo_restriction;
 pub mod graphql;
@@ -10348,13 +10350,15 @@ pub trait Plugin: Send + Sync {
     /// must return `true`. A plugin that publishes a later backend-header
     /// overlay must also return `true` so earlier replay/cache plugins cannot
     /// bind a request before its final backend-visible headers exist; the
-    /// resulting conservative clone is an accepted cost.
+    /// resulting conservative clone is an accepted cost. A change made from
+    /// `authenticate`, `authorize`, or the pre-`before_proxy` body
+    /// normalization must be declared too (issue #6008).
     fn modifies_request_headers(&self) -> bool {
         false
     }
 
     /// Returns `true` if this plugin may rewrite the backend-visible query
-    /// string during `before_proxy`.
+    /// string during `before_proxy` (or any earlier pre-proxy phase).
     ///
     /// Replay plugins use this independently from header mutation: a
     /// query-only transformer still changes the operation even when it does not
@@ -10364,11 +10368,40 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Returns `true` if this plugin may rewrite the effective backend,
-    /// upstream, authority, or path during `before_proxy`.
+    /// upstream, authority, or path during `before_proxy` (or any earlier
+    /// pre-proxy phase).
     ///
     /// Replay plugins use this to ensure their destination partition is built
     /// only after routing has reached its final state.
     fn modifies_request_destination(&self) -> bool {
+        false
+    }
+
+    /// The lower-case names of every request header this plugin may change,
+    /// when that set is fixed at construction. Consulted only when
+    /// [`Self::modifies_request_headers`] is `true`; `None` (the default) means
+    /// any header may change.
+    ///
+    /// The early route-total preview (issue #6008) uses it to keep deciding
+    /// `mesh_route_dispatch` rules that match on other headers. Declare a name
+    /// here only when the plugin can never change any other header.
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Returns `true` when this plugin's request-input declarations
+    /// ([`Self::modifies_request_headers`], [`Self::modified_request_header_names`],
+    /// [`Self::modifies_request_query`], and [`Self::modifies_request_destination`])
+    /// cover every header, query, path, or destination change it makes in ANY
+    /// phase before backend dispatch: `authenticate`, `authorize`, the
+    /// pre-`before_proxy` body normalization, and `before_proxy`.
+    ///
+    /// Built-in plugins are audited and always treated as declared. A custom
+    /// plugin that returns `false` (the default) is treated as able to change
+    /// any request input in any of those phases, so a body collected before
+    /// `before_proxy` gets no early route-total bound from a
+    /// `mesh_route_dispatch` rule matching on those inputs (issue #6008).
+    fn declares_request_input_mutations(&self) -> bool {
         false
     }
 
@@ -10801,6 +10834,30 @@ pub trait Plugin: Send + Sync {
     /// The default is a no-op; `mesh_route_dispatch` uses this to preserve
     /// standalone behavior while coordinating multiple cached instances.
     fn enable_deferred_unmatched_rejection(&self) {}
+
+    /// Pure preview of the route total deadline this instance would publish
+    /// in `before_proxy`, for the body collectors that run before it (issue
+    /// #6008). Never runs a hook or mutates the request. `None` (the default)
+    /// means the instance cannot be previewed; a `mesh_route_dispatch` step
+    /// that answers `None` disables the early route bound for the request.
+    #[doc(hidden)]
+    fn early_route_total<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        _host: Option<&'a str>,
+        _query: Option<&utils::query::CanonicalQuery>,
+        _facts: early_route_total::EarlyRouteTotalFacts<'_>,
+    ) -> Option<early_route_total::EarlyRouteTotalStep<'a>> {
+        None
+    }
+
+    /// Whether a matched rule of this instance may inject a fault, which marks
+    /// the request `fault_injected` so a later instance's rule fault stands
+    /// down. Consulted only by the early route-total preview (issue #6008).
+    #[doc(hidden)]
+    fn may_inject_route_fault(&self) -> bool {
+        false
+    }
 
     /// Returns `true` if this plugin participates in target-aware backend
     /// admission after load balancing and before backend dispatch.

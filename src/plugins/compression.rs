@@ -1747,6 +1747,20 @@ impl Plugin for CompressionPlugin {
             || self.config.decompress_request
     }
 
+    /// `Accept-Encoding` removal and the `Cache-Control: no-transform` merge in
+    /// `before_proxy`, and the coding metadata the pre-`before_proxy` request
+    /// decompression rewrites.
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        let names = [
+            "accept-encoding",
+            "cache-control",
+            "content-encoding",
+            "content-length",
+            "x-ferrum-original-content-encoding",
+        ];
+        Some(Vec::from(names.map(String::from)))
+    }
+
     fn modifies_request_body(&self) -> bool {
         self.config.decompress_request
     }

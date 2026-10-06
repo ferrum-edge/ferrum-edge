@@ -1163,7 +1163,7 @@ async fn conditional_restore_rolls_back_all_phases_and_checks_empty_replacements
 async fn standalone_mongo_refuses_conditional_snapshots_and_restore_without_io() {
     use ferrum_edge::config::db_backend::{
         AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
-        NamespaceConfigAdmissionLeaseRef, atomic_batch_unsupported,
+        NamespaceConfigAdmissionLeaseRef, SnapshotDigest, atomic_batch_unsupported,
     };
 
     let store = ferrum_edge::_test_support::mongo_store_new_unconnected_for_test(vec![]).unwrap();
@@ -1172,7 +1172,7 @@ async fn standalone_mongo_refuses_conditional_snapshots_and_restore_without_io()
         Err(error) => error,
     };
     assert!(atomic_batch_unsupported(&error).is_some());
-    let expected = json!({});
+    let expected = SnapshotDigest::of_representation(&json!({})).unwrap();
     let restore = ConditionalNamespaceRestore {
         graph: AtomicBatchGraph {
             namespace: "ferrum",
@@ -1185,7 +1185,7 @@ async fn standalone_mongo_refuses_conditional_snapshots_and_restore_without_io()
                 generation: 1,
             }),
         },
-        expected: &expected,
+        expected,
         api_specs: &[],
         gateway_trust_bundles: None,
     };
@@ -1298,7 +1298,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
         .load_conditional_namespace_snapshot(&namespace)
         .await
         .unwrap()
-        .representation()
+        .digest()
         .unwrap();
     let consumer: Consumer = serde_json::from_value(json!({
         "namespace": namespace, "id": "concurrent", "username": "concurrent"
@@ -1323,7 +1323,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
                 generation,
             }),
         },
-        expected: &expected,
+        expected,
         api_specs: &[],
         gateway_trust_bundles: None,
     };
@@ -1346,7 +1346,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
         .load_conditional_namespace_snapshot(&namespace)
         .await
         .unwrap()
-        .representation()
+        .digest()
         .unwrap();
     // A matching state with a released admission lease cannot commit either.
     assert!(
@@ -1354,7 +1354,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
             .await
             .unwrap()
     );
-    restore.expected = &current;
+    restore.expected = current;
     let error = db
         .restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
         .await
@@ -1364,7 +1364,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
         db.load_conditional_namespace_snapshot(&namespace)
             .await
             .unwrap()
-            .representation()
+            .digest()
             .unwrap(),
         current
     );
@@ -1390,7 +1390,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
         .load_conditional_namespace_snapshot(&namespace)
         .await
         .unwrap()
-        .representation()
+        .digest()
         .unwrap();
     assert_ne!(empty, current);
     let error = db
@@ -1404,7 +1404,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
     );
     // An empty-to-empty replacement still checks the state and lease, but it
     // must not fabricate a resource change or advance the namespace watermark.
-    restore.expected = &empty;
+    restore.expected = empty;
     db.restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
         .await
         .unwrap();
@@ -1412,7 +1412,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
         db.load_conditional_namespace_snapshot(&namespace)
             .await
             .unwrap()
-            .representation()
+            .digest()
             .unwrap(),
         empty
     );
@@ -1587,7 +1587,7 @@ where
         .load_conditional_namespace_snapshot(&namespace)
         .await
         .unwrap()
-        .representation()
+        .digest()
         .unwrap();
     let mut guard = ferrum_edge::_test_support::lock_namespace_config_admission_db_for_test(
         db.clone(),
@@ -1611,7 +1611,7 @@ where
             plugin_configs: &[],
             admission_lease: Some(guard.lease_ref()),
         },
-        expected: &expected,
+        expected,
         api_specs: &[],
         gateway_trust_bundles: None,
     };
@@ -1664,10 +1664,10 @@ where
         .load_conditional_namespace_snapshot(&namespace)
         .await
         .unwrap()
-        .representation()
+        .digest()
         .unwrap();
     let mut restore = restore;
-    restore.expected = &current;
+    restore.expected = current;
     set_expiry(namespace.clone(), -1).await;
     let error = db
         .restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
@@ -1678,7 +1678,7 @@ where
         db.load_conditional_namespace_snapshot(&namespace)
             .await
             .unwrap()
-            .representation()
+            .digest()
             .unwrap(),
         current
     );
@@ -1697,7 +1697,7 @@ where
         db.load_conditional_namespace_snapshot(&namespace)
             .await
             .unwrap()
-            .representation()
+            .digest()
             .unwrap(),
         current
     );
@@ -2493,13 +2493,14 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         AtomicBatchFault, AtomicBatchPhase, set_atomic_batch_fault_for_test,
     };
     use ferrum_edge::config::db_backend::{
-        NamespaceConfigAdmissionLeaseRef, NamespacePreconditionFailed,
+        NamespaceConfigAdmissionLeaseRef, NamespacePreconditionFailed, SnapshotDigest,
         is_batch_admission_lease_lost,
     };
     use ferrum_edge::config::deployment_mutation::DeploymentPrecondition;
     use ferrum_edge::config::types::Consumer;
 
     assert_deployment_external_dependencies_refused(db.clone()).await;
+    assert_issued_deployment_evidence_authorizes_the_transaction(db.clone()).await;
 
     let validation_http_client = ferrum_edge::plugins::PluginHttpClient::default();
     let namespace = format!("deployment-{}", uuid::Uuid::new_v4());
@@ -2600,7 +2601,33 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
         opened.body["namespace_etag"].as_str().unwrap()
     );
     assert_eq!(opened.body["api_specs"][0]["id"], spec_id);
-    assert!(opened.body["api_specs"][0]["spec_content"].is_array());
+    // Stored spec documents appear only as digest and length, once per view.
+    let stored = db.load_deployment_snapshot(&namespace).await.unwrap();
+    let spec_content = &opened.body["api_specs"][0]["spec_content"];
+    assert_eq!(
+        spec_content["len"],
+        stored.snapshot.api_specs[0].spec_content.len()
+    );
+    assert_eq!(spec_content["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        opened.body["api_specs"],
+        opened.body["evidence"]["resources"][5]
+    );
+    // One base64 copy of the stored bytes travels outside the evidence.
+    let content = &opened.body["api_spec_contents"][0];
+    assert_eq!(content["id"], spec_id);
+    let encoded = content["spec_content_base64"].as_str().unwrap();
+    let decoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+    };
+    assert_eq!(decoded, stored.snapshot.api_specs[0].spec_content);
+    assert!(
+        !opened.body["evidence"].to_string().contains(encoded),
+        "stored bytes must not enter the digested evidence"
+    );
     for header in [
         None,
         Some("*"),
@@ -2823,7 +2850,7 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             .unwrap();
         let precondition = DeploymentPrecondition {
             namespace: &namespace,
-            expected: &original.body["evidence"],
+            expected: SnapshotDigest::of_representation(&original.body["evidence"]).unwrap(),
             validation_http_client: &validation_http_client,
             lease: NamespaceConfigAdmissionLeaseRef {
                 owner: &owner,
@@ -2863,12 +2890,12 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
 
     // Entry loss with matching evidence cannot authorize either mutation.
     let snapshot = db.load_deployment_snapshot(&namespace).await.unwrap();
-    let exact = snapshot.representation().unwrap();
+    let exact = snapshot.digest().unwrap();
     let spec = &snapshot.snapshot.api_specs[0];
     let bundle = deployment_bundle(&snapshot, "deployment", &spec_id);
     let precondition = DeploymentPrecondition {
         namespace: &namespace,
-        expected: &exact,
+        expected: exact,
         validation_http_client: &validation_http_client,
         lease: NamespaceConfigAdmissionLeaseRef {
             owner: "missing-owner",
@@ -3088,6 +3115,90 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
             .unwrap()
             .unwrap(),
         trust_before
+    );
+}
+
+/// The evidence issued by `GET /deployment-snapshot` digests to exactly what
+/// the store recomputes inside its mutation transaction, so issued authority
+/// is spendable at the transaction boundary itself, not only via a fresh read.
+async fn assert_issued_deployment_evidence_authorizes_the_transaction(
+    db: Arc<dyn DatabaseBackend>,
+) {
+    use ferrum_edge::config::db_backend::{NamespaceConfigAdmissionLeaseRef, SnapshotDigest};
+    use ferrum_edge::config::deployment_mutation::DeploymentPrecondition;
+
+    let validation_http_client = ferrum_edge::plugins::PluginHttpClient::default();
+    let namespace = format!("issued-{}", uuid::Uuid::new_v4());
+    let (base, _shutdown) = start_admin(admin_state(db.clone(), JWT_SECRET)).await;
+    let document = json!({
+        "openapi": "3.0.3", "info": {"title": "Issued", "version": "1"},
+        "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": "issued", "listen_path": "/issued",
+            "backend_host": "backend.example.com", "backend_port": 8080}
+    });
+    let imported = send_ns(
+        Method::POST,
+        &base,
+        "/api-specs",
+        &admin_token(),
+        None,
+        Some(&document),
+        &namespace,
+    )
+    .await;
+    assert_eq!(imported.status, 201, "{}", imported.body);
+    let spec_id = imported.body["id"].as_str().unwrap().to_string();
+
+    let issued = get_ns(&base, "/deployment-snapshot", &namespace).await;
+    assert_eq!(issued.status, 200, "{}", issued.body);
+    let expected = SnapshotDigest::of_representation(&issued.body["evidence"]).unwrap();
+    // The issued evidence and the streamed store digest are one computation.
+    assert_eq!(
+        db.load_deployment_snapshot(&namespace)
+            .await
+            .unwrap()
+            .digest()
+            .unwrap(),
+        expected
+    );
+    // Reissuing an unchanged namespace yields the same authority.
+    assert_eq!(
+        get_ns(&base, "/deployment-snapshot", &namespace).await.etag,
+        issued.etag
+    );
+
+    let owner = uuid::Uuid::new_v4().to_string();
+    let generation = db
+        .try_acquire_namespace_config_admission_lease(&namespace, &owner)
+        .await
+        .unwrap()
+        .unwrap();
+    let precondition = DeploymentPrecondition {
+        namespace: &namespace,
+        expected,
+        validation_http_client: &validation_http_client,
+        lease: NamespaceConfigAdmissionLeaseRef {
+            owner: &owner,
+            generation,
+        },
+    };
+    db.remove_deployment_conditionally("issued", &precondition)
+        .await
+        .unwrap();
+    db.release_namespace_config_admission_lease(&namespace, &owner)
+        .await
+        .unwrap();
+    assert!(
+        db.get_proxy_for_write(&namespace, "issued")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.get_api_spec(&namespace, &spec_id)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -4681,7 +4792,10 @@ async fn assert_sql_deployment_raw_preservation(
         assert_eq!(proxy_row["deployment_future_integer"]["value"], 123456);
         assert_eq!(
             proxy_row["deployment_future_bytes"]["value"],
-            json!({"bytes_hex": "00ff0180"})
+            json!({
+                "sha256": "edc81f7e4ee358fb91e94bd9bd74079c3dcba36f40f2c8a36e7ae0567afecc8f",
+                "len": 4,
+            })
         );
         for column in [
             "deployment_future_null_small",

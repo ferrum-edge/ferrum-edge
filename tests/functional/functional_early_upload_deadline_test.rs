@@ -371,6 +371,13 @@ async fn h3_post_stalled_body_with_origin(
 }
 
 async fn spawn_h3_gateway(yaml: String) -> (TestGateway, u16) {
+    spawn_h3_gateway_with_env(yaml, &[]).await
+}
+
+async fn spawn_h3_gateway_with_env(
+    yaml: String,
+    extra_env: &[(&'static str, &'static str)],
+) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: usize = 5;
     let mut last_error = String::new();
     for _ in 0..MAX_ATTEMPTS {
@@ -392,7 +399,7 @@ async fn spawn_h3_gateway(yaml: String) -> (TestGateway, u16) {
         };
         drop(reservation);
 
-        match TestGateway::builder()
+        let mut builder = TestGateway::builder()
             .mode_file(yaml.clone())
             .log_level("warn")
             .max_attempts(1)
@@ -400,10 +407,11 @@ async fn spawn_h3_gateway(yaml: String) -> (TestGateway, u16) {
             .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
             .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-            .spawn()
-            .await
-        {
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+        for (key, value) in extra_env {
+            builder = builder.env(*key, *value);
+        }
+        match builder.spawn().await {
             Ok(gateway) => return (gateway, https_port),
             Err(error) => {
                 last_error = error.to_string();
@@ -673,5 +681,208 @@ async fn h3_slow_cancelled_stream_does_not_block_independent_sibling_stream() {
         .expect("stalled stream response");
     assert_eq!(stalled_response.status, StatusCode::REQUEST_TIMEOUT);
 
+    gateway.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #6009: native-H3 retained-request admission over real streams
+// ---------------------------------------------------------------------------
+
+/// A budget of one 64 KiB block. With the default 10 MiB body limit no
+/// buffered upload fits, so every one is refused before a byte is read.
+const NO_BUFFERED_UPLOAD_FITS: &[(&str, &str)] = &[
+    ("FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES", "65536"),
+    ("FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES", "65536"),
+];
+
+/// A budget that admits exactly one buffered 64 KiB upload at a time.
+const ONE_BUFFERED_UPLOAD_FITS: &[(&str, &str)] = &[
+    ("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "65536"),
+    ("FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES", "65536"),
+    ("FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES", "65536"),
+];
+
+/// Retry the first H3 exchange while the QUIC listener comes up.
+async fn h3_post_stalled_body_when_ready(
+    url: &str,
+    addr: SocketAddr,
+    content_type: &'static str,
+) -> Http3Response {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match h3_post_stalled_body(url, "localhost", addr, content_type, None).await {
+            Ok(response) => return response,
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
+            Err(error) => panic!("H3 upload failed: {error}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_early_upload_the_budget_cannot_admit_is_refused_on_the_wire() {
+    let (backend_port, _backend) = spawn_ok_backend().await;
+    let (mut gateway, https_port) = spawn_h3_gateway_with_env(
+        early_body_proxy_yaml(backend_port, 30_000),
+        NO_BUFFERED_UPLOAD_FITS,
+    )
+    .await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy ready");
+    let url = format!("https://127.0.0.1:{https_port}/upload");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
+
+    // The client never finishes its body: the refusal must not wait for it.
+    let started = Instant::now();
+    let plain = h3_post_stalled_body_when_ready(&url, addr, "application/json").await;
+    assert_eq!(plain.status, StatusCode::SERVICE_UNAVAILABLE);
+    let body = String::from_utf8_lossy(&plain.body_bytes);
+    assert!(
+        body.contains("Request buffering capacity exceeded"),
+        "the shared capacity terminal, got {body}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "admission is refused before the drain, not after a read timeout"
+    );
+
+    let grpc = h3_post_stalled_body_when_ready(&url, addr, "application/grpc").await;
+    assert_eq!(grpc.status, StatusCode::OK);
+    let headers = &grpc.headers;
+    let grpc_status = headers.get("grpc-status").map(|v| v.as_bytes());
+    assert_eq!(
+        grpc_status,
+        Some(&b"8"[..]),
+        "native gRPC gets a trailers-only RESOURCE_EXHAUSTED"
+    );
+    gateway.shutdown();
+}
+
+/// Wait until the QUIC listener answers, on a path no proxy routes, so the
+/// probe takes no request-buffer charge.
+async fn wait_for_h3_listener(https_port: u16) {
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/not-routed");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while client.get(&url).await.is_err() {
+        assert!(Instant::now() < deadline, "the H3 listener never answered");
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A backend whose response head arrives at once and whose body trickles.
+async fn spawn_trickling_backend() -> (u16, ScriptedHttp1Backend) {
+    let reservation = reserve_port().await.expect("reserve backend");
+    let port = reservation.port;
+    let body = vec![b'x'; 16];
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::TrickleBody {
+            status: 200,
+            reason: "OK".into(),
+            headers: vec![("Content-Length".into(), body.len().to_string())],
+            body,
+            chunk_size: 1,
+            pause: Duration::from_millis(500),
+        })
+        .spawn()
+        .expect("spawn trickling backend");
+    (port, backend)
+}
+
+type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+type H3ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+/// Send one complete JSON upload and wait for its response head only.
+async fn h3_upload_and_read_head(
+    send_request: &mut H3SendRequest,
+    url: &str,
+) -> Result<(StatusCode, H3ClientStream), Box<dyn std::error::Error + Send + Sync>> {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(url)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(())?;
+    let mut stream = send_request.send_request(request).await?;
+    stream
+        .send_data(Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .await?;
+    stream.finish().await?;
+    let head = tokio::time::timeout(Duration::from_secs(10), stream.recv_response())
+        .await
+        .map_err(|_| "recv_response timed out")??;
+    Ok((head.status(), stream))
+}
+
+/// The charge rides on the dispatched body (#6009), as on HTTP/1.1 and HTTP/2:
+/// it is released once dispatch is done, not held while the response streams.
+/// The budget admits one buffered upload at a time, so a second upload sent
+/// while the first response is still streaming is admitted only if the first
+/// already released its charge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_a_streaming_response_holds_no_request_buffer_charge() {
+    let (backend_port, _backend) = spawn_trickling_backend().await;
+    let (mut gateway, https_port) = spawn_h3_gateway_with_env(
+        early_body_proxy_yaml(backend_port, 30_000),
+        ONE_BUFFERED_UPLOAD_FITS,
+    )
+    .await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy ready");
+    let url = format!("https://127.0.0.1:{https_port}/upload");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
+    wait_for_h3_listener(https_port).await;
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(DangerAcceptAny))
+        .with_no_client_auth();
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
+        .map_err(|error| error.to_string())
+        .expect("quic config");
+    let mut endpoint = bind_quinn_client_endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .expect("client endpoint");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_config)));
+    let connecting = endpoint.connect(addr, "localhost").expect("connect");
+    let conn = tokio::time::timeout(Duration::from_secs(10), connecting)
+        .await
+        .expect("QUIC handshake in time")
+        .expect("QUIC handshake");
+    let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .expect("h3 client");
+    let driver_task = tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    let (first_status, first) = h3_upload_and_read_head(&mut send_request, &url)
+        .await
+        .expect("first upload");
+    assert_eq!(first_status, StatusCode::OK);
+    // The first response body is still trickling (16 bytes, one per 500ms).
+    let (second_status, second) = h3_upload_and_read_head(&mut send_request, &url)
+        .await
+        .expect("second upload");
+    assert_eq!(
+        second_status,
+        StatusCode::OK,
+        "the first upload's charge must be released before its response streams"
+    );
+
+    drop(first);
+    drop(second);
+    drop(send_request);
+    driver_task.abort();
     gateway.shutdown();
 }

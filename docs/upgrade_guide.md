@@ -26,6 +26,77 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased changes after 0.9.12
+
+**Native HTTP/3 buffered uploads take retained-request admission (#6009).**
+An H3 upload the gateway buffers (for a body-inspecting plugin, a protocol
+translation, or retry replay) now takes the same
+`FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` admission as HTTP/1.1 and HTTP/2. With
+`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` it is also capped at
+`FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` (`413` above it). When the budget is
+exhausted the request gets `503` / gRPC `RESOURCE_EXHAUSTED` instead of being
+buffered. As on HTTP/1.1 and HTTP/2, a buffered body holds its charge only
+until dispatch and every retry are done, not while the response streams, so
+size the budget for concurrent buffered H3 uploads exactly as you already do
+for HTTP/1.1 and HTTP/2; streamed H3 uploads are unaffected.
+
+**Route total deadlines bound early body collection (#6008).** A body collected
+before `before_proxy` on a route whose `mesh_route_dispatch` rule (HTTPRoute
+`timeouts.request`) carries `request_timeout_ms` now ends at that total with the
+route-timeout `504` (gRPC `DEADLINE_EXCEEDED`) instead of running to
+`backend_read_timeout_ms`. When the rule cannot be decided before
+authentication, the largest candidate total applies, and no route bound applies
+if any candidate is untimed. Keep `backend_read_timeout_ms` finite on routes
+that collect bodies before authentication. Custom plugins must now declare
+header, query, path, and destination changes made in **any** pre-proxy phase
+(`authenticate`, `authorize`, body normalization, `before_proxy`) and return
+`true` from `declares_request_input_mutations()`; until they do, their routes
+get no early route bound. See
+[plugins.md → Route request deadline](plugins.md#route-request-deadline).
+
+**Snapshot tokens must be re-read (#5999 / #6012).** Namespace backup tags
+(`GET /backup?conditional=true`) and `deployment-v1-` tokens
+(`GET /deployment-snapshot`) now MAC a bounded SHA-256 of the canonical
+snapshot in which stored spec documents, external-reference snapshots and other
+binary values are represented by the SHA-256 and length of the stored bytes.
+Every tag issued by v0.9.12 or earlier still parses but no longer matches:
+`POST /restore` and the conditional deployment mutations return `412` and
+change nothing. Finish or abandon in-flight recoveries before upgrading, then
+read fresh authority. Deployment evidence changed shape: top-level `api_specs`
+and `evidence.resources[5]` carry `spec_content: {"sha256", "len"}` instead of a
+byte array, SQL blob columns are `{"sha256", "len"}` instead of
+`{"bytes_hex"}`, and MongoDB raw rows carry `bson_sha256` (binary fields as
+`binary_sha256`/`len`/`subtype`) instead of `bson_hex`. Top-level `api_specs` is
+sorted by id and equals `evidence.resources[5]`. Read the stored bytes from the
+new `api_spec_contents` array in the same response. Each entry's
+`spec_content_base64` and `external_ref_snapshot_base64` decode to the bytes
+whose `sha256`/`len` the evidence fences, so recovery journals still need only
+this one read. Do not substitute `GET /api-specs/{id}`: it returns the
+decompressed document (format-converted unless requested in the stored
+`spec_format`), so it cannot match `spec_content.sha256`. In the stored format it
+matches only `content_hash`, and it never returns external-reference snapshot
+bytes. A namespace whose canonical representation (excluding spec bytes) would
+exceed 64 MiB is refused with `507` on these conditional paths, as is a
+deployment snapshot whose base64 spec content would exceed 256 MiB. Use the
+unconditional profiles or split the namespace. A `507` is deterministic for
+unchanged state, so do not retry it. Inside a deployment mutation transaction it
+reports `durable: "not_committed"`; otherwise it reports `durable: "not_started"`.
+
+**Backend egress `schema_version` 2 (#5994 / #5999).**
+`public_only_guaranteed` is now true only with
+`enforcement_scope=local-data-plane`; CP `admission-only`, `unserved-namespace`
+and `no-data-plane` responses always report `false`. Consumers must recognize
+`schema_version: 2` and keep failing closed on unknown versions.
+
+**Deployment-mode refusals (#6012).** Already in v0.9.12: an ordinary
+`PUT /api-specs/{id}` that sends any `If-Match` returns `400` unless it is a
+complete `conditional=true` deployment request; any mutating admin request
+(`POST`, `PUT`, `PATCH`, `DELETE`) carrying a `conditional` query parameter or an
+`If-Match` value containing `deployment-v1-` returns `400` on every route other
+than `DELETE /proxies/{id}` and `PUT /api-specs/{id}`, including
+`POST /restore`. Drop stray `If-Match` headers from ordinary spec replacement and
+never reuse a deployment token on another route.
+
 ## Development Compose fixtures (unreleased)
 
 These changes affect only the sample `docker-compose.yml`, the SQL TLS test

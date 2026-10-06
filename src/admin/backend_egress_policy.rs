@@ -59,11 +59,15 @@ pub(super) fn handle_get(state: &AdminState, namespace: &str) -> Response<Full<B
     };
     // Any allow override may bypass the private/reserved block. Do not try to
     // reclassify or enumerate CIDRs here: a conservative false lets consumers
-    // fail closed without duplicating the enforcement classifier.
-    let public_only_guaranteed =
-        matches!(policy.allow_ips, BackendAllowIps::Public) && !policy.allow_cidr_overrides_present;
+    // fail closed without duplicating the enforcement classifier. Only a local
+    // data plane serving this namespace enforces the policy it reports; CP
+    // admission, unserved-namespace and no-data-plane metadata guarantee nothing.
+    let public_only_guaranteed = enforcement_scope == "local-data-plane"
+        && matches!(policy.allow_ips, BackendAllowIps::Public)
+        && !policy.allow_cidr_overrides_present;
     let response = BackendEgressPolicyResponse {
-        schema_version: 1,
+        // v2: `public_only_guaranteed` also requires local enforcement.
+        schema_version: 2,
         ip_classification: "ferrum-private-reserved-v1",
         namespace,
         policy_scope: "process",

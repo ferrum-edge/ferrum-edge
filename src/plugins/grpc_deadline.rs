@@ -378,6 +378,10 @@ impl Plugin for GrpcDeadline {
         true
     }
 
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        Some(vec!["grpc-timeout".to_string()])
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

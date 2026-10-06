@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BREAKING — bounded namespace and deployment snapshot authority** (issues
+  #5999 / #6012). Conditional backup/restore and `deployment-v1` tags cloned
+  every resource and rendered stored gzip spec documents as JSON number arrays
+  (tens of bytes of heap per stored byte), then built the whole canonical
+  string; conditional restore and deployment mutations held several full
+  copies, the deployment profile carried spec bytes three times (Mongo four)
+  and rebuilt them under namespace row locks. A few multi-MiB specs could
+  exhaust memory. Snapshot representations now carry the SHA-256 and length
+  of stored spec documents, external-reference snapshots and every raw blob or
+  BSON binary; canonical JSON streams into a bounded SHA-256, and stores compare
+  that digest instead of a retained representation. In `GET /deployment-snapshot`,
+  top-level `api_specs` now carries the same digests and is sorted by id to
+  equal `evidence.resources[5]` under any store collation. A new
+  `api_spec_contents` array carries exactly one base64 copy of each stored
+  gzip document and external-reference snapshot, outside the digested evidence
+  and bounded at 256 MiB in total, so one read still recovers the original
+  bytes. Raw SQL blobs are `{"sha256","len"}` and MongoDB rows carry
+  `bson_sha256` instead of `bson_hex`. A namespace whose canonical
+  representation would exceed 64 MiB (spec bytes excluded) returns
+  `507 Insufficient Storage` without issuing, comparing or applying anything.
+  Deployment paths count typed resources against that bound before reading raw
+  rows/documents, then count each raw row/document as it is converted, so the
+  `507` fires before the rest of the evidence is built. This includes inside
+  the mutation transaction, where the `507` reports `durable: "not_committed"`.
+  Namespace (`namespace_snapshot.v2`) and deployment (`deployment_snapshot.v2`)
+  MAC domains changed: every tag issued by v0.9.12 or earlier, including
+  `deployment-v1-` tokens, now fails closed with `412`; re-read authority after
+  upgrading.
+- **BREAKING — `public_only_guaranteed` requires local enforcement** (issues
+  #5994 / #5999). `GET /backend-egress-policy` reported `true` for a public-mode
+  process without allow overrides even when `enforcement_scope` was
+  `admission-only`, `unserved-namespace` or `no-data-plane`, none of which
+  enforces the policy for the selected namespace. It is now true only for
+  `local-data-plane`, and `schema_version` is `2`; consumers pinned to `1`
+  must fail closed and adopt the new meaning.
+- **Deployment replacement column drift guard** (#6012). The SQL known-column
+  lists that decide which stored columns a conditional API-spec replacement
+  rewrites are now one `DEPLOYMENT_KNOWN_COLUMNS` table, and a unit test
+  requires each to equal the V001 baseline's columns for `proxies`,
+  `upstreams`, `plugin_configs` and `proxy_plugins`, so a new column cannot be
+  silently restored to its old value.
 - **gRPC affinity no longer dials a missing or closed shard on the request
   path when a ready sibling exists** (#5991 follow-up; regression since
   0.9.11). A new HTTP/2 frontend connection mapped to a shard that did not
@@ -86,8 +127,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` backend connections per backend
   host from each gateway; see `docs/connection_pooling.md`.
 
+### Documentation
+
+- **BREAKING — deployment-mode request refusals** (issue #6012). Since v0.9.12,
+  an ordinary `PUT /api-specs/{id}` carrying any `If-Match` returns `400` unless
+  it is a complete `conditional=true` deployment request, and every
+  `POST`/`PUT`/`PATCH`/`DELETE` admin request with a `conditional` query key or
+  an `If-Match` containing `deployment-v1-` returns `400` outside the two
+  deployment routes (including `POST /restore`). These refusals are now
+  documented in the upgrade guide.
+
 ### Security
 
+- **Native HTTP/3 buffered uploads now honour the shared retained-request
+  budget** (#6009). Every native-H3 buffered drain — including the collectors
+  that run before `authenticate`, `authorize` and `before_proxy`, and the H3
+  cross-protocol bridge drains — reserves its ceiling from
+  `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` before allocating and folds a `0`
+  body limit to `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES`, as HTTP/1.1 and
+  HTTP/2 already did. Previously an unauthenticated H3 client on a
+  body-before-auth route had no aggregate bound, and no per-request bound when
+  the global body limit was `0`. An upload the budget cannot admit now gets
+  `503` / gRPC `RESOURCE_EXHAUSTED` (`gateway_buffer_capacity`,
+  health-neutral). At a dispatch-stage drain that refusal runs the rejection
+  hooks and is transaction-logged like the other terminal request-body
+  rejections. Cancellation, `413`, disconnect and timeouts release the charge
+  exactly once. A completed body is published for dispatch with its charge, as
+  on HTTP/1.1 and HTTP/2: the charge is released when the last dispatch or
+  retry copy drops, before the response is relayed, so a long streamed
+  response holds no request-buffer charge.
+- **Route total deadlines now bound body collection that runs before
+  `before_proxy`** (partially addresses #6008). A body a plugin needs before
+  authentication, authorization or `before_proxy` (SOAP WS-Security,
+  `hmac_auth`, `waf`) was bounded only by `backend_read_timeout_ms` and any
+  client RPC deadline, because the `mesh_route_dispatch` / HTTPRoute
+  `timeouts.request` total is armed after `before_proxy` selects the rule.
+  An unauthenticated client could trickle such a body past the route budget,
+  or indefinitely with `backend_read_timeout_ms: 0`. HTTP/1.1, HTTP/2 and
+  native HTTP/3 now preview the rule with the request's pinned compiled
+  matchers (no hook runs, nothing is armed) and bound the collect at the
+  receipt-anchored total. An elapsed budget refuses before a ready body is
+  polled, on gRPC too. Expiry is the existing health-neutral route timeout
+  (`504` `{"error":"Request timeout"}`, logged `before_dispatch` under the
+  `route_request_timeout_early_upload` rejection phase on every protocol);
+  gRPC folds it into `DEADLINE_EXCEEDED`. A rule is undetermined when any
+  plugin may still rewrite an input it matches on before it runs: plugins
+  that rewrite headers, query, path or destination in `authenticate`,
+  `authorize` or the request-decompression normalizer count whatever their
+  priority, and so does every custom plugin that has not declared its request
+  mutations (`declares_request_input_mutations`). `correlation_id`,
+  `otel_tracing`, `rate_limiting`, `grpc_deadline`, `sse` and `compression`
+  declare the headers they write, so a rule on any other header stays
+  decided. The bound for an undetermined rule is the largest total among the
+  rules that could still be selected. A request that would be answered
+  without dispatch adds no candidate: a redirect, a fault that always aborts
+  (unless `fault_injection` or an earlier instance's rule fault may inject
+  first), a decided waypoint veto, or the deferred unmatched `404` of a
+  `reject_unmatched` chain. If any candidate is untimed, the read/RPC bounds
+  apply as before; set a finite `backend_read_timeout_ms` on such routes. An
+  undeclared custom plugin that disables the early bound on a proxy is logged
+  at `info` once per proxy chain on startup and reload. A
+  completed early body and its buffer charge are released before
+  authentication or authorization rejection hooks run. **Known limitation:**
+  an instance with an execution trigger stays undetermined whenever any
+  request input may change, and a custom plugin that rewrites
+  `route_override_request_timeout_ms` directly is not modelled.
 - **BREAKING (developer fixtures) — sample Compose MongoDB and SQL TLS test
   fixtures no longer have working default credentials or wildcard ports**
   (issue #6002; GHSA-wq9h-xxp4-7r2m, GHSA-x87v-w7p2-77f4). Affects only the

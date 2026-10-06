@@ -174,7 +174,7 @@ impl Drop for AdminHarness {
 
 fn default_response() -> Value {
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "ip_classification": "ferrum-private-reserved-v1",
         "namespace": "ferrum",
         "policy_scope": "process",
@@ -223,13 +223,51 @@ async fn default_public_and_private_policies_have_exact_versioned_representation
         expected["mode"] = json!(mode.to_string());
         expected["mode_allowed_ip_classes"] = allowed;
         expected["mode_blocked_ip_classes"] = blocked;
-        expected["public_only_guaranteed"] = json!(guaranteed);
-        let state = admin_state("cp", BackendEgressPolicy::from_allow_ips(mode));
+        // CP admission metadata never certifies a serving gateway.
+        let state = admin_state("cp", BackendEgressPolicy::from_allow_ips(mode.clone()));
         let harness = AdminHarness::start(state).await;
         let (status, body) = harness.get(Some(&reader), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, expected);
+        // The same loaded policy on a local data plane serving the namespace.
+        let policy = BackendEgressPolicy::from_allow_ips(mode);
+        let harness = AdminHarness::start(serving_state(policy)).await;
+        let (status, body) = harness.get(Some(&reader), Some("staging")).await;
+        assert_eq!(status, StatusCode::OK);
+        expected["namespace"] = json!("staging");
+        expected["enforcement_scope"] = json!("local-data-plane");
+        expected["public_only_guaranteed"] = json!(guaranteed);
+        assert_eq!(body, expected);
     }
+}
+
+/// A database-mode admin state whose local `ProxyState` serves `staging`.
+fn serving_state(policy: BackendEgressPolicy) -> AdminState {
+    let mut state = admin_state("database", BackendEgressPolicy::unrestricted());
+    state.proxy_state = Some(proxy_state(OperatingMode::Database, policy));
+    state
+}
+
+#[tokio::test]
+async fn public_only_is_never_guaranteed_without_local_enforcement() {
+    let reader = token(PRIMARY_SECRET, json!({"ns": ["staging", "other"]}));
+    let public = || BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public);
+    let harness = AdminHarness::start(admin_state("cp", public())).await;
+    let (_, body) = harness.get(Some(&reader), Some("staging")).await;
+    assert_eq!(body["enforcement_scope"], "admission-only");
+    assert_eq!(body["mode"], "public");
+    assert_eq!(body["public_only_guaranteed"], false);
+    let harness = AdminHarness::start(admin_state("node_agent", public())).await;
+    let (_, body) = harness.get(Some(&reader), Some("staging")).await;
+    assert_eq!(body["enforcement_scope"], "no-data-plane");
+    assert_eq!(body["public_only_guaranteed"], false);
+    let harness = AdminHarness::start(serving_state(public())).await;
+    let (_, body) = harness.get(Some(&reader), Some("other")).await;
+    assert_eq!(body["enforcement_scope"], "unserved-namespace");
+    assert_eq!(body["public_only_guaranteed"], false);
+    let (_, body) = harness.get(Some(&reader), Some("staging")).await;
+    assert_eq!(body["enforcement_scope"], "local-data-plane");
+    assert_eq!(body["public_only_guaranteed"], true);
 }
 
 #[tokio::test]
@@ -243,10 +281,12 @@ async fn overrides_are_bounded_and_public_only_proof_is_conservative() {
     ] {
         let policy =
             BackendEgressPolicy::from_env(BackendAllowIps::Public, allow, deny, baseline).unwrap();
-        let harness = AdminHarness::start(admin_state("cp", policy)).await;
-        let (status, body) = harness.get(Some(&reader), None).await;
+        let harness = AdminHarness::start(serving_state(policy)).await;
+        let (status, body) = harness.get(Some(&reader), Some("staging")).await;
         assert_eq!(status, StatusCode::OK);
         let mut expected = default_response();
+        expected["namespace"] = json!("staging");
+        expected["enforcement_scope"] = json!("local-data-plane");
         expected["mode"] = json!("public");
         expected["mode_allowed_ip_classes"] = json!(["public"]);
         expected["mode_blocked_ip_classes"] = json!(["private-reserved"]);
@@ -473,7 +513,7 @@ fn openapi_metadata_vocabulary_and_default_example_match_the_endpoint() {
         assert!(schema["required"].as_array().unwrap().contains(&json!(key)));
     }
     assert_eq!(properties.len(), expected.as_object().unwrap().len());
-    assert_eq!(properties["schema_version"]["enum"], json!([1]));
+    assert_eq!(properties["schema_version"]["enum"], json!([2]));
     assert_eq!(
         properties["ip_classification"]["enum"],
         json!(["ferrum-private-reserved-v1"])
@@ -494,7 +534,8 @@ fn openapi_metadata_vocabulary_and_default_example_match_the_endpoint() {
     let validator = jsonschema::draft202012::options().build(schema).unwrap();
     assert!(validator.is_valid(&expected));
     for (field, unknown) in [
-        ("schema_version", json!(2)),
+        ("schema_version", json!(1)),
+        ("schema_version", json!(3)),
         ("ip_classification", json!("unknown")),
         ("enforcement_scope", json!("unknown")),
         ("mode", json!("unknown")),

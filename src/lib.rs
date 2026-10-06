@@ -14688,6 +14688,152 @@ pub mod _test_support {
         }
     }
 
+    /// The pure early route-total preview (issue #6008), compiled from
+    /// `plugins` (in execution order) exactly as one plugin-cache generation
+    /// compiles it. Milliseconds from receipt, or `None` for no early bound.
+    pub fn early_route_total_ms_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        identity_ready: bool,
+    ) -> Option<u64> {
+        crate::plugins::early_route_total::EarlyRouteTotalPlan::compile(plugins)
+            .select_ms(ctx, identity_ready)
+    }
+
+    /// The early route-total preview (issue #6008) exactly as an early
+    /// collector reads it: through the request view of one plugin-cache
+    /// generation, with the cache's own chain, finalizer, and deferred
+    /// unmatched handling. Milliseconds from receipt, or `None`.
+    pub fn plugin_cache_early_route_total_ms_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+        ctx: &crate::plugins::RequestContext,
+        identity_ready: bool,
+    ) -> Option<u64> {
+        let view = cache.request_view(namespace, proxy_id, protocol);
+        let at = view.early_route_total_at(ctx, identity_ready)?;
+        let elapsed = at.duration_since(ctx.grpc_deadline_received_at);
+        Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// Terminal outcome of one early (pre-`before_proxy`) H1/H2 body collect
+    /// (issue #6008), projected from the crate-private error type.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EarlyBodyCollectOutcomeForTest {
+        Collected(usize),
+        TooLarge,
+        ClientDisconnected,
+        TimedOut,
+        DeadlineExceeded,
+        BufferCapacityExceeded,
+        RouteDeadlineExceeded,
+    }
+
+    /// Run the PRODUCTION H1/H2 early collector over a real hyper request with
+    /// an explicit RPC deadline and previewed route total.
+    pub async fn buffer_early_request_body_for_test(
+        request: hyper::Request<hyper::body::Incoming>,
+        max_request_body_size_bytes: usize,
+        request_body_read_timeout_ms: u64,
+        rpc_deadline_at: Option<tokio::time::Instant>,
+        route_deadline_at: Option<tokio::time::Instant>,
+    ) -> EarlyBodyCollectOutcomeForTest {
+        use crate::proxy::{ClientRequestBody, RequestBodyBufferError};
+        let method = request.method().as_str().to_string();
+        let headers: HashMap<String, String> = request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+            })
+            .collect();
+        match crate::proxy::buffer_request_body_for_before_proxy(
+            request,
+            &method,
+            &headers,
+            max_request_body_size_bytes,
+            request_body_read_timeout_ms,
+            rpc_deadline_at,
+            route_deadline_at,
+        )
+        .await
+        {
+            Ok(ClientRequestBody::Buffered(buffered)) => {
+                EarlyBodyCollectOutcomeForTest::Collected(buffered.body.len())
+            }
+            Ok(ClientRequestBody::Streaming(_)) => EarlyBodyCollectOutcomeForTest::Collected(0),
+            Err(RequestBodyBufferError::TooLarge) => EarlyBodyCollectOutcomeForTest::TooLarge,
+            Err(RequestBodyBufferError::ClientDisconnected(_)) => {
+                EarlyBodyCollectOutcomeForTest::ClientDisconnected
+            }
+            Err(RequestBodyBufferError::TimedOut) => EarlyBodyCollectOutcomeForTest::TimedOut,
+            Err(RequestBodyBufferError::DeadlineExceeded) => {
+                EarlyBodyCollectOutcomeForTest::DeadlineExceeded
+            }
+            Err(RequestBodyBufferError::BufferCapacityExceeded) => {
+                EarlyBodyCollectOutcomeForTest::BufferCapacityExceeded
+            }
+            Err(RequestBodyBufferError::RouteDeadlineExceeded) => {
+                EarlyBodyCollectOutcomeForTest::RouteDeadlineExceeded
+            }
+        }
+    }
+
+    /// Split a previewed route total as every early collector does: gRPC
+    /// folds it into the RPC deadline, every other request keeps it apart.
+    pub fn early_upload_deadlines_for_test(
+        rpc_deadline_at: Option<tokio::time::Instant>,
+        early_route_at: Option<tokio::time::Instant>,
+        grpc_flavored: bool,
+    ) -> (Option<tokio::time::Instant>, Option<tokio::time::Instant>) {
+        crate::proxy::early_upload_deadlines(rpc_deadline_at, early_route_at, grpc_flavored)
+    }
+
+    /// The PRODUCTION native-H3 retained-upload collector (issue #6009),
+    /// admitted against an isolated [`RequestBufferBudgetProbe`] so a test can
+    /// observe admission, capped growth, and release deterministically.
+    pub struct H3RetainedUploadProbe(crate::http3::server::H3RetainedUpload);
+
+    impl H3RetainedUploadProbe {
+        /// Admit one upload exactly as every native-H3 drain site does: fold
+        /// the effective limit to the retained ceiling, then charge that
+        /// ceiling before a byte is allocated. `None` is the `503` refusal.
+        pub fn admit(budget: &RequestBufferBudgetProbe, effective_limit: usize) -> Option<Self> {
+            let ceiling = budget.0.buffered_request_body_ceiling(effective_limit);
+            crate::http3::server::H3RetainedUpload::admit_in(budget.0.handle(), ceiling).map(Self)
+        }
+
+        /// Append one DATA chunk; `false` is the `413` (drop the probe).
+        pub fn push(&mut self, chunk: &[u8]) -> bool {
+            self.0.push(chunk)
+        }
+
+        pub fn collected_len(&self) -> usize {
+            self.0.collected_len()
+        }
+
+        pub fn reserved_bytes(&self) -> usize {
+            self.0.reserved_bytes()
+        }
+
+        /// The collected body and its narrowed charge, as the drain hands them
+        /// to the request handler.
+        pub fn finish(self) -> (Vec<u8>, RequestBufferPermitProbe) {
+            let (body, permit) = self.0.finish();
+            (body, RequestBufferPermitProbe(permit))
+        }
+
+        /// Finish and publish the body for dispatch through the PRODUCTION
+        /// native-H3 publication (`publish_h3_retained_body`): the charge
+        /// moves onto the shared `Bytes` every attempt and retry replays.
+        pub fn finish_and_publish(self) -> bytes::Bytes {
+            let (body, permit) = self.0.finish();
+            crate::http3::server::publish_h3_retained_body(body, Some(permit))
+        }
+    }
+
     /// What the shared charged content-coding chain decoder — the one
     /// `compression`'s opt-in `decompress_request` normalizer now runs
     /// (`GHSA-q76p-952x-7c3v`) — decided for one coding list, projected so

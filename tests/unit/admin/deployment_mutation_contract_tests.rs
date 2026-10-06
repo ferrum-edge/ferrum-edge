@@ -41,7 +41,7 @@ fn deployment_entry_pins_precede_dependency_reads_and_original_comparison() {
         ),
     ] {
         assert!(source.find(pin).unwrap() < source.find(read).unwrap());
-        assert!(source.find(read).unwrap() < source.find("*precondition.expected").unwrap());
+        assert!(source.find(read).unwrap() < source.find("!= precondition.expected").unwrap());
         assert!(!source.contains("precondition.expected ="));
     }
     assert!(sql.contains("REPEATABLE READ"));

@@ -27,13 +27,17 @@ use crate::config::types::{
     BackendScheme, CountryMmdbLoadSession, CountryMmdbSnapshot, GatewayConfig,
     MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES, PluginScope, Proxy,
 };
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
     adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
+use crate::plugins::early_route_total::{
+    EarlyRouteTotalFacts, EarlyRouteTotalPlan, EarlyRouteTotalStep,
+    undeclared_plugin_disabling_early_route_bound,
+};
 use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
 use crate::plugins::utils::jwks_cache::{JwksRefreshRequirement, retain_active_requirements};
 use crate::plugins::utils::openai_error::proxy_has_openai_auth_error_envelope_plugin;
@@ -398,6 +402,11 @@ impl Plugin for MeshRouteDispatchFinalizer {
     /// (GHSA-pwcm-6rh8-f2gh).
     fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
         crate::plugins::ResponseBodyProduction::Never
+    }
+
+    /// Cache-internal sentinel: rewrites no request input (issue #6008).
+    fn declares_request_input_mutations(&self) -> bool {
+        true
     }
 
     async fn before_proxy(
@@ -1041,6 +1050,32 @@ impl Plugin for PluginInstanceWrapper {
     fn name(&self) -> &str {
         self.inner.name()
     }
+    fn early_route_total<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        host: Option<&'a str>,
+        query: Option<&crate::plugins::utils::query::CanonicalQuery>,
+        facts: EarlyRouteTotalFacts<'_>,
+    ) -> Option<EarlyRouteTotalStep<'a>> {
+        let step = self.inner.early_route_total(ctx, host, query, facts)?;
+        let Some(gate) = &self.trigger else {
+            return Some(step);
+        };
+        let decision =
+            gate.early_route_decision(ctx, facts.identity_ready, facts.inputs_may_change());
+        // An undecided trigger may skip the instance: keep the earlier
+        // selection as a candidate rather than evaluating the trigger early.
+        Some(match decision {
+            Some(true) => step,
+            Some(false) => EarlyRouteTotalStep::NoMatch {
+                stages_unmatched: false,
+            },
+            None => step.or_skipped(),
+        })
+    }
+    fn may_inject_route_fault(&self) -> bool {
+        self.inner.may_inject_route_fault()
+    }
     fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
         self.inner.country_mmdb_snapshot()
     }
@@ -1193,6 +1228,12 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn modifies_request_destination(&self) -> bool {
         self.inner.modifies_request_destination()
+    }
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        self.inner.modified_request_header_names()
+    }
+    fn declares_request_input_mutations(&self) -> bool {
+        self.inner.declares_request_input_mutations()
     }
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
@@ -4876,6 +4917,9 @@ pub struct PluginPhaseData {
     pub conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Pure route-total preview for early body collectors (issue #6008),
+    /// compiled once per generation.
+    early_route_total_plan: Arc<EarlyRouteTotalPlan>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
     /// Content-derived digest of the effective static response-side
@@ -5083,6 +5127,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
             conditional_unbounded_trailer_policy_plugins,
         ),
         response_committed_plugins: Arc::new(response_committed),
+        early_route_total_plan: Arc::new(EarlyRouteTotalPlan::compile(plugins)),
         capabilities: PluginCapabilities(caps),
         response_presentation_policy_digest: (!presentation_policy_unprovable)
             .then(|| presentation_policy_digest(presentation_policy_contributions)),
@@ -5223,6 +5268,21 @@ const ALL_PROXY_PROTOCOLS: [ProxyProtocol; 5] = [
     ProxyProtocol::Udp,
 ];
 
+/// Tell the operator, once per proxy chain built, that an undeclared custom
+/// plugin turns off the early `mesh_route_dispatch` route bound (issue #6008).
+fn log_undeclared_early_route_bound_plugin(proxy_id: Option<&str>, plugins: &[Arc<dyn Plugin>]) {
+    let Some(plugin) = undeclared_plugin_disabling_early_route_bound(plugins) else {
+        return;
+    };
+    info!(
+        scope = %crate::startup::sanitize_startup_scalar(proxy_id.unwrap_or("global")),
+        plugin = %crate::startup::sanitize_startup_scalar(plugin),
+        "Custom plugin does not declare its request input mutations \
+         (`declares_request_input_mutations`); bodies collected before `before_proxy` \
+         on this chain get no early `mesh_route_dispatch` route bound"
+    );
+}
+
 fn build_protocol_entry(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> ProtocolEntry {
     let filtered = filter_for_protocol(plugins, proto);
     let phase = build_phase_data(&filtered);
@@ -5284,12 +5344,14 @@ fn build_protocol_snapshot(
         }
         proxy.insert(proxy_id.clone(), inner);
         grpc_web_proxy.insert(proxy_id.clone(), build_grpc_web_protocol_entry(plugins));
+        log_undeclared_early_route_bound_plugin(Some(proxy_id.as_str()), plugins);
     }
 
     let mut global = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
     for &proto in &ALL_PROXY_PROTOCOLS {
         global.insert(proto, build_protocol_entry(globals, proto));
     }
+    log_undeclared_early_route_bound_plugin(None, globals);
 
     let grpc_web_global = build_grpc_web_protocol_entry(globals);
 
@@ -5980,6 +6042,7 @@ impl PluginCacheInner {
             ),
             response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
             response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
+            early_route_total_plan: Arc::clone(&entry.phase.early_route_total_plan),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
@@ -6008,6 +6071,7 @@ impl PluginCacheInner {
             conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
             response_committed_plugins: Arc::new(Vec::new()),
             response_presentation_policy_digest: None,
+            early_route_total_plan: Arc::default(),
             capabilities: PluginCapabilities::default(),
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
@@ -6058,6 +6122,7 @@ pub struct PluginCacheRequestView {
     conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_presentation_policy_digest: Option<[u8; 32]>,
+    early_route_total_plan: Arc<EarlyRouteTotalPlan>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -6068,6 +6133,22 @@ pub struct PluginCacheRequestView {
 }
 
 impl PluginCacheRequestView {
+    /// The receipt-anchored route total deadline an early (pre-`before_proxy`)
+    /// body collector must honour (issue #6008): the total the request's
+    /// `mesh_route_dispatch` rule will arm, or the maximum among the rules it
+    /// could still select. `None` when no total applies or any candidate is
+    /// untimed; the read/RPC bounds then stand alone. Pure: no hook runs, no
+    /// override is published, and no gRPC attempt clock starts.
+    pub(crate) fn early_route_total_at(
+        &self,
+        ctx: &RequestContext,
+        identity_ready: bool,
+    ) -> Option<tokio::time::Instant> {
+        let timeout_ms = self.early_route_total_plan.select_ms(ctx, identity_ready)?;
+        ctx.grpc_deadline_received_at
+            .checked_add(std::time::Duration::from_millis(timeout_ms))
+    }
+
     /// Strictest active client-facing request-body ceiling for this
     /// proxy/protocol pair, or `None` when no matched plugin enforces one.
     ///
@@ -7543,6 +7624,7 @@ impl PluginCache {
                     inner.insert(proto, build_protocol_entry(plugins, proto));
                 }
                 new_proxy_proto.insert(proxy_key.clone(), inner);
+                log_undeclared_early_route_bound_plugin(Some(proxy_key.as_str()), plugins);
                 new_grpc_web_proxy.insert(proxy_key, build_grpc_web_protocol_entry(plugins));
             }
         }
@@ -7551,6 +7633,7 @@ impl PluginCache {
             for &proto in &ALL_PROXY_PROTOCOLS {
                 g.insert(proto, build_protocol_entry(&new_globals, proto));
             }
+            log_undeclared_early_route_bound_plugin(None, &new_globals);
             g
         } else {
             current.protocol_snapshot.global.clone()

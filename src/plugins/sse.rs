@@ -606,6 +606,11 @@ impl super::Plugin for SsePlugin {
         true
     }
 
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        let names = ["accept-encoding", "last-event-id"];
+        Some(Vec::from(names.map(String::from)))
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         self.wrap_non_sse_responses
     }

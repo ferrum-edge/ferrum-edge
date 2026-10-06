@@ -248,6 +248,12 @@ auth_flow::impl_auth_plugin!(
         self.hide_credentials && self.header_name_lower.is_some()
     }
 
+    /// `authenticate` marks a query credential for stripping from the
+    /// forwarded query, and `before_proxy` removes it.
+    fn modifies_request_query(&self) -> bool {
+        self.hide_credentials && self.query_param_name.is_some()
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut crate::plugins::RequestContext,

@@ -208,6 +208,26 @@ impl PluginTriggerGate {
         decision
     }
 
+    /// Pure preview of this instance's decision for the early route-total
+    /// bound (issue #6008). Never memoizes. `None` when the decision cannot be
+    /// taken yet: an identity predicate before authentication, or request
+    /// inputs an earlier plugin may still rewrite.
+    pub(crate) fn early_route_decision(
+        &self,
+        ctx: &RequestContext,
+        identity_ready: bool,
+        inputs_may_change: bool,
+    ) -> Option<bool> {
+        if let Some(decision) = ctx.plugin_trigger_decision(self.token) {
+            return Some(decision);
+        }
+        let identity_pending = self.compiled.reads_authenticated_identity() && !identity_ready;
+        if inputs_may_change || identity_pending {
+            return None;
+        }
+        Some(self.compiled.evaluate(&HttpTriggerFacts::new(ctx)))
+    }
+
     /// Read-only view of an already-memoized decision.
     ///
     /// Used by the `&RequestContext` capability predicates (buffering,

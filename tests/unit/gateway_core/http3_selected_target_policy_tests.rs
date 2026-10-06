@@ -1024,8 +1024,11 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         "the terminal-body finalizer must own exactly one committed boundary"
     );
 
-    // The terminal provider path shares one finalizer across three writable
-    // rejection exits. Expand that shared boundary when comparing call sites.
+    // The terminal provider path shares one finalizer across four writable
+    // rejection exits (the fourth is the request-buffer capacity refusal,
+    // #6009, which every dispatch-stage drain reaches through
+    // `boxed_finalize_h3_request_buffer_capacity_rejection`). Expand that
+    // shared boundary when comparing call sites.
     // The separate final-body and finalized-egress rejections keep one
     // committed boundary each, and both now hand the wire write to the
     // plugin-aware sender so a browser-framed or native gRPC terminate keeps
@@ -1033,8 +1036,11 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     // reject send and are counted here rather than excluded.
     let shared_terminal_reject_sends = source
         .matches("let rejection = finalize_h3_terminal_body_read_rejection(")
-        .count();
-    assert_eq!(shared_terminal_reject_sends, 3);
+        .count()
+        + source
+            .matches("let rejection = finalize_h3_terminal_body_rejection_with_headers(")
+            .count();
+    assert_eq!(shared_terminal_reject_sends, 4);
     let terminal_dispatch = source
         .split("// Terminal final-body hooks may perform provider egress.")
         .nth(1)
@@ -1055,7 +1061,12 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     assert_eq!(
         terminal_dispatch_plugin_sends,
         terminal_dispatch_boundaries + 1,
-        "each terminal-dispatch boundary precedes a plugin-aware send, plus the shared finalizer"
+        "each terminal-dispatch boundary precedes a plugin-aware send, plus the shared \
+         finalizer's oversize exit"
+    );
+    assert!(
+        terminal_dispatch.contains("boxed_finalize_h3_request_buffer_capacity_rejection("),
+        "the request-buffer capacity exit shares the finalizer through its boxed helper"
     );
     let effective_plugin_committed_boundaries =
         committed_boundaries - shared_terminal_commit_definitions + shared_terminal_reject_sends;
