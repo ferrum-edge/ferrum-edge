@@ -31,8 +31,13 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 **Library API:** code linking the `ferrum-edge` crate that constructs or matches
 `GrpcProxyError::ClientDeadlineExceeded` must build the new
 `GrpcDeadlinePhase` payload instead of the removed `String` (#6022); use
-`phase.message()` or `to_string()` for the diagnostic text. Gateway
-configuration, the Admin API, and metrics are unchanged.
+`phase.message()` or `to_string()` for the diagnostic text. Code that called
+`Http3ConnectionPool::request_streaming`, `request_with_target_streaming`,
+`request_streaming_incoming_body` or `request_with_target_streaming_incoming_body`
+must stop: they are removed, and `request` / `request_with_target` are now
+crate-private (#6022). None carried an authorization lifetime, and the gateway
+never called them. Gateway configuration, the Admin API, and metrics are
+unchanged.
 
 ## Upgrading to 0.9.13
 

@@ -139,7 +139,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING (library API) — test-only HTTP/3 pool entry points** (#6022).
+- **BREAKING (library API) — test-only HTTP/3 pool entry points** (issue #6022).
   `Http3ConnectionPool::request_streaming`, `request_with_target_streaming`,
   `request_streaming_incoming_body`, and
   `request_with_target_streaming_incoming_body` are removed, and the buffered
