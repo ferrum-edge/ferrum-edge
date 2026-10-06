@@ -213,8 +213,8 @@ fn composing_impostor(
 }
 
 fn request_deduplication() -> Arc<dyn Plugin> {
-    let plugin = RequestDeduplication::new(&json!({}), PluginHttpClient::default())
-        .expect("valid config");
+    let plugin =
+        RequestDeduplication::new(&json!({}), PluginHttpClient::default()).expect("valid config");
     Arc::new(plugin)
 }
 

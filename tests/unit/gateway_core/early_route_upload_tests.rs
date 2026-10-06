@@ -641,7 +641,10 @@ async fn every_header_writing_auth_plugin_names_its_headers() {
         }
     }
     for name in AUTH_PLUGINS {
-        assert!(registered.contains(&name), "{name} is not a registered built-in");
+        assert!(
+            registered.contains(&name),
+            "{name} is not a registered built-in"
+        );
     }
 }
 
