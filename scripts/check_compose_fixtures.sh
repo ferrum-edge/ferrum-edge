@@ -62,6 +62,7 @@ compose --profile mongodb down --volumes >/dev/null 2>&1
 pass "Mongo is opt-in, refuses missing/short/reserved passwords, publishes no port"
 
 # --- SQL TLS fixture ------------------------------------------------------------
+mkdir -p "${SQL_DIR%/*}"
 bash scripts/setup_db_tls.sh "$SQL_DIR" >/dev/null
 bad_modes="$(find "$SQL_DIR" \( -type d ! -perm 700 \) -o \( -type f ! -perm 600 \))"
 [[ -z "$bad_modes" ]] || fail "Fixture material is not private: $bad_modes"
