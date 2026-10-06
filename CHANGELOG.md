@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-10-06
+
+Release prepared on **2026-10-06 UTC** from main
+`fd02c5f45bb9dee86a52bc612fcefd0223d6157b`. Snapshot tags, deployment
+snapshot evidence and backend egress policy discovery change shape; read
+[Upgrading to 0.9.13](docs/upgrade_guide.md#upgrading-to-0913) before
+upgrading admin automation or contract consumers.
+
 ### Fixed
 
 - **BREAKING — bounded namespace and deployment snapshot authority** (issues
@@ -108,6 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   H3-unsupported) when its task wakes after the connect instant; the connect
   bound now applies only to a failed connect, and the per-poll send gate still
   enforces the authorization lifetime.
+- The release ARM64 (aarch64) Cross build no longer adds the third-party
+  apt.llvm.org repository or fetches its signing key at release time (#5955).
+  bindgen's `clang-6.0` / `libclang-6.0-dev` now come from the Cross image's
+  own signed Ubuntu 16.04 `xenial-updates` archive, which pre-build already
+  uses for its other packages. They are pinned to the exact version
+  `1:6.0-1ubuntu2~16.04.1`. The LLVM major version and `LIBCLANG_PATH`
+  (`/usr/lib/llvm-6.0/lib`) are unchanged. The trusted Cross build policy's
+  frozen pre-build allowlist is updated to match.
 
 ### Changed
 
@@ -198,7 +214,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source-tree `docker-compose.yml`, `docker-compose.tls-test.yml` and SQL TLS
   helper shipped in v0.9.0–v0.9.12; no container image, Helm chart or binary
   contains them. See the
-  [upgrade guide](docs/upgrade_guide.md#development-compose-fixtures-unreleased).
+  [upgrade guide](docs/upgrade_guide.md#development-compose-fixtures).
   - Plain `docker compose up` no longer starts MongoDB: `mongodb` and
     `ferrum-mongodb` are in the `mongodb` profile, and the
     `dev-password-change-in-production` fallback is gone. The Mongo container
@@ -261,23 +277,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created fresh each run and never saved. Recent releases logged no cache hit,
   so published binaries were already built cold.
 
-### Fixed
+## [0.9.12] - 2026-10-05
 
-- The release ARM64 (aarch64) Cross build no longer adds the third-party
-  apt.llvm.org repository or fetches its signing key at release time (#5955).
-  bindgen's `clang-6.0` / `libclang-6.0-dev` now come from the Cross image's
-  own signed Ubuntu 16.04 `xenial-updates` archive, which pre-build already
-  uses for its other packages. They are pinned to the exact version
-  `1:6.0-1ubuntu2~16.04.1`. The LLVM major version and `LIBCLANG_PATH`
-  (`/usr/lib/llvm-6.0/lib`) are unchanged. The trusted Cross build policy's
-  frozen pre-build allowlist is updated to match.
-
-## [0.9.12] - Unreleased
-
-Candidate prepared on **2026-10-05 UTC** from post-#6012 main
-`a9c758c6352765d13a7f61c4d7e3571c82a2d307`. This is preparation, not a cut
-or publication date. Main-push qualification, final release-head review/CI,
-tag and distribution remain pending. See the [candidate record](docs/releases/v0.9.12.md).
+Published at **2026-10-05T12:33:02Z** at immutable release merge
+`0d917701b63ef38210c49df830f48cf0457cbc7d`, with reviewed #6013 head
+`b277bbb1fc20ed7fb5d785165c7ced5650957a89` as second parent. See the
+[0.9.12 record](docs/releases/v0.9.12.md) for source evidence.
 
 ### Added
 
@@ -299,8 +304,7 @@ tag and distribution remain pending. See the [candidate record](docs/releases/v0
   responses do not authorize cleanup; driver/commit unknown stays uncertain.
   Retain the original encrypted journal after refusal, cancellation or ambiguity;
   no retry or refreshed token supplies cleanup authority. See
-  [consumer adoption](docs/deployment_mutations.md). Canonical publication,
-  downstream adoption and packaged/advisory qualification are not asserted.
+  [consumer adoption](docs/deployment_mutations.md).
 
 ### Fixed
 
@@ -316,7 +320,7 @@ tag and distribution remain pending. See the [candidate record](docs/releases/v0
   Hosted PostgreSQL checks native uncast parameter types and explicit NULLs.
   The stable extended-schema fixture reconnects once after all ALTERs; it proves
   neither the original PostgreSQL initial-import 500's cause nor online DDL safety.
-  No dependency graph/version changes are made. Preserve the hosted regression
+  No dependency graph/version changes were made. Preserve the hosted regression
   after patch retirement and retain the vendor copy while the separate TLS patch
   still requires it; see [retirement rules](docs/upstream-sqlx-patches/002-typed-float-null-bindings/README.md).
 
@@ -328,7 +332,7 @@ Published at **2026-10-04T21:26:11Z** at immutable release merge
 main-push workflows and all 20 release jobs succeeded; root verified all 14
 assets/checksums, three Docker Hub indexes and six platform/config pairs.
 See the [verified 0.9.11 record](docs/releases/v0.9.11.md) for exact identities,
-authenticated GHCR proof and revision-label limits. This does not qualify 0.9.12.
+authenticated GHCR proof and revision-label limits.
 
 ### Security
 
@@ -6890,8 +6894,9 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.11...HEAD
-[0.9.12]: docs/releases/v0.9.12.md
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.13...HEAD
+[0.9.13]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.12...v0.9.13
+[0.9.12]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.8...v0.9.9

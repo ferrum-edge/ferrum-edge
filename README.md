@@ -591,24 +591,23 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The published baseline is
+Edge source. The latest tag is
+[`contracts-edge-0.9.12`](https://github.com/ferrum-edge/ferrum-contracts/tree/31f0a21d707795be293d15837c2f77c3d84219d8)
+at `31f0a21d707795be293d15837c2f77c3d84219d8`, prepared against Edge
+**v0.9.12**, published at 2026-10-05T12:33:02Z at release merge
+`0d917701b63ef38210c49df830f48cf0457cbc7d` (see the
+[0.9.12 record](docs/releases/v0.9.12.md)). The earlier
 [`contracts-edge-0.9.11`](https://github.com/ferrum-edge/ferrum-contracts/tree/390edbd5b2485af0988e02f7827fde778d76ae0a)
-at `390edbd5b2485af0988e02f7827fde778d76ae0a`, with owner provenance from
-verified Edge **v0.9.11** at `c764084b3b51c3f7ffde268c039688d35e49c553`.
-Edge v0.9.11 was published at 2026-10-04T21:26:11Z; its
-[release record](docs/releases/v0.9.11.md) records qualified source, verified
-assets/images and GHCR/revision-label limits. Later contracts main
-`96228e1cc3341c6bd2dff3c47eea9efa45e0545e` is not this tag's target.
+tag at `390edbd5b2485af0988e02f7827fde778d76ae0a` remains unchanged.
 
-The **0.9.12 candidate**, prepared on 2026-10-05 UTC from merged #6012,
-adds opt-in `deployment-v1` snapshots and dependency-fenced partial removal/spec
-replacement with original namespace authority and strict durable/live/cleanup
-acknowledgements. Main-push and release qualification, publication, new canonical
-contracts and downstream adoption remain pending. Published 0.9.11 backup tags
-and row ETags cannot authorize this new profile. Preserve existing tags and
-consumer pins until the actual release/contracts/adoption sequence completes.
-See the [candidate release](docs/releases/v0.9.12.md),
-[adoption contract](docs/deployment_mutations.md) and
+The **0.9.13 candidate**, prepared on 2026-10-06 UTC, changes Edge-owned admin
+contract surfaces: namespace and deployment snapshot tags move to `v2` MAC
+domains, deployment snapshots add `api_spec_contents` and digest-only spec
+evidence, conditional snapshot paths can return `507`, and
+`GET /backend-egress-policy` reports `schema_version: 2`. Preserve existing
+tags and consumer pins until the 0.9.13 release and a matching
+ferrum-contracts publication complete; see the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0913) and
 [contracts handoff](docs/admin_contracts_handoff_5992_5994.md).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
