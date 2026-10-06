@@ -6,7 +6,9 @@
 //! check the pool contract: keep-alive reuse, no reuse of a connection the
 //! backend closes, a one-shot replay when an idle connection died before the
 //! request reached the wire, byte-exact uploads, and the decoder-verified
-//! `Content-Length` on streamed responses.
+//! `Content-Length` on streamed responses. They also check that an HTTP/2
+//! client's masked reset reaches the backend as an aborted upload on both the
+//! direct pool and the reqwest path (issue #6022).
 //!
 //! Run with: `cargo build --bin ferrum-edge && cargo test --test
 //! functional_tests functional_http1_direct_pool -- --ignored --nocapture`
@@ -606,4 +608,213 @@ async fn direct_h1_early_response_mid_upload_is_not_reused() {
         assert_eq!(status, 401);
     }
     assert_transport(&harness, true).await;
+}
+
+/// How the HTTP/1.1 backend saw a chunked upload end (issue #6022).
+#[derive(Debug, PartialEq, Eq)]
+enum ChunkedUploadEnd {
+    /// The terminal `0\r\n\r\n` chunk arrived: the backend saw a complete body.
+    Complete,
+    /// The connection closed or failed before the terminal chunk.
+    Aborted,
+    /// The upload was not chunked, so this fixture cannot judge it.
+    NotChunked(String),
+}
+
+/// Raw HTTP/1.1 backend that answers every `POST /upload` with a complete `200`
+/// as soon as the request head arrives, then reads the rest of the chunked
+/// upload and reports how it ended. Anything else, such as the gateway's h2c
+/// capability probe, is ignored.
+fn spawn_early_answer_upload_backend(
+    listener: TcpListener,
+) -> tokio::sync::mpsc::UnboundedReceiver<ChunkedUploadEnd> {
+    let (ends_tx, ends_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let ends_tx = ends_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let mut pending: Vec<u8> = Vec::new();
+                let head_end = loop {
+                    if let Some(i) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => pending.extend_from_slice(&buf[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&pending[..head_end]).into_owned();
+                let head = head.to_ascii_lowercase();
+                pending.drain(..head_end);
+                if !head.starts_with("post /upload ") {
+                    return;
+                }
+                if !head.contains("transfer-encoding: chunked") {
+                    let _ = ends_tx.send(ChunkedUploadEnd::NotChunked(head));
+                    return;
+                }
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                loop {
+                    if pending.starts_with(b"0\r\n\r\n")
+                        || pending.windows(7).any(|w| w == b"\r\n0\r\n\r\n")
+                    {
+                        let _ = ends_tx.send(ChunkedUploadEnd::Complete);
+                        return;
+                    }
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            let _ = ends_tx.send(ChunkedUploadEnd::Aborted);
+                            return;
+                        }
+                        Ok(n) => pending.extend_from_slice(&buf[..n]),
+                    }
+                }
+            });
+        }
+    });
+    ends_rx
+}
+
+/// Issue #6022: hyper reports an HTTP/2 client's `RST_STREAM(NO_ERROR)` as a
+/// clean end of the request body. An upload relayed to an HTTP/1.1 backend must
+/// still end as an aborted body, never with the terminal chunk that makes a
+/// truncated upload look complete. An explicit client CANCEL ends the same way.
+///
+/// The backend answers before the upload ends and the client reads that whole
+/// response before it resets, so only the relayed upload can carry the reset to
+/// the backend. `max_request_body_bytes == 0` relays the upload through
+/// `CountingIncoming`, anything else through `SizeLimitedIncoming`. A non-zero
+/// `write_timeout_ms` moves the client body into the upload pump, which must
+/// inherit the adapter's END_STREAM requirement.
+async fn h2_client_reset_reaches_h1_backend_as_aborted_upload(
+    direct: bool,
+    max_request_body_bytes: u64,
+    write_timeout_ms: u64,
+) {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let mut upload_ends = spawn_early_answer_upload_backend(reservation.into_listener());
+    let yaml = to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h1-upload-reset",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": write_timeout_ms,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    }));
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .env(
+            "FERRUM_POOL_HTTP1_DIRECT",
+            if direct { "true" } else { "false" },
+        )
+        .env(
+            "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
+            max_request_body_bytes.to_string(),
+        )
+        .pool_warmup_enabled(false)
+        .log_level("debug")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let port = reqwest::Url::parse(harness.proxy_base_url())
+        .expect("frontend URL")
+        .port()
+        .expect("frontend port");
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("h2c socket");
+    let (client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+    let driver = tokio::spawn(connection);
+    for reason in [h2::Reason::NO_ERROR, h2::Reason::CANCEL] {
+        let mut client = client.clone().ready().await.expect("client ready");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost:{port}/api/upload"))
+            .header("content-type", "application/octet-stream")
+            .body(())
+            .expect("request");
+        let (response, mut upload) = client.send_request(request, false).expect("open upload");
+        upload
+            .send_data(Bytes::from_static(b"partial upload"), false)
+            .expect("initial DATA");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), response)
+            .await
+            .expect("early response timeout")
+            .expect("early response");
+        assert_eq!(response.status(), 200, "{reason:?}");
+        let mut body = response.into_body();
+        let read_body = async {
+            while let Some(chunk) = body.data().await {
+                chunk.expect("early response body");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), read_body)
+            .await
+            .expect("the early response must complete");
+        upload.send_reset(reason);
+
+        let end = tokio::time::timeout(std::time::Duration::from_secs(10), upload_ends.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the backend upload never ended after a {reason:?} reset"))
+            .expect("backend upload observer");
+        assert_eq!(
+            end,
+            ChunkedUploadEnd::Aborted,
+            "a client {reason:?} reset must reach the backend as an aborted upload, \
+             never as a complete chunked body"
+        );
+    }
+    driver.abort();
+    let _ = driver.await;
+    assert_transport(&harness, direct).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_client_reset_reaches_reqwest_h1_backend_as_aborted_upload() {
+    // reqwest, `CountingIncoming` polled in place.
+    h2_client_reset_reaches_h1_backend_as_aborted_upload(false, 0, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_client_reset_reaches_reqwest_h1_backend_through_upload_pump() {
+    // reqwest, `SizeLimitedIncoming` with the upload pump.
+    h2_client_reset_reaches_h1_backend_as_aborted_upload(false, 1_048_576, 5_000).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_client_reset_reaches_direct_h1_backend_as_aborted_upload() {
+    // Direct HTTP/1.1 pool, `SizeLimitedIncoming` polled in place.
+    h2_client_reset_reaches_h1_backend_as_aborted_upload(true, 1_048_576, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_client_reset_reaches_direct_h1_backend_through_upload_pump() {
+    // Direct HTTP/1.1 pool, `CountingIncoming` with the upload pump.
+    h2_client_reset_reaches_h1_backend_as_aborted_upload(true, 0, 5_000).await;
 }

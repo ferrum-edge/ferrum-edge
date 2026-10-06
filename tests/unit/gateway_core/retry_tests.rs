@@ -1282,6 +1282,315 @@ mod h2_body_reset_classification {
     }
 }
 
+// Who caused an HTTP/2 reset decides whether it is a backend failure (issue
+// #6022, #6028 review R2-1 and R2-4).
+//
+// R2-4: when the gateway's request body fails (a relayed client reset, an
+// authorization expiry, a size refusal), hyper resets the BACKEND stream with
+// the reason it finds in that error. The upload adapters yield a bare CANCEL
+// (`h2_upload_reset_error`), so the backend sees `RST_STREAM(CANCEL)`. h2
+// records that reset as user-initiated, and neither the streaming nor the
+// reqwest classifier may charge it to the backend.
+//
+// R2-1: a reset the BACKEND sends before the response headers, or while a
+// buffered body is read, is `ProtocolError` on the reqwest classifier exactly as
+// on the streaming one, and stays post-wire so `retry_on_connect_failure` never
+// replays it.
+mod h2_reset_origin_classification {
+    use super::*;
+    use bytes::Bytes;
+    use ferrum_edge::retry::{classify_reqwest_error, request_reached_wire};
+    use futures_util::{Stream, StreamExt};
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+    use hyper::client::conn::http2 as h2_client;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use std::pin::Pin;
+    use tokio::sync::oneshot;
+
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+    type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>;
+    type FrameStream = Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, BoxError>> + Send>>;
+
+    /// The classes the deferred dispatch charges to the backend once the
+    /// request reached the wire (`error_class_is_post_wire_backend_failure`).
+    fn charged_post_wire(class: ErrorClass) -> bool {
+        matches!(
+            class,
+            ErrorClass::ReadWriteTimeout
+                | ErrorClass::ConnectionReset
+                | ErrorClass::ConnectionClosed
+                | ErrorClass::ProtocolError
+                | ErrorClass::ResponseBodyTooLarge
+        )
+    }
+
+    /// Neither charged as a post-wire backend failure nor pre-wire (which the
+    /// circuit breaker would record as a connection failure).
+    fn assert_not_charged_to_backend(class: ErrorClass, case: &str) {
+        assert!(
+            !charged_post_wire(class),
+            "{case}: a gateway-initiated reset was charged to the backend as {class:?}"
+        );
+        assert!(
+            request_reached_wire(class),
+            "{case}: a gateway-initiated reset must not look pre-wire: {class:?}"
+        );
+    }
+
+    /// One upload DATA frame, then the bare CANCEL the gateway's upload
+    /// adapters yield (`h2_upload_reset_error`) once `fail` fires.
+    fn failing_upload(fail: oneshot::Receiver<()>) -> ByteStream {
+        let first = futures_util::stream::once(async {
+            Ok::<_, BoxError>(Bytes::from_static(b"partial"))
+        });
+        let failure = futures_util::stream::once(async move {
+            let _ = fail.await;
+            Err::<Bytes, BoxError>(h2::Error::from(h2::Reason::CANCEL).into())
+        });
+        Box::pin(first.chain(failure))
+    }
+
+    /// How the backend saw the upload end after its first DATA frame.
+    #[derive(Debug)]
+    enum UploadEnd {
+        Reset(h2::Reason),
+        EndStream,
+        Other(String),
+    }
+
+    /// Serve one HTTP/2 stream on `io` that never answers: read the first
+    /// request DATA frame, fire `data_seen`, and report how the upload ended.
+    /// The connection keeps running afterwards, so the client's own reset (and
+    /// not a closed connection) is what ends its request.
+    async fn observe_upload<T>(io: T, data_seen: oneshot::Sender<()>) -> UploadEnd
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut conn = h2::server::handshake(io)
+            .await
+            .expect("h2 server handshake");
+        let Some(Ok((request, respond))) = conn.accept().await else {
+            return UploadEnd::Other("no request stream".into());
+        };
+        tokio::spawn(async move { while conn.accept().await.is_some() {} });
+        let mut body = request.into_body();
+        let end = match body.data().await {
+            Some(Ok(data)) => {
+                let _ = body.flow_control().release_capacity(data.len());
+                let _ = data_seen.send(());
+                match body.data().await {
+                    None => UploadEnd::EndStream,
+                    Some(Err(err)) if err.is_reset() => match err.reason() {
+                        Some(reason) => UploadEnd::Reset(reason),
+                        None => UploadEnd::Other(err.to_string()),
+                    },
+                    Some(Err(err)) => UploadEnd::Other(err.to_string()),
+                    Some(Ok(more)) => UploadEnd::Other(format!("unexpected DATA: {more:?}")),
+                }
+            }
+            other => UploadEnd::Other(format!("first upload frame: {other:?}")),
+        };
+        drop(respond);
+        end
+    }
+
+    async fn assert_backend_saw_cancel(observer: tokio::task::JoinHandle<UploadEnd>) {
+        let end = tokio::time::timeout(Duration::from_secs(5), observer)
+            .await
+            .expect("the backend must observe the upload end")
+            .expect("observer task");
+        assert!(
+            matches!(end, UploadEnd::Reset(h2::Reason::CANCEL)),
+            "the backend must see RST_STREAM(CANCEL), never END_STREAM: {end:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_initiated_backend_reset_is_not_charged_to_the_backend() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (data_seen_tx, data_seen_rx) = oneshot::channel();
+        let observer = tokio::spawn(observe_upload(server_io, data_seen_tx));
+
+        let io = TokioIo::new(client_io);
+        let handshake =
+            h2_client::handshake::<_, _, StreamBody<FrameStream>>(TokioExecutor::new(), io);
+        let (mut sender, connection) = handshake.await.expect("h2 client handshake");
+        tokio::spawn(connection);
+        let frames: FrameStream =
+            Box::pin(failing_upload(data_seen_rx).map(|r| r.map(Frame::data)));
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri("http://backend.test/upload")
+            .body(StreamBody::new(frames))
+            .expect("request");
+        let err = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+            .await
+            .expect("the gateway's reset must end the request")
+            .expect_err("the backend never answers");
+        assert_backend_saw_cancel(observer).await;
+
+        // Whatever h2 error hyper hands back is the gateway's own reset.
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        while let Some(node) = source {
+            if let Some(h2_err) = node.downcast_ref::<h2::Error>() {
+                assert!(
+                    !h2_err.is_remote() && !h2_err.is_library(),
+                    "the reset must be recorded as gateway-initiated: {h2_err:?}"
+                );
+            }
+            source = node.source();
+        }
+        let (class, _) = classify_body_error(&err);
+        assert_not_charged_to_backend(class, "classify_body_error");
+        let boxed: BoxError = Box::new(err);
+        let (class, _) = classify_body_error(&*boxed);
+        assert_not_charged_to_backend(class, "classify_body_error (boxed)");
+    }
+
+    #[tokio::test]
+    async fn gateway_initiated_reset_through_reqwest_is_not_charged_to_the_backend() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (data_seen_tx, data_seen_rx) = oneshot::channel();
+        let observer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            observe_upload(socket, data_seen_tx).await
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .build()
+            .expect("client");
+        let send = client
+            .post(format!("http://127.0.0.1:{port}/upload"))
+            .body(reqwest::Body::wrap_stream(failing_upload(data_seen_rx)))
+            .send();
+        let err = tokio::time::timeout(Duration::from_secs(5), send)
+            .await
+            .expect("the gateway's reset must end the request")
+            .expect_err("the backend never answers");
+        assert_backend_saw_cancel(observer).await;
+        assert_not_charged_to_backend(classify_reqwest_error(&err), "classify_reqwest_error");
+    }
+
+    /// Serve one HTTP/2 stream that the backend resets with `reason`. With
+    /// `after_headers`, the backend first sends response headers and one DATA
+    /// frame, then waits for `reset_now` before resetting.
+    async fn spawn_resetting_backend(
+        reason: h2::Reason,
+        after_headers: Option<oneshot::Receiver<()>>,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let mut conn = h2::server::handshake(socket)
+                .await
+                .expect("h2 server handshake");
+            let Some(Ok((_request, mut respond))) = conn.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                match after_headers {
+                    None => respond.send_reset(reason),
+                    Some(reset_now) => {
+                        let mut stream = respond
+                            .send_response(http::Response::new(()), false)
+                            .expect("response headers");
+                        stream
+                            .send_data(Bytes::from_static(b"partial"), false)
+                            .expect("partial DATA");
+                        let _ = reset_now.await;
+                        stream.send_reset(reason);
+                    }
+                }
+            });
+            while conn.accept().await.is_some() {}
+        });
+        port
+    }
+
+    fn h2c_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .build()
+            .expect("client")
+    }
+
+    #[tokio::test]
+    async fn backend_reset_before_response_headers_is_a_post_wire_protocol_error() {
+        for reason in [h2::Reason::CANCEL, h2::Reason::INTERNAL_ERROR] {
+            let port = spawn_resetting_backend(reason, None).await;
+            let send = h2c_client()
+                .post(format!("http://127.0.0.1:{port}/"))
+                .body("payload")
+                .send();
+            let err = tokio::time::timeout(Duration::from_secs(5), send)
+                .await
+                .expect("the backend reset must end the request")
+                .expect_err("the backend reset the stream before headers");
+            let class = classify_reqwest_error(&err);
+            assert_eq!(class, ErrorClass::ProtocolError, "{reason:?}: {err:?}");
+            assert!(
+                request_reached_wire(class),
+                "{reason:?}: a reset before headers must never be replayed as a connect failure"
+            );
+            let config = RetryConfig {
+                max_retries: 3,
+                retryable_status_codes: vec![502],
+                retry_on_connect_failure: true,
+                ..default_config()
+            };
+            let response = BackendResponse {
+                status_code: 502,
+                body: ResponseBody::buffered(Vec::new()),
+                headers: HashMap::new(),
+                connection_error: !request_reached_wire(class),
+                backend_resolved_ip: None,
+                error_class: Some(class),
+                request_on_wire: true,
+                buffered_trailers: None,
+            };
+            assert!(
+                !should_retry(&config, "POST", &response, 0),
+                "{reason:?}: a non-idempotent request reset before headers must not be retried"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_reset_during_a_buffered_body_read_is_a_protocol_error() {
+        for reason in [h2::Reason::CANCEL, h2::Reason::INTERNAL_ERROR] {
+            let (reset_now_tx, reset_now_rx) = oneshot::channel();
+            let port = spawn_resetting_backend(reason, Some(reset_now_rx)).await;
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                h2c_client().get(format!("http://127.0.0.1:{port}/")).send(),
+            )
+            .await
+            .expect("response headers timeout")
+            .expect("response headers");
+            let _ = reset_now_tx.send(());
+            let err = tokio::time::timeout(Duration::from_secs(5), response.bytes())
+                .await
+                .expect("the backend reset must end the body")
+                .expect_err("the backend reset the stream mid-body");
+            assert_eq!(
+                classify_reqwest_error(&err),
+                ErrorClass::ProtocolError,
+                "{reason:?}: {err:?}"
+            );
+        }
+    }
+}
+
 // --- Typed StreamSetupError classification (Gap 2 + Gap 4) ---
 
 #[test]

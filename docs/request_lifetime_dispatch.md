@@ -56,6 +56,17 @@ backend send half with `H3_REQUEST_CANCELLED`; dropping Quinn's send stream alon
 partial upload into clean EOF. This covers buffered bodies, borrowed H3 frontend streams, and
 Hyper `Incoming` uploads, including cancellation while waiting for more frontend DATA.
 
+An HTTP/2 frontend upload has the matching rule. hyper reports a client's `RST_STREAM(NO_ERROR)`
+as a clean end of the request body, so every streaming upload adapter relaying an HTTP/2 client's
+`Incoming` requires the client's own `END_STREAM` before it ends the backend upload. This covers
+native gRPC, the direct HTTP/2 pool, the reqwest path, the direct HTTP/1.1 pool, sidecar mesh
+mTLS, HBONE, and Unix sockets. When the gateway-owned upload pump owns the client body, the pump
+applies the same check. A reset client instead yields a CANCEL error. An HTTP/2 backend sees
+`RST_STREAM(CANCEL)`. An HTTP/1.1 backend sees an aborted body and a closed connection, never the
+terminal chunk. The reset is gateway-initiated, so the error classifiers never count it as a backend
+failure (see [error classification](error_classification.md)). HTTP/1.1 frontends skip the check:
+a valid chunked EOF need not update `is_end_stream()`.
+
 Regression coverage checks zero backend requests on expiry during TLS checkout and before a cached
 send, and observes backend QUIC resets after complete DATA followed by a stalled frontend (without
 Content-Length), plus buffered flow-control expiry. Paused-clock coverage retains a connect-before-

@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Test coverage for HTTP/2 early responses** (#6019). A scripted direct-H2
   backend now answers before reading any request DATA, then drains the full
   2 MiB upload, alongside the existing variant that reads one DATA frame first.
+- **Test coverage for gateway-initiated backend resets** (#6022). A unit test
+  drives a real hyper HTTP/2 client whose request body fails. It checks that
+  the backend receives `RST_STREAM(CANCEL)` and that the error stays
+  backend-health-neutral in both the streaming and reqwest classifiers.
 ### Fixed
 
 - **HTTP/2 bodies no longer leave as one DATA frame per small window
@@ -76,6 +80,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upload, so a reset client reaches the backend as `RST_STREAM(CANCEL)` instead
   of a truncated request that looks complete. Native gRPC already applied this
   check. HTTP/1.1 frontends are unaffected.
+- **Every other HTTP/2 upload dispatcher also refuses to relay a client reset
+  as a complete body** (#6022). The reqwest streaming path (size-limited and
+  unlimited), the direct HTTP/1.1 pool, the sidecar mesh-mTLS pool, HBONE, and
+  Unix-socket backends now apply the same `END_STREAM` check to an HTTP/2
+  client's upload, including through the upload pump. A client
+  `RST_STREAM(NO_ERROR)` now reaches an HTTP/2 backend as `RST_STREAM(CANCEL)`
+  and an HTTP/1.1 backend as an aborted body and a closed connection, never as
+  the final chunk. The check costs one version compare per request and one bool
+  check at end of body.
+- **A backend HTTP/2 reset on a reqwest request or buffered response counts as
+  a backend failure** (#6022). `classify_reqwest_error` now uses the same typed
+  `h2::Error` check as the streaming body classifier (#6019). A non-`NO_ERROR`
+  `RST_STREAM` or `GOAWAY` that the backend sent before the response headers,
+  or while the eager collector read a buffered body, is `protocol_error`. It
+  used to be `request_error`, which circuit breakers and passive health
+  recorded as a success. The class is post-wire, so `retry_on_connect_failure`
+  still never replays the request. The buffered collector for larger or
+  limited responses (`collect_response_with_limit`) now classifies its read
+  errors the same way as the eager collector. They used to be labelled
+  `response_body_too_large`, and now report the real class, such as
+  `protocol_error`, `connection_closed` or `read_timeout`. A read timeout is
+  `504`. The client-visible `502` body for other read errors is now
+  `{"error":"Backend response body read failed"}`. Like the eager collector's
+  errors, a `502` from these errors can be retried under `retryable_status_codes`
+  for a retryable method. Before, `response_body_too_large` was never retried.
+  A reset the gateway raises itself is still not charged to the backend.
 - **A refused streamed-gRPC handoff keeps the client upload** (#6022). When
   the client RPC deadline or authorization lifetime elapsed while a
   fully-streamed native gRPC dispatch acquired its backend sender, the handoff

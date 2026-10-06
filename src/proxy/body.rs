@@ -3626,6 +3626,9 @@ pub struct CountingIncoming {
     /// Absolute authorization lifetime of the admitted stream, or `None` for an
     /// unauthenticated request (no timer is registered at all).
     auth_deadline: Option<UploadAuthDeadline>,
+    /// A frontend HTTP/2 upload's EOF must be backed by the client's own
+    /// END_STREAM. See [`SizeLimitedIncoming::with_h2_end_stream_required`].
+    require_end_stream: bool,
 }
 
 impl CountingIncoming {
@@ -3659,6 +3662,7 @@ impl CountingIncoming {
             grpc_messages: None,
             grpc_scanner: None,
             auth_deadline: None,
+            require_end_stream: false,
         }
     }
 
@@ -3687,8 +3691,21 @@ impl CountingIncoming {
         plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
-        let join = self.inner.install_pump(plan, write_timeout_ms, false);
+        let join = self
+            .inner
+            .install_pump(plan, write_timeout_ms, self.require_end_stream);
         (self, join)
+    }
+
+    /// Require a frontend HTTP/2 upload's EOF to be backed by the client's own
+    /// END_STREAM (issue #6022). Identical contract to
+    /// [`SizeLimitedIncoming::with_h2_end_stream_required`], for the
+    /// unlimited-size streaming upload path. Set it BEFORE
+    /// [`Self::with_gateway_upload_pump`].
+    #[must_use]
+    pub(crate) fn with_h2_end_stream_required(mut self, required: bool) -> Self {
+        self.require_end_stream = required;
+        self
     }
 
     /// Enable authoritative gRPC length-prefixed message counting while
@@ -3786,6 +3803,13 @@ impl http_body::Body for CountingIncoming {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            // See `SizeLimitedIncoming::with_h2_end_stream_required` (issue
+            // #6022). A pumped source already ran this check against the
+            // original client body, and reports end of stream once it ended
+            // cleanly.
+            Poll::Ready(None) if this.require_end_stream && !this.inner.is_end_stream() => {
+                Poll::Ready(Some(Err(h2_upload_reset_error())))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
