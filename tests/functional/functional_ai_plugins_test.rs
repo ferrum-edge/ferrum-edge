@@ -742,7 +742,8 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
         .get_multiplexed_async_connection()
         .await
         .unwrap();
-    for denied in ["released", "WATCH", "UNWATCH", "MULTI", "DEL", "EXEC"] {
+    // UNWATCH is never granted: the bounded quarantine helper does not send it.
+    for denied in ["released", "WATCH", "MULTI", "DEL", "EXEC"] {
         let username = format!("semantic-quarantine-{}", Uuid::new_v4().simple());
         let password = Uuid::new_v4().simple().to_string();
         let mut acl = redis::cmd("ACL");
@@ -767,7 +768,6 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             .arg("+getrange");
         if denied != "released" {
             acl.arg("+watch")
-                .arg("+unwatch")
                 .arg("+del")
                 .arg(format!("-{}", denied.to_ascii_lowercase()));
         }
@@ -877,14 +877,19 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
                 detail.starts_with("Transaction discarded because of: NOPERM ")
             }));
         }
-        let expected = if denied == "UNWATCH" {
-            b"different".as_slice()
-        } else {
-            MALFORMED
-        };
+        if matches!(denied, "MULTI" | "DEL" | "EXEC") {
+            // A proven mismatch settles before MULTI and needs no UNWATCH, so
+            // an ACL without +unwatch still answers it as a plain false.
+            assert!(matches!(
+                acl_compare
+                    .delete_if_value_matches_bounded(&key, b"different")
+                    .await,
+                Ok(false)
+            ));
+        }
         assert!(
             acl_compare
-                .delete_if_value_matches_bounded(&key, expected)
+                .delete_if_value_matches_bounded(&key, MALFORMED)
                 .await
                 .is_err(),
             "the restricted ACL must refuse the targeted quarantine operation: {denied}"
@@ -927,10 +932,10 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
             .set_bytes_with_expire(&key, MALFORMED, 60)
             .await
             .unwrap();
-        // WATCH/UNWATCH denials use a pre-WATCH replacement. Transaction
-        // denials use a post-comparison replacement; MULTI denial must never
-        // let a following DEL escape the transaction and erase that value.
-        let barrier = if matches!(denied, "released" | "WATCH" | "UNWATCH") {
+        // WATCH denials use a pre-WATCH replacement. Transaction denials use
+        // a post-comparison replacement; MULTI denial must never let a
+        // following DEL escape the transaction and erase that value.
+        let barrier = if matches!(denied, "released" | "WATCH") {
             1
         } else {
             2
