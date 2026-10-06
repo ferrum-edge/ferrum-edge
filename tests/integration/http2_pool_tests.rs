@@ -16,7 +16,7 @@ use ferrum_edge::config::types::{
     ResolvedPortOverride,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
+use ferrum_edge::proxy::grpc_proxy::{GrpcBody, GrpcConnectionPool};
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
 use ferrum_edge::proxy::{ProxyState, handle_proxy_request};
 use hickory_resolver::proto::{
@@ -2388,7 +2388,7 @@ async fn test_grpc_pool_affinity_keeps_each_frontend_connection_on_its_own_shard
 }
 
 #[tokio::test]
-async fn test_grpc_pool_affinity_borrows_a_ready_sibling_while_its_shard_dials() {
+async fn test_grpc_pool_cross_frontend_reuses_ready_sibling_while_its_shard_dials() {
     use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
     use futures_util::FutureExt;
 
@@ -2405,9 +2405,9 @@ async fn test_grpc_pool_affinity_borrows_a_ready_sibling_while_its_shard_dials()
         .expect("warm shard");
     assert_eq!(accepted.load(Ordering::Relaxed), 1);
 
-    // New dials now stall until released. A second frontend connection maps to
-    // a missing shard: its calls are served by the ready sibling at once, on
-    // a paused clock, instead of waiting up to the connect timeout.
+    // New dials now stall until released. The second frontend connection maps
+    // to a missing shard, so its first sender borrows the ready connection
+    // established by the first frontend without waiting for the new dial.
     hold.send_replace(true);
     let second = FrontendConnectionAffinity::with_table(&table);
     let stream = second.open_stream();
@@ -2424,6 +2424,16 @@ async fn test_grpc_pool_affinity_borrows_a_ready_sibling_while_its_shard_dials()
     assert_eq!(started.elapsed(), Duration::ZERO, "no added latency");
     tokio::time::resume();
     assert_eq!(pool.shard_fills_in_flight(), 1, "one coalesced fill");
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "second frontend reused the ready socket"
+    );
+    assert_eq!(
+        pool.pool_size(),
+        1,
+        "borrowed sender does not alias a new shard"
+    );
 
     // The single background create reaches the backend and completes once the
     // backend answers; the shard then serves its own connection's calls.
@@ -3151,4 +3161,223 @@ async fn test_direct_h1_handoff_gate_returns_the_untouched_connection_to_the_poo
     }
     assert_eq!(accepts.load(Ordering::SeqCst), 1, "no redial");
     backend.abort();
+}
+
+// ── Small connection-window increments (issue #6033) ────────────────────────
+
+const RAW_H2_DATA: u8 = 0x0;
+const RAW_H2_HEADERS: u8 = 0x1;
+const RAW_H2_SETTINGS: u8 = 0x4;
+const RAW_H2_PING: u8 = 0x6;
+const RAW_H2_WINDOW_UPDATE: u8 = 0x8;
+/// Every connection starts with this much connection window; SETTINGS cannot
+/// change it.
+const RAW_H2_INITIAL_CONNECTION_WINDOW: usize = 65_535;
+/// h2's `DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD`: an h2 0.4.16+ receiver charges
+/// every DATA frame below it against a connection-wide budget and answers an
+/// exhausted budget with `GOAWAY(ENHANCE_YOUR_CALM)`.
+const SMALL_DATA_FRAME: usize = 256;
+
+fn raw_h2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&stream_id.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Raw HTTP/2 backend that sends every connection-level WINDOW_UPDATE itself
+/// and records the length and END_STREAM flag of each request DATA frame.
+struct WindowTricklingBackend {
+    socket: tokio::net::TcpStream,
+    stream_id: u32,
+    frames: Vec<(usize, bool)>,
+    received: usize,
+}
+
+impl WindowTricklingBackend {
+    async fn accept(listener: tokio::net::TcpListener) -> Self {
+        let (mut socket, _) = listener.accept().await.expect("accept h2c client");
+        socket.set_nodelay(true).expect("TCP_NODELAY");
+        let mut preface = [0_u8; 24];
+        socket
+            .read_exact(&mut preface)
+            .await
+            .expect("read HTTP/2 client preface");
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        // SETTINGS_INITIAL_WINDOW_SIZE = 1 MiB: only the connection window
+        // ever limits the upload.
+        let settings = raw_h2_frame(RAW_H2_SETTINGS, 0, 0, &[0, 4, 0, 0x10, 0, 0]);
+        socket.write_all(&settings).await.expect("write SETTINGS");
+        Self {
+            socket,
+            stream_id: 0,
+            frames: Vec::new(),
+            received: 0,
+        }
+    }
+
+    /// Reads frames until `total` request body bytes have arrived.
+    async fn read_body_until(&mut self, total: usize) {
+        while self.received < total {
+            let mut head = [0_u8; 9];
+            self.socket
+                .read_exact(&mut head)
+                .await
+                .expect("read frame header");
+            let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let stream_id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+            let mut payload = vec![0_u8; len];
+            self.socket
+                .read_exact(&mut payload)
+                .await
+                .expect("read frame payload");
+            match (head[3], head[4]) {
+                (RAW_H2_HEADERS, _) => self.stream_id = stream_id,
+                (RAW_H2_DATA, flags) => {
+                    self.received += len;
+                    self.frames.push((len, flags & 0x1 != 0));
+                }
+                (RAW_H2_SETTINGS, flags) if flags & 0x1 == 0 => {
+                    let ack = raw_h2_frame(RAW_H2_SETTINGS, 0x1, 0, &[]);
+                    self.socket
+                        .write_all(&ack)
+                        .await
+                        .expect("write SETTINGS ACK");
+                }
+                (RAW_H2_PING, flags) if flags & 0x1 == 0 => {
+                    let ack = raw_h2_frame(RAW_H2_PING, 0x1, 0, &payload);
+                    self.socket.write_all(&ack).await.expect("write PING ACK");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Opens the connection window by `increment` bytes, then yields so the
+    /// gateway handles it before the next one arrives.
+    async fn grant(&mut self, increment: u32) {
+        let window_update = raw_h2_frame(RAW_H2_WINDOW_UPDATE, 0, 0, &increment.to_be_bytes());
+        self.socket
+            .write_all(&window_update)
+            .await
+            .expect("write WINDOW_UPDATE");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Answers the request: HEADERS (END_HEADERS | END_STREAM) carrying the
+    /// HPACK static-table entry for `:status: 200`.
+    async fn respond(&mut self) {
+        let headers = raw_h2_frame(RAW_H2_HEADERS, 0x5, self.stream_id, &[0x88]);
+        self.socket
+            .write_all(&headers)
+            .await
+            .expect("write response HEADERS");
+    }
+}
+
+/// Issue #6033: a backend that opens its connection window a few bytes at a
+/// time must not receive one DATA frame per increment. The gRPC pool builds
+/// its hyper client with a timer, so the body pipe coalesces increments into
+/// frames of at least `SMALL_DATA_FRAME` bytes; a window that never reaches
+/// that size still completes once the pipe's bounded wait ends.
+#[tokio::test]
+async fn test_grpc_h2c_upload_coalesces_small_connection_window_increments() {
+    const INCREMENT: u32 = 32;
+    const TRICKLE_GRANTS: usize = 128;
+    const LOCKSTEP_ROUNDS: usize = 8;
+    let trickled = TRICKLE_GRANTS * INCREMENT as usize;
+    let lockstep = LOCKSTEP_ROUNDS * INCREMENT as usize;
+    let after_trickle = RAW_H2_INITIAL_CONNECTION_WINDOW + trickled;
+    let body_len = after_trickle + lockstep;
+
+    let listener = tokio::net::TcpListener::bind_test((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind window-trickling backend");
+    let port = listener.local_addr().expect("backend address").port();
+    let backend = tokio::spawn(async move {
+        let mut backend = WindowTricklingBackend::accept(listener).await;
+        backend
+            .read_body_until(RAW_H2_INITIAL_CONNECTION_WINDOW)
+            .await;
+        let initial = backend.frames.len();
+        // Increments that do not wait for the bytes they allow, so several
+        // arrive while the gateway still holds a chunk: they must leave as
+        // frames of a useful size, not one DATA frame each.
+        for _ in 0..TRICKLE_GRANTS {
+            backend.grant(INCREMENT).await;
+        }
+        backend.read_body_until(after_trickle).await;
+        let trickle_frames = backend.frames.split_off(initial);
+        // Lockstep increments: each opens the window only after the bytes it
+        // allowed arrived, so capacity never reaches a useful frame and only
+        // the bounded wait lets the upload progress.
+        for _ in 0..LOCKSTEP_ROUNDS {
+            let target = backend.received + INCREMENT as usize;
+            backend.grant(INCREMENT).await;
+            backend.read_body_until(target).await;
+        }
+        let lockstep_frames = backend.frames.split_off(initial);
+        backend.respond().await;
+        (trickle_frames, lockstep_frames, backend.received)
+    });
+
+    // One connection: the backend accepts exactly one.
+    let pool = GrpcConnectionPool::new(
+        PoolConfig {
+            http2_connections_per_host: 1,
+            ..PoolConfig::default()
+        },
+        ferrum_edge::config::EnvConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = Ipv4Addr::LOCALHOST.to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 2_000;
+
+    let mut sender = pool.get_sender(&proxy).await.expect("h2c sender");
+    sender.ready().await.expect("sender ready");
+    let body = GrpcBody::Buffered(Full::new(Bytes::from(vec![b'x'; body_len])));
+    let request = Request::post(format!("http://127.0.0.1:{port}/ferrum.Echo/Upload"))
+        .header("content-type", "application/grpc")
+        .body(body)
+        .expect("request");
+    let response = tokio::time::timeout(Duration::from_secs(10), sender.send_request(request))
+        .await
+        .expect("the upload completes")
+        .expect("response");
+    assert_eq!(response.status(), 200);
+
+    let (trickle_frames, lockstep_frames, received) = backend.await.expect("backend task");
+    assert_eq!(received, body_len);
+    // A scheduling stall longer than the bounded wait can let one hold expire,
+    // so tolerate a few small frames; without coalescing every increment is
+    // one.
+    let small = trickle_frames
+        .iter()
+        .filter(|(len, end_stream)| !end_stream && *len < SMALL_DATA_FRAME)
+        .count();
+    assert!(
+        small <= TRICKLE_GRANTS / 8,
+        "{small} of {} DATA frames cut from window increments were under \
+         {SMALL_DATA_FRAME} bytes: {trickle_frames:?}",
+        trickle_frames.len()
+    );
+    let lockstep_sent: usize = lockstep_frames.iter().map(|(len, _)| len).sum();
+    assert_eq!(lockstep_sent, lockstep);
+    assert!(
+        lockstep_frames
+            .last()
+            .is_some_and(|(_, end_stream)| *end_stream),
+        "the last DATA frame ends the stream: {lockstep_frames:?}"
+    );
 }

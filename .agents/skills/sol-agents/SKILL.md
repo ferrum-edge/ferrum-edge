@@ -118,8 +118,8 @@ changes it, and record the selected mode beside each worker. Do not pass both fl
 
 The launcher pins `gpt-6.1-sol`, the reasoning effort, `danger-full-access`, the verified worktree
 root, and stdin prompt mode. Standard mode (omitted flag or `--no-fast`) pins
-`service_tier="default"` and `features.fast_mode=false`; `--fast` pins `service_tier="fast"` and
-`features.fast_mode=true`. These per-run overrides take precedence over saved speed settings.
+`service_tier="default"`; only `--fast` adds `features.fast_mode=true` alongside
+`service_tier="fast"`. These per-run overrides take precedence over saved speed settings.
 Fast mode changes the service tier, not the model or reasoning effort. Report a rejected tier
 instead of silently changing the requested mode. The prompt file reaches EOF cleanly, avoiding
 the non-TTY hang caused by a prompt argument with open stdin. Delete the temporary prompt after

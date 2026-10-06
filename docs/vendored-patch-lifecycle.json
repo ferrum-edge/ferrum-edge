@@ -55,10 +55,11 @@
     },
     {
       "id": "hyper-h2-body-progress-and-timeout",
-      "description": "Hyper patch 004 depends on patch 002's pending-body implementation. Retire both together after adopting an equivalent write-stall bound that preserves positive-capacity progress, or moving the HTTP/2 client off Hyper.",
+      "description": "Hyper patches 004 and 005 depend on patch 002's pending-body implementation, and patch 005 rewrites the loop patch 004 extended. Retire them together after adopting an equivalent write-stall bound that preserves positive-capacity progress, or moving the HTTP/2 client off Hyper; patch 005 may retire earlier once hyper or h2 coalesces small window increments itself.",
       "patch_ids": [
         "hyper-002-min-data-frame-capacity",
-        "hyper-004-h2-body-write-timeout"
+        "hyper-004-h2-body-write-timeout",
+        "hyper-005-h2-small-window-coalescing"
       ]
     }
   ],
@@ -885,6 +886,37 @@
       "regression_tests": [
         "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_body_write_timeout_tests)",
         "tests/functional/scripted_backend_h2_tests.rs (grpc_streaming_backend_write_timeout_maps_to_deadline_exceeded, h2_direct_passthrough_backend_write_timeout_maps_to_504, grpc_streaming_zero_write_timeout_is_not_cut)"
+      ]
+    },
+    {
+      "id": "hyper-005-h2-small-window-coalescing",
+      "label": "hyper HTTP/2 body pipes coalesce DATA frames cut from small window increments",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/005-h2-small-window-coalescing/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "With patch 002's positive-capacity progress, h2 cut one DATA frame from every window increment, so a peer opening its window a few bytes at a time received a self-sustaining run of small frames that an unpatched h2 0.4.16+ receiver answers with GOAWAY(ENHANCE_YOUR_CALM, too_many_data_frames) (#6033). On connections with a Timer, the client and server body pipes hold capacity below min(chunk remaining, 256) for at most 2 ms, then hand h2 exactly the assigned capacity; the bounded wait keeps every positive window live.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with Hyper patches 002 and 004, or earlier when a hyper or h2 release coalesces small window increments on the send side while keeping every positive window live; hosted trickling-window and lockstep-window regressions must pass against the replacement.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": "No upstream release coalesces small window increments on the send side."
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_small_window_coalescing_tests)",
+        "tests/integration/http2_pool_tests.rs (test_grpc_h2c_upload_coalesces_small_connection_window_increments)"
       ]
     },
     {

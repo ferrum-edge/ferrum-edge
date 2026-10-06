@@ -6,13 +6,14 @@ usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
     '                         --effort low|medium|high|xhigh|max' \
-    '                         [--fast]' >&2
+    '                         [--fast | --no-fast]' >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
 fast='false'
+speed_option=''
 
 while (($#)); do
   case "$1" in
@@ -43,8 +44,18 @@ while (($#)); do
       effort=${2-}
       shift 2
       ;;
-    --fast)
-      fast='true'
+    --fast|--no-fast)
+      if [[ -n "$speed_option" && "$speed_option" != "$1" ]]; then
+        printf 'Conflicting speed options: --fast and --no-fast\n' >&2
+        usage
+        exit 2
+      fi
+      speed_option=$1
+      if [[ "$1" == '--fast' ]]; then
+        fast='true'
+      else
+        fast='false'
+      fi
       shift
       ;;
     -h|--help)
@@ -70,7 +81,7 @@ esac
 
 service_tier='default'
 if [[ "$fast" == 'true' ]]; then
-  service_tier='priority'
+  service_tier='fast'
 fi
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
@@ -106,10 +117,17 @@ cd "$physical_worktree"
 printf '[luna-agents] dispatch model=gpt-6-luna effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
   "$effort" "$fast" "$service_tier" "$physical_worktree" "$codex_bin" >&2
 
+config_args=(
+  --config "model_reasoning_effort=\"$effort\""
+  --config "service_tier=\"$service_tier\""
+)
+if [[ "$fast" == 'true' ]]; then
+  config_args+=(--config 'features.fast_mode=true')
+fi
+
 exec "$codex_bin" exec \
   --model gpt-6-luna \
-  --config "model_reasoning_effort=\"$effort\"" \
-  --config "service_tier=\"$service_tier\"" \
+  "${config_args[@]}" \
   --sandbox danger-full-access \
   --cd "$physical_worktree" \
   - < "$prompt_file"

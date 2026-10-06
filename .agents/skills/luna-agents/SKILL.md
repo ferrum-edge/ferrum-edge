@@ -49,7 +49,7 @@ prompt, including continuation prompts and any permitted nested delegation.
    - `codex` on `PATH`.
 3. Confirm that the installed CLI supports `--model`, `--config`, `--sandbox`, `--cd`, and reading
    a prompt from stdin with `-`. If the user explicitly requests fast mode, also confirm the
-   bundled model catalog lists the `priority` service tier for `gpt-6-luna`.
+   bundled model catalog lists the `fast` service tier for `gpt-6-luna`.
 4. Use the pinned model `gpt-6-luna`. Stop and report the exact error if authentication, model
    access, requested effort, or requested service tier is rejected. Do not silently substitute
    another model, effort, or service tier. Confirm the installed model catalog advertises the
@@ -101,18 +101,20 @@ one long-lived execution session:
 <ABS_SKILL_DIR>/scripts/dispatch-agent.sh \
   --worktree <ABS_WORKTREE> \
   --prompt-file <ABS_PROMPT_FILE> \
-  --effort <low|medium|high|xhigh|max>
+  --effort <low|medium|high|xhigh|max> [--fast | --no-fast]
 ```
 
 `--fast` is an opt-in controller flag. Append it only when the user explicitly requests fast mode
 for the dispatch or fleet. Never infer it from urgency, deadlines, task size, or available credits.
 Omit it for every other run, including continuations unless they remain within the same explicit
-request. Record the selected mode beside each worker.
+request. Use `--no-fast` when standard mode is explicitly requested. Record the selected mode
+beside each worker.
 
 The launcher pins `gpt-6-luna`, the reasoning effort, `danger-full-access`, the verified worktree
-root, and stdin prompt mode. It pins `service_tier="default"` normally and selects the model's Fast
-`priority` tier only with `--fast`. The prompt file reaches EOF cleanly, avoiding the non-TTY hang
-caused by a prompt argument with open stdin. Delete the temporary prompt after the worker exits.
+root, and stdin prompt mode. It pins `service_tier="default"` normally and selects
+`service_tier="fast"` with `features.fast_mode=true` only with `--fast`. The prompt file reaches
+EOF cleanly, avoiding the non-TTY hang caused by a prompt argument with open stdin. Delete the
+temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. One worker per tool call keeps completion and failure attributable. Use `pgrep -x codex` only

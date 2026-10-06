@@ -113,6 +113,8 @@ where
     conn: Connection<Compat<T>, SendBuf<B::Data>>,
     closing: Option<crate::Error>,
     date_header: bool,
+    // FERRUM PATCH 005: bounds each response body pipe's coalescing wait.
+    timer: Time,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -225,6 +227,7 @@ where
                         conn,
                         closing: None,
                         date_header: me.date_header,
+                        timer: me.timer.clone(),
                     })
                 }
                 State::Serving(ref mut srv) => {
@@ -312,6 +315,7 @@ where
                             connect_parts,
                             respond,
                             self.date_header,
+                            self.timer.clone(),
                             exec.clone(),
                         );
 
@@ -370,6 +374,8 @@ pin_project! {
         #[pin]
         state: H2StreamState<F, B>,
         date_header: bool,
+        // FERRUM PATCH 005: bounds the response body pipe's coalescing wait.
+        timer: Time,
         exec: E,
     }
 }
@@ -407,12 +413,14 @@ where
         connect_parts: Option<ConnectParts>,
         respond: SendResponse<SendBuf<B::Data>>,
         date_header: bool,
+        timer: Time,
         exec: E,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
             state: H2StreamState::Service { fut, connect_parts },
             date_header,
+            timer,
             exec,
         }
     }
@@ -517,8 +525,11 @@ where
                         }
 
                         let body_tx = reply!(me, res, false);
+                        // FERRUM PATCH 005: coalesce DATA frames cut from
+                        // small window increments, bounded by the timer.
                         H2StreamState::Body {
-                            pipe: PipeToSendStream::new(body, body_tx),
+                            pipe: PipeToSendStream::new(body, body_tx)
+                                .with_coalescing(me.timer.clone()),
                         }
                     } else {
                         reply!(me, res, true);

@@ -373,6 +373,24 @@ enum LookupOutcome<C> {
     Unhealthy(String),
 }
 
+/// Who drives one coalesced [`GenericPool`] create (issue #6032).
+///
+/// Connect timeout is request policy and is not part of a pool key, so a
+/// backend capability probe, whose connect budget is capped at
+/// `BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP`, can own a create that a live
+/// request then joins. A failure of a probe-owned create is never
+/// authoritative for a joined request: the request re-elects and dials under
+/// its own route connect budget, so its effective connect deadline is never
+/// shorter than its route's. Every other create (live requests, background
+/// shard fills started by a request) is [`PoolCreateCaller::Request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolCreateCaller {
+    /// A live request, or any create whose connect budget is the route's own.
+    Request,
+    /// A startup/reload/periodic backend capability probe.
+    CapabilityProbe,
+}
+
 /// Outcome published to coalesced waiters for one pending creation entry.
 ///
 /// `Finished` covers both successful insertion and creator cancellation: waiters
@@ -395,6 +413,9 @@ struct PendingEstablishmentLog {
 
 struct PendingCreation {
     outcome_tx: watch::Sender<CreationNotify>,
+    /// The creator is a capability probe with a capped connect budget. Its
+    /// failure is broadcast to probe waiters only; request waiters re-elect.
+    probe_owned: bool,
     /// Set when any live-request caller joins this coalesced create.
     request_joined: AtomicBool,
     /// Highest establishment-log rank claimed for this attempt:
@@ -425,6 +446,23 @@ impl CoalescedCreateAttempt {
         Self {
             inner: Arc::new(PendingCreation::new()),
         }
+    }
+
+    /// Isolated attempt owned by a capability probe, for tests that drive log
+    /// ranking without a pool.
+    pub fn new_probe_owned() -> Self {
+        let pending = PendingCreation::owned_by(PoolCreateCaller::CapabilityProbe);
+        Self {
+            inner: Arc::new(pending),
+        }
+    }
+
+    /// A capability probe owns this create. Its failure is never a joined
+    /// request's outcome: request waiters re-elect and dial under their own
+    /// budget (issue #6032).
+    #[inline]
+    pub fn probe_owned(&self) -> bool {
+        self.inner.probe_owned
     }
 
     /// Mark that a live request is participating in this create.
@@ -514,9 +552,17 @@ impl PendingCreation {
         let (outcome_tx, _outcome_rx) = watch::channel(CreationNotify::Pending);
         Self {
             outcome_tx,
+            probe_owned: false,
             request_joined: AtomicBool::new(false),
             emitted_rank: AtomicU8::new(0),
             log_context: OnceLock::new(),
+        }
+    }
+
+    fn owned_by(caller: PoolCreateCaller) -> Self {
+        Self {
+            probe_owned: caller == PoolCreateCaller::CapabilityProbe,
+            ..Self::new()
         }
     }
 
@@ -1017,10 +1063,32 @@ impl<M: PoolManager> GenericPool<M> {
         Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
         E: ShareablePoolCreateError + From<SharedPoolCreateError>,
     {
-        self.create_or_get_existing_owned_with_attempt(
+        self.create_or_get_existing_owned_as(key, PoolCreateCaller::Request, create)
+            .await
+    }
+
+    /// Like [`Self::create_or_get_existing_owned`], for a caller that names
+    /// who drives the create. A [`PoolCreateCaller::CapabilityProbe`] creator's
+    /// failure is not broadcast to request waiters: they re-elect and dial
+    /// under their own connect budget (issue #6032).
+    pub async fn create_or_get_existing_owned_as<C, Fut, E>(
+        &self,
+        key: String,
+        caller: PoolCreateCaller,
+        create: C,
+    ) -> std::result::Result<M::Connection, E>
+    where
+        C: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<M::Connection, E>>,
+        E: ShareablePoolCreateError + From<SharedPoolCreateError>,
+    {
+        self.create_or_get_existing_owned_budgeted(
             key,
+            CreateBudget::Request,
+            caller,
             |_| {},
             |_| {},
+            |_| None,
             |key, _attempt| create(key),
         )
         .await
@@ -1051,6 +1119,7 @@ impl<M: PoolManager> GenericPool<M> {
     {
         self.create_or_get_existing_owned_with_recovery(
             key,
+            PoolCreateCaller::Request,
             on_join,
             on_waiter_failure,
             |_| None,
@@ -1067,6 +1136,7 @@ impl<M: PoolManager> GenericPool<M> {
     pub(crate) async fn create_or_get_existing_owned_with_recovery<C, Fut, E, J, W, R>(
         &self,
         key: String,
+        caller: PoolCreateCaller,
         on_join: J,
         on_waiter_failure: W,
         recover: R,
@@ -1083,6 +1153,7 @@ impl<M: PoolManager> GenericPool<M> {
         self.create_or_get_existing_owned_budgeted(
             key,
             CreateBudget::Request,
+            caller,
             on_join,
             on_waiter_failure,
             recover,
@@ -1096,10 +1167,12 @@ impl<M: PoolManager> GenericPool<M> {
     /// instead of waiting for a request-path permit. It still coalesces with
     /// request-path creates of the same key: a request that joins it waits on
     /// this attempt, and this attempt joins a request-path create in flight.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_or_get_existing_owned_in_background<C, Fut, E, J, W, R>(
         &self,
         key: String,
         permit: BackgroundCreatePermit,
+        caller: PoolCreateCaller,
         on_join: J,
         on_waiter_failure: W,
         recover: R,
@@ -1117,6 +1190,7 @@ impl<M: PoolManager> GenericPool<M> {
             .create_or_get_existing_owned_budgeted(
                 key,
                 CreateBudget::Background,
+                caller,
                 on_join,
                 on_waiter_failure,
                 recover,
@@ -1127,10 +1201,12 @@ impl<M: PoolManager> GenericPool<M> {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_or_get_existing_owned_budgeted<C, Fut, E, J, W, R>(
         &self,
         key: String,
         budget: CreateBudget,
+        caller: PoolCreateCaller,
         mut on_join: J,
         mut on_waiter_failure: W,
         recover: R,
@@ -1151,7 +1227,7 @@ impl<M: PoolManager> GenericPool<M> {
                 return Ok(conn);
             }
 
-            let (pending, is_creator) = self.register_pending_creation(&key);
+            let (pending, is_creator) = self.register_pending_creation(&key, caller);
             let attempt = CoalescedCreateAttempt {
                 inner: Arc::clone(&pending),
             };
@@ -1162,6 +1238,15 @@ impl<M: PoolManager> GenericPool<M> {
                 // subscribes after the creator finishes will observe it and
                 // either return the shared failure or loop without hanging.
                 match crate::profile_pool_future!(WaitPoll, pending.wait()) {
+                    // A probe's capped connect budget is not this request's
+                    // (issue #6032). The failed entry is already retired, so
+                    // re-electing either joins a fresh create or becomes its
+                    // creator under this caller's own route budget.
+                    CreationNotify::Failed(_)
+                        if pending.probe_owned && caller == PoolCreateCaller::Request =>
+                    {
+                        continue;
+                    }
                     CreationNotify::Failed(err) => {
                         on_waiter_failure(&attempt);
                         return Err(E::from(err));
@@ -1197,11 +1282,15 @@ impl<M: PoolManager> GenericPool<M> {
         }
     }
 
-    fn register_pending_creation(&self, key: &str) -> (Arc<PendingCreation>, bool) {
+    fn register_pending_creation(
+        &self,
+        key: &str,
+        caller: PoolCreateCaller,
+    ) -> (Arc<PendingCreation>, bool) {
         match self.pending_creations.entry(key.to_owned()) {
             Entry::Occupied(existing) => (existing.get().clone(), false),
             Entry::Vacant(vacant) => {
-                let pending = Arc::new(PendingCreation::new());
+                let pending = Arc::new(PendingCreation::owned_by(caller));
                 vacant.insert(pending.clone());
                 (pending, true)
             }
