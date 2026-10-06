@@ -45,6 +45,7 @@ use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
     extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
+    push_stripped_credential_header_names,
 };
 use super::{PluginResult, RequestContext, strip_auth_scheme};
 
@@ -1533,6 +1534,25 @@ impl super::Plugin for Oauth2Introspection {
                 .providers
                 .iter()
                 .any(|provider| !provider.claim_headers.is_empty())
+    }
+
+    /// The owned claim destinations, plus the credential headers stripping
+    /// may remove. An accepted token is stripped from every provider's header
+    /// locations it appears in, so all of them count (issue #6022).
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        let mut names: Vec<String> = self
+            .claim_header_destinations
+            .names()
+            .map(str::to_string)
+            .collect();
+        if self.strip_authorization_on_success {
+            let locations = self
+                .providers
+                .iter()
+                .flat_map(|provider| &provider.token_locations);
+            push_stripped_credential_header_names(&mut names, locations);
+        }
+        Some(names)
     }
 
     async fn before_proxy(

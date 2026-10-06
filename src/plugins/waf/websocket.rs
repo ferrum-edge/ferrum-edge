@@ -491,6 +491,12 @@ impl Plugin for WafWsSession {
         self.waf.supported_protocols()
     }
 
+    /// The session is the bound `waf` instance, so it carries the built-in's
+    /// declaration rather than the out-of-tree default (issue #6022).
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        self.waf.response_body_production()
+    }
+
     fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
         self.waf.websocket_size_limits()
     }

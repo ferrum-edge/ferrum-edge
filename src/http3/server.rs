@@ -413,6 +413,31 @@ fn boxed_send_h3_request_buffer_capacity_rejection<'a>(
     })
 }
 
+/// The terminal a dispatch-stage drain refusal answers with. The gRPC status
+/// is explicit so it never falls back to the HTTP-status mapping.
+struct H3DispatchBodyRefusal {
+    status: StatusCode,
+    body: &'static str,
+    grpc_status: u32,
+    grpc_message: &'static str,
+}
+
+/// The shared request-buffer budget could not admit the upload (#6009).
+const H3_REQUEST_BUFFER_CAPACITY_REFUSAL: H3DispatchBodyRefusal = H3DispatchBodyRefusal {
+    status: StatusCode::SERVICE_UNAVAILABLE,
+    body: crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY,
+    grpc_status: crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
+    grpc_message: crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE,
+};
+
+/// The upload exceeded the drain's retained ceiling.
+const H3_REQUEST_BODY_TOO_LARGE_REFUSAL: H3DispatchBodyRefusal = H3DispatchBodyRefusal {
+    status: StatusCode::PAYLOAD_TOO_LARGE,
+    body: r#"{"error":"Request body exceeds maximum size"}"#,
+    grpc_status: crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+    grpc_message: "Request body exceeds maximum size",
+};
+
 /// The shared request-buffer budget refused a native-H3 upload at a
 /// dispatch-stage drain (#6009). The same `503` / gRPC `RESOURCE_EXHAUSTED`
 /// refusal, committed through the reject hooks, the committed-response hooks,
@@ -431,14 +456,69 @@ fn boxed_finalize_h3_request_buffer_capacity_rejection<'a>(
     plugin_execution_ns: &'a mut u64,
     request_path: &'a str,
 ) -> BoxedH3RejectFuture<'a> {
+    boxed_finalize_h3_dispatch_body_refusal(
+        stream,
+        state,
+        plugins,
+        ctx,
+        http_flavor,
+        grpc_web_response_content_type,
+        start_time,
+        plugin_execution_ns,
+        request_path,
+        &H3_REQUEST_BUFFER_CAPACITY_REFUSAL,
+    )
+}
+
+/// A native-H3 dispatch-stage drain exceeded its retained ceiling: the `413`
+/// / gRPC `RESOURCE_EXHAUSTED` refusal, committed through the reject hooks,
+/// the committed-response hooks, and the transaction log like the capacity
+/// refusal above (issue #6022). Boxed for the same frame-size reason.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_h3_request_body_too_large_rejection<'a>(
+    stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &'a ProxyState,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    http_flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&'a str>,
+    start_time: std::time::Instant,
+    plugin_execution_ns: &'a mut u64,
+    request_path: &'a str,
+) -> BoxedH3RejectFuture<'a> {
+    boxed_finalize_h3_dispatch_body_refusal(
+        stream,
+        state,
+        plugins,
+        ctx,
+        http_flavor,
+        grpc_web_response_content_type,
+        start_time,
+        plugin_execution_ns,
+        request_path,
+        &H3_REQUEST_BODY_TOO_LARGE_REFUSAL,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn boxed_finalize_h3_dispatch_body_refusal<'a>(
+    stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &'a ProxyState,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    http_flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&'a str>,
+    start_time: std::time::Instant,
+    plugin_execution_ns: &'a mut u64,
+    request_path: &'a str,
+    refusal: &'static H3DispatchBodyRefusal,
+) -> BoxedH3RejectFuture<'a> {
     Box::pin(async move {
-        use crate::proxy::response_buffer_budget as budget;
         let mut headers = HashMap::new();
         if matches!(http_flavor, HttpFlavor::Grpc) || grpc_web_response_content_type.is_some() {
-            let grpc_status = budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS.to_string();
-            headers.insert("grpc-status".to_string(), grpc_status);
-            let grpc_message = budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string();
-            headers.insert("grpc-message".to_string(), grpc_message);
+            headers.insert("grpc-status".to_string(), refusal.grpc_status.to_string());
+            headers.insert("grpc-message".to_string(), refusal.grpc_message.to_string());
         }
         let rejection = finalize_h3_terminal_body_rejection_with_headers(
             state,
@@ -446,9 +526,9 @@ fn boxed_finalize_h3_request_buffer_capacity_rejection<'a>(
             ctx,
             http_flavor,
             grpc_web_response_content_type,
-            StatusCode::SERVICE_UNAVAILABLE,
+            refusal.status,
             headers,
-            Bytes::from_static(budget::REQUEST_BUFFER_OVERLOAD_BODY.as_bytes()),
+            Bytes::from_static(refusal.body.as_bytes()),
             start_time,
             plugin_execution_ns,
             request_path,
@@ -6430,26 +6510,18 @@ async fn handle_h3_request(
                 Ok(None) => {
                     cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
-                    let metric_status = h3_reject_log_status_and_metadata(
+                    return boxed_finalize_h3_request_body_too_large_rejection(
+                        &mut stream,
+                        &state,
+                        &plugins,
                         &mut ctx,
                         http_flavor,
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        br#"{"error":"Request body exceeds maximum size"}"#,
-                        &HashMap::new(),
-                    );
-                    record_request(&state, metric_status);
-                    send_h3_error_flavor_aware_with_policy(
-                        &mut stream,
-                        http_flavor,
                         grpc_web_response_content_type,
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
-                        crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                        "Request body exceeds maximum size",
-                        initial_response_header_policy_plugins.as_ref(),
+                        start_time,
+                        &mut plugin_execution_ns,
+                        &original_request_path,
                     )
-                    .await?;
-                    return Ok(());
+                    .await;
                 }
                 Err(H3RequestBodyReadError::Read(error)) => {
                     halt_cancelled_h3_upload(&mut stream);
@@ -7198,14 +7270,6 @@ async fn handle_h3_request(
                     {
                         Ok(Some(body_data)) => body_data,
                         Ok(None) => {
-                            let metric_status = h3_reject_log_status_and_metadata(
-                                &mut ctx,
-                                http_flavor,
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                br#"{"error":"Request body exceeds maximum size"}"#,
-                                &HashMap::new(),
-                            );
-                            record_request(&state, metric_status);
                             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                                 &state,
                                 &proxy,
@@ -7220,18 +7284,18 @@ async fn handle_h3_request(
                                 false,
                                 backend_start.elapsed(),
                             );
-                            send_h3_error_flavor_aware_with_policy(
+                            return boxed_finalize_h3_request_body_too_large_rejection(
                                 &mut stream,
+                                &state,
+                                &plugins,
+                                &mut ctx,
                                 http_flavor,
                                 grpc_web_response_content_type,
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                r#"{"error":"Request body exceeds maximum size"}"#,
-                                crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                                "Request body exceeds maximum size",
-                                initial_response_header_policy_plugins.as_ref(),
+                                start_time,
+                                &mut plugin_execution_ns,
+                                &original_request_path,
                             )
-                            .await?;
-                            return Ok(());
+                            .await;
                         }
                         Err(H3RequestBodyReadError::Read(error)) => {
                             halt_cancelled_h3_upload(&mut stream);
@@ -8952,26 +9016,18 @@ async fn handle_h3_request(
             Ok(Some(body_data)) => body_data,
             Ok(None) => {
                 cb_probe.release_neutral();
-                let metric_status = h3_reject_log_status_and_metadata(
+                return boxed_finalize_h3_request_body_too_large_rejection(
+                    &mut stream,
+                    &state,
+                    &plugins,
                     &mut ctx,
                     http_flavor,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    br#"{"error":"Request body exceeds maximum size"}"#,
-                    &HashMap::new(),
-                );
-                record_request(&state, metric_status);
-                send_h3_error_flavor_aware_with_policy(
-                    &mut stream,
-                    http_flavor,
                     grpc_web_response_content_type,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    r#"{"error":"Request body exceeds maximum size"}"#,
-                    crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                    "Request body exceeds maximum size",
-                    initial_response_header_policy_plugins.as_ref(),
+                    start_time,
+                    &mut plugin_execution_ns,
+                    &original_request_path,
                 )
-                .await?;
-                return Ok(());
+                .await;
             }
             Err(H3RequestBodyReadError::Read(error)) => {
                 halt_cancelled_h3_upload(&mut stream);

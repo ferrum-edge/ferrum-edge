@@ -60,7 +60,7 @@ use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
     extract_authorization_bearer, extract_authorization_dpop, extract_from_location,
     mark_present_query_credential_locations, provider_locations_extract_token,
-    stage_original_token_stripping as stage_token_stripping,
+    push_stripped_credential_header_names, stage_original_token_stripping as stage_token_stripping,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
@@ -1827,6 +1827,22 @@ impl super::Plugin for JwksAuth {
             || self.providers.iter().any(|provider| {
                 !provider.claim_headers.is_empty() || !provider.output_claim_headers.is_empty()
             })
+    }
+
+    /// The owned claim destinations, plus the credential headers a provider
+    /// that does not forward the original token strips (issue #6022).
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        let mut names: Vec<String> = self
+            .claim_header_destinations
+            .names()
+            .map(str::to_string)
+            .collect();
+        for provider in &self.providers {
+            if !provider.forward_original_token {
+                push_stripped_credential_header_names(&mut names, &provider.token_locations);
+            }
+        }
+        Some(names)
     }
 
     async fn before_proxy(
