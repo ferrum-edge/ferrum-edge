@@ -945,6 +945,17 @@ on a native-gRPC request.
   reconnects in the background either way. `request_deduplication` expresses the
   same choice as `on_redis_unavailable` and does NOT accept
   `redis_failure_policy`; `ai_semantic_cache` has neither.
+- WATCH-fenced writes on dedicated connections (`delete_if_value_matches`,
+  `set_bytes_with_expire_if_value_matches`, `delete_if_value_matches_bounded`)
+  send `MULTI` alone and require `QUEUED` before `EXEC`
+  (`exec_watched_write`). Never pipeline `MULTI` with the write (`.atomic()`):
+  an ACL that denies `MULTI` would run the write unfenced (issue #6018).
+- `ai_semantic_cache` quarantine claims a per-key in-flight marker
+  (`RedisQuarantineSuppressor::try_claim`) before it dials, bounds concurrent
+  dedicated dials per instance with a `try_acquire`-only semaphore (requests
+  never wait), and dials through `get_quarantine_connection`, so a refused or
+  timed-out extra socket never marks the shared client unavailable. A proven
+  mismatch returns `Ok(false)` without `UNWATCH`.
 - Redis Cluster is NOT supported and is screened, not assumed: `INFO CLUSTER`
   at connect plus `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN` reactively.
   The proactive probe is bounded by `redis_connect_timeout_seconds` (no new

@@ -1434,6 +1434,21 @@ enum ConnectAttemptError {
     Timeout,
 }
 
+/// Why a dedicated `WATCH` connection is being dialed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DedicatedDialPurpose {
+    /// An ownership/fencing transaction the consumer's correctness depends on:
+    /// every dial failure follows the ordinary availability policy.
+    Policy,
+    /// Optional cache-quarantine maintenance. The shared client just served
+    /// the read that triggered it, so a refused or timed-out *extra* socket
+    /// (most often a server connection limit) is local to that connection and
+    /// must not mark the shared client unavailable. Proven Cluster topology,
+    /// egress denials, and DNS failures still apply, and every command on an
+    /// established connection keeps the ordinary classification.
+    OptionalMaintenance,
+}
+
 /// Redis error codes that only a Cluster-mode server ever returns.
 ///
 /// This client is not Cluster-aware (see the module-level topology notes), so
@@ -1548,6 +1563,35 @@ pub fn is_unknown_command_error(error: &redis::RedisError) -> bool {
     errors
         .iter()
         .any(|(_, err)| err.code() == "ERR" && err.details().is_some_and(says_unknown_command))
+}
+
+/// Whether a server refused a connection because it is at its client limit
+/// (`ERR max number of clients reached`).
+///
+/// Redis, Valkey, and KeyDB answer the first command on an over-limit
+/// connection with that reply and then close the socket. It says how many
+/// more sockets the server will accept right now, not whether the connections
+/// already established still work, so an optional extra connection that hits
+/// it must not take a shared client out of service. Matched case-insensitively
+/// on the leading words only, like [`is_unknown_command_error`].
+pub fn is_connection_limit_error(error: &redis::RedisError) -> bool {
+    fn says_connection_limit(detail: &str) -> bool {
+        detail
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("max number of clients reached")
+    }
+    if error.code() == Some("ERR") && error.detail().is_some_and(says_connection_limit) {
+        return true;
+    }
+    // `into_server_errors` consumes the error; `RedisError` is `Clone` and the
+    // aggregated variants are `Arc`-backed, so this is a refcount bump.
+    let Some(errors) = error.clone().into_server_errors() else {
+        return false;
+    };
+    errors
+        .iter()
+        .any(|(_, err)| err.code() == "ERR" && err.details().is_some_and(says_connection_limit))
 }
 
 /// Read `cluster_enabled` out of an `INFO CLUSTER` reply.
@@ -4074,6 +4118,22 @@ impl RedisRateLimitClient {
     /// transaction, and must fail closed on any I/O error rather than retrying
     /// a partial transaction on a new connection.
     async fn get_dedicated_connection(&self) -> Option<redis::aio::MultiplexedConnection> {
+        self.dial_dedicated_connection(DedicatedDialPurpose::Policy)
+            .await
+    }
+
+    /// [`Self::get_dedicated_connection`] for optional quarantine maintenance:
+    /// a failed dial leaves backend availability to the pooled path (see
+    /// [`DedicatedDialPurpose::OptionalMaintenance`]).
+    async fn get_quarantine_connection(&self) -> Option<redis::aio::MultiplexedConnection> {
+        self.dial_dedicated_connection(DedicatedDialPurpose::OptionalMaintenance)
+            .await
+    }
+
+    async fn dial_dedicated_connection(
+        &self,
+        purpose: DedicatedDialPurpose,
+    ) -> Option<redis::aio::MultiplexedConnection> {
         // A rejected topology is terminal: never redial it (see
         // `get_or_connect_slot`).
         if self.is_topology_unsupported() {
@@ -4126,9 +4186,35 @@ impl RedisRateLimitClient {
                 }
                 Some(conn)
             }
+            Err(ConnectAttemptError::Redis(e))
+                if purpose == DedicatedDialPurpose::OptionalMaintenance
+                    && !is_cluster_topology_error(&e) =>
+            {
+                let classification = if is_connection_limit_error(&e) {
+                    "connection_limit"
+                } else {
+                    "connect_failed"
+                };
+                warn_sampled!(
+                    operation = "quarantine connect",
+                    classification,
+                    "Redis quarantine connection refused; suppressing the entry locally, retaining backend availability"
+                );
+                None
+            }
             Err(ConnectAttemptError::Redis(e)) => {
                 self.warn_connect_failure(None, &e, "Failed to connect dedicated Redis client");
                 self.note_command_failure(&e);
+                None
+            }
+            Err(ConnectAttemptError::Timeout)
+                if purpose == DedicatedDialPurpose::OptionalMaintenance =>
+            {
+                warn_sampled!(
+                    operation = "quarantine connect",
+                    classification = "connection_timeout",
+                    "Redis quarantine connection timed out; suppressing the entry locally, retaining backend availability"
+                );
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
@@ -5493,8 +5579,11 @@ impl RedisRateLimitClient {
     /// The transaction runs on a freshly dialed, *dedicated* (never pooled,
     /// never shared) non-reconnecting [`redis::aio::MultiplexedConnection`] so
     /// connection-local `WATCH` state can neither be interleaved by another
-    /// command nor silently dropped by a transparent reconnect. Any I/O failure
-    /// at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
+    /// command nor silently dropped by a transparent reconnect. `MULTI` is sent
+    /// on its own and the `DEL` must be acknowledged `QUEUED` before `EXEC`
+    /// (`exec_watched_write`), so an ACL that denies `MULTI` cannot let
+    /// the delete run outside the transaction. Any I/O failure at `WATCH`,
+    /// `GET`, `UNWATCH`, `MULTI`, `DEL`, or `EXEC` fails closed as `Err(())`.
     #[allow(clippy::result_unit_err)]
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
         // Owned for the duration of the transaction; never cloned or shared.
@@ -5557,11 +5646,10 @@ impl RedisRateLimitClient {
             }
         }
 
-        let result: Result<Option<(i64,)>, redis::RedisError> = redis::pipe()
-            .atomic()
-            .cmd("DEL")
-            .arg(key)
-            .query_async(&mut conn)
+        let mut delete = redis::cmd("DEL");
+        delete.arg(key);
+        let result: Result<Option<(i64,)>, ()> = self
+            .exec_watched_write(&mut conn, &delete, "compare-delete")
             .await;
 
         match result {
@@ -5573,17 +5661,78 @@ impl RedisRateLimitClient {
                 self.note_command_success()?;
                 Ok(false)
             }
+            Err(()) => Err(()),
+        }
+    }
+
+    /// Run one write as an explicit `MULTI` → `QUEUED` → `EXEC` transaction on
+    /// a dedicated connection that already holds a `WATCH`.
+    ///
+    /// Never pipeline `MULTI` with the write: if an ACL denies `MULTI` but
+    /// allows the write, a pipelined write still executes — outside the
+    /// transaction and unfenced by `WATCH` — so a compare-then-act could
+    /// overwrite or delete a concurrent replacement. Sending `MULTI` alone and
+    /// requiring the write's `QUEUED` acknowledgement before `EXEC` keeps the
+    /// write inside the fence. `Ok(None)` is an aborted transaction (the
+    /// watched key changed). Every failure is `Err(())` after the ordinary
+    /// availability classification; the caller then drops the connection,
+    /// which discards any open transaction and `WATCH` state.
+    async fn exec_watched_write<T: redis::FromRedisValue>(
+        &self,
+        conn: &mut redis::aio::MultiplexedConnection,
+        write: &redis::Cmd,
+        operation: &'static str,
+    ) -> Result<Option<T>, ()> {
+        let multi: Result<(), redis::RedisError> = redis::cmd("MULTI").query_async(conn).await;
+        if let Err(e) = multi {
+            warn!(
+                redis_url = %self.config.redacted_url(),
+                operation,
+                phase = "MULTI",
+                error = %e,
+                "Redis command failed"
+            );
+            self.note_command_failure(&e);
+            return Err(());
+        }
+        let queued: Result<String, redis::RedisError> = write.query_async(conn).await;
+        match queued {
+            Ok(reply) if reply == "QUEUED" => {}
+            Ok(_) => {
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation,
+                    phase = "queue",
+                    classification = "malformed_response",
+                    "Redis transaction write was not queued"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "compare-delete EXEC",
+                    operation,
+                    phase = "queue",
                     error = %e,
-                    "Redis transaction failed"
+                    "Redis command failed"
                 );
                 self.note_command_failure(&e);
-                Err(())
+                return Err(());
             }
         }
+        let result: Result<Option<T>, redis::RedisError> =
+            redis::cmd("EXEC").query_async(conn).await;
+        result.map_err(|e| {
+            warn!(
+                redis_url = %self.config.redacted_url(),
+                operation,
+                phase = "EXEC",
+                error = %e,
+                "Redis transaction failed"
+            );
+            self.note_command_failure(&e);
+        })
     }
 
     /// Delete an invalid cache entry only when its full observed bytes still match.
@@ -5595,11 +5744,18 @@ impl RedisRateLimitClient {
     /// equality are required before DEL. No Lua or unconditional DEL fallback.
     ///
     /// Quarantine is optional maintenance. A permission denial (including one
-    /// nested in an EXECABORT) returns Err so the caller suppresses the key
-    /// locally until its marker expires, without changing Redis availability.
-    /// Transport/protocol failures and unsupported topology retain the ordinary
-    /// availability policy. Every exit drops the dedicated connection, so even
-    /// denied UNWATCH or an aborted transaction cannot leak connection state.
+    /// nested in an EXECABORT) or a server connection limit returns Err so the
+    /// caller suppresses the key locally until its marker expires, without
+    /// changing Redis availability; so does any non-topology failure to dial
+    /// the extra connection (`DedicatedDialPurpose::OptionalMaintenance`).
+    /// Transport/protocol failures on the established connection and
+    /// unsupported topology retain the ordinary availability policy.
+    ///
+    /// A proven mismatch returns `Ok(false)` without `UNWATCH`: every exit
+    /// drops the dedicated connection, which discards its `WATCH` state, so an
+    /// extra command could only turn a settled answer into an error. The
+    /// command profile is therefore `WATCH`, `EXISTS`, `STRLEN`, `GETRANGE`,
+    /// `MULTI`, `DEL`, and `EXEC`.
     #[allow(clippy::result_unit_err)]
     pub async fn delete_if_value_matches_bounded(
         &self,
@@ -5614,7 +5770,7 @@ impl RedisRateLimitClient {
             redis_getrange_end_index(expected.len()).map_err(|_| ())?
         };
         let max_prefix = expected.len().checked_add(1).ok_or(())?;
-        let mut conn = self.get_dedicated_connection().await.ok_or(())?;
+        let mut conn = self.get_quarantine_connection().await.ok_or(())?;
 
         let watch: Result<(), redis::RedisError> =
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
@@ -5649,12 +5805,7 @@ impl RedisRateLimitClient {
             Ok((exists, length, prefix))
                 if exists == 1 && length == expected.len() && prefix == expected => {}
             Ok(_) => {
-                let unwatch: Result<(), redis::RedisError> =
-                    redis::cmd("UNWATCH").query_async(&mut conn).await;
-                if let Err(e) = unwatch {
-                    self.note_quarantine_command_failure(&e, "UNWATCH");
-                    return Err(());
-                }
+                // Dropping the dedicated connection clears WATCH.
                 self.note_command_success()?;
                 return Ok(false);
             }
@@ -5708,7 +5859,8 @@ impl RedisRateLimitClient {
     }
 
     /// Classify optional quarantine failures without treating withheld
-    /// maintenance permissions as an outage. No server text or key is logged.
+    /// maintenance permissions or a server connection limit as an outage. No
+    /// server text or key is logged.
     fn note_quarantine_command_failure(&self, error: &redis::RedisError, operation: &'static str) {
         // A mixed server-error aggregate must not conceal proven Cluster topology.
         let topology_unsupported = is_cluster_topology_error(error);
@@ -5717,6 +5869,14 @@ impl RedisRateLimitClient {
                 operation,
                 classification = "permission_denied",
                 "Redis quarantine permission denied; suppressing the entry locally, retaining backend availability"
+            );
+            return;
+        }
+        if is_connection_limit_error(error) && !topology_unsupported {
+            warn_sampled!(
+                operation,
+                classification = "connection_limit",
+                "Redis quarantine refused at the server connection limit; suppressing the entry locally, retaining backend availability"
             );
             return;
         }
@@ -6178,8 +6338,11 @@ impl RedisRateLimitClient {
     /// [`Self::delete_if_value_matches`]). Only one key is touched, so the
     /// transaction is also slot-safe on sharded deployments.
     ///
-    /// Any I/O failure at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed;
-    /// a partial transaction is never retried on a fresh connection.
+    /// `MULTI` is sent on its own and the `SET` must be acknowledged `QUEUED`
+    /// before `EXEC` (`exec_watched_write`), so an ACL that denies
+    /// `MULTI` cannot let the write run outside the transaction. Any I/O
+    /// failure at `WATCH`, `GET`, `UNWATCH`, `MULTI`, `SET`, or `EXEC` fails
+    /// closed; a partial transaction is never retried on a fresh connection.
     #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_with_expire_if_value_matches(
         &self,
@@ -6251,14 +6414,13 @@ impl RedisRateLimitClient {
         // A `nil` EXEC reply means the watched key changed after the compare,
         // so the caller lost ownership in the race window. That is reported as
         // `Ok(false)`, never as a successful publication.
-        let result: Result<Option<(String,)>, redis::RedisError> = redis::pipe()
-            .atomic()
-            .cmd("SET")
-            .arg(key)
+        let mut set = redis::cmd("SET");
+        set.arg(key)
             .arg(value)
             .arg("EX")
-            .arg(expire_seconds(ttl_seconds))
-            .query_async(&mut conn)
+            .arg(expire_seconds(ttl_seconds));
+        let result: Result<Option<(String,)>, ()> = self
+            .exec_watched_write(&mut conn, &set, "compare-and-set")
             .await;
 
         match result {
@@ -6270,16 +6432,7 @@ impl RedisRateLimitClient {
                 self.note_command_success()?;
                 Ok(false)
             }
-            Err(e) => {
-                warn!(
-                    redis_url = %self.config.redacted_url(),
-                    operation = "compare-and-set EXEC",
-                    error = %e,
-                    "Redis transaction failed"
-                );
-                self.note_command_failure(&e);
-                Err(())
-            }
+            Err(()) => Err(()),
         }
     }
 

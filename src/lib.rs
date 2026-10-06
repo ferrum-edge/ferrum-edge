@@ -5465,6 +5465,20 @@ pub mod _test_support {
         plugin.clear_redis_quarantine_for_tests(cache_key);
     }
 
+    pub fn ai_semantic_cache_redis_quarantine_try_claim_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+    ) -> bool {
+        plugin.redis_quarantine_try_claim_for_tests(cache_key, fingerprint)
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_dial_permits_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.redis_quarantine_dial_permits_for_tests()
+    }
+
     // ── plugins/response_caching ─────────────────────────────────────────────
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all

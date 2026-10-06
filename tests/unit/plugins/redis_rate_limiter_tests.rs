@@ -5752,7 +5752,169 @@ fn watch_transaction_path_pins_multiplexed_connection_not_connection_manager() {
             impl_body.matches("UNWATCH").count() >= 2,
             "{marker} must UNWATCH on pre-MULTI mismatch and GET failure"
         );
+        // The write must go through the sequential MULTI -> QUEUED -> EXEC
+        // helper, never a pipeline that could run it outside the transaction.
+        assert!(
+            !impl_body.contains(".atomic()") && impl_body.contains(".exec_watched_write("),
+            "{marker} must queue its write through exec_watched_write"
+        );
     }
+
+    let compact = compact_source(source);
+    for dial in [
+        "asyncfnget_dedicated_connection(&self)",
+        "asyncfnget_quarantine_connection(&self)",
+        "asyncfndial_dedicated_connection(&self,purpose:DedicatedDialPurpose)",
+    ] {
+        assert_eq!(
+            source_region(&compact, dial, "{"),
+            "->Option<redis::aio::MultiplexedConnection>",
+            "every dedicated WATCH dial must return MultiplexedConnection: {dial}"
+        );
+    }
+}
+
+/// Source text with every whitespace run removed and trailing commas before a
+/// closing delimiter dropped, so structural source pins compare tokens rather
+/// than rustfmt layout (issue #6018).
+fn compact_source(source: &str) -> String {
+    let mut compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    for (trailing, closing) in [(",)", ")"), (",]", "]"), (",}", "}")] {
+        compact = compact.replace(trailing, closing);
+    }
+    compact
+}
+
+/// The text strictly between the first `start` and the following `end`.
+fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, rest)| rest.split_once(end))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("source region {start} .. {end}"))
+}
+
+/// The older ownership/fencing helpers must never pipeline `MULTI` with their
+/// write: an ACL that denies `MULTI` but allows `DEL`/`SET` would otherwise run
+/// the write outside the transaction, unfenced by `WATCH` (issue #6018).
+#[test]
+fn watched_writes_queue_multi_alone_and_require_queued_before_exec() {
+    let source = compact_source(include_str!(
+        "../../../src/plugins/utils/redis_rate_limiter.rs"
+    ));
+    let helper = source_region(
+        &source,
+        "asyncfnexec_watched_write<T:redis::FromRedisValue>(",
+        "pubasyncfndelete_if_value_matches_bounded(",
+    );
+    let multi = helper
+        .find("redis::cmd(\"MULTI\").query_async(conn).await")
+        .unwrap();
+    let multi_error = helper.find("ifletErr(e)=multi{").unwrap();
+    let queued = helper.find("write.query_async(conn).await").unwrap();
+    let queued_ok = helper.find("Ok(reply)ifreply==\"QUEUED\"=>{}").unwrap();
+    let exec = helper
+        .find("redis::cmd(\"EXEC\").query_async(conn).await")
+        .unwrap();
+    assert!(multi < multi_error && multi_error < queued && queued < queued_ok && queued_ok < exec);
+    assert!(
+        !helper.contains(".atomic()") && !helper.contains("redis::pipe()"),
+        "MULTI and the write must be separate round trips"
+    );
+
+    let ownership = source_region(
+        &source,
+        "pubasyncfndelete_if_value_matches(",
+        "asyncfnexec_watched_write<",
+    );
+    assert!(ownership.contains(".exec_watched_write(&mutconn,&delete,\"compare-delete\")"));
+    assert!(ownership.contains("letmutdelete=redis::cmd(\"DEL\");delete.arg(key);"));
+    let publish = source_region(
+        &source,
+        "pubasyncfnset_bytes_with_expire_if_value_matches(",
+        "///BuildafullRediskey",
+    );
+    assert!(publish.contains(".exec_watched_write(&mutconn,&set,\"compare-and-set\")"));
+    assert!(publish.contains("letmutset=redis::cmd(\"SET\");"));
+    for body in [ownership, publish] {
+        assert!(!body.contains(".atomic()") && !body.contains("redis::pipe()"));
+    }
+}
+
+#[test]
+fn connection_limit_requires_the_exact_server_reply() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::is_connection_limit_error;
+    use redis::ErrorKind;
+
+    for (reply, limited) in [
+        (b"-ERR max number of clients reached\r\n".as_slice(), true),
+        (b"-ERR Max Number Of Clients Reached\r\n".as_slice(), true),
+        (b"-ERR unknown command 'max'\r\n".as_slice(), false),
+        (b"-NOPERM max number of clients reached\r\n".as_slice(), false),
+        (b"-ERR value is max number of clients reached\r\n".as_slice(), false),
+        (b"-MOVED 1 127.0.0.1:6379\r\n".as_slice(), false),
+    ] {
+        let error = redis::parse_redis_value(reply)
+            .unwrap()
+            .extract_error()
+            .unwrap_err();
+        assert_eq!(is_connection_limit_error(&error), limited);
+    }
+    for kind in [ErrorKind::Io, ErrorKind::UnexpectedReturnType] {
+        let error = redis::RedisError::from((kind, "max number of clients reached"));
+        assert!(!is_connection_limit_error(&error));
+    }
+}
+
+/// An optional quarantine dial that the server refuses (most often at its
+/// connection limit) must not take the shared client out of service; a policy
+/// dial keeps the ordinary availability classification (issue #6018).
+#[test]
+fn optional_quarantine_dial_failures_retain_backend_availability() {
+    let source = compact_source(include_str!(
+        "../../../src/plugins/utils/redis_rate_limiter.rs"
+    ));
+    let dial = source_region(
+        &source,
+        "asyncfndial_dedicated_connection(",
+        "fnclear_connection(&self)",
+    );
+    let optional_connect = source_region(
+        dial,
+        "Err(ConnectAttemptError::Redis(e))ifpurpose==DedicatedDialPurpose::OptionalMaintenance",
+        "Err(ConnectAttemptError::Redis(e))=>{",
+    );
+    assert!(optional_connect.starts_with("&&!is_cluster_topology_error(&e)=>{"));
+    assert!(optional_connect.contains("is_connection_limit_error(&e)"));
+    assert!(optional_connect.contains("\"connection_limit\""));
+    let optional_timeout = source_region(
+        dial,
+        "Err(ConnectAttemptError::Timeout)ifpurpose==DedicatedDialPurpose::OptionalMaintenance=>{",
+        "Err(ConnectAttemptError::Timeout)=>{",
+    );
+    for branch in [optional_connect, optional_timeout] {
+        assert!(
+            !branch.contains("note_command_failure")
+                && !branch.contains("mark_unavailable")
+                && branch.contains("None"),
+            "an optional quarantine dial failure must not change backend availability"
+        );
+    }
+    // The policy branches that follow still classify the failure.
+    let policy = source_region(dial, "Err(ConnectAttemptError::Redis(e))=>{", "}");
+    assert!(policy.contains("self.note_command_failure(&e);"));
+
+    let policy_dial = source_region(&source, "asyncfnget_dedicated_connection(&self)", "}");
+    assert!(policy_dial.contains("self.dial_dedicated_connection(DedicatedDialPurpose::Policy)"));
+    let quarantine_dial = source_region(&source, "asyncfnget_quarantine_connection(&self)", "}");
+    assert!(quarantine_dial.contains("(DedicatedDialPurpose::OptionalMaintenance).await"));
+    let bounded = source_region(
+        &source,
+        "pubasyncfndelete_if_value_matches_bounded(",
+        "fnnote_quarantine_command_failure(",
+    );
+    assert!(bounded.contains("self.get_quarantine_connection().await"));
+    assert!(!bounded.contains("get_dedicated_connection()"));
 }
 
 /// Deduplication ownership release keeps its released command profile; only
@@ -5768,7 +5930,9 @@ fn ownership_release_retains_get_without_semantic_read_acl_requirements() {
     for command in ["WATCH", "GET", "UNWATCH"] {
         assert!(ownership.contains(&format!("redis::cmd(\"{command}\")")));
     }
-    assert!(ownership.contains(".atomic()\n            .cmd(\"DEL\")"));
+    // The DEL is queued inside an explicit MULTI, never pipelined with it.
+    assert!(!ownership.contains(".atomic()"));
+    assert!(ownership.contains("exec_watched_write("));
     for command in ["EXISTS", "STRLEN", "GETRANGE"] {
         assert!(!ownership.contains(&format!("cmd(\"{command}\")")));
     }
@@ -5789,6 +5953,14 @@ fn ownership_release_retains_get_without_semantic_read_acl_requirements() {
     assert!(permission_branch.contains("classification = \"permission_denied\""));
     assert!(!permission_branch.contains("mark_unavailable"));
     assert!(!permission_branch.contains("note_command_failure"));
+    let connection_limit_branch = classification
+        .split_once("if is_connection_limit_error(error) && !topology_unsupported {")
+        .and_then(|(_, rest)| rest.split_once("return;"))
+        .map(|(body, _)| body)
+        .expect("a connection limit must return before availability failure handling");
+    assert!(connection_limit_branch.contains("classification = \"connection_limit\""));
+    assert!(!connection_limit_branch.contains("mark_unavailable"));
+    assert!(!connection_limit_branch.contains("note_command_failure"));
     assert!(classification.contains("error.is_io_error()"));
     assert!(classification.contains("self.note_command_failure(error)"));
 }
