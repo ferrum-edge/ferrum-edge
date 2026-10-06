@@ -1,0 +1,28 @@
+# Optional, non-required check of the disposable Compose fixture boundaries.
+name: Compose Fixture Qualification
+
+on:
+  pull_request:
+    paths:
+      - docker-compose.yml
+      - docker-compose.tls-test.yml
+      - scripts/setup_db_tls.sh
+      - scripts/check_compose_fixtures.sh
+      - tests/scripts/setup_db_tls.sh
+      - .github/workflows/compose-fixture-qualification.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: Compose fixture secret and TLS boundaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Check loopback, TLS, Mongo opt-in and credential exposure
+        run: timeout --kill-after=15s 10m bash scripts/check_compose_fixtures.sh

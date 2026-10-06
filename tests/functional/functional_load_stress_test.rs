@@ -2497,7 +2497,7 @@ async fn test_load_stress_10k_proxies() {
         println!("  For PostgreSQL, run:");
         println!("    docker run -d --name ferrum-load-test-pg \\");
         println!("      -e POSTGRES_USER=ferrum -e POSTGRES_PASSWORD=ferrum-load-test \\");
-        println!("      -e POSTGRES_DB=ferrum_load -p 25433:5432 postgres:16");
+        println!("      -e POSTGRES_DB=ferrum_load -p 127.0.0.1:25433:5432 postgres:16");
     }
     println!("============================================================\n");
 

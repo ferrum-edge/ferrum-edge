@@ -139,6 +139,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING (developer fixtures) — sample Compose MongoDB and SQL TLS test
+  fixtures no longer have working default credentials or wildcard ports**
+  (issue #6002; GHSA-wq9h-xxp4-7r2m, GHSA-x87v-w7p2-77f4). Affects only the
+  source-tree `docker-compose.yml`, `docker-compose.tls-test.yml` and SQL TLS
+  helper shipped in v0.9.0–v0.9.12; no container image, Helm chart or binary
+  contains them. See the
+  [upgrade guide](docs/upgrade_guide.md#development-compose-fixtures-unreleased).
+  - Plain `docker compose up` no longer starts MongoDB: `mongodb` and
+    `ferrum-mongodb` are in the `mongodb` profile, and the
+    `dev-password-change-in-production` fallback is gone. The Mongo container
+    refuses a missing `MONGO_PASSWORD`, one shorter than 32 characters, or one
+    containing characters outside `A-Z a-z 0-9 . _ ~ -` (the gateway embeds it
+    in its `mongodb://` URL without escaping). The Mongo image is pinned by
+    digest. A volume initialized with the old default keeps accepting that
+    password until you rotate it. Containers started by an earlier plain
+    `docker compose up` can remain running after this update; remove the old
+    Mongo container and volume or rotate the password as described in the
+    upgrade guide.
+  - `scripts/setup_db_tls.sh` (also run by `tests/scripts/setup_db_tls.sh`)
+    publishes PostgreSQL and MySQL on `127.0.0.1` only. It generates random
+    PostgreSQL, MySQL and MySQL root passwords into a private `0700` directory,
+    passes them through `*_PASSWORD_FILE` and MySQL option files, and writes
+    `connections.env` with `sslmode=verify-full` / `ssl-mode=VERIFY_IDENTITY`
+    URLs. It never prints passwords or dumps container logs, and PostgreSQL
+    rejects non-TLS TCP. It refuses an existing directory or container, and a
+    directory inside the repository unless `--allow-repo-dir` is given. It now
+    requires Docker Compose v2.
+  - The SQL TLS functional tests read `connections.env` from
+    `FERRUM_TEST_CERT_DIR` instead of using `test-password`. Hosted data-plane
+    CI provisions its SQL TLS fixture the same way: loopback ports, generated
+    file-based credentials, no passwords on command lines, and no container log
+    dumps.
+  - New optional `Compose Fixture Qualification` workflow
+    (`scripts/check_compose_fixtures.sh`). It checks loopback-only ports,
+    TLS-only SQL, that MongoDB is opt-in, and that generated passwords stay out
+    of argv, `docker inspect`, healthcheck output and container logs.
 - **ARM64 Cross release inputs are pinned and verified** (#5955, #5989;
   GHSA-2q8f-75vc-v8c7). Cross 0.2.5 now uses the published GHCR OCI index
   digest, retaining its Linux/amd64 host image and aarch64 target. The protoc

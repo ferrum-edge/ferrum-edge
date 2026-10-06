@@ -51,6 +51,11 @@ tests/performance/ci_results/
 # CI sccache local-disk cache (persisted via rust-cache cache-directories)
 /.cache/
 
+# Disposable SQL TLS fixture material (scripts/setup_db_tls.sh): private keys,
+# generated passwords and credential-bearing connections.env. Never commit it.
+ferrum-db-tls-certs/
+connections.env
+
 # Runtime state of a gateway started from the checkout: the default
 # FERRUM_TLS_MANAGED_STORE_PATH (managed TLS records, including private keys,
 # and the TLS event log). Never commit it. Tests keep their stores in private
