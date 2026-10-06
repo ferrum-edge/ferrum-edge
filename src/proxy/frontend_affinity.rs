@@ -277,9 +277,7 @@ pub fn shard_start(shard_count: usize) -> ShardStart {
         .try_with(|connection| {
             let open_streams = connection.open_streams();
             match connection.slot() {
-                Some(slot)
-                    if shard_count <= SLOTS && open_streams <= AFFINITY_MAX_OPEN_STREAMS =>
-                {
+                Some(slot) if shard_count <= SLOTS && open_streams <= AFFINITY_MAX_OPEN_STREAMS => {
                     ShardStart::Affinity {
                         shard: slot % shard_count,
                         open_streams,
