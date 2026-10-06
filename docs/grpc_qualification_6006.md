@@ -14,10 +14,8 @@ by this repair. The final v0.9.11 head
 `ff0a9d5152dc3cf2fd240158cbdf5551f511212e` subsequently qualified through review
 and hosted CI. Release merge `c764084b3b51c3f7ffde268c039688d35e49c553`
 published as v0.9.11 at 2026-10-04T21:26:11Z; see the
-[completed release record](releases/v0.9.11.md). The new
-[v0.9.12 candidate](releases/v0.9.12.md) requires fresh independent review and
-fresh exact-head, main-push and release evidence; these gates remain root-owned
-and pending.
+[completed release record](releases/v0.9.11.md). [v0.9.12](releases/v0.9.12.md)
+was qualified with its own exact-head, main-push and release evidence.
 
 ## Authorization expiry during sender acquisition
 
@@ -234,5 +232,5 @@ was verified; see the [actual release record](releases/v0.9.11.md) for artifact
 identities and GHCR/revision-label limits. Canonical `contracts-edge-0.9.11`
 subsequently published at `390edbd5b2485af0988e02f7827fde778d76ae0a`.
 Neither historical failed head was used as qualification. These results do not
-qualify the new [0.9.12 candidate](releases/v0.9.12.md), downstream adoption or
-advisory closure; its fresh head/main/release gates remain root-owned and pending.
+qualify [v0.9.12](releases/v0.9.12.md), which carries its own evidence, nor
+downstream adoption or advisory closure.

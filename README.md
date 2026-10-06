@@ -600,13 +600,12 @@ at `31f0a21d707795be293d15837c2f77c3d84219d8`, prepared against Edge
 [`contracts-edge-0.9.11`](https://github.com/ferrum-edge/ferrum-contracts/tree/390edbd5b2485af0988e02f7827fde778d76ae0a)
 tag at `390edbd5b2485af0988e02f7827fde778d76ae0a` remains unchanged.
 
-The **0.9.13 candidate**, prepared on 2026-10-06 UTC, changes Edge-owned admin
-contract surfaces: namespace and deployment snapshot tags move to `v2` MAC
-domains, deployment snapshots add `api_spec_contents` and digest-only spec
-evidence, conditional snapshot paths can return `507`, and
-`GET /backend-egress-policy` reports `schema_version: 2`. Preserve existing
-tags and consumer pins until the 0.9.13 release and a matching
-ferrum-contracts publication complete; see the
+Edge **v0.9.13** changes Edge-owned admin contract surfaces: namespace and
+deployment snapshot tags move to `v2` MAC domains, deployment snapshots add
+`api_spec_contents` and digest-only spec evidence, conditional snapshot paths
+can return `507`, and `GET /backend-egress-policy` reports `schema_version: 2`.
+Consumer pins to `contracts-edge-0.9.12` or earlier predate these changes; move
+them only to a ferrum-contracts tag published for Edge 0.9.13. See the
 [upgrade guide](docs/upgrade_guide.md#upgrading-to-0913) and
 [contracts handoff](docs/admin_contracts_handoff_5992_5994.md).
 

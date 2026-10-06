@@ -9,9 +9,12 @@ next candidate handoff. Edge v0.9.11 was published at 2026-10-04T21:26:11Z at
 limits are in the [release record](releases/v0.9.11.md).
 Canonical [`contracts-edge-0.9.11`](https://github.com/ferrum-edge/ferrum-contracts/tree/390edbd5b2485af0988e02f7827fde778d76ae0a)
 targets `390edbd5b2485af0988e02f7827fde778d76ae0a`, not later main
-`96228e1cc3341c6bd2dff3c47eea9efa45e0545e`. New `deployment-v1` source from
-merged #6012 is in the [0.9.12 candidate](releases/v0.9.12.md); its release,
-canonical contracts and downstream adoption are pending.
+`96228e1cc3341c6bd2dff3c47eea9efa45e0545e`. `deployment-v1` from merged #6012
+shipped in [v0.9.12](releases/v0.9.12.md), published at 2026-10-05T12:33:02Z at
+`0d917701b63ef38210c49df830f48cf0457cbc7d`; canonical
+[`contracts-edge-0.9.12`](https://github.com/ferrum-edge/ferrum-contracts/tree/31f0a21d707795be293d15837c2f77c3d84219d8)
+targets `31f0a21d707795be293d15837c2f77c3d84219d8`. Downstream adoption is
+qualified separately in each consumer.
 
 ## Edge sources to synchronize
 
@@ -71,9 +74,9 @@ The earlier inspection on 2026-10-04 at canonical main
 `c35f4c9d254820ad96e7e308583135127c2003de` and historical
 `contracts-edge-0.9.9-r2`/`591c73a3f965fdab440c3a76b2707accdf491ba5` predates
 publication. Its missing-artifact observations are historical, not the current
-baseline. Preserve all published tags. Next root must synchronize the additive
-`deployment-v1` snapshot/mutation contract from the actual verified 0.9.12
-release, then qualify consumers; neither step is complete here.
+baseline. Preserve all published tags. The additive `deployment-v1`
+snapshot/mutation contract was synchronized from released v0.9.12 into
+`contracts-edge-0.9.12`; consumers qualify their own adoption.
 
 Canonical paths to retain and review for the next ferrum-contracts publication:
 
@@ -132,9 +135,9 @@ and merge target: all 14 main-push workflows and all 20 release jobs succeeded.
 The source snapshots below preserve the earlier guard-repair history, not an
 outstanding v0.9.11 publication gate. For the new #6012 head, actual hosted logs
 confirmed all three live PostgreSQL/MySQL/replica-Mongo conditional tests plus
-SQLite's admin control; its exact qualification boundary is recorded in the
-[0.9.12 candidate](releases/v0.9.12.md). Fresh preparation-head and main-push
-qualification remain root-owned and pending. No local project execution occurs.
+SQLite's admin control; its exact qualification boundary and the v0.9.12
+release-head, main-push and release evidence are recorded in the
+[0.9.12 release record](releases/v0.9.12.md). No local project execution occurs.
 
 The new fixture pins were verified on 2026-10-04 against Docker Hub tag metadata and registry OCI index
 `Docker-Content-Digest` headers for `postgres:16-alpine`, `mysql:8`, and `mongo:7`.
@@ -160,9 +163,10 @@ The separate source/schema follow-up
 `4405f5e649c0267a5cfecb7e02cc44c7dd89f90e` contains fixes for those findings.
 Its source delta is outside this guard/docs repair; the earlier failed run is
 neither proof of a remaining failure nor evidence that the fixes pass. The later
-final v0.9.11 qualification superseded this historical pending status. It does not qualify a new 0.9.12 preparation or release head.
+final v0.9.11 qualification superseded this historical pending status; v0.9.12
+was qualified separately.
 
-## Next deployment-v1 publication (#6010 / #6012)
+## deployment-v1 publication (#6010 / #6012)
 
 Carry the new owner surfaces from `openapi.yaml`, `docs/deployment_mutations.md`,
 `src/admin/deployment_mutations.rs` and the SQL/Mongo deployment mutation stores:
@@ -175,8 +179,9 @@ and uncertain driver/commit/lease handling. Backup tags and row ETags cannot
 substitute. No refreshed token, retry or full restore-minus-target is recovery
 cleanup authority. CP durable-only acknowledgement is not serving-DP application.
 
-Publish from the actual verified 0.9.12 release/full SHA after fresh root review
-and hosted qualification. Preserve the v0.9.11 baseline and its schema/catalog
-provenance. Consumers must retain original encrypted evidence/journals through
-refusal, committed-not-live and uncertainty and qualify their adoption separately.
-No 0.9.12 canonical publication, packaged adoption or advisory closure is claimed.
+`contracts-edge-0.9.12` publishes these surfaces from released v0.9.12
+(`0d917701b63ef38210c49df830f48cf0457cbc7d`). The v0.9.11 baseline and its
+schema/catalog provenance are preserved. Consumers must retain original
+encrypted evidence/journals through refusal, committed-not-live and uncertainty
+and qualify their adoption separately. No packaged adoption or advisory closure
+is claimed.

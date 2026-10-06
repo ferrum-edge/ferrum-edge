@@ -14,7 +14,7 @@ sudo cp target/release/ferrum-edge /usr/local/bin/
 # Pin an immutable semver tag (vX.Y.Z from the Releases page). Do not rely on a moving
 # "latest" channel: GitHub /releases/latest skips prerelease tags.
 set -euo pipefail
-TAG=v0.9.13  # candidate: use only after verified publication; v0.9.12 is published
+TAG=v0.9.13
 BASE="https://github.com/ferrum-edge/ferrum-edge/releases/download/${TAG}"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64"
 curl -fsSLO "${BASE}/ferrum-edge-linux-x86_64.sha256"

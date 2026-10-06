@@ -1,9 +1,9 @@
 # Dependency-fenced deployment mutations
 
-Merged #6012 supplies this source capability for the
-[0.9.12 candidate](releases/v0.9.12.md).
-Release qualification, canonical publication and downstream adoption remain pending;
-published v0.9.11 does not provide this profile.
+Merged #6012 shipped this capability in [v0.9.12](releases/v0.9.12.md),
+published at 2026-10-05T12:33:02Z; canonical `contracts-edge-0.9.12` publishes
+its contract. v0.9.11 and earlier do not provide this profile. Downstream
+adoption is qualified separately in each consumer.
 
 The opt-in `deployment-v1` profile (#6010) supports exact proxy cascade removal
 and API-spec replacement without replaying a whole namespace through restore.

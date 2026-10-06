@@ -99,11 +99,10 @@ and [arm64 layer](https://gcr.io/v2/distroless/cc-debian13/blobs/sha256:9e203bbc
 records source package `openssl`, with `libssl3t64` moving from
 `3.5.7-1~deb13u2` to `3.5.7-1~deb13u3` on both architectures.
 
-This refresh describes unreleased source inputs. Published release assets and
-image digests, including v0.9.12, retain their own immutable release-head
-evidence. Required hosted checks and trusted-base policy must qualify the new
-PR head before merge; input hashes alone establish neither GNU ABI
-compatibility, FIPS qualification, nor datapath correctness.
+This refresh (#6014) first ships in v0.9.13; v0.9.12 and earlier release
+assets and image digests retain their own immutable release-head evidence.
+Input hashes alone establish neither GNU ABI compatibility, FIPS
+qualification, nor datapath correctness.
 
 ### Image Details
 

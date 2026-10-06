@@ -437,8 +437,6 @@ export FERRUM_DB_TLS_CLIENT_KEY_PATH=/path/to/client.key
 
 ### Docker Example
 
-The 0.9.13 pin below is a candidate; use it only after verified publication.
-
 ```bash
 docker run -d --name ferrum-edge \
   -p 8000:8000 -p 9000:9000 \

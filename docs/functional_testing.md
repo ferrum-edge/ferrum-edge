@@ -45,7 +45,7 @@ Actions contexts passed, and there were zero review threads. PR #6007 merged
 as `3ce21ad101f164f70cb7f7f77fb033db828b9518` and issue #6006 closed on
 2026-10-04. The final v0.9.11 head and merge target subsequently qualified;
 all 14 main-push workflows and all 20 release jobs succeeded and distribution
-was verified. The 0.9.12 candidate requires its own fresh qualification.
+was verified. [v0.9.12](releases/v0.9.12.md) was qualified separately.
 See [the fixture qualification record](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
 
 ### scripted_backend_matrix_tests.rs

@@ -28,12 +28,10 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to 0.9.13
 
-Prepared on **2026-10-06 UTC** from main
-`fd02c5f45bb9dee86a52bc612fcefd0223d6157b`. Use the 0.9.13 version pins only
-after the release is published and its assets are verified; until then keep the
-published v0.9.12 pin. All previously released breaking identifiers and guidance
-below remain applicable. CP/DP must run the same build. 0.9.13 adds no core
-schema change; a changed baseline in any later release still requires a fresh
+0.9.13 (2026-10-06 UTC) is cut from main
+`fd02c5f45bb9dee86a52bc612fcefd0223d6157b`. All previously released breaking
+identifiers and guidance below remain applicable. CP/DP must run the same
+build. 0.9.13 adds no core schema change; a changed baseline in any later release still requires a fresh
 database with the old database kept intact for rollback.
 
 Before rolling out, check:
