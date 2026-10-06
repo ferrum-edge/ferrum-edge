@@ -1332,7 +1332,10 @@ impl GrpcConnectionPool {
         key: &str,
         ring: ShardRing,
     ) {
-        if self.shard_fills.contains_key(key) {
+        // A create of this key already pending (an awaited request-path create
+        // or another fill) will publish the shard anyway: joining it would
+        // only hold a background permit that another key's fill could use.
+        if self.shard_fills.contains_key(key) || self.pool.has_pending_creation(key) {
             return;
         }
         let Some(permit) = self.pool.try_background_create_permit() else {
@@ -1412,11 +1415,14 @@ impl GrpcConnectionPool {
             buf.push_str(&key[..base_len]);
             for offset in 1..shards {
                 Self::write_shard_key_inplace(&mut buf, base_len, (start + offset) % shards);
+                // Skip a sibling allowing no new streams, as the probe does:
+                // the call would queue inside h2.
                 if let Some(mut sender) = pool.cached(&buf)
                     && matches!(
                         futures_util::FutureExt::now_or_never(sender.ready()),
                         Some(Ok(()))
                     )
+                    && sender.peer_max_streams() != 0
                 {
                     return Some(sender);
                 }
@@ -2133,9 +2139,12 @@ fn samples_peer_max_streams(poll: u32) -> bool {
 /// also take, so the driver samples after each of its first
 /// [`PEER_MAX_STREAMS_EAGER_POLLS`] polls and then once every
 /// [`PEER_MAX_STREAMS_SAMPLE_INTERVAL`] polls. A backend that changes its
-/// limit mid-connection is seen within that many polls; until then affinity
-/// may pin a call or two more than the new limit, which h2 queues. The store
-/// is skipped while the value is unchanged.
+/// limit mid-connection is seen within 64 driver polls (up to 63 polls after
+/// the eager window); until then each frontend connection may still pin up to
+/// the previous bound, and h2 queues any excess. A TLS connection is handed
+/// out once its handshake completes, before the backend's SETTINGS arrive, so
+/// a burst on a fresh TLS connection can exhaust the eager window on the
+/// pre-SETTINGS default. The store is skipped while the value is unchanged.
 async fn drive_sampling_peer_max_streams<C>(
     conn: &mut C,
     current_max_send_streams: impl Fn(&C) -> usize,

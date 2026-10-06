@@ -5981,6 +5981,16 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
     // The uploads run on the first connection, once it is known to call its
     // own shard; the other connections only fill the remaining shards.
     let preferred = warm_grpc_affinity_shards(&mut clients, port, "http", None).await;
+    // The warm-up probes cross the refused target too and log the same retry
+    // line, so only a line logged after them proves an upload was retried.
+    let count_retries = |logs: &str| logs.matches("Retrying gRPC backend request").count();
+    let warm_up_retries = if matches!(mode, QueuedGrpcUpload::RetryBuffered) {
+        harness
+            .wait_for_stable_log_count(&count_retries, 0, Duration::from_secs(5))
+            .await
+    } else {
+        0
+    };
     let mut client = clients[0].clone();
     let mut data = vec![b'x'; DATA_LEN];
     data[..5].copy_from_slice(&[0, 0, 0, 63, 251]);
@@ -6098,15 +6108,13 @@ async fn grpc_affinity_with_queued_final_data(mode: QueuedGrpcUpload) {
         "the uploads reached the backend"
     );
     if matches!(mode, QueuedGrpcUpload::RetryBuffered) {
-        let logs = harness
-            .wait_for_log_contains(
-                &|logs: &str| logs.contains("Retrying gRPC backend request"),
-                Duration::from_secs(5),
-            )
+        let at_least = warm_up_retries + 1;
+        let retries = harness
+            .wait_for_stable_log_count(&count_retries, at_least, Duration::from_secs(5))
             .await;
         assert!(
-            logs.contains("Retrying gRPC backend request"),
-            "real native retry required"
+            retries > warm_up_retries,
+            "real native retry required: {retries} retry lines, {warm_up_retries} from warm-up"
         );
     }
 

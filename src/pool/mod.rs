@@ -873,6 +873,13 @@ impl<M: PoolManager> GenericPool<M> {
         )
     }
 
+    /// Whether a create of `key` is already pending, request-path or
+    /// background. A background fill skips such a key rather than hold a
+    /// background permit while merely joining a create that runs anyway.
+    pub fn has_pending_creation(&self, key: &str) -> bool {
+        self.pending_creations.contains_key(key)
+    }
+
     /// Take a background-create permit if one is free. Never waits: a caller
     /// that gets `None` skips its speculative create and tries again later.
     pub fn try_background_create_permit(&self) -> Option<BackgroundCreatePermit> {
