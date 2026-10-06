@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Disposable SQL TLS fixtures; never use this stack for persistent data.
-# Usage: setup_db_tls.sh [CERT_DIR] | --cleanup [CERT_DIR] | --help
+# Usage: setup_db_tls.sh [--allow-repo-dir] [CERT_DIR] | --cleanup [CERT_DIR] | --help
 set +x
 set -euo pipefail
 umask 077
@@ -49,7 +49,8 @@ on_exit() {
     trap - EXIT
     if (( status != 0 )) && [[ -f "$CERTS_DIR/.fixture-owned" ]]; then
         # Do not print container logs: upstream initialization can include credentials.
-        cleanup || true
+        # A subshell keeps a cleanup failure from replacing the original status.
+        ( cleanup ) || true
     fi
     exit "$status"
 }
@@ -136,35 +137,54 @@ generate_secrets() {
     {
         printf '[client]\nuser=root\npassword=%s\nprotocol=SOCKET\n' "$root_password"
     } > "$CERTS_DIR/mysql-root.cnf"
+    # URL-owned TLS verification; CERTS_DIR is restricted to URL-safe characters.
     {
-        printf 'PG_TLS_URL=postgres://ferrum:%s@localhost:15432/ferrum\n' "$pg_password"
-        printf 'MYSQL_TLS_URL=mysql://ferrum:%s@localhost:13306/ferrum\n' "$mysql_password"
+        printf 'PG_TLS_URL=postgres://ferrum:%s@localhost:15432/ferrum' "$pg_password"
+        printf '?sslmode=verify-full&sslrootcert=%s/ca.crt\n' "$CERTS_DIR"
+        printf 'MYSQL_TLS_URL=mysql://ferrum:%s@localhost:13306/ferrum' "$mysql_password"
+        printf '?ssl-mode=VERIFY_IDENTITY&ssl-ca=%s/ca.crt\n' "$CERTS_DIR"
     } > "$CERTS_DIR/connections.env"
     unset pg_password mysql_password root_password
 }
 
 main() {
-    local cleanup_requested=0 cert_dir name
+    local cleanup_requested=0 allow_repo_dir=0 cert_dir name parent repo
     case "${1:-}" in
         --help|-h)
-            log "Usage: $0 [CERT_DIR] | --cleanup [CERT_DIR]"
+            log "Usage: $0 [--allow-repo-dir] [CERT_DIR] | --cleanup [CERT_DIR]"
             log "Default: /tmp/ferrum-db-tls-certs (must not already exist at setup)."
+            log "CERT_DIR inside the repository is refused unless --allow-repo-dir is given."
             return
             ;;
         --cleanup)
             cleanup_requested=1
             shift
             ;;
+        --allow-repo-dir)
+            allow_repo_dir=1
+            shift
+            ;;
     esac
     (( $# <= 1 )) || die "Too many arguments."
     command -v docker >/dev/null 2>&1 || die "docker is not installed."
     cert_dir="${1:-/tmp/ferrum-db-tls-certs}"
-    CERTS_DIR="$(cd "$(dirname "$cert_dir")" && pwd)/$(basename "$cert_dir")"
+    parent="$(cd "$(dirname "$cert_dir")" && pwd)" || die "CERT_DIR parent must exist."
+    CERTS_DIR="$parent/$(basename "$cert_dir")"
+    [[ "$CERTS_DIR" =~ ^[A-Za-z0-9._/-]+$ ]] || die \
+        "CERT_DIR may contain only letters, digits, '.', '_', '-' and '/'."
     export CERTS_DIR
     if (( cleanup_requested != 0 )); then
         cleanup
         return
     fi
+    # Generated credentials must not land in a working tree by accident.
+    repo="$(cd "$REPO_ROOT" && pwd -P)"
+    case "$(cd "$parent" && pwd -P)/" in
+        "$repo"/*)
+            (( allow_repo_dir != 0 )) || die \
+                "Refusing to generate credentials inside the repository; pass --allow-repo-dir."
+            ;;
+    esac
     command -v openssl >/dev/null 2>&1 || die "openssl is not installed."
     [[ ! -e "$CERTS_DIR" && ! -L "$CERTS_DIR" ]] || die \
         "Fixture directory already exists; clean up deliberately before generating fresh secrets."

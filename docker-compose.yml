@@ -119,10 +119,13 @@ services:
   # ============================================================================
   # MongoDB support is included in the standard binary; enable this sample stack
   # with the `mongodb` compose profile. Startup requires MONGO_PASSWORD to be
-  # at least 32 hexadecimal characters (e.g. openssl rand -hex 32). Validation
-  # happens inside this service, not during interpolation of unrelated profiles.
+  # at least 32 URI-unreserved characters (A-Z a-z 0-9 . _ ~ -), for example
+  # `openssl rand -hex 32`, because ferrum-mongodb embeds it in FERRUM_DB_URL
+  # without percent-encoding. Validation happens inside this service, not during
+  # interpolation of unrelated profiles. Initialization variables never rotate
+  # the user in an existing volume; see docs/upgrade_guide.md.
   mongodb:
-    image: mongo:7-jammy
+    image: mongo:7-jammy@sha256:f71f6d0913c945096cd058557cbadf4ad435007f378d84b3c4c636c928735e72
     container_name: ferrum-mongodb-db
     environment:
       MONGO_INITDB_ROOT_USERNAME: ferrum
@@ -134,13 +137,13 @@ services:
       - |
         password="$${MONGO_INITDB_ROOT_PASSWORD:-}"
         case "$$password" in
-          ""|*[!0-9a-fA-F]*)
-            echo 'Set MONGO_PASSWORD to at least 32 hexadecimal characters' >&2
+          ""|*[!0-9A-Za-z._~-]*)
+            echo 'Set MONGO_PASSWORD to at least 32 URI-unreserved characters' >&2
             exit 1
             ;;
         esac
         if [ "$${#password}" -lt 32 ]; then
-          echo 'Set MONGO_PASSWORD to at least 32 hexadecimal characters' >&2
+          echo 'Set MONGO_PASSWORD to at least 32 URI-unreserved characters' >&2
           exit 1
         fi
         unset password
@@ -178,7 +181,7 @@ services:
     environment:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: mongodb
-      # The Mongo startup guard admits only URI-safe hexadecimal passwords.
+      # The Mongo startup guard admits only URI-unreserved passwords.
       FERRUM_DB_URL: mongodb://ferrum:${MONGO_PASSWORD:-}@mongodb:27017/?authSource=admin
       FERRUM_MONGO_DATABASE: ferrum
       FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:?Set FERRUM_ADMIN_JWT_SECRET to a strong secret}

@@ -2379,11 +2379,12 @@ jobs:
           # Provisioned inline in this non-ARM64 data-plane job — do not add
           # new .github/scripts helpers for these fixtures (Trusted Cross treats
           # newly reachable automation scripts as Cross-sensitive surfaces).
-          # Local SQL TLS remains tests/scripts/setup_db_tls.sh; Mongo TLS is
+          # Local SQL TLS remains scripts/setup_db_tls.sh; Mongo TLS is
           # hosted-CI-owned (local cells skip unless fixtures are already up).
           DB_TLS_CERT_DIR="${RUNNER_TEMP}/ferrum-db-tls-certs"
           MONGO_TLS_CERT_DIR="${RUNNER_TEMP}/ferrum-mongo-tls-certs"
           mkdir -p "$DB_TLS_CERT_DIR" "$MONGO_TLS_CERT_DIR"
+          chmod 700 "$DB_TLS_CERT_DIR"
 
           # --- PostgreSQL / MySQL TLS certificates ---
           openssl genrsa -out "$DB_TLS_CERT_DIR/ca.key" 4096 2>/dev/null
@@ -2441,13 +2442,37 @@ jobs:
           chmod 644 "$DB_TLS_CERT_DIR/mysql-server.key" "$DB_TLS_CERT_DIR/mysql-server.crt" \
             "$DB_TLS_CERT_DIR/ca.crt" "$DB_TLS_CERT_DIR/pg-server.crt" "$DB_TLS_CERT_DIR/client.crt"
 
+          # Generated SQL TLS credentials live only in private 0600 files:
+          # containers read them through *_FILE inputs and MySQL option files,
+          # tests through connections.env. No password reaches argv or logs.
+          (
+            umask 077
+            openssl rand -hex 32 > "$DB_TLS_CERT_DIR/pg-password"
+            openssl rand -hex 32 > "$DB_TLS_CERT_DIR/mysql-password"
+            openssl rand -hex 32 > "$DB_TLS_CERT_DIR/mysql-root-password"
+            read -r pg_password < "$DB_TLS_CERT_DIR/pg-password"
+            read -r mysql_password < "$DB_TLS_CERT_DIR/mysql-password"
+            read -r mysql_root_password < "$DB_TLS_CERT_DIR/mysql-root-password"
+            printf '::add-mask::%s\n' "$pg_password" "$mysql_password" "$mysql_root_password"
+            printf '[client]\nuser=ferrum\npassword=%s\n' "$mysql_password" \
+              > "$DB_TLS_CERT_DIR/mysql-client.cnf"
+            printf '[client]\nuser=root\npassword=%s\n' "$mysql_root_password" \
+              > "$DB_TLS_CERT_DIR/mysql-root.cnf"
+            {
+              printf 'PG_TLS_URL=postgres://ferrum:%s@localhost:15432/ferrum' "$pg_password"
+              printf '?sslmode=verify-full&sslrootcert=%s/ca.crt\n' "$DB_TLS_CERT_DIR"
+              printf 'MYSQL_TLS_URL=mysql://ferrum:%s@localhost:13306/ferrum' "$mysql_password"
+              printf '?ssl-mode=VERIFY_IDENTITY&ssl-ca=%s/ca.crt\n' "$DB_TLS_CERT_DIR"
+            } > "$DB_TLS_CERT_DIR/connections.env"
+          )
+
           docker rm -f ferrum-test-pg-tls >/dev/null 2>&1 || true
           docker run -d \
             --name ferrum-test-pg-tls \
-            -p 15432:5432 \
+            -p 127.0.0.1:15432:5432 \
             -e POSTGRES_DB=ferrum \
             -e POSTGRES_USER=ferrum \
-            -e POSTGRES_PASSWORD=test-password \
+            -e POSTGRES_PASSWORD_FILE=/certs-src/pg-password \
             -v "$DB_TLS_CERT_DIR:/certs-src:ro" \
             --entrypoint sh \
             postgres:16 \
@@ -2468,11 +2493,16 @@ jobs:
           docker rm -f ferrum-test-mysql-tls >/dev/null 2>&1 || true
           docker run -d \
             --name ferrum-test-mysql-tls \
-            -p 13306:3306 \
+            -p 127.0.0.1:13306:3306 \
             -e MYSQL_DATABASE=ferrum \
             -e MYSQL_USER=ferrum \
-            -e MYSQL_PASSWORD=test-password \
-            -e MYSQL_ROOT_PASSWORD=test-password \
+            -e MYSQL_PASSWORD_FILE=/run/secrets/mysql-password \
+            -e MYSQL_ROOT_PASSWORD_FILE=/run/secrets/mysql-root-password \
+            -e MYSQL_ROOT_HOST=localhost \
+            -v "$DB_TLS_CERT_DIR/mysql-password:/run/secrets/mysql-password:ro" \
+            -v "$DB_TLS_CERT_DIR/mysql-root-password:/run/secrets/mysql-root-password:ro" \
+            -v "$DB_TLS_CERT_DIR/mysql-client.cnf:/run/secrets/mysql-client.cnf:ro" \
+            -v "$DB_TLS_CERT_DIR/mysql-root.cnf:/run/secrets/mysql-root.cnf:ro" \
             -v "$DB_TLS_CERT_DIR/mysql-server.crt:/etc/mysql/ssl/server-cert.pem:ro" \
             -v "$DB_TLS_CERT_DIR/mysql-server.key:/etc/mysql/ssl/server-key.pem:ro" \
             -v "$DB_TLS_CERT_DIR/ca.crt:/etc/mysql/ssl/ca.pem:ro" \
@@ -2692,27 +2722,28 @@ jobs:
             fi
             sleep 2
           done
+          # Generated-credential fixtures withhold container logs on failure.
           if [ -z "$pg_tls_ok" ]; then
             echo "::error::postgres TLS fixture did not become ready"
-            docker logs ferrum-test-pg-tls; exit 1
+            exit 1
           fi
 
           mysql_tls_ok=""
           for _ in $(seq 1 90); do
-            if MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls \
-                  mysqladmin ping -h 127.0.0.1 -uferrum --silent >/dev/null 2>&1 \
-              && MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls \
-                  mysql -h 127.0.0.1 -uferrum -D ferrum -e "SELECT 1" >/dev/null 2>&1; then
+            if docker exec ferrum-test-mysql-tls \
+                  mysql --defaults-extra-file=/run/secrets/mysql-client.cnf \
+                  -h 127.0.0.1 -D ferrum -e "SELECT 1" >/dev/null 2>&1; then
               mysql_tls_ok=1; break
             fi
             sleep 2
           done
           if [ -z "$mysql_tls_ok" ]; then
             echo "::error::mysql TLS fixture did not become ready"
-            docker logs ferrum-test-mysql-tls; exit 1
+            exit 1
           fi
 
-          MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls mysql -uroot -e \
+          docker exec ferrum-test-mysql-tls \
+            mysql --defaults-extra-file=/run/secrets/mysql-root.cnf -e \
             "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO 'ferrum'@'%'; FLUSH PRIVILEGES;"
           docker exec ferrum-test-pg-tls psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c \
             "ALTER USER ferrum WITH CREATEDB;"
