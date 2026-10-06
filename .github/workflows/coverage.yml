@@ -266,14 +266,14 @@ jobs:
             -e POSTGRES_DB=ferrum \
             -e POSTGRES_USER=ferrum \
             -e POSTGRES_PASSWORD=ferrum \
-            -p 5432:5432 \
+            -p 127.0.0.1:5432:5432 \
             postgres:16-alpine
           docker run -d --name ferrum-cov-mysql \
             -e MYSQL_DATABASE=ferrum \
             -e MYSQL_USER=ferrum \
             -e MYSQL_PASSWORD=ferrum \
             -e MYSQL_ROOT_PASSWORD=ferrum \
-            -p 3306:3306 \
+            -p 127.0.0.1:3306:3306 \
             mysql:8
 
           redis_ok=""

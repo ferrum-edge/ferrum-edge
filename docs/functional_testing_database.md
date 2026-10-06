@@ -76,7 +76,7 @@ diff in one place. The replica-set cells are opt-in through
 | `FERRUM_TEST_MONGO_CERT_DIR` | `${RUNNER_TEMP}/ferrum-mongo-tls-certs` | Certs provisioned inline by data-plane CI (`ca.crt`, `client.crt`, `client.key`) |
 | `FERRUM_TEST_MONGO_REPLICA_SET` | `rs0` | Enables the transactional `POST /batch` cell and the transactional gateway trust-bundle cells |
 | `FERRUM_TEST_MONGO_REPLICA_SET_URL` | `mongodb://localhost:27020/ferrum_test` | Replica-set member for those cells |
-| `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | SQL TLS certs provisioned inline by data-plane CI (local: `tests/scripts/setup_db_tls.sh`) |
+| `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | SQL TLS certs and generated `connections.env`, provisioned inline by data-plane CI (local: `scripts/setup_db_tls.sh`) |
 | `FERRUM_DB_BACKENDS_REQUIRED` | `1` | Fail when an expected plaintext backend is missing |
 | `FERRUM_DB_TLS_REQUIRED` | `1` | Fail when PostgreSQL/MySQL/MongoDB TLS fixtures are missing |
 | `FERRUM_TEST_DB_FAULT_CONTROL` | path set by `functional_db_outage_test` harness | **Debug builds only.** Test-only file seam that forces config-DB acquires to fail with `PoolClosed` while the control file exists. Not a product setting; omitted from `ferrum.conf` / operator configuration docs. Release binaries ignore it. |
@@ -470,7 +470,7 @@ The MongoDB functional test (`tests/functional/functional_mongodb_test.rs`) prov
 
 ```bash
 # Start MongoDB (plaintext)
-docker run -d --name mongo-test -p 27017:27017 mongo:7
+docker run -d --name mongo-test -p 127.0.0.1:27017:27017 mongo:7
 
 # MongoDB TLS/mTLS fixtures are provisioned inline by hosted data-plane CI.
 # Local TLS cells skip unless FERRUM_TEST_MONGO_CERT_DIR and ports 27018/27019

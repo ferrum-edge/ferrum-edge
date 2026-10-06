@@ -1048,13 +1048,13 @@ async fn test_scale_perf_30k_proxies_postgres() {
     // Check for the PostgreSQL container
     // Start with: docker run -d --name ferrum-scale-test-pg \
     //   -e POSTGRES_USER=ferrum -e POSTGRES_PASSWORD=ferrum-scale-test \
-    //   -e POSTGRES_DB=ferrum_scale -p 25432:5432 postgres:16
+    //   -e POSTGRES_DB=ferrum_scale -p 127.0.0.1:25432:5432 postgres:16
     if !is_container_running("ferrum-scale-test-pg") {
         println!("SKIPPED: ferrum-scale-test-pg container not running.");
         println!("Start it with:");
         println!("  docker run -d --name ferrum-scale-test-pg \\");
         println!("    -e POSTGRES_USER=ferrum -e POSTGRES_PASSWORD=ferrum-scale-test \\");
-        println!("    -e POSTGRES_DB=ferrum_scale -p 25432:5432 postgres:16");
+        println!("    -e POSTGRES_DB=ferrum_scale -p 127.0.0.1:25432:5432 postgres:16");
         return;
     }
 
@@ -1108,10 +1108,10 @@ async fn test_scale_perf_30k_proxies_mongodb() {
         println!("SKIPPED: ferrum-scale-test-mongo container not running.");
         println!("Start it with:");
         println!("  docker run -d --name ferrum-scale-test-mongo --network host \\");
-        println!("    mongo:7 --replSet rs0 --port 27117 --bind_ip_all");
+        println!("    mongo:7 --replSet rs0 --port 27117 --bind_ip 127.0.0.1");
         println!("  docker exec ferrum-scale-test-mongo mongosh --port 27117 --eval \\");
         println!(
-            "    'rs.initiate({{_id: \"rs0\", members: [{{_id: 0, host: \"localhost:27117\"}}]}})'"
+            "    'rs.initiate({{_id: \"rs0\", members: [{{_id: 0, host: \"127.0.0.1:27117\"}}]}})'"
         );
         println!("  export FERRUM_MONGO_REPLICA_SET=rs0");
         return;
@@ -1120,7 +1120,7 @@ async fn test_scale_perf_30k_proxies_mongodb() {
     // The connection URL points at the container's mapped host port. MongoDB
     // stores the gateway's config collections in FERRUM_MONGO_DATABASE
     // (`ferrum_scale`), independent of the URL path / auth database.
-    let db_url = "mongodb://localhost:27117";
+    let db_url = "mongodb://127.0.0.1:27117";
     let mongo_database = "ferrum_scale";
 
     // Clean the database for a fresh run by dropping it inside the container.
