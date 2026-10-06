@@ -73,6 +73,9 @@ use crate::config::types::{
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni, validate_system_trust_roots_verify_pairing,
 };
+use crate::plugins::early_route_total::{
+    EarlyRouteCandidates, EarlyRouteTotalFacts, EarlyRouteTotalStep,
+};
 use crate::plugins::fault_injection::{
     CLIENT_GONE_STATUS, FaultDelayDisposition, ROUTE_FAULT_INJECTED_METADATA_KEY,
     is_native_grpc_request, run_http_fault_delay,
@@ -1697,6 +1700,96 @@ impl MeshRouteDispatch {
     pub fn rules(&self) -> &[RouteRule] {
         &self.config.rules
     }
+
+    /// The pure preview behind [`Plugin::early_route_total`] (issue #6008):
+    /// the same first-match walk `before_proxy` makes, over the same compiled
+    /// matchers, without running a fault, redirect, or rewrite. A rule that
+    /// matches on an input an earlier plugin may still rewrite is a candidate
+    /// rather than a decision.
+    fn preview_route_total<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        host: Option<&'a str>,
+        query: Option<&CanonicalQuery>,
+        facts: EarlyRouteTotalFacts,
+    ) -> EarlyRouteTotalStep<'a> {
+        if ctx.has_ai_stream_router_claim() {
+            return EarlyRouteTotalStep::NoMatch;
+        }
+        let deferred_unmatched = self.aggregate_reject_unmatched.load(Ordering::Relaxed);
+        let refuses_unmatched = self.config.reject_unmatched && !deferred_unmatched;
+        if self.has_query_predicates
+            && !facts.query_may_change
+            && query.is_some_and(|q| q.first_ambiguity().is_some())
+        {
+            return EarlyRouteTotalStep::Terminal;
+        }
+        let mut candidates = EarlyRouteCandidates::default();
+        let mut undetermined = false;
+        for rule in &self.config.rules {
+            let decided = !rule_reads_changing_input(rule, facts);
+            if decided && !rule_matches_with_host(rule, ctx, &ctx.headers, host, query) {
+                continue;
+            }
+            // A redirect answers before any total is published. A fault abort
+            // or a waypoint veto may also end the request, but otherwise this
+            // rule's total is armed, so the rule's total is the bound.
+            let publishes = rule.redirect.is_none();
+            if decided && !undetermined {
+                if !publishes {
+                    return EarlyRouteTotalStep::Terminal;
+                }
+                let next_host = rule
+                    .rewrite
+                    .as_ref()
+                    .and_then(|r| r.authority.as_deref())
+                    .or_else(|| ctx.headers.get("host").map(String::as_str));
+                return EarlyRouteTotalStep::Matched {
+                    timeout_ms: rule.request_timeout_ms,
+                    host: next_host,
+                };
+            }
+            if publishes {
+                candidates.add(rule.request_timeout_ms);
+            }
+            if decided {
+                // First match: no later rule is reachable past this one.
+                return EarlyRouteTotalStep::Candidates {
+                    candidates,
+                    may_fall_through: false,
+                };
+            }
+            undetermined = true;
+        }
+        if !undetermined {
+            return if refuses_unmatched {
+                EarlyRouteTotalStep::Terminal
+            } else {
+                EarlyRouteTotalStep::NoMatch
+            };
+        }
+        EarlyRouteTotalStep::Candidates {
+            candidates,
+            may_fall_through: !refuses_unmatched,
+        }
+    }
+}
+
+/// Whether `rule` matches on a request input an earlier plugin may still
+/// rewrite before this instance runs, so it cannot be decided early.
+/// Gateway-owned assertion headers (`x-consumer-*`, `x-geo-country`) are
+/// published only after authentication and are never decided early.
+fn rule_reads_changing_input(rule: &RouteRule, facts: EarlyRouteTotalFacts) -> bool {
+    let host_changes = facts.headers_may_change || facts.host_unknown;
+    let reads_changing_header = rule.headers_compiled.keys().any(|name| {
+        crate::proxy::headers::is_gateway_assertion_header(name)
+            || facts.headers_may_change
+            || (host_changes && name == "host")
+    });
+    reads_changing_header
+        || (facts.destination_may_change && rule.uri_compiled.is_some())
+        || (host_changes && rule.authority_compiled.is_some())
+        || (facts.query_may_change && !rule.match_.query_params.is_empty())
 }
 
 /// Validate the optional `match.source_namespace` predicate. The Istio CRD
@@ -2103,6 +2196,22 @@ impl Plugin for MeshRouteDispatch {
     fn enable_deferred_unmatched_rejection(&self) {
         self.aggregate_reject_unmatched
             .store(true, Ordering::Relaxed);
+    }
+
+    fn early_route_total<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        host: Option<&'a str>,
+        query: Option<&CanonicalQuery>,
+        facts: EarlyRouteTotalFacts,
+    ) -> Option<EarlyRouteTotalStep<'a>> {
+        let step = self.preview_route_total(ctx, host, query, facts);
+        // An earlier destination-changing plugin (an AI or MCP router) may
+        // claim the request, and a claimed request skips this instance.
+        if facts.destination_may_change {
+            return Some(step.or_skipped());
+        }
+        Some(step)
     }
 
     async fn before_proxy(
@@ -2700,6 +2809,25 @@ fn rule_matches(
     headers: &HashMap<String, String>,
     canonical_query: Option<&CanonicalQuery>,
 ) -> bool {
+    rule_matches_with_host(
+        rule,
+        ctx,
+        headers,
+        headers.get("host").map(String::as_str),
+        canonical_query,
+    )
+}
+
+/// [`rule_matches`] with the forwarded Host supplied separately, so the
+/// early route-total preview can follow an earlier instance's authority
+/// rewrite without mutating a header map.
+fn rule_matches_with_host(
+    rule: &RouteRule,
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    host: Option<&str>,
+    canonical_query: Option<&CanonicalQuery>,
+) -> bool {
     let m = &rule.match_;
     if m.is_empty() {
         // Empty match means "match all". `normalize_and_validate` accepts
@@ -2741,7 +2869,12 @@ fn rule_matches(
     // (regex included) — the hot path is one HashMap lookup plus the
     // matcher op per configured header.
     for (name, matcher) in &rule.headers_compiled {
-        match headers.get(name.as_str()) {
+        let actual = if name == "host" {
+            host
+        } else {
+            headers.get(name.as_str()).map(String::as_str)
+        };
+        match actual {
             Some(actual) if matcher.matches(actual) => {}
             _ => return false,
         }
@@ -2798,7 +2931,7 @@ fn rule_matches(
         // Do not route-normalize here. Istio `authority` is a `StringMatch`;
         // exact/prefix comparisons are case-sensitive and include an explicit
         // port when the client sent one.
-        let Some(authority) = headers.get("host").or_else(|| headers.get(":authority")) else {
+        let Some(authority) = host.or_else(|| headers.get(":authority").map(String::as_str)) else {
             return false;
         };
         if !matcher.matches(authority) {

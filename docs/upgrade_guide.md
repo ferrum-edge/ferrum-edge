@@ -26,6 +26,28 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased changes after 0.9.12
+
+**Native HTTP/3 buffered uploads take retained-request admission (#6009).**
+An H3 upload the gateway buffers (for a body-inspecting plugin, a protocol
+translation, or retry replay) now takes the same
+`FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` admission as HTTP/1.1 and HTTP/2. With
+`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` it is also capped at
+`FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` (`413` above it). When the budget is
+exhausted the request gets `503` / gRPC `RESOURCE_EXHAUSTED` instead of being
+buffered. Size the budget for concurrent buffered H3 uploads as you already do
+for HTTP/1.1 and HTTP/2; streamed H3 uploads are unaffected.
+
+**Route total deadlines bound early body collection (#6008).** A body collected
+before `before_proxy` on a route whose `mesh_route_dispatch` rule (HTTPRoute
+`timeouts.request`) carries `request_timeout_ms` now ends at that total with the
+route-timeout `504` (gRPC `DEADLINE_EXCEEDED`) instead of running to
+`backend_read_timeout_ms`. When the rule cannot be decided before
+authentication, the largest candidate total applies, and no route bound applies
+if any candidate is untimed. Keep `backend_read_timeout_ms` finite on routes
+that collect bodies before authentication. See
+[plugins.md → Route request deadline](plugins.md#route-request-deadline).
+
 ## Upgrading to 0.9.12 (candidate)
 
 Prepared on **2026-10-05 UTC** from merged #6012 main

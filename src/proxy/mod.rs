@@ -3791,7 +3791,7 @@ fn backend_tls_sni_requires_direct_h2_response(
 pub(crate) const BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON: &str =
     "backend_tls_sni_requires_direct_h2";
 
-enum ClientRequestBody {
+pub(crate) enum ClientRequestBody {
     Streaming(Box<Request<Incoming>>),
     Buffered(Box<BufferedClientRequestBody>),
 }
@@ -3821,10 +3821,10 @@ enum MeshClientRequestBody {
 /// reqwest. Keeping the original `HeaderMap` is important for native gRPC:
 /// binary metadata and repeated field lines cannot be reconstructed from the
 /// plugin-facing `HashMap<String, String>` without losing information.
-struct BufferedClientRequestBody {
+pub(crate) struct BufferedClientRequestBody {
     method: hyper::Method,
     headers: hyper::HeaderMap,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
     trailers: Option<hyper::HeaderMap>,
     /// The aggregate buffered-request charge that paid for `body`. Held here
     /// through pre-auth and plugin phases so early exits return it by DROP
@@ -3838,7 +3838,7 @@ struct BufferedClientRequestBody {
     budget: Option<response_buffer_budget::RequestBufferPermit>,
 }
 
-enum RequestBodyBufferError {
+pub(crate) enum RequestBodyBufferError {
     TooLarge,
     ClientDisconnected(String),
     TimedOut,
@@ -3850,6 +3850,48 @@ enum RequestBodyBufferError {
     /// health-neutral [`response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS`],
     /// never as a `4xx` blaming the client.
     BufferCapacityExceeded,
+    /// The previewed route total deadline (issue #6008) is the captured
+    /// earliest bound of an early collect and elapsed first: proxy core's
+    /// health-neutral route-timeout `504`. Only a non-gRPC early collect can
+    /// produce it; a gRPC request folds the total into its RPC deadline.
+    RouteDeadlineExceeded,
+}
+
+/// Capture the winning bound of an early collect under a previewed route
+/// total (issue #6008) once, before the collect is polled: an RPC deadline
+/// wins a route tie and the route total wins a read-timeout tie, so a late
+/// wake reports the owner composed here rather than one re-read from the clock.
+fn early_route_bound(
+    rpc_deadline_at: Option<tokio::time::Instant>,
+    route_at: tokio::time::Instant,
+    request_body_read_timeout_ms: u64,
+) -> (tokio::time::Instant, RequestBodyBufferError) {
+    match compose_early_upload_bound(rpc_deadline_at, request_body_read_timeout_ms) {
+        Some((at, EarlyUploadBoundKind::RpcDeadline)) if at <= route_at => {
+            (at, RequestBodyBufferError::DeadlineExceeded)
+        }
+        Some((at, EarlyUploadBoundKind::OperatorTimeout)) if at < route_at => {
+            (at, RequestBodyBufferError::TimedOut)
+        }
+        _ => (route_at, RequestBodyBufferError::RouteDeadlineExceeded),
+    }
+}
+
+/// Split a previewed route total deadline the way
+/// `RequestContext::arm_route_request_deadline` will apply it once
+/// `before_proxy` selects the rule: a gRPC request folds it into its RPC
+/// deadline; every other request keeps it as its own route-timeout term.
+/// Returns `(rpc_deadline_at, route_deadline_at)` for an early collector.
+pub(crate) fn early_upload_deadlines(
+    rpc_deadline_at: Option<tokio::time::Instant>,
+    early_route_at: Option<tokio::time::Instant>,
+    grpc_flavored: bool,
+) -> (Option<tokio::time::Instant>, Option<tokio::time::Instant>) {
+    if grpc_flavored {
+        (earliest_deadline(rpc_deadline_at, early_route_at), None)
+    } else {
+        (rpc_deadline_at, early_route_at)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4189,13 +4231,14 @@ pub(crate) fn http_flavor_allows_request_body_buffering(flavor: HttpFlavor) -> b
     !matches!(flavor, HttpFlavor::WebSocket)
 }
 
-async fn buffer_request_body_for_before_proxy(
+pub(crate) async fn buffer_request_body_for_before_proxy(
     request: Request<Incoming>,
     method: &str,
     headers: &HashMap<String, String>,
     max_request_body_size_bytes: usize,
     request_body_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    route_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<ClientRequestBody, RequestBodyBufferError> {
     // Keep the existing no-collection fast path only when the method/header
     // classification and the protocol body state agree that the request is
@@ -4235,12 +4278,27 @@ async fn buffer_request_body_for_before_proxy(
     let budget_permit = response_buffer_budget::RequestBufferPermit::reserve(ceiling)
         .ok_or(RequestBodyBufferError::BufferCapacityExceeded)?;
     let limited = http_body_util::Limited::new(body, ceiling);
-    let collected = collect_request_body_with_deadline(
-        limited.collect(),
-        grpc_deadline_at,
-        request_body_read_timeout_ms,
-    )
-    .await?;
+    let collected = match route_deadline_at {
+        None => {
+            collect_request_body_with_deadline(
+                limited.collect(),
+                grpc_deadline_at,
+                request_body_read_timeout_ms,
+            )
+            .await?
+        }
+        // An early collect under a previewed route total (issue #6008). The
+        // wait is deadline-first, so an elapsed bound never polls a ready
+        // body, and the partial buffer and admission permit drop with the
+        // collect before any rejection hook runs.
+        Some(route_at) => {
+            let (at, expiry) =
+                early_route_bound(grpc_deadline_at, route_at, request_body_read_timeout_ms);
+            crate::plugins::await_deadline_first(Some(at), limited.collect())
+                .await
+                .map_err(|()| expiry)?
+        }
+    };
     // Limited::collect() returns either a LengthLimitError (the body actually
     // exceeded the cap -> 413) or the underlying transport error (the client
     // dropped the connection mid-upload -> 499). Distinguish them so a client
@@ -4304,6 +4362,7 @@ async fn prepare_mesh_request_body(
             max_request_body_size_bytes,
             request_body_read_timeout_ms,
             grpc_deadline_at,
+            None,
         )
         .await
         .map_err(|error| match error {
@@ -4335,7 +4394,9 @@ async fn prepare_mesh_request_body(
             RequestBodyBufferError::TimedOut => {
                 request_body_timeout_backend_response(resolved_ip.clone())
             }
-            RequestBodyBufferError::DeadlineExceeded => {
+            // No route term is passed here, so a route expiry cannot occur.
+            RequestBodyBufferError::DeadlineExceeded
+            | RequestBodyBufferError::RouteDeadlineExceeded => {
                 client_grpc_deadline_exceeded_response(resolved_ip.clone())
             }
             RequestBodyBufferError::BufferCapacityExceeded => {
@@ -30950,6 +31011,78 @@ fn boxed_finalize_reject_response<'a>(
     )
 }
 
+/// Rejection phase logged for a route total that elapsed while an early
+/// (pre-`before_proxy`) collector was still buffering the upload (issue #6008).
+pub(crate) const EARLY_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE: &str =
+    "route_request_timeout_early_upload";
+
+/// Finalize a previewed route total deadline (issue #6008) that elapsed while
+/// an early collector was still buffering a NON-gRPC upload: proxy core's
+/// route-timeout `504` with the `request_timeout` token, health-neutral and
+/// logged `before_dispatch`. The collect future, its partial buffer, and its
+/// admission permit were dropped before this runs. A gRPC request folds the
+/// previewed total into its RPC deadline and never reaches this.
+async fn finalize_early_route_upload_timeout(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&str>,
+) -> Response<ProxyBody> {
+    ctx.mark_route_request_timeout_exceeded(ROUTE_REQUEST_TIMEOUT_PHASE_BEFORE_DISPATCH);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        (
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_REQUEST_TIMEOUT.to_string(),
+        ),
+    ]);
+    let reject = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        StatusCode::GATEWAY_TIMEOUT,
+        Bytes::from_static(ROUTE_REQUEST_TIMEOUT_BODY.as_bytes()),
+        headers,
+        false,
+    )
+    .await;
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        reject.http_status.as_u16(),
+        start_time,
+        EARLY_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE,
+        plugin_execution_ns,
+        original_request_path,
+    )
+    .await;
+    record_request(state, reject.http_status.as_u16());
+    build_response_from_normalized_reject(reject)
+}
+
+/// [`finalize_early_route_upload_timeout`], constructed out of line and
+/// returned boxed, for exactly the reason documented on
+/// [`boxed_finalize_reject_response`].
+#[inline(never)]
+fn boxed_finalize_early_route_upload_timeout<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&'a str>,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(finalize_early_route_upload_timeout(
+        plugins,
+        ctx,
+        state,
+        start_time,
+        plugin_execution_ns,
+        original_request_path,
+    ))
+}
+
 /// The client-RPC-deadline upload rejection future, constructed out of line and
 /// returned boxed, for exactly the reason documented on
 /// [`boxed_finalize_reject_response`].
@@ -33996,6 +34129,11 @@ async fn handle_proxy_request_inner(
     if authenticate_body_requirements.required {
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
+                let (upload_rpc_deadline_at, early_route_at) = early_upload_deadlines(
+                    ctx.grpc_deadline_at(),
+                    plugin_cache_view.early_route_total_at(&ctx, false),
+                    is_grpc_request,
+                );
                 match buffer_request_body_for_before_proxy(
                     *request,
                     &method,
@@ -34010,7 +34148,8 @@ async fn handle_proxy_request_inner(
                         ),
                     ),
                     proxy.backend_read_timeout_ms,
-                    ctx.grpc_deadline_at(),
+                    upload_rpc_deadline_at,
+                    early_route_at,
                 )
                 .await
                 {
@@ -34116,6 +34255,17 @@ async fn handle_proxy_request_inner(
                         .await;
                         return Ok(response);
                     }
+                    Err(RequestBodyBufferError::RouteDeadlineExceeded) => {
+                        return Ok(boxed_finalize_early_route_upload_timeout(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await);
+                    }
                 }
             }
             ClientRequestBody::Buffered(buffered) => {
@@ -34149,6 +34299,11 @@ async fn handle_proxy_request_inner(
         )
         .await
         {
+            // A completed early body and its request-buffer charge are
+            // released before the rejection hooks run (issue #6008).
+            if matches!(client_request_body, ClientRequestBody::Buffered(_)) {
+                drop(client_request_body);
+            }
             plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
             let reject = boxed_finalize_reject_response(
                 &plugins,
@@ -34211,13 +34366,19 @@ async fn handle_proxy_request_inner(
         );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
+                let (upload_rpc_deadline_at, early_route_at) = early_upload_deadlines(
+                    ctx.grpc_deadline_at(),
+                    plugin_cache_view.early_route_total_at(&ctx, true),
+                    is_grpc_request,
+                );
                 match buffer_request_body_for_before_proxy(
                     *request,
                     &method,
                     &ctx.headers,
                     body_limit,
                     proxy.backend_read_timeout_ms,
-                    ctx.grpc_deadline_at(),
+                    upload_rpc_deadline_at,
+                    early_route_at,
                 )
                 .await
                 {
@@ -34299,6 +34460,17 @@ async fn handle_proxy_request_inner(
                         .await;
                         return Ok(response);
                     }
+                    Err(RequestBodyBufferError::RouteDeadlineExceeded) => {
+                        return Ok(boxed_finalize_early_route_upload_timeout(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await);
+                    }
                 }
             }
             ClientRequestBody::Buffered(buffered) => {
@@ -34342,6 +34514,11 @@ async fn handle_proxy_request_inner(
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
                     crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
+                    // A completed early body and its request-buffer charge are
+                    // released before the rejection hooks run (issue #6008).
+                    if matches!(client_request_body, ClientRequestBody::Buffered(_)) {
+                        drop(client_request_body);
+                    }
                     let plugin_reject = plugin_result_into_reject_parts(reject)
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
@@ -34435,13 +34612,19 @@ async fn handle_proxy_request_inner(
         );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
+                let (upload_rpc_deadline_at, early_route_at) = early_upload_deadlines(
+                    ctx.grpc_deadline_at(),
+                    plugin_cache_view.early_route_total_at(&ctx, true),
+                    is_grpc_request,
+                );
                 match buffer_request_body_for_before_proxy(
                     *request,
                     &method,
                     &ctx.headers,
                     body_limit,
                     proxy.backend_read_timeout_ms,
-                    ctx.grpc_deadline_at(),
+                    upload_rpc_deadline_at,
+                    early_route_at,
                 )
                 .await
                 {
@@ -34528,6 +34711,17 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                         return Ok(response);
+                    }
+                    Err(RequestBodyBufferError::RouteDeadlineExceeded) => {
+                        return Ok(boxed_finalize_early_route_upload_timeout(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await);
                     }
                 }
             }
@@ -35430,6 +35624,7 @@ async fn handle_proxy_request_inner(
                     effective_max_request_body_size_bytes,
                     proxy.backend_read_timeout_ms,
                     ctx.grpc_deadline_at(),
+                    None,
                 )
                 .await
                 {
@@ -35500,7 +35695,11 @@ async fn handle_proxy_request_inner(
                         )
                         .await);
                     }
-                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                    // No route term is passed here, so a route expiry cannot occur.
+                    Err(
+                        RequestBodyBufferError::DeadlineExceeded
+                        | RequestBodyBufferError::RouteDeadlineExceeded,
+                    ) => {
                         ctx.metadata.insert(
                             RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
                             "true".to_string(),
@@ -35898,6 +36097,7 @@ async fn handle_proxy_request_inner(
                     effective_max_request_body_size_bytes,
                     proxy.backend_read_timeout_ms,
                     ctx.grpc_deadline_at(),
+                    None,
                 )
                 .await
                 {
@@ -35951,7 +36151,11 @@ async fn handle_proxy_request_inner(
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
-                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                    // No route term is passed here, so a route expiry cannot occur.
+                    Err(
+                        RequestBodyBufferError::DeadlineExceeded
+                        | RequestBodyBufferError::RouteDeadlineExceeded,
+                    ) => {
                         cb_probe.release_neutral();
                         drop(preacquired_backend_admission.take_if_acquired());
                         let response = boxed_finalize_upload_deadline_rejection(

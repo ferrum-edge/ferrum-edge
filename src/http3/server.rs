@@ -234,6 +234,34 @@ pub(crate) fn h3_upload_authorization_bound(
     )
 }
 
+/// [`h3_upload_authorization_bound`] for a drain that runs BEFORE
+/// `before_proxy` arms the route rule (issue #6008). The previewed route total
+/// is applied the way `arm_route_request_deadline` will apply it: a gRPC
+/// request folds it into its RPC deadline (expiry is the gRPC deadline
+/// terminal); any other request carries it as its own owner, whose expiry is
+/// proxy core's health-neutral route timeout. Nothing is armed on `ctx`.
+fn h3_early_upload_bound(
+    ctx: &RequestContext,
+    plugin_cache_view: &crate::plugin_cache::PluginCacheRequestView,
+    identity_ready: bool,
+    http_flavor: HttpFlavor,
+    authenticated_stream_max_lifetime_seconds: u64,
+) -> crate::proxy::auth_lifetime::ComposedAuthBound {
+    let (rpc_at, route_at) = crate::proxy::early_upload_deadlines(
+        ctx.grpc_deadline_at(),
+        plugin_cache_view.early_route_total_at(ctx, identity_ready),
+        matches!(http_flavor, HttpFlavor::Grpc),
+    );
+    crate::proxy::auth_lifetime::ComposedAuthBound::compose(
+        rpc_at,
+        crate::proxy::auth_lifetime::effective_request_auth_deadline(
+            ctx,
+            authenticated_stream_max_lifetime_seconds,
+        ),
+    )
+    .with_route_total(route_at)
+}
+
 /// One native-H3 retained upload under the shared buffered-request contract
 /// (issue #6009), the H3 counterpart of `buffer_request_body_for_before_proxy`.
 ///
@@ -3979,12 +4007,16 @@ async fn handle_h3_request(
             .await?;
             return Ok(());
         };
+        let upload_bound = h3_early_upload_bound(
+            &ctx,
+            &plugin_cache_view,
+            false,
+            http_flavor,
+            state.env_config.authenticated_stream_max_lifetime_seconds,
+        );
         let body_data = match collect_h3_request_body_under_authorization(
             drain_h3_request_body(&mut stream, upload, &mut retained_request_charge),
-            h3_upload_authorization_bound(
-                &ctx,
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            ),
+            upload_bound,
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -4024,6 +4056,7 @@ async fn handle_h3_request(
                     "grpc_deadline_upload_before_authenticate",
                     plugin_execution_ns,
                     authorization_expiry,
+                    upload_bound.route_wins(),
                 )
                 .await?;
                 return Ok(());
@@ -4087,6 +4120,10 @@ async fn handle_h3_request(
     )
     .await
     {
+        // A completed early body and its request-buffer charge are released
+        // before the rejection hooks run (issues #6008, #6009).
+        drop(prebuffered_body_data.take());
+        drop(retained_request_charge.take());
         let mut reject_status = status_code;
         let mut reject_body = body;
         // Run after_proxy reject hooks AND the synthetic response-body
@@ -4185,12 +4222,16 @@ async fn handle_h3_request(
                 .await?;
                 return Ok(());
             };
+            let upload_bound = h3_early_upload_bound(
+                &ctx,
+                &plugin_cache_view,
+                true,
+                http_flavor,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            );
             let body_data = match collect_h3_request_body_under_authorization(
                 drain_h3_request_body(&mut stream, upload, &mut retained_request_charge),
-                h3_upload_authorization_bound(
-                    &ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                ),
+                upload_bound,
                 proxy.backend_read_timeout_ms,
             )
             .await
@@ -4230,6 +4271,7 @@ async fn handle_h3_request(
                         "grpc_deadline_upload_before_authorize",
                         plugin_execution_ns,
                         authorization_expiry,
+                        upload_bound.route_wins(),
                     )
                     .await?;
                     return Ok(());
@@ -4309,6 +4351,10 @@ async fn handle_h3_request(
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
                     crate::diagnostic_ref::note_rejecting_plugin(&ctx, plugin.as_ref());
+                    // A completed early body and its request-buffer charge are
+                    // released before the rejection hooks run (#6008, #6009).
+                    drop(prebuffered_body_data.take());
+                    drop(retained_request_charge.take());
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
                         run_h3_reject_response_committed_hooks(
@@ -4468,12 +4514,16 @@ async fn handle_h3_request(
             .await?;
             return Ok(());
         };
+        let upload_bound = h3_early_upload_bound(
+            &ctx,
+            &plugin_cache_view,
+            true,
+            http_flavor,
+            state.env_config.authenticated_stream_max_lifetime_seconds,
+        );
         let body_data = match collect_h3_request_body_under_authorization(
             drain_h3_request_body(&mut stream, upload, &mut retained_request_charge),
-            h3_upload_authorization_bound(
-                &ctx,
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            ),
+            upload_bound,
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -4513,6 +4563,7 @@ async fn handle_h3_request(
                     "grpc_deadline_upload_before_before_proxy",
                     plugin_execution_ns,
                     authorization_expiry,
+                    upload_bound.route_wins(),
                 )
                 .await?;
                 return Ok(());
@@ -5798,6 +5849,7 @@ async fn handle_h3_request(
                         "grpc_deadline_terminal_h3_upload",
                         plugin_execution_ns,
                         authorization_expiry,
+                        false,
                     )
                     .await?;
                     return Ok(());
@@ -6329,6 +6381,7 @@ async fn handle_h3_request(
                         "grpc_deadline_upload_before_dispatch",
                         plugin_execution_ns,
                         authorization_expiry,
+                        false,
                     )
                     .await?;
                     return Ok(());
@@ -7134,6 +7187,7 @@ async fn handle_h3_request(
                                 "grpc_deadline_upload_before_cross_protocol_dispatch",
                                 plugin_execution_ns,
                                 authorization_expiry,
+                                false,
                             )
                             .await?;
                             return Ok(());
@@ -8841,6 +8895,7 @@ async fn handle_h3_request(
                     "grpc_deadline_buffered_h3_upload",
                     plugin_execution_ns,
                     authorization_expiry,
+                    false,
                 )
                 .await?;
                 return Ok(());
@@ -18254,9 +18309,14 @@ async fn finalize_h3_upload_deadline_rejection(
     // point, so the terminal is the fixed redacted `401` / gRPC `UNAUTHENTICATED`
     // contract instead of the deadline one.
     authorization_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
+    // The previewed route total owned the early drain's composed bound (issue
+    // #6008). Captured at composition, because the rule is not armed on `ctx`
+    // until `before_proxy` selects it.
+    early_route_won: bool,
 ) -> Result<(), anyhow::Error> {
     let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(ctx);
-    let route_timeout = authorization_termination.is_none() && route.total_elapsed();
+    let route_timeout =
+        authorization_termination.is_none() && (early_route_won || route.total_elapsed());
     let (rejection_phase, canonical_result) = match authorization_termination {
         // A plain request's matched route rule's total deadline (#5646) expired
         // while the gateway was still buffering the client upload: proxy core's

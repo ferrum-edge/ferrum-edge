@@ -71,6 +71,8 @@ pub(crate) mod charged_decode;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
+#[doc(hidden)]
+pub mod early_route_total;
 pub mod fault_injection;
 pub mod geo_restriction;
 pub mod graphql;
@@ -10801,6 +10803,22 @@ pub trait Plugin: Send + Sync {
     /// The default is a no-op; `mesh_route_dispatch` uses this to preserve
     /// standalone behavior while coordinating multiple cached instances.
     fn enable_deferred_unmatched_rejection(&self) {}
+
+    /// Pure preview of the route total deadline this instance would publish
+    /// in `before_proxy`, for the body collectors that run before it (issue
+    /// #6008). Never runs a hook or mutates the request. `None` (the default)
+    /// means the instance cannot be previewed; a `mesh_route_dispatch` step
+    /// that answers `None` disables the early route bound for the request.
+    #[doc(hidden)]
+    fn early_route_total<'a>(
+        &'a self,
+        _ctx: &'a RequestContext,
+        _host: Option<&'a str>,
+        _query: Option<&utils::query::CanonicalQuery>,
+        _facts: early_route_total::EarlyRouteTotalFacts,
+    ) -> Option<early_route_total::EarlyRouteTotalStep<'a>> {
+        None
+    }
 
     /// Returns `true` if this plugin participates in target-aware backend
     /// admission after load balancing and before backend dispatch.

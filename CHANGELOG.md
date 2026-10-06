@@ -22,6 +22,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   health-neutral). Cancellation, `413`, disconnect and timeouts release the
   charge exactly once; a completed body stays charged until its owner and
   every retry copy are done.
+- **Route total deadlines now bound body collection that runs before
+  `before_proxy`** (partially addresses #6008). A body a plugin needs before
+  authentication, authorization or `before_proxy` (SOAP WS-Security,
+  `hmac_auth`, `waf`) was bounded only by `backend_read_timeout_ms` and any
+  client RPC deadline, because the `mesh_route_dispatch` / HTTPRoute
+  `timeouts.request` total is armed after `before_proxy` selects the rule.
+  An unauthenticated client could trickle such a body past the route budget,
+  or indefinitely with `backend_read_timeout_ms: 0`. HTTP/1.1, HTTP/2 and
+  native HTTP/3 now preview the rule with the request's pinned compiled
+  matchers (no hook runs, nothing is armed) and bound the collect at the
+  receipt-anchored total. An elapsed budget refuses before a ready body is
+  polled. Expiry is the existing health-neutral route timeout (`504`
+  `{"error":"Request timeout"}`, logged `before_dispatch`); gRPC folds it into
+  `DEADLINE_EXCEEDED`. When the rule cannot be decided before authentication
+  (an earlier plugin may still rewrite an input it matches on, or an
+  identity-dependent trigger), the bound is the largest total among the rules
+  that could still be selected. If any of those is untimed, the read/RPC
+  bounds apply as before; set a finite `backend_read_timeout_ms` on such
+  routes. A completed early body and its buffer charge are released before
+  authentication or authorization rejection hooks run.
 
 ## [0.9.12] - Unreleased
 

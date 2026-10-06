@@ -9240,6 +9240,30 @@ head is never charged: the backend has answered, and the total budget ends a
 long healthy download or a slow-reading client exactly as it ends a slow
 backend, so deferred accounting treats it like an expired client RPC deadline.
 
+**Bodies collected before `before_proxy` (issue #6008).** A body a plugin
+needs before `authenticate`, `authorize`, or `before_proxy` (SOAP WS-Security,
+`hmac_auth`, `waf`) is collected before this rule is selected. Each such
+collector previews the selection with the same compiled matchers from the
+request's pinned plugin-cache generation. No hook runs, no override is
+published, and no gRPC attempt clock starts. The collect is bounded by the
+receipt-anchored total alongside `backend_read_timeout_ms` and any client RPC
+deadline. An RPC deadline wins a tie with it, and it wins a tie with the read
+timeout. An already-elapsed total refuses before a ready body is polled. Expiry
+is the `before_dispatch` `504` above, and gRPC folds the total into
+`DEADLINE_EXCEEDED`. Selection may not be decidable that early:
+
+- A rule that matches on an input an earlier plugin in the chain may still
+  rewrite (headers or Host, query, path or destination), or on a gateway-owned
+  identity header (`x-consumer-*`, `x-geo-country`), is a candidate rather than
+  a decision. So is an instance whose trigger reads an identity that is not yet
+  established, and an instance an earlier routing plugin may claim the request
+  away from.
+- The early bound is then the **largest** total among the rules that could
+  still be selected. A redirect or an unmatched `404` arms no total and adds no
+  candidate. If any candidate is untimed (including "no rule matches"), there is
+  no early route bound and only `backend_read_timeout_ms` and the RPC deadline
+  apply. Set a finite `backend_read_timeout_ms` on such routes.
+
 Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
 not bounded by `request_timeout_ms`. Gateway-local plugin hooks are not
 cancelled mid-hook on a non-gRPC request: their time counts against the budget,

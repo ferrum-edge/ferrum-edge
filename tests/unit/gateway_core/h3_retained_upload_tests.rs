@@ -29,8 +29,7 @@ fn a_zero_limit_is_admitted_at_the_finite_fallback_before_any_byte() {
     let upload = H3RetainedUploadProbe::admit(&budget, 0).expect("admitted");
     assert_eq!(upload.collected_len(), 0);
     assert_eq!(
-        upload.reserved_bytes(),
-        2 * UNIT,
+        upload.reserved_bytes(), 2 * UNIT,
         "a `0` limit must charge the finite fallback ceiling, not run unbounded"
     );
     assert_eq!(budget.available_bytes(), total - 2 * UNIT);
@@ -50,8 +49,7 @@ fn a_zero_limit_upload_is_refused_past_the_fallback_ceiling() {
     );
     drop(upload);
     assert_eq!(
-        budget.available_bytes(),
-        total,
+        budget.available_bytes(), total,
         "the 413 releases exactly once"
     );
 }
@@ -114,8 +112,7 @@ fn a_finished_body_keeps_only_its_resident_charge_until_the_owner_drops() {
     let (body, permit) = upload.finish();
     assert_eq!(body, b"small soap envelope");
     assert_eq!(
-        permit.reserved_bytes(),
-        UNIT,
+        permit.reserved_bytes(), UNIT,
         "a small body must not hold a ceiling-sized claim for the whole request"
     );
     assert_eq!(budget.available_bytes(), total - UNIT);
@@ -163,8 +160,7 @@ async fn a_drain_cancelled_by_its_bound_releases_admission_before_the_wait_retur
     .await;
     assert_eq!(outcome, H3UploadWaitOutcomeForTest::DeadlineExceeded);
     assert_eq!(
-        budget.available_bytes(),
-        total,
+        budget.available_bytes(), total,
         "the cancelled drain must release its partial buffer and admission before any \
          rejection hook can run"
     );
@@ -207,13 +203,11 @@ fn every_native_h3_drain_site_admits_before_it_drains() {
         "all seven native-H3 drain sites must drain an admitted upload into the handler charge"
     );
     assert_eq!(
-        server.matches("H3RetainedUpload::admit(").count(),
-        7,
+        server.matches("H3RetainedUpload::admit(").count(), 7,
         "each native-H3 drain site must take admission before its drain"
     );
     assert_eq!(
-        bridge.matches("H3RetainedUpload::admit(").count(),
-        2,
+        bridge.matches("H3RetainedUpload::admit(").count(), 2,
         "both H3 bridge drains must take admission before draining"
     );
     assert!(
