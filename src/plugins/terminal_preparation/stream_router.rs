@@ -255,11 +255,15 @@ impl StreamRouterTerminalDecision {
             .unwrap_or(0);
         // The canonical metadata patch and response repair can coexist. Admit
         // both native backings before allocating either patch or copying fields.
-        let required = frame.checked_add(encoding_bytes).ok_or_else(|| {
-            capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0)
-        })?;
+        let required = frame
+            .checked_add(encoding_bytes)
+            .ok_or_else(|| capacity_error(TerminalRefusal::ArithmeticOverflow, usize::MAX, 0))?;
         let allowance = output.output_limit.checked_sub(required).ok_or_else(|| {
-            capacity_error(TerminalRefusal::PatchCapacity, required, output.output_limit)
+            capacity_error(
+                TerminalRefusal::PatchCapacity,
+                required,
+                output.output_limit,
+            )
         })?;
         output.fields = Some(repair_patch(
             selected,
@@ -284,7 +288,9 @@ fn classify_encoding(
     if values.next().is_some() {
         return Err(Reason::AmbiguousDuplicateFieldLines);
     }
-    let raw = std::str::from_utf8(raw).map_err(|_| Reason::MalformedList)?.trim();
+    let raw = std::str::from_utf8(raw)
+        .map_err(|_| Reason::MalformedList)?
+        .trim();
     if raw.is_empty() {
         return Ok(None);
     }
@@ -374,9 +380,8 @@ fn repair_patch(
                 // Ordinary scrub only treats a complete field value as '*'.
                 wildcard |= value.trim() == "*";
             } else {
-                already_sse |= crate::plugins::utils::body_transform::is_event_stream_content_type(
-                    value,
-                );
+                already_sse |=
+                    crate::plugins::utils::body_transform::is_event_stream_content_type(value);
             }
         }
     }
@@ -398,7 +403,11 @@ fn repair_patch(
     for name in ["content-encoding", "content-length"]
         .into_iter()
         .chain(TRANSFORM_INVALIDATED_RESPONSE_HEADERS.iter().copied())
-        .chain(TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES.iter().copied())
+        .chain(
+            TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES
+                .iter()
+                .copied(),
+        )
         .chain(vary_present.then_some("vary"))
         .chain((!already_sse).then_some("content-type"))
     {
@@ -472,16 +481,14 @@ impl PreparedTerminalChain {
             return Err(capacity_error(TerminalRefusal::PinnedGeneration, 0, 0));
         }
         if let Some(coding) = &output.encoding {
-            let fields = output.fields.as_ref().map_or(0, |fields| fields.owned_bytes);
+            let fields = output
+                .fields
+                .as_ref()
+                .map_or(0, |fields| fields.owned_bytes);
             let remaining = output
                 .output_limit
                 .saturating_sub(fields + std::mem::size_of::<StreamRouterTerminalOutput>());
-            let mut metadata = TerminalPatch::new(
-                1,
-                remaining,
-                &output.ticket,
-                output.instance,
-            )?;
+            let mut metadata = TerminalPatch::new(1, remaining, &output.ticket, output.instance)?;
             metadata.set_metadata(META_PROVIDER_ENCODING, coding.as_str())?;
             apply_terminal_metadata(metadata, ctx)?;
         }

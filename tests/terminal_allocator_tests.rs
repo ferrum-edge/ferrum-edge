@@ -1893,8 +1893,10 @@ mod qualified {
         let mut ctx = context();
         ctx.metadata
             .insert("ai_stream_router_claimed".into(), "true".into());
-        ctx.metadata
-            .insert("ai_stream_router.provider".into(), "same-provider-name".into());
+        ctx.metadata.insert(
+            "ai_stream_router.provider".into(),
+            "same-provider-name".into(),
+        );
         manifest.pin(&mut ctx).unwrap();
         let mut chain = PreparedTerminalChain::prepare(&plugins, &mut ctx, true, false).unwrap();
         let mut selected = chain.new_selected_carrier().unwrap();
@@ -1990,13 +1992,9 @@ mod qualified {
             let mut ctx = context();
             ctx.method = if matched { "GET" } else { "POST" }.into();
             pin(&triggered_view.plugins(), &mut ctx);
-            let mut chain = PreparedTerminalChain::prepare(
-                &triggered_view.plugins(),
-                &mut ctx,
-                true,
-                false,
-            )
-            .unwrap();
+            let mut chain =
+                PreparedTerminalChain::prepare(&triggered_view.plugins(), &mut ctx, true, false)
+                    .unwrap();
             assert_eq!(
                 matches!(
                     chain.next_operation().unwrap().execute(),
@@ -2042,7 +2040,10 @@ mod qualified {
         assert_eq!(status, 200);
         assert_eq!(body.as_ref(), b"selected terminal");
         assert_eq!(headers, original);
-        assert!(!ctx.metadata.contains_key("ai_stream_router.provider_content_encoding"));
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_stream_router.provider_content_encoding")
+        );
         assert_eq!(
             PreparedTerminalChain::prepare(&plugins, &mut ctx, false, false)
                 .unwrap_err()
@@ -2137,7 +2138,10 @@ mod qualified {
         assert_eq!(allocated.get(), before);
         assert_eq!(chain.allocated_backing_bytes(), backing);
         assert_eq!(selected.field_count(), 3);
-        assert!(!ctx.metadata.contains_key("ai_stream_router.provider_content_encoding"));
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_stream_router.provider_content_encoding")
+        );
         drop(selected);
         drop(chain);
         drop(ctx);
