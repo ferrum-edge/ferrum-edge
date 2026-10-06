@@ -62,6 +62,7 @@ mod functional_h1_h2_auth_lifetime_test;
 mod functional_h2_response_trailers_test;
 mod functional_h3_auth_lifetime_test;
 mod functional_h3_authority_validation_test;
+mod functional_h3_drain_refusal_hooks_test;
 mod functional_h3_early_data_classification_test;
 mod functional_h3_grpc_streaming_test;
 mod functional_h3_grpc_web_test;

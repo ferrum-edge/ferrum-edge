@@ -2577,7 +2577,12 @@ impl Http3ConnectionPool {
     /// double-execute a possibly non-idempotent request and bypass the gateway's
     /// `retry_on_methods` policy. The gateway's own retry layer then decides
     /// whether the request (if idempotent) may be retried.
-    pub async fn request<TlsFut>(
+    ///
+    /// No authorization lifetime bounds this path, so it is crate-private:
+    /// production dispatch buffers through the `_under_authorization`
+    /// streaming entry points, and the pool's shard and admission tests reach
+    /// it through `_test_support` (issue #6022).
+    pub(crate) async fn request<TlsFut>(
         &self,
         proxy: &Proxy,
         method: &str,
@@ -2760,8 +2765,10 @@ impl Http3ConnectionPool {
     ///
     /// Pool entries are keyed by the explicit target host:port so connections
     /// are cached and reused per target, not per proxy.
+    ///
+    /// Crate-private for the same reason as `request()` (issue #6022).
     #[allow(clippy::too_many_arguments)]
-    pub async fn request_with_target<TlsFut>(
+    pub(crate) async fn request_with_target<TlsFut>(
         &self,
         proxy: &Proxy,
         target_host: &str,
@@ -4250,37 +4257,6 @@ impl Http3ConnectionPool {
     /// hyper `Incoming` body, returning headers and a stream handle for the
     /// response body.
     #[allow(clippy::too_many_arguments)]
-    pub async fn request_streaming_incoming_body<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        frontend_body: Incoming,
-        max_request_body_size: usize,
-        bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_streaming_incoming_body_inner(
-            proxy,
-            method,
-            backend_url,
-            headers,
-            frontend_body,
-            max_request_body_size,
-            bytes_seen,
-            grpc_messages,
-            H3Authorization::new(None, None),
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_streaming_incoming_body_under_authorization<TlsFut>(
         &self,
         proxy: &Proxy,
@@ -4587,48 +4563,6 @@ impl Http3ConnectionPool {
     /// Send an HTTP/3 request with a streaming `Incoming` request body to an
     /// explicit host/port target.
     #[allow(clippy::too_many_arguments)]
-    pub async fn request_with_target_streaming_incoming_body<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        // DestinationRule policy port for this dispatch — the selected target's
-        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
-        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
-        // for `connectionPool.tcp.maxConnections` admission; the dial address,
-        // TLS/SNI and the pool key all stay on `target_host:target_port`.
-        target_policy_port: u16,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        frontend_body: Incoming,
-        max_request_body_size: usize,
-        bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_with_target_streaming_incoming_body_inner(
-            proxy,
-            target_host,
-            target_port,
-            target_policy_port,
-            method,
-            backend_url,
-            headers,
-            frontend_body,
-            max_request_body_size,
-            bytes_seen,
-            grpc_messages,
-            H3Authorization::new(None, None),
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_with_target_streaming_incoming_body_under_authorization<TlsFut>(
         &self,
         proxy: &Proxy,
@@ -4811,30 +4745,6 @@ impl Http3ConnectionPool {
 
     /// Send an HTTP/3 request, returning headers and a stream handle for the
     /// response body. Same pool key / fallback / reconnect logic as `request()`.
-    pub async fn request_streaming<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        body: bytes::Bytes,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_streaming_inner(
-            proxy,
-            method,
-            backend_url,
-            headers,
-            body,
-            H3Authorization::new(None, None),
-            tls_config_fn,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_streaming_under_authorization<TlsFut>(
         &self,
@@ -5033,42 +4943,6 @@ impl Http3ConnectionPool {
 
     /// Send an HTTP/3 request to an explicit host/port target, returning headers
     /// and a stream handle for the response body.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn request_with_target_streaming<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        // DestinationRule policy port for this dispatch — the selected target's
-        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
-        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
-        // for `connectionPool.tcp.maxConnections` admission; the dial address,
-        // TLS/SNI and the pool key all stay on `target_host:target_port`.
-        target_policy_port: u16,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        body: bytes::Bytes,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_with_target_streaming_inner(
-            proxy,
-            target_host,
-            target_port,
-            target_policy_port,
-            method,
-            backend_url,
-            headers,
-            body,
-            H3Authorization::new(None, None),
-            tls_config_fn,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_with_target_streaming_under_authorization<TlsFut>(
         &self,

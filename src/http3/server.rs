@@ -17568,8 +17568,8 @@ async fn proxy_to_backend_h3_streaming(
         bytes_streamed,
         client_disconnected,
         body_error_class,
-        // Reached this point only after `request_streaming` returned
-        // `Ok(_)`, which means the H3 pool committed the request and
+        // Reached this point only after `request_streaming_under_authorization`
+        // returned `Ok(_)`, which means the H3 pool committed the request and
         // produced response headers. Mid-stream aborts are post-wire
         // by construction — we already have headers from the backend.
         request_on_wire: true,
