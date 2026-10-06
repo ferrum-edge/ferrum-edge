@@ -68,6 +68,7 @@ use crate::config::types::{
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::diagnostic_ref::DIAGNOSTICS_READ_SCOPE;
+use crate::grpc::backend_egress_attestation::{DataPlaneEgressSummary, attestation_label};
 use crate::grpc::cp_server::DpNodeRegistry;
 use crate::grpc::dp_client::DpCpConnectionState;
 use crate::grpc::mesh_registry::MeshNodeRegistry;
@@ -12536,6 +12537,7 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
             let data_plane_details: Vec<serde_json::Value> = data_planes
                 .iter()
                 .map(|n| {
+                    let egress_attestation = attestation_label(n.backend_egress_policy.as_ref());
                     json!({
                         "node_id": n.node_id,
                         "version": n.version,
@@ -12543,9 +12545,16 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                         "status": "online",
                         "connected_at": n.connected_at.to_rfc3339(),
                         "last_sync_at": n.last_update_at.to_rfc3339(),
+                        "backend_egress_policy_attestation": egress_attestation,
+                        "backend_egress_policy": n.backend_egress_policy,
                     })
                 })
                 .collect();
+            // Cluster-wide aggregate; `GET /backend-egress-policy` scopes the
+            // same aggregate to one authorized namespace.
+            let backend_egress_summary = DataPlaneEgressSummary::from_reports(
+                data_planes.iter().map(|n| n.backend_egress_policy),
+            );
             let mesh_nodes = state
                 .mesh_registry
                 .as_ref()
@@ -12571,6 +12580,7 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                     "mode": "cp",
                     "connected_data_planes": data_planes.len(),
                     "data_planes": data_plane_details,
+                    "data_plane_backend_egress_policy": backend_egress_summary,
                     "connected_mesh_nodes": mesh_nodes.len(),
                     "mesh_nodes": mesh_node_details,
                 }),

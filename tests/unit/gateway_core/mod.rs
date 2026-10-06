@@ -8,6 +8,7 @@ mod backend_capability_commit_tests;
 mod backend_capability_probe_merge_tests;
 mod backend_capability_refresh_coalescer_tests;
 mod backend_dispatch_tests;
+mod backend_egress_attestation_tests;
 mod backend_handoff_auth_lifetime_tests;
 mod backend_pending_limit_scope_tests;
 mod backend_reqwest_no_proxy_tests;

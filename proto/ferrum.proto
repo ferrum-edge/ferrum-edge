@@ -39,6 +39,33 @@ message SubscribeRequest {
   // must run the same build: the CP refuses Subscribe with FAILED_PRECONDITION
   // unless this equals its own identity exactly.
   string config_sync_build = 6;
+  // Bounded metadata about the DP's loaded backend egress (SSRF) policy
+  // (issue #6020). The CP records it against this connected node and exposes
+  // it through GET /backend-egress-policy and GET /cluster. It carries the
+  // mode and override-presence flags only, never CIDRs, addresses, counts, or
+  // raw settings. An absent report, or one with an UNSPECIFIED/unrecognised
+  // mode, is recorded as unknown and never counts as public-only.
+  BackendEgressPolicyReport backend_egress_policy = 7;
+}
+
+// Closed backend address mode vocabulary (FERRUM_BACKEND_ALLOW_IPS). The
+// classification is `ferrum-private-reserved-v1`; CP and DP run the same build,
+// so both sides share one classifier.
+enum BackendEgressMode {
+  // No mode reported. The CP records the DP's policy as unknown.
+  BACKEND_EGRESS_MODE_UNSPECIFIED = 0;
+  BACKEND_EGRESS_MODE_BOTH = 1;
+  BACKEND_EGRESS_MODE_PUBLIC = 2;
+  BACKEND_EGRESS_MODE_PRIVATE = 3;
+}
+
+// DP-reported backend egress policy metadata. Mirrors the presence-only fields
+// of GET /backend-egress-policy; CIDR lists and their sizes are withheld.
+message BackendEgressPolicyReport {
+  BackendEgressMode mode = 1;
+  bool dangerous_ranges_blocked = 2;
+  bool allow_cidr_overrides_present = 3;
+  bool deny_cidr_overrides_present = 4;
 }
 
 message FullConfigRequest {

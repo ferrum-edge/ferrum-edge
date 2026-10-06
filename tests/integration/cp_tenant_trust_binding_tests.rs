@@ -439,6 +439,7 @@ fn subscribe_request(node_id: &str, namespace: &str) -> ferrum_edge::grpc::proto
         config_sync_build: config_sync_build_identity().to_string(),
         namespace: namespace.to_string(),
         real_ip_header: Some(String::new()),
+        backend_egress_policy: None,
     }
 }
 

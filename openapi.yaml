@@ -2370,6 +2370,12 @@ paths:
         Mesh nodes. Each entry includes `node_id`, `version`, `namespace`,
         `status`, `connected_at`, and `last_sync_at`. Disconnected nodes
         are automatically removed from their respective registries.
+        Data Plane entries also carry the backend egress policy metadata the
+        DP reported on ConfigSync Subscribe (`backend_egress_policy_attestation`
+        and `backend_egress_policy`, presence flags only), and
+        `data_plane_backend_egress_policy` aggregates every connected DP
+        across namespaces. See `GET /backend-egress-policy` for the
+        namespace-scoped attestation.
 
         **DP mode**: Shows the connection to the Control Plane — `url`,
         `status` (online/offline), `is_primary` (primary vs fallback CP),
@@ -2405,12 +2411,37 @@ paths:
                         status: online
                         connected_at: "2025-01-15T10:30:00Z"
                         last_sync_at: "2025-01-15T10:35:00Z"
+                        backend_egress_policy_attestation: reported
+                        backend_egress_policy:
+                          mode: public
+                          mode_allowed_ip_classes: [public]
+                          mode_blocked_ip_classes: [private-reserved]
+                          dangerous_ranges_blocked: true
+                          allow_cidr_overrides_present: false
+                          deny_cidr_overrides_present: false
+                          public_only_guaranteed: true
                       - node_id: "def-456"
                         version: "0.9.0"
                         namespace: staging
                         status: online
                         connected_at: "2025-01-15T10:31:00Z"
                         last_sync_at: "2025-01-15T10:35:00Z"
+                        backend_egress_policy_attestation: unknown
+                        backend_egress_policy: null
+                    data_plane_backend_egress_policy:
+                      connected_data_planes: 2
+                      reporting_data_planes: 1
+                      unknown_data_planes: 1
+                      weakest_policy:
+                        mode: public
+                        mode_allowed_ip_classes: [public]
+                        mode_blocked_ip_classes: [private-reserved]
+                        dangerous_ranges_blocked: true
+                        allow_cidr_overrides_present: false
+                        deny_cidr_overrides_present: false
+                        public_only_guaranteed: true
+                      weakest_policy_complete: false
+                      all_connected_public_only_guaranteed: false
                     connected_mesh_nodes: 1
                     mesh_nodes:
                       - node_id: "mesh-789"
@@ -2471,8 +2502,20 @@ paths:
 
         The policy is process-wide. enforcement_scope distinguishes a local
         data plane serving the selected namespace from an unserved namespace,
-        CP admission-only policy, or a process without a data plane. CP metadata
-        does not attest its DPs: check every serving gateway independently.
+        CP admission-only policy, or a process without a data plane. The CP's
+        own top-level fields never attest its DPs.
+
+        On a CP (enforcement_scope=admission-only) the response additionally
+        carries data_plane_attestation: the policies that the DPs currently
+        connected for the selected namespace self-reported on ConfigSync
+        Subscribe, a field-wise weakest policy over them, and
+        all_connected_public_only_guaranteed. A DP that sent no recognised
+        report is unknown and makes weakest_policy_complete and
+        all_connected_public_only_guaranteed false; so does an empty set.
+        Disconnected DPs that still serve cached config are not listed, so
+        compare connected_data_planes against the expected DP inventory.
+        The object is additive within schema_version 2 and is absent on
+        non-CP responses.
 
         Mode class lists describe the last evaluation stage, not unconditional
         effective permissions: allow CIDRs override deny CIDRs, the dangerous
@@ -2520,6 +2563,69 @@ paths:
                     deny_cidr_overrides_present: false
                     evaluation_order: [allow-cidrs, deny-cidrs, dangerous-ranges, ip-mode]
                     public_only_guaranteed: false
+                    data_plane_attestation:
+                      source: configsync-subscribe
+                      connected_data_planes: 0
+                      reporting_data_planes: 0
+                      unknown_data_planes: 0
+                      weakest_policy: null
+                      weakest_policy_complete: false
+                      all_connected_public_only_guaranteed: false
+                      data_planes: []
+                controlPlaneAttestingPublicOnlyDataPlanes:
+                  summary: CP whose two connected DPs both report public-only
+                  value:
+                    schema_version: 2
+                    ip_classification: ferrum-private-reserved-v1
+                    namespace: ferrum
+                    policy_scope: process
+                    enforcement_scope: admission-only
+                    mode: both
+                    mode_allowed_ip_classes: [public, private-reserved]
+                    mode_blocked_ip_classes: []
+                    dangerous_ranges_blocked: true
+                    allow_cidr_overrides_present: false
+                    deny_cidr_overrides_present: false
+                    evaluation_order: [allow-cidrs, deny-cidrs, dangerous-ranges, ip-mode]
+                    public_only_guaranteed: false
+                    data_plane_attestation:
+                      source: configsync-subscribe
+                      connected_data_planes: 2
+                      reporting_data_planes: 2
+                      unknown_data_planes: 0
+                      weakest_policy:
+                        mode: public
+                        mode_allowed_ip_classes: [public]
+                        mode_blocked_ip_classes: [private-reserved]
+                        dangerous_ranges_blocked: true
+                        allow_cidr_overrides_present: false
+                        deny_cidr_overrides_present: false
+                        public_only_guaranteed: true
+                      weakest_policy_complete: true
+                      all_connected_public_only_guaranteed: true
+                      data_planes:
+                        - node_id: dp-a
+                          connected_at: "2026-10-06T12:00:00+00:00"
+                          attestation: reported
+                          policy:
+                            mode: public
+                            mode_allowed_ip_classes: [public]
+                            mode_blocked_ip_classes: [private-reserved]
+                            dangerous_ranges_blocked: true
+                            allow_cidr_overrides_present: false
+                            deny_cidr_overrides_present: true
+                            public_only_guaranteed: true
+                        - node_id: dp-b
+                          connected_at: "2026-10-06T12:00:05+00:00"
+                          attestation: reported
+                          policy:
+                            mode: public
+                            mode_allowed_ip_classes: [public]
+                            mode_blocked_ip_classes: [private-reserved]
+                            dangerous_ranges_blocked: true
+                            allow_cidr_overrides_present: false
+                            deny_cidr_overrides_present: false
+                            public_only_guaranteed: true
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -39145,18 +39251,32 @@ components:
 
     ClusterStatusCp:
       type: object
-      required: [mode, connected_data_planes, data_planes, connected_mesh_nodes, mesh_nodes]
+      required:
+        - mode
+        - connected_data_planes
+        - data_planes
+        - data_plane_backend_egress_policy
+        - connected_mesh_nodes
+        - mesh_nodes
       properties:
         mode:
           type: string
           enum: [cp]
         connected_data_planes:
           type: integer
-          description: Number of currently connected Data Plane nodes
+          description: |
+            Number of live Data Plane ConfigSync Subscribe streams. Each stream
+            is counted, including several that share one node_id.
         data_planes:
           type: array
+          description: One entry per live Data Plane Subscribe stream
           items:
             $ref: "#/components/schemas/ConnectedDpNode"
+        data_plane_backend_egress_policy:
+          description: Aggregate over every live Data Plane stream, all namespaces
+          allOf:
+            - $ref: "#/components/schemas/DataPlaneEgressSummary"
+          unevaluatedProperties: false
         connected_mesh_nodes:
           type: integer
           description: Number of currently connected Mesh nodes
@@ -39332,7 +39452,15 @@ components:
 
     ConnectedDpNode:
       type: object
-      required: [node_id, version, namespace, status, connected_at, last_sync_at]
+      required:
+        - node_id
+        - version
+        - namespace
+        - status
+        - connected_at
+        - last_sync_at
+        - backend_egress_policy_attestation
+        - backend_egress_policy
       properties:
         node_id:
           type: string
@@ -39355,6 +39483,13 @@ components:
           type: string
           format: date-time
           description: When the last config update was broadcast to this DP
+        backend_egress_policy_attestation:
+          $ref: "#/components/schemas/DataPlaneEgressAttestationStatus"
+        backend_egress_policy:
+          oneOf:
+            - $ref: "#/components/schemas/DataPlaneEgressPolicy"
+            - type: "null"
+          description: Policy the DP reported on Subscribe; null when unknown
 
     ClusterStatusDp:
       type: object
@@ -39537,6 +39672,157 @@ components:
             nothing for the selected namespace. Deny overrides only restrict.
             False is conservative: even a wholly public allow list prevents
             certification, since CIDRs are withheld.
+        data_plane_attestation:
+          $ref: "#/components/schemas/DataPlaneEgressAttestation"
+
+    DataPlaneEgressAttestation:
+      description: |
+        CP-only (enforcement_scope=admission-only), additive within
+        schema_version 2 and absent on other responses. Lists every live
+        ConfigSync Subscribe stream for the selected namespace with the backend
+        egress policy metadata it self-reported. Streams are keyed per stream,
+        so several streams sharing a node_id are each listed and counted, and
+        another namespace's streams never affect this view. Reports come from
+        JWT-authenticated DPs running the CP's exact build; they are not
+        cryptographic host attestation. DPs that are disconnected but still
+        serving cached config are not listed.
+      allOf:
+        - $ref: "#/components/schemas/DataPlaneEgressSummary"
+        - type: object
+          required: [source, data_planes]
+          properties:
+            source:
+              type: string
+              enum: [configsync-subscribe]
+              description: Reports arrive on ConfigSync Subscribe
+            data_planes:
+              type: array
+              description: |
+                Live streams for the selected namespace, sorted by node_id then
+                connected_at
+              items:
+                $ref: "#/components/schemas/DataPlaneEgressEntry"
+      unevaluatedProperties: false
+
+    DataPlaneEgressSummary:
+      type: object
+      required:
+        - connected_data_planes
+        - reporting_data_planes
+        - unknown_data_planes
+        - weakest_policy
+        - weakest_policy_complete
+        - all_connected_public_only_guaranteed
+      properties:
+        connected_data_planes:
+          type: integer
+          minimum: 0
+          description: |
+            Live ConfigSync Subscribe streams in this set, one per stream rather
+            than per distinct node_id
+        reporting_data_planes:
+          type: integer
+          minimum: 0
+          description: Connected DPs that sent a recognised egress policy report
+        unknown_data_planes:
+          type: integer
+          minimum: 0
+          description: Connected DPs whose egress policy is unknown
+        weakest_policy:
+          oneOf:
+            - $ref: "#/components/schemas/DataPlaneEgressPolicy"
+            - type: "null"
+          description: |
+            Field-wise least restrictive combination of the reporting DPs'
+            policies: the mode admitting the union of their mode-stage classes,
+            dangerous_ranges_blocked only if every one blocks, allow overrides if
+            any has them, deny overrides only if every one has them. Null when no
+            DP reported. It omits unknown DPs; see weakest_policy_complete.
+        weakest_policy_complete:
+          type: boolean
+          description: |
+            True only when at least one DP is connected and every connected DP
+            reported, so weakest_policy covers the whole set.
+        all_connected_public_only_guaranteed:
+          type: boolean
+          description: |
+            True only when weakest_policy_complete and every connected DP
+            reports public_only_guaranteed. False for an empty set or any
+            unknown DP. Covers only DPs connected at the time of the read.
+
+    DataPlaneEgressEntry:
+      type: object
+      additionalProperties: false
+      description: |
+        One live Subscribe stream. No build version is included: the ConfigSync
+        build gate pins it to the CP's own build, and GET /cluster reports it.
+      required: [node_id, connected_at, attestation, policy]
+      properties:
+        node_id:
+          type: string
+          description: Authenticated ConfigSync node identity
+        connected_at:
+          type: string
+          format: date-time
+          description: When the DP's Subscribe stream was established
+        attestation:
+          $ref: "#/components/schemas/DataPlaneEgressAttestationStatus"
+        policy:
+          oneOf:
+            - $ref: "#/components/schemas/DataPlaneEgressPolicy"
+            - type: "null"
+          description: Policy the DP reported; null when unknown
+
+    DataPlaneEgressAttestationStatus:
+      type: string
+      enum: [reported, unknown]
+      description: |
+        reported means the DP sent a recognised policy report on Subscribe.
+        unknown means it sent none or an unrecognised mode; an unknown DP
+        never counts as public-only.
+
+    DataPlaneEgressPolicy:
+      type: object
+      additionalProperties: false
+      description: |
+        Presence-only backend egress policy metadata a DP reported. Field
+        meanings match the same-named top-level BackendEgressPolicyResponse
+        fields for a local data plane; CIDRs, addresses and counts are withheld.
+      required:
+        - mode
+        - mode_allowed_ip_classes
+        - mode_blocked_ip_classes
+        - dangerous_ranges_blocked
+        - allow_cidr_overrides_present
+        - deny_cidr_overrides_present
+        - public_only_guaranteed
+      properties:
+        mode:
+          type: string
+          enum: [both, public, private]
+        mode_allowed_ip_classes:
+          type: array
+          uniqueItems: true
+          maxItems: 2
+          items:
+            type: string
+            enum: [public, private-reserved]
+        mode_blocked_ip_classes:
+          type: array
+          uniqueItems: true
+          maxItems: 1
+          items:
+            type: string
+            enum: [public, private-reserved]
+        dangerous_ranges_blocked:
+          type: boolean
+        allow_cidr_overrides_present:
+          type: boolean
+        deny_cidr_overrides_present:
+          type: boolean
+        public_only_guaranteed:
+          type: boolean
+          description: True exactly for mode=public with no allow CIDR overrides
 
     # ── Backend Capabilities ─────────────────────────────────────────
     ProtocolSupport:
