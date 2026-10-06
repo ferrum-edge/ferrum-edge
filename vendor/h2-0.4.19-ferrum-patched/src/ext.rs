@@ -53,34 +53,3 @@ impl fmt::Debug for Protocol {
         self.value.fmt(f)
     }
 }
-
-/// FERRUM PATCH 002: an owned client-stream lifetime extension.
-///
-/// Insert into a client request to retain `owner` until h2 releases the active
-/// stream: both halves have closed and queued frames and DATA have drained,
-/// or a reset/connection teardown discards them. Dropping the request body or
-/// a public send handle alone is not completion. Frames accepted by the codec
-/// count as drained, as in h2's concurrent-stream accounting; this does not
-/// promise peer receipt or a socket flush.
-///
-/// The owner's destructor must be cheap, non-blocking, and must not re-enter
-/// h2: normal completion drops it under the existing stream-state lock. Keep
-/// no h2 handles in the owner. Requests without this extension pay no new
-/// allocation, task, or lock. Clones retain the same owner.
-#[derive(Clone)]
-pub struct StreamLifetime {
-    _owner: std::sync::Arc<dyn Send + Sync>,
-}
-
-impl StreamLifetime {
-    /// Retain an owner whose last drop records completion.
-    pub fn new(owner: std::sync::Arc<dyn Send + Sync>) -> Self {
-        Self { _owner: owner }
-    }
-}
-
-impl fmt::Debug for StreamLifetime {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("StreamLifetime").finish_non_exhaustive()
-    }
-}

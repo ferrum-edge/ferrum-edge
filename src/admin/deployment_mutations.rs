@@ -5,11 +5,14 @@ use super::crud::{self, NamespaceConfigAdmissionGuard};
 use super::preconditions;
 use super::{AdminState, json_response};
 use crate::config::db_backend::{
-    DatabaseBackend, DbWriteTopologyPermit, NamespacePreconditionFailed,
+    ApiSpecSnapshotView, ConditionalNamespaceSnapshot, DatabaseBackend, DbWriteTopologyPermit,
+    NamespacePreconditionFailed, NamespaceSnapshotTooLarge, SnapshotDigest,
+    is_namespace_snapshot_too_large,
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, ExternalSpecUpstreamConflict,
 };
+use crate::config::types::ApiSpec;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{HeaderMap, Response, StatusCode};
@@ -19,6 +22,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 const PREFIX: &str = "deployment-v1-";
+
+/// MAC domain for deployment tokens. The `deployment-v1-` wire prefix is kept
+/// so tokens issued before stored content was digested still parse and then
+/// fail closed with `412` instead of being reinterpreted.
+const DEPLOYMENT_SNAPSHOT_TAG_KIND: &str = "deployment_snapshot.v2";
+
+/// Upper bound, in base64 bytes, on `api_spec_contents` in
+/// `GET /deployment-snapshot`: one base64 copy of every stored gzip spec
+/// document and external-reference snapshot, carried outside the digested
+/// evidence. A namespace past it returns `507` without disclosing evidence.
+pub(crate) const MAX_DEPLOYMENT_SNAPSHOT_CONTENT_BASE64_BYTES: usize = 256 * 1024 * 1024;
+
+const SNAPSHOT_CONTENT_TOO_LARGE: &str =
+    "Deployment snapshot stored API-spec content exceeds the 256 MiB response limit";
 
 pub(super) fn requested(query: Option<&str>, headers: &HeaderMap) -> bool {
     url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
@@ -84,16 +101,10 @@ pub(super) fn parse_request(
     Ok(Some(token.to_string()))
 }
 
-fn tag(state: &AdminState, namespace: &str, representation: &Value) -> Option<String> {
+fn tag(state: &AdminState, namespace: &str, digest: &SnapshotDigest) -> Option<String> {
     let key = state.jwt_manager.resource_etag_key()?;
-    let digest = preconditions::resource_etag(
-        &key,
-        "deployment_snapshot.v1",
-        namespace,
-        namespace,
-        representation,
-    );
-    Some(format!("{PREFIX}{digest}"))
+    let tag = preconditions::snapshot_etag(&key, DEPLOYMENT_SNAPSHOT_TAG_KIND, namespace, digest);
+    Some(format!("{PREFIX}{tag}"))
 }
 
 pub(super) fn refusal(message: &'static str) -> Response<Full<Bytes>> {
@@ -116,7 +127,25 @@ pub(super) fn unavailable(durable: &str) -> Response<Full<Bytes>> {
     )
 }
 
+/// `507`: the namespace is too large to fence or return. `durable` is
+/// `not_started` before any mutation transaction opens and `not_committed`
+/// once one was opened and rolled back.
+fn snapshot_too_large(error: &str, durable: &str) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::INSUFFICIENT_STORAGE,
+        &json!({
+            "error": error, "durable": durable, "live": "unconfirmed",
+            "recovery_cleanup_authorized": false,
+        }),
+    )
+}
+
+/// Map a mutation outcome. Every store error reaching here was raised inside
+/// the mutation transaction, which rolled back.
 pub(super) fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if is_namespace_snapshot_too_large(error) {
+        return snapshot_too_large(&NamespaceSnapshotTooLarge.to_string(), "not_committed");
+    }
     let status = if error.chain().any(|e| e.is::<NamespacePreconditionFailed>()) {
         StatusCode::PRECONDITION_FAILED
     } else if error
@@ -144,7 +173,9 @@ pub(super) fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
 }
 
 fn read_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
-    if crate::config::db_backend::atomic_batch_unsupported(error).is_some() {
+    if is_namespace_snapshot_too_large(error) {
+        snapshot_too_large(&NamespaceSnapshotTooLarge.to_string(), "not_started")
+    } else if crate::config::db_backend::atomic_batch_unsupported(error).is_some() {
         store_error(error)
     } else {
         unavailable("not_started")
@@ -157,20 +188,17 @@ pub(super) async fn expected(
     db: &dyn DatabaseBackend,
     namespace: &str,
     original: &str,
-) -> Result<Value, Response<Full<Bytes>>> {
-    let snapshot = db
+) -> Result<SnapshotDigest, Response<Full<Bytes>>> {
+    let digest = db
         .load_deployment_snapshot(namespace)
         .await
+        .and_then(|snapshot| snapshot.digest())
         .map_err(|e| read_error(&e))?;
-    let representation = snapshot
-        .representation()
-        .map_err(|_| unavailable("not_started"))?;
-    let current =
-        tag(state, namespace, &representation).ok_or_else(|| unavailable("not_started"))?;
+    let current = tag(state, namespace, &digest).ok_or_else(|| unavailable("not_started"))?;
     if current != original {
         return Err(store_error(&NamespacePreconditionFailed.into()));
     }
-    Ok(representation)
+    Ok(digest)
 }
 
 pub(super) async fn snapshot(
@@ -186,11 +214,35 @@ pub(super) async fn snapshot(
         Ok(snapshot) => snapshot,
         Err(error) => return read_error(&error),
     };
-    let representation = match snapshot.representation() {
-        Ok(value) => value,
+    // Bound the snapshot before materializing any evidence for the response.
+    let digest = match snapshot.digest() {
+        Ok(digest) => digest,
+        Err(error) => return read_error(&error),
+    };
+    let Some(tag) = tag(state, namespace, &digest) else {
+        return unavailable("not_started");
+    };
+    // Bound the one base64 copy of stored spec content before encoding any.
+    let mut content_len = 0usize;
+    for spec in &snapshot.snapshot.api_specs {
+        let external = spec.external_ref_snapshot.as_ref().map_or(0, Vec::len);
+        content_len = content_len
+            .saturating_add(base64_len(spec.spec_content.len()))
+            .saturating_add(base64_len(external));
+    }
+    if content_len > MAX_DEPLOYMENT_SNAPSHOT_CONTENT_BASE64_BYTES {
+        return snapshot_too_large(SNAPSHOT_CONTENT_TOO_LARGE, "not_started");
+    }
+    // Moves the raw evidence into the response instead of deep-cloning it.
+    let (representation, snapshot) = match snapshot.into_representation() {
+        Ok(parts) => parts,
         Err(_) => return unavailable("not_started"),
     };
-    let Some(tag) = tag(state, namespace, &representation) else {
+    // Sorted by id in byte order, exactly as `evidence.resources[5]`, whatever
+    // order or collation the store returned them in.
+    let mut specs: Vec<&ApiSpec> = snapshot.api_specs.iter().collect();
+    specs.sort_by(|a, b| a.id.cmp(&b.id));
+    let Ok([proxies, plugin_configs, upstreams, api_specs]) = typed_lists(&snapshot, &specs) else {
         return unavailable("not_started");
     };
     let event = audit::AuditEvent::new(
@@ -213,18 +265,24 @@ pub(super) async fn snapshot(
     {
         return unavailable("not_started");
     }
-    let mut response = json_response(
-        StatusCode::OK,
-        &json!({
-            "profile": "deployment-v1", "namespace": namespace,
-            "namespace_etag": preconditions::quoted(&tag),
-            "evidence": representation,
-            "proxies": snapshot.snapshot.config.proxies,
-            "plugin_configs": snapshot.snapshot.config.plugin_configs,
-            "upstreams": snapshot.snapshot.config.upstreams,
-            "api_specs": snapshot.snapshot.api_specs,
-        }),
+    let api_spec_contents = specs.into_iter().map(api_spec_content).collect();
+    let mut body = serde_json::Map::with_capacity(9);
+    body.insert("profile".to_string(), Value::from("deployment-v1"));
+    body.insert("namespace".to_string(), Value::from(namespace));
+    body.insert(
+        "namespace_etag".to_string(),
+        Value::from(preconditions::quoted(&tag)),
     );
+    body.insert("evidence".to_string(), representation);
+    body.insert("proxies".to_string(), proxies);
+    body.insert("plugin_configs".to_string(), plugin_configs);
+    body.insert("upstreams".to_string(), upstreams);
+    body.insert("api_specs".to_string(), api_specs);
+    body.insert(
+        "api_spec_contents".to_string(),
+        Value::Array(api_spec_contents),
+    );
+    let mut response = json_response(StatusCode::OK, &Value::Object(body));
     let Ok(value) = hyper::header::HeaderValue::from_str(&preconditions::quoted(&tag)) else {
         return unavailable("not_started");
     };
@@ -234,6 +292,50 @@ pub(super) async fn snapshot(
         hyper::header::HeaderValue::from_static("no-store"),
     );
     response
+}
+
+/// The response's typed inspection lists. `api_specs` repeats the evidence
+/// view, stored documents as digests; `api_spec_contents` carries their bytes
+/// once, outside the evidence.
+fn typed_lists(
+    snapshot: &ConditionalNamespaceSnapshot,
+    specs: &[&ApiSpec],
+) -> Result<[Value; 4], serde_json::Error> {
+    let api_specs = specs
+        .iter()
+        .map(|spec| serde_json::to_value(ApiSpecSnapshotView::from(*spec)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok([
+        serde_json::to_value(&snapshot.config.proxies)?,
+        serde_json::to_value(&snapshot.config.plugin_configs)?,
+        serde_json::to_value(&snapshot.config.upstreams)?,
+        Value::Array(api_specs),
+    ])
+}
+
+/// Encoded length of `bytes` bytes in padded base64.
+fn base64_len(bytes: usize) -> usize {
+    bytes.div_ceil(3).saturating_mul(4)
+}
+
+/// One base64 copy of a spec's stored gzip document and external-reference
+/// snapshot, outside the digested evidence. They decode to the bytes whose
+/// SHA-256 and length the evidence fences.
+fn api_spec_content(spec: &ApiSpec) -> Value {
+    use base64::Engine as _;
+    let engine = &base64::engine::general_purpose::STANDARD;
+    let external = match &spec.external_ref_snapshot {
+        Some(bytes) => Value::String(engine.encode(bytes)),
+        None => Value::Null,
+    };
+    let mut content = serde_json::Map::with_capacity(3);
+    content.insert("id".to_string(), Value::String(spec.id.clone()));
+    content.insert(
+        "spec_content_base64".to_string(),
+        Value::String(engine.encode(&spec.spec_content)),
+    );
+    content.insert("external_ref_snapshot_base64".to_string(), external);
+    Value::Object(content)
 }
 
 pub(super) async fn admit_mutation_audit(
@@ -272,7 +374,7 @@ pub(super) fn finish_boxed(
     id: String,
     guard: NamespaceConfigAdmissionGuard,
     permit: DbWriteTopologyPermit,
-    expected: Value,
+    expected: SnapshotDigest,
     replacement: Option<(
         super::api_specs::ExtractedBundle,
         crate::config::types::ApiSpec,
@@ -302,7 +404,7 @@ async fn finish(
     id: String,
     mut guard: NamespaceConfigAdmissionGuard,
     permit: DbWriteTopologyPermit,
-    expected: Value,
+    expected: SnapshotDigest,
     replacement: Option<(
         super::api_specs::ExtractedBundle,
         crate::config::types::ApiSpec,
@@ -314,7 +416,7 @@ async fn finish(
     let validation_http_client = super::plugin_validation_http_client(&state);
     let precondition = DeploymentPrecondition {
         namespace: &namespace,
-        expected: &expected,
+        expected,
         lease: guard.lease_ref(),
         validation_http_client: &validation_http_client,
     };

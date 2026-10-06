@@ -6,7 +6,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::audit::{self, AuditActor};
 use super::backup::{
@@ -18,6 +18,7 @@ use super::{AdminState, BackupExportPayload, json_response};
 use crate::config::db_backend::{
     AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
     ConditionalNamespaceSnapshot, DatabaseBackend, NamespacePreconditionFailed,
+    NamespaceSnapshotTooLarge, SnapshotDigest, is_namespace_snapshot_too_large,
 };
 use crate::config::types::{Consumer, PluginConfig, Proxy, Upstream, validate_resource_id};
 
@@ -34,21 +35,25 @@ pub(super) fn parse_backup_opt_in(query: Option<&str>) -> Result<bool, &'static 
     Ok(found.unwrap_or(false))
 }
 
+/// MAC domain for namespace snapshot tags. `v2` digests stored spec content
+/// instead of embedding it; `v1` tags issued before that change no longer
+/// match and fail closed with `412`.
+const NAMESPACE_SNAPSHOT_TAG_KIND: &str = "namespace_snapshot.v2";
+
 fn namespace_tag(
     state: &AdminState,
     namespace: &str,
-    representation: &Value,
+    digest: &SnapshotDigest,
 ) -> Result<String, anyhow::Error> {
     let key = state
         .jwt_manager
         .resource_etag_key()
         .ok_or_else(|| anyhow::anyhow!("Namespace ETag key unavailable"))?;
-    Ok(preconditions::resource_etag(
+    Ok(preconditions::snapshot_etag(
         &key,
-        "namespace_snapshot.v1",
+        NAMESPACE_SNAPSHOT_TAG_KIND,
         namespace,
-        namespace,
-        representation,
+        digest,
     ))
 }
 
@@ -72,7 +77,18 @@ fn unavailable() -> Response<Full<Bytes>> {
     )
 }
 
+/// `507`: the namespace is too large to fence; nothing was materialized or applied.
+pub(super) fn snapshot_too_large() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::INSUFFICIENT_STORAGE,
+        &json!({"error": NamespaceSnapshotTooLarge.to_string()}),
+    )
+}
+
 fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if is_namespace_snapshot_too_large(error) {
+        return snapshot_too_large();
+    }
     if let Some(unsupported) = crate::config::db_backend::atomic_batch_unsupported(error) {
         return super::atomic_batch_unsupported_response(unsupported);
     }
@@ -165,7 +181,7 @@ fn serialize_snapshot(
     snapshot: &ConditionalNamespaceSnapshot,
 ) -> Result<(Vec<u8>, String), anyhow::Error> {
     let config = &snapshot.config;
-    let tag = namespace_tag(state, namespace, &snapshot.representation()?)?;
+    let tag = namespace_tag(state, namespace, &snapshot.digest()?)?;
     let metadata = ConditionalBackupMetadata {
         namespace_etag: preconditions::quoted(&tag),
         row_etags: BTreeMap::from([
@@ -223,7 +239,13 @@ pub(super) async fn backup(
             .await
             .map_err(|error| store_error(&error))?;
         let (body_bytes, tag) =
-            serialize_snapshot(state, namespace, &snapshot).map_err(|_| unavailable())?;
+            serialize_snapshot(state, namespace, &snapshot).map_err(|error| {
+                if is_namespace_snapshot_too_large(&error) {
+                    snapshot_too_large()
+                } else {
+                    unavailable()
+                }
+            })?;
         let config = snapshot.config;
         let response = super::finalize_backup_export(
             state,
@@ -292,10 +314,12 @@ pub(super) async fn restore(
         Ok(snapshot) => snapshot,
         Err(error) => return store_error(&error),
     };
-    let expected = match snapshot.representation() {
-        Ok(value) => value,
-        Err(_) => return unavailable(),
+    let expected = match snapshot.digest() {
+        Ok(digest) => digest,
+        Err(error) => return store_error(&error),
     };
+    // Release the snapshot before the replacement transaction reads its own.
+    drop(snapshot);
     let tag = match namespace_tag(state, namespace, &expected) {
         Ok(tag) => tag,
         Err(_) => return unavailable(),
@@ -324,7 +348,7 @@ pub(super) async fn restore(
             plugin_configs: &payload.plugin_configs,
             admission_lease: Some(admission.lease_ref()),
         },
-        expected: &expected,
+        expected,
         api_specs: &specs,
         gateway_trust_bundles: payload.gateway_trust_bundles.as_deref(),
     };

@@ -11,50 +11,73 @@
 //!
 //! An HTTP/2 frontend connection (ALPN `h2`, prior-knowledge h2 over TLS, or
 //! h2c) now takes a slot on its first HTTP/2 request and holds it for its
-//! lifetime; HTTP/1.x connections allocate nothing. Slots are taken least-loaded, so long-lived
+//! lifetime; HTTP/1.x connections allocate nothing. Slots come from the gRPC
+//! pool's own [`SlotTable`], so separate gateways (and in-process tests) never
+//! share balance state. Slots are taken least-loaded, so long-lived
 //! connections stay spread evenly however many short-lived ones come and go.
-//! Each stream counts until its response terminates; every gRPC request
-//! also retains the count until h2 releases its backend stream, including
-//! queued final DATA after the source body ends or an early terminal response.
-//! [`FrontendStream`] rides in the response body and runs with the connection
-//! in a task-local. The gRPC pool reads it through
-//! [`shard_start`]:
+//! Each stream counts until its response terminates: [`FrontendStream`] rides
+//! in the response body and runs with the connection in a task-local. The
+//! count is gateway-side only. An upload h2 still holds after an early
+//! terminal response is not counted, by this bound or by the backend-limit
+//! bound below, yet it still occupies one of the backend connection's
+//! concurrent streams. A backend that answers early but neither reads nor
+//! resets the upload can therefore collect such streams on a connection's
+//! shard, up to the frontend connection's own stream limit, and later pinned
+//! calls queue inside h2 behind them while other shards sit idle. Mainstream
+//! gRPC servers reset the unread half, so this takes an unusual backend. The
+//! gRPC pool reads the count through [`shard_start`]:
 //!
 //! - While the connection has at most [`AFFINITY_MAX_OPEN_STREAMS`] open
-//!   streams, a call goes to the connection's own shard (`slot % shards`). If
-//!   that shard does not exist yet, or has closed, the pool creates it rather
-//!   than borrowing a neighbour, so the pool still widens to its configured
-//!   width as connections arrive.
+//!   streams (the new call included), and no more than its shard's backend
+//!   allows ([`affinity_stream_limit`]), a call goes to the connection's own
+//!   shard (`slot % shards`).
 //! - Beyond that, the connection is heavy enough that one backend connection
-//!   (and its peer's `SETTINGS_MAX_CONCURRENT_STREAMS`) should not carry it
-//!   alone: further calls spill to the round-robin shard, which is likewise
-//!   created if missing. A heavy connection therefore pins at most
-//!   [`AFFINITY_MAX_OPEN_STREAMS`] of its calls to its own shard; the rest are
-//!   spread round-robin over all shards (its own included), and it still
-//!   widens the pool.
+//!   should not carry it alone: further calls spill to the round-robin shard.
+//!   A heavy connection therefore pins at most that many of its calls to its
+//!   own shard; the rest are spread round-robin over all shards (its own
+//!   included).
+//! - A shard whose backend currently allows no streams (a draining
+//!   `SETTINGS_MAX_CONCURRENT_STREAMS` of 0) is skipped while a sibling is
+//!   ready, for pinned, spilled and round-robin calls alike.
+//! - When the affinity or spill shard does not exist yet, or has closed, and a
+//!   ready sibling exists, the call is served by the sibling at once and the
+//!   preferred shard is created in the background (one detached create per
+//!   shard), so the pool still widens to its configured width as connections
+//!   arrive without a new connection waiting on a dial. Background creates
+//!   draw on a small budget of their own (at most 4 per pool) and never wait
+//!   for it; a call that finds it spent just borrows, and a later call starts
+//!   the create. Only a pool with no ready shard dials on the request path.
 //! - A failed or cancelled affinity/spill create puts the shard on a short
-//!   borrow cooldown when a ready sibling exists. A cold pool can retry
-//!   immediately. The bounded cache records only physical attempts, never
-//!   coalesced waiters, and does at most one FIFO eviction per failure.
+//!   borrow cooldown. A cold pool can retry immediately. The bounded cache
+//!   records only physical attempts, never coalesced waiters, and does at most
+//!   one FIFO eviction per failure.
 //! - Calls with no frontend connection in scope (HTTP/1.1 and HTTP/3
 //!   frontends, spawned work) keep the original round-robin probe.
 //!
-//! An open hyper HTTP/2 sender always reports ready, and hyper does not expose
-//! the peer's `SETTINGS_MAX_CONCURRENT_STREAMS`, so the pool cannot see a busy
-//! backend connection; the open-stream bound above is what keeps one client
-//! from monopolising one. The bound is per frontend connection, not per shard:
-//! several busy connections whose slots share a shard still share its backend
-//! connection (each with at most [`AFFINITY_MAX_OPEN_STREAMS`] affinity calls),
-//! and a backend that allows fewer concurrent streams than that can queue
-//! calls that round-robin would have spread. Slots are spread evenly over
-//! shard counts that divide [`SLOTS`] (the default 2, 4 and 8); other counts
-//! are slightly uneven once more than [`SLOTS`] HTTP/2 connections are live.
+//! An open hyper HTTP/2 sender always reports ready, however many streams it
+//! carries, so the pool cannot see a busy backend connection from the sender.
+//! The connection driver samples the backend's
+//! `SETTINGS_MAX_CONCURRENT_STREAMS` from hyper's
+//! `Connection::current_max_send_streams()` (after each of its first polls,
+//! then once every 64 polls), and the pool caps a connection's pinned streams
+//! at the smaller of that and [`AFFINITY_MAX_OPEN_STREAMS`]. The bound is per frontend connection, not
+//! per shard: several busy connections whose slots share a shard still share
+//! its backend connection, each within its own bound, so a backend that allows
+//! very few concurrent streams can still queue calls that round-robin would
+//! have spread; counting per shard would put a shared atomic on every call.
+//! Slots are spread evenly over shard counts that divide [`SLOTS`] (the
+//! default 2, 4 and 8); other counts are slightly uneven once more than
+//! [`SLOTS`] HTTP/2 connections are live.
+//!
+//! Affinity makes the pool open its shards on demand: a client that opens many
+//! short-lived HTTP/2 connections spreads them over every slot, so each
+//! backend host can see up to `http2_connections_per_host` backend
+//! connections where round-robin borrowing would have reused fewer.
 //!
 //! The direct HTTP/2 pool keeps the round-robin start for every request: on the
 //! protocol benchmark the same affinity made HTTP/2 slower (up to about 20% at
 //! 1–5 MiB on one runner type), while gRPC gained at 10 KiB on every runner.
 
-use std::cell::RefCell;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -67,10 +90,20 @@ use crossbeam_utils::CachePadded;
 pub const SLOTS: usize = 64;
 
 /// Open streams a frontend connection may keep on its own shard. Further
-/// concurrent calls spill round-robin.
+/// concurrent calls spill round-robin. A backend that advertises a lower
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` lowers this bound for its shard.
 pub const AFFINITY_MAX_OPEN_STREAMS: usize = 32;
 
-/// Live frontend connections per slot.
+/// Open streams a frontend connection may pin to a shard whose backend
+/// currently allows `peer_max_streams` concurrent streams. A backend allowing
+/// none (a draining `SETTINGS_MAX_CONCURRENT_STREAMS` of 0) pins none: the
+/// pool skips that shard while a sibling is ready.
+pub fn affinity_stream_limit(peer_max_streams: usize) -> usize {
+    AFFINITY_MAX_OPEN_STREAMS.min(peer_max_streams)
+}
+
+/// Live frontend connections per slot. One table per gRPC pool, shared by
+/// every frontend listener of that gateway.
 pub struct SlotTable {
     live: [CachePadded<AtomicUsize>; SLOTS],
 }
@@ -84,7 +117,7 @@ impl SlotTable {
 
     /// Take the lowest slot with the fewest live connections. Two concurrent
     /// acquires may take the same slot; that only costs balance.
-    pub fn acquire(&'static self) -> FrontendConnectionSlot {
+    pub fn acquire(self: &Arc<Self>) -> FrontendConnectionSlot {
         let mut slot = 0;
         let mut fewest = usize::MAX;
         for (index, live) in self.live.iter().enumerate() {
@@ -98,7 +131,10 @@ impl SlotTable {
             }
         }
         self.live[slot].fetch_add(1, Ordering::Relaxed);
-        FrontendConnectionSlot { table: self, slot }
+        FrontendConnectionSlot {
+            table: Arc::clone(self),
+            slot,
+        }
     }
 
     /// Live connections holding `slot`.
@@ -113,11 +149,9 @@ impl Default for SlotTable {
     }
 }
 
-static FRONTEND_SLOTS: SlotTable = SlotTable::new();
-
 /// A frontend connection's slot, released when the connection ends.
 pub struct FrontendConnectionSlot {
-    table: &'static SlotTable,
+    table: Arc<SlotTable>,
     slot: usize,
 }
 
@@ -135,37 +169,30 @@ impl Drop for FrontendConnectionSlot {
 
 /// One frontend connection's affinity state, shared by its streams.
 pub struct FrontendConnectionAffinity {
-    table: &'static SlotTable,
+    table: Arc<SlotTable>,
     /// Taken on the connection's first HTTP/2 request.
     slot: OnceLock<FrontendConnectionSlot>,
     open_streams: CachePadded<AtomicUsize>,
 }
 
 impl FrontendConnectionAffinity {
-    /// State for a newly accepted frontend connection. Takes no slot until the
-    /// connection's first HTTP/2 request.
-    pub fn new() -> Arc<Self> {
-        Self::with_table(&FRONTEND_SLOTS)
-    }
-
-    /// As [`Self::new`], drawing slots from `table`.
-    pub fn with_table(table: &'static SlotTable) -> Arc<Self> {
+    /// State for a newly accepted frontend connection, drawing its slot from
+    /// `table`. Takes no slot until the connection's first HTTP/2 request.
+    pub fn with_table(table: &Arc<SlotTable>) -> Arc<Self> {
         Arc::new(Self {
-            table,
+            table: Arc::clone(table),
             slot: OnceLock::new(),
             open_streams: CachePadded::new(AtomicUsize::new(0)),
         })
     }
 
     /// Open one stream of this connection. The stream counts as open until the
-    /// returned guard drops, exactly once. Every gRPC backend attempt joins its
-    /// transport lifetime with that response-side guard.
+    /// returned guard drops, exactly once.
     pub fn open_stream(self: &Arc<Self>) -> FrontendStream {
         self.slot.get_or_init(|| self.table.acquire());
         self.open_streams.fetch_add(1, Ordering::Relaxed);
         FrontendStream {
             connection: Arc::clone(self),
-            backend_lifetime: None,
         }
     }
 
@@ -182,32 +209,36 @@ impl FrontendConnectionAffinity {
 
 /// A frontend connection's affinity state, allocated on its first HTTP/2
 /// request: HTTP/1.x connections never allocate it or take a slot.
-#[derive(Default)]
 pub struct LazyConnectionAffinity {
+    table: Arc<SlotTable>,
     connection: OnceLock<Arc<FrontendConnectionAffinity>>,
 }
 
 impl LazyConnectionAffinity {
-    pub fn new() -> Self {
-        Self::default()
+    /// Affinity for one accepted frontend connection, drawing its slot from
+    /// the gateway's gRPC pool table.
+    pub fn new(table: Arc<SlotTable>) -> Self {
+        Self {
+            table,
+            connection: OnceLock::new(),
+        }
     }
 
     /// Open a stream for a request of `version`; HTTP/1.x requests get none.
     pub fn open_stream(&self, version: hyper::Version) -> Option<FrontendStream> {
         (version == hyper::Version::HTTP_2).then(|| {
             self.connection
-                .get_or_init(FrontendConnectionAffinity::new)
+                .get_or_init(|| FrontendConnectionAffinity::with_table(&self.table))
                 .open_stream()
         })
     }
 }
 
-/// One open stream of a frontend connection.
+/// One open stream of a frontend connection. Dropping it closes the stream;
+/// the frontend keeps it in the response body, so it closes when the response
+/// terminates.
 pub struct FrontendStream {
     connection: Arc<FrontendConnectionAffinity>,
-    // The response and every backend attempt share one owner. Other H2
-    // requests keep just this response guard.
-    backend_lifetime: Option<Arc<BackendStreamLifetime>>,
 }
 
 impl FrontendStream {
@@ -219,83 +250,31 @@ impl FrontendStream {
             .await
     }
 
-    /// Scope a frontend handler and return its response-side guard. The
-    /// backend dispatcher may register a transport owner while the
-    /// handler runs. Keeping the guard inside the scope makes cancellation
-    /// release the response half even before a response body exists.
+    /// Run a frontend handler in scope and hand the stream back for its
+    /// response body. Cancelling the handler drops the stream, closing it.
     pub async fn run_request<F: Future>(self, request: F) -> (F::Output, Self) {
-        let connection = Arc::clone(&self.connection);
-        FRONTEND_STREAM
-            .scope(
-                connection,
-                FRONTEND_REQUEST.scope(RefCell::new(Some(self)), async move {
-                    let output = request.await;
-                    let stream = FRONTEND_REQUEST.with(|stream| stream.borrow_mut().take());
-                    // This scope owns exactly one guard; only this terminal
-                    // handoff takes it out. Backend registration borrows it.
-                    let stream = stream.expect("frontend request scope owns its stream guard");
-                    (output, stream)
-                }),
-            )
-            .await
+        let output = self.run(request).await;
+        (output, self)
     }
 }
 
 impl Drop for FrontendStream {
     fn drop(&mut self) {
-        if self.backend_lifetime.is_none() {
-            self.connection.open_streams.fetch_sub(1, Ordering::Relaxed);
-        }
-        // Otherwise the shared owner's last drop releases the count, after
-        // this response and all h2 attempts have terminated.
+        self.connection.open_streams.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 tokio::task_local! {
     static FRONTEND_STREAM: Arc<FrontendConnectionAffinity>;
-    static FRONTEND_REQUEST: RefCell<Option<FrontendStream>>;
-}
-
-struct BackendStreamLifetime {
-    connection: Arc<FrontendConnectionAffinity>,
-}
-
-impl Drop for BackendStreamLifetime {
-    fn drop(&mut self) {
-        self.connection.open_streams.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// Retain this frontend call until both its response and all backend gRPC
-/// attempts terminate. Insert the returned extension at the shared dispatch
-/// seam, independent of the body's representation. Hyper passes it through
-/// to h2, which owns it until queued DATA drains or the stream resets.
-///
-/// One Arc allocation per scoped call, shared across retries. No source-body
-/// observer, byte-accounting latch, timer, extra task, or lock is involved.
-/// Dispatches without an HTTP/2 frontend scope allocate nothing.
-pub fn retain_backend_stream() -> Option<h2::ext::StreamLifetime> {
-    FRONTEND_REQUEST
-        .try_with(|stream| {
-            let mut stream = stream.borrow_mut();
-            let stream = stream.as_mut()?;
-            let lifetime = stream.backend_lifetime.get_or_insert_with(|| {
-                Arc::new(BackendStreamLifetime {
-                    connection: Arc::clone(&stream.connection),
-                })
-            });
-            let owner: Arc<dyn Send + Sync> = lifetime.clone();
-            Some(h2::ext::StreamLifetime::new(owner))
-        })
-        .ok()
-        .flatten()
 }
 
 /// Where the gRPC pool's shard probe starts for the current call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardStart {
-    /// The frontend connection's own shard; create it if missing.
-    Affinity(usize),
+    /// The frontend connection's own shard, created if missing. The pool
+    /// spills instead when `open_streams` exceeds that shard's
+    /// [`affinity_stream_limit`].
+    Affinity { shard: usize, open_streams: usize },
     /// A frontend connection over its affinity bound (or a pool wider than
     /// [`SLOTS`]): the round-robin shard, created if missing.
     Spill,
@@ -307,14 +286,17 @@ pub enum ShardStart {
 pub fn shard_start(shard_count: usize) -> ShardStart {
     let shard_count = shard_count.max(1);
     FRONTEND_STREAM
-        .try_with(|connection| match connection.slot() {
-            Some(slot)
-                if shard_count <= SLOTS
-                    && connection.open_streams() <= AFFINITY_MAX_OPEN_STREAMS =>
-            {
-                ShardStart::Affinity(slot % shard_count)
+        .try_with(|connection| {
+            let open_streams = connection.open_streams();
+            match connection.slot() {
+                Some(slot) if shard_count <= SLOTS && open_streams <= AFFINITY_MAX_OPEN_STREAMS => {
+                    ShardStart::Affinity {
+                        shard: slot % shard_count,
+                        open_streams,
+                    }
+                }
+                _ => ShardStart::Spill,
             }
-            _ => ShardStart::Spill,
         })
         .unwrap_or(ShardStart::Unscoped)
 }

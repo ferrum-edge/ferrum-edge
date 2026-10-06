@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BREAKING — bounded namespace and deployment snapshot authority** (issues
+  #5999 / #6012). Conditional backup/restore and `deployment-v1` tags cloned
+  every resource and rendered stored gzip spec documents as JSON number arrays
+  (tens of bytes of heap per stored byte), then built the whole canonical
+  string; conditional restore and deployment mutations held several full
+  copies, the deployment profile carried spec bytes three times (Mongo four)
+  and rebuilt them under namespace row locks. A few multi-MiB specs could
+  exhaust memory. Snapshot representations now carry the SHA-256 and length
+  of stored spec documents, external-reference snapshots and every raw blob or
+  BSON binary; canonical JSON streams into a bounded SHA-256, and stores compare
+  that digest instead of a retained representation. In `GET /deployment-snapshot`,
+  top-level `api_specs` now carries the same digests and is sorted by id to
+  equal `evidence.resources[5]` under any store collation. A new
+  `api_spec_contents` array carries exactly one base64 copy of each stored
+  gzip document and external-reference snapshot, outside the digested evidence
+  and bounded at 256 MiB in total, so one read still recovers the original
+  bytes. Raw SQL blobs are `{"sha256","len"}` and MongoDB rows carry
+  `bson_sha256` instead of `bson_hex`. A namespace whose canonical
+  representation would exceed 64 MiB (spec bytes excluded) returns
+  `507 Insufficient Storage` without issuing, comparing or applying anything.
+  Deployment paths count typed resources against that bound before reading raw
+  rows/documents, then count each raw row/document as it is converted, so the
+  `507` fires before the rest of the evidence is built. This includes inside
+  the mutation transaction, where the `507` reports `durable: "not_committed"`.
+  Namespace (`namespace_snapshot.v2`) and deployment (`deployment_snapshot.v2`)
+  MAC domains changed: every tag issued by v0.9.12 or earlier, including
+  `deployment-v1-` tokens, now fails closed with `412`; re-read authority after
+  upgrading.
+- **BREAKING — `public_only_guaranteed` requires local enforcement** (issues
+  #5994 / #5999). `GET /backend-egress-policy` reported `true` for a public-mode
+  process without allow overrides even when `enforcement_scope` was
+  `admission-only`, `unserved-namespace` or `no-data-plane`, none of which
+  enforces the policy for the selected namespace. It is now true only for
+  `local-data-plane`, and `schema_version` is `2`; consumers pinned to `1`
+  must fail closed and adopt the new meaning.
+- **Deployment replacement column drift guard** (#6012). The SQL known-column
+  lists that decide which stored columns a conditional API-spec replacement
+  rewrites are now one `DEPLOYMENT_KNOWN_COLUMNS` table, and a unit test
+  requires each to equal the V001 baseline's columns for `proxies`,
+  `upstreams`, `plugin_configs` and `proxy_plugins`, so a new column cannot be
+  silently restored to its old value.
+- **gRPC affinity no longer dials a missing or closed shard on the request
+  path when a ready sibling exists** (#5991 follow-up; regression since
+  0.9.11). A new HTTP/2 frontend connection mapped to a shard that did not
+  exist yet, or a connection whose shard had just closed on a backend GOAWAY,
+  waited for a fresh dial (up to `backend_connect_timeout_ms`, 5 s by default)
+  even while another backend connection was ready, and with the backend at its
+  connection cap every such call paid that wait. The ready sibling now serves
+  the call at once and the shard is created on a detached, single-flight
+  background task that honours the existing create cooldown. Background
+  creates have their own small budget (at most 4 per pool) and never wait for
+  it or for a request-path creation permit, so slow or blackholed fills cannot
+  delay a request-path dial to another backend. Only a pool with no ready
+  shard dials inline.
+- **gRPC affinity respects the backend's `SETTINGS_MAX_CONCURRENT_STREAMS`**.
+  Up to 32 of a frontend connection's streams were pinned to one backend
+  connection whatever the backend allowed, so a backend advertising a small
+  limit queued calls inside h2 while other shards sat idle. The pool's
+  connection driver now samples the backend's current limit (on each of its
+  first 32 polls, then once every 64 polls, since each sample takes h2's
+  per-connection stream lock), and a connection pins at most `min(32, limit)`
+  of its calls; the next one spills. A backend advertising a limit of 0 is
+  skipped while a sibling is ready instead of being pinned.
+- **gRPC affinity slot tables are per gateway**. The table that spreads HTTP/2
+  frontend connections over shards was process-global; it now belongs to the
+  gateway's gRPC pool, so separate in-process gateways and tests no longer
+  share balance state.
 - **Order the buffered gRPC final authorization check before logging**
   (follow-up to #5993 / #5995). A buffered native gRPC or gRPC-Web response
   whose credential expired during the response hooks logged two transaction
@@ -41,6 +108,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   H3-unsupported) when its task wakes after the connect instant; the connect
   bound now applies only to a failed connect, and the per-poll send gate still
   enforces the authorization lifetime.
+
+### Changed
+
+- **Retired the vendored h2 stream-lifetime patch** (`h2-002-stream-lifetime`).
+  It existed only to keep a gRPC call counted for affinity until h2 drained
+  an upload's queued final DATA after an early terminal response. Affinity now
+  counts a stream until its response terminates, gateway-side. An upload h2
+  still holds after an early response no longer counts toward either the
+  per-connection bound or the backend-limit bound, though it still occupies a
+  backend stream: a backend that answers early but neither reads nor resets
+  the upload can collect such streams on one shard, and later pinned calls
+  queue in h2 behind them. Mainstream gRPC servers reset the unread half. The
+  vendored h2 keeps the coalescing and runtime DATA-frame-budget patches, and
+  the duplicate `002` patch number is gone.
+- **Documented the backend connection width of gRPC affinity**. Clients that
+  open many short-lived HTTP/2 connections can see up to
+  `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` backend connections per backend
+  host from each gateway; see `docs/connection_pooling.md`.
+
+### Documentation
+
+- **BREAKING — deployment-mode request refusals** (issue #6012). Since v0.9.12,
+  an ordinary `PUT /api-specs/{id}` carrying any `If-Match` returns `400` unless
+  it is a complete `conditional=true` deployment request, and every
+  `POST`/`PUT`/`PATCH`/`DELETE` admin request with a `conditional` query key or
+  an `If-Match` containing `deployment-v1-` returns `400` outside the two
+  deployment routes (including `POST /restore`). These refusals are now
+  documented in the upgrade guide.
 
 ### Security
 
@@ -97,6 +192,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an instance with an execution trigger stays undetermined whenever any
   request input may change, and a custom plugin that rewrites
   `route_override_request_timeout_ms` directly is not modelled.
+- **BREAKING (developer fixtures) — sample Compose MongoDB and SQL TLS test
+  fixtures no longer have working default credentials or wildcard ports**
+  (issue #6002; GHSA-wq9h-xxp4-7r2m, GHSA-x87v-w7p2-77f4). Affects only the
+  source-tree `docker-compose.yml`, `docker-compose.tls-test.yml` and SQL TLS
+  helper shipped in v0.9.0–v0.9.12; no container image, Helm chart or binary
+  contains them. See the
+  [upgrade guide](docs/upgrade_guide.md#development-compose-fixtures-unreleased).
+  - Plain `docker compose up` no longer starts MongoDB: `mongodb` and
+    `ferrum-mongodb` are in the `mongodb` profile, and the
+    `dev-password-change-in-production` fallback is gone. The Mongo container
+    refuses a missing `MONGO_PASSWORD`, one shorter than 32 characters, or one
+    containing characters outside `A-Z a-z 0-9 . _ ~ -` (the gateway embeds it
+    in its `mongodb://` URL without escaping). The Mongo image is pinned by
+    digest. A volume initialized with the old default keeps accepting that
+    password until you rotate it. Containers started by an earlier plain
+    `docker compose up` can remain running after this update; remove the old
+    Mongo container and volume or rotate the password as described in the
+    upgrade guide.
+  - `scripts/setup_db_tls.sh` (also run by `tests/scripts/setup_db_tls.sh`)
+    publishes PostgreSQL and MySQL on `127.0.0.1` only. It generates random
+    PostgreSQL, MySQL and MySQL root passwords into a private `0700` directory,
+    passes them through `*_PASSWORD_FILE` and MySQL option files, and writes
+    `connections.env` with `sslmode=verify-full` / `ssl-mode=VERIFY_IDENTITY`
+    URLs. It never prints passwords or dumps container logs, and PostgreSQL
+    rejects non-TLS TCP. It refuses an existing directory or container, and a
+    directory inside the repository unless `--allow-repo-dir` is given. It now
+    requires Docker Compose v2.
+  - The SQL TLS functional tests read `connections.env` from
+    `FERRUM_TEST_CERT_DIR` instead of using `test-password`. Hosted data-plane
+    CI provisions its SQL TLS fixture the same way: loopback ports, generated
+    file-based credentials, no passwords on command lines, and no container log
+    dumps.
+  - New optional `Compose Fixture Qualification` workflow
+    (`scripts/check_compose_fixtures.sh`). It checks loopback-only ports,
+    TLS-only SQL, that MongoDB is opt-in, and that generated passwords stay out
+    of argv, `docker inspect`, healthcheck output and container logs.
 - **ARM64 Cross release inputs are pinned and verified** (#5955, #5989;
   GHSA-2q8f-75vc-v8c7). Cross 0.2.5 now uses the published GHCR OCI index
   digest, retaining its Linux/amd64 host image and aarch64 target. The protoc

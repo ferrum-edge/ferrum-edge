@@ -26,7 +26,14 @@
 //! consumer credential material): an unkeyed digest would be an offline oracle
 //! for guessing a redacted value. Replicas that accept the same admin tokens
 //! share the secret and therefore agree on tags.
+//!
+//! Whole-namespace snapshot tags (`GET /backup?conditional=true`,
+//! `GET /deployment-snapshot`) instead MAC a bounded SHA-256
+//! [`SnapshotDigest`] of the canonical snapshot, in which stored spec and
+//! other binary content is itself represented by a digest and length. See
+//! [`crate::config::db_backend::ConditionalNamespaceSnapshot::digest`].
 
+use crate::config::db_backend::SnapshotDigest;
 use crate::fips::approved::HmacSha256Key;
 use serde_json::Value;
 
@@ -173,7 +180,8 @@ pub(crate) fn etag_key(jwt_secret: &str) -> Option<HmacSha256Key> {
 ///
 /// The resource kind, namespace, and id are bound into the MAC so a tag issued
 /// for one resource can never satisfy a precondition on another, even if their
-/// bodies are identical.
+/// bodies are identical. The canonical rendering is streamed into the MAC
+/// rather than materialized as one string.
 pub(crate) fn resource_etag(
     key: &HmacSha256Key,
     resource_kind: &str,
@@ -181,15 +189,40 @@ pub(crate) fn resource_etag(
     id: &str,
     representation: &Value,
 ) -> String {
-    let mut canonical = String::new();
-    write_canonical_json(representation, &mut canonical);
+    let mut mac = bound_mac(key, resource_kind, namespace, id);
+    let Ok(()) = emit_canonical_json(representation, &mut |text: &str| {
+        mac.update(text.as_bytes());
+        Ok::<(), std::convert::Infallible>(())
+    });
+    hex::encode(&mac.finalize().as_ref()[..ETAG_TAG_BYTES])
+}
+
+/// The opaque tag for a whole-namespace snapshot, keyed over the unkeyed
+/// [`SnapshotDigest`] of its canonical representation. The digest never
+/// leaves the server, so it is not an offline oracle for redacted values.
+pub(crate) fn snapshot_etag(
+    key: &HmacSha256Key,
+    snapshot_kind: &str,
+    namespace: &str,
+    digest: &SnapshotDigest,
+) -> String {
+    let mut mac = bound_mac(key, snapshot_kind, namespace, namespace);
+    mac.update(digest.as_bytes());
+    hex::encode(&mac.finalize().as_ref()[..ETAG_TAG_BYTES])
+}
+
+fn bound_mac(
+    key: &HmacSha256Key,
+    resource_kind: &str,
+    namespace: &str,
+    id: &str,
+) -> crate::fips::approved::HmacSha256 {
     let mut mac = key.begin();
     for part in [resource_kind, namespace, id] {
         mac.update((part.len() as u64).to_be_bytes());
         mac.update(part.as_bytes());
     }
-    mac.update(canonical.as_bytes());
-    hex::encode(&mac.finalize().as_ref()[..ETAG_TAG_BYTES])
+    mac
 }
 
 /// Quote an opaque tag for the `ETag` response header.
@@ -206,31 +239,50 @@ pub(crate) fn quoted(opaque: &str) -> String {
 /// fingerprints, so an unchanged stored value fingerprints identically however
 /// its object keys happen to be ordered.
 pub(crate) fn write_canonical_json(value: &Value, out: &mut String) {
+    let Ok(()) = emit_canonical_json(value, &mut |text: &str| {
+        out.push_str(text);
+        Ok::<(), std::convert::Infallible>(())
+    });
+}
+
+/// Stream the same canonical rendering as [`write_canonical_json`] into an
+/// [`std::io::Write`] sink without materializing it.
+pub(crate) fn write_canonical_json_to<W: std::io::Write + ?Sized>(
+    value: &Value,
+    out: &mut W,
+) -> std::io::Result<()> {
+    emit_canonical_json(value, &mut |text: &str| out.write_all(text.as_bytes()))
+}
+
+fn emit_canonical_json<E>(
+    value: &Value,
+    out: &mut impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
     match value {
         Value::Object(map) => {
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
             entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            out.push('{');
+            out("{")?;
             for (index, (key, value)) in entries.into_iter().enumerate() {
                 if index > 0 {
-                    out.push(',');
+                    out(",")?;
                 }
-                out.push_str(&Value::String(key.clone()).to_string());
-                out.push(':');
-                write_canonical_json(value, out);
+                out(&Value::String(key.clone()).to_string())?;
+                out(":")?;
+                emit_canonical_json(value, out)?;
             }
-            out.push('}');
+            out("}")
         }
         Value::Array(items) => {
-            out.push('[');
+            out("[")?;
             for (index, item) in items.iter().enumerate() {
                 if index > 0 {
-                    out.push(',');
+                    out(",")?;
                 }
-                write_canonical_json(item, out);
+                emit_canonical_json(item, out)?;
             }
-            out.push(']');
+            out("]")
         }
-        scalar => out.push_str(&scalar.to_string()),
+        scalar => out(&scalar.to_string()),
     }
 }

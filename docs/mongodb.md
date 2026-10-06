@@ -16,7 +16,7 @@ This guide covers deploying Ferrum Edge with MongoDB as the configuration databa
 
 ```bash
 # Start MongoDB (Docker)
-docker run -d --name mongo -p 27017:27017 mongo:7
+docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:7
 
 # Start Ferrum Edge
 FERRUM_MODE=database \
@@ -398,7 +398,7 @@ available.
 
 ```bash
 # Start a single-node replica set for development
-docker run -d --name mongo-rs -p 27017:27017 mongo:7 --replSet rs0
+docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0
 docker exec mongo-rs mongosh --eval "rs.initiate()"
 
 # Configure Ferrum Edge

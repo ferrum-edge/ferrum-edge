@@ -5,7 +5,7 @@
   "url": "https://static.crates.io/crates/h2/h2-0.4.19.crate",
   "sha256": "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16",
   "revision": "d57d1b852fec9dda6d42d3454502006d52104da8",
-  "patch_sha256": "8db5c285df9c91a9bcd590ff6547ebf4c31c7db97a216cbb09fb9d6cec4fea58",
+  "patch_sha256": "08f0da5f6f3ea423ae546badca486fda059f46a851bfdaeb1fa3fc320419451b",
   "files": {
     "src/lib.rs": {
       "before": "c8680fc4eb13ccb4ce944716042bd33c6554677cf8261c371442f91fbee352e0",
@@ -16,8 +16,8 @@
       "after": "6d89842e80dc2247a968bdc231242c356a982e770c9b406620ae2a1c44b73f89"
     },
     "src/proto/streams/counts.rs": {
-      "before": "c8ddced0c2a90aa859ad722dfcf4b45a9f0b632c3ca35467300d717554a9ef50",
-      "after": "a11bdec2fde65ac9905ee2a85d12ac5e6f073705776f4f83908d6bd668522d31"
+      "before": "9c0a1326fe0edf1e0636e1664915ceeb09e762c90fa8184bc6af0ca6ad077449",
+      "after": "c8caf8e45e985ae07497547f117bfa7f84280bb011fe4d2e5470d2ffe511e01c"
     },
     "src/proto/streams/mod.rs": {
       "before": "49a9d42775813e08ae6318441314c3a4dca58a345a04b73275cd9755e348a621",
@@ -28,8 +28,8 @@
       "after": "c58c186df6564e29c97e7160917fd52384aee52b159543128bb31e4b50931009"
     },
     "src/proto/streams/streams.rs": {
-      "before": "691f9ccbda00da2e7e3babe895d20aa5caf23e167ae94c672a3a8efe9d5df847",
-      "after": "dbbad34d1f79bb7811410947d0fe2eecb3d5a11a90098a76f17fa94a2c90bd86"
+      "before": "28b74ed10ceb24d404008652af0b5b9818bb9ea3e492bb6517e6ed2c935ad33a",
+      "after": "7e3a2c92d90acd877ec44e247325501fa599d3e15c7672f7daa937f771ef75bd"
     }
   },
   "assets": {

@@ -27,6 +27,290 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{info, warn};
 
+/// Upper bound, in canonical JSON bytes, on the representation that fences one
+/// namespace snapshot (`GET /backup?conditional=true`, conditional `/restore`,
+/// `GET /deployment-snapshot` and the conditional deployment mutations).
+///
+/// Stored API-spec documents and every other binary column count only as a
+/// fixed-size digest and length, so the bound covers the namespace's proxies,
+/// consumers, upstreams, plugin configs, trust, registry metadata and raw row
+/// evidence. A namespace whose representation would exceed it is refused with
+/// [`NamespaceSnapshotTooLarge`] (HTTP 507) instead of being materialized.
+pub const MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES: usize = 64 * 1024 * 1024;
+
+/// Unkeyed SHA-256 over the bounded canonical representation of a namespace
+/// snapshot. It never leaves the server: admin tags are an HMAC over it, and
+/// stores compare it inside their write transactions instead of retaining and
+/// comparing whole representations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotDigest([u8; 32]);
+
+impl SnapshotDigest {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Digest an already materialized representation, bounded by
+    /// [`MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES`]. Equal to the streamed
+    /// `digest()` of the snapshot that produced the representation.
+    pub fn of_representation(representation: &serde_json::Value) -> Result<Self, anyhow::Error> {
+        let mut writer = SnapshotDigestWriter::new(MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES);
+        let written =
+            crate::admin::preconditions::write_canonical_json_to(representation, &mut writer);
+        writer.finish(written)
+    }
+}
+
+impl std::fmt::Debug for SnapshotDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SnapshotDigest({})", hex::encode(self.0))
+    }
+}
+
+/// The namespace snapshot representation exceeds
+/// [`MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES`].
+#[derive(Debug, Clone, Copy)]
+pub struct NamespaceSnapshotTooLarge;
+
+impl std::fmt::Display for NamespaceSnapshotTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Namespace snapshot representation exceeds the {} MiB conditional authority limit",
+            MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES / (1024 * 1024)
+        )
+    }
+}
+
+impl std::error::Error for NamespaceSnapshotTooLarge {}
+
+/// Whether `error` reports an over-bound namespace snapshot representation.
+pub fn is_namespace_snapshot_too_large(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<NamespaceSnapshotTooLarge>())
+}
+
+/// Canonical JSON sink that hashes as it goes and refuses to accept more than
+/// `limit` bytes. Nothing is buffered.
+pub(crate) struct SnapshotDigestWriter {
+    hasher: crate::fips::approved::Sha256,
+    written: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl SnapshotDigestWriter {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            hasher: crate::fips::approved::Sha256::new(),
+            written: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+
+    /// Finish after the caller's last write, reporting an exceeded bound as
+    /// [`NamespaceSnapshotTooLarge`] rather than as the I/O error it surfaced as.
+    pub(crate) fn finish(
+        self,
+        written: Result<(), std::io::Error>,
+    ) -> Result<SnapshotDigest, anyhow::Error> {
+        if self.exceeded {
+            return Err(NamespaceSnapshotTooLarge.into());
+        }
+        written?;
+        Ok(SnapshotDigest(self.hasher.finalize()))
+    }
+}
+
+impl std::io::Write for SnapshotDigestWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.written.saturating_add(buf.len());
+        if written > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other(NamespaceSnapshotTooLarge));
+        }
+        self.written = written;
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Running canonical-byte budget for evidence assembled piece by piece. Every
+/// charge is part of the final canonical representation, so an exhausted
+/// budget proves that [`SnapshotDigestWriter`] would refuse it too, and lets
+/// assembly stop before materializing the rest.
+pub(crate) struct SnapshotByteBudget {
+    remaining: usize,
+    exceeded: bool,
+}
+
+impl SnapshotByteBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            remaining: limit,
+            exceeded: false,
+        }
+    }
+
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), NamespaceSnapshotTooLarge> {
+        match self.remaining.checked_sub(bytes) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => {
+                self.exceeded = true;
+                Err(NamespaceSnapshotTooLarge)
+            }
+        }
+    }
+
+    /// Settle a streamed write into this budget, reporting an exhausted budget
+    /// as [`NamespaceSnapshotTooLarge`] rather than as the I/O error it
+    /// surfaced as.
+    pub(crate) fn settle(&self, written: std::io::Result<()>) -> Result<(), anyhow::Error> {
+        if self.exceeded {
+            return Err(NamespaceSnapshotTooLarge.into());
+        }
+        written?;
+        Ok(())
+    }
+}
+
+impl std::io::Write for SnapshotByteBudget {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.charge(buf.len()).map_err(std::io::Error::other)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// SHA-256 and length of stored binary content. Snapshot representations
+/// carry this instead of the bytes, which `serde_json` would otherwise render
+/// as an array of numbers (tens of bytes of heap per stored byte).
+pub(crate) fn stored_bytes_digest(bytes: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "sha256": hex::encode(crate::fips::approved::Sha256::digest(bytes)),
+        "len": bytes.len(),
+    })
+}
+
+/// Snapshot view of one stored [`ApiSpec`]. Every field is carried verbatim
+/// except the stored binary documents, which are represented by
+/// [`stored_bytes_digest`]. `content_hash` is the digest of the *uncompressed*
+/// document, so it cannot stand in for the stored bytes.
+#[derive(serde::Serialize)]
+pub struct ApiSpecSnapshotView<'a> {
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub proxy_id: &'a str,
+    pub spec_version: &'a str,
+    pub spec_format: crate::config::types::SpecFormat,
+    pub spec_content: serde_json::Value,
+    pub content_encoding: &'a str,
+    pub uncompressed_size: u64,
+    pub content_hash: &'a str,
+    pub title: Option<&'a str>,
+    pub info_version: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub contact_name: Option<&'a str>,
+    pub contact_email: Option<&'a str>,
+    pub license_name: Option<&'a str>,
+    pub license_identifier: Option<&'a str>,
+    pub tags: &'a [String],
+    pub server_urls: &'a [String],
+    pub operation_count: u32,
+    pub resource_hash: &'a str,
+    pub external_ref_snapshot: Option<serde_json::Value>,
+    pub external_ref_digest: Option<&'a str>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl<'a> From<&'a ApiSpec> for ApiSpecSnapshotView<'a> {
+    fn from(spec: &'a ApiSpec) -> Self {
+        // Exhaustive destructuring: a new `ApiSpec` field fails to compile here
+        // until it is added to the fenced representation.
+        let ApiSpec {
+            id,
+            namespace,
+            proxy_id,
+            spec_version,
+            spec_format,
+            spec_content,
+            content_encoding,
+            uncompressed_size,
+            content_hash,
+            title,
+            info_version,
+            description,
+            contact_name,
+            contact_email,
+            license_name,
+            license_identifier,
+            tags,
+            server_urls,
+            operation_count,
+            resource_hash,
+            external_ref_snapshot,
+            external_ref_digest,
+            created_at,
+            updated_at,
+        } = spec;
+        Self {
+            id,
+            namespace,
+            proxy_id,
+            spec_version,
+            spec_format: *spec_format,
+            spec_content: stored_bytes_digest(spec_content),
+            content_encoding,
+            uncompressed_size: *uncompressed_size,
+            content_hash,
+            title: title.as_deref(),
+            info_version: info_version.as_deref(),
+            description: description.as_deref(),
+            contact_name: contact_name.as_deref(),
+            contact_email: contact_email.as_deref(),
+            license_name: license_name.as_deref(),
+            license_identifier: license_identifier.as_deref(),
+            tags,
+            server_urls,
+            operation_count: *operation_count,
+            resource_hash,
+            external_ref_snapshot: external_ref_snapshot.as_deref().map(stored_bytes_digest),
+            external_ref_digest: external_ref_digest.as_deref(),
+            created_at: *created_at,
+            updated_at: *updated_at,
+        }
+    }
+}
+
+/// One member of the snapshot representation tuple.
+enum RepresentationMember<'a> {
+    /// A sorted array whose elements are produced, and released, one at a time.
+    Items(Box<dyn Iterator<Item = Result<serde_json::Value, serde_json::Error>> + 'a>),
+    Value(Result<serde_json::Value, serde_json::Error>),
+}
+
+fn sorted_items<'a, T: serde::Serialize + 'a>(
+    items: &'a [T],
+    id: fn(&T) -> &str,
+) -> RepresentationMember<'a> {
+    let mut sorted: Vec<&T> = items.iter().collect();
+    sorted.sort_by(|a, b| id(a).cmp(id(b)));
+    RepresentationMember::Items(Box::new(sorted.into_iter().map(serde_json::to_value)))
+}
+
 /// Complete primary snapshot for opt-in conditional administrative exports.
 /// Runtime-only state and read timestamps never contribute to the revision.
 pub struct ConditionalNamespaceSnapshot {
@@ -38,45 +322,105 @@ pub struct ConditionalNamespaceSnapshot {
 
 impl ConditionalNamespaceSnapshot {
     /// Stable full stored representation, including credentials, associations,
-    /// spec documents, trust and registry metadata. The durable namespace
-    /// change watermark also fences delete/recreate and reverted mutations.
+    /// spec metadata and stored-content digests, trust and registry metadata.
+    /// The durable namespace change watermark also fences delete/recreate and
+    /// reverted mutations.
+    ///
+    /// Shape: `[proxies, consumers, upstreams, plugin_configs,
+    /// gateway_trust_bundles, api_specs, namespace_record, change_sequence]`,
+    /// each array sorted by id. Prefer [`Self::digest`], which streams the same
+    /// canonical bytes without materializing them.
     pub fn representation(&self) -> Result<serde_json::Value, serde_json::Error> {
-        let mut proxies = self.config.proxies.clone();
+        let mut members = Vec::with_capacity(8);
+        for member in self.representation_members() {
+            members.push(match member {
+                RepresentationMember::Items(items) => {
+                    serde_json::Value::Array(items.collect::<Result<_, _>>()?)
+                }
+                RepresentationMember::Value(value) => value?,
+            });
+        }
+        Ok(serde_json::Value::Array(members))
+    }
+
+    /// Bounded digest of [`Self::representation`], streamed one resource at a
+    /// time. Fails with [`NamespaceSnapshotTooLarge`] past
+    /// [`MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES`].
+    pub fn digest(&self) -> Result<SnapshotDigest, anyhow::Error> {
+        self.digest_within(MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES)
+    }
+
+    /// [`Self::digest`] with an explicit canonical-byte bound.
+    pub fn digest_within(&self, limit: usize) -> Result<SnapshotDigest, anyhow::Error> {
+        let mut writer = SnapshotDigestWriter::new(limit);
+        let written = self.write_canonical(&mut writer);
+        writer.finish(written)
+    }
+
+    /// Stream the canonical rendering of [`Self::representation`].
+    pub(crate) fn write_canonical<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
+        use crate::admin::preconditions::write_canonical_json_to;
+        out.write_all(b"[")?;
+        for (index, member) in self.representation_members().into_iter().enumerate() {
+            if index > 0 {
+                out.write_all(b",")?;
+            }
+            match member {
+                RepresentationMember::Items(items) => {
+                    out.write_all(b"[")?;
+                    for (position, item) in items.enumerate() {
+                        if position > 0 {
+                            out.write_all(b",")?;
+                        }
+                        write_canonical_json_to(&item.map_err(std::io::Error::other)?, out)?;
+                    }
+                    out.write_all(b"]")?;
+                }
+                RepresentationMember::Value(value) => {
+                    write_canonical_json_to(&value.map_err(std::io::Error::other)?, out)?;
+                }
+            }
+        }
+        out.write_all(b"]")
+    }
+
+    fn representation_members(&self) -> [RepresentationMember<'_>; 8] {
+        let mut proxies: Vec<&Proxy> = self.config.proxies.iter().collect();
         proxies.sort_by(|a, b| a.id.cmp(&b.id));
-        for proxy in &mut proxies {
+        let proxies = proxies.into_iter().map(|proxy| {
+            let mut proxy = proxy.clone();
             proxy
                 .plugins
                 .sort_by(|a, b| a.plugin_config_id.cmp(&b.plugin_config_id));
-        }
-        let mut consumers = self.config.consumers.clone();
-        consumers.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut upstreams = self.config.upstreams.clone();
-        upstreams.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut plugins = self.config.plugin_configs.clone();
-        plugins.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut specs = self.api_specs.clone();
+            serde_json::to_value(proxy)
+        });
+        let mut specs: Vec<&ApiSpec> = self.api_specs.iter().collect();
         specs.sort_by(|a, b| a.id.cmp(&b.id));
-        serde_json::to_value((
-            proxies,
-            consumers,
-            upstreams,
-            plugins,
-            &self.config.gateway_trust_bundles,
-            specs,
-            &self.namespace_record,
-            self.change_sequence,
-        ))
+        let specs = specs
+            .into_iter()
+            .map(|spec| serde_json::to_value(ApiSpecSnapshotView::from(spec)));
+        [
+            RepresentationMember::Items(Box::new(proxies)),
+            sorted_items(&self.config.consumers, |c| c.id.as_str()),
+            sorted_items(&self.config.upstreams, |u| u.id.as_str()),
+            sorted_items(&self.config.plugin_configs, |p| p.id.as_str()),
+            RepresentationMember::Value(serde_json::to_value(&self.config.gateway_trust_bundles)),
+            RepresentationMember::Items(Box::new(specs)),
+            RepresentationMember::Value(serde_json::to_value(&self.namespace_record)),
+            RepresentationMember::Value(Ok(serde_json::Value::from(self.change_sequence))),
+        ]
     }
 }
 
 /// A validated replacement plus the exact namespace state it may replace.
-/// Stores compare `expected` inside the same transaction as every mutation and
-/// pin a live admission lease before reading the snapshot, then renew that
-/// pinned owner/generation before commit. Callers must stop and join external
-/// renewal before invoking this operation. No fallback to chunked restore.
+/// Stores compare the digest of the current snapshot with `expected` inside the
+/// same transaction as every mutation and pin a live admission lease before
+/// reading the snapshot, then renew that pinned owner/generation before commit.
+/// Callers must stop and join external renewal before invoking this operation.
+/// No fallback to chunked restore.
 pub struct ConditionalNamespaceRestore<'a> {
     pub graph: AtomicBatchGraph<'a>,
-    pub expected: &'a serde_json::Value,
+    pub expected: SnapshotDigest,
     pub api_specs: &'a [ApiSpec],
     /// Omission preserves trust; an empty slice explicitly revokes it.
     pub gateway_trust_bundles: Option<&'a [GatewayTrustBundleRecord]>,

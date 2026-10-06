@@ -62,7 +62,7 @@
 //!   because the warmup probe landed first.
 //! - **Connection-counter drift.** Tests that assert
 //!   `backend.accepted_connections() == 1` (e.g.
-//!   `h2_direct_pool_reuses_connection_across_requests`) need warmup off
+//!   `grpc_pool_reuses_backend_connection_across_requests`) need warmup off
 //!   because the warmup probe consumes the first connection slot.
 //! - **Capability classification timing.** Conversely, tests that depend
 //!   on the capability registry having a `Supported` entry for an HTTPS
@@ -188,7 +188,7 @@ impl Default for GatewayHarnessBuilder {
             // in via `pool_warmup_enabled(true)`. Defaulting `true` here
             // would silently double-count the first probe as a backend
             // connection in tests like
-            // `h2_direct_pool_reuses_connection_across_requests`.
+            // `grpc_pool_reuses_backend_connection_across_requests`.
             pool_warmup_enabled: false,
             extra_env: Vec::new(),
         }
