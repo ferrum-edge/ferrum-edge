@@ -655,6 +655,81 @@ async fn h2_stream_reset_classified_as_protocol_error() {
     );
 }
 
+// A response-side CANCEL after DATA is still a backend protocol failure.
+// In particular, Hyper 1.10 exposes CANCEL as a body error; only NO_ERROR is
+// deliberately masked. `classify_body_error` reads the remote `h2::Error`
+// under hyper's body error, so the access log records `protocol_error` and
+// the reset counts against backend health.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_backend_cancel_mid_response_is_logged_as_protocol_error() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptStreamingRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"partial")))
+        .step(GrpcStep::SendRstStream { error_code: 8 }) // CANCEL
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = GatewayHarness::builder()
+        .file_config(grpc_file_config(backend_port, Value::Null))
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        // Select the production zero-buffering H2 body branch so the partial
+        // DATA frame is committed to the client before the reset reaches it.
+        .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b"request")),
+    )
+    .await
+    .expect("backend CANCEL response timeout")
+    .expect("response surfaced");
+
+    assert_eq!(response.http_status, 200);
+    // The client's h2 stack may discard DATA it buffered when the RST_STREAM
+    // arrives, so the partial message is not guaranteed to surface; it must
+    // never be followed by anything else.
+    assert!(
+        response.messages.is_empty() || response.messages == [Bytes::from_static(b"partial")],
+        "unexpected messages after backend CANCEL: {:?}",
+        response.messages
+    );
+    assert!(
+        response.stream_error.is_some()
+            || response.grpc_status().is_some_and(|status| status != 0)
+            || response.trailers.is_none(),
+        "backend CANCEL must not become a clean truncated gRPC 200: {response:?}"
+    );
+
+    // The reset can win the race with the gateway committing response headers.
+    // After headers it is a streamed body error (`body_error_class` =
+    // `protocol_error`, deterministic coverage in the `classify_body_error`
+    // unit tests); before them it is a pre-header backend failure
+    // (`rejection_phase` = `grpc_backend_error`). Either way it is a backend
+    // failure, never a clean success.
+    let logs = collect_flushed_logs(&harness).await;
+    let body_protocol_error = logs.contains("\\\"body_error_class\\\":\\\"protocol_error\\\"")
+        || logs.contains("\"body_error_class\":\"protocol_error\"");
+    assert!(
+        body_protocol_error || has_backend_error_signal(&logs),
+        "backend CANCEL must be recorded as a backend failure; logs:\n{logs}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Round-2 error-code matrices. Error handling is asserted as a family because
 // the response may be a Trailers-Only gRPC error or a transport-level stream
@@ -5279,16 +5354,33 @@ async fn h2_direct_sse_stall_after_first_event_classifies_read_write_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload() {
+    direct_h2_early_response_upload(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_response_before_request_data_survives_upload() {
+    direct_h2_early_response_upload(false).await;
+}
+
+async fn direct_h2_early_response_upload(read_request_data_before_response: bool) {
+    // Larger than the backend's default 65,535-byte stream window, so the
+    // upload is provably unfinished when the response head arrives.
+    const UPLOAD_LEN: usize = 2 * 1024 * 1024;
     let ca = TestCa::new("h2-early-response-upload").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
-    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
-        .expect("h2 tls backend")
-        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+    let mut backend_builder =
+        ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+            .expect("h2 tls backend")
+            .step(H2Step::ExpectHeaders(MatchHeaders::any()));
+    if read_request_data_before_response {
         // One DATA frame proves the upload started; the rest is still in
         // flight when the response head goes out.
-        .step(H2Step::ReadRequestData)
+        backend_builder = backend_builder.step(H2Step::ReadRequestData);
+    }
+    let backend = backend_builder
         .step(H2Step::RespondHeaders(vec![
             (":status", "200".into()),
             ("content-type", "text/plain".into()),
@@ -5339,13 +5431,14 @@ async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload()
         .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
 
     let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
-    // Larger than the backend's default 65,535-byte stream window, so the
-    // upload is provably unfinished when the response head arrives.
-    let upload = vec![b'x'; 2 * 1024 * 1024];
+    let upload = vec![b'x'; UPLOAD_LEN];
     let resp = client
         .as_reqwest()
         .post(format!("{}/api/early", harness.proxy_base_url()))
         .header("content-type", "application/octet-stream")
+        // Bound the whole exchange, body included, so a hang fails here rather
+        // than running to the job timeout.
+        .timeout(Duration::from_secs(30))
         .body(upload)
         .send()
         .await
@@ -5359,11 +5452,14 @@ async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload()
         "the early response must complete: a truncated body means the \
          dispatcher cancelled the still-live upload on return"
     );
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), 1, "the exchange must use one backend stream");
     assert_eq!(
-        backend.received_streams().await.len(),
-        1,
-        "the exchange must complete on a single backend stream, not a retry"
+        streams[0].body.len(),
+        UPLOAD_LEN,
+        "the backend must receive the whole upload after the early response"
     );
+    backend.assert_no_step_errors().await;
 }
 
 /// gRPC pool shards per backend host in the affinity tests.

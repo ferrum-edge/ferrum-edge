@@ -1704,6 +1704,27 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
                 _ => {}
             }
         }
+        // A backend RST_STREAM or GOAWAY that ends the response body mid-stream.
+        // hyper's H2 body surfaces it as `hyper::Error(Body)` whose source is the
+        // `h2::Error`, and neither its Display nor its Debug text carries a token
+        // the string fallback recognizes, so it used to fall through to
+        // `RequestError` and the deferred dispatch banked a phantom success.
+        // Only backend-caused frames count: received from the peer (`is_remote`)
+        // or sent by h2 because the peer violated the protocol (`is_library`).
+        // A gateway-originated reset or bare reason (`h2::Error::from(Reason)`,
+        // e.g. the upload pump relaying a client CANCEL) is not charged to the
+        // backend. NO_ERROR keeps its existing meaning: hyper's body already ends
+        // a NO_ERROR reset as a clean early response (RFC 9113 §8.1) and a
+        // NO_ERROR GOAWAY is a graceful shutdown, so one that still reaches this
+        // point falls through unchanged instead of becoming a backend failure.
+        if let Some(h2_err) = err.downcast_ref::<h2::Error>()
+            && (h2_err.is_remote() || h2_err.is_library())
+            && h2_err
+                .reason()
+                .is_some_and(|reason| reason != h2::Reason::NO_ERROR)
+        {
+            return (ErrorClass::ProtocolError, false);
+        }
         if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
             // `is_canceled` maps to a client-side cancellation (e.g. the client
             // dropped the request future). `is_incomplete_message` means the

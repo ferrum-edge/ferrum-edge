@@ -1,40 +1,44 @@
 #!/usr/bin/env python3
-"""Check #5912's security floors in committed Cargo lockfiles (hosted CI only)."""
+"""Check security floors and vendored path patches in committed Cargo lockfiles.
+
+Hosted CI only. Every committed lockfile must keep each SECURITY_FLOORS crate at
+or above its fixed version. Every lockfile that builds `ferrum-edge` must also
+resolve each PATH_PATCHED crate to exactly one copy: the `[patch.crates-io]`
+path crate under `vendor/`, which has no `source` or `checksum`. A second,
+registry copy (for example a dependency that moves to a semver line the patch
+does not cover) would ship that crate without Ferrum's patches.
+"""
 
 from pathlib import Path
-import json
+import re
 import subprocess
 import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FLOORS = {
+SECURITY_FLOORS = {
     "opentelemetry_sdk": (0, 32, 1),
     "aws-smithy-json": (0, 62, 7),
     "xxhash-rust": (0, 8, 16),
 }
-GCP_CHAIN = {
-    "google-cloud-secretmanager-v1": "1.10.0",
-    "google-cloud-auth": "1.11.0",
-    "google-cloud-gax-internal": "0.7.14",
-    "google-cloud-gax": "1.11.0",
-    "google-cloud-wkt": "1.5.0",
-    "opentelemetry": "0.32.0",
-    "opentelemetry-semantic-conventions": "0.32.0",
-    "tracing-opentelemetry": "0.33.0",
-}
-AWS_CHAIN = {
-    "aws-smithy-json": "0.62.7",
-    "aws-smithy-runtime-api": "1.12.3",
-    "aws-smithy-runtime-api-macros": "1.0.0",
-    "aws-smithy-types": "1.4.9",
-    "aws-smithy-schema": "0.1.0",
-    "aws-smithy-async": "1.2.14",
-}
-VENDORS = {"hyper": "1.10.0", "reqwest": "0.13.4"}
+PATH_PATCHED = ("hyper", "reqwest", "h2", "hyper-util")
+
+
+def vendored_version(crate: str) -> str:
+    """Return the version of the single `vendor/<crate>-<version>-ferrum-patched` copy."""
+    pattern = re.compile(rf"{re.escape(crate)}-(\d+\.\d+\.\d+)-ferrum-patched")
+    matches = [path for path in (ROOT / "vendor").iterdir() if pattern.fullmatch(path.name)]
+    if len(matches) != 1:
+        raise SystemExit(f"expected one vendored {crate} copy, found {len(matches)}")
+    manifest = tomllib.loads((matches[0] / "Cargo.toml").read_text())
+    version = manifest["package"]["version"]
+    if pattern.fullmatch(matches[0].name).group(1) != version:
+        raise SystemExit(f"{matches[0].name}: Cargo.toml declares {crate} {version}")
+    return version
 
 
 def verify() -> None:
+    patched = {crate: vendored_version(crate) for crate in PATH_PATCHED}
     names = subprocess.check_output(
         ["git", "ls-files", "-z", "Cargo.lock", "**/Cargo.lock"], cwd=ROOT
     ).decode().split("\0")
@@ -44,7 +48,7 @@ def verify() -> None:
         by_name = {}
         for package in packages:
             by_name.setdefault(package["name"], []).append(package)
-            floor = FLOORS.get(package["name"])
+            floor = SECURITY_FLOORS.get(package["name"])
             if floor is not None:
                 version = package["version"]
                 parts = version.split(".")
@@ -53,7 +57,7 @@ def verify() -> None:
                 elif tuple(map(int, parts)) < floor:
                     failures.append(f"{name}: vulnerable {package['name']} {version}")
         if "ferrum-edge" in by_name:
-            for crate, expected in VENDORS.items():
+            for crate, expected in patched.items():
                 copies = by_name.get(crate, [])
                 if (
                     len(copies) != 1
@@ -61,36 +65,10 @@ def verify() -> None:
                     or "source" in copies[0]
                     or "checksum" in copies[0]
                 ):
-                    failures.append(f"{name}: {crate} must use only the {expected} path patch")
-        if name == "Cargo.lock":
-            for crate, expected in (GCP_CHAIN | AWS_CHAIN).items():
-                copies = by_name.get(crate, [])
-                if len(copies) != 1 or copies[0]["version"] != expected:
-                    failures.append(f"{name}: expected one {crate} {expected}")
-            for crate in FLOORS:
-                if len(by_name.get(crate, [])) != 1:
-                    failures.append(f"{name}: expected one fixed {crate}")
+                    failures.append(
+                        f"{name}: {crate} must resolve only to the vendored {expected} path patch"
+                    )
         print(f"Inspected {name}: {len(packages)} packages")
-    if "Cargo.lock" not in names or "tests/performance/mesh/Cargo.lock" not in names:
-        failures.append("root and mesh lockfiles must both be committed")
-    # The lockfile's source-less entry alone cannot identify WHICH path crate
-    # Cargo used. Check metadata from each actual production-dependent graph.
-    for graph in ("root", "mesh", "fuzz"):
-        metadata = ROOT / f"security-lockfiles/evidence/{graph}-metadata.json"
-        if not metadata.is_file():
-            failures.append(f"missing hosted {graph} metadata")
-            continue
-        packages = json.loads(metadata.read_text())["packages"]
-        for crate, version in VENDORS.items():
-            copies = [p for p in packages if p["name"] == crate]
-            expected = ROOT / f"vendor/{crate}-{version}-ferrum-patched/Cargo.toml"
-            if (
-                len(copies) != 1
-                or copies[0]["version"] != version
-                or copies[0]["source"] is not None
-                or Path(copies[0]["manifest_path"]).resolve() != expected.resolve()
-            ):
-                failures.append(f"{graph} metadata: {crate} must resolve to {expected}")
     if failures:
         raise SystemExit("\n".join(failures))
 

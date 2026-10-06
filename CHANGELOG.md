@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Make reqwest patch reconstruction and dependency security floors required
+  CI** (#6019). The blocking dependency audit now reconstructs the published
+  reqwest archive and checks security floors across committed lockfiles; the
+  obsolete lockfile workflow and completed #5912 evidence page are removed.
+  The dependency policy now documents how to lift the GCP, Smithy, and xxhash
+  pins.
+
+### Fixed
+
+- **Backend HTTP/2 resets mid-response count as backend failures** (#6019).
+  A backend `RST_STREAM` or `GOAWAY` with any reason other than `NO_ERROR`
+  after response headers reached the body classifier as a hyper body error
+  whose text matched no heuristic. It was logged as
+  `body_error_class=request_error`, and circuit breakers and passive health
+  recorded the response as a success. `classify_body_error` now reads the typed
+  `h2::Error` in the source chain and classifies these as `protocol_error`,
+  which counts as a backend failure. This covers direct HTTP/2 and gRPC
+  response bodies, and any other body whose error chain carries the h2 error.
+  Only frames the backend sent, or that h2 sent
+  because the backend broke the protocol, are charged to it. A reset the
+  gateway raises itself is not. `NO_ERROR` is unchanged: hyper still ends the
+  body as an early response. Backends that reset streams mid-response can now
+  open circuit breakers and fail passive health checks where they did not
+  before. Dashboards keyed on `body_error_class` will see these responses move
+  from `request_error` to `protocol_error`.
+
+### Changed
+
+- **Test coverage for HTTP/2 early responses** (#6019). A scripted direct-H2
+  backend now answers before reading any request DATA, then drains the full
+  2 MiB upload, alongside the existing variant that reads one DATA frame first.
 ### Fixed
 
 - **A request that joins the capability probe's backend setup keeps its own
@@ -478,7 +511,7 @@ authenticated GHCR proof and revision-label limits.
   `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; issue #5912 is closed. Its
   exact-head hosted checks passed, followed by the separately verified 0.9.11
   release qualification and publication. Advisory disposition remains separate.
-  See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
+  See the [security-floor policy](docs/dependency-policy.md#security-floor-pins)
   and [completed source integration evidence](docs/releases/v0.9.11.md#dependency-source-integration-evidence).
 
 - **Conditional admin reads and restores use authoritative strong state tags**

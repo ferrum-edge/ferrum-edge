@@ -409,9 +409,10 @@ versions, checksums, graph inputs and producer provenance are unchanged from
 main's security fix. Hosted source qualification passed at the reviewed
 #6004 head and issue #5912 is closed; the subsequent 0.9.11 release
 qualification and distribution verification completed separately. Cloud secrets
-remain unsupported in enforcing FIPS mode. See
-[the security upgrade record](dependency-security-upgrade-5912.md) for exact
-producer provenance and patch-port risks, and the
+remain unsupported in enforcing FIPS mode. See the
+[dependency security-floor policy](dependency-policy.md#security-floor-pins)
+and the archive reconstruction notes in the Hyper and reqwest patch records,
+and the
 [completed source integration evidence](releases/v0.9.11.md#dependency-source-integration-evidence)
 for the merge and exact-head hosted proof. Those historical results do not
 qualify future release candidates or close product advisories.

@@ -1141,6 +1141,147 @@ fn test_classify_body_error_walks_source_chain_to_io_error() {
     assert!(!disconnected);
 }
 
+// A backend RST_STREAM after response DATA reaches the body classifier as
+// `hyper::Error(Body)` wrapping a remote `h2::Error`. Its text matches no string
+// fallback token, so only the typed h2 arm keeps it from becoming a
+// `RequestError` that circuit breaker and passive health bank as a success.
+mod h2_body_reset_classification {
+    use super::*;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty};
+    use hyper::client::conn::http2 as h2_client;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio::sync::oneshot;
+
+    /// Serve one H2 response that sends `partial` and then resets with
+    /// `reason`, and return what the client body yields after that DATA frame.
+    async fn body_result_after_remote_reset(
+        reason: h2::Reason,
+    ) -> Option<Result<http_body::Frame<Bytes>, hyper::Error>> {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (data_seen_tx, data_seen_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io)
+                .await
+                .expect("h2 server handshake");
+            let Some(Ok((_request, mut respond))) = conn.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut stream = respond
+                    .send_response(http::Response::new(()), false)
+                    .expect("response headers");
+                stream
+                    .send_data(Bytes::from_static(b"partial"), false)
+                    .expect("partial DATA");
+                // Reset only after the client holds the DATA frame, so the
+                // reset cannot discard it while still queued.
+                let _ = data_seen_rx.await;
+                stream.send_reset(reason);
+            });
+            // Keep driving the connection until the client goes away.
+            while conn.accept().await.is_some() {}
+        });
+
+        let io = TokioIo::new(client_io);
+        let handshake = h2_client::handshake::<_, _, Empty<Bytes>>(TokioExecutor::new(), io);
+        let (mut sender, connection) = handshake.await.expect("h2 client handshake");
+        tokio::spawn(connection);
+        let request = hyper::Request::builder()
+            .uri("http://backend.test/")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let response = sender
+            .send_request(request)
+            .await
+            .expect("response headers");
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("partial DATA frame")
+            .expect("partial DATA");
+        assert_eq!(
+            first.data_ref().map(|data| data.as_ref()),
+            Some(&b"partial"[..])
+        );
+        let _ = data_seen_tx.send(());
+        body.frame().await
+    }
+
+    #[tokio::test]
+    async fn remote_reset_mid_body_is_a_backend_protocol_error() {
+        for reason in [h2::Reason::CANCEL, h2::Reason::INTERNAL_ERROR] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                body_result_after_remote_reset(reason),
+            )
+            .await
+            .expect("remote reset must reach the client body");
+            let err = match result {
+                Some(Err(err)) => err,
+                other => panic!("{reason:?}: expected a body error, got {other:?}"),
+            };
+            let h2_err = std::error::Error::source(&err)
+                .and_then(|source| source.downcast_ref::<h2::Error>())
+                .expect("hyper body error carries the h2 error");
+            assert!(h2_err.is_reset() && h2_err.is_remote(), "{reason:?}");
+            assert_eq!(h2_err.reason(), Some(reason));
+
+            let (class, disconnected) = classify_body_error(&err);
+            assert_eq!(class, ErrorClass::ProtocolError, "{reason:?}");
+            assert!(!disconnected, "{reason:?}");
+
+            // The same error boxed the way the streaming adapters hand it on.
+            let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+            let (class, disconnected) = classify_body_error(&*boxed);
+            assert_eq!(class, ErrorClass::ProtocolError, "{reason:?}");
+            assert!(!disconnected, "{reason:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_no_error_reset_ends_the_body_cleanly() {
+        // hyper ends a NO_ERROR reset as an early response (RFC 9113 §8.1), so
+        // it never reaches the classifier as a body error.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            body_result_after_remote_reset(h2::Reason::NO_ERROR),
+        )
+        .await
+        .expect("NO_ERROR reset must reach the client body");
+        assert!(result.is_none(), "NO_ERROR must end the body: {result:?}");
+    }
+
+    #[test]
+    fn gateway_originated_h2_reason_is_not_charged_to_the_backend() {
+        // `h2::Error::from(Reason)` is how the upload pump relays a client
+        // CANCEL. It is neither received from nor caused by the backend.
+        #[derive(Debug)]
+        struct Wrapper(h2::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error reading a body from connection")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        for reason in [
+            h2::Reason::CANCEL,
+            h2::Reason::INTERNAL_ERROR,
+            h2::Reason::NO_ERROR,
+        ] {
+            let wrapped = Wrapper(h2::Error::from(reason));
+            let (class, disconnected) = classify_body_error(&wrapped);
+            assert_eq!(class, ErrorClass::RequestError, "{reason:?}");
+            assert!(!disconnected, "{reason:?}");
+        }
+    }
+}
+
 // --- Typed StreamSetupError classification (Gap 2 + Gap 4) ---
 
 #[test]
