@@ -5454,12 +5454,10 @@ async fn grpc_early_response_upload_affinity(tls_frontend: bool, authenticated: 
     let key_path = scratch.path().join("frontend.key");
     std::fs::write(&cert_path, cert).expect("write cert");
     std::fs::write(&key_path, key).expect("write key");
-    let mut builder = GatewayHarness::builder()
-        .file_config(yaml)
-        .env(
-            "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST",
-            AFFINITY_SHARDS.to_string(),
-        );
+    let mut builder = GatewayHarness::builder().file_config(yaml).env(
+        "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST",
+        AFFINITY_SHARDS.to_string(),
+    );
     let tls_port = if tls_frontend {
         let reservation = reserve_port().await.expect("frontend TLS port");
         let port = reservation.drop_and_take_port();

@@ -2737,7 +2737,9 @@ async fn start_first_connection_draining_h2c_backend() -> (u16, Arc<AtomicUsize>
                 if draining {
                     builder.max_concurrent_streams(0);
                 }
-                let _ = builder.serve_connection(TokioIo::new(socket), service).await;
+                let _ = builder
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
             });
         }
     });
