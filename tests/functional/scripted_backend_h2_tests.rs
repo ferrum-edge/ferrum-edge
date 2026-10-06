@@ -657,7 +657,9 @@ async fn h2_stream_reset_classified_as_protocol_error() {
 
 // A response-side CANCEL after DATA is still a backend protocol failure.
 // In particular, Hyper 1.10 exposes CANCEL as a body error; only NO_ERROR is
-// deliberately masked by the gRPC proxy.
+// deliberately masked. `classify_body_error` reads the remote `h2::Error`
+// under hyper's body error, so the access log records `protocol_error` and
+// the reset counts against backend health.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_backend_cancel_mid_response_is_logged_as_protocol_error() {
@@ -675,6 +677,10 @@ async fn h2_backend_cancel_mid_response_is_logged_as_protocol_error() {
         .file_config(grpc_file_config(backend_port, Value::Null))
         .log_level("info")
         .env("RUST_LOG", "info")
+        // Select the production zero-buffering H2 body branch so the partial
+        // DATA frame is committed to the client before the reset reaches it.
+        .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
         .capture_output()
         .spawn()
         .await
@@ -5181,6 +5187,9 @@ async fn direct_h2_response_before_request_data_survives_upload() {
 }
 
 async fn direct_h2_early_response_upload(read_request_data_before_response: bool) {
+    // Larger than the backend's default 65,535-byte stream window, so the
+    // upload is provably unfinished when the response head arrives.
+    const UPLOAD_LEN: usize = 2 * 1024 * 1024;
     let ca = TestCa::new("h2-early-response-upload").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("reserve port");
@@ -5245,13 +5254,14 @@ async fn direct_h2_early_response_upload(read_request_data_before_response: bool
         .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
 
     let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
-    // Larger than the backend's default 65,535-byte stream window, so the
-    // upload is provably unfinished when the response head arrives.
-    let upload = vec![b'x'; 2 * 1024 * 1024];
+    let upload = vec![b'x'; UPLOAD_LEN];
     let resp = client
         .as_reqwest()
         .post(format!("{}/api/early", harness.proxy_base_url()))
         .header("content-type", "application/octet-stream")
+        // Bound the whole exchange, body included, so a hang fails here rather
+        // than running to the job timeout.
+        .timeout(Duration::from_secs(30))
         .body(upload)
         .send()
         .await
@@ -5267,12 +5277,12 @@ async fn direct_h2_early_response_upload(read_request_data_before_response: bool
     );
     let streams = backend.received_streams().await;
     assert_eq!(streams.len(), 1, "the exchange must use one backend stream");
-    if read_request_data_before_response {
-        assert!(
-            !streams[0].body.is_empty(),
-            "backend read initial request DATA"
-        );
-    }
+    assert_eq!(
+        streams[0].body.len(),
+        UPLOAD_LEN,
+        "the backend must receive the whole upload after the early response"
+    );
+    backend.assert_no_step_errors().await;
 }
 
 /// gRPC pool shards per backend host in the affinity tests.

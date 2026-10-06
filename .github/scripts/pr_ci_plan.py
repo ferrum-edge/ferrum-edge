@@ -939,7 +939,8 @@ VENDOR_PATCH_PATTERNS = [
 ]
 
 # `run_dependency_audit`: cargo-deny plus the vendored-patch lifecycle and
-# advisory-expiry gates and pinned Hyper patch reconstruction it hosts.
+# advisory-expiry gates, the pinned Hyper and reqwest patch reconstructions, and
+# the lockfile security-floor check it hosts.
 DEPENDENCY_AUDIT_PATTERNS = [
     re.compile(pattern)
     for pattern in (
@@ -958,6 +959,7 @@ DEPENDENCY_AUDIT_PATTERNS = [
         r"^docs/upstream-",
         r"^PRODUCTION_READINESS\.md$",
         r"^scripts/(?:check_advisory_expiry\.sh|check_vendored_patch_lifecycle\.py)$",
+        r"^scripts/verify_dependency_security_chain\.py$",
     )
 ]
 
@@ -1760,6 +1762,11 @@ def self_test() -> int:
         (
             "pull_request",
             ["scripts/check_advisory_expiry.sh"],
+            {"run_dependency_audit": True, "run_rust": False},
+        ),
+        (
+            "pull_request",
+            ["scripts/verify_dependency_security_chain.py"],
             {"run_dependency_audit": True, "run_rust": False},
         ),
         # Standalone benchmark workspaces are not root-crate inputs; their own

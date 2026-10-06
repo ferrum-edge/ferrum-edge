@@ -18,10 +18,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Cover H2 early responses and backend CANCEL resets** (#6019).
-  Scripted-backend regressions cover a response before request DATA and require
-  a backend response-side `RST_STREAM(CANCEL)` to surface as a protocol error
-  rather than a clean truncated response.
+- **Backend HTTP/2 resets mid-response count as backend failures** (#6019).
+  A backend `RST_STREAM` or `GOAWAY` with any reason other than `NO_ERROR`
+  after response headers reached the body classifier as a hyper body error
+  whose text matched no heuristic. It was logged as
+  `body_error_class=request_error`, and circuit breakers and passive health
+  recorded the response as a success. `classify_body_error` now reads the typed
+  `h2::Error` in the source chain and classifies these as `protocol_error`,
+  which counts as a backend failure. This covers direct HTTP/2 and gRPC
+  response bodies, and any other body whose error chain carries the h2 error.
+  Only frames the backend sent, or that h2 sent
+  because the backend broke the protocol, are charged to it. A reset the
+  gateway raises itself is not. `NO_ERROR` is unchanged: hyper still ends the
+  body as an early response. Backends that reset streams mid-response can now
+  open circuit breakers and fail passive health checks where they did not
+  before. Dashboards keyed on `body_error_class` will see these responses move
+  from `request_error` to `protocol_error`.
+
+### Changed
+
+- **Test coverage for HTTP/2 early responses** (#6019). A scripted direct-H2
+  backend now answers before reading any request DATA, then drains the full
+  2 MiB upload, alongside the existing variant that reads one DATA frame first.
 
 ## [0.9.13] - 2026-10-06
 
