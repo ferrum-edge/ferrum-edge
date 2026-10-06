@@ -1,25 +1,55 @@
 //! Opt-in authority for partial deployment mutations. Never used by runtime loading.
 
 use crate::config::batch_atomicity::NamespaceConfigAdmissionLeaseRef;
-use crate::config::db_backend::ConditionalNamespaceSnapshot;
+use crate::config::db_backend::{
+    ConditionalNamespaceSnapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES, SnapshotDigest,
+    SnapshotDigestWriter,
+};
 use crate::config::types::PluginScope;
 use serde_json::Value;
 use std::collections::HashSet;
 
 /// Typed evidence and raw store evidence read from the same primary transaction.
-/// Raw rows/documents retain unknown fields, credentials and association metadata.
+/// Raw rows/documents retain unknown fields, credentials and association metadata;
+/// binary values (stored spec documents included) are carried as a SHA-256
+/// digest and length, never as the bytes themselves.
 pub struct DeploymentSnapshot {
     pub snapshot: ConditionalNamespaceSnapshot,
     pub stored: Value,
 }
 
 impl DeploymentSnapshot {
+    /// `{"profile": "deployment-v1", "resources": <namespace representation>,
+    /// "stored": <raw evidence>}`. Materialize it only after [`Self::digest`]
+    /// has accepted the snapshot within the representation bound.
     pub fn representation(&self) -> Result<Value, serde_json::Error> {
         Ok(serde_json::json!({
             "profile": "deployment-v1",
             "resources": self.snapshot.representation()?,
             "stored": self.stored,
         }))
+    }
+
+    /// Bounded digest of [`Self::representation`], streamed without
+    /// materializing it.
+    pub fn digest(&self) -> Result<SnapshotDigest, anyhow::Error> {
+        self.digest_within(MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES)
+    }
+
+    /// [`Self::digest`] with an explicit canonical-byte bound.
+    pub fn digest_within(&self, limit: usize) -> Result<SnapshotDigest, anyhow::Error> {
+        let mut writer = SnapshotDigestWriter::new(limit);
+        let written = self.write_canonical(&mut writer);
+        writer.finish(written)
+    }
+
+    fn write_canonical<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
+        // Keys in canonical (sorted) order: profile < resources < stored.
+        out.write_all(br#"{"profile":"deployment-v1","resources":"#)?;
+        self.snapshot.write_canonical(out)?;
+        out.write_all(br#","stored":"#)?;
+        crate::admin::preconditions::write_canonical_json_to(&self.stored, out)?;
+        out.write_all(b"}")
     }
 
     pub(crate) fn replacement_is_noop(
@@ -191,10 +221,138 @@ pub struct DeploymentRemovalPlan {
     pub upstreams: HashSet<String>,
 }
 
-/// Original expected representation, retained across transaction retries.
+/// Columns of each table rewritten by a conditional deployment replacement
+/// that the typed resource model owns. A replacement writes these from the
+/// submitted bundle and carries every other stored column forward unchanged,
+/// so this list must equal the baseline schema's columns for each table: a
+/// schema column missing here would silently keep its old value. The
+/// `deployment_known_columns_match_the_baseline_schema` unit test fails on
+/// any drift from `src/config/migrations/sql_dialect.rs`.
+pub const DEPLOYMENT_KNOWN_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "proxies",
+        &[
+            "labels",
+            "id",
+            "namespace",
+            "name",
+            "hosts",
+            "listen_path",
+            "backend_scheme",
+            "backend_host",
+            "backend_port",
+            "backend_path",
+            "strip_listen_path",
+            "preserve_host_header",
+            "backend_connect_timeout_ms",
+            "backend_read_timeout_ms",
+            "backend_write_timeout_ms",
+            "backend_tls_client_cert_path",
+            "backend_tls_client_key_path",
+            "backend_tls_verify_server_cert",
+            "backend_tls_server_ca_cert_path",
+            "dns_override",
+            "dns_cache_ttl_seconds",
+            "auth_mode",
+            "upstream_id",
+            "upstream_subset",
+            "circuit_breaker",
+            "retry",
+            "response_body_mode",
+            "pool_idle_timeout_seconds",
+            "pool_enable_http_keep_alive",
+            "pool_enable_http2",
+            "pool_tcp_keepalive_seconds",
+            "pool_http2_keep_alive_interval_seconds",
+            "pool_http2_keep_alive_timeout_seconds",
+            "pool_http2_initial_stream_window_size",
+            "pool_http2_initial_connection_window_size",
+            "pool_http2_adaptive_window",
+            "pool_http2_max_frame_size",
+            "pool_http2_max_concurrent_streams",
+            "pool_http3_connections_per_backend",
+            "pool_max_requests_per_connection",
+            "listen_port",
+            "frontend_tls",
+            "passthrough",
+            "udp_idle_timeout_seconds",
+            "tcp_idle_timeout_seconds",
+            "websocket_idle_timeout_seconds",
+            "websocket_permessage_deflate",
+            "allow_path_parameters",
+            "allowed_methods",
+            "allowed_ws_origins",
+            "udp_max_response_amplification_factor",
+            "stream_proxy_protocol",
+            "backend_proxy_protocol",
+            "stream_match",
+            "api_spec_id",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "upstreams",
+        &[
+            "labels",
+            "id",
+            "namespace",
+            "name",
+            "targets",
+            "algorithm",
+            "hash_on",
+            "hash_on_cookie_config",
+            "health_checks",
+            "service_discovery",
+            "subsets",
+            "backend_tls_client_cert_path",
+            "backend_tls_client_key_path",
+            "backend_tls_verify_server_cert",
+            "backend_tls_server_ca_cert_path",
+            "backend_tls_sni",
+            "backend_tls_san_allow_list",
+            "api_spec_id",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "plugin_configs",
+        &[
+            "labels",
+            "id",
+            "namespace",
+            "plugin_name",
+            "config",
+            "scope",
+            "proxy_id",
+            "enabled",
+            "priority_override",
+            "trigger_json",
+            "api_spec_id",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "proxy_plugins",
+        &["namespace", "proxy_id", "plugin_config_id"],
+    ),
+];
+
+/// The [`DEPLOYMENT_KNOWN_COLUMNS`] entry for `table`, if it is replaceable.
+pub fn deployment_known_columns(table: &str) -> Option<&'static [&'static str]> {
+    DEPLOYMENT_KNOWN_COLUMNS
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map(|(_, columns)| *columns)
+}
+
+/// Digest of the original expected representation, retained across
+/// transaction retries.
 pub struct DeploymentPrecondition<'a> {
     pub namespace: &'a str,
-    pub expected: &'a Value,
+    pub expected: SnapshotDigest,
     pub lease: NamespaceConfigAdmissionLeaseRef<'a>,
     pub validation_http_client: &'a crate::plugins::PluginHttpClient,
 }

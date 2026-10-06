@@ -29,7 +29,8 @@ use crate::config::db_backend::{
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, DeploymentSnapshot,
-    ExternalSpecUpstreamConflict, sort_stored_rows, validate_deployment_candidate,
+    ExternalSpecUpstreamConflict, deployment_known_columns, sort_stored_rows,
+    validate_deployment_candidate,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
 use crate::config::namespace_registry::{
@@ -3088,7 +3089,7 @@ impl DatabaseStore {
         let snapshot = self
             .deployment_snapshot_tx(tx, precondition.namespace)
             .await?;
-        if snapshot.representation()? != *precondition.expected {
+        if snapshot.digest()? != precondition.expected {
             return Err(NamespacePreconditionFailed.into());
         }
         crate::config::batch_atomicity::pause_conditional_restore_for_test(precondition.namespace)
@@ -7928,7 +7929,7 @@ impl DatabaseStore {
             let current = self
                 .conditional_namespace_snapshot_tx(&mut tx, graph.namespace)
                 .await?;
-            if current.representation()? != *restore.expected {
+            if current.digest()? != restore.expected {
                 return Err(anyhow::Error::new(NamespacePreconditionFailed));
             }
             crate::config::batch_atomicity::pause_conditional_restore_for_test(graph.namespace)
@@ -10945,105 +10946,8 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         use sqlx::Column;
         use sqlx::any::AnyTypeInfoKind;
-        let known: &[&str] = match table {
-            "proxies" => &[
-                "labels",
-                "id",
-                "namespace",
-                "name",
-                "hosts",
-                "listen_path",
-                "backend_scheme",
-                "backend_host",
-                "backend_port",
-                "backend_path",
-                "strip_listen_path",
-                "preserve_host_header",
-                "backend_connect_timeout_ms",
-                "backend_read_timeout_ms",
-                "backend_write_timeout_ms",
-                "backend_tls_client_cert_path",
-                "backend_tls_client_key_path",
-                "backend_tls_verify_server_cert",
-                "backend_tls_server_ca_cert_path",
-                "dns_override",
-                "dns_cache_ttl_seconds",
-                "auth_mode",
-                "upstream_id",
-                "upstream_subset",
-                "circuit_breaker",
-                "retry",
-                "response_body_mode",
-                "pool_idle_timeout_seconds",
-                "pool_enable_http_keep_alive",
-                "pool_enable_http2",
-                "pool_tcp_keepalive_seconds",
-                "pool_http2_keep_alive_interval_seconds",
-                "pool_http2_keep_alive_timeout_seconds",
-                "pool_http2_initial_stream_window_size",
-                "pool_http2_initial_connection_window_size",
-                "pool_http2_adaptive_window",
-                "pool_http2_max_frame_size",
-                "pool_http2_max_concurrent_streams",
-                "pool_http3_connections_per_backend",
-                "pool_max_requests_per_connection",
-                "listen_port",
-                "frontend_tls",
-                "passthrough",
-                "udp_idle_timeout_seconds",
-                "tcp_idle_timeout_seconds",
-                "websocket_idle_timeout_seconds",
-                "websocket_permessage_deflate",
-                "allow_path_parameters",
-                "allowed_methods",
-                "allowed_ws_origins",
-                "udp_max_response_amplification_factor",
-                "stream_proxy_protocol",
-                "backend_proxy_protocol",
-                "stream_match",
-                "api_spec_id",
-                "created_at",
-                "updated_at",
-            ],
-            "upstreams" => &[
-                "labels",
-                "id",
-                "namespace",
-                "name",
-                "targets",
-                "algorithm",
-                "hash_on",
-                "hash_on_cookie_config",
-                "health_checks",
-                "service_discovery",
-                "subsets",
-                "backend_tls_client_cert_path",
-                "backend_tls_client_key_path",
-                "backend_tls_verify_server_cert",
-                "backend_tls_server_ca_cert_path",
-                "backend_tls_sni",
-                "backend_tls_san_allow_list",
-                "api_spec_id",
-                "created_at",
-                "updated_at",
-            ],
-            "plugin_configs" => &[
-                "labels",
-                "id",
-                "namespace",
-                "plugin_name",
-                "config",
-                "scope",
-                "proxy_id",
-                "enabled",
-                "priority_override",
-                "trigger_json",
-                "api_spec_id",
-                "created_at",
-                "updated_at",
-            ],
-            "proxy_plugins" => &["namespace", "proxy_id", "plugin_config_id"],
-            _ => anyhow::bail!("Unsupported deployment resource table"),
+        let Some(known) = deployment_known_columns(table) else {
+            anyhow::bail!("Unsupported deployment resource table");
         };
         let predicate = if table == "proxy_plugins" {
             "namespace = ? AND proxy_id = ? AND plugin_config_id = ?"
@@ -14255,8 +14159,10 @@ fn deployment_raw_sql_row(row: &AnyRow) -> Result<serde_json::Value, anyhow::Err
             DeploymentSqlScalar::Real(value) => serde_json::json!({"bits": value.to_bits()}),
             DeploymentSqlScalar::Double(value) => serde_json::json!({"bits": value.to_bits()}),
             DeploymentSqlScalar::Text(value) => serde_json::json!(value),
+            // Digest and length only: a stored spec document must not be
+            // copied into the snapshot evidence.
             DeploymentSqlScalar::Blob(value) => {
-                serde_json::json!({"bytes_hex": hex::encode(value)})
+                crate::config::db_backend::stored_bytes_digest(&value)
             }
         };
         fields.insert(

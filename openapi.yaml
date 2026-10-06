@@ -2477,7 +2477,8 @@ paths:
         Mode class lists describe the last evaluation stage, not unconditional
         effective permissions: allow CIDRs override deny CIDRs, the dangerous
         baseline, and mode. public_only_guaranteed is conservative and true only
-        for public mode with no allow overrides. It describes the loaded policy,
+        for public mode with no allow overrides on a local data plane serving the
+        selected namespace (schema_version 2). It describes the loaded policy,
         not external firewalls, DNS ownership, or successful socket connections.
         The ordinary runtime enforcement remains authoritative; this endpoint
         does not add enforcement to any outbound path.
@@ -2506,7 +2507,7 @@ paths:
                 defaultControlPlane:
                   summary: Production default; admission policy only on a CP
                   value:
-                    schema_version: 1
+                    schema_version: 2
                     ip_classification: ferrum-private-reserved-v1
                     namespace: ferrum
                     policy_scope: process
@@ -4937,8 +4938,10 @@ paths:
       description: |
         Admin-only, unfiltered primary snapshot for the deployment-v1 partial
         mutation profile. Contains complete proxy/plugin/association dependencies,
-        full gzip spec bytes and external-reference snapshots, raw store fields,
-        historical credentials, trust, registry metadata and the change watermark.
+        spec metadata, raw store fields, historical credentials, trust, registry
+        metadata and the change watermark. Stored gzip spec documents,
+        external-reference snapshots and every other binary value appear only
+        as the SHA-256 and length of the stored bytes, never as the bytes.
         Security audit admission is mandatory before disclosure. No queries or
         cached fallback are supported. Unknown/unrepresentable resource shapes
         refuse authority rather than being erased. MongoDB requires a replica set.
@@ -4972,6 +4975,8 @@ paths:
           description: Store topology cannot provide atomic deployment authority
         "503":
           description: Coherent state or security audit admission unavailable
+        "507":
+          $ref: "#/components/responses/NamespaceSnapshotTooLarge"
 
   /backup:
     parameters:
@@ -4984,9 +4989,11 @@ paths:
         strong ETags plus a namespace ETag from ONE primary database snapshot.
         This requires an unfiltered export and snapshot transactions (SQL or
         replica-set MongoDB); it never falls back to cached data. The namespace
-        token covers all resources, associations, API-spec documents, trust,
-        registry metadata and the durable namespace change watermark. Send it
-        as `If-Match` to `POST /restore?confirm=true` on this same namespace.
+        token covers all resources, associations, API-spec metadata and stored
+        documents (by SHA-256 and length of the stored bytes), trust, registry
+        metadata and the durable namespace change watermark. Send it as
+        `If-Match` to `POST /restore?confirm=true` on this same namespace. A
+        namespace whose canonical representation exceeds 64 MiB returns `507`.
         Consumer credentials on this path are copied exactly, including older
         stored fields, rather than canonicalized for archival restoration.
 
@@ -5120,6 +5127,8 @@ paths:
                 $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+        "507":
+          $ref: "#/components/responses/NamespaceSnapshotTooLarge"
 
   /restore:
     parameters:
@@ -5268,6 +5277,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "507":
+          $ref: "#/components/responses/NamespaceSnapshotTooLarge"
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
@@ -5742,6 +5753,8 @@ paths:
                   - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "503":
           $ref: "#/components/responses/DeploymentMutationUnavailable"
+        "507":
+          $ref: "#/components/responses/NamespaceSnapshotTooLarge"
 
   /proxies/{id}/mcp/tools:
     parameters:
@@ -8206,6 +8219,8 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
           $ref: "#/components/responses/DeploymentMutationUnavailable"
+        "507":
+          $ref: "#/components/responses/NamespaceSnapshotTooLarge"
 
     delete:
       operationId: deleteApiSpec
@@ -8871,6 +8886,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    NamespaceSnapshotTooLarge:
+      description: |
+        The namespace's canonical snapshot representation exceeds the 64 MiB
+        conditional-authority bound, so no namespace token was issued or
+        compared and nothing was applied. Stored API-spec documents and other
+        binary content count only as a fixed-size SHA-256 digest and length.
+        Split the namespace or use the unconditional profile.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
     ServiceUnavailable:
       description: >-
         The admin write gate refused the mutation. Either the configured
@@ -9096,9 +9124,12 @@ components:
           description: |
             Complete secret-bearing typed and raw stored identity; retain with the
             original token. SQL column evidence includes column_type, value_type
-            and a lossless value (float bits or blob bytes where applicable);
+            and a lossless value (float bits, or a StoredContentDigest for blobs);
             null values retain their column type. MongoDB includes raw documents
-            and BSON bytes. Treat the complete evidence as the comparison basis.
+            (binary values as {binary_sha256, len, subtype}) and the SHA-256 of
+            each document's BSON bytes. resources[5] lists API specs with stored
+            documents as StoredContentDigest. Treat the complete evidence as the
+            comparison basis; the token fences it within a 64 MiB canonical bound.
         proxies:
           type: array
           items:
@@ -9119,7 +9150,35 @@ components:
           items:
             type: object
             additionalProperties: true
-            description: Full spec metadata, numeric gzip byte array and external-reference evidence
+            required: [id, proxy_id, spec_content]
+            properties:
+              spec_content:
+                $ref: "#/components/schemas/StoredContentDigest"
+              external_ref_snapshot:
+                oneOf:
+                  - $ref: "#/components/schemas/StoredContentDigest"
+                  - type: "null"
+            description: |
+              Full spec metadata, identical to evidence.resources[5]. The stored
+              gzip document and external-reference snapshot are represented by
+              digest; read the bytes from a conditional backup
+              (spec_content_base64) or GET /api-specs/{id}.
+    StoredContentDigest:
+      type: object
+      additionalProperties: false
+      required: [sha256, len]
+      properties:
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Lowercase hex SHA-256 of the stored (for specs, gzip-compressed) bytes
+        len:
+          type: integer
+          minimum: 0
+          description: Stored byte length
+      description: |
+        Snapshot stand-in for stored binary content. Namespace and deployment
+        snapshot tokens fence this digest instead of embedding the bytes.
     Namespace:
       type: object
       required: [name, created_at, updated_at]
@@ -39343,8 +39402,12 @@ components:
       properties:
         schema_version:
           type: integer
-          enum: [1]
-          description: Version of this response vocabulary; unknown versions must fail closed
+          enum: [2]
+          description: |
+            Version of this response vocabulary; unknown versions must fail
+            closed. Version 2 scopes public_only_guaranteed to
+            enforcement_scope=local-data-plane; version 1 reported it from the
+            loaded policy alone, including CP admission-only metadata.
         ip_classification:
           type: string
           enum: [ferrum-private-reserved-v1]
@@ -39432,11 +39495,12 @@ components:
         public_only_guaranteed:
           type: boolean
           description: |
-            True exactly when mode=public and allow_cidr_overrides_present=false.
-            Deny overrides only restrict. False is conservative: even a wholly
-            public allow list prevents certification, since CIDRs are withheld.
-            This policy guarantee requires enforcement_scope=local-data-plane
-            before it is usable as evidence about a serving gateway.
+            True exactly when enforcement_scope=local-data-plane, mode=public and
+            allow_cidr_overrides_present=false. It is always false for
+            admission-only, unserved-namespace and no-data-plane, which enforce
+            nothing for the selected namespace. Deny overrides only restrict.
+            False is conservative: even a wholly public allow list prevents
+            certification, since CIDRs are withheld.
 
     # ── Backend Capabilities ─────────────────────────────────────────
     ProtocolSupport:

@@ -19,16 +19,21 @@ Read `GET /deployment-snapshot` with an admin-role JWT and the intended
 - `profile`: exactly `deployment-v1`.
 - `namespace_etag`: the same quoted token as the HTTP `ETag`.
 - `proxies`, `upstreams`, `plugin_configs`, `api_specs`: typed inspection data
-  from the same primary snapshot. Specs include the complete gzip bytes in
-  `spec_content` (a JSON byte array), content/hash/ownership metadata, and any
-  stored external-reference snapshot and digest.
+  from the same primary snapshot. Specs carry content/hash/ownership metadata;
+  the stored gzip document (`spec_content`) and any stored external-reference
+  snapshot appear as `{"sha256": "<hex of stored bytes>", "len": <bytes>}`,
+  never as the bytes. Read the document itself from a conditional backup
+  (`spec_content_base64` decodes to bytes with that SHA-256) or
+  `GET /api-specs/{id}`. Each `api_specs` entry equals `evidence.resources[5]`.
 - `evidence`: the complete comparison representation. It binds all namespace
-  resources, full specs, associations, trust, namespace metadata, the durable
-  change watermark, and raw stored rows/documents. SQL includes every column of
-  the resource and association tables, including credential indexes, with each
-  column's SQLx type, runtime value type and lossless scalar evidence (float bits
-  and blob bytes). Typed nulls retain their column type. MongoDB includes raw
-  documents and their BSON bytes, including embedded association metadata.
+  resources, spec metadata and stored-document digests, associations, trust,
+  namespace metadata, the durable change watermark, and raw stored
+  rows/documents. SQL includes every column of the resource and association
+  tables, including credential indexes, with each column's SQLx type, runtime
+  value type and lossless scalar evidence (float bits; blobs as `sha256`/`len`).
+  Typed nulls retain their column type. MongoDB includes raw documents (binary
+  values as `binary_sha256`/`len`/`subtype`) and the SHA-256 of their BSON
+  bytes (`bson_sha256`), covering embedded association metadata.
   MongoDB credential representations and uniqueness hashes are stored on
   `consumers` and covered by those raw documents; `consumer_identity_index`
   is the separate identity reservation collection. Lease maintenance and audit
@@ -39,8 +44,15 @@ spec/plugin material. Security-audit admission is mandatory before disclosure,
 independent of ordinary audit enablement. Keep the response and original token
 in encrypted recovery storage; do not put evidence or tokens in routine logs.
 A token uses a distinct `deployment-v1-` prefix and keyed HMAC under the admin
-JWT secret. Replicas must share that secret. A backup/restore namespace token or
-individual row token is not deployment authority.
+JWT secret over a bounded SHA-256 of the canonical evidence. Replicas must share
+that secret. A backup/restore namespace token or individual row token is not
+deployment authority. Stores compare that digest, not a retained copy of the
+evidence, inside the mutation transaction. A namespace whose canonical evidence
+would exceed **64 MiB** returns `507` with `durable: "not_started"` and no token.
+Tokens issued before stored bytes were digested (v0.9.12) keep the
+`deployment-v1-` shape but no longer match: they fail closed with `412`.
+Finish or abandon in-flight recoveries before upgrading, then capture new
+authority; never refresh authority to retry a refused recovery.
 
 Snapshots require PostgreSQL, MySQL, SQLite or replica-set MongoDB. Standalone
 MongoDB returns `501`. Missing stores or unavailable/undecodable coherent state

@@ -1459,8 +1459,8 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
 
 ## Dependency-fenced deployment recovery (#6010)
 
-Use admin-only `GET /deployment-snapshot` for complete original spec/plugin and
-raw dependency evidence. Send its original deployment token to
+Use admin-only `GET /deployment-snapshot` for complete original spec metadata,
+stored-document digests, plugin and raw dependency evidence. Send its original deployment token to
 `DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
 `PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
 partially mutate inside one owner-fenced transaction on all four supported
@@ -2640,7 +2640,7 @@ A default serving gateway for `ferrum` responds with `Cache-Control: no-store`:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "ip_classification": "ferrum-private-reserved-v1",
   "namespace": "ferrum",
   "policy_scope": "process",
@@ -2716,14 +2716,18 @@ override the baseline and mode, so baseline-on **does not mean public-only**.
 The two override-presence booleans disclose only whether parsed lists are
 nonempty; operators' network topology stays private.
 
-`public_only_guaranteed` is true exactly for `mode=public` with no allow CIDR
-overrides. Deny overrides only restrict and do not invalidate this guarantee.
+`public_only_guaranteed` is true exactly for `enforcement_scope=local-data-plane`
+and `mode=public` with no allow CIDR overrides. It is always false for
+`admission-only`, `unserved-namespace`, and `no-data-plane`: those processes do
+not enforce the reported policy for the selected namespace. (Schema version 1
+reported the policy-only value, including `true` on a public-mode CP.) Deny
+overrides only restrict and do not invalidate this guarantee.
 Even a wholly public allow list yields false: the endpoint conservatively
 refuses to certify undisclosed overrides. False does not prove that a private
 address is reachable (for example, a deny list might block everything).
 
 A control plane requiring public-only upstreams must check the serving gateway
-for its namespace, recognize schema version 1 and the complete v1 vocabulary,
+for its namespace, recognize schema version 2 and its complete vocabulary,
 require `enforcement_scope=local-data-plane`, and require
 `public_only_guaranteed=true`. Missing endpoints/fields, unknown versions or
 labels, authorization failures, unserved namespaces, CP-only metadata, and

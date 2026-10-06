@@ -5,7 +5,8 @@ use super::crud::{self, NamespaceConfigAdmissionGuard};
 use super::preconditions;
 use super::{AdminState, json_response};
 use crate::config::db_backend::{
-    DatabaseBackend, DbWriteTopologyPermit, NamespacePreconditionFailed,
+    ApiSpecSnapshotView, DatabaseBackend, DbWriteTopologyPermit, NamespacePreconditionFailed,
+    NamespaceSnapshotTooLarge, SnapshotDigest, is_namespace_snapshot_too_large,
 };
 use crate::config::deployment_mutation::{
     DeploymentGraphInvalid, DeploymentPrecondition, ExternalSpecUpstreamConflict,
@@ -13,12 +14,17 @@ use crate::config::deployment_mutation::{
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{HeaderMap, Response, StatusCode};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 const PREFIX: &str = "deployment-v1-";
+
+/// MAC domain for deployment tokens. The `deployment-v1-` wire prefix is kept
+/// so tokens issued before stored content was digested still parse and then
+/// fail closed with `412` instead of being reinterpreted.
+const DEPLOYMENT_SNAPSHOT_TAG_KIND: &str = "deployment_snapshot.v2";
 
 pub(super) fn requested(query: Option<&str>, headers: &HeaderMap) -> bool {
     url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
@@ -84,16 +90,10 @@ pub(super) fn parse_request(
     Ok(Some(token.to_string()))
 }
 
-fn tag(state: &AdminState, namespace: &str, representation: &Value) -> Option<String> {
+fn tag(state: &AdminState, namespace: &str, digest: &SnapshotDigest) -> Option<String> {
     let key = state.jwt_manager.resource_etag_key()?;
-    let digest = preconditions::resource_etag(
-        &key,
-        "deployment_snapshot.v1",
-        namespace,
-        namespace,
-        representation,
-    );
-    Some(format!("{PREFIX}{digest}"))
+    let tag = preconditions::snapshot_etag(&key, DEPLOYMENT_SNAPSHOT_TAG_KIND, namespace, digest);
+    Some(format!("{PREFIX}{tag}"))
 }
 
 pub(super) fn refusal(message: &'static str) -> Response<Full<Bytes>> {
@@ -116,7 +116,22 @@ pub(super) fn unavailable(durable: &str) -> Response<Full<Bytes>> {
     )
 }
 
+/// `507`: the namespace is too large to fence; nothing was started.
+fn snapshot_too_large() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::INSUFFICIENT_STORAGE,
+        &json!({
+            "error": NamespaceSnapshotTooLarge.to_string(),
+            "durable": "not_started", "live": "unconfirmed",
+            "recovery_cleanup_authorized": false,
+        }),
+    )
+}
+
 pub(super) fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if is_namespace_snapshot_too_large(error) {
+        return snapshot_too_large();
+    }
     let status = if error.chain().any(|e| e.is::<NamespacePreconditionFailed>()) {
         StatusCode::PRECONDITION_FAILED
     } else if error
@@ -144,7 +159,9 @@ pub(super) fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
 }
 
 fn read_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
-    if crate::config::db_backend::atomic_batch_unsupported(error).is_some() {
+    if crate::config::db_backend::atomic_batch_unsupported(error).is_some()
+        || is_namespace_snapshot_too_large(error)
+    {
         store_error(error)
     } else {
         unavailable("not_started")
@@ -157,20 +174,17 @@ pub(super) async fn expected(
     db: &dyn DatabaseBackend,
     namespace: &str,
     original: &str,
-) -> Result<Value, Response<Full<Bytes>>> {
-    let snapshot = db
+) -> Result<SnapshotDigest, Response<Full<Bytes>>> {
+    let digest = db
         .load_deployment_snapshot(namespace)
         .await
+        .and_then(|snapshot| snapshot.digest())
         .map_err(|e| read_error(&e))?;
-    let representation = snapshot
-        .representation()
-        .map_err(|_| unavailable("not_started"))?;
-    let current =
-        tag(state, namespace, &representation).ok_or_else(|| unavailable("not_started"))?;
+    let current = tag(state, namespace, &digest).ok_or_else(|| unavailable("not_started"))?;
     if current != original {
         return Err(store_error(&NamespacePreconditionFailed.into()));
     }
-    Ok(representation)
+    Ok(digest)
 }
 
 pub(super) async fn snapshot(
@@ -186,12 +200,29 @@ pub(super) async fn snapshot(
         Ok(snapshot) => snapshot,
         Err(error) => return read_error(&error),
     };
+    // Bound the snapshot before materializing any evidence for the response.
+    let digest = match snapshot.digest() {
+        Ok(digest) => digest,
+        Err(error) => return read_error(&error),
+    };
+    let Some(tag) = tag(state, namespace, &digest) else {
+        return unavailable("not_started");
+    };
     let representation = match snapshot.representation() {
         Ok(value) => value,
         Err(_) => return unavailable("not_started"),
     };
-    let Some(tag) = tag(state, namespace, &representation) else {
-        return unavailable("not_started");
+    // `evidence.resources` already carries every spec's metadata with stored
+    // documents as digests; the top-level list repeats that view, never bytes.
+    let api_specs = match snapshot
+        .snapshot
+        .api_specs
+        .iter()
+        .map(|spec| serde_json::to_value(ApiSpecSnapshotView::from(spec)))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(specs) => specs,
+        Err(_) => return unavailable("not_started"),
     };
     let event = audit::AuditEvent::new(
         actor,
@@ -222,7 +253,7 @@ pub(super) async fn snapshot(
             "proxies": snapshot.snapshot.config.proxies,
             "plugin_configs": snapshot.snapshot.config.plugin_configs,
             "upstreams": snapshot.snapshot.config.upstreams,
-            "api_specs": snapshot.snapshot.api_specs,
+            "api_specs": api_specs,
         }),
     );
     let Ok(value) = hyper::header::HeaderValue::from_str(&preconditions::quoted(&tag)) else {
@@ -272,7 +303,7 @@ pub(super) fn finish_boxed(
     id: String,
     guard: NamespaceConfigAdmissionGuard,
     permit: DbWriteTopologyPermit,
-    expected: Value,
+    expected: SnapshotDigest,
     replacement: Option<(
         super::api_specs::ExtractedBundle,
         crate::config::types::ApiSpec,
@@ -302,7 +333,7 @@ async fn finish(
     id: String,
     mut guard: NamespaceConfigAdmissionGuard,
     permit: DbWriteTopologyPermit,
-    expected: Value,
+    expected: SnapshotDigest,
     replacement: Option<(
         super::api_specs::ExtractedBundle,
         crate::config::types::ApiSpec,
@@ -314,7 +345,7 @@ async fn finish(
     let validation_http_client = super::plugin_validation_http_client(&state);
     let precondition = DeploymentPrecondition {
         namespace: &namespace,
-        expected: &expected,
+        expected,
         lease: guard.lease_ref(),
         validation_http_client: &validation_http_client,
     };

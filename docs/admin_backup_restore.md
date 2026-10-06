@@ -105,8 +105,8 @@ A filtered export that includes `api_specs` without `proxies`, `upstreams`, and 
 
 ## Dependency-fenced deployment recovery (#6010)
 
-Use admin-only `GET /deployment-snapshot` for complete original spec/plugin and
-raw dependency evidence. Send its original deployment token to
+Use admin-only `GET /deployment-snapshot` for complete original spec metadata,
+stored-document digests, plugin and raw dependency evidence. Send its original deployment token to
 `DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
 `PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
 partially mutate inside one owner-fenced transaction on all four supported
@@ -160,6 +160,16 @@ mutations invalidate old namespace tags. Read timestamps, lease maintenance,
 audit events, and missing-resource no-ops do not. Tokens use keyed HMACs under
 the admin JWT secret, so replicas need the same secret to share tokens; tags
 are not offline credential-guessing digests.
+
+Stored API-spec documents (and external-reference snapshots) enter the tag as
+the SHA-256 and length of the stored gzip bytes, not as the bytes themselves,
+and the canonical representation is streamed into the digest rather than
+materialized. Any changed stored byte still invalidates the tag. A namespace
+whose canonical representation (excluding spec bytes) would exceed **64 MiB**
+is refused with `507 Insufficient Storage` instead of being fenced; nothing is
+applied. Tags issued before this representation (v0.9.12 and earlier) no longer
+match and fail closed with `412`: re-read `GET /backup?conditional=true` after
+upgrading.
 
 Send the namespace tag as `If-Match` to `POST /restore?confirm=true`. Comparison,
 clear, every import chunk, ownership restoration, trust changes, config-change

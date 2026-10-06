@@ -361,8 +361,8 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 
 ## Dependency-fenced deployment recovery (#6010)
 
-Use admin-only `GET /deployment-snapshot` for complete original spec/plugin and
-raw dependency evidence. Send its original deployment token to
+Use admin-only `GET /deployment-snapshot` for complete original spec metadata,
+stored-document digests, plugin and raw dependency evidence. Send its original deployment token to
 `DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
 `PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
 partially mutate inside one owner-fenced transaction on all four supported

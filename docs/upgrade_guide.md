@@ -26,6 +26,41 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Unreleased changes after 0.9.12
+
+**Snapshot tokens must be re-read (#5999 / #6012).** Namespace backup tags
+(`GET /backup?conditional=true`) and `deployment-v1-` tokens
+(`GET /deployment-snapshot`) now MAC a bounded SHA-256 of the canonical
+snapshot in which stored spec documents, external-reference snapshots and other
+binary values are represented by the SHA-256 and length of the stored bytes.
+Every tag issued by v0.9.12 or earlier still parses but no longer matches:
+`POST /restore` and the conditional deployment mutations return `412` and
+change nothing. Finish or abandon in-flight recoveries before upgrading, then
+read fresh authority. Deployment evidence changed shape: top-level `api_specs`
+and `evidence.resources[5]` carry `spec_content: {"sha256", "len"}` instead of a
+byte array, SQL blob columns are `{"sha256", "len"}` instead of
+`{"bytes_hex"}`, and MongoDB raw rows carry `bson_sha256` (binary fields as
+`binary_sha256`/`len`/`subtype`) instead of `bson_hex`. Read spec bytes from a
+conditional backup (`spec_content_base64`) or `GET /api-specs/{id}`. A namespace
+whose canonical representation (excluding spec bytes) would exceed 64 MiB is
+refused with `507` on these conditional paths; use the unconditional profiles or
+split the namespace.
+
+**Backend egress `schema_version` 2 (#5994 / #5999).**
+`public_only_guaranteed` is now true only with
+`enforcement_scope=local-data-plane`; CP `admission-only`, `unserved-namespace`
+and `no-data-plane` responses always report `false`. Consumers must recognize
+`schema_version: 2` and keep failing closed on unknown versions.
+
+**Deployment-mode refusals (#6012).** Already in v0.9.12: an ordinary
+`PUT /api-specs/{id}` that sends any `If-Match` returns `400` unless it is a
+complete `conditional=true` deployment request; any mutating admin request
+(`POST`, `PUT`, `PATCH`, `DELETE`) carrying a `conditional` query parameter or an
+`If-Match` value containing `deployment-v1-` returns `400` on every route other
+than `DELETE /proxies/{id}` and `PUT /api-specs/{id}`, including
+`POST /restore`. Drop stray `If-Match` headers from ordinary spec replacement and
+never reuse a deployment token on another route.
+
 ## Upgrading to 0.9.12 (candidate)
 
 Prepared on **2026-10-05 UTC** from merged #6012 main

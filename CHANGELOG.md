@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **BREAKING — bounded namespace and deployment snapshot authority** (issues
+  #5999 / #6012). Conditional backup/restore and `deployment-v1` tags cloned
+  every resource and rendered stored gzip spec documents as JSON number arrays
+  (tens of bytes of heap per stored byte), then built the whole canonical
+  string; conditional restore and deployment mutations held several full
+  copies, the deployment profile carried spec bytes three times (Mongo four)
+  and rebuilt them under namespace row locks. A few multi-MiB specs could
+  exhaust memory. Snapshot representations now carry the SHA-256 and length
+  of stored spec documents, external-reference snapshots and every raw blob or
+  BSON binary; canonical JSON streams into a bounded SHA-256, and stores compare
+  that digest instead of a retained representation. `GET /deployment-snapshot`
+  no longer repeats spec bytes in top-level `api_specs` (entries equal
+  `evidence.resources[5]`); raw SQL blobs are `{"sha256","len"}` and MongoDB
+  rows carry `bson_sha256` instead of `bson_hex`. A namespace whose canonical
+  representation would exceed 64 MiB (spec bytes excluded) returns
+  `507 Insufficient Storage` without issuing, comparing or applying anything.
+  Namespace (`namespace_snapshot.v2`) and deployment (`deployment_snapshot.v2`)
+  MAC domains changed: every tag issued by v0.9.12 or earlier, including
+  `deployment-v1-` tokens, now fails closed with `412`; re-read authority after
+  upgrading.
+- **BREAKING — `public_only_guaranteed` requires local enforcement** (issues
+  #5994 / #5999). `GET /backend-egress-policy` reported `true` for a public-mode
+  process without allow overrides even when `enforcement_scope` was
+  `admission-only`, `unserved-namespace` or `no-data-plane`, none of which
+  enforces the policy for the selected namespace. It is now true only for
+  `local-data-plane`, and `schema_version` is `2`; consumers pinned to `1`
+  must fail closed and adopt the new meaning.
+- **Deployment replacement column drift guard** (#6012). The SQL known-column
+  lists that decide which stored columns a conditional API-spec replacement
+  rewrites are now one `DEPLOYMENT_KNOWN_COLUMNS` table, and a unit test
+  requires each to equal the V001 baseline's columns for `proxies`,
+  `upstreams`, `plugin_configs` and `proxy_plugins`, so a new column cannot be
+  silently restored to its old value.
+
+### Documentation
+
+- **BREAKING — deployment-mode request refusals** (issue #6012). Since v0.9.12,
+  an ordinary `PUT /api-specs/{id}` carrying any `If-Match` returns `400` unless
+  it is a complete `conditional=true` deployment request, and every
+  `POST`/`PUT`/`PATCH`/`DELETE` admin request with a `conditional` query key or
+  an `If-Match` containing `deployment-v1-` returns `400` outside the two
+  deployment routes (including `POST /restore`). These refusals are now
+  documented in the upgrade guide.
+
 ## [0.9.12] - Unreleased
 
 Candidate prepared on **2026-10-05 UTC** from post-#6012 main
