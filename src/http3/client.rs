@@ -4036,6 +4036,7 @@ impl Http3ConnectionPool {
     /// the reset guard cancels the backend stream with `H3_REQUEST_CANCELLED`
     /// instead of finishing a truncated upload. Never set for HTTP/1.1, whose
     /// valid chunked EOF need not update `is_end_stream()`.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_incoming_body_and_read_response(
         mut backend_stream: H3RequestStream,
         proxy: &Proxy,
