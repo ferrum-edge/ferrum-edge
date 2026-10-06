@@ -4393,13 +4393,15 @@ fn published_or_placeholder_session_secrets_are_rejected_for_both_fields() {
     const DENIED: &[&str] = &[
         // Documented placeholder, stored literally rather than resolved.
         "${OIDC_SESSION_SECRET_32_BYTES_MIN}",
-        // Unresolved templates must be detected at any position.
+        // Valid unresolved templates must be detected at any position.
         "oidc-${OIDC_SESSION_SECRET_32_BYTES_MIN}",
         "0123456789abcdef0123456789abcdef${KEY}",
         "0123456789abcdef${KEY}0123456789abcdef",
-        "0123456789abcdef0123456789abcdef${KEY",
         // The key Ferrum Foundry's OIDC template published.
         "change-me-32-byte-minimum-secret!!",
+        // Public fixtures introduced while replacing earlier published values.
+        "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
+        "2d8b6f0a4c1e9375b8d2f6a0c4e19753",
         // Sequential fixtures Edge's own tests and examples used.
         "01234567890123456789012345678901",
         "0123456789012345678901234567890123",
@@ -4415,7 +4417,6 @@ fn published_or_placeholder_session_secrets_are_rejected_for_both_fields() {
         "REPLACE_ME",
         "REPLACE_ME-000000000000000000000000",
         "placeholder-secret-value-00000000000",
-        "example-secret-value-00000000000000",
         "your-secret-00000000000000000000000",
         "your_secret",
         "your_secret-000000000000000000000000",
@@ -4438,13 +4439,18 @@ fn published_or_placeholder_session_secrets_are_rejected_for_both_fields() {
                 config["session"][field] = json!(spelling);
                 let error = validate_plugin_config("oidc_relying_party", &config)
                     .expect_err("published/placeholder secret must be rejected");
-                assert_eq!(
-                    error,
+                let expected_error = if secret.contains("${") {
+                    format!(
+                        "oidc_relying_party: `session.{field}` contains an unresolved \
+                         `${{NAME}}` placeholder"
+                    )
+                } else {
                     format!(
                         "oidc_relying_party: `session.{field}` must not be a published or \
                          placeholder secret; generate a unique random value"
                     )
-                );
+                };
+                assert_eq!(error, expected_error);
                 let diagnostics = format!("{error}\n{}", logs.contents());
                 assert!(!diagnostics.contains(&spelling));
                 assert!(!diagnostics.contains(secret));
@@ -4453,15 +4459,19 @@ fn published_or_placeholder_session_secrets_are_rejected_for_both_fields() {
     }
 }
 
-/// A unique random secret is still admitted on both fields, so the deny-list
-/// cannot regress into rejecting every operator-supplied key.
 #[test]
-fn unique_session_secrets_are_admitted_on_both_fields() {
-    let mut config = base_config();
-    config["session"]["encryption_secret"] = json!("9f3a7c1e5b2d8406a1c9e7f3b5d20486");
-    config["session"]["encryption_secret_previous"] = json!("2d8b6f0a4c1e9375b8d2f6a0c4e19753");
-    validate_plugin_config("oidc_relying_party", &config)
-        .expect("unique current and previous secrets must be admitted");
+fn ordinary_secret_text_is_not_rejected_as_a_template_or_sample() {
+    for secret in [
+        "a-random-secret-containing-${-characters-1234567890",
+        "acme-example-prod-session-secret-0123456789abcdef",
+        "0123456789abcdef0123456789abcdef${KEY",
+        "${9NOT_A_NAME}-0123456789abcdef0123456789",
+    ] {
+        let mut config = base_config();
+        config["session"]["encryption_secret"] = json!(secret);
+        validate_plugin_config("oidc_relying_party", &config)
+            .unwrap_or_else(|error| panic!("ordinary secret text must be admitted: {error}"));
+    }
 }
 
 #[test]

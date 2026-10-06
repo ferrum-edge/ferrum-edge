@@ -375,28 +375,6 @@ build; follow the [upgrade order](#upgrade-order) and the build-out database
 rebuild procedure rather than treating this patch version as mixed-build or
 in-place schema compatibility.
 
-**gRPC qualification fixtures (#6006 / #6007).** No configuration or runtime
-change is required. Buffered and streamed acquisition-expiry coverage owns a
-cold pool without a shorter startup probe, observes cancellation before any
-RPC frames, requires exactly one expiry, and proves healthy recovery on the
-same frontend through a threshold-one breaker. OTEL attempt-span and direct
-sequential-reuse coverage retain one frontend H2 connection and independently
-require one backend accept/handshake, complete bodies, and success trailers.
-Strict authorization, telemetry, physical reuse, and bounded cleanup remain
-required. Final fixture head `9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2`
-received complete root review and fresh independent whole/focused review2
-with no findings after the accepted completion finding was fixed. All 12
-hosted workflows succeeded; all 80 checks completed (49 successful and 31
-nonapplicable PR skips), all nine protected Actions contexts passed, and there
-were zero review threads. PR #6007 merged and issue #6006 closed on
-2026-10-04; the published 0.9.11 release includes the fix. The failed
-historical `5bab92a367c69ececaaa81e535fca45ba4436f38` release run and
-`66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017` main run remain failure evidence,
-not candidates for blind reruns. The final #6005 reviewed head, actual
-merge/push gates and published distribution subsequently qualified separately.
-See [the failure analysis](grpc_qualification_6006.md) and
-[fixture source qualification](releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
-
 **Dependency security chain (#5912 / #6004).** The integrated Hyper 1.10.0
 and reqwest 0.13.4 vendor refresh retains every local patch and preserves the
 selected ordinary/FIPS crypto profiles. GCP uses the compatible GAX-internal

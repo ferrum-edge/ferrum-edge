@@ -587,34 +587,6 @@ authenticated GHCR proof and revision-label limits.
 
 ### Fixed
 
-- **gRPC qualification fixtures prove acquisition expiry and physical reuse**
-  (#6006). Isolate buffered and streamed acquisition from the binary startup
-  probe's shorter coalesced connect budget; observe preface, socket closure,
-  absence of RPC frames, exactly one expiry, and successful pool/breaker recovery
-  without a sleep-based settlement. Retain one frontend H2 connection for both
-  live OTEL RPCs and prove one backend accept/handshake while preserving cold
-  setup timings, genuine reuse without setup attributes, attempt parentage, and
-  three connect-failure retry spans. Repair the exact-main sequential reuse
-  fixture with one owned frontend, distinct stream IDs, complete exact
-  `"one"` / `"two"` bodies and success trailers, and exactly two backend streams
-  on one accept/handshake; hold the script open through inspection and join
-  frontend cleanup under a bound. Completed responses replace its counter
-  settlement sleep. Bound OTEL RPC readiness, send, complete body, and trailers
-  under one watchdog; own its frontend driver through inspection and release
-  the scripted backend gate on shutdown/unwind. Acquisition and recovery
-  watchdogs also include terminal body/trailer completion. Production lifetime
-  and pool semantics are unchanged. Final fixture head
-  `9965ec52b2f8b9b96e62dfd080614dffd0c2d7e2` received complete root review
-  and fresh independent whole/focused review2 with no findings after the
-  accepted completion finding was fixed. All 12 hosted workflows succeeded;
-  all 80 checks completed (49 successful, 31 nonapplicable PR skips), all nine
-  protected Actions contexts passed, and there were zero review threads.
-  PR #6007 merged at `3ce21ad101f164f70cb7f7f77fb033db828b9518` and
-  issue #6006 closed on 2026-10-04. The verified 0.9.11 release includes
-  that fix; historical failing runs remain distinct from final qualification.
-  See [the root-cause record](docs/grpc_qualification_6006.md) and
-  [completed fixture source evidence](docs/releases/v0.9.11.md#grpc-fixture-source-integration-evidence).
-
 - **H1/H2 listener dispatch keeps large child futures out of enclosing poll
   frames** (#5993). The frontend boxes its concrete handler rather than an
   async trampoline, and routing/backend dispatch boxes its selected child

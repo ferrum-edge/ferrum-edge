@@ -117,11 +117,17 @@ cd "$physical_worktree"
 printf '[sol-agents] dispatch model=gpt-6.1-sol effort=%s fast=%s service_tier=%s worktree=%s bin=%s\n' \
   "$effort" "$fast" "$service_tier" "$physical_worktree" "$codex_bin" >&2
 
+config_args=(
+  --config "model_reasoning_effort=\"$effort\""
+  --config "service_tier=\"$service_tier\""
+)
+if [[ "$fast" == 'true' ]]; then
+  config_args+=(--config 'features.fast_mode=true')
+fi
+
 exec "$codex_bin" exec \
   --model gpt-6.1-sol \
-  --config "model_reasoning_effort=\"$effort\"" \
-  --config "service_tier=\"$service_tier\"" \
-  --config "features.fast_mode=$fast" \
+  "${config_args[@]}" \
   --sandbox danger-full-access \
   --cd "$physical_worktree" \
   - < "$prompt_file"

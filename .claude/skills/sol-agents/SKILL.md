@@ -21,9 +21,9 @@ Append `--fast` only when the user explicitly requests fast mode for that dispat
 for example "Sol high with fast mode". Use `--no-fast` for "fast mode off", "without fast mode",
 or "standard mode". Omit both flags for standard mode when no speed is specified. Carry an
 explicit choice through continuations of the same task until the user changes it; never pass both
-flags. The shared launcher pins `gpt-6.1-sol`, `service_tier="default"` and
-`features.fast_mode=false` normally, or `service_tier="fast"` and `features.fast_mode=true` with
-`--fast`. Keep the selected reasoning effort unchanged and report an unavailable tier.
+flags. The shared launcher pins `gpt-6.1-sol` and `service_tier="default"` normally. Only
+`--fast` adds `features.fast_mode=true` alongside `service_tier="fast"`. Keep the selected
+reasoning effort unchanged and report an unavailable tier.
 
 Read the canonical skill before dispatch for effort selection, preflight, isolation, failure
 handling, and verification. For implementer mode, read

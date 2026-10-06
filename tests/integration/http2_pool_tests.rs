@@ -2388,7 +2388,7 @@ async fn test_grpc_pool_affinity_keeps_each_frontend_connection_on_its_own_shard
 }
 
 #[tokio::test]
-async fn test_grpc_pool_affinity_borrows_a_ready_sibling_while_its_shard_dials() {
+async fn test_grpc_pool_cross_frontend_reuses_ready_sibling_while_its_shard_dials() {
     use ferrum_edge::proxy::frontend_affinity::FrontendConnectionAffinity;
     use futures_util::FutureExt;
 
@@ -2405,9 +2405,9 @@ async fn test_grpc_pool_affinity_borrows_a_ready_sibling_while_its_shard_dials()
         .expect("warm shard");
     assert_eq!(accepted.load(Ordering::Relaxed), 1);
 
-    // New dials now stall until released. A second frontend connection maps to
-    // a missing shard: its calls are served by the ready sibling at once, on
-    // a paused clock, instead of waiting up to the connect timeout.
+    // New dials now stall until released. The second frontend connection maps
+    // to a missing shard, so its first sender borrows the ready connection
+    // established by the first frontend without waiting for the new dial.
     hold.send_replace(true);
     let second = FrontendConnectionAffinity::with_table(&table);
     let stream = second.open_stream();
@@ -2424,6 +2424,8 @@ async fn test_grpc_pool_affinity_borrows_a_ready_sibling_while_its_shard_dials()
     assert_eq!(started.elapsed(), Duration::ZERO, "no added latency");
     tokio::time::resume();
     assert_eq!(pool.shard_fills_in_flight(), 1, "one coalesced fill");
+    assert_eq!(accepted.load(Ordering::Relaxed), 1, "second frontend reused the ready socket");
+    assert_eq!(pool.pool_size(), 1, "borrowed sender does not alias a new shard");
 
     // The single background create reaches the backend and completes once the
     // backend answers; the shard then serves its own connection's calls.

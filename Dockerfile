@@ -18,7 +18,7 @@
 # Build the eBPF targets with `FEATURES=cloud-secrets,ebpf`; hosted CI exercises
 # all three contracts.
 ARG FEATURES=cloud-secrets
-# Digest resolved 2026-09-14; the tag is kept for readability, the digest is authoritative.
+# Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
 ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
 ARG IPROUTE2_BASE=debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 ARG IPROUTE2_VERSION=6.15.0-1
@@ -40,7 +40,7 @@ ARG BPF_LINKER_ARM64_SHA256=d09ddd83303e9ab1443f51e0e284680154009646a3ce141c63d8
 # nightly, drop `+nightly` from the build below so the rust-toolchain.toml pin
 # is honored (and install rust-src on that pinned toolchain). core-only
 # build-std matches the crate's `#![no_std]` + `panic = "abort"`.
-# Digest resolved 2026-09-14; the tag is kept for readability, the digest is authoritative.
+# Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
 FROM rust:latest@sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49 AS ebpf-builder
 ARG TARGETARCH
 ARG BPF_LINKER_VERSION
@@ -90,7 +90,7 @@ RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
         /iproute2-root /distroless-root "${IPROUTE2_VERSION}"
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
-# Digest resolved 2026-09-14; the tag is kept for readability, the digest is authoritative.
+# Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
 FROM rust:latest@sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49 AS builder
 
 # Install build dependencies

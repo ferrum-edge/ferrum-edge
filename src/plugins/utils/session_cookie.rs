@@ -109,8 +109,8 @@ impl SessionCookieCodec {
 
 /// Literal OIDC session-secret values that are known to be public: Ferrum
 /// Edge's own documented placeholder, the key Ferrum Foundry's OIDC template
-/// published (GHSA-hjw6-685j-p5hw), and the sequential fixtures Edge's own
-/// tests and examples used for `session.encryption_secret`. Anyone reading the
+/// published (GHSA-hjw6-685j-p5hw), and the fixtures Edge's own tests and
+/// examples used for `session.encryption_secret`. Anyone reading the
 /// repository can hold these, so accepting one as an AEAD key would let a third
 /// party forge or decrypt session and pending-flow cookies.
 ///
@@ -119,6 +119,8 @@ impl SessionCookieCodec {
 const DENIED_SESSION_SECRETS: &[&str] = &[
     "${OIDC_SESSION_SECRET_32_BYTES_MIN}",
     "change-me-32-byte-minimum-secret!!",
+    "9f3a7c1e5b2d8406a1c9e7f3b5d20486ab",
+    "2d8b6f0a4c1e9375b8d2f6a0c4e19753",
     "01234567890123456789012345678901",
     "0123456789012345678901234567890123",
     "abcdefghijklmnopqrstuvwxyz123456",
@@ -132,7 +134,6 @@ const DENIED_SESSION_SECRET_SUBSTRINGS: &[&str] = &[
     "replace-me",
     "replace_me",
     "placeholder",
-    "example",
     "your-secret",
     "your_secret",
 ];
@@ -142,15 +143,25 @@ const DENIED_SESSION_SECRET_SUBSTRINGS: &[&str] = &[
 /// config path used in the error so an Admin API 400 names the offending key.
 ///
 /// Screen both the supplied spelling and the effective pre-HKDF key material,
-/// using the same normalization as key derivation. An unresolved `${...}` env
-/// placeholder anywhere in either value is refused as well: it would be stored
-/// literally rather than resolved before admission.
+/// using the same normalization as key derivation. A `${NAME}` env placeholder
+/// anywhere in either value is refused as well: it would be stored literally
+/// rather than resolved before admission.
 pub fn reject_published_session_secret(secret: &str, field: &str) -> Result<(), String> {
     // Known public values and templates are textual; binary Base64 key
     // material remains supported without interpreting it as a template.
-    if is_denied_session_secret(secret)
-        || std::str::from_utf8(&normalize_secret(secret)?).is_ok_and(is_denied_session_secret)
-    {
+    if contains_unresolved_env_placeholder(secret) {
+        return Err(format!(
+            "oidc_relying_party: `{field}` contains an unresolved `${{NAME}}` placeholder"
+        ));
+    }
+    let normalized = normalize_secret(secret)?;
+    let decoded = std::str::from_utf8(&normalized).ok();
+    if decoded.is_some_and(contains_unresolved_env_placeholder) {
+        return Err(format!(
+            "oidc_relying_party: `{field}` contains an unresolved `${{NAME}}` placeholder"
+        ));
+    }
+    if is_denied_session_secret(secret) || decoded.is_some_and(is_denied_session_secret) {
         return Err(format!(
             "oidc_relying_party: `{field}` must not be a published or placeholder secret; \
              generate a unique random value"
@@ -162,14 +173,41 @@ pub fn reject_published_session_secret(secret: &str, field: &str) -> Result<(), 
 fn is_denied_session_secret(secret: &str) -> bool {
     let trimmed = secret.trim();
     let lowered = trimmed.to_ascii_lowercase();
-    let unresolved_placeholder = trimmed.contains("${");
     let denied_exact = DENIED_SESSION_SECRETS
         .iter()
         .any(|known| trimmed.eq_ignore_ascii_case(known));
     let denied_substring = DENIED_SESSION_SECRET_SUBSTRINGS
         .iter()
         .any(|token| lowered.contains(*token));
-    unresolved_placeholder || denied_exact || denied_substring
+    denied_exact || denied_substring
+}
+
+fn contains_unresolved_env_placeholder(secret: &str) -> bool {
+    let bytes = secret.as_bytes();
+    let mut offset = 0;
+    while let Some(relative_start) = secret[offset..].find("${") {
+        let start = offset + relative_start;
+        let name_start = start + 2;
+        let Some(first) = bytes.get(name_start).copied() else {
+            return false;
+        };
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            offset = name_start;
+            continue;
+        }
+        let mut end = name_start + 1;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            end += 1;
+        }
+        if bytes.get(end) == Some(&b'}') {
+            return true;
+        }
+        offset = name_start;
+    }
+    false
 }
 
 pub fn normalize_secret(secret: &str) -> Result<Vec<u8>, String> {
