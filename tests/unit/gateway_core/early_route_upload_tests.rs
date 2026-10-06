@@ -446,9 +446,22 @@ async fn a_hidden_query_credential_undecides_query_rules() {
         Some(9000),
         "`key_auth` strips the credential from the forwarded query in `authenticate`"
     );
-    let shown = json!({"key_location": "query:api_key"});
+    // `hide_credentials` defaults to `true`, so only an explicit `false`
+    // leaves the forwarded query alone and the query rule decided.
+    let default = json!({"key_location": "query:api_key"});
+    let plugins = [built_in("key_auth", default), dispatch(rules.clone())];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(9000),
+        "the default config hides the credential too"
+    );
+    let shown = json!({"key_location": "query:api_key", "hide_credentials": false});
     let plugins = [built_in("key_auth", shown), dispatch(rules)];
-    assert_eq!(preview(&plugins, &request("/soap", &[])), Some(1000));
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(1000),
+        "no `api_key` in the query, so the decided path rule is selected"
+    );
 }
 
 #[tokio::test]
