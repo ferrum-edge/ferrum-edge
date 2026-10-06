@@ -4167,9 +4167,8 @@ fn test_native_h3_streaming_upload_requires_h2_end_stream() {
         .next()
         .expect("bounded native-H3 dispatcher");
     assert!(
-        dispatch.contains(
-            "let require_end_stream = original_req.version() == hyper::Version::HTTP_2;"
-        ),
+        dispatch
+            .contains("let require_end_stream = original_req.version() == hyper::Version::HTTP_2;"),
         "the requirement must come from the frontend request version, never HTTP/1.1"
     );
     assert_eq!(
