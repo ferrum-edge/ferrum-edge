@@ -500,7 +500,8 @@ impl StoredEvidence {
         let mut canonical = String::new();
         crate::admin::preconditions::write_canonical_json(&row, &mut canonical);
         let separator = usize::from(!self.rows.is_empty());
-        self.budget.charge(canonical.len().saturating_add(separator))?;
+        self.budget
+            .charge(canonical.len().saturating_add(separator))?;
         self.rows.push((canonical, row));
         Ok(())
     }
@@ -511,7 +512,8 @@ impl StoredEvidence {
     pub fn end_table(&mut self, name: &str) -> Result<(), anyhow::Error> {
         // `"name":[]` plus its separator. Table names are plain identifiers.
         let separator = usize::from(!self.stored.is_empty());
-        self.budget.charge(name.len().saturating_add(5 + separator))?;
+        self.budget
+            .charge(name.len().saturating_add(5 + separator))?;
         let mut rows = std::mem::take(&mut self.rows);
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         let rows = rows.into_iter().map(|(_, row)| row).collect();
