@@ -526,17 +526,16 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
         .find("// Keep only the independently owned header map")
         .expect("native gRPC response terminals end");
     let proxy_src = &native_tail[..native_end];
-    // Check each terminal's own scope: two pre-commitment gates, dispatch
-    // expiry, and all three native/gRPC-Web backend-error shapes. A duplicate
-    // attachment elsewhere cannot compensate for a lost one here.
+    // Check each terminal's own scope: the streaming pre-commitment gate,
+    // dispatch expiry, and all three native/gRPC-Web backend-error shapes. A
+    // duplicate attachment elsewhere cannot compensate for a lost one here.
+    // The buffered arm is not a separate terminal: its pre-commitment check
+    // rewrites the collected response in place, and an upload is held only on
+    // a pre-wire dispatch error, never alongside a collected response.
     for (start, end) in [
         (
             "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
             "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
-        ),
-        (
-            "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
-            "Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {",
         ),
         (
             "Err(GrpcProxyError::AuthorizationExpired { termination, .. }) => {",

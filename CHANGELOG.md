@@ -50,6 +50,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requires each to equal the V001 baseline's columns for `proxies`,
   `upstreams`, `plugin_configs` and `proxy_plugins`, so a new column cannot be
   silently restored to its old value.
+- **Order the buffered gRPC final authorization check before logging**
+  (follow-up to #5993 / #5995). A buffered native gRPC or gRPC-Web response
+  whose credential expired during the response hooks logged two transaction
+  summaries: one for the protected `200`/`grpc-status: 0` response, then a
+  rejection summary for the `grpc-status: 16` terminal the client actually
+  received, after the committed observers had seen a response that was never
+  sent. The final check now replaces the response in place before the
+  committed observers and again before the summary is built, as on the H1/H2
+  path, so exactly one summary carrying `grpc-status: 16` and the bounded
+  termination class is written. An authenticated request hands that summary to
+  bounded detached delivery instead of awaiting it, and the summary's backend
+  address is resolved before the check, so nothing awaits between the final
+  check and the client-visible response. The expiry terminal no longer re-runs
+  the rejection-path `after_proxy` hooks, matching H1/H2 expiry during the
+  committed hooks: it keeps only gateway headers whose provenance the completed
+  hooks recorded. gRPC-Web keeps its CORS headers through that tracking, but a
+  native gRPC expiry response may omit gateway headers such as correlation IDs.
+- **Record the buffered gRPC backend outcome before response hooks.** In
+  0.9.11 and 0.9.12 (since #5993), a buffered native gRPC response settled
+  circuit-breaker, passive-health, backend-admission, and least-connections
+  accounting only after hooks and logging, so a client disconnect during the
+  hooks or a later authorization terminal released a real backend outcome —
+  including `UNAVAILABLE` in trailers — as neutral. The outcome is recorded once the response is
+  collected within the lifetime; only an expiry detected by then stays neutral.
+- **Native H3 dispatch timing without an authorization plan.** An
+  unauthenticated native H3 response-header wait with no client deadline no
+  longer arms a second timer around the receive's own read timeout. A cold H3
+  connection that was successfully established is no longer misreported as a
+  `ConnectionTimeout` (tripping the breaker and possibly marking the backend
+  H3-unsupported) when its task wakes after the connect instant; the connect
+  bound now applies only to a failed connect, and the per-poll send gate still
+  enforces the authorization lifetime.
 
 ### Documentation
 
@@ -73,6 +105,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The base-image refresh inventory reports Cross tag drift for an independent
   trusted-policy rotation. The existing admission guard remains enforced;
   candidate CI cannot authorize a merge or release.
+- **hickory-resolver upgraded to 0.26.2** (GHSA-5j98-2g5x-46v6,
+  GHSA-6w6g-hm98-mhgm, GHSA-6f2x-v7q7-m7m5). The DNS resolver behind
+  `src/dns/` and the MongoDB `dns-resolver` path now moves with its matching
+  `hickory-proto` / `hickory-net` 0.26.2 siblings in the root, `fuzz`, and
+  `tests/performance/mesh` lockfiles. 0.26.2 bounds the truncated-response
+  (TC) retry loop in `NameServerPool::try_send` that a hostile or spoofed
+  nameserver could drive into resource exhaustion, stops following CNAME
+  records irrelevant to the query, rejects records whose class differs from
+  the query, and no longer lets `lookup()` / `lookup_ip()` hide DNSSEC
+  validation failures. Ferrum does not enable resolver DNSSEC validation, so
+  resolution results are otherwise unchanged; no call sites changed.
 
 ### Fixed
 
@@ -235,7 +278,10 @@ authenticated GHCR proof and revision-label limits. This does not qualify 0.9.12
   wire submission. Lifetime errors suppress replay regardless of that marker.
   An immediately ready sender still takes the timer-free fast path, and an
   unauthenticated dispatch still avoids the authorization clock read.
-  Unauthenticated requests retain their existing behavior. See
+  Unauthenticated requests retain their existing behavior. (Correction: in
+  this release an unauthenticated native H3 header wait also armed a redundant
+  second timer, and a successful cold H3 connect woken late could be reported
+  as a connect timeout for any request; both are fixed under [Unreleased].) See
   [request lifetime dispatch](docs/request_lifetime_dispatch.md).
 
 ### Fixed
