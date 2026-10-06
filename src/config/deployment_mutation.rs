@@ -468,8 +468,7 @@ pub fn deployment_commit_unknown<E>(error: E) -> anyhow::Error
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    anyhow::Error::new(error)
-        .context(DeploymentCommitOutcomeUnknown)
+    anyhow::Error::new(error).context(DeploymentCommitOutcomeUnknown)
 }
 
 /// Whether `error` reports a deployment commit whose outcome is unknown.
