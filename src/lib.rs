@@ -11864,7 +11864,9 @@ pub mod _test_support {
         upload: crate::proxy::grpc_proxy::GrpcBody,
         held_frontend_upload: &mut Option<crate::proxy::grpc_proxy::GrpcBody>,
     ) -> Result<crate::proxy::grpc_proxy::GrpcBody, crate::proxy::grpc_proxy::GrpcProxyError> {
-        bounds.0.admit_upload_handoff(auth, upload, held_frontend_upload)
+        bounds
+            .0
+            .admit_upload_handoff(auth, upload, held_frontend_upload)
     }
 
     /// Await a controlled native gRPC response-header wait under the

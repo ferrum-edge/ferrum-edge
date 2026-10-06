@@ -38,7 +38,9 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::proxy::auth_lifetime::{
     StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
 };
-use ferrum_edge::proxy::grpc_proxy::{GrpcBody, GrpcDeadlinePhase, GrpcProxyError, GrpcTimeoutKind};
+use ferrum_edge::proxy::grpc_proxy::{
+    GrpcBody, GrpcDeadlinePhase, GrpcProxyError, GrpcTimeoutKind,
+};
 use ferrum_edge::retry::{ErrorClass, classify_grpc_proxy_error};
 
 /// The `ClientDeadlineExceeded` message for a client RPC deadline that

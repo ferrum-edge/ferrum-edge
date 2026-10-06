@@ -3049,7 +3049,9 @@ impl SizeLimitedIncoming {
         plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
     ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
-        let join = self.inner.install_pump(plan, write_timeout_ms, self.require_end_stream);
+        let join = self
+            .inner
+            .install_pump(plan, write_timeout_ms, self.require_end_stream);
         (self, join)
     }
 
