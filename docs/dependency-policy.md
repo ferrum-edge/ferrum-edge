@@ -49,6 +49,44 @@ crate). Keep the version aligned with the transitive copy already in
 | `crc32fast` | AWS Bedrock event-stream prelude/message CRC32 validation before lengths or usage payloads are trusted |
 | `unsafe-libyaml` | API-spec YAML event composition + bounded alias expansion (#3307); already transitive via `serde_yaml` |
 
+## Security floor pins
+
+Security fixes use minimum compatible versions, not permanent exact-version
+locks. The required `dependency-audit` job in `.github/workflows/ci.yml` checks
+every committed `Cargo.lock` against these floors with
+`scripts/verify_dependency_security_chain.py`:
+
+| Crate | Fixed floor | Advisory / purpose |
+|---|---:|---|
+| `opentelemetry_sdk` | 0.32.1 | GHSA-w9wp-h8wv-79jx |
+| `aws-smithy-json` | 0.62.7 | GHSA-8ffr-xgwf-xj56 |
+| `xxhash-rust` | 0.8.16 | GHSA-6g2r-675j-hx59 |
+
+Some optional GCP crates and the AWS Smithy support crates also have exact
+`=` constraints in `Cargo.toml`. Those constraints selected a published,
+compatible dependency generation for the fixes above; they are not a promise to
+stay on those releases. To lift them:
+
+1. Confirm the advisory's fixed release and check that newer GCP/OpenTelemetry
+   releases remain compatible with the currently patched Hyper/reqwest pair
+   and enabled feature sets. Keep direct GCP API dependencies declared when
+   Ferrum calls their APIs.
+2. Replace each security-only `=version` constraint with the fixed minimum
+   version (or remove the direct constraint if Ferrum no longer needs that
+   crate directly). Keep the `opentelemetry_sdk`, `aws-smithy-json`, and
+   `xxhash-rust` requirements at or above their applicable fixed floors.
+3. Refresh the root and affected standalone lockfiles from their real manifest
+   roots. Inspect Cargo metadata for the root, mesh, and fuzz graphs where they
+   consume Ferrum's production dependency path; do not hand-edit lockfile
+   package entries or checksums.
+4. If a newer advisory fixes one of these packages, update the corresponding
+   floor in the checker and this table together. The required dependency audit
+   must keep checking every committed lockfile, including standalone graphs.
+
+GCP and AWS provider features, crypto profiles, and MSRV are separate policy
+surfaces. A pin lift must preserve those constraints unless a separately
+reviewed change intentionally updates them.
+
 ## Vendored crate inventory
 
 Each row is the authoritative human summary. The **Lifecycle ID** column is the

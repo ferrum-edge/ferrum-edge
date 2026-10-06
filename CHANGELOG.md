@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Make reqwest patch reconstruction and dependency security floors required
+  CI** (#6019). The blocking dependency audit now reconstructs the published
+  reqwest archive and checks security floors across committed lockfiles; the
+  obsolete lockfile workflow and completed #5912 evidence page are removed.
+  The dependency policy now documents how to lift the GCP, Smithy, and xxhash
+  pins.
+
+### Fixed
+
+- **Cover H2 early responses and backend CANCEL resets** (#6019).
+  Scripted-backend regressions cover a response before request DATA and require
+  a backend response-side `RST_STREAM(CANCEL)` to surface as a protocol error
+  rather than a clean truncated response.
+
 ## [0.9.13] - 2026-10-06
 
 Release prepared on **2026-10-06 UTC** from main
@@ -348,7 +364,7 @@ authenticated GHCR proof and revision-label limits.
   `66f25f5f89f1dbd4f7d523f3c57e2ace7f59d017`; issue #5912 is closed. Its
   exact-head hosted checks passed, followed by the separately verified 0.9.11
   release qualification and publication. Advisory disposition remains separate.
-  See the [lockfile provenance](docs/dependency-security-upgrade-5912.md)
+  See the [security-floor policy](docs/dependency-policy.md#security-floor-pins)
   and [completed source integration evidence](docs/releases/v0.9.11.md#dependency-source-integration-evidence).
 
 - **Conditional admin reads and restores use authoritative strong state tags**

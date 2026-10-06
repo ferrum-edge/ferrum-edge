@@ -655,6 +655,61 @@ async fn h2_stream_reset_classified_as_protocol_error() {
     );
 }
 
+// A response-side CANCEL after DATA is still a backend protocol failure.
+// In particular, Hyper 1.10 exposes CANCEL as a body error; only NO_ERROR is
+// deliberately masked by the gRPC proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_backend_cancel_mid_response_is_logged_as_protocol_error() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptStreamingRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"partial")))
+        .step(GrpcStep::SendRstStream { error_code: 8 }) // CANCEL
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = GatewayHarness::builder()
+        .file_config(grpc_file_config(backend_port, Value::Null))
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b"request")),
+    )
+    .await
+    .expect("backend CANCEL response timeout")
+    .expect("response surfaced");
+
+    assert_eq!(response.http_status, 200);
+    assert_eq!(response.messages, [Bytes::from_static(b"partial")]);
+    assert!(
+        response.stream_error.is_some()
+            || response.grpc_status().is_some_and(|status| status != 0)
+            || response.trailers.is_none(),
+        "backend CANCEL must not become a clean truncated gRPC 200: {response:?}"
+    );
+
+    let logs = collect_flushed_logs(&harness).await;
+    assert!(
+        logs.contains("\\\"body_error_class\\\":\\\"protocol_error\\\"")
+            || logs.contains("\"body_error_class\":\"protocol_error\""),
+        "backend CANCEL must be recorded as body_error_class=protocol_error; logs:\n{logs}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Round-2 error-code matrices. Error handling is asserted as a family because
 // the response may be a Trailers-Only gRPC error or a transport-level stream
@@ -5116,16 +5171,30 @@ async fn h2_direct_sse_stall_after_first_event_classifies_read_write_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload() {
+    direct_h2_early_response_upload(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_response_before_request_data_survives_upload() {
+    direct_h2_early_response_upload(false).await;
+}
+
+async fn direct_h2_early_response_upload(read_request_data_before_response: bool) {
     let ca = TestCa::new("h2-early-response-upload").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
-    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
-        .expect("h2 tls backend")
-        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+    let mut backend_builder =
+        ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+            .expect("h2 tls backend")
+            .step(H2Step::ExpectHeaders(MatchHeaders::any()));
+    if read_request_data_before_response {
         // One DATA frame proves the upload started; the rest is still in
         // flight when the response head goes out.
-        .step(H2Step::ReadRequestData)
+        backend_builder = backend_builder.step(H2Step::ReadRequestData);
+    }
+    let backend = backend_builder
         .step(H2Step::RespondHeaders(vec![
             (":status", "200".into()),
             ("content-type", "text/plain".into()),
@@ -5196,11 +5265,11 @@ async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload()
         "the early response must complete: a truncated body means the \
          dispatcher cancelled the still-live upload on return"
     );
-    assert_eq!(
-        backend.received_streams().await.len(),
-        1,
-        "the exchange must complete on a single backend stream, not a retry"
-    );
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), 1, "the exchange must use one backend stream");
+    if read_request_data_before_response {
+        assert!(!streams[0].body.is_empty(), "backend read initial request DATA");
+    }
 }
 
 /// gRPC pool shards per backend host in the affinity tests.
