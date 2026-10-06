@@ -4029,6 +4029,192 @@ fn test_direct_h2_dispatch_requires_h2_end_stream_on_every_upload_arm() {
 }
 
 #[test]
+fn test_remaining_h2_upload_dispatchers_require_h2_end_stream() {
+    // Issue #6022: the direct-H2 pool is not the only dispatcher that relays an
+    // HTTP/2 client's `Incoming`. The reqwest streaming path, the direct
+    // HTTP/1.1 pool, HBONE, Unix sockets, and the sidecar mesh-mTLS pool must
+    // also turn a masked client RST_STREAM(NO_ERROR) into an error, so the
+    // backend sees a reset or an aborted body, never a complete one.
+    // Behavioural proof for the reqwest and direct HTTP/1.1 arms:
+    // `h2_client_reset_reaches_*` in
+    // `tests/functional/functional_http1_direct_pool_test.rs`.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    // (dispatcher signature, frontend version expression, upload adapters)
+    let dispatchers = [
+        (
+            "async fn proxy_to_backend(",
+            "original_req.version() == hyper::Version::HTTP_2",
+            2,
+        ),
+        (
+            "async fn proxy_to_backend_direct_h1(",
+            "original_req.version() == hyper::Version::HTTP_2",
+            2,
+        ),
+        (
+            "async fn proxy_to_backend_hbone_after_ready(",
+            "parts.version == hyper::Version::HTTP_2",
+            1,
+        ),
+        (
+            "#[cfg(unix)]\nasync fn proxy_to_backend_unix(",
+            "parts.version == hyper::Version::HTTP_2",
+            1,
+        ),
+        (
+            "async fn proxy_to_backend_mesh_mtls_after_ready(",
+            "parts.version == hyper::Version::HTTP_2",
+            1,
+        ),
+    ];
+    for (signature, version_check, adapters) in dispatchers {
+        let dispatch = source
+            .split(signature)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{signature} not found"))
+            .split("\n}\n")
+            .next()
+            .expect("bounded dispatcher");
+        assert!(
+            dispatch.contains(&format!("let require_end_stream = {version_check};")),
+            "{signature}: the requirement must come from the frontend request version"
+        );
+        let ctors: Vec<&str> = dispatch
+            .split("Incoming::new_with_counter(")
+            .skip(1)
+            .collect();
+        assert_eq!(
+            ctors.len(),
+            adapters,
+            "{signature}: unexpected number of streaming upload adapters"
+        );
+        for ctor in ctors {
+            // The gate must be set before the upload pump is installed: the
+            // pump takes the client body and must inherit the requirement.
+            let before_pump = ctor
+                .split("install_")
+                .next()
+                .expect("adapter before its upload pump");
+            assert!(
+                ctor.contains("install_")
+                    && before_pump.contains(".with_h2_end_stream_required(require_end_stream)"),
+                "{signature}: every streaming upload adapter must require the client's \
+                 END_STREAM before its upload pump is installed"
+            );
+        }
+    }
+    // HBONE and Unix rewrite `parts.version` to HTTP/1.1 for the backend, so
+    // the frontend version must be read before that rewrite.
+    for signature in [
+        "async fn proxy_to_backend_hbone_after_ready(",
+        "#[cfg(unix)]\nasync fn proxy_to_backend_unix(",
+    ] {
+        let dispatch = source
+            .split(signature)
+            .nth(1)
+            .expect("dispatcher")
+            .split("\n}\n")
+            .next()
+            .expect("bounded dispatcher");
+        let read = dispatch
+            .find("let require_end_stream = parts.version == hyper::Version::HTTP_2;")
+            .expect("frontend version read");
+        let rewrite = dispatch
+            .find("parts.version = hyper::Version::HTTP_11;")
+            .expect("backend version rewrite");
+        assert!(
+            read < rewrite,
+            "{signature}: read the frontend version first"
+        );
+    }
+
+    let body = include_str!("../../../src/proxy/body.rs");
+    let counting = body
+        .split("impl http_body::Body for CountingIncoming {")
+        .nth(1)
+        .expect("CountingIncoming body impl");
+    assert!(
+        counting.contains("this.require_end_stream && !this.inner.is_end_stream()"),
+        "CountingIncoming must check the client's receive state at EOF"
+    );
+    let counting_impl = body
+        .split("impl CountingIncoming {")
+        .nth(1)
+        .expect("CountingIncoming impl")
+        .split("\n}\n")
+        .next()
+        .expect("bounded CountingIncoming impl");
+    assert!(
+        counting_impl.contains("write_timeout_ms, self.require_end_stream)"),
+        "a pumped unlimited upload must hand the requirement to its pump"
+    );
+}
+
+#[test]
+fn test_native_h3_streaming_upload_requires_h2_end_stream() {
+    // Issue #6022: an HTTP/1.1 or HTTP/2 route whose target is native HTTP/3
+    // streams the client's `Incoming` straight into the backend QUIC stream.
+    // hyper reports an HTTP/2 client's RST_STREAM(NO_ERROR) as a clean end of
+    // body, so the native-H3 forwarder must check the client's END_STREAM
+    // before it FINs the backend stream. Otherwise the backend receives a
+    // truncated upload that looks complete.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = source
+        .split("async fn proxy_to_backend_http3(")
+        .nth(1)
+        .expect("native-H3 dispatcher")
+        .split("\n}\n")
+        .next()
+        .expect("bounded native-H3 dispatcher");
+    assert!(
+        dispatch
+            .contains("let require_end_stream = original_req.version() == hyper::Version::HTTP_2;"),
+        "the requirement must come from the frontend request version, never HTTP/1.1"
+    );
+    assert_eq!(
+        dispatch
+            .matches("_streaming_incoming_body_under_authorization(")
+            .count(),
+        2,
+        "unexpected number of native-H3 streaming Incoming dispatch calls"
+    );
+    assert_eq!(
+        dispatch
+            .matches("body,\n                            require_end_stream,\n")
+            .count(),
+        2,
+        "both native-H3 streaming Incoming calls must pass the END_STREAM requirement"
+    );
+
+    let client = include_str!("../../../src/http3/client.rs");
+    let forward = client
+        .split("async fn forward_incoming_body_and_read_response(")
+        .nth(1)
+        .expect("native-H3 Incoming forwarder")
+        .split("\n    }\n")
+        .next()
+        .expect("bounded native-H3 Incoming forwarder");
+    let gate = forward
+        .find("require_h2_end_stream && !hyper::body::Body::is_end_stream(&frontend_body)")
+        .expect("END_STREAM check after the frontend body ends");
+    let finish = forward
+        .find("upload.stream.finish()")
+        .expect("backend stream FIN");
+    assert!(
+        gate < finish,
+        "the END_STREAM check must run before the backend stream is finished"
+    );
+    // A post-wire error leaves the reset guard incomplete, so it cancels the
+    // backend stream; the message maps to the 499 client-disconnect arm.
+    let refusal = &forward[gate..finish];
+    assert!(
+        refusal.contains("H3PoolError::post_wire(")
+            && refusal.contains("Client disconnected while sending request body"),
+        "a masked client reset must be a post-wire client disconnect"
+    );
+}
+
+#[test]
 fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
     // Ordinary and SNI routes share the same body-compat gate; body-size
     // limits no longer fork the predicate.

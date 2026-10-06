@@ -3941,6 +3941,9 @@ impl Http3ConnectionPool {
     /// the backend stream returns the still-unpolled body alongside the error
     /// so the caller can replay it on a fresh connection; failures at or past
     /// that boundary return `None` — the body may already be partially sent.
+    ///
+    /// `require_h2_end_stream` is set for an HTTP/2 frontend: see
+    /// `forward_incoming_body_and_read_response`.
     #[allow(clippy::too_many_arguments)]
     async fn do_request_streaming_incoming_body(
         send_request: &mut H3SendRequest,
@@ -3949,6 +3952,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         frontend_body: Incoming,
+        require_h2_end_stream: bool,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
@@ -3974,6 +3978,7 @@ impl Http3ConnectionPool {
             backend_stream,
             proxy,
             frontend_body,
+            require_h2_end_stream,
             max_request_body_size,
             bytes_seen,
             grpc_messages,
@@ -4030,10 +4035,20 @@ impl Http3ConnectionPool {
     /// Post-wire phase of `do_request_streaming_incoming_body`: forward the
     /// frontend body, FIN the send side, and read the response headers. The
     /// backend stream is already open, so nothing here may be replayed.
+    ///
+    /// hyper reports an HTTP/2 client's `RST_STREAM(NO_ERROR)` as a clean end
+    /// of the request body (issue #6022). With `require_h2_end_stream` set (an
+    /// HTTP/2 frontend), only the client's own END_STREAM may FIN the backend
+    /// stream; a masked reset returns a post-wire client-disconnect error, so
+    /// the reset guard cancels the backend stream with `H3_REQUEST_CANCELLED`
+    /// instead of finishing a truncated upload. Never set for HTTP/1.1, whose
+    /// valid chunked EOF need not update `is_end_stream()`.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_incoming_body_and_read_response(
         mut backend_stream: H3RequestStream,
         proxy: &Proxy,
         mut frontend_body: Incoming,
+        require_h2_end_stream: bool,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
@@ -4079,6 +4094,11 @@ impl Http3ConnectionPool {
                 tap.push(metric_data);
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
+        }
+        if require_h2_end_stream && !hyper::body::Body::is_end_stream(&frontend_body) {
+            return Err(H3PoolError::post_wire(anyhow::anyhow!(
+                "Client disconnected while sending request body: HTTP/2 stream reset before END_STREAM"
+            )));
         }
         await_h3_write_under_authorization(
             auth,
@@ -4264,6 +4284,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         frontend_body: Incoming,
+        require_h2_end_stream: bool,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
@@ -4279,6 +4300,7 @@ impl Http3ConnectionPool {
             backend_url,
             headers,
             frontend_body,
+            require_h2_end_stream,
             max_request_body_size,
             bytes_seen,
             grpc_messages,
@@ -4296,6 +4318,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         mut frontend_body: Incoming,
+        require_h2_end_stream: bool,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
@@ -4321,6 +4344,7 @@ impl Http3ConnectionPool {
                 backend_url,
                 headers,
                 frontend_body,
+                require_h2_end_stream,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
                 grpc_messages.clone(),
@@ -4393,6 +4417,7 @@ impl Http3ConnectionPool {
             backend_url,
             headers,
             frontend_body,
+            require_h2_end_stream,
             max_request_body_size,
             bytes_seen,
             grpc_messages,
@@ -4578,6 +4603,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         frontend_body: Incoming,
+        require_h2_end_stream: bool,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
@@ -4596,6 +4622,7 @@ impl Http3ConnectionPool {
             backend_url,
             headers,
             frontend_body,
+            require_h2_end_stream,
             max_request_body_size,
             bytes_seen,
             grpc_messages,
@@ -4621,6 +4648,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         mut frontend_body: Incoming,
+        require_h2_end_stream: bool,
         max_request_body_size: usize,
         bytes_seen: Arc<AtomicU64>,
         grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
@@ -4651,6 +4679,7 @@ impl Http3ConnectionPool {
                 backend_url,
                 headers,
                 frontend_body,
+                require_h2_end_stream,
                 max_request_body_size,
                 Arc::clone(&bytes_seen),
                 grpc_messages.clone(),
@@ -4734,6 +4763,7 @@ impl Http3ConnectionPool {
             backend_url,
             headers,
             frontend_body,
+            require_h2_end_stream,
             max_request_body_size,
             bytes_seen,
             grpc_messages,

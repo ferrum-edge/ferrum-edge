@@ -112,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either reach the backend intact with END_STREAM or arrive as the client's
   `CANCEL` with no DATA. This is checked with and without an authenticated
   consumer.
+- **Test coverage for gateway-initiated backend resets** (#6022). A unit test
+  drives a real hyper HTTP/2 client whose request body fails. It checks that
+  the backend receives `RST_STREAM(CANCEL)` and that the error stays
+  backend-health-neutral in both the streaming and reqwest classifiers.
 
 ### Fixed
 
@@ -149,6 +153,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upload, so a reset client reaches the backend as `RST_STREAM(CANCEL)` instead
   of a truncated request that looks complete. Native gRPC already applied this
   check. HTTP/1.1 frontends are unaffected.
+- **Every other HTTP/2 streaming upload dispatcher also refuses to relay a
+  client reset as a complete body** (#6022). The reqwest streaming path
+  (size-limited and unlimited), the direct HTTP/1.1 pool, the sidecar mesh-mTLS
+  pool, HBONE, Unix-socket backends, and native HTTP/3 backends now apply the
+  same `END_STREAM` check to an HTTP/2 client's streamed upload, including
+  through the upload pump. A client `RST_STREAM(NO_ERROR)` now reaches an
+  HTTP/2 backend as `RST_STREAM(CANCEL)`, an HTTP/1.1 backend as an aborted
+  body and a closed connection, never as the final chunk, and a native HTTP/3
+  backend as a stream reset with `H3_REQUEST_CANCELLED` instead of a FIN; the
+  native HTTP/3 request ends as a `499` client disconnect. Bodies the gateway
+  buffers before dispatch are not covered by this check. The check costs one
+  version compare per streaming request and, at the end of each HTTP/2
+  upload, one read of the client stream's receive state, which takes h2's
+  connection lock once.
+- **A backend HTTP/2 reset on a reqwest request or buffered response counts as
+  a backend failure** (#6022). `classify_reqwest_error` now uses the same typed
+  `h2::Error` check as the streaming body classifier (#6019). A non-`NO_ERROR`
+  `RST_STREAM` or `GOAWAY` that the backend sent before the response headers,
+  or while the eager collector read a buffered body, is `protocol_error`. It
+  used to be `request_error`, which circuit breakers and passive health
+  recorded as a success. The class is post-wire, so `retry_on_connect_failure`
+  still never replays the request. The buffered collector for larger or
+  limited responses (`collect_response_with_limit`) now classifies its read
+  errors the same way as the eager collector. They used to be labelled
+  `response_body_too_large`, and now report the real class, such as
+  `protocol_error`, `connection_closed` or `read_write_timeout`. A read timeout
+  is `504`. The client-visible `502` body for other read errors is now
+  `{"error":"Backend response body read failed"}`. Like the eager collector's
+  errors, a `502` from these errors can be retried under `retryable_status_codes`
+  for a retryable method. Before, `response_body_too_large` was never retried.
+  Only `NO_ERROR` is excluded, so a backend `RST_STREAM(REFUSED_STREAM)` before
+  the response headers is now also `protocol_error` and is charged to the
+  target's circuit breaker and passive health. A reset the gateway raises
+  itself is not charged by these classifiers. The sidecar mesh-mTLS, HBONE and
+  Unix-socket dispatchers still classify any `send_request` failure before the
+  response headers as `protocol_error`, so a gateway reset that surfaces there
+  is charged to that target.
 - **A refused streamed-gRPC handoff keeps the client upload** (#6022). When
   the client RPC deadline or authorization lifetime elapsed while a
   fully-streamed native gRPC dispatch acquired its backend sender, the handoff
