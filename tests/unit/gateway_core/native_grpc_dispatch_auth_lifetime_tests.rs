@@ -986,7 +986,24 @@ fn all_grouped_paths_carry_the_authorization_plan_to_their_actual_boundaries() {
         "Ok(GrpcResponseKind::Buffered(grpc_resp)) => {",
         "Err(GrpcProxyError::AuthorizationExpired",
     );
-    assert!(native.contains("authorization_expired_grpc_precommit"));
+    // The buffered final check rewrites the collected response in place before
+    // the committed observers and the single transaction summary; it never
+    // logs a second rejection summary after the protected one.
+    assert!(!native.contains("authorization_expired_grpc_precommit"));
+    assert!(!native.contains("boxed_finalize_authorization_expired_rejection("));
+    let gate = "apply_buffered_grpc_precommit_authorization_terminal(";
+    assert_eq!(native.matches(gate).count(), 2);
+    let committed = offset_of(native, "run_deadline_bounded_response_committed_hooks(");
+    let summary = offset_of(native, "let summary = TransactionSummary {");
+    assert!(offset_of(native, gate) < committed);
+    let last_gate = native.rfind(gate).expect("authoritative pre-log gate");
+    assert!(committed < last_gate && last_gate < summary);
+    // The collected response is real backend evidence: health and admission
+    // settle before any response hook can run or the client can disconnect.
+    let hooks = offset_of(native, "run_after_proxy_hooks(");
+    assert!(offset_of(native, "permits.record_backend_outcome(") < hooks);
+    assert!(offset_of(native, "record_grpc_backend_dispatch_outcome(") < hooks);
+    assert!(!native.contains("cb_probe.release_neutral()"));
     let sidecar = source_region(
         PROXY_SOURCE,
         "async fn proxy_to_backend_mesh_mtls(",
@@ -1755,6 +1772,138 @@ async fn native_h3_cold_checkout_success_after_expiry_cannot_handoff_headers() {
         plan.2.observed(),
         Some(StreamAuthTermination::CredentialExpired)
     );
+}
+
+/// The creator publishes its connect instant on the first poll, and the dial
+/// then succeeds, but the task is not woken until after that instant. An
+/// established connection is never reported as a connect timeout, whether or
+/// not the request is authenticated. An authorization that elapsed while the
+/// dial was in flight is still refused at the send gate, before any HEADERS.
+#[tokio::test(start_paused = true)]
+async fn native_h3_cold_checkout_success_woken_after_connect_instant_is_not_a_timeout() {
+    use ferrum_edge::_test_support::await_native_h3_dispatch_for_test;
+    use ferrum_edge::http3::client::await_h3_connection_checkout_for_test;
+    use std::sync::OnceLock;
+
+    // The task wakes 100ms in: past every connect instant below, and past
+    // the authorization instant only where one is 60ms.
+    for (connect_ms, auth_ms) in [(40, None), (40, Some(500)), (40, Some(60)), (80, Some(60))] {
+        let started = tokio::time::Instant::now();
+        let plan = auth_ms.map(|ms| plan_after(Duration::from_millis(ms)));
+        let connect_instant = started + Duration::from_millis(connect_ms);
+        let connect_at = OnceLock::new();
+        let connected = AtomicBool::new(false);
+        let checkout = std::future::poll_fn(|_| {
+            let _ = connect_at.set(connect_instant);
+            if connected.load(Ordering::Relaxed) {
+                Poll::Ready(Ok::<(), anyhow::Error>(()))
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut wait = Box::pin(await_h3_connection_checkout_for_test(
+            None,
+            plan.as_ref(),
+            &connect_at,
+            checkout,
+        ));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            connect_at.get().copied(),
+            Some(connect_instant),
+            "the creator published its connect instant before the dial completed"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        connected.store(true, Ordering::Relaxed);
+        assert_eq!(
+            wait.await,
+            Ok(()),
+            "an established connection is not a ConnectionTimeout"
+        );
+
+        let expired = auth_ms.is_some_and(|ms| ms <= 100);
+        let backend_headers = AtomicUsize::new(0);
+        let send = std::future::poll_fn(|_| {
+            backend_headers.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok::<(), ferrum_edge::http3::client::H3PoolError>(()))
+        });
+        let sent = await_native_h3_dispatch_for_test(None, plan.as_ref(), false, send).await;
+        let termination = expired.then_some(StreamAuthTermination::CredentialExpired);
+        if expired {
+            assert_eq!(sent, Err((termination, false, false)));
+        } else {
+            assert_eq!(sent, Ok(()));
+        }
+        assert_eq!(
+            backend_headers.load(Ordering::Relaxed),
+            usize::from(!expired)
+        );
+        if let Some(plan) = &plan {
+            assert_eq!(plan.2.observed(), termination);
+        }
+    }
+}
+
+/// An unauthenticated native H3 response-header wait with no client deadline
+/// arms no bound around a receive that already applies its own read timeout,
+/// and that read timeout surfaces as the same error the composed bound reports
+/// when it wins at the read-timeout instant.
+#[tokio::test(start_paused = true)]
+async fn native_h3_unbounded_header_wait_arms_no_outer_timer_and_keeps_read_timeout() {
+    use ferrum_edge::http3::client::{
+        H3PoolError, await_h3_response_header_wait_for_test,
+        h3_connection_checkout_metadata_for_test,
+    };
+
+    const READ_TIMEOUT_MS: u64 = 50;
+    let read_timeout = Duration::from_millis(READ_TIMEOUT_MS);
+
+    // A receive that never resolves on its own: only an outer bound armed by
+    // the header wait could end it.
+    let unbounded = await_h3_response_header_wait_for_test(
+        None,
+        None,
+        READ_TIMEOUT_MS,
+        std::future::pending::<Result<(), H3PoolError>>(),
+    );
+    let outcome = tokio::time::timeout(Duration::from_secs(60), unbounded).await;
+    assert!(
+        outcome.is_err(),
+        "no outer timer may end an unauthenticated header wait"
+    );
+
+    // The receive's own read timeout is what ends the unbounded wait.
+    let started = tokio::time::Instant::now();
+    let own = await_h3_response_header_wait_for_test(None, None, READ_TIMEOUT_MS, async {
+        tokio::time::sleep(read_timeout).await;
+        let error = anyhow::anyhow!("recv_response read timeout after 50ms");
+        Err::<(), _>(H3PoolError::read_timeout(error))
+    })
+    .await;
+    let own = own.unwrap_err();
+    assert_eq!(tokio::time::Instant::now(), started + read_timeout);
+
+    // A client deadline takes the composed bound, which wins at the same
+    // read-timeout instant over a receive that never times out itself.
+    let started = tokio::time::Instant::now();
+    let composed = await_h3_response_header_wait_for_test(
+        Some(started + Duration::from_secs(1)),
+        None,
+        READ_TIMEOUT_MS,
+        std::future::pending::<Result<(), H3PoolError>>(),
+    )
+    .await;
+    let composed = composed.unwrap_err();
+    assert_eq!(tokio::time::Instant::now(), started + read_timeout);
+
+    for error in [&own, &composed] {
+        assert!(error.is_read_timeout());
+        assert_eq!(
+            h3_connection_checkout_metadata_for_test(error),
+            (None, true, false, ErrorClass::ReadWriteTimeout)
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
