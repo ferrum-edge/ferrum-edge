@@ -306,8 +306,8 @@ fn h3_body_retain_error(
 }
 
 /// A fully buffered HTTP/3 backend response returned by the pool's buffered
-/// request APIs ([`Http3ConnectionPool::request`] /
-/// [`Http3ConnectionPool::request_with_target`]).
+/// request APIs (`Http3ConnectionPool::request` /
+/// `Http3ConnectionPool::request_with_target`).
 ///
 /// `headers` carries the response headers (hop-by-hop names already stripped
 /// during collection). `trailers` carries any backend response trailers read

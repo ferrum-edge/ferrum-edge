@@ -37,6 +37,15 @@ pub(crate) use super::plugin_utils::{
 };
 use std::sync::Arc;
 
+struct NameOnlyPlugin(&'static str);
+
+#[async_trait::async_trait]
+impl Plugin for NameOnlyPlugin {
+    fn name(&self) -> &str {
+        self.0
+    }
+}
+
 /// Test shim for the finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv).
 ///
 /// `request_mirror` and `serverless_function` no longer have a `before_proxy`
@@ -1618,6 +1627,26 @@ fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
     let tcp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let tcp_names: Vec<_> = tcp_plugins.iter().map(|plugin| plugin.name()).collect();
     assert_eq!(tcp_names, ["tcp_connection_throttle"]);
+}
+
+#[test]
+fn custom_plugins_named_like_cache_finalizers_survive_cleanup() {
+    let mut plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(NameOnlyPlugin("__cors_finalizer")),
+        Arc::new(NameOnlyPlugin("__mesh_route_dispatch_finalizer")),
+    ];
+
+    ferrum_edge::_test_support::install_plugin_finalizers_for_test(&mut plugins)
+        .expect("custom sentinel names do not create finalizer conflicts");
+
+    let names: Vec<_> = plugins.iter().map(|plugin| plugin.name()).collect();
+    assert_eq!(
+        names,
+        ["__cors_finalizer", "__mesh_route_dispatch_finalizer"]
+    );
+    assert!(plugins
+        .iter()
+        .all(|plugin| !ferrum_edge::plugins::is_builtin_plugin(plugin.as_ref())));
 }
 
 /// Cache-internal finalizers are proven response-body non-producers whose

@@ -456,20 +456,20 @@ impl Plugin for MeshRouteDispatchFinalizer {
 /// Existing finalizers may be present when a global list is cloned during an
 /// incremental rebuild, so remove them before recomputing the boundary.
 fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
-    plugins.retain(|plugin| plugin.name() != MESH_ROUTE_DISPATCH_FINALIZER_NAME);
+    plugins.retain(|plugin| !is_builtin_named(plugin, MESH_ROUTE_DISPATCH_FINALIZER_NAME));
     let first_index = plugins
         .iter()
-        .position(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME);
+        .position(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME));
     let Some(last_index) = plugins
         .iter()
-        .rposition(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME)
+        .rposition(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME))
     else {
         return Ok(());
     };
     let first_index = first_index.unwrap_or(last_index);
 
     if plugins[first_index..=last_index].iter().any(|plugin| {
-        plugin.name() != MESH_ROUTE_DISPATCH_NAME
+        !is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME)
             && plugin
                 .supported_protocols()
                 .iter()
@@ -483,7 +483,7 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
 
     for plugin in plugins
         .iter()
-        .filter(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME)
+        .filter(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME))
     {
         plugin.enable_deferred_unmatched_rejection();
     }
@@ -499,13 +499,18 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
 /// evaluated the request. The chain must remain contiguous so an intervening
 /// short-circuit plugin cannot bypass a later CORS policy.
 fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
-    plugins.retain(|plugin| plugin.name() != crate::plugins::cors::CORS_FINALIZER_NAME);
-    let Some(first_index) = plugins.iter().position(|plugin| plugin.name() == CORS_NAME) else {
+    plugins.retain(|plugin| {
+        !is_builtin_named(plugin, crate::plugins::cors::CORS_FINALIZER_NAME)
+    });
+    let Some(first_index) = plugins
+        .iter()
+        .position(|plugin| is_builtin_named(plugin, CORS_NAME))
+    else {
         return Ok(());
     };
     let Some(last_index) = plugins
         .iter()
-        .rposition(|plugin| plugin.name() == CORS_NAME)
+        .rposition(|plugin| is_builtin_named(plugin, CORS_NAME))
     else {
         return Err("cors cache invariant lost its first instance".to_string());
     };
@@ -513,7 +518,7 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
         return Ok(());
     }
     if plugins[first_index..=last_index].iter().any(|plugin| {
-        plugin.name() != CORS_NAME
+        !is_builtin_named(plugin, CORS_NAME)
             && plugin
                 .supported_protocols()
                 .iter()
@@ -525,7 +530,7 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
         );
     }
     for plugin in &mut plugins[first_index..=last_index] {
-        if plugin.name() == CORS_NAME && !plugin.is_deferred_cors_wrapper() {
+        if is_builtin_named(plugin, CORS_NAME) && !plugin.is_deferred_cors_wrapper() {
             *plugin = Arc::new(DeferredCorsPlugin {
                 inner: Arc::clone(plugin),
             });
