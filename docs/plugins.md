@@ -9252,17 +9252,39 @@ timeout. An already-elapsed total refuses before a ready body is polled. Expiry
 is the `before_dispatch` `504` above, and gRPC folds the total into
 `DEADLINE_EXCEEDED`. Selection may not be decidable that early:
 
-- A rule that matches on an input an earlier plugin in the chain may still
-  rewrite (headers or Host, query, path or destination), or on a gateway-owned
-  identity header (`x-consumer-*`, `x-geo-country`), is a candidate rather than
-  a decision. So is an instance whose trigger reads an identity that is not yet
-  established, and an instance an earlier routing plugin may claim the request
-  away from.
+- A rule that matches on an input a plugin may still rewrite before the
+  instance runs (headers or Host, query, path or destination), or on a
+  gateway-owned identity header (`x-consumer-*`, `x-geo-country`), is a
+  candidate rather than a decision. A plugin that rewrites inputs from
+  `authenticate`, `authorize`, or the request-decompression normalizer counts
+  whatever its priority, because those phases run before every instance's
+  `before_proxy`; a plugin that rewrites only in `before_proxy` counts only when
+  it runs ahead of the instance. Every custom plugin counts whatever its
+  priority, and one that does not return `true` from
+  `declares_request_input_mutations()` is treated as able to rewrite any input
+  (see `CUSTOM_PLUGINS.md`).
+- Plugins that always write a fixed set of headers declare those names
+  (`correlation_id` its `header_name`, `otel_tracing` `traceparent` /
+  `tracestate`, `rate_limiting` its `x-ratelimit-*` set, `grpc_deadline`
+  `grpc-timeout`, `sse` `accept-encoding` / `last-event-id`, `compression` the
+  `accept-encoding` / `content-encoding` / `content-length` set), so a rule on
+  any other header stays decided alongside them.
+- An instance whose trigger reads an identity that is not yet established, or
+  any input that may still change, may or may not run. So may an instance a
+  routing plugin may claim the request away from.
 - The early bound is then the **largest** total among the rules that could
-  still be selected. A redirect or an unmatched `404` arms no total and adds no
-  candidate. If any candidate is untimed (including "no rule matches"), there is
-  no early route bound and only `backend_read_timeout_ms` and the RPC deadline
-  apply. Set a finite `backend_read_timeout_ms` on such routes.
+  still be selected. An outcome answered without dispatch arms no total and
+  adds no candidate: a redirect, a fault that always aborts (unless a
+  `fault_injection` instance runs ahead and may inject first), a waypoint veto
+  the request's authorization metadata already decides, and the `404` the
+  cache's finalizer returns when no instance of a `reject_unmatched` chain
+  matched. If any candidate is untimed (including "no rule matches" without
+  `reject_unmatched`, or with a routing plugin that may publish its own
+  override), there is no early route bound and only `backend_read_timeout_ms`
+  and the RPC deadline apply. Set a finite `backend_read_timeout_ms` on such
+  routes.
+- The transaction log names an early route expiry
+  `route_request_timeout_early_upload` on HTTP/1.1, HTTP/2, and HTTP/3.
 
 Upgraded WebSocket and CONNECT-UDP tunnels are not HTTP response bodies and are
 not bounded by `request_timeout_ms`. Gateway-local plugin hooks are not

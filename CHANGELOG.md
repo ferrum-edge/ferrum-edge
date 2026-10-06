@@ -19,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body-before-auth route had no aggregate bound, and no per-request bound when
   the global body limit was `0`. An upload the budget cannot admit now gets
   `503` / gRPC `RESOURCE_EXHAUSTED` (`gateway_buffer_capacity`,
-  health-neutral). Cancellation, `413`, disconnect and timeouts release the
-  charge exactly once; a completed body stays charged until its owner and
-  every retry copy are done.
+  health-neutral). At a dispatch-stage drain that refusal runs the rejection
+  hooks and is transaction-logged like the other terminal request-body
+  rejections. Cancellation, `413`, disconnect and timeouts release the charge
+  exactly once. A completed body is published for dispatch with its charge, as
+  on HTTP/1.1 and HTTP/2: the charge is released when the last dispatch or
+  retry copy drops, before the response is relayed, so a long streamed
+  response holds no request-buffer charge.
 - **Route total deadlines now bound body collection that runs before
   `before_proxy`** (partially addresses #6008). A body a plugin needs before
   authentication, authorization or `before_proxy` (SOAP WS-Security,
@@ -33,15 +37,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native HTTP/3 now preview the rule with the request's pinned compiled
   matchers (no hook runs, nothing is armed) and bound the collect at the
   receipt-anchored total. An elapsed budget refuses before a ready body is
-  polled. Expiry is the existing health-neutral route timeout (`504`
-  `{"error":"Request timeout"}`, logged `before_dispatch`); gRPC folds it into
-  `DEADLINE_EXCEEDED`. When the rule cannot be decided before authentication
-  (an earlier plugin may still rewrite an input it matches on, or an
-  identity-dependent trigger), the bound is the largest total among the rules
-  that could still be selected. If any of those is untimed, the read/RPC
-  bounds apply as before; set a finite `backend_read_timeout_ms` on such
-  routes. A completed early body and its buffer charge are released before
-  authentication or authorization rejection hooks run.
+  polled, on gRPC too. Expiry is the existing health-neutral route timeout
+  (`504` `{"error":"Request timeout"}`, logged `before_dispatch` under the
+  `route_request_timeout_early_upload` rejection phase on every protocol);
+  gRPC folds it into `DEADLINE_EXCEEDED`. A rule is undetermined when any
+  plugin may still rewrite an input it matches on before it runs: plugins
+  that rewrite headers, query, path or destination in `authenticate`,
+  `authorize` or the request-decompression normalizer count whatever their
+  priority, and so does every custom plugin that has not declared its request
+  mutations (`declares_request_input_mutations`). `correlation_id`,
+  `otel_tracing`, `rate_limiting`, `grpc_deadline`, `sse` and `compression`
+  declare the headers they write, so a rule on any other header stays
+  decided. The bound for an undetermined rule is the largest total among the
+  rules that could still be selected. A request that would be answered
+  without dispatch adds no candidate: a redirect, a fault that always aborts,
+  a decided waypoint veto, or the deferred unmatched `404` of a
+  `reject_unmatched` chain. If any candidate is untimed, the read/RPC bounds
+  apply as before; set a finite `backend_read_timeout_ms` on such routes. A
+  completed early body and its buffer charge are released before
+  authentication or authorization rejection hooks run. **Known limitation:**
+  an instance with an execution trigger stays undetermined whenever any
+  request input may change, and a custom plugin that rewrites
+  `route_override_request_timeout_ms` directly is not modelled.
 - **ARM64 Cross release inputs are pinned and verified** (#5955, #5989;
   GHSA-2q8f-75vc-v8c7). Cross 0.2.5 now uses the published GHCR OCI index
   digest, retaining its Linux/amd64 host image and aarch64 target. The protoc

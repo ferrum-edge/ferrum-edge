@@ -31,22 +31,31 @@ use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
+use ferrum_edge::PluginCache;
 use ferrum_edge::_test_support::{
     EarlyBodyCollectOutcomeForTest as Outcome, H3UploadWaitOutcomeForTest,
     buffer_early_request_body_for_test, collect_h3_upload_under_authorization_for_test,
     early_route_total_ms_for_test, early_upload_deadlines_for_test,
+    plugin_cache_early_route_total_ms_for_test,
 };
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, create_plugin};
 use ferrum_edge::proxy::auth_lifetime::{
     ComposedAuthBound, StreamAuthDeadline, StreamAuthTermination,
+};
+
+use crate::unit::plugins::plugin_utils::{
+    make_plugin_config_with_json, make_proxy, minimal_plugin_config,
 };
 
 // ---------------------------------------------------------------------------
 // Preview fixtures
 // ---------------------------------------------------------------------------
 
-/// A plugin that may rewrite request inputs before route dispatch runs.
+/// A custom plugin that declares the request inputs it may rewrite. A custom
+/// plugin may rewrite them in any pre-proxy phase, so the declaration applies
+/// to every instance whatever its position.
 struct InputMutator {
     headers: bool,
     query: bool,
@@ -56,6 +65,10 @@ struct InputMutator {
 impl Plugin for InputMutator {
     fn name(&self) -> &str {
         "test_early_route_input_mutator"
+    }
+
+    fn declares_request_input_mutations(&self) -> bool {
+        true
     }
 
     fn modifies_request_headers(&self) -> bool {
@@ -317,12 +330,14 @@ fn a_destination_claim_ahead_of_dispatch_may_skip_the_instance() {
         None,
         "a router may claim the request and leave it untimed"
     );
+    // A custom router may claim in `authenticate` or `authorize`, ahead of
+    // every instance, whatever its own priority.
     let plugins = [
         dispatch(json!([path_rule("/", Some(2000))])),
         destination_mutator(),
         dispatch(json!([path_rule("/", Some(5000))])),
     ];
-    assert_eq!(preview(&plugins, &request("/soap", &[])), Some(5000));
+    assert_eq!(preview(&plugins, &request("/soap", &[])), None);
 }
 
 #[test]
@@ -338,6 +353,327 @@ fn query_rules_are_undecided_behind_a_query_rewrite() {
     ]);
     let plugins = [query_mutator, dispatch(rules)];
     assert_eq!(preview(&plugins, &request("/soap", &[])), Some(9000));
+}
+
+// ---------------------------------------------------------------------------
+// Rewrites in any pre-proxy phase
+// ---------------------------------------------------------------------------
+
+/// A custom plugin that declares nothing about the request inputs it rewrites.
+struct UndeclaredCustom;
+
+impl Plugin for UndeclaredCustom {
+    fn name(&self) -> &str {
+        "test_early_route_undeclared_custom"
+    }
+}
+
+fn built_in(name: &str, config: serde_json::Value) -> Arc<dyn Plugin> {
+    create_plugin(name, &config)
+        .expect("valid config")
+        .expect("built-in plugin")
+}
+
+#[test]
+fn a_later_custom_header_writer_still_undecides_a_header_rule() {
+    // The plugin runs after dispatch in `before_proxy` order, but a custom
+    // plugin may inject `x-tenant` from `authenticate`, before dispatch.
+    let plugins = [
+        dispatch(json!([
+            header_rule("x-tenant", "gold", None),
+            path_rule("/soap", Some(2000)),
+        ])),
+        header_mutator(),
+    ];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        None,
+        "the untimed gold rule may still be selected, so no early bound applies"
+    );
+}
+
+#[test]
+fn an_undeclared_custom_plugin_may_rewrite_any_input() {
+    let rules = json!([path_rule("/soap", Some(1500))]);
+    assert_eq!(
+        preview(&[dispatch(rules.clone())], &request("/soap", &[])),
+        Some(1500)
+    );
+    let plugins = [
+        dispatch(rules),
+        Arc::new(UndeclaredCustom) as Arc<dyn Plugin>,
+    ];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        None,
+        "an undeclared custom plugin may rewrite the path or claim the request"
+    );
+}
+
+#[tokio::test]
+async fn the_request_decompression_normalizer_counts_whatever_its_priority() {
+    let decompress = built_in("compression", json!({"decompress_request": true}));
+    let rules = json!([
+        header_rule("content-encoding", "gzip", Some(900)),
+        header_rule("x-soap-tier", "gold", Some(800)),
+        path_rule("/", Some(5000)),
+    ]);
+    let plugins = [dispatch(rules), decompress];
+    let gzip = request("/soap", &[("content-encoding", "gzip")]);
+    assert_eq!(
+        preview(&plugins, &gzip),
+        Some(5000),
+        "the normalizer may remove `content-encoding` before dispatch reads it"
+    );
+    let gold = request("/soap", &[("x-soap-tier", "gold")]);
+    assert_eq!(
+        preview(&plugins, &gold),
+        Some(900),
+        "the undecided `content-encoding` rule ahead keeps its candidate"
+    );
+}
+
+#[tokio::test]
+async fn fixed_header_writers_undecide_only_the_headers_they_write() {
+    let plugins = [
+        built_in("correlation_id", json!({})),
+        built_in("rate_limiting", minimal_plugin_config("rate_limiting")),
+        dispatch(json!([
+            header_rule("x-soap-tier", "gold", Some(800)),
+            header_rule("x-request-id", "batch", Some(9000)),
+            path_rule("/", Some(5000)),
+        ])),
+    ];
+    let gold = request("/soap", &[("x-soap-tier", "gold")]);
+    assert_eq!(
+        preview(&plugins, &gold),
+        Some(800),
+        "no plugin writes `x-soap-tier`, so its rule is decided"
+    );
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(9000),
+        "`correlation_id` may write `x-request-id`, so that rule is a candidate"
+    );
+}
+
+#[tokio::test]
+async fn a_certain_fault_abort_adds_no_candidate() {
+    let abort = json!({"abort": {"status_code": 503, "percentage": 100.0}});
+    let rules = json!([{
+        "match": {"uri": {"prefix": "/soap"}},
+        "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+        "request_timeout_ms": 700,
+        "fault": abort
+    }]);
+    assert_eq!(
+        preview(&[dispatch(rules.clone())], &request("/soap", &[])),
+        None,
+        "the request is answered by the fault before any total is armed"
+    );
+    let partial = json!([{
+        "match": {"uri": {"prefix": "/soap"}},
+        "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+        "request_timeout_ms": 700,
+        "fault": {"abort": {"status_code": 503, "percentage": 50.0}}
+    }]);
+    assert_eq!(
+        preview(&[dispatch(partial)], &request("/soap", &[])),
+        Some(700),
+        "a partial abort may still dispatch under the rule's total"
+    );
+    let fault_first = [
+        built_in(
+            "fault_injection",
+            json!({"abort": {"status_code": 503, "percentage": 100.0}}),
+        ),
+        dispatch(rules),
+    ];
+    assert_eq!(
+        preview(&fault_first, &request("/soap", &[])),
+        Some(700),
+        "an earlier `fault_injection` may inject first, and the rule's fault then stands down"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Chains built by the plugin cache
+// ---------------------------------------------------------------------------
+
+fn mesh_config(id: &str, config: serde_json::Value) -> PluginConfig {
+    proxy_plugin(id, "mesh_route_dispatch", config)
+}
+
+fn proxy_plugin(id: &str, name: &str, config: serde_json::Value) -> PluginConfig {
+    make_plugin_config_with_json(id, name, config, PluginScope::Proxy, Some("p1"))
+}
+
+fn cached(plugin_configs: Vec<PluginConfig>) -> PluginCache {
+    let ids: Vec<String> = plugin_configs
+        .iter()
+        .map(|config| config.id.clone())
+        .collect();
+    let proxy = make_proxy("p1", "/", ids.iter().map(String::as_str).collect());
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy],
+        plugin_configs,
+        ..Default::default()
+    };
+    PluginCache::new(&config).expect("plugin cache")
+}
+
+fn cached_preview(cache: &PluginCache, ctx: &RequestContext) -> Option<u64> {
+    plugin_cache_early_route_total_ms_for_test(
+        cache,
+        "ferrum",
+        "p1",
+        ProxyProtocol::Http,
+        ctx,
+        true,
+    )
+}
+
+#[tokio::test]
+async fn a_cached_unmatched_rejection_adds_no_candidate() {
+    let rules = json!([header_rule("x-request-id", "batch", Some(800))]);
+    let rejecting = json!({ "rules": rules.clone(), "reject_unmatched": true });
+    let cache = cached(vec![
+        proxy_plugin("correlation", "correlation_id", json!({})),
+        mesh_config("route", rejecting),
+    ]);
+    assert_eq!(
+        cached_preview(&cache, &request("/soap", &[])),
+        Some(800),
+        "a miss is the finalizer's `404`, which never reaches a backend"
+    );
+
+    let open = json!({ "rules": rules });
+    let cache = cached(vec![
+        proxy_plugin("correlation", "correlation_id", json!({})),
+        mesh_config("route", open),
+    ]);
+    assert_eq!(
+        cached_preview(&cache, &request("/soap", &[])),
+        None,
+        "without `reject_unmatched` a miss reaches the proxy backend untimed"
+    );
+}
+
+#[tokio::test]
+async fn cached_fixed_header_writers_keep_other_header_rules_decided() {
+    let cache = cached(vec![
+        proxy_plugin("correlation", "correlation_id", json!({})),
+        proxy_plugin(
+            "tracing",
+            "otel_tracing",
+            minimal_plugin_config("otel_tracing"),
+        ),
+        proxy_plugin(
+            "limits",
+            "rate_limiting",
+            minimal_plugin_config("rate_limiting"),
+        ),
+        mesh_config(
+            "route",
+            json!({ "rules": [
+                header_rule("x-soap-tier", "gold", Some(800)),
+                path_rule("/", Some(5000)),
+            ]}),
+        ),
+    ]);
+    let gold = request("/soap", &[("x-soap-tier", "gold")]);
+    assert_eq!(cached_preview(&cache, &gold), Some(800));
+    assert_eq!(cached_preview(&cache, &request("/soap", &[])), Some(5000));
+}
+
+/// Run the cache's real `before_proxy` chain and report the total it arms.
+async fn published_total(cache: &PluginCache, mut ctx: RequestContext) -> Option<u64> {
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let mut headers = ctx.headers.clone();
+    for plugin in plugins.iter() {
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Continue => {}
+            _ => return None,
+        }
+    }
+    ctx.route_override_request_timeout_ms
+}
+
+#[tokio::test]
+async fn the_cached_preview_agrees_with_the_before_proxy_chain() {
+    let first = json!({ "rules": [
+        {
+            "match": {"uri": {"prefix": "/old"}},
+            "redirect": {"uri": "/new", "redirect_code": 308}
+        },
+        header_rule("x-soap-tier", "gold", Some(800)),
+        {
+            "match": {"uri": {"prefix": "/soap"}},
+            "destination": {"backend_host": "127.0.0.1", "backend_port": 8080},
+            "rewrite": {"authority": "soap.internal"},
+            "request_timeout_ms": 1500
+        },
+    ]});
+    let internal = json!({"authority": {"exact": "soap.internal"}});
+    let bulk = json!({
+        "authority": {"exact": "soap.internal"},
+        "query_params": {"op": "bulk"}
+    });
+    let second = json!({ "rules": [
+        rule(bulk, Some(9000)),
+        rule(internal, Some(2500)),
+        rule(json!({"methods": ["PUT"]}), Some(400)),
+    ], "reject_unmatched": true });
+    // Explicit order: each instance replaces the previous instance's match.
+    let mut second = mesh_config("route-b", second);
+    second.priority_override = Some(2996);
+    let mut triggered = mesh_config(
+        "route-post",
+        json!({ "rules": [path_rule("/soap/post", Some(700))] }),
+    );
+    triggered.priority_override = Some(2997);
+    triggered.trigger = Some(
+        serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}}))
+            .expect("valid method trigger"),
+    );
+    let cache = cached(vec![mesh_config("route-a", first), second, triggered]);
+
+    // (method, path, headers, query, total the chain arms)
+    type Fixture<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], &'a str, Option<u64>);
+    let fixtures: [Fixture; 7] = [
+        // Authority rewrite feeds the next instance.
+        ("GET", "/soap/x", &[], "", Some(2500)),
+        // Query predicate on the rewritten authority.
+        ("GET", "/soap/x", &[], "op=bulk", Some(9000)),
+        // Header match; the later instance's miss stages a `404` that an
+        // earlier match overrides.
+        ("GET", "/soap/x", &[("x-soap-tier", "gold")], "", Some(800)),
+        // Redirect: answered before any total.
+        ("GET", "/old/page", &[], "", None),
+        // Method predicate in the second instance.
+        ("PUT", "/rest", &[], "", Some(400)),
+        // No instance matches: the finalizer's `404`.
+        ("GET", "/rest", &[], "", None),
+        // A triggered third instance replaces the earlier selections.
+        ("POST", "/soap/post", &[], "", Some(700)),
+    ];
+    for (method, path, headers, query, expected) in fixtures {
+        let build = || {
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                method.to_string(),
+                path.to_string(),
+            );
+            ctx.headers = request(path, headers).headers;
+            ctx.set_raw_query_string(query.to_string());
+            ctx
+        };
+        let previewed = cached_preview(&cache, &build());
+        let published = published_total(&cache, build()).await;
+        assert_eq!(previewed, published, "{method} {path}?{query} drifted");
+        assert_eq!(previewed, expected, "{method} {path}?{query}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -650,12 +986,52 @@ fn grpc_folds_the_previewed_total_into_its_rpc_deadline() {
     let now = Instant::now();
     let rpc = Some(now + Duration::from_secs(9));
     let route = Some(now + Duration::from_secs(2));
+    // The folded deadline is also the gRPC route term, so the collector
+    // waits deadline-first; the RPC deadline wins that tie.
     let folded = early_upload_deadlines_for_test(rpc, route, true);
-    assert_eq!(folded, (route, None));
+    assert_eq!(folded, (route, route));
+    let earlier_rpc = Some(now + Duration::from_secs(1));
+    let folded = early_upload_deadlines_for_test(earlier_rpc, route, true);
+    assert_eq!(folded, (earlier_rpc, earlier_rpc));
     let split = early_upload_deadlines_for_test(rpc, route, false);
     assert_eq!(split, (rpc, route));
+    let unpreviewed = early_upload_deadlines_for_test(rpc, None, true);
+    assert_eq!(unpreviewed, (rpc, None), "no preview, no change");
     let none = early_upload_deadlines_for_test(None, None, true);
     assert_eq!(none, (None, None));
+}
+
+#[tokio::test(start_paused = true)]
+async fn h1_grpc_an_elapsed_folded_budget_refuses_a_ready_body_without_polling_it() {
+    let start = Instant::now();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    client.write_all(H1_HEAD).await.expect("head");
+    client.write_all(&[b'x'; 64]).await.expect("complete body");
+    tokio::time::advance(Duration::from_millis(20)).await;
+    // The composition every H1/H2 early collector applies to a gRPC request.
+    let (rpc_at, route_at) = early_upload_deadlines_for_test(
+        Some(start + Duration::from_secs(30)),
+        Some(start + Duration::from_millis(10)),
+        true,
+    );
+    let bounds = CollectBounds {
+        max_bytes: 64 * 1024,
+        read_timeout_ms: 30_000,
+        rpc_at,
+        route_at,
+    };
+    let (outcome, at) = report(serve_h1(server, bounds)).await;
+    assert_eq!(
+        outcome,
+        Outcome::DeadlineExceeded,
+        "a ready gRPC body must not be accepted once the folded budget is spent"
+    );
+    assert_eq!(
+        at,
+        start + Duration::from_millis(20),
+        "refused without waiting"
+    );
+    drop(client);
 }
 
 #[test]

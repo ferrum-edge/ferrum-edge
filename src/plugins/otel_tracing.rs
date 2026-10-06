@@ -817,6 +817,11 @@ impl Plugin for OtelTracing {
         true
     }
 
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        let names = [TRACEPARENT_HEADER, TRACESTATE_HEADER];
+        Some(Vec::from(names.map(String::from)))
+    }
+
     fn requires_ws_disconnect_hooks(&self) -> bool {
         true
     }

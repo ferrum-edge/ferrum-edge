@@ -10350,13 +10350,15 @@ pub trait Plugin: Send + Sync {
     /// must return `true`. A plugin that publishes a later backend-header
     /// overlay must also return `true` so earlier replay/cache plugins cannot
     /// bind a request before its final backend-visible headers exist; the
-    /// resulting conservative clone is an accepted cost.
+    /// resulting conservative clone is an accepted cost. A change made from
+    /// `authenticate`, `authorize`, or the pre-`before_proxy` body
+    /// normalization must be declared too (issue #6008).
     fn modifies_request_headers(&self) -> bool {
         false
     }
 
     /// Returns `true` if this plugin may rewrite the backend-visible query
-    /// string during `before_proxy`.
+    /// string during `before_proxy` (or any earlier pre-proxy phase).
     ///
     /// Replay plugins use this independently from header mutation: a
     /// query-only transformer still changes the operation even when it does not
@@ -10366,11 +10368,40 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Returns `true` if this plugin may rewrite the effective backend,
-    /// upstream, authority, or path during `before_proxy`.
+    /// upstream, authority, or path during `before_proxy` (or any earlier
+    /// pre-proxy phase).
     ///
     /// Replay plugins use this to ensure their destination partition is built
     /// only after routing has reached its final state.
     fn modifies_request_destination(&self) -> bool {
+        false
+    }
+
+    /// The lower-case names of every request header this plugin may change,
+    /// when that set is fixed at construction. Consulted only when
+    /// [`Self::modifies_request_headers`] is `true`; `None` (the default) means
+    /// any header may change.
+    ///
+    /// The early route-total preview (issue #6008) uses it to keep deciding
+    /// `mesh_route_dispatch` rules that match on other headers. Declare a name
+    /// here only when the plugin can never change any other header.
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Returns `true` when this plugin's request-input declarations
+    /// ([`Self::modifies_request_headers`], [`Self::modified_request_header_names`],
+    /// [`Self::modifies_request_query`], and [`Self::modifies_request_destination`])
+    /// cover every header, query, path, or destination change it makes in ANY
+    /// phase before backend dispatch: `authenticate`, `authorize`, the
+    /// pre-`before_proxy` body normalization, and `before_proxy`.
+    ///
+    /// Built-in plugins are audited and always treated as declared. A custom
+    /// plugin that returns `false` (the default) is treated as able to change
+    /// any request input in any of those phases, so a body collected before
+    /// `before_proxy` gets no early route-total bound from a
+    /// `mesh_route_dispatch` rule matching on those inputs (issue #6008).
+    fn declares_request_input_mutations(&self) -> bool {
         false
     }
 
@@ -10815,7 +10846,7 @@ pub trait Plugin: Send + Sync {
         _ctx: &'a RequestContext,
         _host: Option<&'a str>,
         _query: Option<&utils::query::CanonicalQuery>,
-        _facts: early_route_total::EarlyRouteTotalFacts,
+        _facts: early_route_total::EarlyRouteTotalFacts<'_>,
     ) -> Option<early_route_total::EarlyRouteTotalStep<'a>> {
         None
     }

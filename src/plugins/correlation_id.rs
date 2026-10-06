@@ -244,6 +244,10 @@ impl Plugin for CorrelationId {
         true
     }
 
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        Some(vec![self.header_name.clone()])
+    }
+
     async fn on_stream_connect(
         &self,
         ctx: &mut super::StreamConnectionContext,

@@ -3853,7 +3853,8 @@ pub(crate) enum RequestBodyBufferError {
     /// The previewed route total deadline (issue #6008) is the captured
     /// earliest bound of an early collect and elapsed first: proxy core's
     /// health-neutral route-timeout `504`. Only a non-gRPC early collect can
-    /// produce it; a gRPC request folds the total into its RPC deadline.
+    /// produce it. A gRPC request folds the total into its RPC deadline, which
+    /// wins the tie with its own route term.
     RouteDeadlineExceeded,
 }
 
@@ -3882,13 +3883,20 @@ fn early_route_bound(
 /// `before_proxy` selects the rule: a gRPC request folds it into its RPC
 /// deadline; every other request keeps it as its own route-timeout term.
 /// Returns `(rpc_deadline_at, route_deadline_at)` for an early collector.
+///
+/// A gRPC request with a previewed total also gets the folded deadline back
+/// as its route term. The collector then waits deadline-first, so an elapsed
+/// budget refuses before a ready body is polled. The RPC deadline wins that
+/// tie, so the expiry is still the gRPC deadline terminal and never the plain
+/// route timeout.
 pub(crate) fn early_upload_deadlines(
     rpc_deadline_at: Option<tokio::time::Instant>,
     early_route_at: Option<tokio::time::Instant>,
     grpc_flavored: bool,
 ) -> (Option<tokio::time::Instant>, Option<tokio::time::Instant>) {
     if grpc_flavored {
-        (earliest_deadline(rpc_deadline_at, early_route_at), None)
+        let folded = earliest_deadline(rpc_deadline_at, early_route_at);
+        (folded, early_route_at.and(folded))
     } else {
         (rpc_deadline_at, early_route_at)
     }

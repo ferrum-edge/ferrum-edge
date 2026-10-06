@@ -426,7 +426,11 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn priority(&self) -> u16` | `5000` | Execution order (lower = earlier). See priority bands below. |
 | `fn supported_protocols(&self) -> &'static [ProxyProtocol]` | `HTTP_ONLY_PROTOCOLS` | Which proxy protocols this plugin supports. See protocol constants below. |
 | `fn is_auth_plugin(&self) -> bool` | `false` | Set to `true` if your plugin participates in the authentication phase. |
-| `fn modifies_request_headers(&self) -> bool` | `false` | Set to `true` if your plugin modifies outgoing request headers in `before_proxy`. |
+| `fn modifies_request_headers(&self) -> bool` | `false` | Set to `true` if your plugin may insert, remove, or modify request headers (Host included) in **any** pre-proxy phase: `authenticate`, `authorize`, the pre-`before_proxy` body normalization, or `before_proxy`. |
+| `fn modified_request_header_names(&self) -> Option<Vec<String>>` | `None` | The lower-case names of every request header the plugin may change, when that set is fixed at construction. `None` means any header. Consulted only when `modifies_request_headers()` is `true`. |
+| `fn modifies_request_query(&self) -> bool` | `false` | Set to `true` if your plugin may rewrite the forwarded query in any pre-proxy phase. |
+| `fn modifies_request_destination(&self) -> bool` | `false` | Set to `true` if your plugin may rewrite the path, backend, upstream, or authority (including publishing route overrides) in any pre-proxy phase. |
+| `fn declares_request_input_mutations(&self) -> bool` | `false` | Return `true` once the four declarations above cover **every** header, query, path, or destination change the plugin makes in any pre-proxy phase. Until it does, the gateway treats the plugin as able to rewrite any request input in any phase, whatever its priority: a body collected before `before_proxy` then gets no early route-total bound from a `mesh_route_dispatch` rule (issue #6008). See [plugins.md → Route request deadline](docs/plugins.md#route-request-deadline). |
 | `fn modifies_request_body(&self) -> bool` | `false` | Set to `true` if your plugin transforms the request body via `transform_request_body`. |
 | `fn egresses_request_body_before_finalization(&self) -> bool` | `false` | Set to `true` if `before_proxy` sends the buffered request body to an external service before request transforms/final hooks. Candidate admission and runtime cache construction then reject same-protocol body-transform compositions and same HTTP/gRPC-protocol final request-body policy plugins (`enforces_finalized_request_policy()`). |
 | `fn requires_prior_request_deduplication(&self) -> bool` | `false` | Set to `true` if `before_proxy` can execute an external side effect and return a terminal response. Any attached same-protocol `request_deduplication` instance must then have a strictly lower effective priority. |
@@ -1663,6 +1667,7 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] `supported_protocols()` returns the correct protocol set
 - [ ] `is_auth_plugin()` returns `true` if it's an auth plugin
 - [ ] `modifies_request_body()` returns `true` if it transforms the request body
+- [ ] `modifies_request_headers()` / `modifies_request_query()` / `modifies_request_destination()` declare every request-input change made in **any** pre-proxy phase (`authenticate`, `authorize`, body normalization, `before_proxy`), and `declares_request_input_mutations()` returns `true` once they do
 - [ ] `egresses_request_body_before_finalization()` returns `true` if `before_proxy` sends body bytes to an external service before finalization (candidate admission then refuses same-protocol body transformers and same HTTP/gRPC-protocol final request-body policy plugins)
 - [ ] `requires_prior_request_deduplication()` returns `true` if a terminal external side effect must run after attached deduplication instances
 - [ ] `requires_request_body_before_before_proxy()` returns `true` if it reads the request body during `before_proxy` or implements `validate_client_request_body_contract()`

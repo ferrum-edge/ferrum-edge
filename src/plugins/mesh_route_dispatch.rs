@@ -1704,20 +1704,26 @@ impl MeshRouteDispatch {
     /// The pure preview behind [`Plugin::early_route_total`] (issue #6008):
     /// the same first-match walk `before_proxy` makes, over the same compiled
     /// matchers, without running a fault, redirect, or rewrite. A rule that
-    /// matches on an input an earlier plugin may still rewrite is a candidate
-    /// rather than a decision.
+    /// matches on an input a plugin may still rewrite is a candidate rather
+    /// than a decision.
     fn preview_route_total<'a>(
         &'a self,
         ctx: &'a RequestContext,
         host: Option<&'a str>,
         query: Option<&CanonicalQuery>,
-        facts: EarlyRouteTotalFacts,
+        facts: EarlyRouteTotalFacts<'_>,
     ) -> EarlyRouteTotalStep<'a> {
         if ctx.has_ai_stream_router_claim() {
-            return EarlyRouteTotalStep::NoMatch;
+            return EarlyRouteTotalStep::NoMatch {
+                stages_unmatched: false,
+            };
         }
+        // Under the cache's deferred unmatched handling a miss only stages the
+        // `404`, which the finalizer answers when no instance matched; a
+        // standalone instance answers it itself.
         let deferred_unmatched = self.aggregate_reject_unmatched.load(Ordering::Relaxed);
         let refuses_unmatched = self.config.reject_unmatched && !deferred_unmatched;
+        let stages_unmatched = self.config.reject_unmatched && deferred_unmatched;
         if self.has_query_predicates
             && !facts.query_may_change
             && query.is_some_and(|q| q.first_ambiguity().is_some())
@@ -1731,10 +1737,7 @@ impl MeshRouteDispatch {
             if decided && !rule_matches_with_host(rule, ctx, &ctx.headers, host, query) {
                 continue;
             }
-            // A redirect answers before any total is published. A fault abort
-            // or a waypoint veto may also end the request, but otherwise this
-            // rule's total is armed, so the rule's total is the bound.
-            let publishes = rule.redirect.is_none();
+            let publishes = !rule_answers_before_dispatch(ctx, rule, facts);
             if decided && !undetermined {
                 if !publishes {
                     return EarlyRouteTotalStep::Terminal;
@@ -1757,6 +1760,7 @@ impl MeshRouteDispatch {
                 return EarlyRouteTotalStep::Candidates {
                     candidates,
                     may_fall_through: false,
+                    stages_unmatched: false,
                 };
             }
             undetermined = true;
@@ -1765,31 +1769,54 @@ impl MeshRouteDispatch {
             return if refuses_unmatched {
                 EarlyRouteTotalStep::Terminal
             } else {
-                EarlyRouteTotalStep::NoMatch
+                EarlyRouteTotalStep::NoMatch { stages_unmatched }
             };
         }
         EarlyRouteTotalStep::Candidates {
             candidates,
             may_fall_through: !refuses_unmatched,
+            stages_unmatched,
         }
     }
 }
 
-/// Whether `rule` matches on a request input an earlier plugin may still
-/// rewrite before this instance runs, so it cannot be decided early.
-/// Gateway-owned assertion headers (`x-consumer-*`, `x-geo-country`) are
-/// published only after authentication and are never decided early.
-fn rule_reads_changing_input(rule: &RouteRule, facts: EarlyRouteTotalFacts) -> bool {
-    let host_changes = facts.headers_may_change || facts.host_unknown;
+/// Whether `rule` matches on a request input a plugin may still rewrite
+/// before this instance runs, so it cannot be decided early. Gateway-owned
+/// assertion headers (`x-consumer-*`, `x-geo-country`) are published only
+/// after authentication and are never decided early.
+fn rule_reads_changing_input(rule: &RouteRule, facts: EarlyRouteTotalFacts<'_>) -> bool {
+    let host_changes = facts.headers.may_change("host") || facts.host_unknown;
     let reads_changing_header = rule.headers_compiled.keys().any(|name| {
         crate::proxy::headers::is_gateway_assertion_header(name)
-            || facts.headers_may_change
-            || (host_changes && name == "host")
+            || facts.headers.may_change(name)
+            || (host_changes && name.eq_ignore_ascii_case("host"))
     });
     reads_changing_header
         || (facts.destination_may_change && rule.uri_compiled.is_some())
         || (host_changes && rule.authority_compiled.is_some())
         || (facts.query_may_change && !rule.match_.query_params.is_empty())
+}
+
+/// Whether a matched `rule` answers the request itself before any route
+/// total is armed, so it adds no candidate (issue #6008): a redirect, a fault
+/// that always aborts, or a node-waypoint veto the request's authorization
+/// metadata already decides. A rule fault stands down when an earlier
+/// `fault_injection` already injected, so its abort is certain only when no
+/// such instance runs ahead of this one.
+fn rule_answers_before_dispatch(
+    ctx: &RequestContext,
+    rule: &RouteRule,
+    facts: EarlyRouteTotalFacts<'_>,
+) -> bool {
+    let always_aborts = rule
+        .fault
+        .as_ref()
+        .and_then(|fault| fault.abort.as_ref())
+        .is_some_and(|abort| abort.percentage >= 100.0);
+    let fault_preempted =
+        facts.route_faults_may_be_preempted || ctx.metadata.contains_key("fault_injected");
+    let veto = reject_node_waypoint_authz_destination_override(ctx, &rule.destination);
+    rule.redirect.is_some() || (always_aborts && !fault_preempted) || veto.is_some()
 }
 
 /// Validate the optional `match.source_namespace` predicate. The Istio CRD
@@ -2203,7 +2230,7 @@ impl Plugin for MeshRouteDispatch {
         ctx: &'a RequestContext,
         host: Option<&'a str>,
         query: Option<&CanonicalQuery>,
-        facts: EarlyRouteTotalFacts,
+        facts: EarlyRouteTotalFacts<'_>,
     ) -> Option<EarlyRouteTotalStep<'a>> {
         let step = self.preview_route_total(ctx, host, query, facts);
         // An earlier destination-changing plugin (an AI or MCP router) may

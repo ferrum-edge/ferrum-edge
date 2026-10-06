@@ -403,6 +403,11 @@ impl Plugin for MeshRouteDispatchFinalizer {
         crate::plugins::ResponseBodyProduction::Never
     }
 
+    /// Cache-internal sentinel: rewrites no request input (issue #6008).
+    fn declares_request_input_mutations(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -1049,7 +1054,7 @@ impl Plugin for PluginInstanceWrapper {
         ctx: &'a RequestContext,
         host: Option<&'a str>,
         query: Option<&crate::plugins::utils::query::CanonicalQuery>,
-        facts: EarlyRouteTotalFacts,
+        facts: EarlyRouteTotalFacts<'_>,
     ) -> Option<EarlyRouteTotalStep<'a>> {
         let step = self.inner.early_route_total(ctx, host, query, facts)?;
         let Some(gate) = &self.trigger else {
@@ -1061,7 +1066,9 @@ impl Plugin for PluginInstanceWrapper {
         // selection as a candidate rather than evaluating the trigger early.
         Some(match decision {
             Some(true) => step,
-            Some(false) => EarlyRouteTotalStep::NoMatch,
+            Some(false) => EarlyRouteTotalStep::NoMatch {
+                stages_unmatched: false,
+            },
             None => step.or_skipped(),
         })
     }
@@ -1217,6 +1224,12 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn modifies_request_destination(&self) -> bool {
         self.inner.modifies_request_destination()
+    }
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        self.inner.modified_request_header_names()
+    }
+    fn declares_request_input_mutations(&self) -> bool {
+        self.inner.declares_request_input_mutations()
     }
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
