@@ -106,7 +106,7 @@ fn growth_never_outruns_the_charged_ceiling() {
 }
 
 #[test]
-fn a_finished_body_keeps_only_its_resident_charge_until_the_owner_drops() {
+fn a_finished_body_keeps_only_its_resident_charge() {
     let budget = budget();
     let total = budget.available_bytes();
     let mut upload = H3RetainedUploadProbe::admit(&budget, 4 * UNIT).expect("admitted");
@@ -119,14 +119,38 @@ fn a_finished_body_keeps_only_its_resident_charge_until_the_owner_drops() {
         "a small body must not hold a ceiling-sized claim for the whole request"
     );
     assert_eq!(budget.available_bytes(), total - UNIT);
-    // Dispatch and retry replay borrow or clone the body while the handler
-    // keeps the charge; it is released once, when the owner drops it.
-    let replay = body.clone();
     drop(body);
-    assert_eq!(budget.available_bytes(), total - UNIT);
-    drop(replay);
     drop(permit);
     assert_eq!(budget.available_bytes(), total);
+}
+
+#[test]
+fn a_published_body_is_released_when_its_last_dispatch_copy_drops() {
+    let budget = budget();
+    let total = budget.available_bytes();
+    let mut upload = H3RetainedUploadProbe::admit(&budget, 4 * UNIT).expect("admitted");
+    assert!(upload.push(b"small soap envelope"));
+    // The production publication native-H3 dispatch and both bridges use: the
+    // charge moves onto the body, so no handler-held charge outlives it.
+    let body = upload.finish_and_publish();
+    assert_eq!(&body[..], b"small soap envelope");
+    assert_eq!(budget.available_bytes(), total - UNIT);
+    // The first attempt and a retry replay share the one charged allocation.
+    let attempt = body.clone();
+    let replay = body.clone();
+    drop(body);
+    drop(attempt);
+    assert_eq!(
+        budget.available_bytes(),
+        total - UNIT,
+        "a live replay copy keeps the allocation charged"
+    );
+    drop(replay);
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "the last dispatch copy releases the charge, before any response relay"
+    );
 }
 
 #[test]
@@ -220,4 +244,33 @@ fn every_native_h3_drain_site_admits_before_it_drains() {
         !server.contains("max_bytes > 0 && body.len()"),
         "a `0` limit must never disable the native-H3 retained ceiling again"
     );
+}
+
+#[test]
+fn every_h3_dispatch_publishes_the_charge_with_the_body() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    for (source, publication) in [
+        (
+            server,
+            "publish_h3_retained_body(body_data, retained_request_charge.take());",
+        ),
+        (
+            server,
+            "prebuffered_body_charge: retained_request_charge.take(),",
+        ),
+        (
+            bridge,
+            "prebuffered_body_charge.or(mesh_upload_charge.take()),",
+        ),
+        (
+            bridge,
+            "publish_h3_retained_body(body, bridge_upload_charge.take());",
+        ),
+    ] {
+        assert!(
+            source.contains(publication),
+            "the request-buffer charge must ride on the dispatched body: `{publication}`"
+        );
+    }
 }

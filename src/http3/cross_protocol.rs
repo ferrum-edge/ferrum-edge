@@ -147,7 +147,7 @@ use crate::proxy::{
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
-use super::server::H3RetainedUpload;
+use super::server::{H3RetainedUpload, publish_h3_retained_body};
 
 /// Outcome reported back to the H3 listener so it can update request
 /// counters, build the `TransactionSummary` for log plugins, and record
@@ -254,6 +254,10 @@ where
     pub cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
     pub flavor: HttpFlavor,
     pub prebuffered_body: Option<Vec<u8>>,
+    /// The shared request-buffer charge for `prebuffered_body` (#6009). The
+    /// bridge publishes them together, so the charge is released once
+    /// dispatch and every retry are done, before the response is relayed.
+    pub prebuffered_body_charge: Option<crate::proxy::response_buffer_budget::RequestBufferPermit>,
     /// The request body was already transformed and passed through final-body
     /// hooks before transport selection in the H3 frontend.
     pub request_body_prepared: bool,
@@ -972,6 +976,7 @@ where
         cb_probe,
         flavor,
         prebuffered_body,
+        prebuffered_body_charge,
         request_body_prepared,
         raw_prebuffered_body_bytes,
         client_ip,
@@ -1088,6 +1093,7 @@ where
                 cb_target_key,
                 cb_probe,
                 prebuffered_body,
+                prebuffered_body_charge,
                 raw_prebuffered_body_bytes,
                 client_ip,
                 xff_append_ip,
@@ -1124,6 +1130,7 @@ where
                 cb_target_key,
                 cb_probe,
                 prebuffered_body,
+                prebuffered_body_charge,
                 raw_prebuffered_body_bytes,
                 client_ip,
                 xff_append_ip,
@@ -3155,6 +3162,7 @@ fn boxed_dispatch_plain<'a, S>(
     cb_target_key: Option<&'a str>,
     cb_probe: &'a crate::proxy::HalfOpenProbeGuard,
     prebuffered_body: Option<Vec<u8>>,
+    prebuffered_body_charge: Option<crate::proxy::response_buffer_budget::RequestBufferPermit>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &'a str,
     xff_append_ip: &'a str,
@@ -3192,6 +3200,7 @@ where
             cb_target_key,
             cb_probe,
             prebuffered_body,
+            prebuffered_body_charge,
             raw_prebuffered_body_bytes,
             client_ip,
             xff_append_ip,
@@ -3230,6 +3239,7 @@ async fn dispatch_plain<S>(
     cb_target_key: Option<&str>,
     cb_probe: &crate::proxy::HalfOpenProbeGuard,
     prebuffered_body: Option<Vec<u8>>,
+    prebuffered_body_charge: Option<crate::proxy::response_buffer_budget::RequestBufferPermit>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
     xff_append_ip: &str,
@@ -3382,7 +3392,7 @@ where
     // authorization bound so an elapsed credential cannot complete a ready
     // upload (issue #3815); the client-RPC wrapper would ignore that owner.
     // The shared request-buffer charge for a force-buffered mesh upload
-    // (#6009), held until this dispatch and every retry replay are done.
+    // (#6009), published with the body below.
     let mut mesh_upload_charge = None;
     let (prebuffered_body, raw_prebuffered_body_bytes) = if prebuffered_body.is_none()
         && upstream_target.is_some_and(crate::proxy::target_requires_http_mesh_egress)
@@ -3479,6 +3489,14 @@ where
     let (response, bytes_sent, mut backend_admission_permits, backend_admission_elapsed) =
         match prebuffered_body {
             Some(buffered_body) => {
+                // Publish the body with its request-buffer charge (#6009):
+                // every attempt shares the one allocation, and the charge is
+                // released when this arm drops the last copy, once dispatch
+                // and every retry are done and before the response relay.
+                let buffered_body = publish_h3_retained_body(
+                    buffered_body,
+                    prebuffered_body_charge.or(mesh_upload_charge.take()),
+                );
                 let bytes_sent = raw_prebuffered_body_bytes;
                 let mut attempt = 0u32;
                 let final_backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -3636,7 +3654,7 @@ where
                                 &current_url,
                                 method,
                                 attempt_span.headers(proxy_headers),
-                                Bytes::from(buffered_body.clone()),
+                                buffered_body.clone(),
                                 target,
                                 plugins,
                                 ctx,
@@ -4048,7 +4066,7 @@ where
                         ctx.is_early_data,
                         grpc_web_deadline_at,
                     );
-                    let plain_upload_bytes = Bytes::from(buffered_body.clone());
+                    let plain_upload_bytes = buffered_body.clone();
                     let (plain_upload_body, mut plain_upload_pump) =
                         install_buffered_upload_write_watermark(
                             plain_upload_bytes.clone(),
@@ -7977,6 +7995,7 @@ async fn dispatch_grpc<S>(
     cb_target_key: Option<&str>,
     cb_probe: &crate::proxy::HalfOpenProbeGuard,
     prebuffered_body: Option<Vec<u8>>,
+    prebuffered_body_charge: Option<crate::proxy::response_buffer_budget::RequestBufferPermit>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
     xff_append_ip: &str,
@@ -8083,9 +8102,9 @@ where
     // `max_request_body_size_bytes`) so H3 gRPC matches the H1/H2 gRPC limit —
     // an `https` proxy serves any client HTTP version uniformly.
     let body_was_prebuffered = prebuffered_body.is_some();
-    // The shared request-buffer charge for a bridge-drained upload (#6009),
-    // held until this dispatch and every retry replay are done.
-    let mut bridge_upload_charge = None;
+    // The shared request-buffer charge for the body (#6009): handed in with a
+    // prebuffered body, or taken by the drain below. Published with the body.
+    let mut bridge_upload_charge = prebuffered_body_charge;
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
@@ -8286,7 +8305,9 @@ where
         ctx,
         requires_response_body_buffering,
     );
-    let body_bytes = Bytes::from(body);
+    // Every attempt shares the one charged allocation; the charge is released
+    // when the last copy drops, once dispatch and every retry are done (#6009).
+    let body_bytes = publish_h3_retained_body(body, bridge_upload_charge.take());
     let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry {
         (
             hmap.clone(),

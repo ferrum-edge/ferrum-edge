@@ -14700,6 +14700,24 @@ pub mod _test_support {
             .select_ms(ctx, identity_ready)
     }
 
+    /// The early route-total preview (issue #6008) exactly as an early
+    /// collector reads it: through the request view of one plugin-cache
+    /// generation, with the cache's own chain, finalizer, and deferred
+    /// unmatched handling. Milliseconds from receipt, or `None`.
+    pub fn plugin_cache_early_route_total_ms_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+        ctx: &crate::plugins::RequestContext,
+        identity_ready: bool,
+    ) -> Option<u64> {
+        let view = cache.request_view(namespace, proxy_id, protocol);
+        let at = view.early_route_total_at(ctx, identity_ready)?;
+        let elapsed = at.duration_since(ctx.grpc_deadline_received_at);
+        Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+    }
+
     /// Terminal outcome of one early (pre-`before_proxy`) H1/H2 body collect
     /// (issue #6008), projected from the crate-private error type.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14805,6 +14823,14 @@ pub mod _test_support {
         pub fn finish(self) -> (Vec<u8>, RequestBufferPermitProbe) {
             let (body, permit) = self.0.finish();
             (body, RequestBufferPermitProbe(permit))
+        }
+
+        /// Finish and publish the body for dispatch through the PRODUCTION
+        /// native-H3 publication (`publish_h3_retained_body`): the charge
+        /// moves onto the shared `Bytes` every attempt and retry replays.
+        pub fn finish_and_publish(self) -> bytes::Bytes {
+            let (body, permit) = self.0.finish();
+            crate::http3::server::publish_h3_retained_body(body, Some(permit))
         }
     }
 
