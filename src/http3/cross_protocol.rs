@@ -8509,7 +8509,7 @@ where
                     .is_err()
                 {
                     result = Err(grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(
-                        "gRPC deadline exceeded during retry backoff".to_string(),
+                        grpc_proxy::GrpcDeadlinePhase::RetryBackoff,
                     ));
                     break;
                 }

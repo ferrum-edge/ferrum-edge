@@ -194,8 +194,23 @@ async fn explicit_cancel_requires_the_incoming_h2_end_stream_gate() {
     assert_source_error(h2::Error::from(h2::Reason::CANCEL), false, false).await;
 
     let (body, state) = error_body(h2::Error::from(h2::Reason::CANCEL));
-    let (source, join) = spawn_upload_pump(body, None, 0);
+    let (source, join) = spawn_upload_pump(body, None, 0, false);
     assert_terminal(source, join, &state, false).await;
+}
+
+#[tokio::test]
+async fn consumer_armed_pump_carries_the_h2_end_stream_gate() {
+    // Issue #6022: the direct-H2 pool installs the consumer-armed pump on a
+    // size-limited or authenticated non-gRPC upload. An HTTP/2 frontend's
+    // masked reset and explicit CANCEL must end non-clean there too.
+    let (mut body, state) = error_body(h2::Error::from(h2::Reason::CANCEL));
+    body.frames.clear();
+    let (source, join) = spawn_upload_pump(body, None, 0, true);
+    assert_terminal(source, join, &state, true).await;
+
+    let (body, state) = error_body(h2::Error::from(h2::Reason::CANCEL));
+    let (source, join) = spawn_upload_pump(body, None, 0, true);
+    assert_terminal(source, join, &state, true).await;
 }
 
 #[tokio::test]

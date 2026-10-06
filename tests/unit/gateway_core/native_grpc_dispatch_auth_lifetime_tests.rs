@@ -33,11 +33,14 @@ use std::time::Duration;
 use ferrum_edge::_test_support::{
     await_native_grpc_acquisition_for_test, await_native_grpc_header_wait_for_test,
     compose_native_grpc_dispatch_bounds_for_test, native_grpc_handoff_gate_for_test,
+    native_grpc_upload_handoff_gate_for_test,
 };
 use ferrum_edge::proxy::auth_lifetime::{
     StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
 };
-use ferrum_edge::proxy::grpc_proxy::{GrpcProxyError, GrpcTimeoutKind};
+use ferrum_edge::proxy::grpc_proxy::{
+    GrpcBody, GrpcDeadlinePhase, GrpcProxyError, GrpcTimeoutKind,
+};
 use ferrum_edge::retry::{ErrorClass, classify_grpc_proxy_error};
 
 /// The `ClientDeadlineExceeded` message for a client RPC deadline that
@@ -175,10 +178,14 @@ async fn an_earlier_client_deadline_keeps_its_pre_wire_deadline_terminal() {
     assert!(
         matches!(
             &outcome,
-            Err(GrpcProxyError::ClientDeadlineExceeded(message))
-                if message == ACQUISITION_DEADLINE_MESSAGE
+            Err(GrpcProxyError::ClientDeadlineExceeded(phase))
+                if *phase == GrpcDeadlinePhase::ConnectionAcquisition && phase.is_before_handoff()
         ),
         "an earlier client RPC deadline keeps its own pre-wire terminal; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.err().map(|error| error.to_string()).as_deref(),
+        Some(ACQUISITION_DEADLINE_MESSAGE)
     );
     assert!(dropped.load(Ordering::SeqCst));
     tokio::time::advance(Duration::from_millis(500)).await;
@@ -268,13 +275,90 @@ async fn the_handoff_gate_refuses_an_elapsed_client_deadline_as_pre_wire() {
     assert!(
         matches!(
             &refused,
-            Err(GrpcProxyError::ClientDeadlineExceeded(message))
-                if message == HANDOFF_DEADLINE_MESSAGE
+            Err(GrpcProxyError::ClientDeadlineExceeded(phase))
+                if *phase == GrpcDeadlinePhase::Handoff && phase.is_before_handoff()
         ),
         "a client deadline that elapsed before the handoff is refused pre-wire; got {refused:?}"
     );
+    assert_eq!(
+        refused.err().map(|error| error.to_string()).as_deref(),
+        Some(HANDOFF_DEADLINE_MESSAGE)
+    );
     assert_eq!(enqueued.load(Ordering::SeqCst), 0);
     assert_eq!(latch.observed(), None);
+}
+
+/// The bytes of a frontend upload the gateway has not read yet.
+const UNREAD_UPLOAD: &[u8] = b"unread client upload";
+
+/// A stand-in for the client's unreplayable frontend upload.
+fn unread_upload() -> GrpcBody {
+    let upload = bytes::Bytes::from_static(UNREAD_UPLOAD);
+    GrpcBody::Buffered(http_body_util::Full::new(upload))
+}
+
+/// Whether `held` is the stand-in upload, returned whole.
+fn holds_the_unread_upload(held: &Option<GrpcBody>) -> bool {
+    held.as_ref().is_some_and(|upload| {
+        http_body::Body::size_hint(upload).exact() == Some(UNREAD_UPLOAD.len() as u64)
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_streaming_handoff_returns_the_unread_frontend_upload() {
+    // Issue #6022: the fully-streamed dispatch gates BEFORE it moves the
+    // client's upload into the outbound request. A refusal is pre-wire, so the
+    // upload goes back to the caller, which then controls its termination
+    // relative to the Trailers-Only response, as after a failed acquisition.
+    let plan = plan_after(Duration::from_millis(100));
+    let latch = plan.2.clone();
+    let bounds = compose_native_grpc_dispatch_bounds_for_test(None, Some(&plan));
+
+    let mut held = None;
+    let admitted =
+        native_grpc_upload_handoff_gate_for_test(&bounds, Some(&plan), unread_upload(), &mut held);
+    assert!(
+        admitted.is_ok_and(|upload| matches!(upload, GrpcBody::Buffered(_))),
+        "an admitted handoff hands the upload on"
+    );
+    assert!(held.is_none(), "an admitted upload is never held back");
+
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let refused =
+        native_grpc_upload_handoff_gate_for_test(&bounds, Some(&plan), unread_upload(), &mut held);
+    assert_eq!(
+        expired_class(refused),
+        Some(StreamAuthTermination::CredentialExpired),
+        "an authorization expiry at the gate is refused pre-wire"
+    );
+    assert!(
+        holds_the_unread_upload(&held),
+        "a refused handoff must return the unread upload to the caller"
+    );
+    assert_eq!(
+        latch.observed(),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+
+    // An elapsed client RPC deadline is refused the same way.
+    let plan = plan_after(Duration::from_millis(200));
+    let bounds = compose_native_grpc_dispatch_bounds_for_test(Some(50), Some(&plan));
+    tokio::time::advance(Duration::from_millis(50)).await;
+    let mut held = None;
+    let refused =
+        native_grpc_upload_handoff_gate_for_test(&bounds, Some(&plan), unread_upload(), &mut held);
+    assert!(
+        matches!(
+            &refused,
+            Err(GrpcProxyError::ClientDeadlineExceeded(phase))
+                if *phase == GrpcDeadlinePhase::Handoff
+        ),
+        "a client deadline that elapsed before the handoff is refused pre-wire"
+    );
+    assert!(
+        holds_the_unread_upload(&held),
+        "a refused handoff must return the unread upload to the caller"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -571,21 +655,33 @@ fn offset_of(haystack: &str, pattern: &str) -> usize {
 
 #[test]
 fn both_native_grpc_dispatches_bound_acquisition_handoff_and_header_wait() {
+    // The buffered dispatch gates as the first statement of the future that
+    // owns the send. The fully-streamed one gates before its unreplayable
+    // frontend upload is moved into the outbound request, so a refusal can
+    // return that upload to the caller (#6022).
     let dispatches = [
         (
             "buffered",
             "pub(crate) async fn proxy_grpc_request_core(",
             "// Extract response status and headers through the shared collector",
             "protocol_header_wait",
+            "letprotocol_header_wait=async{dispatch_bounds.admit_handoff(auth)?;",
+            "dispatch_bounds.admit_handoff(auth)?;letsend_fut=sender.send_request(",
         ),
         (
             "fully-streamed",
             "async fn proxy_grpc_streaming_dispatch(",
             "// Check if the request body already exceeded the limit before response",
             "protocol_send_wait",
+            concat!(
+                "letgrpc_body=dispatch_bounds.admit_upload_handoff(",
+                "auth,grpc_body,held_frontend_upload)?;",
+                "letmutbackend_req=Request::new(grpc_body);",
+            ),
+            "letprotocol_send_wait=async{letsend_fut=sender.send_request(",
         ),
     ];
-    for (label, start, end, wait) in dispatches {
+    for (label, start, end, wait, gate, send) in dispatches {
         let code = compact_code(source_region(GRPC_PROXY_SOURCE, start, end));
         let composed = offset_of(&code, "letdispatch_bounds=GrpcDispatchBounds::compose(");
         let acquired = offset_of(
@@ -602,19 +698,19 @@ fn both_native_grpc_dispatches_bound_acquisition_handoff_and_header_wait() {
             "{label}: the only sender acquisition must be the bounded one"
         );
         // hyper enqueues the request as soon as `send_request` is called. The
-        // handoff gate is the first statement of the future that owns the
-        // send, and the send future is built immediately after it, so the gate
-        // is ahead of the enqueue whether or not the adapter is lazy.
-        let gate = offset_of(
-            &code,
-            &format!("let{wait}=async{{dispatch_bounds.admit_handoff(auth)?;"),
-        );
-        let gated_send = format!(
-            "{wait}=async{{dispatch_bounds.admit_handoff(auth)?;letsend_fut=sender.send_request("
-        );
+        // send future is built after the handoff gate with nothing awaited in
+        // between, so the gate is ahead of the enqueue whether or not the
+        // adapter is lazy.
+        let gate = offset_of(&code, gate);
+        let send = offset_of(&code, send);
         assert!(
-            acquired < gate && code.contains(&gated_send),
-            "{label}: the send future must be built immediately after the handoff gate"
+            acquired < gate && gate < send && !code[gate..send].contains(".await"),
+            "{label}: the send future must be built after the handoff gate, with nothing awaited"
+        );
+        assert_eq!(
+            code.matches("dispatch_bounds.admit_").count(),
+            1,
+            "{label}: the only handoff gate must be the one ahead of the send"
         );
         assert_eq!(
             code.matches(".send_request(").count(),

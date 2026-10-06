@@ -916,10 +916,14 @@ impl Drop for UploadPumpJoin {
 /// Generic over the source body so the pump can be proven end to end against a
 /// deliberately non-draining consumer in a unit test — `hyper::body::Incoming`
 /// cannot be constructed outside a live connection.
+///
+/// `require_end_stream` is set for an HTTP/2 frontend upload only: its EOF must
+/// be backed by the client's own END_STREAM (issue #6022).
 pub(crate) fn spawn_upload_pump<B>(
     body: B,
     plan: Option<&RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
+    require_end_stream: bool,
 ) -> (UploadPumpSource, UploadPumpJoin)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
@@ -930,7 +934,7 @@ where
         plan,
         write_timeout_ms,
         WriteWatermarkArm::Consumer,
-        false,
+        require_end_stream,
     )
 }
 

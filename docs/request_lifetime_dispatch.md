@@ -39,9 +39,10 @@ separates the final check from the client-visible response. Terminal writes use 
 bounded post-expiry grace. Once a response has committed, the existing streaming body/relay
 authorization owner governs termination and accounting.
 
-The implementation and hosted regressions address PR #5993, issue #5995, and all four dispatch
-paths grouped by issue #5990. This change does not depend on copying the response-body changes
-owned by PR #5991.
+A fully-streamed native gRPC dispatch runs its handoff gate before it moves the client's
+unreplayable upload into the backend request. A refusal there is pre-wire, so the unread upload
+returns to the caller exactly as after a failed sender acquisition, and the caller ends it only
+after the Trailers-Only response (HTTP/2) or after HEADERS+FIN (HTTP/3).
 
 Native H3 retains the pool's HEADERS-completion wire boundary: `send_request` returns only after
 its HEADERS write completes. Earlier polls can have offered a partial HEADERS frame while the
@@ -55,14 +56,11 @@ backend send half with `H3_REQUEST_CANCELLED`; dropping Quinn's send stream alon
 partial upload into clean EOF. This covers buffered bodies, borrowed H3 frontend streams, and
 Hyper `Incoming` uploads, including cancellation while waiting for more frontend DATA.
 
-Hosted regressions check zero backend requests on expiry during TLS checkout and before a cached
-send, and observe backend QUIC resets after complete DATA followed by a stalled frontend (without
+Regression coverage checks zero backend requests on expiry during TLS checkout and before a cached
+send, and observes backend QUIC resets after complete DATA followed by a stalled frontend (without
 Content-Length), plus buffered flow-control expiry. Paused-clock coverage retains a connect-before-
 client winner on late sidecar readiness wakeups and distinguishes pre-handoff authorization refusal
-from expiry after transmission; a live pooled upload also asserts its post-handoff marker. Local
-verification for this repair is static only; compilation,
-formatting, lint, FIPS, and tests must run in GitHub-hosted CI.
+from expiry after transmission; a live pooled upload also asserts its post-handoff marker.
 
-The `BackendResponse` handoff field does not change public gateway error/header tokens. Because
-`src/retry.rs` is an edge-owned contract surface, the corresponding ferrum-contracts update must
-record the independent handoff/health semantics when this PR is integrated.
+The `BackendResponse` handoff field does not change public gateway error/header tokens. It records
+whether the request was handed to the backend independently of the backend-health class.
